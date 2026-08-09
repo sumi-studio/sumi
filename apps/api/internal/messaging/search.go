@@ -79,17 +79,8 @@ func (s *Store) SearchMessages(ctx context.Context, viewer ParticipantRef, query
 		placeFilter = "AND m.place_id = $6"
 		args = append(args, opt.PlaceID)
 	}
-	rows, err := s.pool.Query(ctx, fmt.Sprintf(
-		`WITH my_places AS (
-		   SELECT p.* FROM places p
-		   JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-		    AND wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
-		   WHERE p.kind = 'channel'
-		   UNION
-		   SELECT p.* FROM places p
-		   JOIN place_members pm ON pm.place_id = p.place_id
-		    AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL
-		 )
+	rows, err := s.pool.Query(ctx, participantVisiblePlacesCTE+fmt.Sprintf(
+		`
 		 SELECT m.message_id, m.place_id, m.seq, m.author_kind, m.author_id,
 		        m.content, m.urgency, m.reply_to, m.client_nonce,
 		        m.created_at, m.edited_at,

@@ -169,17 +169,7 @@ func (s *Store) ReplyLaterMarkersFor(ctx context.Context, viewer ParticipantRef)
 	if err := viewer.Validate(); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx,
-		`WITH my_places AS (
-		   SELECT p.place_id, p.kind FROM places p
-		   JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-		    AND wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
-		   WHERE p.kind = 'channel'
-		   UNION
-		   SELECT p.place_id, p.kind FROM places p
-		   JOIN place_members pm ON pm.place_id = p.place_id
-		    AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL
-		 )
+	rows, err := s.pool.Query(ctx, participantVisiblePlacesCTE+`
 		 SELECT rl.marker_id, rl.member_kind, rl.member_id, rl.place_id, mp.kind,
 		        rl.message_id, rl.note, rl.remind_at
 		 FROM reply_later_markers rl

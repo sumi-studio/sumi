@@ -338,9 +338,6 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	if authEnabled {
 		authServer.RegisterRoutes(mux)
-		if database != nil {
-			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
-		}
 	}
 	// The /messaging surface requires the control-plane database. Without a
 	// session verifier the routes stay mounted but fail closed (401), matching
@@ -390,10 +387,7 @@ func newApplicationFromEnv() (*application, error) {
 			APIKey:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_KEY")),
 			APISecret: strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_SECRET")),
 		}
-		calls := messaging.NewCallService(messagingServer, livekit)
-		messagingServer.Calls = calls
-		calls.RegisterRoutes(mux)
-		if livekit.APIKey != "" && livekit.APISecret != "" {
+		if registerMessagingCallRoutes(mux, messagingServer, livekit) {
 			log.Printf("messaging calls ready (livekit url=%s)", livekit.URL)
 		} else {
 			log.Print("messaging calls unavailable (LiveKit is not configured)")
@@ -403,6 +397,9 @@ func newApplicationFromEnv() (*application, error) {
 		messagingWS.AllowedOrigins = browserOrigins
 		mux.Handle("GET /messaging/ws", messagingWS)
 		log.Print("messaging routes ready (REST + WS)")
+	}
+	if authEnabled && messagingServer != nil {
+		newHumanProfileServer(messagingServer, sv, browserOrigins).RegisterRoutes(mux)
 	}
 	if authEnabled {
 		closers := browserSessionConnectionClosers{browser}
@@ -469,6 +466,23 @@ func newApplicationFromEnv() (*application, error) {
 		localRuntimes: localRuntimes,
 		messaging:     messagingServer,
 	}, nil
+}
+
+// registerMessagingCallRoutes keeps the browser's read-only current-state
+// route mounted in every database-backed deployment, while exposing call state
+// to the agent's local-control lane only when an SFU can actually produce it.
+func registerMessagingCallRoutes(
+	mux *http.ServeMux,
+	server *messaging.Server,
+	livekit messaging.LiveKitConfig,
+) bool {
+	calls := messaging.NewCallService(server, livekit)
+	calls.RegisterRoutes(mux)
+	if livekit.APIKey == "" || livekit.APISecret == "" {
+		return false
+	}
+	server.Calls = calls
+	return true
 }
 
 // databaseFromEnv opens and migrates the control-plane Postgres database when

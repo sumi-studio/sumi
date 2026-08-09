@@ -132,3 +132,107 @@ func TestThreadNotifiesItsParticipantsNotTheWholeChannel(t *testing.T) {
 		t.Fatalf("mention in a thread = %+v", decisions)
 	}
 }
+
+func TestLeavingWorkspaceRemovesThreadProjectionsAndNotifications(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	thread, err := w.store.CreateThread(ctx, channel.PlaceID, "脇道", "", w.humanA)
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	joinedMessage := w.send(t, ctx, thread.Place.PlaceID, w.humanB, "参加します")
+	if _, _, err := w.store.CreateReplyLater(
+		ctx, thread.Place.PlaceID, joinedMessage.MessageID, w.humanB,
+		"あとで確認", time.Now().Add(time.Hour),
+	); err != nil {
+		t.Fatalf("create reply-later marker: %v", err)
+	}
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/left-member")
+	activePlace, err := w.store.PlaceFor(ctx, thread.Place.PlaceID, w.humanA)
+	if err != nil {
+		t.Fatalf("load active thread place: %v", err)
+	}
+	whileJoined := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "在籍中の通知")
+	joinedDecisions, err := w.store.NotificationDecisionsFor(ctx, activePlace, whileJoined)
+	if err != nil {
+		t.Fatalf("notification decisions while joined: %v", err)
+	}
+	if len(joinedDecisions) != 1 || joinedDecisions[0].Participant != w.humanB {
+		t.Fatalf("joined thread member should be notified: %+v", joinedDecisions)
+	}
+
+	if err := w.store.RemoveWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+		t.Fatalf("remove workspace member: %v", err)
+	}
+	if _, err := w.store.PlaceFor(ctx, thread.Place.PlaceID, w.humanB); !errors.Is(err, ErrPlaceNotFound) {
+		t.Fatalf("left member thread access = %v, want ErrPlaceNotFound", err)
+	}
+
+	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "脱退後の本文")
+	threads, err := w.store.ThreadsFor(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("threads for left member: %v", err)
+	}
+	if len(threads) != 0 {
+		t.Errorf("left member bootstrap leaked thread preview: %+v", threads)
+	}
+
+	summaries, err := w.store.UnreadSummaries(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("unread summaries for left member: %v", err)
+	}
+	for _, summary := range summaries {
+		if summary.Place.PlaceID == thread.Place.PlaceID {
+			t.Errorf("left member retained thread unread summary: %+v", summary)
+		}
+	}
+	searchResults, err := w.store.SearchMessages(ctx, w.humanB, "脱退後の本文", SearchOptions{})
+	if err != nil {
+		t.Fatalf("search as left member: %v", err)
+	}
+	if len(searchResults) != 0 {
+		t.Errorf("left member search leaked thread messages: %+v", searchResults)
+	}
+	markers, err := w.store.ReplyLaterMarkersFor(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("reply-later markers for left member: %v", err)
+	}
+	for _, marker := range markers {
+		if marker.PlaceID == thread.Place.PlaceID {
+			t.Errorf("left member retained thread reply-later marker: %+v", marker)
+		}
+	}
+
+	// Every active parent-channel member may still browse the thread, but the
+	// participant projection and notifications only contain joined active
+	// workspace members.
+	visible, err := w.store.ThreadsIn(ctx, channel.PlaceID, w.agent)
+	if err != nil {
+		t.Fatalf("browse threads as active non-participant: %v", err)
+	}
+	if len(visible) != 1 {
+		t.Fatalf("active parent member should see the thread: %+v", visible)
+	}
+	if len(visible[0].Participants) != 1 || visible[0].Participants[0] != w.humanA {
+		t.Errorf("thread participants retained left member: %+v", visible[0].Participants)
+	}
+
+	place, err := w.store.PlaceFor(ctx, thread.Place.PlaceID, w.humanA)
+	if err != nil {
+		t.Fatalf("load thread place: %v", err)
+	}
+	decisions, err := w.store.NotificationDecisionsFor(ctx, place, message)
+	if err != nil {
+		t.Fatalf("notification decisions: %v", err)
+	}
+	if len(decisions) != 0 {
+		t.Errorf("left or non-joined member remained in notification audience: %+v", decisions)
+	}
+	client := &recordingPushClient{}
+	w.dispatcher(t, ctx, client).deliver(ctx, place, message, decisions)
+	if sent := client.endpoints(); len(sent) != 0 {
+		t.Fatalf("push leaked thread message to left member: %v", sent)
+	}
+}

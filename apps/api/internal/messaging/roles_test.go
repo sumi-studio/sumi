@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 // admitAll puts everyone in the shared Workspace, where the migration's seeded
@@ -542,5 +545,408 @@ func TestFoundingAdminIgnoresAdminAssignmentsOutsideTheWorkspace(t *testing.T) {
 	}
 	if !granted.Can(PermManageChannels) || !granted.Can(PermManageRoles) {
 		t.Fatalf("first active human permissions = %#v, want Admin", granted)
+	}
+}
+
+func TestRoleMutationsCannotExceedTheActorsEffectiveAuthority(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.admitAll(t, ctx)
+
+	roleManager, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanA, "Role manager", "",
+		map[string]bool{PermManageRoles: true})
+	if err != nil {
+		t.Fatalf("create role manager: %v", err)
+	}
+	memberManager, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanA, "Member manager", "",
+		map[string]bool{PermManageMembers: true})
+	if err != nil {
+		t.Fatalf("create member manager: %v", err)
+	}
+	stronger, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanA, "Stronger", "",
+		map[string]bool{
+			PermManageRoles: true, PermManageMembers: true, PermManageChannels: true,
+		})
+	if err != nil {
+		t.Fatalf("create stronger role: %v", err)
+	}
+	if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanB,
+		[]string{roleManager.RoleID}); err != nil {
+		t.Fatalf("grant role manager: %v", err)
+	}
+	if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.agent,
+		[]string{memberManager.RoleID}); err != nil {
+		t.Fatalf("grant member manager: %v", err)
+	}
+
+	if _, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanB, "Escalation", "",
+		map[string]bool{PermManageChannels: true}); !errors.Is(err, ErrForbidden) {
+		t.Errorf("role manager creates a permission it lacks: error = %v, want ErrForbidden", err)
+	}
+	if _, err := w.store.UpdateRole(ctx, DefaultWorkspaceID, roleManager.RoleID, w.humanB,
+		"Role manager", "", map[string]bool{
+			PermManageRoles: true, PermManageChannels: true,
+		}); !errors.Is(err, ErrForbidden) {
+		t.Errorf("role manager adds a permission to its own role: error = %v, want ErrForbidden", err)
+	}
+	if err := w.store.DeleteRole(ctx, DefaultWorkspaceID, stronger.RoleID, w.humanB); !errors.Is(err, ErrForbidden) {
+		t.Errorf("role manager deletes a stronger role: error = %v, want ErrForbidden", err)
+	}
+	if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.agent, w.agent,
+		[]string{DefaultAdminRoleID}); !errors.Is(err, ErrForbidden) {
+		t.Errorf("member manager grants itself Admin: error = %v, want ErrForbidden", err)
+	}
+	if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.agent, w.humanA, nil); !errors.Is(err, ErrForbidden) {
+		t.Errorf("member manager strips a stronger role: error = %v, want ErrForbidden", err)
+	}
+}
+
+func TestRoleAuthorityCeilingIsSharedByHumanAndAgentLanes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	w.admitAll(t, ctx)
+
+	memberManager, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanA, "Member manager", "",
+		map[string]bool{PermManageMembers: true})
+	if err != nil {
+		t.Fatalf("create member manager: %v", err)
+	}
+	for _, participant := range []ParticipantRef{w.humanB, w.agent} {
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, participant,
+			[]string{memberManager.RoleID}); err != nil {
+			t.Fatalf("grant member manager to %s: %v", participant.Key(), err)
+		}
+	}
+
+	memberPath := "/messaging/workspaces/" + DefaultWorkspaceID +
+		"/members/human/" + w.humanB.ID + "/roles"
+	response, body := call(t, ts, http.MethodPut, memberPath, w.humanB.ID, map[string]any{
+		"role_ids": []string{DefaultAdminRoleID},
+	})
+	if response.StatusCode != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("Human self-escalation: status %d body %v", response.StatusCode, body)
+	}
+
+	server := NewServer(w.store, nil)
+	status, body := w.callAgent(t, ctx, server.localSetMemberRoles, LocalMemberRolesPath,
+		map[string]any{
+			"member_kind": "personality_agent", "member_id": w.agent.ID,
+			"role_ids": []string{DefaultAdminRoleID},
+		})
+	if status != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("agent self-escalation: status %d body %v", status, body)
+	}
+}
+
+func TestRoleMutationsPreserveARecoverableWorkspaceAdministrator(t *testing.T) {
+	t.Run("seed role cannot be weakened or deleted", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		w.admitAll(t, ctx)
+
+		backup, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanA, "Backup admin", "",
+			map[string]bool{
+				PermManageChannels: true, PermManageRoles: true,
+				PermManageMembers: true, PermMentionAll: true,
+			})
+		if err != nil {
+			t.Fatalf("create backup admin: %v", err)
+		}
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanB,
+			[]string{backup.RoleID}); err != nil {
+			t.Fatalf("grant backup admin: %v", err)
+		}
+
+		if _, err := w.store.UpdateRole(ctx, DefaultWorkspaceID, DefaultAdminRoleID, w.humanA,
+			"Admin", "", map[string]bool{PermManageRoles: true}); !errors.Is(err, ErrForbidden) {
+			t.Errorf("weaken seeded Admin: error = %v, want ErrForbidden", err)
+		}
+		if err := w.store.DeleteRole(ctx, DefaultWorkspaceID, DefaultAdminRoleID, w.humanA); !errors.Is(err, ErrForbidden) {
+			t.Errorf("delete seeded Admin: error = %v, want ErrForbidden", err)
+		}
+	})
+
+	t.Run("last effective administrator cannot be removed", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		w.admitAll(t, ctx)
+
+		customAdmin, err := w.store.CreateRole(ctx, DefaultWorkspaceID, w.humanA, "Custom admin", "",
+			map[string]bool{
+				PermManageChannels: true, PermManageRoles: true,
+				PermManageMembers: true, PermMentionAll: true,
+			})
+		if err != nil {
+			t.Fatalf("create custom admin: %v", err)
+		}
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanA,
+			[]string{customAdmin.RoleID}); err != nil {
+			t.Fatalf("replace seeded Admin with custom Admin: %v", err)
+		}
+
+		if _, err := w.store.UpdateRole(ctx, DefaultWorkspaceID, customAdmin.RoleID, w.humanA,
+			"Custom admin", "", map[string]bool{PermManageChannels: true}); !errors.Is(err, ErrForbidden) {
+			t.Errorf("remove manage_roles from the last admin: error = %v, want ErrForbidden", err)
+		}
+		if err := w.store.DeleteRole(ctx, DefaultWorkspaceID, customAdmin.RoleID, w.humanA); !errors.Is(err, ErrForbidden) {
+			t.Errorf("delete the last admin role: error = %v, want ErrForbidden", err)
+		}
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanA, nil); !errors.Is(err, ErrForbidden) {
+			t.Errorf("remove the last admin assignment: error = %v, want ErrForbidden", err)
+		}
+	})
+
+	t.Run("one admin may hand administration to another", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		w.admitAll(t, ctx)
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanB,
+			[]string{DefaultAdminRoleID}); err != nil {
+			t.Fatalf("grant second admin: %v", err)
+		}
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanA, nil); err != nil {
+			t.Fatalf("first admin hands off administration: %v", err)
+		}
+		granted, err := w.store.PermissionsFor(ctx, DefaultWorkspaceID, w.humanB)
+		if err != nil {
+			t.Fatalf("second admin permissions: %v", err)
+		}
+		if !granted.Can(PermManageRoles) {
+			t.Fatalf("second admin permissions = %#v, want manage_roles", granted)
+		}
+	})
+
+	t.Run("concurrent admins cannot both remove themselves", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		w.admitAll(t, ctx)
+		if _, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, w.humanB,
+			[]string{DefaultAdminRoleID}); err != nil {
+			t.Fatalf("grant second admin: %v", err)
+		}
+
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		for _, participant := range []ParticipantRef{w.humanA, w.humanB} {
+			participant := participant
+			go func() {
+				<-start
+				_, err := w.store.SetParticipantRoles(ctx, DefaultWorkspaceID, participant, participant, nil)
+				errs <- err
+			}()
+		}
+		close(start)
+		var succeeded, refused int
+		for range 2 {
+			switch err := <-errs; {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, ErrForbidden):
+				refused++
+			default:
+				t.Fatalf("concurrent admin removal: %v", err)
+			}
+		}
+		if succeeded != 1 || refused != 1 {
+			t.Fatalf("concurrent admin removals: succeeded=%d refused=%d, want 1/1", succeeded, refused)
+		}
+	})
+}
+
+func TestFoundingAdminDoesNotPretendAMissingSeedWasGranted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.admitAll(t, ctx)
+	if _, err := w.store.pool.Exec(ctx, "DELETE FROM participant_roles"); err != nil {
+		t.Fatalf("clear seeded grants: %v", err)
+	}
+	if _, err := w.store.pool.Exec(ctx,
+		"DELETE FROM workspace_roles WHERE role_id = $1", DefaultAdminRoleID); err != nil {
+		t.Fatalf("remove seeded Admin role: %v", err)
+	}
+	if err := w.store.EnsureFoundingAdmin(ctx, w.humanA); !errors.Is(err, ErrRoleNotFound) {
+		t.Fatalf("founding admin with missing seed: error = %v, want ErrRoleNotFound", err)
+	}
+}
+
+func TestFoundingAdminIgnoresAssignmentsHeldOnlyByFormerMembers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.admitAll(t, ctx)
+	if err := w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, w.humanA); err != nil {
+		t.Fatalf("remove original admin: %v", err)
+	}
+	if err := w.store.EnsureFoundingAdmin(ctx, w.humanB); err != nil {
+		t.Fatalf("grant replacement founding admin: %v", err)
+	}
+	granted, err := w.store.PermissionsFor(ctx, DefaultWorkspaceID, w.humanB)
+	if err != nil {
+		t.Fatalf("replacement admin permissions: %v", err)
+	}
+	if !granted.Can(PermManageRoles) {
+		t.Fatalf("replacement admin permissions = %#v, want manage_roles", granted)
+	}
+}
+
+func TestConcurrentFoundingAdminBootstrapGrantsExactlyOneHuman(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.admitAll(t, ctx)
+
+	participants := []ParticipantRef{w.humanA, w.humanB}
+	registry := koseki.New(w.store.pool)
+	for range 30 {
+		humanID, err := registry.MintHuman(ctx)
+		if err != nil {
+			t.Fatalf("mint concurrent founder: %v", err)
+		}
+		participant := Human(humanID)
+		if err := w.store.AddWorkspaceMember(ctx, DefaultWorkspaceID, participant, RoleMember); err != nil {
+			t.Fatalf("admit concurrent founder: %v", err)
+		}
+		participants = append(participants, participant)
+	}
+	if _, err := w.store.pool.Exec(ctx, "DELETE FROM participant_roles"); err != nil {
+		t.Fatalf("clear seeded grants: %v", err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(participants))
+	var ready sync.WaitGroup
+	ready.Add(len(participants))
+	for _, participant := range participants {
+		participant := participant
+		go func() {
+			ready.Done()
+			<-start
+			errs <- w.store.EnsureFoundingAdmin(ctx, participant)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for range participants {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent founding admin: %v", err)
+		}
+	}
+
+	var admins int
+	if err := w.store.pool.QueryRow(ctx,
+		`SELECT count(DISTINCT (pr.member_kind, pr.member_id))
+		 FROM participant_roles pr
+		 JOIN workspace_roles wr ON wr.role_id = pr.role_id
+		 JOIN workspace_members wm
+		   ON wm.workspace_id = wr.workspace_id
+		  AND wm.member_kind = pr.member_kind AND wm.member_id = pr.member_id
+		  AND wm.left_at IS NULL
+		 WHERE wr.workspace_id = $1
+		   AND COALESCE((wr.permissions ->> 'manage_roles')::boolean, false)`,
+		DefaultWorkspaceID).Scan(&admins); err != nil {
+		t.Fatalf("count founding admins: %v", err)
+	}
+	if admins != 1 {
+		t.Fatalf("concurrent founding admins = %d, want exactly 1", admins)
+	}
+}
+
+func TestRoleTransactionsDoNotReenterASaturatedPoolForMissingMembership(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.admitAll(t, ctx)
+	registry := koseki.New(w.store.pool)
+	outsiderID, err := registry.MintHuman(ctx)
+	if err != nil {
+		t.Fatalf("mint nonmember: %v", err)
+	}
+	outsider := Human(outsiderID)
+
+	tests := []struct {
+		name      string
+		want      error
+		operation func(context.Context, *Store) error
+	}{
+		{
+			name: "nonmember actor",
+			want: ErrForbidden,
+			operation: func(ctx context.Context, store *Store) error {
+				_, err := store.CreateRole(ctx, DefaultWorkspaceID, outsider, "not allowed", "", nil)
+				return err
+			},
+		},
+		{
+			name: "nonmember target",
+			want: ErrNotAMember,
+			operation: func(ctx context.Context, store *Store) error {
+				_, err := store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, outsider, nil)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := pgxpool.ParseConfig(w.store.pool.Config().ConnString())
+			if err != nil {
+				t.Fatalf("parse saturated pool config: %v", err)
+			}
+			config.MaxConns = 2
+			pool, err := pgxpool.NewWithConfig(ctx, config)
+			if err != nil {
+				t.Fatalf("create saturated pool: %v", err)
+			}
+			defer pool.Close()
+			store := New(pool)
+
+			blocker, err := w.store.pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin membership blocker: %v", err)
+			}
+			defer func() { _ = blocker.Rollback(ctx) }()
+			if _, err := blocker.Exec(ctx, "LOCK TABLE workspace_members IN ACCESS EXCLUSIVE MODE"); err != nil {
+				t.Fatalf("lock memberships: %v", err)
+			}
+
+			opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer opCancel()
+			results := make(chan error, 2)
+			start := make(chan struct{})
+			for range 2 {
+				go func() {
+					<-start
+					results <- test.operation(opCtx, store)
+				}()
+			}
+			close(start)
+
+			acquireDeadline := time.NewTimer(time.Second)
+			defer acquireDeadline.Stop()
+			acquirePoll := time.NewTicker(5 * time.Millisecond)
+			defer acquirePoll.Stop()
+			for pool.Stat().AcquiredConns() != 2 {
+				select {
+				case <-acquirePoll.C:
+				case <-acquireDeadline.C:
+					t.Fatalf("role requests acquired %d/2 pool connections", pool.Stat().AcquiredConns())
+				}
+			}
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatalf("release membership blocker: %v", err)
+			}
+
+			for range 2 {
+				if err := <-results; !errors.Is(err, test.want) {
+					t.Fatalf("saturated role request: error = %v, want %v", err, test.want)
+				}
+			}
+		})
 	}
 }

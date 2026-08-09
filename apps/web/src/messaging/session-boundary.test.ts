@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useCall } from "./call/call-store";
 import { MockMessagingServer } from "./mock-server";
+import type { ConnectionState } from "./model";
 import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
@@ -9,7 +11,10 @@ import {
 } from "./store";
 
 describe("messaging session boundary", () => {
-  afterEach(() => bindMessagingSessionIdentity(null));
+  afterEach(() => {
+    bindMessagingSessionIdentity(null);
+    vi.unstubAllGlobals();
+  });
 
   it("disposes private state before a different signed-in human can render", () => {
     bindMessagingSessionIdentity("human-a");
@@ -47,6 +52,11 @@ describe("messaging session boundary", () => {
         ],
       },
     });
+    useCall.setState({
+      activePlaceKey: "channel:private-a",
+      phase: "connected",
+      audioPlaybackBlocked: true,
+    });
 
     bindMessagingSessionIdentity(null);
     bindMessagingSessionIdentity("human-b");
@@ -61,6 +71,55 @@ describe("messaging session boundary", () => {
       activePlaceKey: null,
       connection: "disconnected",
     });
+    expect(useCall.getState()).toMatchObject({
+      activePlaceKey: null,
+      phase: "idle",
+      audioPlaybackBlocked: false,
+    });
+  });
+
+  it("ignores a bootstrap that completes after the session changes", async () => {
+    const serverA = new MockMessagingServer();
+    const serverB = new MockMessagingServer();
+    const baseA = await serverA.bootstrap();
+    const baseB = await serverB.bootstrap();
+    let resolveA: (snapshot: typeof baseA) => void = () => {};
+    const pendingA = new Promise<typeof baseA>((resolve) => {
+      resolveA = resolve;
+    });
+    vi.spyOn(serverA, "bootstrap").mockReturnValue(pendingA);
+    vi.spyOn(serverB, "bootstrap").mockResolvedValue({
+      ...baseB,
+      self: { kind: "human", humanId: "human-b" },
+    });
+    const subscribeB = vi.spyOn(serverB, "subscribe");
+
+    bindMessagingSessionIdentity("human-a");
+    installMessagingBackend(serverA);
+    useMessaging.getState().init();
+
+    bindMessagingSessionIdentity("human-b");
+    installMessagingBackend(serverB);
+    useMessaging.getState().init();
+    await vi.waitFor(() =>
+      expect(useMessaging.getState()).toMatchObject({
+        ready: true,
+        selfKey: "human:human-b",
+      }),
+    );
+
+    resolveA({
+      ...baseA,
+      self: { kind: "human", humanId: "human-a" },
+    });
+    await pendingA;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(useMessaging.getState()).toMatchObject({
+      ready: true,
+      selfKey: "human:human-b",
+    });
+    expect(subscribeB).toHaveBeenCalledTimes(1);
   });
 
   it("atomically refreshes Human and contextual agent presentation profiles", async () => {
@@ -136,4 +195,45 @@ describe("messaging session boundary", () => {
     });
     expect(useMessaging.getState().messagesByPlace).toBe(messagesByPlace);
   });
+
+  it("WebSocketが再接続するたびvolatile call snapshotを読み直す", async () => {
+    bindMessagingSessionIdentity("reconnect-human");
+    const server = new ReconnectingMockServer();
+    installMessagingBackend(server);
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ calls: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    useMessaging.getState().init();
+    await vi.waitFor(() => expect(server.connectionListener).not.toBeNull());
+
+    server.emitConnection("connected");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    server.emitConnection("reconnecting");
+    server.emitConnection("connected");
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
 });
+
+class ReconnectingMockServer extends MockMessagingServer {
+  connectionListener: ((state: ConnectionState) => void) | null = null;
+
+  subscribeConnection(listener: (state: ConnectionState) => void): () => void {
+    this.connectionListener = listener;
+    listener("reconnecting");
+    return () => {
+      this.connectionListener = null;
+    };
+  }
+
+  emitConnection(state: ConnectionState): void {
+    this.connectionListener?.(state);
+  }
+}

@@ -47,10 +47,9 @@ func normalizeHumanDisplayName(raw string) (string, error) {
 	return "", ErrInvalidDisplayName
 }
 
-// NormalizeDisplayName is the registry's rule for a名乗り, exported so other
-// boundaries (messaging の個人設定) apply the identical normalization instead of
-// inventing a second one. Humans and PersonalityAgents share it: a participant
-// is a participant.
+// NormalizeDisplayName exposes the registry's rule for callers that need to
+// validate a名乗り without persisting it. Humans and PersonalityAgents share
+// the rule: a participant is a participant.
 func NormalizeDisplayName(raw string) (string, error) {
 	return normalizeHumanDisplayName(raw)
 }
@@ -77,6 +76,40 @@ func (s *Store) UpdateAgentDisplayName(ctx context.Context, agentID, raw string)
 		return "", fmt.Errorf("update PersonalityAgent display name: %w", err)
 	}
 	return stored, nil
+}
+
+// ResolveAgentDisplayNameTx locks a PersonalityAgent's canonical row inside a
+// caller-owned transaction and optionally updates its name. A nil raw value is
+// a lock-only operation: wider partial-profile mutations can serialize on the
+// same registry row before reading the fields they intend to preserve.
+func (s *Store) ResolveAgentDisplayNameTx(ctx context.Context, tx pgx.Tx, agentID string, raw *string) (string, bool, error) {
+	var name string
+	if raw != nil {
+		var err error
+		name, err = normalizeHumanDisplayName(*raw)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	var previous string
+	if err := tx.QueryRow(ctx,
+		`SELECT display_name FROM agents WHERE personality_agent_id=$1 FOR UPDATE`, agentID,
+	).Scan(&previous); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, ErrAgentNotFound
+		}
+		return "", false, fmt.Errorf("lock PersonalityAgent display name: %w", err)
+	}
+	if raw == nil {
+		return previous, false, nil
+	}
+	var stored string
+	if err := tx.QueryRow(ctx,
+		`UPDATE agents SET display_name=$2 WHERE personality_agent_id=$1
+		 RETURNING display_name`, agentID, name).Scan(&stored); err != nil {
+		return "", false, fmt.Errorf("update PersonalityAgent display name: %w", err)
+	}
+	return stored, stored != previous, nil
 }
 
 // initialHumanDisplayName treats a malformed verified provider label as absent
@@ -121,6 +154,39 @@ func (s *Store) UpdateHumanDisplayName(ctx context.Context, humanID, raw string)
 		return "", fmt.Errorf("update Human display name: %w", err)
 	}
 	return stored, nil
+}
+
+// ResolveHumanDisplayNameTx locks a Human's canonical row inside a caller-owned
+// transaction and optionally updates its name. The Human row is the
+// participant-level serialization point for both full and partial profiles.
+func (s *Store) ResolveHumanDisplayNameTx(ctx context.Context, tx pgx.Tx, humanID string, raw *string) (string, bool, error) {
+	var name string
+	if raw != nil {
+		var err error
+		name, err = normalizeHumanDisplayName(*raw)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	var previous string
+	if err := tx.QueryRow(ctx,
+		`SELECT display_name FROM humans WHERE human_id=$1 FOR UPDATE`, humanID,
+	).Scan(&previous); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, ErrHumanNotFound
+		}
+		return "", false, fmt.Errorf("lock Human display name: %w", err)
+	}
+	if raw == nil {
+		return previous, false, nil
+	}
+	var stored string
+	if err := tx.QueryRow(ctx, `UPDATE humans
+		SET display_name=$2, display_name_customized=true, display_name_initialized=true
+		WHERE human_id=$1 RETURNING display_name`, humanID, name).Scan(&stored); err != nil {
+		return "", false, fmt.Errorf("update Human display name: %w", err)
+	}
+	return stored, stored != previous, nil
 }
 
 // SeedHumanDisplayName upgrades only the historical creation sentinel and only
