@@ -55,51 +55,79 @@ func (s *Store) Catalog(ctx context.Context) ([]Descriptor, error) {
 	return descriptors, nil
 }
 
-// RequireEnabledInTx is the app-consumer admission seam for a commit. Apps
-// such as Messaging call it inside the same transaction as their write so a
-// concurrent disable cannot admit new work after the lifecycle change commits.
-func (s *Store) RequireEnabledInTx(ctx context.Context, tx pgx.Tx, owner OwnerRef, appID string) error {
+// RequireEnabledInstallationInTx is the app-consumer admission seam for a
+// commit. The caller must present the exact installation identity it entered
+// through; matching only owner+app would let a stale pre-uninstall capability
+// authorize against a later reinstall. The SHARE lock binds lifecycle
+// admission and the app-owned write to one transaction ordering.
+func (s *Store) RequireEnabledInstallationInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID string,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
+	if !isCanonicalUUIDv7(installationID) {
+		return Installation{}, ErrInstallationNotFound
+	}
 	if err := owner.Validate(); err != nil {
-		return err
+		return Installation{}, err
 	}
 	storageKind, storageID := ownerStorageKey(owner)
-	var enabled bool
-	err := tx.QueryRow(ctx, `
-		SELECT enabled FROM app_installations
-		WHERE owner_kind = $1 AND owner_id = $2 AND app_id = $3
-		FOR SHARE`, storageKind, storageID, appID).Scan(&enabled)
+	row := tx.QueryRow(ctx, `
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		       installed_at, updated_at
+		FROM app_installations
+		WHERE installation_id = $1
+		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4
+		FOR SHARE`, installationID, storageKind, storageID, appID)
+	installation, err := scanInstallation(row)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrInstallationNotFound
+		return Installation{}, ErrInstallationNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("load app lifecycle admission: %w", err)
+		return Installation{}, fmt.Errorf("load exact app lifecycle admission: %w", err)
 	}
-	if !enabled {
-		return ErrAppDisabled
+	if installation.State != StateEnabled {
+		return Installation{}, ErrAppDisabled
 	}
-	return nil
+	return installation, nil
 }
 
-// Enabled is the read-side lifecycle projection used to decide whether an
-// entry surface or background worker should be present. Missing and disabled
-// installations both return false without inventing an installation.
-func (s *Store) Enabled(ctx context.Context, owner OwnerRef, appID string) (bool, error) {
+// RequireEnabledInstallation is the read-side equivalent used by entry
+// surfaces and delivery workers. It deliberately preserves exact installation
+// identity instead of collapsing missing and disabled bindings into a boolean.
+func (s *Store) RequireEnabledInstallation(
+	ctx context.Context,
+	installationID string,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
+	if !isCanonicalUUIDv7(installationID) {
+		return Installation{}, ErrInstallationNotFound
+	}
 	if err := owner.Validate(); err != nil {
-		return false, err
+		return Installation{}, err
 	}
 	storageKind, storageID := ownerStorageKey(owner)
-	var enabled bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT enabled FROM app_installations
-		WHERE owner_kind = $1 AND owner_id = $2 AND app_id = $3`,
-		storageKind, storageID, appID).Scan(&enabled)
+	row := s.pool.QueryRow(ctx, `
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		       installed_at, updated_at
+		FROM app_installations
+		WHERE installation_id = $1
+		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4`,
+		installationID, storageKind, storageID, appID)
+	installation, err := scanInstallation(row)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return Installation{}, ErrInstallationNotFound
 	}
 	if err != nil {
-		return false, fmt.Errorf("read app lifecycle state: %w", err)
+		return Installation{}, fmt.Errorf("read exact app lifecycle state: %w", err)
 	}
-	return enabled, nil
+	if installation.State != StateEnabled {
+		return Installation{}, ErrAppDisabled
+	}
+	return installation, nil
 }
 
 func (s *Store) Installations(ctx context.Context, owner OwnerRef, actor participant.Ref) ([]Installation, error) {

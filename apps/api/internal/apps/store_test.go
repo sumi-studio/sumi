@@ -73,9 +73,10 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if installed.State != applicationapps.StateEnabled {
 		t.Fatalf("initial state = %q", installed.State)
 	}
-	enabled, err := w.apps.Enabled(ctx, workspaceOwner, "messaging")
-	if err != nil || !enabled {
-		t.Fatalf("enabled projection = %v, %v", enabled, err)
+	projected, err := w.apps.RequireEnabledInstallation(ctx,
+		installed.InstallationID, workspaceOwner, "messaging")
+	if err != nil || projected.InstallationID != installed.InstallationID {
+		t.Fatalf("exact enabled projection = %#v, %v", projected, err)
 	}
 	if _, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, false); err != nil {
 		t.Fatalf("disable Messaging: %v", err)
@@ -88,7 +89,8 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.apps.RequireEnabledInTx(ctx, tx, workspaceOwner, "messaging"); !errors.Is(err, applicationapps.ErrAppDisabled) {
+	if _, err := w.apps.RequireEnabledInstallationInTx(ctx, tx,
+		installed.InstallationID, workspaceOwner, "messaging"); !errors.Is(err, applicationapps.ErrAppDisabled) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("disabled commit admission = %v", err)
 	}
@@ -117,9 +119,61 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if !preserved {
 		t.Fatal("uninstall deleted app-owned Messaging data")
 	}
+	if _, err := w.apps.RequireEnabledInstallation(ctx,
+		installed.InstallationID, workspaceOwner, "messaging"); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+		t.Fatalf("uninstalled exact id admission = %v", err)
+	}
 	list, err = w.apps.Installations(ctx, workspaceOwner, w.owner)
 	if err != nil || len(list) != 0 {
 		t.Fatalf("post-uninstall list = %#v, %v", list, err)
+	}
+	reinstalled, err := w.apps.Install(ctx, workspaceOwner, w.owner, "messaging")
+	if err != nil {
+		t.Fatalf("reinstall Messaging: %v", err)
+	}
+	if reinstalled.InstallationID == installed.InstallationID {
+		t.Fatal("reinstall reused installation identity")
+	}
+	if _, err := w.apps.RequireEnabledInstallation(ctx,
+		installed.InstallationID, workspaceOwner, "messaging"); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+		t.Fatalf("stale pre-uninstall id authorized reinstall: %v", err)
+	}
+	if exact, err := w.apps.RequireEnabledInstallation(ctx,
+		reinstalled.InstallationID, workspaceOwner, "messaging"); err != nil || exact.InstallationID != reinstalled.InstallationID {
+		t.Fatalf("reinstalled exact admission = %#v, %v", exact, err)
+	}
+}
+
+func TestExactInstallationAdmissionRejectsOwnerAndAppSubstitution(t *testing.T) {
+	w := newAppWorld(t)
+	ctx := context.Background()
+	first, err := w.workspaces.CreateWorkspace(ctx, "first", w.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := w.workspaces.CreateWorkspace(ctx, "second", w.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstOwner := applicationapps.WorkspaceOwner(first.WorkspaceID)
+	installed, err := w.apps.Install(ctx, firstOwner, w.owner, "messaging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, owner := range map[string]applicationapps.OwnerRef{
+		"other Workspace": applicationapps.WorkspaceOwner(second.WorkspaceID),
+		"Participant":     applicationapps.ParticipantOwner(w.owner),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := w.apps.RequireEnabledInstallation(ctx,
+				installed.InstallationID, owner, "messaging"); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+				t.Fatalf("substituted owner admission = %v", err)
+			}
+		})
+	}
+	if _, err := w.apps.RequireEnabledInstallation(ctx,
+		installed.InstallationID, firstOwner, "alarm"); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+		t.Fatalf("substituted app admission = %v", err)
 	}
 }
 

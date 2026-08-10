@@ -620,6 +620,59 @@ func (s *Store) RequireMembershipInTx(ctx context.Context, tx pgx.Tx, workspaceI
 	return err
 }
 
+// ActiveMembershipInTx returns the exact active tenure an application binds
+// its own child resource to. Returning only a boolean would force consumers to
+// rediscover workspace_member_id and reopen a race with removal/rejoin.
+func (s *Store) ActiveMembershipInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	workspaceID string,
+	actor participant.Ref,
+) (Membership, error) {
+	return activeMembership(ctx, tx, workspaceID, actor)
+}
+
+// ActiveMembershipsInTx is the narrow audience projection for applications
+// that have already admitted an operation in this transaction. It exposes
+// exact active tenure identities; it does not authorize the caller by itself.
+func (s *Store) ActiveMembershipsInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	workspaceID string,
+) ([]Membership, error) {
+	if !isCanonicalUUIDv7(workspaceID) {
+		return nil, ErrNotFound
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT wm.workspace_member_id, wm.workspace_id, wm.member_kind, wm.member_id,
+		       wm.workspace_member_id = w.owner_workspace_member_id,
+		       wm.joined_at
+		FROM workspace_members wm
+		JOIN workspaces w ON w.workspace_id = wm.workspace_id
+		WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
+		ORDER BY wm.joined_at, wm.workspace_member_id`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list active workspace membership tenures: %w", err)
+	}
+	defer rows.Close()
+	memberships := []Membership{}
+	for rows.Next() {
+		var membership Membership
+		var kind string
+		if err := rows.Scan(&membership.WorkspaceMemberID, &membership.WorkspaceID,
+			&kind, &membership.Participant.ID, &membership.Owner,
+			&membership.JoinedAt); err != nil {
+			return nil, fmt.Errorf("scan active workspace membership tenure: %w", err)
+		}
+		membership.Participant.Kind = participant.Kind(kind)
+		memberships = append(memberships, membership)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active workspace membership tenures: %w", err)
+	}
+	return memberships, nil
+}
+
 func (s *Store) permissionsFor(ctx context.Context, q querier, workspaceID string, actor participant.Ref) (PermissionSet, error) {
 	membership, err := activeMembership(ctx, q, workspaceID, actor)
 	if err != nil {

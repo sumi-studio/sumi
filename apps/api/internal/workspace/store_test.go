@@ -86,6 +86,28 @@ func TestWorkspaceCreateIsAtomicAndReadsNeverAdmit(t *testing.T) {
 		members[0].Participant != w.humanA {
 		t.Fatalf("owner membership = %#v", members)
 	}
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact, err := w.store.ActiveMembershipInTx(ctx, tx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("ActiveMembershipInTx: %v", err)
+	}
+	active, err := w.store.ActiveMembershipsInTx(ctx, tx, created.WorkspaceID)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("ActiveMembershipsInTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if exact.WorkspaceMemberID != created.OwnerWorkspaceMemberID ||
+		len(active) != 1 || active[0].WorkspaceMemberID != exact.WorkspaceMemberID ||
+		active[0].Participant != w.humanA {
+		t.Fatalf("exact active tenures exact=%#v active=%#v", exact, active)
+	}
 
 	// Make the second half of creation fail inside the transaction. The
 	// workspace row inserted before it must roll back too.

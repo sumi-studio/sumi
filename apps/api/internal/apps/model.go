@@ -45,7 +45,7 @@ func (o OwnerRef) Validate() error {
 		if o.ParticipantRef != (participant.Ref{}) {
 			return errors.New("Workspace app owner contains ParticipantRef")
 		}
-		if err := participant.Human(o.WorkspaceID).Validate(); err != nil {
+		if !isCanonicalUUIDv7(o.WorkspaceID) {
 			return fmt.Errorf("workspace_id must be a canonical lowercase UUIDv7")
 		}
 		return nil
