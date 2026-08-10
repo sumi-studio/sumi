@@ -238,10 +238,29 @@ func (s *Store) SetNotificationSetting(
 // silencing a place means silence, not "silence unless someone insists". The
 // author is never notified of their own message: writing is not being called.
 func (s *Store) NotificationDecisionsFor(ctx context.Context, place Place, msg Message) ([]NotificationDecision, error) {
-	members, err := s.activeMembers(ctx, s.pool, place)
+	return s.notificationDecisionsFor(ctx, s.pool, place, msg)
+}
+
+// notificationDecisionsFor accepts a transaction so AppendMessage can issue
+// the durable intent before committing the message. The exported evaluator is
+// retained for policy inspection; live delivery reads the persisted decision.
+func (s *Store) notificationDecisionsFor(
+	ctx context.Context, q querier, place Place, msg Message,
+) ([]NotificationDecision, error) {
+	members, err := s.activeMembers(ctx, q, place)
 	if err != nil {
 		return nil, err
 	}
+	return s.notificationDecisionsForMembers(ctx, q, place, msg, members)
+}
+
+// notificationDecisionsForMembers evaluates the exact membership snapshot
+// already used to resolve mentions during admission. A join or removal racing
+// the transaction therefore cannot make the mention and recipient sets refer
+// to different views of the place.
+func (s *Store) notificationDecisionsForMembers(
+	ctx context.Context, q querier, place Place, msg Message, members []MemberProfile,
+) ([]NotificationDecision, error) {
 	candidates := make([]ParticipantRef, 0, len(members))
 	for _, member := range members {
 		if member.Participant == msg.Author {
@@ -252,7 +271,7 @@ func (s *Store) NotificationDecisionsFor(ctx context.Context, place Place, msg M
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	settings, err := s.notificationSettingsFor(ctx, place.PlaceID, candidates)
+	settings, err := s.notificationSettingsFor(ctx, q, place.PlaceID, candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +306,59 @@ func (s *Store) NotificationDecisionsFor(ctx context.Context, place Place, msg M
 	return decisions, nil
 }
 
+// issueNotificationIntents persists the admission-time verdict in the same
+// transaction as the message. Issuance failure rolls the message back;
+// delivery after commit remains best-effort.
+func (s *Store) issueNotificationIntents(
+	ctx context.Context, tx pgx.Tx, place Place, msg Message, members []MemberProfile,
+) error {
+	decisions, err := s.notificationDecisionsForMembers(ctx, tx, place, msg, members)
+	if err != nil {
+		return fmt.Errorf("evaluate notification intents: %w", err)
+	}
+	for _, decision := range decisions {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO message_notification_intents
+			   (message_id, recipient_kind, recipient_id, reason)
+			 VALUES ($1, $2, $3, $4)`,
+			msg.MessageID, decision.Participant.Kind, decision.Participant.ID, decision.Reason); err != nil {
+			return fmt.Errorf("issue notification intent: %w", err)
+		}
+	}
+	return nil
+}
+
+// NotificationIntentsForMessage loads the immutable intent issued with one
+// committed message. It is the source for live delivery adapters.
+func (s *Store) NotificationIntentsForMessage(
+	ctx context.Context, messageID string,
+) ([]NotificationDecision, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT recipient_kind, recipient_id, reason
+		 FROM message_notification_intents
+		 WHERE message_id = $1
+		 ORDER BY recipient_kind, recipient_id`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("query notification intents: %w", err)
+	}
+	defer rows.Close()
+	var decisions []NotificationDecision
+	for rows.Next() {
+		var kind, id, reason string
+		if err := rows.Scan(&kind, &id, &reason); err != nil {
+			return nil, fmt.Errorf("scan notification intent: %w", err)
+		}
+		decisions = append(decisions, NotificationDecision{
+			Participant: ParticipantRef{Kind: ParticipantKind(kind), ID: id},
+			Reason:      reason,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate notification intents: %w", err)
+	}
+	return decisions, nil
+}
+
 // --- internals ---
 
 // resolvedSetting is one candidate's effective level for one place plus their
@@ -299,7 +371,7 @@ type resolvedSetting struct {
 // notificationSettingsFor loads the effective setting of every candidate for
 // one place in a single round trip. Candidates without a row keep the default.
 func (s *Store) notificationSettingsFor(
-	ctx context.Context, placeID string, candidates []ParticipantRef,
+	ctx context.Context, q querier, placeID string, candidates []ParticipantRef,
 ) (map[string]resolvedSetting, error) {
 	out := make(map[string]resolvedSetting, len(candidates))
 	var humanIDs, agentIDs []string
@@ -312,7 +384,7 @@ func (s *Store) notificationSettingsFor(
 			agentIDs = append(agentIDs, candidate.ID)
 		}
 	}
-	rows, err := s.pool.Query(ctx,
+	rows, err := q.Query(ctx,
 		`SELECT ns.member_kind, ns.member_id, ns.defaults_level, ns.keywords, nsp.level
 		 FROM notification_settings ns
 		 LEFT JOIN notification_setting_places nsp

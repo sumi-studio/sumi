@@ -28,10 +28,10 @@ export const NOTIFICATION_LEVEL_LABEL: Record<NotificationLevel, string> = {
 const NOTIFICATION_LEVEL_HINT: Record<NotificationLevel, string> = {
   all: "この場所の発言で呼ばれます",
   mentions: "名前を呼ばれたときだけ",
-  mute: "呼ばれません（未読は数えます）",
+  mute: "通知も未読バッジも出しません",
 };
 
-function Badge({
+export function Badge({
   count,
   urgent,
   muted,
@@ -40,14 +40,14 @@ function Badge({
   urgent: boolean;
   muted: boolean;
 }) {
-  if (count <= 0) return null;
+  if (count <= 0 || muted) return null;
   return (
     <span
       className={`rounded-full px-1.5 py-px font-semibold text-[10px] tabular-nums ${
         urgent
           ? "bg-rose-500 text-white"
           : "bg-muted-foreground/20 text-foreground"
-      } ${muted ? "opacity-40" : ""}`}
+      }`}
     >
       {count > 99 ? "99+" : count}
     </span>

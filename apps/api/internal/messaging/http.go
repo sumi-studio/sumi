@@ -374,16 +374,17 @@ func notificationSettingToWire(setting NotificationSetting) notificationSettingW
 // publishMessageCreated fans one committed message out as per-recipient
 // payloads: the people the server decided to interrupt get the message with
 // `notify`, everyone else gets the same message without it. The evaluation
-// happens here — one place, shared by REST, WS, and the agent's control socket
-// — so no transport can deliver a message that skipped the receiver's own
-// rules. Notification is best-effort on top of durable truth: an evaluation
-// failure still delivers the message, silently.
+// and intent issuance happen inside AppendMessage — one place shared by REST,
+// WS, and the agent's control socket — so no transport can send a message that
+// skipped the receiver's own rules. Delivery is best-effort on top of that
+// durable truth, so a delivery read failure still fans out the message without
+// claiming that anyone was called.
 func publishMessageCreated(ctx context.Context, store *Store, hub *Hub, place Place, msg Message) {
 	if hub == nil {
 		return
 	}
 	wire := messageToWire(place, msg)
-	decisions, err := store.NotificationDecisionsFor(ctx, place, msg)
+	decisions, err := store.NotificationIntentsForMessage(ctx, msg.MessageID)
 	if err != nil {
 		decisions = nil
 	}

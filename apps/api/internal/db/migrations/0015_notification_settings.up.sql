@@ -41,3 +41,22 @@ CREATE TABLE notification_setting_places (
 -- 送信ごとに「この place を mute している人は誰か」を引く経路。
 CREATE INDEX notification_setting_places_by_place
     ON notification_setting_places (place_id);
+
+-- 3. message_notification_intents — message と同じ transaction で発行する
+--    typed intent。live WebSocket / Push / AttentionCandidate はこの正本から
+--    best-effort に配送できるが、配送失敗を message commit の失敗にはしない。
+--    recipient と reason は admission 時の判定を固定し、message commit 後の
+--    membership・setting 変更で過去の intent を書き換えない。
+CREATE TABLE message_notification_intents (
+    message_id      uuidv7      NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    recipient_kind  text        NOT NULL
+        CHECK (recipient_kind IN ('human', 'personality_agent')),
+    recipient_id    uuidv7      NOT NULL,
+    reason          text        NOT NULL
+        CHECK (reason IN ('dm', 'mention', 'keyword', 'all')),
+    issued_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (message_id, recipient_kind, recipient_id)
+);
+
+CREATE INDEX message_notification_intents_by_recipient
+    ON message_notification_intents (recipient_kind, recipient_id, issued_at);

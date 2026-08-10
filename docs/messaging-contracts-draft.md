@@ -127,8 +127,8 @@
   同じ場所が将来のagent delivery eligibility（`AttentionCandidate` の発行判断）の
   評価点になる。
 - 通知の**提示**（デスクトップ通知・音・許可）はclient側の関心で、設定の正本には
-  混ぜない。未読件数はmuteしても数え続ける（呼ばないことと、無かったことにするのは
-  別である）。
+  混ぜない。未読の正本はmuteしても数え続けるが、mute中はsidebarとtab titleの
+  バッジへ提示しない。muteを解除すれば、その間の未読も再び見える。
 
 ## API / event（人間UI側）
 

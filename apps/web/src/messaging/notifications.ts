@@ -9,7 +9,7 @@
  * （正本はサーバー）に一本化する。
  */
 
-import type { NotifyReason, PlaceKey } from "./model";
+import type { NotificationLevel, NotifyReason, PlaceKey } from "./model";
 
 const SOUND_STORAGE_KEY = "sumi.messaging.notification-sound";
 const PROMPT_STORAGE_KEY = "sumi.messaging.notification-prompt";
@@ -90,6 +90,18 @@ export interface PresentationInput {
 export interface Presentation {
   desktop: boolean;
   sound: boolean;
+}
+
+/** タブタイトルに載せる「この place から呼ばれている未読」の件数。 */
+export function notificationCountForPlace(
+  key: PlaceKey,
+  level: NotificationLevel,
+  unread: number,
+  mentions: number,
+): number {
+  if (level === "mute") return 0;
+  if (key.startsWith("dm:") || key.startsWith("group_dm:")) return unread;
+  return level === "all" ? unread : mentions;
 }
 
 /**

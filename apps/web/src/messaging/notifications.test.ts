@@ -7,6 +7,7 @@ import {
   isPermissionPromptDismissed,
   MAX_SNIPPET_CHARS,
   notificationBody,
+  notificationCountForPlace,
   notificationTitle,
   playNotificationSound,
   presentationFor,
@@ -98,6 +99,19 @@ describe("notification text", () => {
     const body = notificationBody(long);
     expect(body).toHaveLength(MAX_SNIPPET_CHARS);
     expect(body.endsWith("…")).toBe(true);
+  });
+});
+
+describe("notification badge aggregation", () => {
+  it("suppresses muted places and follows each channel level", () => {
+    expect(notificationCountForPlace("channel:c1", "mute", 8, 3)).toBe(0);
+    expect(notificationCountForPlace("channel:c1", "all", 8, 3)).toBe(8);
+    expect(notificationCountForPlace("channel:c1", "mentions", 8, 3)).toBe(3);
+  });
+
+  it("counts every direct message unless the conversation is muted", () => {
+    expect(notificationCountForPlace("dm:d1", "mentions", 4, 0)).toBe(4);
+    expect(notificationCountForPlace("group_dm:g1", "mute", 4, 0)).toBe(0);
   });
 });
 

@@ -180,6 +180,78 @@ func TestNotificationDecisionsTreatDMsAsTheirOwnReason(t *testing.T) {
 	}
 }
 
+func TestNotificationIntentsAreIssuedAtomicallyAtAdmission(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+
+	if _, err := w.store.SetNotificationSetting(ctx, w.humanB, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("humanB mentions: %v", err)
+	}
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMute, nil, nil); err != nil {
+		t.Fatalf("agent mute: %v", err)
+	}
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "@Haru 確認をお願いします")
+
+	intents, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("load committed intents: %v", err)
+	}
+	if len(intents) != 1 || intents[0].Participant != w.humanB || intents[0].Reason != NotifyReasonMention {
+		t.Fatalf("committed intents = %+v, want humanB via mention", intents)
+	}
+
+	// A later preference change cannot rewrite what was issued with the
+	// message. Live delivery therefore uses the admission-time authority and
+	// setting snapshot instead of re-evaluating mutable state after commit.
+	if _, err := w.store.SetNotificationSetting(ctx, w.humanB, NotifyLevelMute, nil, nil); err != nil {
+		t.Fatalf("humanB mute after admission: %v", err)
+	}
+	intents, err = w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("reload committed intents: %v", err)
+	}
+	if len(intents) != 1 || intents[0].Reason != NotifyReasonMention {
+		t.Fatalf("later setting change rewrote committed intents: %+v", intents)
+	}
+}
+
+func TestNotificationIntentIssuanceFailureRollsBackMessage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+
+	// This isolated test database deliberately removes the outbox to prove that
+	// a message cannot commit without its required intent issuance step.
+	if _, err := w.store.pool.Exec(ctx, "DROP TABLE message_notification_intents"); err != nil {
+		t.Fatalf("drop intent table: %v", err)
+	}
+	if _, _, err := w.store.AppendMessage(ctx, AppendInput{
+		PlaceID: ch.PlaceID, Author: w.humanA, Content: "commitしてはいけない",
+		ClientNonce: "intent-issuance-failure",
+	}); err == nil {
+		t.Fatal("append succeeded without its notification intent outbox")
+	}
+	var messages int
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM messages WHERE place_id = $1", ch.PlaceID).Scan(&messages); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if messages != 0 {
+		t.Fatalf("messages = %d, want rollback", messages)
+	}
+	var lastSeq int64
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT last_seq FROM places WHERE place_id = $1", ch.PlaceID).Scan(&lastSeq); err != nil {
+		t.Fatalf("load place seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last_seq = %d, want rollback to 0", lastSeq)
+	}
+}
+
 func TestNotificationSettingRoundTripsAndStaysItsOwners(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -20,6 +20,7 @@ import {
   dismissPermissionPrompt,
   isPermissionPromptDismissed,
   type NotificationPermissionState,
+  notificationCountForPlace,
   notificationPermission,
   requestNotificationPermission,
 } from "../notifications";
@@ -549,17 +550,18 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   }, [ready, placeKey, activePlaceKey, selectPlace, channels, dms]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
-  // muteしたplaceはここから外す——サイドバーには件数が残るが、タブの数字は
-  // 「呼ばれている数」であって「溜まっている数」ではない。
+  // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
+  // mentionsはmention未読だけを数え、「呼ばれている数」を表示する。
   useEffect(() => {
     let unread = 0;
     for (const [key, count] of Object.entries(unreadCountByPlace)) {
       const level = notificationLevelByPlace[key] ?? notificationDefaultLevel;
-      if (level === "mute") continue;
-      unread +=
-        key.startsWith("dm:") || key.startsWith("group_dm:")
-          ? count
-          : (mentionCountByPlace[key] ?? 0);
+      unread += notificationCountForPlace(
+        key,
+        level,
+        count,
+        mentionCountByPlace[key] ?? 0,
+      );
     }
     document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
   }, [

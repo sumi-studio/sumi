@@ -181,6 +181,9 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err := insertMentions(ctx, tx, msg.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
+	if err := s.issueNotificationIntents(ctx, tx, place, msg, members); err != nil {
+		return Message{}, false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit append: %w", err)
 	}
