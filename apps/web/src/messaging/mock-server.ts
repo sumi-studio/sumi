@@ -829,6 +829,13 @@ export class MockMessagingServer implements MessagingBackend {
     return next;
   }
 
+  async renewAttachments(attachmentIds: string[]): Promise<void> {
+    // 実APIと同じく一件でも既に束ね済み/未知なら、部分成功にしない。
+    if (attachmentIds.some((attachmentId) => !this.uploads.has(attachmentId))) {
+      throw new Error("attachment_not_found");
+    }
+  }
+
   async editMessage(
     place: Place,
     messageId: string,

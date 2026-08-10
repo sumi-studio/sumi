@@ -73,7 +73,6 @@ export function Composer() {
   const startEdit = useMessaging((state) => state.startEdit);
   const replyTargetId = useMessaging((state) => state.replyTargetId);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
-  const uploadAttachment = useMessaging((state) => state.uploadAttachment);
   const canPoll = useMessaging((state) => state.capabilities.polls);
 
   const display = usePlaceDisplay(activePlaceKey);
@@ -81,10 +80,8 @@ export function Composer() {
   const [urgency, setUrgency] = useState<Urgency>("normal");
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
-  const updateAttachment = useMessaging((state) => state.updateAttachment);
   const drafts = useDraftAttachments({
-    upload: uploadAttachment,
-    update: updateAttachment,
+    placeKey: activePlaceKey,
   });
   const [dragging, setDragging] = useState(false);
   const [pollOpen, setPollOpen] = useState(false);
@@ -210,6 +207,13 @@ export function Composer() {
   const { uploading, ready: readyAttachments, clear: clearDrafts } = drafts;
 
   const submit = useCallback(() => {
+    // place切替直後の古いイベントから、別placeへ添付idを渡さない。
+    if (
+      !activePlaceKey ||
+      useMessaging.getState().activePlaceKey !== activePlaceKey
+    ) {
+      return;
+    }
     // アップロード中に送ると添付を取りこぼす。終わるまで送信しない。
     if (uploading) return;
     if (!value.trim() && readyAttachments.length === 0) return;
@@ -217,7 +221,15 @@ export function Composer() {
     clearDrafts();
     setUrgency("normal");
     setMention(null);
-  }, [value, send, urgency, uploading, readyAttachments, clearDrafts]);
+  }, [
+    activePlaceKey,
+    value,
+    send,
+    urgency,
+    uploading,
+    readyAttachments,
+    clearDrafts,
+  ]);
 
   // 送信できるかどうかの判定は送信ボタンの活殺とEnter送信で同じものを使う。
   const canSend =
@@ -411,6 +423,7 @@ export function Composer() {
         }}
       >
         <ComposerAttachments
+          key={activePlaceKey}
           items={drafts.items}
           onRemove={drafts.remove}
           onToggleSpoiler={drafts.toggleSpoiler}

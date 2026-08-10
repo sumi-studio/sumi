@@ -243,6 +243,41 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
+  it("renews unbound attachment draft leases with the bounded id payload", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input) === "/messaging/attachments:renew" &&
+          init?.method === "POST"
+        ) {
+          return new Response(null, { status: 204 });
+        }
+        throw new Error(`unexpected request ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+
+    await backend.renewAttachments(["attachment-1", "attachment-2"]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/attachments:renew",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: expect.objectContaining({
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+    const request = fetchMock.mock.calls[0]?.[1];
+    expect(JSON.parse(String(request?.body))).toEqual({
+      attachment_ids: ["attachment-1", "attachment-2"],
+    });
+  });
+
   it("projects the attachments a message carries", async () => {
     vi.stubGlobal(
       "fetch",

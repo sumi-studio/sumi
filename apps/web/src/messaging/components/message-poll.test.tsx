@@ -20,6 +20,7 @@ import type {
 import { participantKey } from "../model";
 import { useMessaging } from "../store";
 import { Composer } from "./composer";
+import { DraftAttachmentsProvider } from "./composer-attachments";
 import { MessagePoll } from "./message-poll";
 
 const SELF = { kind: "human", humanId: "me" } as const;
@@ -83,6 +84,18 @@ const sends: {
   urgency: Urgency;
   poll: PollInput | null | undefined;
 }[] = [];
+
+function renderComposer() {
+  const { uploadAttachment, updateAttachment } = useMessaging.getState();
+  return render(
+    <DraftAttachmentsProvider
+      upload={uploadAttachment}
+      update={updateAttachment}
+    >
+      <Composer />
+    </DraftAttachmentsProvider>,
+  );
+}
 
 beforeEach(() => {
   votes.length = 0;
@@ -211,7 +224,7 @@ describe("composerからの投票作成", () => {
             name: "general",
             topic: "",
             visibility: "public",
-          voice: false,
+            voice: false,
           },
         ],
         draftByPlace: {},
@@ -225,7 +238,7 @@ describe("composerからの投票作成", () => {
   });
 
   it("入力欄の入口から投票を立て、通常の送信に乗せる", () => {
-    render(<Composer />);
+    renderComposer();
     fireEvent.click(screen.getByRole("button", { name: "作成メニューを開く" }));
     fireEvent.click(screen.getByRole("button", { name: /投票を作成/ }));
 
@@ -271,7 +284,7 @@ describe("composerからの投票作成", () => {
   });
 
   it("同じ選択肢は作らせない", () => {
-    render(<Composer />);
+    renderComposer();
     fireEvent.click(screen.getByRole("button", { name: "作成メニューを開く" }));
     fireEvent.click(screen.getByRole("button", { name: /投票を作成/ }));
 
@@ -296,7 +309,7 @@ describe("composerからの投票作成", () => {
   it("締切を選ぶと相対の分数から時刻を決める", () => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse("2026-08-05T09:00:00Z"));
-    render(<Composer />);
+    renderComposer();
     fireEvent.click(screen.getByRole("button", { name: "作成メニューを開く" }));
     fireEvent.click(screen.getByRole("button", { name: /投票を作成/ }));
 

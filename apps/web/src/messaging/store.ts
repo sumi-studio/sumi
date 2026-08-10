@@ -178,6 +178,8 @@ interface MessagingState {
     attachmentId: string,
     patch: AttachmentDraftPatch,
   ): Promise<Attachment>;
+  /** session ownerが保持中の未送信添付をreclaimerから守る。 */
+  renewAttachments(attachmentIds: string[]): Promise<void>;
   retrySend(clientNonce: string): void;
   startEdit(messageId: string): void;
   cancelEdit(): void;
@@ -1806,6 +1808,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     updateAttachment(attachmentId, patch) {
       return backend.updateAttachment(attachmentId, patch);
+    },
+
+    renewAttachments(attachmentIds) {
+      return backend.renewAttachments(attachmentIds);
     },
 
     retrySend(clientNonce) {

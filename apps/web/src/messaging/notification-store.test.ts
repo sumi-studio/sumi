@@ -37,6 +37,7 @@ class StubBackend implements MessagingBackend {
     polls: true,
   } as const;
   readonly settingWrites: NotificationSettingInput[] = [];
+  readonly renewalWrites: string[][] = [];
   rejectSettingWrites = false;
   serverSetting: NotificationSetting = {
     owner: SELF,
@@ -132,6 +133,11 @@ class StubBackend implements MessagingBackend {
   }
   async updateAttachment(): ReturnType<MessagingBackend["updateAttachment"]> {
     throw new Error("not used");
+  }
+  async renewAttachments(
+    attachmentIds: string[],
+  ): ReturnType<MessagingBackend["renewAttachments"]> {
+    this.renewalWrites.push([...attachmentIds]);
   }
   async sendMessage() {
     return {
@@ -431,6 +437,16 @@ describe("notification settings in the store", () => {
     expect(localStorage.getItem("sumi.messaging.notification-sound")).toBe(
       "off",
     );
+  });
+});
+
+describe("attachment draft leases in the store", () => {
+  it("forwards renewal ids to the installed backend", async () => {
+    await useMessaging
+      .getState()
+      .renewAttachments(["attachment-1", "attachment-2"]);
+
+    expect(backend.renewalWrites).toEqual([["attachment-1", "attachment-2"]]);
   });
 });
 

@@ -348,6 +348,13 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  async renewAttachments(attachmentIds: string[]): Promise<void> {
+    await this.request("/messaging/attachments:renew", {
+      method: "POST",
+      body: { attachment_ids: attachmentIds },
+    });
+  }
+
   async editMessage(
     place: Place,
     messageId: string,

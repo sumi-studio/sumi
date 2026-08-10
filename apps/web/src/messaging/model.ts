@@ -301,7 +301,10 @@ export interface ProfileInput {
  * なるので増やさない。
  */
 export type Permission =
-  "manage_channels" | "manage_roles" | "manage_members" | "mention_all";
+  | "manage_channels"
+  | "manage_roles"
+  | "manage_members"
+  | "mention_all";
 
 export const PERMISSIONS: Permission[] = [
   "manage_channels",
@@ -616,6 +619,8 @@ export interface MessagingBackend {
     attachmentId: string,
     patch: AttachmentDraftPatch,
   ): Promise<Attachment>;
+  /** まだ送信に束ねていない自分の添付下書きのleaseを更新する。 */
+  renewAttachments(attachmentIds: string[]): Promise<void>;
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
