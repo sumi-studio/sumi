@@ -648,6 +648,100 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
   };
 
+  let placeReconcileGeneration = 0;
+
+  /**
+   * Place lifecycle events are live-only, so a reconnect must compare the
+   * durable bootstrap snapshot with the places this client already knows.
+   * Existing local timelines, drafts, and read progress remain authoritative
+   * for known places; bootstrap counters are adopted only for newly learned
+   * places. A generation fence prevents an older REST response from replacing
+   * a later reconnect's snapshot.
+   */
+  const reconcilePlaces = async (
+    currentBackend: MessagingBackend,
+    currentIdentity: string | null,
+    expectedSelfKey: ParticipantKey,
+    generation: number,
+  ) => {
+    const snapshot = await currentBackend.bootstrap();
+    if (
+      backend !== currentBackend ||
+      messagingSessionIdentity !== currentIdentity ||
+      get().selfKey !== expectedSelfKey ||
+      participantKey(snapshot.self) !== expectedSelfKey ||
+      placeReconcileGeneration !== generation
+    ) {
+      return;
+    }
+
+    const state = get();
+    const known = new Set<PlaceKey>([
+      ...state.channels.map((entry) =>
+        placeKey({ kind: "channel", channelId: entry.channelId }),
+      ),
+      ...state.dms.map((entry) =>
+        placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+      ...Object.keys(state.threadsById).map(
+        (threadId) => `thread:${threadId}` as PlaceKey,
+      ),
+    ]);
+    const discovered = new Set<PlaceKey>([
+      ...snapshot.channels.map((entry) =>
+        placeKey({ kind: "channel", channelId: entry.channelId }),
+      ),
+      ...snapshot.dms.map((entry) =>
+        placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+      ...snapshot.threads.map(
+        (entry) => `thread:${entry.threadId}` as PlaceKey,
+      ),
+    ]);
+    for (const key of known) discovered.delete(key);
+
+    const membersByKey: Record<ParticipantKey, MemberProfile> = {};
+    for (const member of snapshot.members) {
+      membersByKey[participantKey(member.participant)] = member;
+    }
+    const threadsById = { ...state.threadsById };
+    for (const thread of snapshot.threads) {
+      threadsById[thread.threadId] = thread;
+    }
+    const lastReadByPlace = { ...state.lastReadByPlace };
+    for (const marker of snapshot.readMarkers) {
+      const key = placeKey(marker.place);
+      if (!known.has(key)) lastReadByPlace[key] = marker.lastReadSeq;
+    }
+    const unreadCountByPlace = { ...state.unreadCountByPlace };
+    const mentionCountByPlace = { ...state.mentionCountByPlace };
+    const sinceByPlace: Record<PlaceKey, number> = {};
+    for (const key of discovered) sinceByPlace[key] = 0;
+    for (const summary of snapshot.unreadSummaries) {
+      const key = placeKey(summary.place);
+      if (known.has(key)) continue;
+      unreadCountByPlace[key] = summary.unreadCount;
+      mentionCountByPlace[key] = summary.mentionCount;
+      sinceByPlace[key] = summary.latestSeq;
+    }
+
+    set({
+      workspaces: snapshot.workspaces,
+      channels: snapshot.channels,
+      dms: snapshot.dms,
+      threadsById,
+      membersByKey,
+      lastReadByPlace,
+      unreadCountByPlace,
+      mentionCountByPlace,
+    });
+    if (Object.keys(sinceByPlace).length > 0) {
+      // ApiMessagingBackend keeps listeners in a Set, so this updates cursors
+      // without registering a duplicate event delivery path.
+      currentBackend.subscribe(applyEvent, { sinceByPlace });
+    }
+  };
+
   const PAGE_SIZE = 50;
   const placeLoads = new Map<PlaceKey, Promise<void>>();
   const pollReconciliationVersions = new Map<PlaceKey, number>();
@@ -934,6 +1028,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       appliedThreadDeletions.clear();
       placeLoads.clear();
       pollReconciliationVersions.clear();
+      placeReconcileGeneration += 1;
       const currentBackend = backend;
       const currentSessionIdentity = messagingSessionIdentity;
       void currentBackend
@@ -1008,13 +1103,30 @@ export const useMessaging = create<MessagingState>((set, get) => {
           );
           currentBackend.subscribe(applyEvent, { sinceByPlace });
           let previousConnection: ConnectionState | null = null;
+          let connectedOnce = false;
           currentBackend.subscribeConnection((state) => {
             set({ connection: state });
+            if (state !== "connected") {
+              // Invalidate a REST snapshot that belongs to the connection we
+              // just lost, even before the next socket reaches hello_ack.
+              placeReconcileGeneration += 1;
+            }
             // call_stateはreplayされない。初回接続と再接続のどちらでも、WSが
             // live配送可能になった時点の全量を読み、取得中のeventはcall storeで
             // snapshotの後へreplayする。
             if (state === "connected" && previousConnection !== "connected") {
               void useCall.getState().hydrate();
+              if (connectedOnce) {
+                const generation = ++placeReconcileGeneration;
+                void reconcilePlaces(
+                  currentBackend,
+                  currentSessionIdentity,
+                  participantKey(snapshot.self),
+                  generation,
+                ).catch(() => undefined);
+              } else {
+                connectedOnce = true;
+              }
             }
             previousConnection = state;
           });

@@ -792,6 +792,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       // voiceが無いwireは「話す場所ではない」——欠損として扱わない。
       voice: wire.voice === true,
     };
+    if (!this.cursors.has(channel.channelId)) {
+      this.cursors.set(channel.channelId, 0);
+    }
     this.places.set(channel.channelId, {
       kind: "channel",
       channelId: channel.channelId,
@@ -818,6 +821,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       participants: asArray(wire.participants).map(parseParticipant),
       latestSeq: asSeq(wire.latest_seq),
     };
+    if (!this.cursors.has(thread.threadId)) {
+      this.cursors.set(thread.threadId, 0);
+    }
     this.places.set(thread.threadId, {
       kind: "thread",
       threadId: thread.threadId,
@@ -833,6 +839,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
+    if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
     this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
     return dm;
   }

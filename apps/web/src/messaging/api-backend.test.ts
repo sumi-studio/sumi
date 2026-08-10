@@ -843,6 +843,57 @@ describe("ApiMessagingBackend", () => {
     ]);
   });
 
+  it("includes live-learned places in the next reconnect cursor set", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    backend.subscribe(() => {}, {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const firstSocket = FakeWebSocket.instances[0];
+    firstSocket?.open();
+    firstSocket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "channel-2",
+        channel: channelSummaryWire(""),
+      },
+    });
+    firstSocket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "dm-9",
+        dm: {
+          dm_id: "dm-9",
+          kind: "dm",
+          participants: [
+            { kind: "human", human_id: "human-1" },
+            { kind: "human", human_id: "human-2" },
+          ],
+        },
+      },
+    });
+
+    firstSocket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnectSocket = FakeWebSocket.instances[0];
+    expect(reconnectSocket).not.toBe(firstSocket);
+    reconnectSocket?.open();
+
+    expect(JSON.parse(reconnectSocket?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "channel-2": 0, "dm-9": 0 },
+    });
+    backend.dispose();
+  });
+
   it("toggles reactions over REST and projects reaction_updated", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
