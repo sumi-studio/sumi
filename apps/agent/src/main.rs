@@ -1,3 +1,7 @@
+// The messaging tool schema is one large `serde_json::json!` literal; keep
+// the macro from hitting the default recursion ceiling as actions grow.
+#![recursion_limit = "256"]
+
 mod agent;
 mod apiclient;
 mod approval;

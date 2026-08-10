@@ -1,32 +1,62 @@
 import { secureRandomUUID } from "../lib/random-uuid";
 import { hasDisplayMention } from "./mention";
 import type {
+  Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
   MemberProfile,
   Message,
+  MessagePoll,
+  MessageSearchResult,
   MessagingBackend,
+  NotificationSetting,
+  NotificationSettingInput,
+  NotifyReason,
   ParticipantRef,
   ParticipantStatus,
+  PermissionSet,
   Place,
   PlaceKey,
+  PollInput,
+  ProfileInput,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
+  RoleAssignment,
+  RoleInput,
   SendMessageInput,
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
+  WorkspaceRole,
   WorkspaceSummary,
 } from "./model";
 import {
+  isPollClosed,
   parsePlaceKey,
   participantKey,
+  placeId,
   placeKey,
   sameParticipant,
 } from "./model";
+
+/** 述べられた投票を、選択肢idの付いた状態へ起こす（実サーバーの採番役）。 */
+function seedPoll(input: PollInput): MessagePoll {
+  return {
+    question: input.question,
+    allowMulti: input.allowMulti,
+    closesAt: input.closesAt,
+    options: input.options.map((text) => ({
+      optionId: secureRandomUUID(),
+      text,
+      voters: [],
+    })),
+  };
+}
 
 /**
  * インメモリのモックbackend。実API（WS + REST）と同じMessagingBackend境界を
@@ -59,6 +89,7 @@ const CHANNELS: ChannelSummary[] = [
     name: "general",
     topic: "雑談と全体連絡",
     visibility: "public",
+    voice: false,
   },
   {
     channelId: "ch-dev",
@@ -66,6 +97,7 @@ const CHANNELS: ChannelSummary[] = [
     name: "dev",
     topic: "開発の相談と進捗",
     visibility: "public",
+    voice: false,
   },
   {
     channelId: "ch-design",
@@ -73,6 +105,7 @@ const CHANNELS: ChannelSummary[] = [
     name: "design",
     topic: "デザインレビュー",
     visibility: "public",
+    voice: false,
   },
 ];
 
@@ -87,6 +120,38 @@ const MEMBERS: MemberProfile[] = [
   { participant: SUMI, displayName: "Sumi", tagline: "yohakuの秘書" },
   { participant: KURO, displayName: "Kuro", tagline: "開発" },
 ];
+
+const ROLES: WorkspaceRole[] = [
+  {
+    roleId: "role-admin",
+    workspaceId: "ws-sumi",
+    name: "Admin",
+    color: "#3366ff",
+    position: 100,
+    permissions: {
+      manage_channels: true,
+      manage_roles: true,
+      manage_members: true,
+      mention_all: true,
+    },
+  },
+  {
+    roleId: "role-member",
+    workspaceId: "ws-sumi",
+    name: "Member",
+    color: "",
+    position: 0,
+    permissions: {},
+  },
+];
+
+/** モックの自分は創業メンバー相当。全権限を持つ。 */
+const SELF_PERMISSIONS: PermissionSet = {
+  manage_channels: true,
+  manage_roles: true,
+  manage_members: true,
+  mention_all: true,
+};
 
 interface AgentPersona {
   ref: ParticipantRef;
@@ -138,6 +203,7 @@ function seedMessages(place: Place, specs: SeedSpec[]): Message[] {
     mentions: spec.mentions ?? [],
     urgency: spec.urgency ?? "normal",
     reactions: spec.reactions ?? [],
+    attachments: [],
     replyTo: null,
     createdAt: now - spec.minutesAgo * 60_000,
     editedAt: null,
@@ -331,14 +397,32 @@ export class MockMessagingServer implements MessagingBackend {
     status: true,
     replyLater: true,
     reactions: true,
+    notifications: true,
+    threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
+  /** スレッドはplaceの一種。作成されるまで存在しないのでインスタンス側に持つ。 */
+  private readonly threads = new Map<string, ThreadSummary>();
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
+  /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
+  private notificationSetting: NotificationSetting = {
+    owner: SELF,
+    defaults: { level: "all" },
+    perPlace: [],
+    keywords: [],
+  };
+  private roles: WorkspaceRole[] = [...ROLES];
+  private roleAssignments: RoleAssignment[] = [
+    { participant: SELF, roleIds: ["role-admin"] },
+  ];
   /** 同じagentへの呼びかけは直列に処理される（人格は複製しない）。 */
   private readonly agentNextFreeAt = new Map<string, number>();
+  /** 送信前の預かり中の添付。送信で1度だけメッセージへ移る。 */
+  private readonly uploads = new Map<string, Attachment>();
 
   constructor() {
     this.readMarkers = initialReadMarkers(this.history);
@@ -347,6 +431,8 @@ export class MockMessagingServer implements MessagingBackend {
       status: "busy",
       note: "デプロイ対応中",
       expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
     });
   }
 
@@ -385,13 +471,116 @@ export class MockMessagingServer implements MessagingBackend {
       workspaces: WORKSPACES,
       channels: CHANNELS,
       dms: DMS,
+      threads: [...this.threads.values()],
       members: MEMBERS,
       statuses: [...this.statuses.values()],
       readMarkers,
       unreadSummaries,
       replyLaterMarkers: [...this.replyLaterMarkers.values()],
+      notificationSetting: this.notificationSetting,
+      roles: this.roles,
+      roleAssignments: this.roleAssignments,
+      permissions: SELF_PERMISSIONS,
       employedAgents: [SUMI],
     };
+  }
+
+  async fetchRoles(): Promise<{
+    roles: WorkspaceRole[];
+    roleAssignments: RoleAssignment[];
+    permissions: PermissionSet;
+  }> {
+    return {
+      roles: this.roles,
+      roleAssignments: this.roleAssignments,
+      permissions: SELF_PERMISSIONS,
+    };
+  }
+
+  async createRole(
+    _workspaceId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole> {
+    const role: WorkspaceRole = {
+      roleId: `role-${secureRandomUUID().slice(0, 8)}`,
+      workspaceId: WORKSPACES[0].workspaceId,
+      name: input.name,
+      color: input.color,
+      position: 0,
+      permissions: input.permissions,
+    };
+    this.roles = [...this.roles, role];
+    return role;
+  }
+
+  async updateRole(
+    _workspaceId: string,
+    roleId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole> {
+    const existing = this.roles.find((role) => role.roleId === roleId);
+    if (!existing) throw new Error("unknown role");
+    const role: WorkspaceRole = { ...existing, ...input };
+    this.roles = this.roles.map((entry) =>
+      entry.roleId === roleId ? role : entry,
+    );
+    return role;
+  }
+
+  async deleteRole(_workspaceId: string, roleId: string): Promise<void> {
+    this.roles = this.roles.filter((role) => role.roleId !== roleId);
+    this.roleAssignments = this.roleAssignments
+      .map((entry) => ({
+        ...entry,
+        roleIds: entry.roleIds.filter((id) => id !== roleId),
+      }))
+      .filter((entry) => entry.roleIds.length > 0);
+  }
+
+  async setMemberRoles(
+    _workspaceId: string,
+    participant: ParticipantRef,
+    roleIds: string[],
+  ): Promise<RoleAssignment> {
+    const assignment: RoleAssignment = { participant, roleIds };
+    this.roleAssignments = this.roleAssignments.filter(
+      (entry) => !sameParticipant(entry.participant, participant),
+    );
+    if (roleIds.length > 0) this.roleAssignments.push(assignment);
+    return assignment;
+  }
+
+  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+    this.notificationSetting = { owner: SELF, ...input };
+  }
+
+  /**
+   * 受信者（このモックでは常にSELF）を呼ぶかどうか。優先度は
+   * dm > mention > keyword > all、muteはすべてを抑制する——実サーバーと同じ規則。
+   */
+  private notifyFor(message: Message): { reason: NotifyReason } | null {
+    if (sameParticipant(message.author, SELF)) return null;
+    const key = placeKey(message.place);
+    const override = this.notificationSetting.perPlace.find(
+      (entry) => placeKey(entry.place) === key,
+    );
+    const level = override?.level ?? this.notificationSetting.defaults.level;
+    if (level === "mute") return null;
+    if (message.place.kind === "dm" || message.place.kind === "group_dm") {
+      return { reason: "dm" };
+    }
+    if (message.mentions.some((ref) => sameParticipant(ref, SELF))) {
+      return { reason: "mention" };
+    }
+    const content = message.content.toLowerCase();
+    if (
+      this.notificationSetting.keywords.some(
+        (keyword) => keyword && content.includes(keyword.toLowerCase()),
+      )
+    ) {
+      return { reason: "keyword" };
+    }
+    return level === "all" ? { reason: "all" } : null;
   }
 
   async fetchMessages(
@@ -403,6 +592,150 @@ export class MockMessagingServer implements MessagingBackend {
     const limit = options?.limit ?? 50;
     const slice = messages.filter((message) => message.seq < beforeSeq);
     return slice.slice(Math.max(0, slice.length - limit));
+  }
+
+  async searchMessages(
+    query: string,
+    options?: { place?: Place; limit?: number },
+  ): Promise<MessageSearchResult[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const scope = options?.place
+      ? [placeKey(options.place)]
+      : [...this.history.keys()];
+    const results: MessageSearchResult[] = [];
+    for (const key of scope) {
+      const place = parsePlaceKey(key);
+      if (!place) continue;
+      for (const message of this.history.get(key) ?? []) {
+        if (message.deleted) continue;
+        if (!message.content.toLowerCase().includes(q)) continue;
+        results.push({
+          messageId: message.messageId,
+          place,
+          seq: message.seq,
+          author: message.author,
+          snippet:
+            message.content.length > 120
+              ? `${message.content.slice(0, 120)}…`
+              : message.content,
+          createdAt: message.createdAt,
+        });
+      }
+    }
+    results.sort((a, b) => b.createdAt - a.createdAt);
+    return results.slice(0, options?.limit ?? 20);
+  }
+
+  async createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+    voice = false,
+  ): Promise<ChannelSummary> {
+    const channel: ChannelSummary = {
+      channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
+      workspaceId,
+      name,
+      topic,
+      visibility: "public",
+      voice,
+    };
+    CHANNELS.push(channel);
+    this.emit({ type: "place_created", channel });
+    return channel;
+  }
+
+  async ensureDM(participant: ParticipantRef): Promise<DmSummary> {
+    const existing = DMS.find(
+      (dm) =>
+        dm.kind === "dm" &&
+        dm.participants.some((ref) => sameParticipant(ref, participant)),
+    );
+    if (existing) return existing;
+    const dm: DmSummary = {
+      dmId: `dm-${secureRandomUUID().slice(0, 8)}`,
+      kind: "dm",
+      participants: [SELF, participant],
+    };
+    DMS.push(dm);
+    this.emit({ type: "place_created", dm });
+    return dm;
+  }
+
+  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+    const dm: DmSummary = {
+      dmId: `gdm-${secureRandomUUID().slice(0, 8)}`,
+      kind: "group_dm",
+      participants: [SELF, ...participants],
+    };
+    DMS.push(dm);
+    this.emit({ type: "place_created", dm });
+    return dm;
+  }
+
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const parentKey = placeKey(parent);
+    return [...this.threads.values()].filter(
+      (thread) => placeKey(thread.parentPlace) === parentKey,
+    );
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    if (parent.kind !== "channel") throw new Error("not threadable");
+    const taken = [...this.threads.values()].some(
+      (thread) =>
+        originMessageId !== null && thread.parentMessageId === originMessageId,
+    );
+    if (taken) throw new Error("thread exists");
+    const thread: ThreadSummary = {
+      threadId: `th-${secureRandomUUID().slice(0, 8)}`,
+      parentPlace: parent,
+      parentMessageId: originMessageId,
+      name,
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [SELF],
+      latestSeq: 0,
+    };
+    this.threads.set(thread.threadId, thread);
+    this.readMarkers.set(
+      placeKey({ kind: "thread", threadId: thread.threadId }),
+      0,
+    );
+    this.emit({ type: "place_created", thread });
+    return thread;
+  }
+
+  async updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<ChannelSummary> {
+    const channel = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!channel) throw new Error("unknown channel");
+    if (input.name !== undefined) channel.name = input.name;
+    if (input.topic !== undefined) channel.topic = input.topic;
+    this.emit({ type: "place_updated", channel });
+    return channel;
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    const source = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!source) throw new Error("unknown channel");
+    // 名前の既定は実サーバーと同じ導出（「〜 のコピー」）。中身は運ばない。
+    return this.createChannel(
+      source.workspaceId,
+      name?.trim() || `${source.name} のコピー`,
+      source.topic,
+    );
   }
 
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -427,13 +760,63 @@ export class MockMessagingServer implements MessagingBackend {
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
+          poll: input.poll ? seedPoll(input.poll) : null,
+          // 自分がアップロードした未紐付けの添付だけがメッセージに載る。
+          attachments: input.attachments.flatMap((attachmentId) => {
+            const pending = this.uploads.get(attachmentId);
+            if (!pending) return [];
+            this.uploads.delete(attachmentId);
+            return [pending];
+          }),
         });
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
-        this.emit({ type: "message_created", message: { ...message } });
+        this.emit({
+          type: "message_created",
+          message: { ...message },
+          notify: this.notifyFor(message),
+        });
         this.scheduleAgentResponses(message);
         resolve({ messageId: message.messageId, seq: message.seq });
       }, SEND_LATENCY_MS);
     });
+  }
+
+  /**
+   * モックはブラウザ内で完結するため、実体はobject URLで参照する。
+   * 実APIではセッション付きの `/messaging/attachments/<id>` になる。
+   */
+  async uploadAttachment(file: File): Promise<Attachment> {
+    const attachment: Attachment = {
+      attachmentId: secureRandomUUID(),
+      filename: file.name,
+      mime: file.type || "application/octet-stream",
+      size: file.size,
+      url: URL.createObjectURL(file),
+      spoiler: false,
+      alt: "",
+    };
+    this.uploads.set(attachment.attachmentId, attachment);
+    return attachment;
+  }
+
+  /**
+   * 送信前の添付の編集。実APIと同じく、送ってしまった（=uploadsから消えた）
+   * 添付は編集できない。
+   */
+  async updateAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment> {
+    const pending = this.uploads.get(attachmentId);
+    if (!pending) throw new Error("attachment_not_found");
+    const next: Attachment = {
+      ...pending,
+      filename: patch.filename ?? pending.filename,
+      alt: patch.alt ?? pending.alt,
+      spoiler: patch.spoiler ?? pending.spoiler,
+    };
+    this.uploads.set(attachmentId, next);
+    return next;
   }
 
   async editMessage(
@@ -473,15 +856,91 @@ export class MockMessagingServer implements MessagingBackend {
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
-  async setStatus(status: StatusKind, note: string): Promise<void> {
+  async setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null = null,
+  ): Promise<void> {
+    const key = participantKey(SELF);
+    const current = this.statuses.get(key);
+    // 一時ステータスは「その前に言っていたこと」を覚えて、期限で戻る。
+    // 一時の上に一時を重ねても、下にある恒久の宣言は埋もれない。
+    const base =
+      expiresAt === null
+        ? null
+        : current?.expiresAt !== null && current?.expiresAt !== undefined
+          ? current.baseStatus
+            ? { status: current.baseStatus, note: current.baseNote }
+            : null
+          : current
+            ? { status: current.status, note: current.note }
+            : null;
     const next: ParticipantStatus = {
       participant: SELF,
       status,
       note,
-      expiresAt: null,
+      expiresAt,
+      baseStatus: base?.status ?? null,
+      baseNote: base?.note ?? "",
     };
-    this.statuses.set(participantKey(SELF), next);
+    this.statuses.set(key, next);
     this.emit({ type: "status_updated", status: next });
+    if (expiresAt === null) return;
+    window.setTimeout(
+      () => {
+        // 期限が来ても、途中で置き換えられていたら何もしない。
+        if (this.statuses.get(key) !== next) return;
+        if (next.baseStatus === null) {
+          this.statuses.delete(key);
+          this.emit({ type: "status_cleared", participant: SELF });
+          return;
+        }
+        const restored: ParticipantStatus = {
+          participant: SELF,
+          status: next.baseStatus,
+          note: next.baseNote,
+          expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
+        };
+        this.statuses.set(key, restored);
+        this.emit({ type: "status_updated", status: restored });
+      },
+      Math.max(0, expiresAt - Date.now()),
+    );
+  }
+
+  /**
+   * 自分の名乗りの置き換え。実サーバーと同じく、誰のものかは呼び出し側が
+   * 名乗るのではなく認証済みの participant（モックでは常にSELF）が決める。
+   */
+  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
+    const index = MEMBERS.findIndex((member) =>
+      sameParticipant(member.participant, SELF),
+    );
+    if (index < 0) throw new Error("unknown participant");
+    const current = MEMBERS[index];
+    // 空文字は「外す」。それ以外は預かり中のアップロードのURLを使い、
+    // 既に設定済みのidをそのまま出し直した場合は現在のURLを保つ。
+    const image = (attachmentId: string, url: string | undefined) =>
+      attachmentId
+        ? { attachmentId, url: this.uploads.get(attachmentId)?.url ?? url }
+        : { attachmentId: undefined, url: undefined };
+    const avatar = image(input.avatarAttachmentId, current.avatarUrl);
+    const banner = image(input.bannerAttachmentId, current.bannerUrl);
+    const member: MemberProfile = {
+      participant: SELF,
+      displayName: input.displayName.trim(),
+      tagline: input.tagline,
+      avatarAttachmentId: avatar.attachmentId,
+      bannerAttachmentId: banner.attachmentId,
+      avatarUrl: avatar.url,
+      bannerUrl: banner.url,
+    };
+    if (!member.displayName) throw new Error("invalid display name");
+    MEMBERS[index] = member;
+    this.emit({ type: "profile_updated", member });
+    return member;
   }
 
   async createReplyLater(
@@ -522,6 +981,31 @@ export class MockMessagingServer implements MessagingBackend {
     emoji: string,
   ): Promise<void> {
     this.applyReaction(place, messageId, SELF, emoji);
+  }
+
+  /**
+   * 回答の置き換え。空配列は取り消し。単一選択では最後の1つだけが残る——
+   * 実サーバーが「同一投票に1票」を強制するのと同じ結果になる。
+   */
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<void> {
+    const messages = this.history.get(placeKey(place)) ?? [];
+    const message = messages.find((entry) => entry.messageId === messageId);
+    const poll = message?.poll;
+    if (!message || message.deleted || !poll) return;
+    if (isPollClosed(poll, Date.now())) return;
+    const chosen = poll.allowMulti ? optionIds : optionIds.slice(0, 1);
+    poll.options = poll.options.map((option) => ({
+      ...option,
+      voters: [
+        ...option.voters.filter((ref) => !sameParticipant(ref, SELF)),
+        ...(chosen.includes(option.optionId) ? [SELF] : []),
+      ],
+    }));
+    this.emit({ type: "poll_updated", message: { ...message } });
   }
 
   /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
@@ -587,6 +1071,8 @@ export class MockMessagingServer implements MessagingBackend {
     urgency: Message["urgency"];
     replyTo: string | null;
     clientNonce?: string;
+    attachments?: Attachment[];
+    poll?: MessagePoll | null;
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -600,6 +1086,8 @@ export class MockMessagingServer implements MessagingBackend {
       mentions: input.mentions,
       urgency: input.urgency,
       reactions: [],
+      attachments: input.attachments ?? [],
+      poll: input.poll ?? null,
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,
@@ -608,6 +1096,21 @@ export class MockMessagingServer implements MessagingBackend {
     };
     messages.push(message);
     this.history.set(key, messages);
+    // スレッドに書くことが参加すること。一覧の件数・最新行・参加者を更新する。
+    if (input.place.kind === "thread") {
+      const thread = this.threads.get(placeId(input.place));
+      if (thread) {
+        thread.messageCount += 1;
+        thread.lastMessageAt = message.createdAt;
+        thread.lastMessage = message.content;
+        thread.latestSeq = message.seq;
+        if (
+          !thread.participants.some((ref) => sameParticipant(ref, input.author))
+        ) {
+          thread.participants = [...thread.participants, input.author];
+        }
+      }
+    }
     return message;
   }
 
@@ -687,6 +1190,8 @@ export class MockMessagingServer implements MessagingBackend {
           status: "available",
           note: "",
           expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
         };
         this.statuses.set(participantKey(persona.ref), status);
         this.emit({ type: "status_updated", status });
@@ -705,7 +1210,11 @@ export class MockMessagingServer implements MessagingBackend {
       urgency: "normal",
       replyTo: trigger.messageId,
     });
-    this.emit({ type: "message_created", message: { ...message } });
+    this.emit({
+      type: "message_created",
+      message: { ...message },
+      notify: this.notifyFor(message),
+    });
   }
 
   private scheduleTypingUntil(

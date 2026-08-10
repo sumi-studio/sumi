@@ -76,8 +76,18 @@ function ChatScreenContent() {
   );
 
   useEffect(() => {
-    connect();
-    return disconnect;
+    // StrictModeは開発時にeffectを setup→cleanup→setup と検査する。
+    // その最初のsetupでCONNECTING socketを作ると、直後のcleanupがブラウザへ
+    // 「確立前に閉じた」警告を出す。次tickまで残った実マウントだけ接続する。
+    let connected = false;
+    const timer = window.setTimeout(() => {
+      connected = true;
+      connect();
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      if (connected) disconnect();
+    };
   }, [connect, disconnect]);
 
   const available = connection === "connected" && ready === "ready";

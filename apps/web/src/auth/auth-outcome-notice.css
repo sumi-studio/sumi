@@ -1,0 +1,32 @@
+.auth-outcome-notice {
+  --auth-outcome-notice-drag-y: 0px;
+  touch-action: pan-x;
+  transform: translate3d(0, var(--auth-outcome-notice-drag-y), 0);
+  transition:
+    transform 180ms cubic-bezier(0.55, 0.055, 0.675, 0.19),
+    opacity 180ms cubic-bezier(0.55, 0.055, 0.675, 0.19);
+}
+
+.auth-outcome-notice[data-dragging],
+.auth-outcome-notice[data-exiting] {
+  will-change: transform, opacity;
+}
+
+.auth-outcome-notice[data-dragging] {
+  transition: none;
+}
+
+.auth-outcome-notice[data-exiting] {
+  opacity: 0;
+  transform: translate3d(0, calc(var(--auth-outcome-notice-drag-y) - 120vh), 0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-outcome-notice {
+    transition: opacity 180ms ease-in;
+  }
+
+  .auth-outcome-notice[data-exiting] {
+    transform: none;
+  }
+}

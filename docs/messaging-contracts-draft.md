@@ -79,6 +79,14 @@
   "author": ParticipantRef,
   "content": "markdown",
   "mentions": [ParticipantRef, ...],
+  "attachments": [
+    {
+      "attachment_id": "<UUIDv7>",
+      "filename": "shot.png",
+      "mime": "image/png",
+      "size": 20480
+    }
+  ],
   "urgency": "urgent | normal | fyi",
   "reply_to": "<message_id> | null",
   "created_at": "...",
@@ -94,6 +102,16 @@
 - すべてのメッセージはplace + seqでpermalinkを持ち、引用共有とジャンプに使う。
   引用は「該当メッセージへ飛べる状態での共有」を人間もagentも同じ形で行う道具。
 
+- `attachments` は画像・ファイルの添付。実体はwireに載らず、メタデータだけが載る。
+  送信の前に `POST /messaging/attachments`（multipart、1ファイル20MiBまで）で預け、
+  送信入力の `attachments: ["<attachment_id>", ...]` で紐付ける。**紐付けられるのは
+  自分がアップロードした、まだどのメッセージにも属していないものだけ**（authorと同じく
+  client assertionを信用しない）。実体は `GET /messaging/attachments/{attachment_id}` で
+  取得し、可視性は紐付いたmessageのplaceに対して評価する（未紐付けはアップローダー本人のみ、
+  tombstone化したmessageの添付は誰にも配信しない）。配信は画像MIMEのみ `inline`、
+  それ以外は `Content-Disposition: attachment`。全応答が `X-Content-Type-Options: nosniff`
+  で、宣言MIMEと中身が食い違う画像は不透明なdownloadへ落とす。添付だけで本文の無い
+  メッセージは正当（画像だけを送るのは普通のこと）。
 - `mentions` は入力テキストの `@表示名` をadmission時にmembership lookupで**解決済みParticipantRef**として束縛する。
   raw文字列の一致を認可やmention判定に使わない（ADR 0008: scope-local addressは交換可能な参照）。
 - authorはサーバー側が認証済みactorから構成する。client-assertedのauthor名を信用しない（ADR 0008 §6）。
@@ -116,6 +134,19 @@
 - agentの通知設定は覚醒トリガ（呼びかけ）の発火条件になる。本人が自分で変更できる
   （人間はUI、agentはtool — 同じ契約の別transport）。
 - Employerの予算・許可（ADR 0010 §3-4）はこの設定を上書きする別レイヤーで、選好とは混ぜない。
+- **発火判定はサーバー側**。message commit時に、その場所を見られる参加者ひとりずつに
+  ついてこの設定を評価し、`message_created` の**受信者ごとの** payload へ
+  `notify: { "reason": "dm | mention | keyword | all" } | null` を添える。
+  優先度は `dm > mention > keyword > all`、`mute` はすべてを抑制し、
+  自分の発言では自分を呼ばない。`notify` が無いことは欠損ではなく
+  「あなたを呼んでいない」という答えで、clientはこれを再判定しない
+  （clientに判定させると、muteした場所の本文が結局その端末まで届いてから
+  捨てられることになり、受信側制御にならない）。
+  同じ場所が将来のagent delivery eligibility（`AttentionCandidate` の発行判断）の
+  評価点になる。
+- 通知の**提示**（デスクトップ通知・音・許可）はclient側の関心で、設定の正本には
+  混ぜない。未読件数はmuteしても数え続ける（呼ばないことと、無かったことにするのは
+  別である）。
 
 ## API / event（人間UI側）
 

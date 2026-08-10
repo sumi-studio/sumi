@@ -35,6 +35,10 @@ type Message struct {
 	Content     string
 	Urgency     string
 	Mentions    []ParticipantRef
+	Attachments []Attachment
+	Reactions   []ReactionSummary
+	// Poll is the question the message carries, when it asks one.
+	Poll        *Poll
 	ReplyTo     string // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
@@ -44,14 +48,20 @@ type Message struct {
 
 // AppendInput is a send request. Mentions are deliberately absent: the server
 // resolves them from content and active membership at admission time and never
-// accepts them as a client assertion.
+// accepts them as a client assertion. AttachmentIDs, by contrast, are a client
+// assertion the store verifies: only the author's own still-unbound uploads can
+// be bound to the message.
 type AppendInput struct {
-	PlaceID     string
-	Author      ParticipantRef
-	Content     string
-	Urgency     string // empty means normal
-	ReplyTo     string // optional message_id in the same place
-	ClientNonce string
+	PlaceID       string
+	Author        ParticipantRef
+	Content       string
+	Urgency       string // empty means normal
+	ReplyTo       string // optional message_id in the same place
+	ClientNonce   string
+	AttachmentIDs []string
+	// Poll, when set, is committed with the message: a question and the
+	// message that asks it are one durable event, never two.
+	Poll *PollInput
 }
 
 // AppendMessage commits a message to a place, allocating the next place seq in
@@ -70,11 +80,22 @@ func (s *Store) AppendMessage(ctx context.Context, in AppendInput) (Message, boo
 	default:
 		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
-	if in.Content == "" {
+	// A message may carry attachments or a poll instead of text: sending an
+	// image without a caption, or a bare question, are ordinary things to do.
+	// Empty with nothing attached stays refused.
+	if in.Content == "" && len(in.AttachmentIDs) == 0 && in.Poll == nil {
 		return Message{}, false, fmt.Errorf("content must not be empty")
+	}
+	if in.Poll != nil {
+		if err := in.Poll.Validate(); err != nil {
+			return Message{}, false, err
+		}
 	}
 	if len(in.Content) > MaxContentBytes {
 		return Message{}, false, fmt.Errorf("content exceeds %d bytes", MaxContentBytes)
+	}
+	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
+		return Message{}, false, ErrTooManyAttachments
 	}
 	if in.ClientNonce == "" || len(in.ClientNonce) > 128 {
 		return Message{}, false, fmt.Errorf("client nonce must be 1..128 bytes")
@@ -180,6 +201,25 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err := insertMentions(ctx, tx, msg.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
+	// Writing in a thread is how one joins it: from here the thread counts
+	// towards this participant's unread and may call them.
+	if place.Kind == PlaceThread {
+		if err := joinThread(ctx, tx, place.PlaceID, in.Author); err != nil {
+			return Message{}, false, err
+		}
+	}
+	attachments, err := bindAttachments(ctx, tx, msg.MessageID, in.Author, in.AttachmentIDs)
+	if err != nil {
+		return Message{}, false, err
+	}
+	msg.Attachments = attachments
+	if in.Poll != nil {
+		poll, err := insertPoll(ctx, tx, msg.MessageID, *in.Poll)
+		if err != nil {
+			return Message{}, false, err
+		}
+		msg.Poll = poll
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit append: %w", err)
 	}
@@ -230,6 +270,15 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	if err := s.attachMentions(ctx, messages); err != nil {
 		return nil, err
 	}
+	if err := s.attachAttachments(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachPolls(ctx, messages); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -256,6 +305,15 @@ func (s *Store) MessagesSince(ctx context.Context, placeID string, viewer Partic
 		return nil, err
 	}
 	if err := s.attachMentions(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachAttachments(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachPolls(ctx, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -326,7 +384,23 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 	msg.Content = content
 	msg.Mentions = mentions
 	msg.EditedAt = &editedAt
-	return msg, nil
+	// An edit rewrites text only; the attachments the message was sent with
+	// stay part of it, so the returned message (and its echo) keeps them.
+	// The edited event carries the whole message; live consumers replace their
+	// copy with it, so reactions must ride along or the edit would erase them.
+	edited := []Message{msg}
+	if err := s.attachAttachments(ctx, edited); err != nil {
+		return Message{}, err
+	}
+	if err := s.attachReactions(ctx, edited); err != nil {
+		return Message{}, err
+	}
+	// An edit rewrites the text around a question; the question and the votes
+	// cast on it are untouched, so they ride along with the edited copy.
+	if err := s.attachPolls(ctx, edited); err != nil {
+		return Message{}, err
+	}
+	return edited[0], nil
 }
 
 // DeleteMessage tombstones a message: content is removed, the fact and the seq
@@ -384,11 +458,29 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 		"DELETE FROM message_mentions WHERE message_id = $1", messageID); err != nil {
 		return Message{}, fmt.Errorf("clear mentions: %w", err)
 	}
+	// A tombstone keeps only the fact and the seq; reactions to the vanished
+	// content vanish with it.
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM message_reactions WHERE message_id = $1", messageID); err != nil {
+		return Message{}, fmt.Errorf("clear reactions: %w", err)
+	}
+	// A vanished question keeps no answers: the poll and every vote go with
+	// the content, leaving only the fact and the seq.
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM message_polls WHERE message_id = $1", messageID); err != nil {
+		return Message{}, fmt.Errorf("clear poll: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit delete: %w", err)
 	}
 	msg.Content = ""
 	msg.Mentions = nil
+	// A tombstone carries nothing: the attachment rows stay as the record of
+	// what was sent, but they are no longer delivered or served (see
+	// AttachmentForViewer).
+	msg.Attachments = nil
+	msg.Reactions = nil
+	msg.Poll = nil
 	msg.Deleted = true
 	return msg, nil
 }
@@ -441,18 +533,9 @@ func (s *Store) UnreadSummaries(ctx context.Context, viewer ParticipantRef) ([]U
 	if err := viewer.Validate(); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx,
-		`WITH my_places AS (
-		   SELECT p.* FROM places p
-		   JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-		    AND wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
-		   WHERE p.kind = 'channel'
-		   UNION
-		   SELECT p.* FROM places p
-		   JOIN place_members pm ON pm.place_id = p.place_id
-		    AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL
-		 )
+	rows, err := s.pool.Query(ctx, participantVisiblePlacesCTE+`
 		 SELECT mp.place_id, mp.kind, mp.workspace_id, mp.name, mp.topic, mp.visibility, mp.last_seq,
+		        mp.voice,
 		        COALESCE(rm.last_read_seq, 0),
 		        (SELECT count(*) FROM messages m
 		          WHERE m.place_id = mp.place_id AND m.seq > COALESCE(rm.last_read_seq, 0)
@@ -481,7 +564,7 @@ func (s *Store) UnreadSummaries(ctx context.Context, viewer ParticipantRef) ([]U
 			name        *string
 		)
 		if err := rows.Scan(&sum.Place.PlaceID, &sum.Place.Kind, &workspaceID, &name,
-			&sum.Place.Topic, &sum.Place.Visibility, &sum.Place.LastSeq,
+			&sum.Place.Topic, &sum.Place.Visibility, &sum.Place.LastSeq, &sum.Place.Voice,
 			&sum.LastReadSeq, &sum.UnreadCount, &sum.MentionCount); err != nil {
 			return nil, fmt.Errorf("scan unread summary: %w", err)
 		}
@@ -519,6 +602,15 @@ func (s *Store) messageByNonce(ctx context.Context, q querier, in AppendInput) (
 		return Message{}, false, nil
 	}
 	if err := s.attachMentions(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachAttachments(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachPolls(ctx, messages); err != nil {
 		return Message{}, false, err
 	}
 	return messages[0], true, nil

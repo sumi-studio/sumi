@@ -3,10 +3,13 @@ package messaging
 import "context"
 
 type overviewWire struct {
-	Self            participantWire     `json:"self"`
-	Workspaces      []workspaceWire     `json:"workspaces"`
-	Channels        []channelWire       `json:"channels"`
-	DMs             []dmWire            `json:"dms"`
+	Self       participantWire `json:"self"`
+	Workspaces []workspaceWire `json:"workspaces"`
+	Channels   []channelWire   `json:"channels"`
+	DMs        []dmWire        `json:"dms"`
+	// Threads carry their parent, so the agent reads a side conversation as
+	// belonging to a channel rather than as a stray place beside it.
+	Threads         []threadWire        `json:"threads"`
 	Members         []memberWire        `json:"members"`
 	ReadMarkers     []readMarkerWire    `json:"read_markers"`
 	UnreadSummaries []unreadSummaryWire `json:"unread_summaries"`
@@ -29,7 +32,7 @@ func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (over
 			if _, seen := memberSet[key]; seen {
 				continue
 			}
-			memberSet[key] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
+			memberSet[key] = memberToWire(p)
 			memberOrder = append(memberOrder, key)
 		}
 	}
@@ -53,6 +56,9 @@ func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (over
 			channels = append(channels, channelToWire(summary.Place))
 			continue
 		}
+		if summary.Place.Kind == PlaceThread {
+			continue
+		}
 		profiles, err := s.Store.ActiveMembers(ctx, summary.Place.PlaceID, viewer)
 		if err != nil {
 			return overviewWire{}, err
@@ -68,5 +74,9 @@ func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (over
 	for i, key := range memberOrder {
 		members[i] = memberSet[key]
 	}
-	return overviewWire{Self: participantToWire(viewer), Workspaces: workspaceWires, Channels: channels, DMs: dms, Members: members, ReadMarkers: readMarkers, UnreadSummaries: unread}, nil
+	threads, err := s.Store.ThreadsFor(ctx, viewer)
+	if err != nil {
+		return overviewWire{}, err
+	}
+	return overviewWire{Self: participantToWire(viewer), Workspaces: workspaceWires, Channels: channels, DMs: dms, Threads: threadsToWire(threads), Members: members, ReadMarkers: readMarkers, UnreadSummaries: unread}, nil
 }

@@ -12,6 +12,7 @@ import {
   ConversationVirtualizer,
   type ConversationVirtualizerHandle,
 } from "../../components/conversation-virtualizer";
+import { copyText } from "../../lib/clipboard";
 import { type Message, participantKey } from "../model";
 import { placePath } from "../place-route";
 import { useMessaging } from "../store";
@@ -71,6 +72,8 @@ export function MessageList({
   const noteReadUpTo = useMessaging((state) => state.noteReadUpTo);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
   const startEdit = useMessaging((state) => state.startEdit);
+  const submitEdit = useMessaging((state) => state.submitEdit);
+  const cancelEdit = useMessaging((state) => state.cancelEdit);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
@@ -265,11 +268,12 @@ export function MessageList({
     return () => window.removeEventListener("focus", onFocus);
   }, [advanceRead]);
 
+  // コピーは成否を返す。呼び出し側（操作チップ）が完了表示を出すため。
   const copyLink = useCallback(
     (message: Message) => {
-      if (!activePlaceKey) return;
+      if (!activePlaceKey) return Promise.resolve(false);
       const url = `${window.location.origin}${placePath(activePlaceKey)}?m=${message.seq}`;
-      void navigator.clipboard.writeText(url);
+      return copyText(url);
     },
     [activePlaceKey],
   );
@@ -363,6 +367,9 @@ export function MessageList({
             onEdit={(message) => startEdit(message.messageId)}
             onDelete={deleteMessage2}
             onJumpTo={flashMessage}
+            editing={editingMessageId === row.message.messageId}
+            onSubmitEdit={submitEdit}
+            onCancelEdit={cancelEdit}
           />
         </div>
       );
@@ -370,6 +377,8 @@ export function MessageList({
     [
       highlightedId,
       editingMessageId,
+      submitEdit,
+      cancelEdit,
       selfKey,
       membersByKey,
       messagesById,
@@ -388,6 +397,21 @@ export function MessageList({
     ],
   );
 
+  // 「最新へ」は一覧のスクロール領域の内側に置く。外に浮かせると、その真下に
+  // 来たホイールがスクロール領域へ届かず一覧が止まる（BUG-NAV-01）。
+  const jumpToLatest = atEnd ? null : (
+    <button
+      type="button"
+      onClick={() =>
+        virtualizerRef.current?.scrollToEnd({ behavior: "smooth" })
+      }
+      className="absolute right-4 bottom-3 flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1.5 text-muted-foreground text-xs shadow-sm transition-colors hover:text-foreground"
+    >
+      <ArrowDown className="size-3.5" />
+      最新へ
+    </button>
+  );
+
   return (
     <div className="relative min-h-0 flex-1">
       <ConversationVirtualizer
@@ -398,24 +422,13 @@ export function MessageList({
         ariaLabel="メッセージ"
         className="scrollbar-ui size-full min-h-0 overscroll-contain"
         contentClassName="pb-4"
+        footerOverlay={jumpToLatest}
         onAtEndChange={(next) => {
           atEndRef.current = next;
           setAtEnd(next);
         }}
         onVisibleMessageIdsChange={advanceRead}
       />
-      {atEnd ? null : (
-        <button
-          type="button"
-          onClick={() =>
-            virtualizerRef.current?.scrollToEnd({ behavior: "smooth" })
-          }
-          className="absolute right-4 bottom-3 flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1.5 text-muted-foreground text-xs shadow-sm transition-colors hover:text-foreground"
-        >
-          <ArrowDown className="size-3.5" />
-          最新へ
-        </button>
-      )}
     </div>
   );
 }

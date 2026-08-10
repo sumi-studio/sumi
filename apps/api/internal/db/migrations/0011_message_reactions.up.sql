@@ -1,0 +1,20 @@
+-- 0011_message_reactions: emoji reactions on messages (ADR 0011 §3,
+-- docs/messaging-contracts-draft.md). Reacting is the same capability for
+-- Humans and PersonalityAgents, so the row carries the shared participant
+-- (kind, id) shape used by author, membership, mention, and read marker rows.
+--
+-- One row means "this participant currently reacts to this message with this
+-- emoji". The primary key makes "at most one identical reaction per person"
+-- a database guarantee, so the store-level toggle can never duplicate rows
+-- no matter how requests race or retry.
+CREATE TABLE message_reactions (
+    message_id  uuidv7      NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    member_kind text        NOT NULL
+        CHECK (member_kind IN ('human', 'personality_agent')),
+    member_id   uuidv7      NOT NULL,
+    -- One emoji grapheme cluster; complex ZWJ sequences stay well within 32
+    -- characters. The store validates shape, the schema bounds size.
+    emoji       text        NOT NULL CHECK (length(emoji) BETWEEN 1 AND 32),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (message_id, member_kind, member_id, emoji)
+);

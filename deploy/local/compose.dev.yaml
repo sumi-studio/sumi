@@ -83,12 +83,14 @@ services:
       - |
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-command-log
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-runtime-state
+        install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-messaging-attachments
         install -d -m 0750 -o 65532 -g 20000 /run/sumi/local-control
         install -d -m 0700 -o root -g root /run/sumi/runtime-secrets
     cap_add: [CHOWN, FOWNER]
     volumes:
       - api-command-log:/var/lib/sumi-command-log
       - api-runtime-state:/var/lib/sumi-runtime-state
+      - api-messaging-attachments:/var/lib/sumi-messaging-attachments
       - type: bind
         source: /run/sumi/local-control
         target: /run/sumi/local-control
@@ -108,6 +110,7 @@ services:
       SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
       SUMI_COMMAND_LOG_DIR: /var/lib/sumi-command-log
       SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
+      SUMI_MESSAGING_ATTACHMENT_ROOT: /var/lib/sumi-messaging-attachments
       SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:-}
       SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?SUMI_BROWSER_SESSION_SECRET is required}
       SUMI_BROWSER_SESSION_AUDIENCE: ${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}
@@ -133,11 +136,17 @@ services:
       SUMI_APPROVAL_SECRET_DIGEST_KEY: ${SUMI_APPROVAL_SECRET_DIGEST_KEY:?SUMI_APPROVAL_SECRET_DIGEST_KEY is required}
       SUMI_PROVIDER_API_KEY: ${SUMI_PROVIDER_API_KEY:?SUMI_PROVIDER_API_KEY is required}
       SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      # 通話 (ADR 0012)。key/secret が空なら通話の口自体が生えず、テキストは
+      # そのまま動く。URL はブラウザが繋ぐ先なので公開アドレスを渡す。
+      SUMI_LIVEKIT_URL: ${SUMI_LIVEKIT_URL:-ws://${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880}
+      SUMI_LIVEKIT_API_KEY: ${SUMI_LIVEKIT_API_KEY:-sumi-local}
+      SUMI_LIVEKIT_API_SECRET: ${SUMI_LIVEKIT_API_SECRET:-sumi-local-dev-secret-change-me}
     ports:
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080:8080"
     volumes:
       - api-command-log:/var/lib/sumi-command-log
       - api-runtime-state:/var/lib/sumi-runtime-state
+      - api-messaging-attachments:/var/lib/sumi-messaging-attachments
       - type: bind
         source: /run/sumi/local-control
         target: /run/sumi/local-control
@@ -166,6 +175,46 @@ services:
       start_period: 5s
     restart: "no"
     stop_grace_period: 2m
+
+  # 通話のメディア配信 (ADR 0012)。SFU は音声・映像だけを運び、誰が部屋へ
+  # 入ってよいかは api が発行するアクセストークンが決める。api は media を
+  # 一切中継しない。
+  #
+  # WSL でのポート公開を単純にするため rtc-mux（単一 UDP ポート）を使う。
+  # ポート範囲を開けると WSL の NAT 越しでは扱いづらく、7882/udp 1 本で足りる。
+  livekit:
+    image: livekit/livekit-server:v1.8
+    pull_policy: missing
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      # ローカル開発の既定値。本番は必ず別の値を注入する。
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: info
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: false
+        keys:
+          ${SUMI_LIVEKIT_API_KEY:-sumi-local}: ${SUMI_LIVEKIT_API_SECRET:-sumi-local-dev-secret-change-me}
+        webhook:
+          api_key: ${SUMI_LIVEKIT_API_KEY:-sumi-local}
+          urls:
+            - http://api:8080/messaging/livekit/webhook
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'printf %s "$$LIVEKIT_CONFIG" > /etc/livekit.yaml && exec /livekit-server --config /etc/livekit.yaml'
+    ports:
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880:7880"
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7882:7882/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7880"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
 
   # This is the sole Docker authority. API/runtime/executor/broker containers
   # have no Docker socket, client, or host-process execution capability.
@@ -249,6 +298,9 @@ services:
       # which Docker has published only on a selected Tailnet address.
       SUMI_DEV_HOST: ${SUMI_DEV_BIND_HOST:-127.0.0.1}
       SUMI_DEV_API_ORIGIN: http://${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080
+      # 通話の signalling 先。api が返す url を既定に使うので、これは
+      # 上書きしたいときだけ効く（ADR 0012）。
+      VITE_LIVEKIT_URL: ${SUMI_LIVEKIT_URL:-}
     # The Vite server binds the selected host/Tailnet address directly.
     depends_on:
       api:
@@ -260,6 +312,7 @@ volumes:
   sumi-postgres: {}
   api-command-log: {}
   api-runtime-state: {}
+  api-messaging-attachments: {}
   provisioner-control: {}
 
 networks:

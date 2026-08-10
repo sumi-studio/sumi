@@ -1,4 +1,10 @@
-import type { Message, ParticipantKey, Urgency } from "./model";
+import type {
+  Attachment,
+  Message,
+  ParticipantKey,
+  PollInput,
+  Urgency,
+} from "./model";
 import { participantKey } from "./model";
 
 /**
@@ -13,6 +19,10 @@ export interface PendingMessage {
   clientNonce: string;
   content: string;
   mentions: Message["mentions"];
+  /** アップロード済みで、この送信に載せる添付。 */
+  attachments: Attachment[];
+  /** 一緒に立てる問い。楽観的描画では票ゼロの投票として見える。 */
+  poll?: PollInput | null;
   urgency: Urgency;
   replyTo: string | null;
   createdAt: number;
@@ -209,6 +219,20 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         mentions: entry.mentions,
         urgency: entry.urgency,
         reactions: [],
+        attachments: entry.attachments,
+        poll: entry.poll
+          ? {
+              question: entry.poll.question,
+              allowMulti: entry.poll.allowMulti,
+              closesAt: entry.poll.closesAt,
+              // 採番はサーバーの仕事。確定するまで押せる選択肢は無い。
+              options: entry.poll.options.map((text, index) => ({
+                optionId: `pending:${index}`,
+                text,
+                voters: [],
+              })),
+            }
+          : null,
         replyTo: entry.replyTo,
         createdAt: entry.createdAt,
         editedAt: null,

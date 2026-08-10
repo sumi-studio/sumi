@@ -86,6 +86,14 @@ func run(ctx context.Context) (runErr error) {
 		defer cancelReaper()
 		go runIdleReaper(reaperCtx, app.spawnManager)
 	}
+	// Temporary statuses lapse back to what the participant had said before.
+	// Readers resolve that themselves, so this loop only makes the change
+	// visible on screens that are already open.
+	if app.messaging != nil {
+		expiryCtx, cancelExpiry := context.WithCancel(ctx)
+		defer cancelExpiry()
+		go app.messaging.RunStatusExpiry(expiryCtx, messaging.DefaultStatusExpiryInterval)
+	}
 	if app.localMux == nil {
 		return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
 	}
@@ -214,6 +222,7 @@ type application struct {
 	database      *db.Pool
 	spawnManager  *spawn.Manager
 	localRuntimes *agentevents.LocalControlListenerRegistry
+	messaging     *messaging.Server
 	closeOnce     sync.Once
 	closeErr      error
 }
@@ -329,9 +338,6 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	if authEnabled {
 		authServer.RegisterRoutes(mux)
-		if database != nil {
-			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
-		}
 	}
 	// The /messaging surface requires the control-plane database. Without a
 	// session verifier the routes stay mounted but fail closed (401), matching
@@ -348,11 +354,52 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
+		// Attachment bytes live on local disk. Without a configured root the
+		// attachment routes stay mounted and fail closed (503) rather than
+		// accepting uploads nothing can serve.
+		if root := strings.TrimSpace(os.Getenv("SUMI_MESSAGING_ATTACHMENT_ROOT")); root != "" {
+			blobs, err := messaging.NewDiskAttachments(root)
+			if err != nil {
+				closeOnError()
+				return nil, fmt.Errorf("messaging attachments: %w", err)
+			}
+			messagingServer.Attachments = blobs
+			log.Printf("messaging attachments ready (root=%s)", root)
+		}
+		// Web Push は「タブを閉じていても呼ばれる」ための出口。VAPID の
+		// subject は push service に対する運用連絡先で、設定が無ければ push
+		// だけを黙って持たない（routes は 503 で正直に断る）。判定も既存の
+		// タブ内通知も、これとは独立に動く。
+		if subject := strings.TrimSpace(os.Getenv("SUMI_MESSAGING_PUSH_SUBJECT")); subject != "" {
+			dispatcher, err := messaging.NewPushDispatcher(context.Background(), messagingStore, subject)
+			if err != nil {
+				closeOnError()
+				return nil, fmt.Errorf("messaging web push: %w", err)
+			}
+			messagingServer.Push = dispatcher
+			messagingStore.UsePush(dispatcher)
+			log.Print("messaging web push ready")
+		}
+		// 通話 (ADR 0012)。現在値のGETは常設し、SFU未設定でも空の状態を返す。
+		// token/webhookだけが503へ縮退するため、Webは404を障害として扱わずに済む。
+		livekit := messaging.LiveKitConfig{
+			URL:       strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_URL")),
+			APIKey:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_KEY")),
+			APISecret: strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_SECRET")),
+		}
+		if registerMessagingCallRoutes(mux, messagingServer, livekit) {
+			log.Printf("messaging calls ready (livekit url=%s)", livekit.URL)
+		} else {
+			log.Print("messaging calls unavailable (LiveKit is not configured)")
+		}
 		messagingServer.RegisterRoutes(mux)
 		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
 		messagingWS.AllowedOrigins = browserOrigins
 		mux.Handle("GET /messaging/ws", messagingWS)
 		log.Print("messaging routes ready (REST + WS)")
+	}
+	if authEnabled && messagingServer != nil {
+		newHumanProfileServer(messagingServer, sv, browserOrigins).RegisterRoutes(mux)
 	}
 	if authEnabled {
 		closers := browserSessionConnectionClosers{browser}
@@ -417,7 +464,25 @@ func newApplicationFromEnv() (*application, error) {
 		database:      database,
 		spawnManager:  spawnManager,
 		localRuntimes: localRuntimes,
+		messaging:     messagingServer,
 	}, nil
+}
+
+// registerMessagingCallRoutes keeps the browser's read-only current-state
+// route mounted in every database-backed deployment, while exposing call state
+// to the agent's local-control lane only when an SFU can actually produce it.
+func registerMessagingCallRoutes(
+	mux *http.ServeMux,
+	server *messaging.Server,
+	livekit messaging.LiveKitConfig,
+) bool {
+	calls := messaging.NewCallService(server, livekit)
+	calls.RegisterRoutes(mux)
+	if livekit.APIKey == "" || livekit.APISecret == "" {
+		return false
+	}
+	server.Calls = calls
+	return true
 }
 
 // databaseFromEnv opens and migrates the control-plane Postgres database when

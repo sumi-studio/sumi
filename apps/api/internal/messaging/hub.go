@@ -7,21 +7,61 @@ import (
 )
 
 // Event is one durable or volatile messaging event fanned out to live
-// subscribers. Durable events carry the message (with its place seq); volatile
-// events (typing) carry only the actor and are never replayed.
+// subscribers. Durable events carry the message (with its place seq) or the
+// place summary; volatile events (typing, status_updated) are never replayed.
+// Place events scope delivery by PlaceID; participant-scoped events
+// (status_updated) leave PlaceID empty and set Subject instead. Place
+// created/updated events are not replayed either — the durable truth is the
+// places table, and a reconnecting client re-reads it via bootstrap.
 type Event struct {
 	Type    string           `json:"type"`
-	PlaceID string           `json:"place_id"`
+	PlaceID string           `json:"place_id,omitempty"`
 	Message *messageWire     `json:"message,omitempty"`
 	Actor   *participantWire `json:"actor,omitempty"`
+	Status  *statusWire      `json:"status,omitempty"`
+	Marker  *replyLaterWire  `json:"marker,omitempty"`
+	Channel *channelWire     `json:"channel,omitempty"`
+	DM      *dmWire          `json:"dm,omitempty"`
+	// Thread rides on place_created scoped to the parent place, so everyone
+	// who can see the parent learns the side conversation exists.
+	Thread *threadWire `json:"thread,omitempty"`
+	// Member rides on participant-scoped profile changes (表示名・tagline・画像).
+	Member *memberWire `json:"member,omitempty"`
+	// Notify rides only on the copy addressed to a recipient the server decided
+	// to interrupt. Its absence is the answer "this is not worth calling you
+	// for", which is why it is per-recipient rather than part of the message.
+	Notify   *notifyWire `json:"notify,omitempty"`
+	MarkerID string      `json:"marker_id,omitempty"`
+	// Call is one place's live call membership (ADR 0012). Volatile like
+	// typing: never replayed, re-read from GET /messaging/calls on reconnect.
+	Call *callStateWire `json:"call,omitempty"`
+
+	// Delivery controls; never serialized. Subject scopes a place-less event to
+	// subscribers who can see that participant. OnlyFor/ExceptFor split one
+	// logical event into per-audience payloads (remind_at は本人以外の wire に
+	// 載せない; notify は呼ばれた人の wire にしか載らない).
+	Subject   *ParticipantRef  `json:"-"`
+	OnlyFor   *ParticipantRef  `json:"-"`
+	ExceptFor []ParticipantRef `json:"-"`
 }
 
 // Durable event types. The wire names match the web model's ServerEvent.
 const (
-	EventMessageCreated = "message_created"
-	EventMessageEdited  = "message_edited"
-	EventMessageDeleted = "message_deleted"
-	EventTyping         = "typing"
+	EventMessageCreated  = "message_created"
+	EventMessageEdited   = "message_edited"
+	EventMessageDeleted  = "message_deleted"
+	EventReactionUpdated = "reaction_updated"
+	// EventPollUpdated carries the whole message after a vote, like
+	// reaction_updated: the durable truth is the vote rows, this is the fan-out.
+	EventPollUpdated        = "poll_updated"
+	EventTyping             = "typing"
+	EventStatusUpdated      = "status_updated"
+	EventProfileUpdated     = "profile_updated"
+	EventReplyLaterCreated  = "reply_later_created"
+	EventReplyLaterResolved = "reply_later_resolved"
+	EventPlaceCreated       = "place_created"
+	EventPlaceUpdated       = "place_updated"
+	EventCallState          = "call_state"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible is a
@@ -96,8 +136,9 @@ func (h *Hub) unsubscribe(sub *subscriber) {
 	h.mu.Unlock()
 }
 
-// Publish delivers the event to every subscriber who can see its place.
-// Slow subscribers are dropped rather than blocking the publisher.
+// Publish delivers the event to every subscriber in its audience who can see
+// its scope (place, or subject participant for place-less events). Slow
+// subscribers are dropped rather than blocking the publisher.
 func (h *Hub) Publish(ctx context.Context, event Event) {
 	if h == nil {
 		return
@@ -118,13 +159,13 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 
 	var drop []*subscriber
 	for _, sub := range subs {
-		ok, known := sub.visibility(event.PlaceID)
-		if !known {
-			_, err := h.store.PlaceFor(ctx, event.PlaceID, sub.viewer)
-			ok = err == nil
-			sub.markVisible(event.PlaceID, ok)
+		if event.OnlyFor != nil && sub.viewer != *event.OnlyFor {
+			continue
 		}
-		if !ok {
+		if excluded(event.ExceptFor, sub.viewer) {
+			continue
+		}
+		if !h.visibleTo(ctx, sub, event) {
 			continue
 		}
 		select {
@@ -137,4 +178,44 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 	for _, sub := range drop {
 		h.unsubscribe(sub)
 	}
+}
+
+// excluded reports whether the viewer is in an event's exclusion list. The
+// list is short by construction (one audience split per publish), so a linear
+// scan is the honest shape.
+func excluded(refs []ParticipantRef, viewer ParticipantRef) bool {
+	for _, ref := range refs {
+		if ref == viewer {
+			return true
+		}
+	}
+	return false
+}
+
+// visibleTo answers "may this subscriber be told about this event now",
+// caching verdicts per scope key. Place events use place visibility;
+// participant-scoped events use ParticipantVisible under a prefixed key so the
+// two namespaces cannot collide. An event with neither scope is delivered to
+// no one (fail-closed).
+func (h *Hub) visibleTo(ctx context.Context, sub *subscriber, event Event) bool {
+	scope := event.PlaceID
+	if scope == "" {
+		if event.Subject == nil {
+			return false
+		}
+		scope = "participant|" + event.Subject.Key()
+	}
+	ok, known := sub.visibility(scope)
+	if known {
+		return ok
+	}
+	if event.PlaceID != "" {
+		_, err := h.store.PlaceFor(ctx, event.PlaceID, sub.viewer)
+		ok = err == nil
+	} else {
+		visible, err := h.store.ParticipantVisible(ctx, sub.viewer, *event.Subject)
+		ok = err == nil && visible
+	}
+	sub.markVisible(scope, ok)
+	return ok
 }

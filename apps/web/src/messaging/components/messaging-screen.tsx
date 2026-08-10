@@ -1,14 +1,50 @@
-import { Clock, Hash, Users } from "lucide-react";
+import {
+  Bell,
+  ChevronLeft,
+  Clock,
+  Hash,
+  MessagesSquare,
+  Users,
+  Volume2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "../../shell/app-rail";
-import { type PlaceKey, participantKey } from "../model";
+import { CallBanner } from "../call/call-banner";
+import { CallStage } from "../call/call-stage";
+import { CallStartButtons } from "../call/call-start-buttons";
+import { IncomingCallModal } from "../call/incoming-call";
+import { VoiceChannelPanel } from "../call/voice-channel-panel";
+import {
+  type PlaceKey,
+  participantKey,
+  placeKey,
+  type ReplyLaterMarker,
+} from "../model";
+import {
+  dismissPermissionPrompt,
+  isPermissionPromptDismissed,
+  type NotificationPermissionState,
+  notificationPermission,
+  requestNotificationPermission,
+} from "../notifications";
 import { usePlaceNavigate } from "../place-route";
-import { useMessaging } from "../store";
+import { enablePushSubscription } from "../push";
+import {
+  setNotificationNavigator,
+  useMessaging,
+} from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
+import { ConnectionBanner } from "./connection-banner";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
+import { MessageSearch } from "./message-search";
+import { NotificationSettingsMenu } from "./notification-settings";
+import { useOverlayPanel, useWheelPassthrough } from "./overlay";
+import { PushSubscriptionBridge } from "./push-bridge";
 import { Sidebar } from "./sidebar";
+import { ThreadPanel } from "./thread-panel";
 
 interface PendingJump {
   placeKey: PlaceKey;
@@ -57,19 +93,77 @@ function TypingIndicator() {
   );
 }
 
+/**
+ * 通知許可を求める導線。ブラウザのダイアログは一度断られると出し直せないので、
+ * 押されるまで待つ控えめなバナーにしておく。閉じたら二度と出さない。
+ */
+function NotificationPermissionBanner() {
+  const enabled = useMessaging((state) => state.capabilities.notifications);
+  const [permission, setPermission] = useState<NotificationPermissionState>(
+    () => notificationPermission(),
+  );
+  const [dismissed, setDismissed] = useState(() =>
+    isPermissionPromptDismissed(),
+  );
+
+  if (!enabled || dismissed || permission !== "default") return null;
+
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-border/70 border-b bg-accent/40 px-4 py-1.5 sm:px-5">
+      <Bell className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
+        呼ばれたときだけ通知します。ブラウザの通知を許可しますか？
+      </span>
+      <button
+        type="button"
+        onClick={() => {
+          void requestNotificationPermission().then((next) => {
+            setPermission(next);
+            // 許可されたその場で端末を購読済みにする。ここで待たせると、
+            // 「許可したのに閉じている間は届かない」時間が生まれる。
+            if (next === "granted") void enablePushSubscription();
+          });
+        }}
+        className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
+      >
+        許可する
+      </button>
+      <button
+        type="button"
+        aria-label="通知の案内を閉じる"
+        onClick={() => {
+          dismissPermissionPrompt();
+          setDismissed(true);
+        }}
+        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
 function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const replyLaterById = useMessaging((state) => state.replyLaterById);
   const selfKey = useMessaging((state) => state.selfKey);
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const overlay = useOverlayPanel<HTMLButtonElement>({
+    open,
+    onOpenChange: setOpen,
+  });
 
+  // リマインドの予定が入っているのは本人のmarkerだけ。相手の「後で返信します」は
+  // messageの側に見えていればよく、こちらのknock対象にはならない。
   const markers = useMemo(
     () =>
       Object.values(replyLaterById)
         .filter(
-          (marker) =>
-            !marker.resolved && participantKey(marker.participant) === selfKey,
+          (marker): marker is ReplyLaterMarker & { remindAt: number } =>
+            !marker.resolved &&
+            participantKey(marker.participant) === selfKey &&
+            marker.remindAt !== null,
         )
         .sort((a, b) => a.remindAt - b.remindAt),
     [replyLaterById, selfKey],
@@ -86,8 +180,9 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
     <div className="relative">
       <button
         type="button"
-        onClick={() => setOpen((value) => !value)}
         title="後で返信"
+        aria-haspopup="dialog"
+        {...overlay.triggerProps}
         className={`relative flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
           open ? "bg-accent text-foreground" : "text-muted-foreground"
         }`}
@@ -104,7 +199,12 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
         ) : null}
       </button>
       {open ? (
-        <div className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-1 shadow-md">
+        <div
+          {...overlay.panelProps}
+          role="dialog"
+          aria-label="後で返信"
+          className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-1 shadow-md"
+        >
           <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
             後で返信 — 忘れないように knock します
           </p>
@@ -125,11 +225,7 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
                     onClick={() => {
                       setOpen(false);
                       onJump({
-                        placeKey: `${marker.place.kind}:${
-                          marker.place.kind === "channel"
-                            ? marker.place.channelId
-                            : marker.place.dmId
-                        }`,
+                        placeKey: placeKey(marker.place),
                         messageId: marker.messageId,
                       });
                     }}
@@ -171,6 +267,8 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [now, setNow] = useState(() => Date.now());
   const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
+  // 一覧の上に浮いているので、この上でのホイールも一覧へ渡す。
+  const passthroughRef = useWheelPassthrough<HTMLDivElement>();
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 5_000);
@@ -181,6 +279,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
     (marker) =>
       !marker.resolved &&
       participantKey(marker.participant) === selfKey &&
+      marker.remindAt !== null &&
       marker.remindAt <= now &&
       !dismissed[marker.markerId],
   );
@@ -188,7 +287,10 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   if (!marker) return null;
 
   return (
-    <div className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg">
+    <div
+      ref={passthroughRef}
+      className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg"
+    >
       <p className="flex items-center gap-1.5 font-medium text-[13px]">
         <Clock className="size-3.5 text-rose-500" />
         後で返信の時間です
@@ -201,11 +303,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
           type="button"
           onClick={() =>
             onJump({
-              placeKey: `${marker.place.kind}:${
-                marker.place.kind === "channel"
-                  ? marker.place.channelId
-                  : marker.place.dmId
-              }`,
+              placeKey: placeKey(marker.place),
               messageId: marker.messageId,
             })
           }
@@ -244,12 +342,29 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const loadPlaceAround = useMessaging((state) => state.loadPlaceAround);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
   const display = usePlaceDisplay(activePlaceKey);
+  // 開いているchannelが「話す場所」か（ADR 0012）。booleanなので購読は安定する。
+  const activeIsVoiceChannel = useMessaging((state) =>
+    activePlaceKey?.startsWith("channel:")
+      ? (state.channels.find(
+          (channel) => `channel:${channel.channelId}` === activePlaceKey,
+        )?.voice ?? false)
+      : false,
+  );
   const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
   const mentionCountByPlace = useMessaging(
     (state) => state.mentionCountByPlace,
   );
+  const canNotify = useMessaging((state) => state.capabilities.notifications);
+  const notificationLevelByPlace = useMessaging(
+    (state) => state.notificationLevelByPlace,
+  );
+  const notificationDefaultLevel = useMessaging(
+    (state) => state.notificationDefaultLevel,
+  );
+  const canThread = useMessaging((state) => state.capabilities.threads);
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
+  const [threadsOpen, setThreadsOpen] = useState(false);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
 
   useEffect(() => {
@@ -263,16 +378,31 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   }, [ready, placeKey, activePlaceKey, selectPlace]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
+  // muteしたplaceはここから外す——サイドバーには件数が残るが、タブの数字は
+  // 「呼ばれている数」であって「溜まっている数」ではない。
   useEffect(() => {
     let unread = 0;
     for (const [key, count] of Object.entries(unreadCountByPlace)) {
+      const level = notificationLevelByPlace[key] ?? notificationDefaultLevel;
+      if (level === "mute") continue;
       unread +=
         key.startsWith("dm:") || key.startsWith("group_dm:")
           ? count
           : (mentionCountByPlace[key] ?? 0);
     }
     document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
-  }, [unreadCountByPlace, mentionCountByPlace]);
+  }, [
+    unreadCountByPlace,
+    mentionCountByPlace,
+    notificationLevelByPlace,
+    notificationDefaultLevel,
+  ]);
+
+  // デスクトップ通知のクリック先。URLが現在地の正本なのでrouterに任せる。
+  useEffect(() => {
+    setNotificationNavigator(placeNavigate);
+    return () => setNotificationNavigator(null);
+  }, [placeNavigate]);
 
   // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {
@@ -291,8 +421,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     (jump: PendingJump) => {
       placeNavigate(jump.placeKey);
       setPendingJump(jump);
+      // seq付きジャンプ（検索結果など）は対象が履歴の彼方にあり得るため、
+      // permalinkと同じ経路で該当seq周辺を読み込んでおく。
+      if (jump.seq !== undefined) {
+        void loadPlaceAround(jump.placeKey, jump.seq);
+      }
     },
-    [placeNavigate],
+    [placeNavigate, loadPlaceAround],
   );
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。
@@ -330,14 +465,39 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     <div className="flex h-dvh bg-background text-foreground">
       <AppRail activeAppId="home" />
       <Sidebar />
-      <main className="flex min-w-0 flex-1 flex-col">
+      {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
+          開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
+      <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
           {display?.kind === "channel" ? (
-            <Hash className="size-4 shrink-0 text-muted-foreground" />
+            activeIsVoiceChannel ? (
+              <Volume2 className="size-4 shrink-0 text-muted-foreground" />
+            ) : (
+              <Hash className="size-4 shrink-0 text-muted-foreground" />
+            )
+          ) : null}
+          {/* スレッドは親チャンネルの脇道。どこから枝分かれしたかを見出しに残し、
+              戻る導線を必ず添える。 */}
+          {display?.kind === "thread" && display.parent ? (
+            <button
+              type="button"
+              title={`#${display.parent.name} へ戻る`}
+              onClick={() => placeNavigate(display.parent?.placeKey ?? "")}
+              className="flex shrink-0 items-center gap-0.5 rounded-md py-0.5 pr-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <ChevronLeft className="size-3.5" />
+              <Hash className="size-3" />
+              <span className="max-w-32 truncate">{display.parent.name}</span>
+            </button>
+          ) : null}
+          {display?.kind === "thread" ? (
+            <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
           ) : null}
           <span className="truncate font-semibold text-[14.5px]">
             {display?.name ?? ""}
           </span>
+          {/* トピックは読むだけ。編集はサイドバーの
+              「チャンネルを編集」に一本化した（UX-CHN-02）。 */}
           {display?.topic ? (
             <>
               <span className="h-4 w-px shrink-0 bg-border" />
@@ -347,6 +507,26 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
+            {/* 通話 (ADR 0012)。DM・グループDMのヘッダーから始める。 */}
+            {activePlaceKey && display && display.kind !== "channel" ? (
+              <CallStartButtons placeKey={activePlaceKey} />
+            ) : null}
+            <MessageSearch onJump={requestJump} />
+            {canThread && display?.kind === "channel" ? (
+              <button
+                type="button"
+                title="スレッド"
+                onClick={() => setThreadsOpen((value) => !value)}
+                className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
+                  threadsOpen
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground"
+                }`}
+              >
+                <MessagesSquare className="size-4" />
+              </button>
+            ) : null}
+            {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             <button
               type="button"
@@ -360,12 +540,36 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </button>
           </span>
         </header>
-        <MessageList handleRef={listRef} />
-        <TypingIndicator />
-        <Composer />
-      </main>
-      {membersOpen ? <MemberList /> : null}
+        <PushSubscriptionBridge />
+        <NotificationPermissionBanner />
+        <ConnectionBanner />
+        <div className="flex min-h-0 flex-1">
+          <main className="flex min-w-0 flex-1 flex-col">
+            {/* 通話領域はテキストの上に積む。通話中もそのまま会話が続く。 */}
+            {activePlaceKey ? (
+              <>
+                {activeIsVoiceChannel ? (
+                  <VoiceChannelPanel placeKey={activePlaceKey} />
+                ) : null}
+                <CallBanner placeKey={activePlaceKey} />
+                <CallStage placeKey={activePlaceKey} />
+              </>
+            ) : null}
+            <MessageList handleRef={listRef} />
+            <TypingIndicator />
+            <Composer />
+          </main>
+          {threadsOpen && activePlaceKey?.startsWith("channel:") ? (
+            <ThreadPanel
+              parentKey={activePlaceKey}
+              onClose={() => setThreadsOpen(false)}
+            />
+          ) : null}
+          {membersOpen ? <MemberList /> : null}
+        </div>
+      </div>
       {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}
+      <IncomingCallModal />
     </div>
   );
 }

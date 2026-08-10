@@ -1,26 +1,51 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
+  Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   MessagingCapabilities,
+  NotificationLevel,
   ParticipantKey,
   ParticipantRef,
   ParticipantStatus,
+  Permission,
+  PermissionSet,
   Place,
   PlaceKey,
+  PollInput,
+  ProfileInput,
   ReplyLaterMarker,
+  RoleAssignment,
+  RoleInput,
+  ServerEvent,
   StatusKind,
+  ThreadSummary,
   Urgency,
+  WorkspaceRole,
   WorkspaceSummary,
 } from "./model";
-import { parsePlaceKey, participantKey, placeKey } from "./model";
+import { MAX_SEQ, parsePlaceKey, participantKey, placeKey } from "./model";
+import {
+  isNotificationSoundEnabled,
+  isTabActive,
+  notificationBody,
+  notificationPermission,
+  notificationTitle,
+  setNotificationSoundEnabled as persistNotificationSound,
+  playNotificationSound,
+  presentationFor,
+  presentDesktopNotification,
+} from "./notifications";
 import type { PendingMessage } from "./timeline";
 import { mergeMessages, upsertMessage } from "./timeline";
 
@@ -28,6 +53,12 @@ const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
 
 let backend: MessagingBackend = new ApiMessagingBackend();
+
+type CatchUpAwareMessagingBackend = MessagingBackend & {
+  subscribeCatchUp?: (
+    listener: (place: Place, latestSeq: number) => void | Promise<void>,
+  ) => () => void;
+};
 
 /** Tests and explicit development harnesses may replace the transport before init. */
 export function installMessagingBackend(override: MessagingBackend): void {
@@ -43,6 +74,13 @@ interface MessagingState {
   workspaces: WorkspaceSummary[];
   channels: ChannelSummary[];
   dms: DmSummary[];
+  /**
+   * 見えているスレッド。bootstrapでは自分が参加しているものだけが載り、
+   * 親チャンネルを開くとその配下が全部足される（閲覧は親のメンバー全員できる）。
+   */
+  threadsById: Record<string, ThreadSummary>;
+  /** スレッド一覧を取り終えた親place。開くたびの再取得を避ける。 */
+  threadsLoadedForPlace: Record<PlaceKey, boolean>;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -55,7 +93,17 @@ interface MessagingState {
   draftByPlace: Record<PlaceKey, string>;
   typingByPlace: Record<PlaceKey, Record<ParticipantKey, number>>;
   replyLaterById: Record<string, ReplyLaterMarker>;
+  /** 自分の通知設定。正本はサーバーで、ここはその写し。 */
+  notificationDefaultLevel: NotificationLevel;
+  notificationLevelByPlace: Record<PlaceKey, NotificationLevel>;
+  notificationKeywords: string[];
+  /** 音は端末の都合なのでlocalStorageに置く（設定の正本には混ぜない）。 */
+  notificationSoundEnabled: boolean;
   employedAgents: ParticipantRef[];
+  /** いま居るワークスペースのロールと、自分の権限（正本はサーバー）。 */
+  roles: WorkspaceRole[];
+  roleAssignments: RoleAssignment[];
+  permissions: PermissionSet;
   hasMoreByPlace: Record<PlaceKey, boolean>;
   loadingOlderByPlace: Record<PlaceKey, boolean>;
   activePlaceKey: PlaceKey | null;
@@ -65,9 +113,46 @@ interface MessagingState {
 
   init(): void;
   selectPlace(key: PlaceKey): void;
+  createChannel(
+    name: string,
+    topic: string,
+    voice?: boolean,
+  ): Promise<PlaceKey>;
+  /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
+  startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<void>;
+  /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
+  duplicateChannel(channelId: string): Promise<PlaceKey>;
+  /** 親チャンネル配下のスレッド一覧を取り込む。取得済みなら何もしない。 */
+  loadThreads(parentKey: PlaceKey): Promise<void>;
+  /** スレッドを作る。返り値は開く先のPlaceKey。 */
+  createThread(
+    parentKey: PlaceKey,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<PlaceKey>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
+  /** 可視なplace全体の本文検索。結果はUI局所状態で持ち、storeには残さない。 */
+  searchMessages(query: string): Promise<MessageSearchResult[]>;
   setDraft(key: PlaceKey, draft: string): void;
-  send(content: string, urgency: Urgency): void;
+  send(
+    content: string,
+    urgency: Urgency,
+    attachments?: Attachment[],
+    poll?: PollInput | null,
+  ): void;
+  /** 投票する。空配列は取り消し。押した結果はサーバーのechoで確定する。 */
+  votePoll(message: Message, optionIds: string[]): void;
+  /** 送信前にファイルを預ける。返ったAttachmentをsendへ渡すまで誰にも見えない。 */
+  uploadAttachment(file: File): Promise<Attachment>;
+  /** 送信前の添付を編集する（名前・概要・ネタバレ）。 */
+  updateAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment>;
   retrySend(clientNonce: string): void;
   startEdit(messageId: string): void;
   cancelEdit(): void;
@@ -75,7 +160,22 @@ interface MessagingState {
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
-  setStatus(status: StatusKind, note: string): void;
+  setStatus(status: StatusKind, note: string, expiresAt?: number | null): void;
+  /**
+   * 自分の名乗りの更新。失敗はUIが伝えるべきことなので握り潰さず投げ返す
+   * （設定が効いたふりをして黙って効いていないのが一番困る）。
+   */
+  updateProfile(input: ProfileInput): Promise<void>;
+  /** ロールを取り直す。ライブ配信しない代わりに、設定画面を開いた時点で読む。 */
+  refreshRoles(): Promise<void>;
+  createRole(input: RoleInput): Promise<void>;
+  updateRole(roleId: string, input: RoleInput): Promise<void>;
+  deleteRole(roleId: string): Promise<void>;
+  setMemberRoles(participant: ParticipantRef, roleIds: string[]): Promise<void>;
+  setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
+  setNotificationDefaultLevel(level: NotificationLevel): void;
+  setNotificationKeywords(keywords: string[]): void;
+  setNotificationSoundEnabled(enabled: boolean): void;
   createReplyLater(message: Message, delayMs?: number): void;
   toggleReaction(message: Message, emoji: string): void;
   loadOlder(key: PlaceKey): Promise<void>;
@@ -123,35 +223,233 @@ function unreadContribution(
 
 let initialized = false;
 
+let notificationNavigate: ((key: PlaceKey) => void) | null = null;
+
+/**
+ * 通知をクリックした先の遷移。URLが現在地の正本なので、storeが自前で
+ * activePlaceKeyを書き換えるのではなくrouterの遷移を借りる。
+ */
+export function setNotificationNavigator(
+  navigate: ((key: PlaceKey) => void) | null,
+): void {
+  notificationNavigate = navigate;
+}
+
+/** placeに効いている通知レベル。place個別の指定が無ければ既定に落ちる。 */
+export function notificationLevelFor(
+  state: Pick<
+    MessagingState,
+    "notificationLevelByPlace" | "notificationDefaultLevel"
+  >,
+  key: PlaceKey,
+): NotificationLevel {
+  return state.notificationLevelByPlace[key] ?? state.notificationDefaultLevel;
+}
+
+/**
+ * 通知の見出しに使う場所の名前。DMは相手の名前が発言者の名前と同じなので
+ * 場所を名乗らせない（「Haru — Haru」は情報が無い）。
+ */
+function notificationPlaceLabel(state: MessagingState, key: PlaceKey): string {
+  const place = parsePlaceKey(key);
+  if (!place) return "";
+  if (place.kind === "channel") {
+    const channel = state.channels.find(
+      (entry) => entry.channelId === place.channelId,
+    );
+    return channel ? `#${channel.name}` : "";
+  }
+  if (place.kind === "dm") return "";
+  const dm = state.dms.find(
+    (entry) => entry.kind === place.kind && entry.dmId === place.dmId,
+  );
+  if (!dm) return "";
+  return dm.participants
+    .filter((ref) => participantKey(ref) !== state.selfKey)
+    .map(
+      (ref) => state.membersByKey[participantKey(ref)]?.displayName ?? "不明",
+    )
+    .join("、");
+}
+
 export const useMessaging = create<MessagingState>((set, get) => {
   if (import.meta.env.DEV) {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+  /**
+   * 呼ばれたことの提示。「呼ぶかどうか」はサーバーが送信時に判定済みで、
+   * ここに来る `notify` はその答えそのもの。クライアントは提示の仕方だけを
+   * 決める——見ている画面に通知を重ねない、音を鳴らすか。
+   */
+  const presentNotification = (
+    event: Extract<ServerEvent, { type: "message_created" }>,
+  ) => {
+    const state = get();
+    if (!state.capabilities.notifications) return;
+    const key = placeKey(event.message.place);
+    const presentation = presentationFor({
+      notify: event.notify,
+      authorIsSelf: participantKey(event.message.author) === state.selfKey,
+      tabActive: isTabActive(),
+      placeIsActive: state.activePlaceKey === key,
+      permission: notificationPermission(),
+      soundEnabled: state.notificationSoundEnabled,
+    });
+    if (presentation.sound) playNotificationSound();
+    if (!presentation.desktop) return;
+    const authorName =
+      state.membersByKey[participantKey(event.message.author)]?.displayName ??
+      "誰か";
+    presentDesktopNotification({
+      title: notificationTitle(notificationPlaceLabel(state, key), authorName),
+      body: notificationBody(event.message.content),
+      placeKey: key,
+      onActivate: () => notificationNavigate?.(key),
+    });
+  };
+
+  const threadProjectionVersions = new Map<string, number>();
+  const appliedThreadDeletions = new Set<string>();
+
+  const advanceThreadProjection = (message: Message): number | null => {
+    if (message.place.kind !== "thread") return null;
+    const threadId = message.place.threadId;
+    const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
+    threadProjectionVersions.set(threadId, version);
+    return version;
+  };
+
+  const refreshThreadSummary = async (message: Message, version: number) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    const thread = get().threadsById[threadId];
+    if (!thread) return;
+    const currentBackend = backend;
+    const parentKey = placeKey(thread.parentPlace);
+    try {
+      const summaries = await currentBackend.fetchThreads(thread.parentPlace);
+      if (
+        backend !== currentBackend ||
+        threadProjectionVersions.get(threadId) !== version
+      ) {
+        return;
+      }
+      const refreshed = summaries.find((entry) => entry.threadId === threadId);
+      if (!refreshed) return;
+      set((state) => ({
+        threadsById: { ...state.threadsById, [threadId]: refreshed },
+      }));
+    } catch {
+      if (
+        backend !== currentBackend ||
+        threadProjectionVersions.get(threadId) !== version
+      ) {
+        return;
+      }
+      // A later visit may retry the authoritative list instead of treating a
+      // failed refresh as a permanently loaded projection.
+      set((state) => ({
+        threadsLoadedForPlace: {
+          ...state.threadsLoadedForPlace,
+          [parentKey]: false,
+        },
+      }));
+    }
+  };
+
+  const applyThreadDeletionSummary = (message: Message) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    const deletionKey = `${threadId}:${message.messageId}`;
+    const applyDeletion = !appliedThreadDeletions.has(deletionKey);
+    appliedThreadDeletions.add(deletionKey);
+    if (applyDeletion) {
+      set((state) => {
+        const thread = state.threadsById[threadId];
+        if (!thread) return {};
+        return {
+          threadsById: {
+            ...state.threadsById,
+            [threadId]: {
+              ...thread,
+              messageCount: Math.max(0, thread.messageCount - 1),
+            },
+          },
+        };
+      });
+    }
+    const version = advanceThreadProjection(message);
+    if (version !== null) {
+      void refreshThreadSummary(message, version);
+    }
+  };
+
+  /**
+   * スレッドに新しい発言が着いたときの一覧側の追従。件数と最新行は一覧を
+   * 開き直さなくても正しくあってほしいので、eventから直接更新する。
+   */
+  const noteThreadActivity = (message: Message) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    set((state) => {
+      const thread = state.threadsById[threadId];
+      if (!thread) return {};
+      const known = thread.participants.some(
+        (ref) => participantKey(ref) === participantKey(message.author),
+      );
+      return {
+        threadsById: {
+          ...state.threadsById,
+          [threadId]: {
+            ...thread,
+            messageCount: thread.messageCount + (message.deleted ? 0 : 1),
+            lastMessageAt: message.createdAt,
+            lastMessage: message.content,
+            latestSeq: Math.max(thread.latestSeq, message.seq),
+            participants: known
+              ? thread.participants
+              : [...thread.participants, message.author],
+          },
+        },
+      };
+    });
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
     if (
       event.type === "message_created" ||
       event.type === "message_edited" ||
-      event.type === "reaction_updated"
+      event.type === "reaction_updated" ||
+      event.type === "poll_updated"
     ) {
       const key = placeKey(event.message.place);
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
+        const projected =
+          event.type === "poll_updated" && existing
+            ? {
+                ...existing,
+                // A delayed poll frame is a delta for the poll projection. It
+                // must not revert a later edit or revive a tombstone.
+                poll: existing.deleted ? null : (event.message.poll ?? null),
+              }
+            : event.message;
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
-          event.message,
+          projected,
         );
-        const nonce = event.message.clientNonce;
+        const nonce = projected.clientNonce;
         const pending = nonce
           ? (state.pendingByPlace[key] ?? []).filter(
               (entry) => entry.clientNonce !== nonce,
             )
           : (state.pendingByPlace[key] ?? []);
-        const authorKey = participantKey(event.message.author);
+        const authorKey = participantKey(projected.author);
         const typing = { ...(state.typingByPlace[key] ?? {}) };
         delete typing[authorKey];
         const lastRead =
@@ -162,7 +460,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ? unreadContribution(existing, lastRead, state.selfKey)
           : { unread: 0, mentions: 0 };
         const nextContribution = unreadContribution(
-          event.message,
+          projected,
           lastRead,
           state.selfKey,
         );
@@ -191,6 +489,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      if (event.type === "message_created") {
+        advanceThreadProjection(event.message);
+        noteThreadActivity(event.message);
+        presentNotification(event);
+      } else if (event.type === "message_edited") {
+        const version = advanceThreadProjection(event.message);
+        if (version !== null) {
+          void refreshThreadSummary(event.message, version);
+        }
+      }
       return;
     }
     if (event.type === "message_deleted") {
@@ -229,6 +537,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      applyThreadDeletionSummary(event.message);
       return;
     }
     if (event.type === "typing") {
@@ -246,6 +555,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }));
       return;
     }
+    if (event.type === "profile_updated") {
+      set((state) => ({
+        membersByKey: {
+          ...state.membersByKey,
+          [participantKey(event.member.participant)]: event.member,
+        },
+      }));
+      return;
+    }
     if (event.type === "status_updated") {
       set((state) => ({
         statusByKey: {
@@ -253,6 +571,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
           [participantKey(event.status.participant)]: event.status,
         },
       }));
+      return;
+    }
+    if (event.type === "status_cleared") {
+      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
+      set((state) => {
+        const key = participantKey(event.participant);
+        if (!(key in state.statusByKey)) return {};
+        const statusByKey = { ...state.statusByKey };
+        delete statusByKey[key];
+        return { statusByKey };
+      });
       return;
     }
     if (event.type === "reply_later_created") {
@@ -275,25 +604,188 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      return;
+    }
+    if (event.type === "place_created") {
+      const { channel, dm, thread } = event;
+      set((state) => {
+        if (thread) {
+          return {
+            threadsById: {
+              ...state.threadsById,
+              [thread.threadId]: thread,
+            },
+          };
+        }
+        if (channel) {
+          return state.channels.some(
+            (entry) => entry.channelId === channel.channelId,
+          )
+            ? {}
+            : { channels: [...state.channels, channel] };
+        }
+        if (dm) {
+          return state.dms.some((entry) => entry.dmId === dm.dmId)
+            ? {}
+            : { dms: [...state.dms, dm] };
+        }
+        return {};
+      });
+      return;
+    }
+    if (event.type === "place_updated") {
+      const { channel } = event;
+      set((state) => ({
+        channels: state.channels.map((entry) =>
+          entry.channelId === channel.channelId ? channel : entry,
+        ),
+      }));
+      return;
+    }
+    // 通話の在室（ADR 0012）はメッセージングのstateではなくcall storeが持つ。
+    if (event.type === "call_state") {
+      useCall.getState().applyCallState(event.call);
     }
   };
 
   const PAGE_SIZE = 50;
+  const placeLoads = new Map<PlaceKey, Promise<void>>();
+  const pollReconciliationVersions = new Map<PlaceKey, number>();
+
+  const reconcileLoadedPolls = async (
+    currentBackend: MessagingBackend,
+    place: Place,
+  ) => {
+    const key = placeKey(place);
+    const reconciliationVersion =
+      (pollReconciliationVersions.get(key) ?? 0) + 1;
+    pollReconciliationVersions.set(key, reconciliationVersion);
+    const isCurrentReconciliation = () =>
+      backend === currentBackend &&
+      pollReconciliationVersions.get(key) === reconciliationVersion;
+    const inFlightLoad = placeLoads.get(key);
+    if (inFlightLoad) await inFlightLoad;
+    if (!isCurrentReconciliation()) return;
+    const targets = (get().messagesByPlace[key] ?? [])
+      .filter((message) => !message.deleted && message.poll)
+      .map((message) => ({ messageId: message.messageId, seq: message.seq }));
+    if (targets.length === 0) return;
+
+    const snapshots = await Promise.all(
+      targets.map(async (target) => {
+        const options =
+          target.seq === MAX_SEQ
+            ? { limit: 1 }
+            : { beforeSeq: target.seq + 1, limit: 1 };
+        const messages = await currentBackend.fetchMessages(place, options);
+        return (
+          messages.find(
+            (message) =>
+              message.messageId === target.messageId &&
+              message.seq === target.seq,
+          ) ?? null
+        );
+      }),
+    );
+    // A session switch owns a different store. Never let the old person's
+    // catch-up response cross that boundary. A newer socket generation can
+    // also reconcile through the same backend instance, so identity alone is
+    // not enough to reject its predecessor's delayed REST response.
+    if (!isCurrentReconciliation()) return;
+    const discoveredThreadDeletions: Message[] = [];
+    set((state) => {
+      let messages = state.messagesByPlace[key] ?? [];
+      let unreadCount = state.unreadCountByPlace[key] ?? 0;
+      let mentionCount = state.mentionCountByPlace[key] ?? 0;
+      let changed = false;
+      for (const snapshot of snapshots) {
+        if (!snapshot) continue;
+        const current = messages.find(
+          (message) => message.messageId === snapshot.messageId,
+        );
+        if (!current) continue;
+        if (
+          !current.deleted &&
+          snapshot.deleted &&
+          snapshot.place.kind === "thread"
+        ) {
+          discoveredThreadDeletions.push(snapshot);
+        }
+        const projected = snapshot.deleted
+          ? { ...current, ...snapshot, poll: null }
+          : current.deleted
+            ? { ...current, poll: null }
+            : { ...current, poll: snapshot.poll ?? null };
+        const lastRead = state.lastReadByPlace[key] ?? 0;
+        const previousContribution = unreadContribution(
+          current,
+          lastRead,
+          state.selfKey,
+        );
+        const nextContribution = unreadContribution(
+          projected,
+          lastRead,
+          state.selfKey,
+        );
+        unreadCount = Math.max(
+          0,
+          unreadCount - previousContribution.unread + nextContribution.unread,
+        );
+        mentionCount = Math.max(
+          0,
+          mentionCount -
+            previousContribution.mentions +
+            nextContribution.mentions,
+        );
+        messages = upsertMessage(messages, projected);
+        changed = true;
+      }
+      return changed
+        ? {
+            messagesByPlace: { ...state.messagesByPlace, [key]: messages },
+            unreadCountByPlace: {
+              ...state.unreadCountByPlace,
+              [key]: unreadCount,
+            },
+            mentionCountByPlace: {
+              ...state.mentionCountByPlace,
+              [key]: mentionCount,
+            },
+          }
+        : {};
+    });
+    for (const deletion of discoveredThreadDeletions) {
+      applyThreadDeletionSummary(deletion);
+    }
+  };
 
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
     if (get().messagesByPlace[key]) return;
-    const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
-    set((state) => ({
-      messagesByPlace: {
-        ...state.messagesByPlace,
-        [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
-      },
-      hasMoreByPlace: {
-        ...state.hasMoreByPlace,
-        [key]: messages.length >= PAGE_SIZE,
-      },
-    }));
+    const existingLoad = placeLoads.get(key);
+    if (existingLoad) return existingLoad;
+    const currentBackend = backend;
+    const load = currentBackend
+      .fetchMessages(place, { limit: PAGE_SIZE })
+      .then((messages) => {
+        if (backend !== currentBackend) return;
+        set((state) => ({
+          messagesByPlace: {
+            ...state.messagesByPlace,
+            [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+          },
+          hasMoreByPlace: {
+            ...state.hasMoreByPlace,
+            [key]: messages.length >= PAGE_SIZE,
+          },
+        }));
+      });
+    placeLoads.set(key, load);
+    try {
+      await load;
+    } finally {
+      if (placeLoads.get(key) === load) placeLoads.delete(key);
+    }
   };
 
   // 送信・再送の共通経路。ACK(receipt)はecho eventで照合されるため、
@@ -308,6 +800,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         urgency: pending.urgency,
         replyTo: pending.replyTo,
         clientNonce: pending.clientNonce,
+        attachments: pending.attachments.map(
+          (attachment) => attachment.attachmentId,
+        ),
+        poll: pending.poll ?? null,
       })
       .then(async (receipt) => {
         let confirmed = (get().messagesByPlace[key] ?? []).some(
@@ -361,6 +857,40 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
   };
 
+  /**
+   * 通知設定は丸ごと置き換える。手元を先に動かして即座に反映し、失敗したら
+   * 元に戻す——設定が効いたふりをして黙って効いていないのが一番困る。
+   */
+  const pushNotificationSetting = (next: {
+    defaultLevel: NotificationLevel;
+    levelByPlace: Record<PlaceKey, NotificationLevel>;
+    keywords: string[];
+  }) => {
+    const state = get();
+    const previous = {
+      notificationDefaultLevel: state.notificationDefaultLevel,
+      notificationLevelByPlace: state.notificationLevelByPlace,
+      notificationKeywords: state.notificationKeywords,
+    };
+    set({
+      notificationDefaultLevel: next.defaultLevel,
+      notificationLevelByPlace: next.levelByPlace,
+      notificationKeywords: next.keywords,
+    });
+    const perPlace: { place: Place; level: NotificationLevel }[] = [];
+    for (const [key, level] of Object.entries(next.levelByPlace)) {
+      const place = parsePlaceKey(key);
+      if (place) perPlace.push({ place, level });
+    }
+    void backend
+      .setNotificationSetting({
+        defaults: { level: next.defaultLevel },
+        perPlace,
+        keywords: next.keywords,
+      })
+      .catch(() => set(previous));
+  };
+
   return {
     capabilities: backend.capabilities,
     ready: false,
@@ -369,6 +899,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -380,7 +912,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
     draftByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
+    notificationDefaultLevel: "all",
+    notificationLevelByPlace: {},
+    notificationKeywords: [],
+    notificationSoundEnabled: isNotificationSoundEnabled(),
     employedAgents: [],
+    roles: [],
+    roleAssignments: [],
+    permissions: {},
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
     activePlaceKey: null,
@@ -391,9 +930,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
-      void backend
+      threadProjectionVersions.clear();
+      appliedThreadDeletions.clear();
+      placeLoads.clear();
+      pollReconciliationVersions.clear();
+      const currentBackend = backend;
+      const currentSessionIdentity = messagingSessionIdentity;
+      void currentBackend
         .bootstrap()
         .then((snapshot) => {
+          if (
+            backend !== currentBackend ||
+            messagingSessionIdentity !== currentSessionIdentity
+          ) {
+            return;
+          }
           const membersByKey: Record<ParticipantKey, MemberProfile> = {};
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
@@ -419,26 +970,62 @@ export const useMessaging = create<MessagingState>((set, get) => {
             mentionCountByPlace[key] = summary.mentionCount;
             sinceByPlace[key] = summary.latestSeq;
           }
+          const threadsById: Record<string, ThreadSummary> = {};
+          for (const thread of snapshot.threads) {
+            threadsById[thread.threadId] = thread;
+          }
+          const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> =
+            {};
+          for (const entry of snapshot.notificationSetting.perPlace) {
+            notificationLevelByPlace[placeKey(entry.place)] = entry.level;
+          }
           set({
             ready: true,
-            capabilities: backend.capabilities,
+            capabilities: currentBackend.capabilities,
             self: snapshot.self,
             selfKey: participantKey(snapshot.self),
             workspaces: snapshot.workspaces,
             channels: snapshot.channels,
             dms: snapshot.dms,
+            threadsById,
             membersByKey,
             statusByKey,
             lastReadByPlace,
             unreadCountByPlace,
             mentionCountByPlace,
             replyLaterById,
+            notificationDefaultLevel:
+              snapshot.notificationSetting.defaults.level,
+            notificationLevelByPlace,
+            notificationKeywords: snapshot.notificationSetting.keywords,
             employedAgents: snapshot.employedAgents,
+            roles: snapshot.roles,
+            roleAssignments: snapshot.roleAssignments,
+            permissions: snapshot.permissions,
           });
-          backend.subscribe(applyEvent, { sinceByPlace });
-          backend.subscribeConnection((state) => set({ connection: state }));
+          (currentBackend as CatchUpAwareMessagingBackend).subscribeCatchUp?.(
+            (place) => reconcileLoadedPolls(currentBackend, place),
+          );
+          currentBackend.subscribe(applyEvent, { sinceByPlace });
+          let previousConnection: ConnectionState | null = null;
+          currentBackend.subscribeConnection((state) => {
+            set({ connection: state });
+            // call_stateはreplayされない。初回接続と再接続のどちらでも、WSが
+            // live配送可能になった時点の全量を読み、取得中のeventはcall storeで
+            // snapshotの後へreplayする。
+            if (state === "connected" && previousConnection !== "connected") {
+              void useCall.getState().hydrate();
+            }
+            previousConnection = state;
+          });
         })
         .catch(() => {
+          if (
+            backend !== currentBackend ||
+            messagingSessionIdentity !== currentSessionIdentity
+          ) {
+            return;
+          }
           initialized = false;
           set({ connection: "disconnected" });
         });
@@ -453,9 +1040,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ? state.channels.some(
               (channel) => channel.channelId === place.channelId,
             )
-          : state.dms.some(
-              (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
-            );
+          : place.kind === "thread"
+            ? state.threadsById[place.threadId] !== undefined
+            : state.dms.some(
+                (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
+              );
       if (!known) return;
       set((state) => ({
         activePlaceKey: key,
@@ -467,6 +1056,98 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       }));
       void loadPlace(place);
+    },
+
+    async createChannel(name, topic, voice = false) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      const channel = await backend.createChannel(
+        workspaceId,
+        name,
+        topic,
+        voice,
+      );
+      set((state) =>
+        state.channels.some((entry) => entry.channelId === channel.channelId)
+          ? {}
+          : { channels: [...state.channels, channel] },
+      );
+      return placeKey({ kind: "channel", channelId: channel.channelId });
+    },
+
+    async startDM(participants) {
+      const [first] = participants;
+      if (!first) throw new Error("participants are required");
+      const dm =
+        participants.length === 1
+          ? await backend.ensureDM(first)
+          : await backend.createGroupDM(participants);
+      set((state) =>
+        state.dms.some((entry) => entry.dmId === dm.dmId)
+          ? {}
+          : { dms: [...state.dms, dm] },
+      );
+      return placeKey({ kind: dm.kind, dmId: dm.dmId });
+    },
+
+    async loadThreads(parentKey) {
+      const parent = parsePlaceKey(parentKey);
+      if (parent?.kind !== "channel") return;
+      if (get().threadsLoadedForPlace[parentKey]) return;
+      const currentBackend = backend;
+      const versionsAtStart = new Map(threadProjectionVersions);
+      const threads = await currentBackend.fetchThreads(parent);
+      if (backend !== currentBackend) return;
+      set((state) => {
+        const threadsById = { ...state.threadsById };
+        let skippedStaleThread = false;
+        for (const thread of threads) {
+          if (
+            (threadProjectionVersions.get(thread.threadId) ?? 0) !==
+            (versionsAtStart.get(thread.threadId) ?? 0)
+          ) {
+            skippedStaleThread = true;
+            continue;
+          }
+          threadsById[thread.threadId] = thread;
+        }
+        return {
+          threadsById,
+          threadsLoadedForPlace: {
+            ...state.threadsLoadedForPlace,
+            [parentKey]: !skippedStaleThread,
+          },
+        };
+      });
+    },
+
+    async createThread(parentKey, name, originMessageId) {
+      const parent = parsePlaceKey(parentKey);
+      if (!parent) throw new Error("unknown place");
+      const thread = await backend.createThread(parent, name, originMessageId);
+      set((state) => ({
+        threadsById: { ...state.threadsById, [thread.threadId]: thread },
+      }));
+      return placeKey({ kind: "thread", threadId: thread.threadId });
+    },
+
+    async updateChannel(channelId, input) {
+      const channel = await backend.updateChannel(channelId, input);
+      set((state) => ({
+        channels: state.channels.map((entry) =>
+          entry.channelId === channel.channelId ? channel : entry,
+        ),
+      }));
+    },
+
+    async duplicateChannel(channelId) {
+      const channel = await backend.duplicateChannel(channelId);
+      set((state) =>
+        state.channels.some((entry) => entry.channelId === channel.channelId)
+          ? {}
+          : { channels: [...state.channels, channel] },
+      );
+      return placeKey({ kind: "channel", channelId: channel.channelId });
     },
 
     async loadPlaceAround(key, seq) {
@@ -492,22 +1173,31 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return messages.some((message) => message.seq === seq);
     },
 
+    searchMessages(query) {
+      return backend.searchMessages(query, { limit: 20 });
+    },
+
     setDraft(key, draft) {
       set((state) => ({
         draftByPlace: { ...state.draftByPlace, [key]: draft },
       }));
     },
 
-    send(content, urgency) {
+    send(content, urgency, attachments = [], poll = null) {
       const state = get();
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       const trimmed = content.trim();
-      if (!key || !place || !trimmed || !state.self) return;
+      // 添付だけの送信は普通のこと。本文も添付も無いときだけ送らない。
+      if (!key || !place || !state.self) return;
+      // 問いだけの送信も普通のこと。本文も添付も投票も無いときだけ送らない。
+      if (!trimmed && attachments.length === 0 && !poll) return;
       const pending: PendingMessage = {
         clientNonce: secureRandomUUID(),
         content: trimmed,
         mentions: resolveMentions(trimmed, state.membersByKey, state.selfKey),
+        attachments,
+        poll,
         urgency,
         replyTo: state.replyTargetId,
         createdAt: Date.now(),
@@ -521,6 +1211,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
         replyTargetId: null,
       }));
       dispatchSend(key, pending);
+    },
+
+    uploadAttachment(file) {
+      return backend.uploadAttachment(file);
+    },
+
+    updateAttachment(attachmentId, patch) {
+      return backend.updateAttachment(attachmentId, patch);
     },
 
     retrySend(clientNonce) {
@@ -601,8 +1299,90 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend.markRead(place, seq);
     },
 
-    setStatus(status, note) {
-      void backend.setStatus(status, note).catch(() => undefined);
+    setStatus(status, note, expiresAt = null) {
+      void backend.setStatus(status, note, expiresAt).catch(() => undefined);
+    },
+
+    async refreshRoles() {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) return;
+      const snapshot = await backend.fetchRoles(workspaceId);
+      set({
+        roles: snapshot.roles,
+        roleAssignments: snapshot.roleAssignments,
+        permissions: snapshot.permissions,
+      });
+    },
+
+    async createRole(input) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.createRole(workspaceId, input);
+      await get().refreshRoles();
+    },
+
+    async updateRole(roleId, input) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.updateRole(workspaceId, roleId, input);
+      await get().refreshRoles();
+    },
+
+    async deleteRole(roleId) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.deleteRole(workspaceId, roleId);
+      await get().refreshRoles();
+    },
+
+    async setMemberRoles(participant, roleIds) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.setMemberRoles(workspaceId, participant, roleIds);
+      await get().refreshRoles();
+    },
+
+    async updateProfile(input) {
+      const member = await backend.updateProfile(input);
+      set((state) => ({
+        membersByKey: {
+          ...state.membersByKey,
+          [participantKey(member.participant)]: member,
+        },
+      }));
+    },
+
+    setPlaceNotificationLevel(key, level) {
+      const state = get();
+      pushNotificationSetting({
+        defaultLevel: state.notificationDefaultLevel,
+        levelByPlace: { ...state.notificationLevelByPlace, [key]: level },
+        keywords: state.notificationKeywords,
+      });
+    },
+
+    setNotificationDefaultLevel(level) {
+      const state = get();
+      pushNotificationSetting({
+        defaultLevel: level,
+        levelByPlace: state.notificationLevelByPlace,
+        keywords: state.notificationKeywords,
+      });
+    },
+
+    setNotificationKeywords(keywords) {
+      const state = get();
+      pushNotificationSetting({
+        defaultLevel: state.notificationDefaultLevel,
+        levelByPlace: state.notificationLevelByPlace,
+        keywords,
+      });
+    },
+
+    // 音は端末の設定。サーバーへは送らないので、他の端末の鳴り方は変わらない。
+    setNotificationSoundEnabled(enabled) {
+      persistNotificationSound(enabled);
+      set({ notificationSoundEnabled: enabled });
     },
 
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
@@ -612,6 +1392,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           message.messageId,
           Date.now() + delayMs,
         )
+        .catch(() => undefined);
+    },
+
+    votePoll(message, optionIds) {
+      void backend
+        .votePoll(message.place, message.messageId, optionIds)
         .catch(() => undefined);
     },
 
@@ -664,6 +1450,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 });
 
+/**
+ * 自分の権限セット。並行して作られたUI（チャンネルメニュー等）へ権限ゲートを
+ * 差し込みやすいよう、単純な述語として export する。
+ *
+ * 正本はサーバーで、ここはその写し。UIで隠すのは導線の整理であって、
+ * 強制ではない——実際の拒否はサーバーの 403 が行う。
+ */
+export function usePermissions(): {
+  can: (permission: Permission) => boolean;
+  permissions: PermissionSet;
+} {
+  const permissions = useMessaging((state) => state.permissions);
+  return {
+    permissions,
+    can: (permission: Permission) => permissions[permission] === true,
+  };
+}
+
+/** フック外（イベントハンドラ等）から同じ判定を使うための口。 */
+export function canDo(permission: Permission): boolean {
+  return useMessaging.getState().permissions[permission] === true;
+}
+
 let messagingSessionIdentity: string | null = null;
 
 export function getMessagingSessionIdentity(): string | null {
@@ -702,6 +1511,8 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  // 人が入れ替わるなら通話も終わる。前の人の部屋に残らない。
+  useCall.getState().reset();
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;
@@ -713,6 +1524,8 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -724,7 +1537,14 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
     draftByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
+    notificationDefaultLevel: "all",
+    notificationLevelByPlace: {},
+    notificationKeywords: [],
+    notificationSoundEnabled: isNotificationSoundEnabled(),
     employedAgents: [],
+    roles: [],
+    roleAssignments: [],
+    permissions: {},
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
     activePlaceKey: null,

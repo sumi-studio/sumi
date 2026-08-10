@@ -70,7 +70,7 @@ func (w world) workspaceWithChannel(t *testing.T, ctx context.Context) (Workspac
 			t.Fatalf("add member %s: %v", m.Key(), err)
 		}
 	}
-	ch, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "general", "日々のこと", w.humanA)
+	ch, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "general", "日々のこと", w.humanA, false)
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestChannelPostingFollowsWorkspaceMembership(t *testing.T) {
 	if _, err := w.store.PlaceFor(ctx, ch.PlaceID, Human(stranger)); !errors.Is(err, ErrPlaceNotFound) {
 		t.Fatalf("stranger view: got %v, want ErrPlaceNotFound", err)
 	}
-	if _, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "secret", "", Human(stranger)); !errors.Is(err, ErrNotAMember) {
+	if _, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "secret", "", Human(stranger), false); !errors.Is(err, ErrNotAMember) {
 		t.Fatalf("stranger create channel: got %v, want ErrNotAMember", err)
 	}
 
@@ -224,16 +224,22 @@ func TestDMReachabilityAndPairUniqueness(t *testing.T) {
 	w := newWorld(t, ctx)
 	w.workspaceWithChannel(t, ctx)
 
-	dm, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	dm, created, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}
-	same, err := w.store.EnsureDM(ctx, w.agent, w.humanA)
+	if !created {
+		t.Fatalf("first ensure must create the dm")
+	}
+	same, createdAgain, err := w.store.EnsureDM(ctx, w.agent, w.humanA)
 	if err != nil {
 		t.Fatalf("ensure dm again: %v", err)
 	}
 	if same.PlaceID != dm.PlaceID {
 		t.Fatalf("a pair must have exactly one dm: %s vs %s", same.PlaceID, dm.PlaceID)
+	}
+	if createdAgain {
+		t.Fatalf("second ensure must reuse the dm, not create one")
 	}
 
 	// No shared workspace, no reachability (v0 basis; Connection domain will
@@ -242,7 +248,7 @@ func TestDMReachabilityAndPairUniqueness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint stranger: %v", err)
 	}
-	if _, err := w.store.EnsureDM(ctx, w.humanA, Human(stranger)); !errors.Is(err, ErrNotReachable) {
+	if _, _, err := w.store.EnsureDM(ctx, w.humanA, Human(stranger)); !errors.Is(err, ErrNotReachable) {
 		t.Fatalf("unreachable dm: got %v, want ErrNotReachable", err)
 	}
 
@@ -407,4 +413,85 @@ func seqsOf(messages []Message) []int64 {
 		out[i] = m.Seq
 	}
 	return out
+}
+
+// A channel's name and topic are edited together or one at a time; an omitted
+// field is left alone. Duplication makes a new, empty place shaped like the
+// original — the messages stay with the channel that holds them.
+func TestUpdateAndDuplicateChannel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+		t.Fatalf("admit human: %v", err)
+	}
+	channel, err := w.store.CreateChannel(ctx, DefaultWorkspaceID, "dev", "開発の相談", w.humanA, false)
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	name := "design"
+	renamed, err := w.store.UpdateChannel(ctx, channel.PlaceID, &name, nil, w.humanA)
+	if err != nil {
+		t.Fatalf("rename channel: %v", err)
+	}
+	if renamed.Name != "design" || renamed.Topic != "開発の相談" {
+		t.Fatalf("renamed = %+v, want the topic left alone", renamed)
+	}
+
+	topic := "図面レビュー"
+	retopiced, err := w.store.UpdateChannel(ctx, channel.PlaceID, nil, &topic, w.humanA)
+	if err != nil {
+		t.Fatalf("retopic channel: %v", err)
+	}
+	if retopiced.Name != "design" || retopiced.Topic != topic {
+		t.Fatalf("retopiced = %+v, want the name left alone", retopiced)
+	}
+
+	empty := ""
+	if _, err := w.store.UpdateChannel(ctx, channel.PlaceID, &empty, nil, w.humanA); !errors.Is(err, ErrInvalidChannelName) {
+		t.Fatalf("empty rename err = %v, want ErrInvalidChannelName", err)
+	}
+
+	// A message in the original does not travel to the copy.
+	if _, _, err := w.store.AppendMessage(ctx, AppendInput{
+		PlaceID: channel.PlaceID, Author: w.humanA, Content: "ここに書きます",
+		Urgency: UrgencyNormal, ClientNonce: "nonce-dup",
+	}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	copied, err := w.store.DuplicateChannel(ctx, channel.PlaceID, "", w.humanA)
+	if err != nil {
+		t.Fatalf("duplicate channel: %v", err)
+	}
+	if copied.PlaceID == channel.PlaceID {
+		t.Fatal("duplicate returned the source place")
+	}
+	if copied.Name != "design のコピー" || copied.Topic != topic {
+		t.Fatalf("copy = %+v, want the derived name and the carried topic", copied)
+	}
+	history, err := w.store.History(ctx, copied.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil {
+		t.Fatalf("copy history: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("copy history = %d messages, want an empty place", len(history))
+	}
+
+	// A dm has no name to edit or copy.
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	if err != nil {
+		t.Fatalf("ensure dm: %v", err)
+	}
+	if _, err := w.store.UpdateChannel(ctx, dm.PlaceID, &name, nil, w.humanA); !errors.Is(err, ErrNotAChannel) {
+		t.Fatalf("dm rename err = %v, want ErrNotAChannel", err)
+	}
+	if _, err := w.store.DuplicateChannel(ctx, dm.PlaceID, "", w.humanA); !errors.Is(err, ErrNotAChannel) {
+		t.Fatalf("dm duplicate err = %v, want ErrNotAChannel", err)
+	}
+
+	// A channel the actor cannot see stays unrevealed rather than 403.
+	if _, err := w.store.UpdateChannel(ctx, newUUIDv7(), &name, nil, w.humanA); !errors.Is(err, ErrPlaceNotFound) {
+		t.Fatalf("unknown place err = %v, want ErrPlaceNotFound", err)
+	}
 }

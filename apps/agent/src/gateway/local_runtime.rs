@@ -36,8 +36,15 @@ use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
 use crate::apiclient::messaging::{
-    MessagingApi, OpenMessagingPlaceRequest, ReadMessagingThroughRequest,
-    WriteMessagingMessageRequest,
+    CreateMessagingChannelRequest, CreateMessagingPollRequest, CreateMessagingReplyLaterRequest,
+    CreateMessagingRoleRequest, CreateMessagingThreadRequest, DeleteMessagingRoleRequest,
+    DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, ListMessagingRolesRequest,
+    ListMessagingThreadsRequest, MessagingApi, MessagingNotificationSettingsRequest,
+    OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
+    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+    SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest, SetMessagingProfileRequest,
+    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+    UpdateMessagingRoleRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -500,12 +507,210 @@ impl MessagingApi for LocalControlHttpClient {
             .await
     }
 
+    async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<serde_json::Value> {
+        // The response echoes the full message (content up to 64 KiB plus its
+        // reaction state), so it shares the messaging screen bound rather than
+        // the tighter control-plane bound.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:react",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn set_status(
+        &self,
+        request: SetMessagingStatusRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:status", &request)
+            .await
+    }
+
+    async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:profile", &request)
+            .await
+    }
+
+    async fn roles(&self, request: ListMessagingRolesRequest<'_>) -> Result<serde_json::Value> {
+        // The response carries the whole member list, so it shares the
+        // messaging screen bound rather than the tighter control-plane one.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:roles",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_role(
+        &self,
+        request: CreateMessagingRoleRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:role-create", &request)
+            .await
+    }
+
+    async fn update_role(
+        &self,
+        request: UpdateMessagingRoleRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:role-update", &request)
+            .await
+    }
+
+    async fn delete_role(
+        &self,
+        request: DeleteMessagingRoleRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:role-delete", &request)
+            .await
+    }
+
+    async fn set_member_roles(
+        &self,
+        request: SetMessagingMemberRolesRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:member-roles", &request)
+            .await
+    }
+
+    async fn set_channel_topic(
+        &self,
+        request: SetMessagingChannelTopicRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:channel-topic", &request)
+            .await
+    }
+
+    async fn reply_later(
+        &self,
+        request: CreateMessagingReplyLaterRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:reply-later", &request)
+            .await
+    }
+
+    async fn resolve_reply_later(
+        &self,
+        request: ResolveMessagingReplyLaterRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:reply-later-resolve", &request)
+            .await
+    }
+
     async fn read_through(
         &self,
         request: ReadMessagingThroughRequest<'_>,
     ) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:read-through", &request)
             .await
+    }
+
+    async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:start-dm", &request)
+            .await
+    }
+
+    async fn create_channel(
+        &self,
+        request: CreateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:create-channel", &request)
+            .await
+    }
+
+    async fn update_channel(
+        &self,
+        request: UpdateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:update-channel", &request)
+            .await
+    }
+
+    async fn duplicate_channel(
+        &self,
+        request: DuplicateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:duplicate-channel", &request)
+            .await
+    }
+
+    async fn search(&self, request: SearchMessagingRequest<'_>) -> Result<serde_json::Value> {
+        // Up to 50 hits, each carrying a snippet — a result list, not a
+        // timeline, but still wider than the control-plane bound.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:search",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn notification_settings(
+        &self,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:notification-settings",
+            &request,
+        )
+        .await
+    }
+
+    async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:attention", &request)
+            .await
+    }
+
+    async fn call_state(
+        &self,
+        request: GetMessagingCallStateRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:call-state", &request)
+            .await
+    }
+
+    async fn threads(&self, request: ListMessagingThreadsRequest<'_>) -> Result<serde_json::Value> {
+        // A channel's thread list carries one preview line per thread, so it
+        // shares the messaging screen bound rather than the control-plane one.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:threads",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_thread(
+        &self,
+        request: CreateMessagingThreadRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:create-thread", &request)
+            .await
+    }
+
+    async fn create_poll(
+        &self,
+        request: CreateMessagingPollRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        // The response echoes the committed message, so it shares the
+        // messaging screen bound rather than the control-plane one.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:create-poll",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn vote_poll(&self, request: VoteMessagingPollRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:vote-poll",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
     }
 }
 

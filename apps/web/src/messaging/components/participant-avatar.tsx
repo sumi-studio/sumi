@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { StatusKind } from "../model";
 
 /**
@@ -13,10 +14,17 @@ function hueFor(key: string): number {
   return ((hash % 360) + 360) % 360;
 }
 
-const STATUS_DOT: Record<StatusKind, string> = {
+/** 自己申告ステータスの色と日本語表示。参加者UI全体で1か所に持つ。 */
+export const STATUS_DOT: Record<StatusKind, string> = {
   available: "bg-emerald-500",
   busy: "bg-rose-500",
   away: "bg-amber-400",
+};
+
+export const STATUS_LABEL: Record<StatusKind, string> = {
+  available: "対応可能",
+  busy: "取り込み中",
+  away: "離席中",
 };
 
 export function ParticipantAvatar({
@@ -24,13 +32,18 @@ export function ParticipantAvatar({
   name,
   size = 32,
   status,
+  src,
 }: {
   participantKey: string;
   name: string;
   size?: number;
   status?: StatusKind;
+  /** 本人が設定した画像。無ければ頭文字にフォールバックする。 */
+  src?: string;
 }) {
   const hue = hueFor(participantKey);
+  const [failedSrc, setFailedSrc] = useState<string>();
+  const showImage = Boolean(src && src !== failedSrc);
   return (
     <span
       className="relative inline-flex shrink-0 select-none items-center justify-center rounded-full font-medium"
@@ -43,7 +56,19 @@ export function ParticipantAvatar({
       }}
       aria-hidden
     >
-      {name.slice(0, 1).toUpperCase()}
+      {showImage ? (
+        // ステータスの点は円の外側に環を持つので、切り抜きは画像だけに掛ける。
+        <span className="absolute inset-0 overflow-hidden rounded-full">
+          <img
+            src={src}
+            alt=""
+            className="size-full object-cover"
+            onError={() => setFailedSrc(src)}
+          />
+        </span>
+      ) : (
+        name.slice(0, 1).toUpperCase()
+      )}
       {status ? (
         <span
           className={`absolute right-0 bottom-0 block rounded-full ring-2 ring-background ${STATUS_DOT[status]}`}

@@ -1,0 +1,377 @@
+// @vitest-environment jsdom
+
+import "@testing-library/jest-dom/vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  lockedMessageId,
+  lockMessageActions,
+  resetMessageActionLock,
+} from "../message-action-lock";
+import type {
+  MemberProfile,
+  Message,
+  ParticipantKey,
+  ParticipantRef,
+} from "../model";
+import { participantKey } from "../model";
+import {
+  noteEmojiUsed,
+  recentEmojis,
+  resetRecentEmojis,
+} from "../recent-emoji";
+import { MessageItem } from "./message-item";
+
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => vi.fn(),
+}));
+
+const human: ParticipantRef = { kind: "human", humanId: "h1" };
+const agent: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a1",
+};
+const selfKey: ParticipantKey = participantKey(human);
+
+const membersByKey: Record<ParticipantKey, MemberProfile> = {
+  [participantKey(human)]: {
+    participant: human,
+    displayName: "余白",
+    tagline: "創業・デザイン",
+  },
+  [participantKey(agent)]: {
+    participant: agent,
+    displayName: "墨",
+    tagline: "秘書",
+    avatarUrl: "/messaging/attachments/agent-avatar",
+  },
+};
+
+function makeMessage(overrides: Partial<Message> = {}): Message {
+  return {
+    messageId: "m1",
+    place: { kind: "channel", channelId: "c1" },
+    seq: 1,
+    author: human,
+    content: "本文です",
+    mentions: [],
+    urgency: "normal",
+    reactions: [],
+    attachments: [],
+    replyTo: null,
+    createdAt: Date.UTC(2026, 0, 1, 3, 0),
+    editedAt: null,
+    deleted: false,
+    ...overrides,
+  };
+}
+
+function renderItem(
+  message: Message,
+  props: Partial<React.ComponentProps<typeof MessageItem>> = {},
+) {
+  const noop = () => undefined;
+  return render(
+    <MessageItem
+      message={message}
+      grouped={false}
+      pending={false}
+      failed={false}
+      selfKey={selfKey}
+      membersByKey={membersByKey}
+      replyLaterBy={[]}
+      allowReactions
+      allowReplyLater
+      findMessage={() => undefined}
+      onReply={noop}
+      onReplyLater={noop}
+      onToggleReaction={noop}
+      onCopyLink={() => Promise.resolve(true)}
+      onEdit={noop}
+      onDelete={noop}
+      onJumpTo={noop}
+      onRetry={noop}
+      editing={false}
+      onSubmitEdit={noop}
+      onCancelEdit={noop}
+      {...props}
+    />,
+  );
+}
+
+beforeEach(() => {
+  resetRecentEmojis();
+  resetMessageActionLock();
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe("MessageItem の行の見せ方", () => {
+  it("操作チップは対象メッセージの要素の内側に置かれる", () => {
+    const { container } = renderItem(makeMessage());
+    const row = container.querySelector("[data-message-id='m1']");
+    const toolbar = screen.getByLabelText("返信").closest("div");
+    expect(row).not.toBeNull();
+    expect(row?.contains(toolbar ?? null)).toBe(true);
+    // 行の外へはみ出さない（translateで上へ逃がさない）。
+    expect(toolbar?.className).not.toContain("-translate-y-1/2");
+  });
+
+  it("行にはホバー時のハイライトと左端の目印がある", () => {
+    const { container } = renderItem(makeMessage());
+    const row = container.querySelector("[data-message-id='m1']");
+    expect(row?.className).toContain("hover:bg-accent");
+    const marker = row?.querySelector("span[aria-hidden]");
+    expect(marker?.className).toContain("group-hover:bg-primary/50");
+  });
+
+  it("返信引用は本文と同じ左端に揃い、投稿者のミニアバターを伴う", () => {
+    const target = makeMessage({
+      messageId: "m0",
+      seq: 0,
+      author: agent,
+      content: "元のメッセージ",
+    });
+    renderItem(makeMessage({ messageId: "m1", replyTo: "m0" }), {
+      findMessage: (id) => (id === "m0" ? target : undefined),
+    });
+    const quote = screen.getByTitle("墨 の返信元へ移動");
+    expect(quote).toHaveTextContent("墨");
+    expect(quote).toHaveTextContent("元のメッセージ");
+    expect(quote.querySelector("img")).toHaveAttribute(
+      "src",
+      "/messaging/attachments/agent-avatar",
+    );
+    // カギ線 → ミニアバター → 名前 → 抜粋 の順で一つの階層に並ぶ。
+    const connector = quote.querySelector("span[aria-hidden]");
+    expect(connector?.className).toContain("border-l-2");
+    expect(quote.querySelectorAll("span[aria-hidden]").length).toBeGreaterThan(
+      1,
+    );
+  });
+
+  it("本文のない返信元は「添付ファイル」と示す", () => {
+    const target = makeMessage({ messageId: "m0", seq: 0, content: "" });
+    renderItem(makeMessage({ messageId: "m1", replyTo: "m0" }), {
+      findMessage: () => target,
+    });
+    expect(screen.getByTitle("余白 の返信元へ移動")).toHaveTextContent(
+      "添付ファイル",
+    );
+  });
+});
+
+describe("リンクのコピー", () => {
+  it("成功したらチェック表示へ一時的に変わる", async () => {
+    const onCopyLink = vi.fn().mockResolvedValue(true);
+    renderItem(makeMessage(), { onCopyLink });
+    fireEvent.click(screen.getByLabelText("リンクをコピー"));
+    expect(onCopyLink).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.getByLabelText("リンクをコピーしました")).toBeVisible(),
+    );
+  });
+
+  it("失敗したら成功と偽らず、失敗として示す", async () => {
+    const onCopyLink = vi.fn().mockResolvedValue(false);
+    renderItem(makeMessage(), { onCopyLink });
+    fireEvent.click(screen.getByLabelText("リンクをコピー"));
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("リンクをコピーできませんでした"),
+      ).toBeVisible(),
+    );
+    expect(screen.queryByLabelText("リンクをコピーしました")).toBeNull();
+  });
+});
+
+describe("インライン編集", () => {
+  it("編集中は本文の位置に入力欄とヒントが出て、操作チップは引っ込む", () => {
+    renderItem(makeMessage({ content: "編集前" }), { editing: true });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    expect(textarea).toHaveValue("編集前");
+    expect(screen.getByText("Escでキャンセル・Enterで保存")).toBeVisible();
+    expect(screen.queryByLabelText("返信")).toBeNull();
+  });
+
+  it("Enterで保存し、Escで取り消す", () => {
+    const onSubmitEdit = vi.fn();
+    const onCancelEdit = vi.fn();
+    renderItem(makeMessage({ content: "編集前" }), {
+      editing: true,
+      onSubmitEdit,
+      onCancelEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: "編集後" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSubmitEdit).toHaveBeenCalledWith("編集後");
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it("IME変換中のEnter・Escは編集の操作として奪わない", () => {
+    const onSubmitEdit = vi.fn();
+    const onCancelEdit = vi.fn();
+    renderItem(makeMessage(), {
+      editing: true,
+      onSubmitEdit,
+      onCancelEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(textarea, { key: "Escape", isComposing: true });
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+    expect(onCancelEdit).not.toHaveBeenCalled();
+  });
+
+  it("Shift+Enterと未閉鎖のコードフェンス内では保存しない", () => {
+    const onSubmitEdit = vi.fn();
+    renderItem(makeMessage({ content: "```ts" }), {
+      editing: true,
+      onSubmitEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+  });
+
+  it("空にして保存しようとしたら削除ではなく取消として扱う", () => {
+    const onSubmitEdit = vi.fn();
+    const onCancelEdit = vi.fn();
+    renderItem(makeMessage({ content: "編集前" }), {
+      editing: true,
+      onSubmitEdit,
+      onCancelEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: "   " } });
+    fireEvent.click(screen.getByText("保存"));
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("リアクションの選択", () => {
+  it("直近使用の3つがピッカー無しでチップに並ぶ", () => {
+    noteEmojiUsed("🔥");
+    noteEmojiUsed("🚀");
+    const onToggleReaction = vi.fn();
+    renderItem(makeMessage(), { onToggleReaction });
+    // 直近が先頭。足りない分は既定で埋める。
+    expect(screen.getByLabelText("進める でリアクション")).toBeVisible();
+    expect(screen.getByLabelText("熱い でリアクション")).toBeVisible();
+    fireEvent.click(screen.getByLabelText("進める でリアクション"));
+    expect(onToggleReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "m1" }),
+      "🚀",
+    );
+  });
+
+  it("使った絵文字が直近の先頭へ来る", () => {
+    const { unmount } = renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("完了 でリアクション"));
+    unmount();
+    cleanup();
+    renderItem(makeMessage());
+    const quick = screen
+      .getAllByRole("button")
+      .filter((node) =>
+        node.getAttribute("aria-label")?.endsWith("でリアクション"),
+      );
+    expect(quick[0]).toHaveAccessibleName("完了 でリアクション");
+  });
+
+  it("自分のリアクションを外すときは直近の並びを変えない", () => {
+    noteEmojiUsed("✅");
+    noteEmojiUsed("🔥");
+    const onToggleReaction = vi.fn();
+    renderItem(
+      makeMessage({
+        reactions: [{ emoji: "✅", participants: [human] }],
+      }),
+      { onToggleReaction },
+    );
+
+    fireEvent.click(screen.getByLabelText("完了 でリアクション"));
+
+    expect(recentEmojis()).toEqual(["🔥", "✅"]);
+    expect(onToggleReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "m1" }),
+      "✅",
+    );
+  });
+
+  it("ピッカーは検索・カテゴリ・最近から選べる", async () => {
+    noteEmojiUsed("🐛");
+    const onToggleReaction = vi.fn();
+    renderItem(makeMessage(), { onToggleReaction });
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    const search = await screen.findByLabelText("絵文字を検索");
+    expect(screen.getByText("最近使った絵文字")).toBeVisible();
+    expect(screen.getByTitle("顔・気持ち")).toBeVisible();
+    fireEvent.change(search, { target: { value: "祝" } });
+    const found = await screen.findByTitle("祝う");
+    fireEvent.click(found);
+    expect(onToggleReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "m1" }),
+      "🎉",
+    );
+  });
+
+  it("見つからない検索語では素直に見つからないと言う", async () => {
+    renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    const search = await screen.findByLabelText("絵文字を検索");
+    fireEvent.change(search, { target: { value: "zzzznotfound" } });
+    expect(await screen.findByText("見つかりませんでした")).toBeVisible();
+  });
+});
+
+describe("操作対象の固定", () => {
+  it("ピッカーを開いている間、その行が対象を握り続ける", async () => {
+    const { container } = renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    await screen.findByLabelText("絵文字を検索");
+    await waitFor(() =>
+      expect(
+        container.querySelector("[data-message-id='m1'][data-holds-actions]"),
+      ).not.toBeNull(),
+    );
+  });
+
+  it("他の行がパネルを開いている間は自分のチップを出さない", async () => {
+    // 別のメッセージが対象を握っている状態を作る。
+    const first = renderItem(makeMessage({ messageId: "m1" }));
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    await screen.findByLabelText("絵文字を検索");
+    first.unmount();
+    // アンマウントで手放されるので、握ったままの状態を直接作って確認する。
+    lockMessageActions("other");
+    const { container } = renderItem(makeMessage({ messageId: "m1" }));
+    expect(screen.queryByLabelText("返信")).toBeNull();
+    expect(
+      container.querySelector("[data-message-id='m1']")?.className,
+    ).not.toContain("hover:bg-accent");
+  });
+
+  it("行が消えるときは対象の固定を手放す", async () => {
+    const view = renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    await screen.findByLabelText("絵文字を検索");
+    expect(lockedMessageId()).toBe("m1");
+    view.unmount();
+    expect(lockedMessageId()).toBeNull();
+  });
+});
