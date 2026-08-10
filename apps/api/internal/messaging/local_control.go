@@ -2,10 +2,13 @@ package messaging
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,8 +24,12 @@ const (
 	// browser surface has separate cookie-authenticated upload/download routes.
 	LocalUploadAttachmentPath = "/local-control/v1/messaging:upload"
 	LocalAttachmentPath       = "/local-control/v1/messaging:attachment"
-	LocalReactPath            = "/local-control/v1/messaging:react"
-	LocalStatusPath           = "/local-control/v1/messaging:status"
+	// LocalDownloadAttachmentPath streams the complete authorized blob to the
+	// Agent runtime. The runtime, not Messaging, owns the destination workspace
+	// path and atomic file installation.
+	LocalDownloadAttachmentPath = "/local-control/v1/messaging:attachment-download"
+	LocalReactPath              = "/local-control/v1/messaging:react"
+	LocalStatusPath             = "/local-control/v1/messaging:status"
 	// LocalProfilePath は agent が自分の名乗り（表示名・tagline）を読み書きする口。
 	// 人間が個人設定画面から行うのと同じ Store 経路を通る（AX: UIだけにある操作を
 	// 作らない）。
@@ -100,6 +107,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalWritePath, s.localWrite},
 		{"POST " + LocalUploadAttachmentPath, s.localUploadAttachment},
 		{"POST " + LocalAttachmentPath, s.localAttachment},
+		{"POST " + LocalDownloadAttachmentPath, s.localDownloadAttachment},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
 		{"POST " + LocalProfilePath, s.localProfile},
@@ -481,6 +489,63 @@ func (s *Server) localAttachment(w http.ResponseWriter, r *http.Request, authori
 		MessageID string `json:"message_id,omitempty"`
 		Data      string `json:"data"`
 	}{attachmentToWire(att), att.MessageID, base64.StdEncoding.EncodeToString(payload)})
+}
+
+// localDownloadAttachment is the full Human/Agent capability-parity lane for
+// attachment bytes. Messaging resolves and authorizes the exact attachment,
+// then streams an immutable byte commitment. The Agent foundation separately
+// confines and atomically installs those bytes at its chosen private-workspace
+// path; no host path or base64 payload enters the model-visible result.
+func (s *Server) localDownloadAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		AttachmentID string `json:"attachment_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	att, err := s.Store.AttachmentForViewer(r.Context(), request.AttachmentID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if att.SizeBytes <= 0 || att.SizeBytes > MaxAttachmentBytes {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	blob, err := s.Attachments.Open(att.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	defer blob.Close()
+
+	digest := sha256.New()
+	size, err := io.Copy(digest, io.LimitReader(blob, MaxAttachmentBytes+1))
+	if err != nil || size != att.SizeBytes {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if _, err := blob.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	header := w.Header()
+	header.Set("Content-Type", "application/octet-stream")
+	header.Set("Content-Length", strconv.FormatInt(size, 10))
+	header.Set("X-Sumi-Content-SHA256", hex.EncodeToString(digest.Sum(nil)))
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Cache-Control", "private, no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.CopyN(w, blob, size)
 }
 
 // localReact states the agent's desired emoji state through the identical

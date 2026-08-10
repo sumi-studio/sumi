@@ -3,6 +3,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -569,6 +570,71 @@ func TestAgentUploadsAndSendsAttachmentThroughPAIDBoundControl(t *testing.T) {
 	decoded, err := base64.StdEncoding.DecodeString(fetched.Data)
 	if err != nil || !bytes.Equal(decoded, payload) {
 		t.Fatalf("local attachment bytes = %v, decode error %v", decoded, err)
+	}
+}
+
+func TestLocalAttachmentDownloadStreamsTheFullAuthorizedCommitment(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, place, messagingServer, ts := newAuthorizedAttachmentLocalControlServer(t, ctx)
+	messagingServer.Sessions = stubSessions{}
+	messagingServer.AllowedOrigins = []string{testOrigin}
+	publicMux := http.NewServeMux()
+	messagingServer.RegisterRoutes(publicMux)
+	publicTS := httptest.NewServer(publicMux)
+	t.Cleanup(publicTS.Close)
+
+	payload := bytes.Repeat([]byte("full-size-agent-download"),
+		int(MaxAttachmentBytes)/len("full-size-agent-download")+1)
+	payload = payload[:MaxAttachmentBytes]
+	response, uploadBody := upload(
+		t, publicTS, w.humanA.ID, "archive.bin", "application/octet-stream", payload,
+	)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("full-size Human upload = %d %v, want 201", response.StatusCode, uploadBody)
+	}
+	uploadedID := attachmentID(t, uploadBody)
+	response, sendBody := call(t, publicTS, http.MethodPost,
+		"/messaging/places/"+place.PlaceID+"/messages", w.humanA.ID, map[string]any{
+			"content":      "full attachment",
+			"client_nonce": "human-full-download",
+			"attachments":  []string{uploadedID},
+		})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("Human bind of full-size attachment = %d %v, want 201", response.StatusCode, sendBody)
+	}
+
+	response, downloaded := postLocalJSON(t, ctx, ts, LocalDownloadAttachmentPath, map[string]any{
+		"attachment_id": uploadedID,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("download full-size attachment = %d %s, want 200", response.StatusCode, downloaded)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if !bytes.Equal(downloaded, payload) || response.ContentLength != MaxAttachmentBytes ||
+		response.Header.Get("X-Sumi-Content-SHA256") != wantDigest ||
+		response.Header.Get("Content-Type") != "application/octet-stream" ||
+		response.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("download commitment mismatch: bytes=%d content-length=%d digest=%q type=%q encoding=%q",
+			len(downloaded), response.ContentLength,
+			response.Header.Get("X-Sumi-Content-SHA256"), response.Header.Get("Content-Type"),
+			response.Header.Get("Content-Encoding"))
+	}
+
+	// The same membership that authorizes Human history authorizes the Agent's
+	// stream. Closing that tenure revokes it immediately; there is no cached or
+	// attachment-specific authority to outlive the Workspace decision.
+	if err := w.store.RemoveWorkspaceMember(ctx, place.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("revoke agent workspace membership: %v", err)
+	}
+	response, downloaded = postLocalJSON(t, ctx, ts, LocalDownloadAttachmentPath, map[string]any{
+		"attachment_id": uploadedID,
+	})
+	if response.StatusCode != http.StatusNotFound ||
+		!bytes.Contains(downloaded, []byte(`"error":"attachment_not_found"`)) ||
+		bytes.Contains(downloaded, payload[:64]) {
+		t.Fatalf("download after tenure revocation = %d %s, want indistinguishable 404",
+			response.StatusCode, downloaded)
 	}
 }
 
