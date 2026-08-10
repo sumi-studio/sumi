@@ -11,6 +11,7 @@ import type {
   PlaceKey,
   ServerEvent,
 } from "./model";
+import { resetNotificationAudio } from "./notifications";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
@@ -220,6 +221,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   bindMessagingSessionIdentity(null);
+  resetNotificationAudio();
   localStorage.clear();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -448,6 +450,54 @@ describe("presenting an incoming message", () => {
       notify: { reason: "mention" },
     });
 
+    expect(FakeNotification.constructed).toHaveLength(0);
+  });
+
+  it("presents a called message after the current place is explicitly cleared", () => {
+    const startTone = vi.fn();
+    const gainNode = () => ({
+      gain: {
+        value: 0,
+        setValueAtTime: vi.fn(),
+        exponentialRampToValueAtTime: vi.fn(),
+      },
+      connect: vi.fn(),
+    });
+    class FakeAudioContext {
+      currentTime = 0;
+      destination = {};
+      resume = vi.fn();
+      createGain = vi.fn(gainNode);
+      createOscillator = vi.fn(() => ({
+        type: "",
+        frequency: { setValueAtTime: vi.fn() },
+        connect: vi.fn(),
+        start: startTone,
+        stop: vi.fn(),
+      }));
+    }
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+    resetNotificationAudio();
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    useMessaging.setState({
+      activePlaceKey: CHANNEL_KEY,
+      editingMessageId: "editing-in-channel",
+      replyTargetId: "replying-in-channel",
+    });
+
+    useMessaging.getState().clearPlaceSelection();
+    backend.emit({
+      type: "message_created",
+      message: incoming(),
+      notify: { reason: "mention" },
+    });
+
+    expect(useMessaging.getState()).toMatchObject({
+      activePlaceKey: null,
+      editingMessageId: null,
+      replyTargetId: null,
+    });
+    expect(startTone).toHaveBeenCalledTimes(2);
     expect(FakeNotification.constructed).toHaveLength(0);
   });
 });

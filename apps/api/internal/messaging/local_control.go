@@ -66,10 +66,6 @@ func (s *Server) localOverview(w http.ResponseWriter, r *http.Request, authoriza
 		return
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	overview, err := s.buildOverview(r.Context(), viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -98,10 +94,6 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 		request.Limit = 50
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -151,10 +143,6 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		return
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -205,10 +193,6 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		return
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -256,10 +240,6 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 		expiresAt = &moment
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	status, err := s.Store.SetStatus(r.Context(), viewer, request.Status, request.Note, expiresAt)
 	if err != nil {
 		writeStoreError(w, err)
@@ -298,10 +278,6 @@ func (s *Server) localReplyLater(w http.ResponseWriter, r *http.Request, authori
 		remindAt = time.Now().Add(time.Duration(request.RemindInMinutes) * time.Minute)
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	marker, created, err := s.Store.CreateReplyLater(
 		r.Context(), request.PlaceID, request.MessageID, viewer, request.Note, remindAt)
 	if err != nil {
@@ -337,10 +313,6 @@ func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	marker, err := s.Store.ResolveReplyLater(r.Context(), request.MarkerID, viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -370,10 +342,6 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	current, err := s.Store.NotificationSettingFor(r.Context(), viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -423,10 +391,6 @@ func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, author
 		return
 	}
 	viewer := localViewer(authorization)
-	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	if err := s.Store.ReadThrough(r.Context(), request.PlaceID, viewer, request.Seq); err != nil {
 		writeStoreError(w, err)
 		return

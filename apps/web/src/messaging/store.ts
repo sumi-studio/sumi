@@ -98,7 +98,12 @@ interface MessagingState {
 
   init(): void;
   selectPlace(key: PlaceKey): void;
-  createChannel(name: string, topic: string): Promise<PlaceKey>;
+  clearPlaceSelection(): void;
+  createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannelTopic(channelId: string, topic: string): Promise<void>;
@@ -1180,10 +1185,38 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void loadPlace(place);
     },
 
-    async createChannel(name, topic) {
-      const workspaceId = get().workspaces[0]?.workspaceId;
-      if (!workspaceId) throw new Error("workspace is not ready");
-      const channel = await backend.createChannel(workspaceId, name, topic);
+    clearPlaceSelection() {
+      const state = get();
+      if (
+        state.activePlaceKey === null &&
+        state.editingMessageId === null &&
+        state.replyTargetId === null
+      ) {
+        return;
+      }
+      set({
+        activePlaceKey: null,
+        editingMessageId: null,
+        replyTargetId: null,
+      });
+    },
+
+    async createChannel(workspaceId, name, topic) {
+      const currentBackend = backend;
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
+      const channel = await currentBackend.createChannel(
+        workspaceId,
+        name,
+        topic,
+      );
+      if (
+        backend !== currentBackend ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during channel creation");
+      }
       set((state) =>
         state.channels.some((entry) => entry.channelId === channel.channelId)
           ? {}

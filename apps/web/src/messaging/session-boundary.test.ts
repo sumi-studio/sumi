@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
-import type { DmSummary } from "./model";
+import type { ChannelSummary, DmSummary } from "./model";
 import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
@@ -169,5 +169,55 @@ describe("messaging session boundary", () => {
       "Messaging session changed during DM start",
     );
     expect(useMessaging.getState().dms).toEqual([]);
+  });
+
+  it("creates a channel only in the explicitly named Workspace", async () => {
+    bindMessagingSessionIdentity("human-a");
+    const server = new MockMessagingServer();
+    const create = vi.spyOn(server, "createChannel");
+    installMessagingBackend(server);
+
+    await useMessaging
+      .getState()
+      .createChannel("workspace-explicit", "dev", "開発");
+
+    expect(create).toHaveBeenCalledWith("workspace-explicit", "dev", "開発");
+  });
+
+  it("rejects a deferred channel result after the messaging identity changes", async () => {
+    bindMessagingSessionIdentity("human-a");
+    const server = new MockMessagingServer();
+    let resolveChannel!: (channel: ChannelSummary) => void;
+    const deferredChannel = new Promise<ChannelSummary>((resolve) => {
+      resolveChannel = resolve;
+    });
+    vi.spyOn(server, "createChannel").mockReturnValue(deferredChannel);
+    installMessagingBackend(server);
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "human-a" },
+      selfKey: "human:human-a",
+      workspaces: [{ workspaceId: "workspace-a", name: "A" }],
+      channels: [],
+    });
+
+    const operation = useMessaging
+      .getState()
+      .createChannel("workspace-a", "private-a", "A only");
+    bindMessagingSessionIdentity(null);
+    bindMessagingSessionIdentity("human-b");
+    resolveChannel({
+      channelId: "stale-channel",
+      workspaceId: "workspace-a",
+      name: "private-a",
+      topic: "A only",
+      visibility: "private",
+    });
+
+    await expect(operation).rejects.toThrow(
+      "Messaging session changed during channel creation",
+    );
+    expect(useMessaging.getState().workspaces).toEqual([]);
+    expect(useMessaging.getState().channels).toEqual([]);
   });
 });

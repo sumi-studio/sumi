@@ -306,15 +306,13 @@ func TestLocalReactTogglesForTheAgent(t *testing.T) {
 	defer cancel()
 	w := newWorld(t, ctx)
 	server := NewServer(w.store, nil)
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
-		t.Fatalf("admit human: %v", err)
-	}
-	msg := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "generalの発言")
+	_, channel := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, channel.PlaceID, w.humanA, "generalの発言")
 
 	react := func(emoji, clientNonce string) (int, map[string]any) {
 		t.Helper()
 		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{
-			"place_id": DefaultGeneralChannelID, "message_id": msg.MessageID, "emoji": emoji,
+			"place_id": channel.PlaceID, "message_id": msg.MessageID, "emoji": emoji,
 			"client_nonce": clientNonce,
 		}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
 	}

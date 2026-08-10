@@ -174,7 +174,7 @@ describe("MemberList DM action", () => {
   it("rechecks identity after store completion before dialog navigation", async () => {
     const startDM = vi.fn(resolveThenSwitchIdentity);
     useMessaging.setState({ startDM });
-    render(<Sidebar />);
+    render(<Sidebar selectedPlaceKey={null} />);
 
     fireEvent.click(screen.getByTitle("ダイレクトメッセージを開始"));
     const dialog = screen.getByRole("dialog", {

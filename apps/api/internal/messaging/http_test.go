@@ -93,7 +93,7 @@ func TestMessagingRoutesFailClosedOnOriginAndSession(t *testing.T) {
 	}
 
 	// Unsafe methods still fail closed before request-body or resource checks.
-	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/messaging/places/"+DefaultGeneralChannelID+"/messages", strings.NewReader(`{}`))
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/messaging/places/"+newUUIDv7()+"/messages", strings.NewReader(`{}`))
 	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: w.humanA.ID})
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -135,11 +135,11 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	if self["kind"] != "human" || self["human_id"] != w.humanA.ID {
 		t.Fatalf("self = %v", self)
 	}
-	if n := len(body["workspaces"].([]any)); n != 2 {
-		t.Fatalf("workspaces = %d, want default plus explicit workspace", n)
+	if n := len(body["workspaces"].([]any)); n != 1 {
+		t.Fatalf("workspaces = %d, want the explicit workspace", n)
 	}
-	if n := len(body["channels"].([]any)); n != 2 {
-		t.Fatalf("channels = %d, want default plus explicit channel", n)
+	if n := len(body["channels"].([]any)); n != 1 {
+		t.Fatalf("channels = %d, want the explicit channel", n)
 	}
 	dms := body["dms"].([]any)
 	if len(dms) != 1 || len(dms[0].(map[string]any)["participants"].([]any)) != 2 {

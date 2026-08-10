@@ -8,7 +8,14 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { AppRail } from "../../shell/app-rail";
 import {
   type NotificationLevel,
@@ -515,16 +522,26 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const selectPlace = useMessaging((state) => state.selectPlace);
+  const clearPlaceSelection = useMessaging(
+    (state) => state.clearPlaceSelection,
+  );
   const placeNavigate = usePlaceNavigate();
   const loadPlaceAround = useMessaging((state) => state.loadPlaceAround);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
-  const display = usePlaceDisplay(activePlaceKey);
   const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
   const mentionCountByPlace = useMessaging(
     (state) => state.mentionCountByPlace,
   );
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
+  const workspaces = useMessaging((state) => state.workspaces);
+  const selectedPlaceKey =
+    placeKey &&
+    (channels.some((channel) => placeKey === `channel:${channel.channelId}`) ||
+      dms.some((dm) => placeKey === `${dm.kind}:${dm.dmId}`))
+      ? placeKey
+      : null;
+  const display = usePlaceDisplay(selectedPlaceKey);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
   const notificationLevelByPlace = useMessaging(
     (state) => state.notificationLevelByPlace,
@@ -541,13 +558,23 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   }, [init]);
 
   // URLが現在地の正本。route paramのplaceをstoreへ同期する。
-  // selectPlaceは未知のplaceを黙って捨てるので、place一覧が変わったら
-  // （live event・再接続後の突き合わせ）もう一度同期し直す。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: place一覧の変化を選び直しのトリガーにする
-  useEffect(() => {
-    if (!ready || !placeKey) return;
-    if (placeKey !== activePlaceKey) selectPlace(placeKey);
-  }, [ready, placeKey, activePlaceKey, selectPlace, channels, dms]);
+  // homeまたはbootstrapに存在しないplace URLは「未選択」が正本。表示だけを
+  // 隠すのではなくcurrent placeを解除し、通知判定や編集状態にも同じ現在地を渡す。
+  useLayoutEffect(() => {
+    if (!ready) return;
+    if (!selectedPlaceKey) {
+      clearPlaceSelection();
+      setPendingJump(null);
+      return;
+    }
+    if (selectedPlaceKey !== activePlaceKey) selectPlace(selectedPlaceKey);
+  }, [
+    ready,
+    selectedPlaceKey,
+    activePlaceKey,
+    selectPlace,
+    clearPlaceSelection,
+  ]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
@@ -629,10 +656,14 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     );
   }
 
+  const hasSelectablePlace = channels.length > 0 || dms.length > 0;
+  const selectedPlaceIsLoaded =
+    selectedPlaceKey !== null && activePlaceKey === selectedPlaceKey;
+
   return (
     <div className="flex h-dvh bg-background text-foreground">
       <AppRail activeAppId="home" />
-      <Sidebar />
+      <Sidebar selectedPlaceKey={selectedPlaceKey} />
       {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
           開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
       <div className="flex min-w-0 flex-1 flex-col">
@@ -642,11 +673,11 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             <Hash className="size-4 shrink-0 text-muted-foreground" />
           ) : null}
           <span className="truncate font-semibold text-[14.5px]">
-            {display?.name ?? ""}
+            {display?.name ?? "メッセージ"}
           </span>
-          {display?.kind === "channel" && activePlaceKey ? (
+          {display?.kind === "channel" && selectedPlaceKey ? (
             <ChannelTopic
-              channelId={activePlaceKey.slice("channel:".length)}
+              channelId={selectedPlaceKey.slice("channel:".length)}
               topic={display.topic}
             />
           ) : display?.topic ? (
@@ -660,26 +691,51 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           <span className="ml-auto flex items-center gap-1">
             {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
-            <button
-              type="button"
-              title="メンバーリスト"
-              onClick={() => setMembersOpen((value) => !value)}
-              className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
-                membersOpen ? "text-foreground" : "text-muted-foreground"
-              }`}
-            >
-              <Users className="size-4" />
-            </button>
+            {selectedPlaceIsLoaded ? (
+              <button
+                type="button"
+                title="メンバーリスト"
+                onClick={() => setMembersOpen((value) => !value)}
+                className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
+                  membersOpen ? "text-foreground" : "text-muted-foreground"
+                }`}
+              >
+                <Users className="size-4" />
+              </button>
+            ) : null}
           </span>
         </header>
         <ConnectionBanner />
         <div className="flex min-h-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col">
-            <MessageList handleRef={listRef} />
-            <TypingIndicator />
-            <Composer />
+            {selectedPlaceIsLoaded ? (
+              <>
+                <MessageList handleRef={listRef} />
+                <TypingIndicator />
+                <Composer />
+              </>
+            ) : (
+              <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+                <div className="max-w-sm">
+                  <h2 className="font-medium text-[15px] text-foreground">
+                    {hasSelectablePlace
+                      ? "場所を選択"
+                      : workspaces.length === 0
+                        ? "参加中のワークスペースはありません"
+                        : "場所はまだありません"}
+                  </h2>
+                  <p className="mt-1.5 text-[13px] text-muted-foreground leading-5">
+                    {hasSelectablePlace
+                      ? "サイドバーからチャンネルまたはダイレクトメッセージを選んでください。"
+                      : workspaces.length === 0
+                        ? "ワークスペースに参加すると、ここから会話を始められます。"
+                        : "チャンネルやダイレクトメッセージが作成されると、ここに表示されます。"}
+                  </p>
+                </div>
+              </section>
+            )}
           </main>
-          {membersOpen ? <MemberList /> : null}
+          {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
         </div>
       </div>
       {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}

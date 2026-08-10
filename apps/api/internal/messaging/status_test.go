@@ -216,10 +216,9 @@ func TestLocalStatusSetsTheAgentsOwnAttentionState(t *testing.T) {
 		t.Fatalf("a relative expiry must resolve to an instant: %v", declared)
 	}
 
-	// The human sees the agent's status through the same store the UI reads.
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
-		t.Fatalf("admit human: %v", err)
-	}
+	// Explicit membership, not the Human-Agent relation, makes the status
+	// visible through the same store the UI reads.
+	w.workspaceWithChannel(t, ctx)
 	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanA)
 	if err != nil {
 		t.Fatalf("list statuses: %v", err)
