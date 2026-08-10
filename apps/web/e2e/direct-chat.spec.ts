@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
 const webURL = "http://127.0.0.1:4173";
+const directChatURL = `${webURL}/direct`;
 let fixtureBuild: { directory: string; binary: string } | undefined;
 
 test.beforeAll(async () => {
@@ -76,7 +77,7 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     expect(
       (await page.request.get(`${fixture.url}/__e2e__/session`)).status(),
     ).toBe(204);
-    await page.goto(webURL);
+    await page.goto(directChatURL);
     await expect(
       page.getByText("エージェント利用可能", { exact: true }),
     ).toBeVisible();
@@ -139,6 +140,46 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
       page.getByText("Terminal replay", { exact: true }),
     ).toHaveCount(1);
     expect(terminalFrames).toBe(1);
+
+    const completedSummary = page.getByText("作業が終了しました", {
+      exact: true,
+    });
+    await expect(completedSummary).toBeVisible();
+    await expect(
+      page.getByText("read_fileを完了", { exact: true }),
+    ).toBeHidden();
+
+    const terminalRow = page
+      .getByText("Terminal replay", { exact: true })
+      .locator("xpath=ancestor::*[@data-message-id][1]");
+    await terminalRow.hover();
+    await expect(
+      terminalRow.getByRole("button", { name: "コピー" }),
+    ).toBeVisible();
+
+    const beforeReload = await connectionStats(fixture.url);
+    await page.reload();
+    await expect(
+      page.getByText("エージェント利用可能", { exact: true }),
+    ).toBeVisible();
+    await expect
+      .poll(async () => {
+        const stats = await connectionStats(fixture.url);
+        return stats.active === 1 && stats.accepted > beforeReload.accepted;
+      })
+      .toBe(true);
+    await expect(
+      page.getByText("Terminal replay", { exact: true }),
+    ).toHaveCount(1);
+    await expect(completedSummary).toBeVisible();
+    await expect(
+      page.getByText("read_fileを完了", { exact: true }),
+    ).toBeHidden();
+    await completedSummary.click();
+    await expect(
+      page.getByText("read_fileを完了", { exact: true }),
+    ).toBeVisible();
+    expect(terminalFrames).toBe(2);
   } finally {
     await Promise.all([stop(vite), stop(fixture.process)]);
     await rm(fixture.runtimeDirectory, { recursive: true, force: true });
