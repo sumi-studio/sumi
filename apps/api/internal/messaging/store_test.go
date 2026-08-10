@@ -197,6 +197,326 @@ func TestAppendIsIdempotentOnClientNonce(t *testing.T) {
 	}
 }
 
+func waitForAdvisoryLocks(
+	t *testing.T, ctx context.Context, store *Store, key string, granted bool, want int,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var count int
+		err := store.pool.QueryRow(ctx,
+			`WITH key AS (SELECT hashtextextended($1, 0) AS value)
+			 SELECT count(*)
+			 FROM pg_locks, key
+			 WHERE locktype = 'advisory' AND granted = $2
+			   AND classid::bigint = ((value >> 32) & 4294967295)
+			   AND objid::bigint = (value & 4294967295)`, key, granted).Scan(&count)
+		if err != nil {
+			t.Fatalf("inspect advisory waiters: %v", err)
+		}
+		if count >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("advisory locks for %q (granted=%v) did not reach %d", key, granted, want)
+}
+
+func assertDefaultMembershipTombstoned(
+	t *testing.T, ctx context.Context, store *Store, participant ParticipantRef,
+) {
+	t.Helper()
+	var active, historical int
+	if err := store.pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE left_at IS NULL),
+		        count(*) FILTER (WHERE left_at IS NOT NULL)
+		 FROM workspace_members
+		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3`,
+		DefaultWorkspaceID, participant.Kind, participant.ID).Scan(&active, &historical); err != nil {
+		t.Fatalf("inspect default membership for %s: %v", participant.Key(), err)
+	}
+	if active != 0 || historical != 1 {
+		t.Fatalf("default membership for %s = active %d historical %d, want 0/1",
+			participant.Key(), active, historical)
+	}
+}
+
+func TestEnsureDefaultWorkspaceMembershipPreservesExplicitRemoval(t *testing.T) {
+	t.Run("direct Human and PersonalityAgent calls", func(t *testing.T) {
+		for _, kind := range []ParticipantKind{KindHuman, KindPersonalityAgent} {
+			t.Run(string(kind), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				w := newWorld(t, ctx)
+				participant := w.agent
+				if kind == KindHuman {
+					participant = w.humanA
+				}
+				if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+					t.Fatalf("initial default admission: %v", err)
+				}
+				if err := w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, participant); err != nil {
+					t.Fatalf("remove default member: %v", err)
+				}
+				if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+					t.Fatalf("ensure after removal: %v", err)
+				}
+				assertDefaultMembershipTombstoned(t, ctx, w.store, participant)
+			})
+		}
+	})
+
+	t.Run("Human admission does not resurrect an owned PersonalityAgent", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+			t.Fatalf("initial Human admission: %v", err)
+		}
+		if err := w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, w.agent); err != nil {
+			t.Fatalf("remove owned PersonalityAgent: %v", err)
+		}
+		if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+			t.Fatalf("ensure Human after agent removal: %v", err)
+		}
+		assertDefaultMembershipTombstoned(t, ctx, w.store, w.agent)
+	})
+}
+
+func TestEnsureDefaultWorkspaceMembershipAndRemovalCommitInLockOrder(t *testing.T) {
+	for _, kind := range []ParticipantKind{KindHuman, KindPersonalityAgent} {
+		for _, removalFirst := range []bool{true, false} {
+			order := "ensure first"
+			if removalFirst {
+				order = "removal first"
+			}
+			t.Run(string(kind)+"/"+order, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				w := newWorld(t, ctx)
+				participant := w.agent
+				if kind == KindHuman {
+					participant = w.humanA
+				}
+				if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+					t.Fatalf("initial default admission: %v", err)
+				}
+
+				blocker, err := w.store.pool.Begin(ctx)
+				if err != nil {
+					t.Fatalf("begin blocker: %v", err)
+				}
+				defer func() { _ = blocker.Rollback(ctx) }()
+				if err := lockWorkspaceMembershipScope(ctx, blocker, DefaultWorkspaceID); err != nil {
+					t.Fatalf("lock blocker: %v", err)
+				}
+
+				removeDone := make(chan error, 1)
+				ensureDone := make(chan error, 1)
+				first := func() { ensureDone <- w.store.EnsureDefaultWorkspaceMembership(ctx, participant) }
+				second := func() {
+					removeDone <- w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, participant)
+				}
+				if removalFirst {
+					first, second = second, first
+				}
+				go first()
+				key := workspaceMembershipScopeKey(DefaultWorkspaceID)
+				waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
+				go second()
+				waitForAdvisoryLocks(t, ctx, w.store, key, false, 2)
+				if err := blocker.Commit(ctx); err != nil {
+					t.Fatalf("release blocker: %v", err)
+				}
+				if err := <-ensureDone; err != nil {
+					t.Fatalf("ensure default membership: %v", err)
+				}
+				if err := <-removeDone; err != nil {
+					t.Fatalf("remove default membership: %v", err)
+				}
+				assertDefaultMembershipTombstoned(t, ctx, w.store, participant)
+			})
+		}
+	}
+}
+
+func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
+	t.Run("removal first fences the send", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		ws, ch := w.workspaceWithChannel(t, ctx)
+
+		blocker, err := w.store.pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin blocker: %v", err)
+		}
+		defer func() { _ = blocker.Rollback(ctx) }()
+		if err := lockWorkspaceMembershipScope(ctx, blocker, ws.WorkspaceID); err != nil {
+			t.Fatalf("lock blocker: %v", err)
+		}
+
+		removeDone := make(chan error, 1)
+		go func() { removeDone <- w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.humanA) }()
+		key := workspaceMembershipScopeKey(ws.WorkspaceID)
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
+
+		type appendResult struct {
+			created bool
+			err     error
+		}
+		appendDone := make(chan appendResult, 1)
+		go func() {
+			_, created, appendErr := w.store.AppendMessage(ctx, AppendInput{
+				PlaceID: ch.PlaceID, Author: w.humanA, Content: "race",
+				ClientNonce: "removal-first",
+			})
+			appendDone <- appendResult{created: created, err: appendErr}
+		}()
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 2)
+		if err := blocker.Commit(ctx); err != nil {
+			t.Fatalf("release blocker: %v", err)
+		}
+		if err := <-removeDone; err != nil {
+			t.Fatalf("remove member: %v", err)
+		}
+		result := <-appendDone
+		if !errors.Is(result.err, ErrPlaceNotFound) || result.created {
+			t.Fatalf("post-removal append = created %v err %v, want fenced", result.created, result.err)
+		}
+		var messages int
+		if err := w.store.pool.QueryRow(ctx,
+			"SELECT count(*) FROM messages WHERE place_id = $1", ch.PlaceID).Scan(&messages); err != nil {
+			t.Fatalf("count messages: %v", err)
+		}
+		if messages != 0 {
+			t.Fatalf("messages = %d, revoked author committed content", messages)
+		}
+	})
+
+	t.Run("send first commits its coherent pre-removal snapshot", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		ws, ch := w.workspaceWithChannel(t, ctx)
+
+		blocker, err := w.store.pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin blocker: %v", err)
+		}
+		defer func() { _ = blocker.Rollback(ctx) }()
+		if err := lockWorkspaceMembershipScope(ctx, blocker, ws.WorkspaceID); err != nil {
+			t.Fatalf("lock blocker: %v", err)
+		}
+
+		type appendResult struct {
+			message Message
+			created bool
+			err     error
+		}
+		appendDone := make(chan appendResult, 1)
+		go func() {
+			message, created, appendErr := w.store.AppendMessage(ctx, AppendInput{
+				PlaceID: ch.PlaceID, Author: w.humanA, Content: "ordered before removal",
+				ClientNonce: "send-first",
+			})
+			appendDone <- appendResult{message: message, created: created, err: appendErr}
+		}()
+		key := workspaceMembershipScopeKey(ws.WorkspaceID)
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
+
+		removeDone := make(chan error, 1)
+		go func() { removeDone <- w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.humanA) }()
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 2)
+		if err := blocker.Commit(ctx); err != nil {
+			t.Fatalf("release blocker: %v", err)
+		}
+		result := <-appendDone
+		if result.err != nil || !result.created {
+			t.Fatalf("pre-removal append = created %v err %v", result.created, result.err)
+		}
+		if err := <-removeDone; err != nil {
+			t.Fatalf("remove member: %v", err)
+		}
+		intents, err := w.store.NotificationIntentsForMessage(ctx, result.message.MessageID)
+		if err != nil {
+			t.Fatalf("load admission intents: %v", err)
+		}
+		if len(intents) != 2 {
+			t.Fatalf("admission intents = %+v, want the two pre-removal recipients", intents)
+		}
+	})
+}
+
+func TestChannelAdmissionsShareScopeWhileRemovalWaits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	ws, first := w.workspaceWithChannel(t, ctx)
+	second, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "second", "", w.humanA)
+	if err != nil {
+		t.Fatalf("create second channel: %v", err)
+	}
+
+	// Hold each append at its per-place seq update, after it has acquired the
+	// shared workspace admission lock. Different channel rows let both sends
+	// reach that point concurrently.
+	firstBlocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin first place blocker: %v", err)
+	}
+	defer func() { _ = firstBlocker.Rollback(ctx) }()
+	if _, err := firstBlocker.Exec(ctx,
+		"UPDATE places SET last_seq = last_seq WHERE place_id = $1", first.PlaceID); err != nil {
+		t.Fatalf("block first place: %v", err)
+	}
+	secondBlocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin second place blocker: %v", err)
+	}
+	defer func() { _ = secondBlocker.Rollback(ctx) }()
+	if _, err := secondBlocker.Exec(ctx,
+		"UPDATE places SET last_seq = last_seq WHERE place_id = $1", second.PlaceID); err != nil {
+		t.Fatalf("block second place: %v", err)
+	}
+
+	type appendResult struct {
+		created bool
+		err     error
+	}
+	appendDone := make(chan appendResult, 2)
+	for i, placeID := range []string{first.PlaceID, second.PlaceID} {
+		go func(index int, target string) {
+			_, created, appendErr := w.store.AppendMessage(ctx, AppendInput{
+				PlaceID: target, Author: w.humanA, Content: "parallel admission",
+				ClientNonce: fmt.Sprintf("parallel-%d", index),
+			})
+			appendDone <- appendResult{created: created, err: appendErr}
+		}(i, placeID)
+	}
+	key := workspaceMembershipScopeKey(ws.WorkspaceID)
+	waitForAdvisoryLocks(t, ctx, w.store, key, true, 2)
+
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.humanA) }()
+	waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
+	if err := firstBlocker.Commit(ctx); err != nil {
+		t.Fatalf("release first place: %v", err)
+	}
+	if err := secondBlocker.Commit(ctx); err != nil {
+		t.Fatalf("release second place: %v", err)
+	}
+	for range 2 {
+		result := <-appendDone
+		if result.err != nil || !result.created {
+			t.Fatalf("parallel append = created %v err %v", result.created, result.err)
+		}
+	}
+	if err := <-removeDone; err != nil {
+		t.Fatalf("remove after shared admissions: %v", err)
+	}
+}
+
 func TestMentionsBindAtAdmissionFromActiveMembership(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

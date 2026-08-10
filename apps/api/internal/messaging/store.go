@@ -66,10 +66,13 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// EnsureDefaultWorkspaceMembership idempotently admits a participant to the
-// shared MVP Workspace. When a Human arrives, all of that Human's durable
-// PersonalityAgents are admitted through the identical membership shape. The
-// Human remains the caller; this does not act or speak on an agent's behalf.
+// EnsureDefaultWorkspaceMembership idempotently admits a participant that has
+// never joined the shared MVP Workspace. A historical membership is an
+// explicit do-not-auto-admit marker: only AddWorkspaceMember may re-enroll a
+// participant after removal. When a Human first arrives, all of that Human's
+// never-enrolled durable PersonalityAgents are admitted through the identical
+// membership shape. The Human remains the caller; this does not act or speak
+// on an agent's behalf.
 func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participant ParticipantRef) error {
 	if err := participant.Validate(); err != nil {
 		return err
@@ -77,11 +80,43 @@ func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participan
 	if err := s.participantExists(ctx, participant); err != nil {
 		return err
 	}
+	readTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin default workspace admission check: %w", err)
+	}
+	if err := lockWorkspaceMembershipAdmission(ctx, readTx, DefaultWorkspaceID); err != nil {
+		_ = readTx.Rollback(ctx)
+		return err
+	}
+	complete, err := defaultWorkspaceAdmissionComplete(ctx, readTx, participant)
+	if rollbackErr := readTx.Rollback(ctx); err == nil && rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+		err = rollbackErr
+	}
+	if err != nil {
+		return fmt.Errorf("check default workspace admission: %w", err)
+	}
+	if complete {
+		return nil
+	}
+
+	// Do not upgrade the shared lock in place: two concurrent upgraders can
+	// deadlock. Release it, acquire exclusive in a fresh transaction, then
+	// recheck because another admission may have completed in between.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin default workspace admission: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMembershipScope(ctx, tx, DefaultWorkspaceID); err != nil {
+		return err
+	}
+	complete, err = defaultWorkspaceAdmissionComplete(ctx, tx, participant)
+	if err != nil {
+		return fmt.Errorf("recheck default workspace admission: %w", err)
+	}
+	if complete {
+		return nil
+	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO workspaces (workspace_id, name) VALUES ($1, 'Sumi')
 		 ON CONFLICT (workspace_id) DO NOTHING`, DefaultWorkspaceID); err != nil {
@@ -129,10 +164,47 @@ func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participan
 	return nil
 }
 
+func defaultWorkspaceAdmissionComplete(
+	ctx context.Context, q querier, participant ParticipantRef,
+) (bool, error) {
+	var complete bool
+	err := q.QueryRow(ctx,
+		`SELECT
+		   EXISTS (SELECT 1 FROM workspaces WHERE workspace_id = $1)
+		   AND EXISTS (SELECT 1 FROM places WHERE place_id = $2 AND workspace_id = $1)
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM workspace_members
+		       WHERE workspace_id = $1 AND member_kind = $3 AND member_id = $4
+		         AND left_at IS NOT NULL)
+		     OR (
+		       EXISTS (
+		         SELECT 1 FROM workspace_members
+		         WHERE workspace_id = $1 AND member_kind = $3 AND member_id = $4
+		           AND left_at IS NULL)
+		       AND ($3 <> 'human' OR NOT EXISTS (
+		         SELECT 1 FROM agents a
+		         WHERE a.human_id = $4 AND NOT EXISTS (
+		           SELECT 1 FROM workspace_members wm
+		           WHERE wm.workspace_id = $1
+		             AND wm.member_kind = 'personality_agent'
+		             AND wm.member_id = a.personality_agent_id)))
+		     )
+		   )`,
+		DefaultWorkspaceID, DefaultGeneralChannelID, participant.Kind, participant.ID).Scan(&complete)
+	if err != nil {
+		return false, err
+	}
+	return complete, nil
+}
+
 func addDefaultMember(ctx context.Context, tx pgx.Tx, participant ParticipantRef) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO workspace_members (workspace_id, member_kind, member_id, role)
-		 VALUES ($1, $2, $3, 'member')
+		 SELECT $1::uuidv7, $2::text, $3::uuidv7, 'member'
+		 WHERE NOT EXISTS (
+		   SELECT 1 FROM workspace_members
+		   WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3)
 		 ON CONFLICT (workspace_id, member_kind, member_id) WHERE left_at IS NULL
 		 DO NOTHING`, DefaultWorkspaceID, participant.Kind, participant.ID)
 	if err != nil {
@@ -228,7 +300,15 @@ func (s *Store) AddWorkspaceMember(ctx context.Context, workspaceID string, memb
 	if err := s.participantExists(ctx, member); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin add workspace member: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMembershipScope(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx,
 		`INSERT INTO workspace_members (workspace_id, member_kind, member_id, role)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (workspace_id, member_kind, member_id) WHERE left_at IS NULL
@@ -236,6 +316,9 @@ func (s *Store) AddWorkspaceMember(ctx context.Context, workspaceID string, memb
 		workspaceID, member.Kind, member.ID, role)
 	if err != nil {
 		return fmt.Errorf("add workspace member: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit add workspace member: %w", err)
 	}
 	return nil
 }
@@ -246,12 +329,23 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, workspaceID string, m
 	if err := member.Validate(); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin remove workspace member: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMembershipScope(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx,
 		`UPDATE workspace_members SET left_at = now()
 		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
 		workspaceID, member.Kind, member.ID)
 	if err != nil {
 		return fmt.Errorf("remove workspace member: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit remove workspace member: %w", err)
 	}
 	return nil
 }
@@ -455,6 +549,40 @@ func (s *Store) ActiveMembers(ctx context.Context, placeID string, viewer Partic
 	return s.activeMembers(ctx, s.pool, place)
 }
 
+// ActiveParticipantsForPlace returns the current content-delivery audience in
+// one query. Hub fanout consumes this store-owned authorization projection;
+// it does not reproduce channel vs dm membership rules per subscriber.
+func (s *Store) ActiveParticipantsForPlace(
+	ctx context.Context, placeID string,
+) (map[ParticipantRef]struct{}, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT wm.member_kind, wm.member_id
+		 FROM places p
+		 JOIN workspace_members wm ON wm.workspace_id = p.workspace_id AND wm.left_at IS NULL
+		 WHERE p.place_id = $1 AND p.kind = 'channel'
+		 UNION
+		 SELECT pm.member_kind, pm.member_id
+		 FROM places p
+		 JOIN place_members pm ON pm.place_id = p.place_id AND pm.left_at IS NULL
+		 WHERE p.place_id = $1 AND p.kind <> 'channel'`, placeID)
+	if err != nil {
+		return nil, fmt.Errorf("query active place participants: %w", err)
+	}
+	defer rows.Close()
+	audience := map[ParticipantRef]struct{}{}
+	for rows.Next() {
+		var kind, id string
+		if err := rows.Scan(&kind, &id); err != nil {
+			return nil, fmt.Errorf("scan active place participant: %w", err)
+		}
+		audience[ParticipantRef{Kind: ParticipantKind(kind), ID: id}] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active place participants: %w", err)
+	}
+	return audience, nil
+}
+
 // --- internals ---
 
 // querier lets the same helpers run on the pool or inside a transaction.
@@ -462,6 +590,49 @@ type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Membership admission and mutation coordinate on one transaction-scoped key
+// per authority scope. Sends take the shared form; add/remove takes exclusive.
+// For a channel the workspace membership is the authority; for dm/group_dm it
+// is place membership. Holding the fence through commit defines send vs
+// mutation order without serializing independent channel sends.
+func lockWorkspaceMembershipScope(ctx context.Context, q querier, workspaceID string) error {
+	if _, err := q.Exec(ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+		workspaceMembershipScopeKey(workspaceID)); err != nil {
+		return fmt.Errorf("lock workspace membership scope: %w", err)
+	}
+	return nil
+}
+
+func lockWorkspaceMembershipAdmission(ctx context.Context, q querier, workspaceID string) error {
+	if _, err := q.Exec(ctx,
+		"SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
+		workspaceMembershipScopeKey(workspaceID)); err != nil {
+		return fmt.Errorf("lock shared workspace membership scope: %w", err)
+	}
+	return nil
+}
+
+func workspaceMembershipScopeKey(workspaceID string) string {
+	return "messaging:workspace-membership:" + workspaceID
+}
+
+func lockPlaceMembershipAdmission(ctx context.Context, q querier, place Place) error {
+	if place.Kind == PlaceChannel {
+		return lockWorkspaceMembershipAdmission(ctx, q, place.WorkspaceID)
+	}
+	if _, err := q.Exec(ctx,
+		"SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
+		placeMembershipScopeKey(place.PlaceID)); err != nil {
+		return fmt.Errorf("lock shared place membership scope: %w", err)
+	}
+	return nil
+}
+
+func placeMembershipScopeKey(placeID string) string {
+	return "messaging:place-membership:" + placeID
 }
 
 func (s *Store) workspaceExists(ctx context.Context, workspaceID string) error {

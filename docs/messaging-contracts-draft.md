@@ -116,6 +116,19 @@
 - agentの通知設定は覚醒トリガ（呼びかけ）の発火条件になる。本人が自分で変更できる
   （人間はUI、agentはtool — 同じ契約の別transport）。
 - Employerの予算・許可（ADR 0010 §3-4）はこの設定を上書きする別レイヤーで、選好とは混ぜない。
+- **発火判定はサーバー側**。message commit時に、その場所を見られる参加者ひとりずつに
+  ついてこの設定を評価し、`message_created` の**受信者ごとの** payload へ
+  `notify: { "reason": "dm | mention | keyword | all" } | null` を添える。
+  優先度は `dm > mention > keyword > all`、`mute` はすべてを抑制し、
+  自分の発言では自分を呼ばない。`notify` が無いことは欠損ではなく
+  「あなたを呼んでいない」という答えで、clientはこれを再判定しない
+  （clientに判定させると、muteした場所の本文が結局その端末まで届いてから
+  捨てられることになり、受信側制御にならない）。
+  同じ場所が将来のagent delivery eligibility（`AttentionCandidate` の発行判断）の
+  評価点になる。
+- 通知の**提示**（デスクトップ通知・音・許可）はclient側の関心で、設定の正本には
+  混ぜない。未読の正本はmuteしても数え続けるが、mute中はsidebarとtab titleの
+  バッジへ提示しない。muteを解除すれば、その間の未読も再び見える。
 
 ## API / event（人間UI側）
 
@@ -231,7 +244,12 @@ agentにとってより適した方法があるときだけそちらで代替す
 3. **membership**: channelはWorkspace直下。v0はactiveなWorkspaceメンバー全員が
    閲覧・投稿可。HumanMembershipとPersonalityAgentMembershipを同型に扱う。
    Employmentとmembershipは別物（Workspace雇用⇒全閲覧可、Secretary⇒Humanと同権限、
-   とはしない）。Workspaceとorgは同一概念にしない。
+   とはしない）。Workspaceとorgは同一概念にしない。message admissionは同じ
+   workspace/place scopeのshared fence、membership変更はexclusive fenceをtransaction
+   commitまで保持し、先にcommitした側をauthority snapshotとする。channelごとの送信は
+   相互に止めない。live fanoutはevent scopeごとに現在のauthorized participant setを
+   一度だけ取得し、過去の可視性cacheやsubscriberごとの問い合わせを認可に使わない。
+   removal commit後のeventは再接続を待たず本文ごとfenceする。
 4. **Connection**: 戸籍そのもの（immutableなidentity台帳）には入れない。
    shared control plane上の独立Connection domainが正本。DM到達性は
    authorization serviceが「activeな共有Workspace membership / accepted Connection /
@@ -267,7 +285,10 @@ agentにとってより適した方法があるときだけそちらで代替す
 8. **通知配送**: shared notification delivery service/control planeの管轄。
    messagingはtyped notification intentの発行まで。device token、permission、
    quiet hours、retry、dedupeは所有しない。HumanのWeb Pushとagentのattention
-   triggerは同じintentから分かれる別adapter。
+   triggerは同じintentから分かれる別adapter。intent rowはlive配信でconsume/delete
+   せずdurableなcanonical outboxとして保持し、message lifecycleにFK cascadeで従う。
+   recipient/time indexは将来のPush/Attention adapterが自身のcursorからintentを
+   走査する境界である。
 
    *未確定（ADR 0011 Open questions）*: この記述と ADR 0011 §9「通知設定の保管と
    評価は shared messaging service 側」は、quiet hours の保持者について割れて

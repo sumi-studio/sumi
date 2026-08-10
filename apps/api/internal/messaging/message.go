@@ -108,6 +108,9 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err != nil {
 		return Message{}, false, err
 	}
+	if err := lockPlaceMembershipAdmission(ctx, tx, place); err != nil {
+		return Message{}, false, err
+	}
 	canPost, err := s.canAccess(ctx, tx, place, in.Author)
 	if err != nil {
 		return Message{}, false, err
@@ -179,6 +182,9 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 		return Message{}, false, fmt.Errorf("insert message: %w", err)
 	}
 	if err := insertMentions(ctx, tx, msg.MessageID, mentions); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.issueNotificationIntents(ctx, tx, place, msg, members); err != nil {
 		return Message{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {

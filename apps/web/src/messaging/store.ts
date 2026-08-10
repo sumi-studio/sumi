@@ -10,6 +10,8 @@ import type {
   Message,
   MessagingBackend,
   MessagingCapabilities,
+  NotificationLevel,
+  NotificationSetting,
   ParticipantKey,
   ParticipantRef,
   ParticipantStatus,
@@ -23,6 +25,17 @@ import type {
   WorkspaceSummary,
 } from "./model";
 import { parsePlaceKey, participantKey, placeKey } from "./model";
+import {
+  isNotificationSoundEnabled,
+  isTabActive,
+  notificationBody,
+  notificationPermission,
+  notificationTitle,
+  setNotificationSoundEnabled as persistNotificationSound,
+  playNotificationSound,
+  presentationFor,
+  presentDesktopNotification,
+} from "./notifications";
 import type { PendingMessage } from "./timeline";
 import { mergeMessages, upsertMessage } from "./timeline";
 
@@ -69,6 +82,12 @@ interface MessagingState {
   draftByPlace: Record<PlaceKey, string>;
   typingByPlace: Record<PlaceKey, Record<ParticipantKey, number>>;
   replyLaterById: Record<string, ReplyLaterMarker>;
+  /** 自分の通知設定。正本はサーバーで、ここはその写し。 */
+  notificationDefaultLevel: NotificationLevel;
+  notificationLevelByPlace: Record<PlaceKey, NotificationLevel>;
+  notificationKeywords: string[];
+  /** 音は端末の都合なのでlocalStorageに置く（設定の正本には混ぜない）。 */
+  notificationSoundEnabled: boolean;
   employedAgents: ParticipantRef[];
   hasMoreByPlace: Record<PlaceKey, boolean>;
   loadingOlderByPlace: Record<PlaceKey, boolean>;
@@ -94,6 +113,10 @@ interface MessagingState {
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
   setStatus(status: StatusKind, note: string): void;
+  setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
+  setNotificationDefaultLevel(level: NotificationLevel): void;
+  setNotificationKeywords(keywords: string[]): void;
+  setNotificationSoundEnabled(enabled: boolean): void;
   createReplyLater(message: Message, delayMs?: number): void;
   toggleReaction(message: Message, emoji: string): void;
   loadOlder(key: PlaceKey): Promise<void>;
@@ -175,6 +198,88 @@ let pendingPresenceResync: {
 
 /** 遠い期限でもtimerを一度に張らない上限。起きたら残りをもう一度張り直す。 */
 const STATUS_EXPIRY_MAX_DELAY_MS = 60 * 60_000;
+
+/** 通知設定のうち、サーバーと共有している部分だけを取り出した形。 */
+type NotificationSettingState = Pick<
+  MessagingState,
+  | "notificationDefaultLevel"
+  | "notificationLevelByPlace"
+  | "notificationKeywords"
+>;
+
+function notificationSettingState(
+  setting: NotificationSetting,
+): NotificationSettingState {
+  const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> = {};
+  for (const entry of setting.perPlace) {
+    notificationLevelByPlace[placeKey(entry.place)] = entry.level;
+  }
+  return {
+    notificationDefaultLevel: setting.defaults.level,
+    notificationLevelByPlace,
+    notificationKeywords: setting.keywords,
+  };
+}
+
+/**
+ * 通知設定のPUTは全置換なので、二本同時に飛ばすと着順しだいで古いsnapshotが
+ * サーバーの正になる。書き込みは一本の列に並べ、送る番が来た時点でもっと新しい
+ * 設定になっていたら古い方は送らずに畳む——全置換だから最新の一本で足りる。
+ */
+let notificationWriteChain: Promise<void> = Promise.resolve();
+/** 手元の設定がどの書き込みのものか。追い越された書き込みは手元を動かさない。 */
+let notificationWriteGeneration = 0;
+/** サーバーが最後に確定を返した設定。失敗時に戻る先はここで、送信前の手元ではない。 */
+let confirmedNotificationSetting: NotificationSettingState | null = null;
+
+let notificationNavigate: ((key: PlaceKey) => void) | null = null;
+
+/**
+ * 通知をクリックした先の遷移。URLが現在地の正本なので、storeが自前で
+ * activePlaceKeyを書き換えるのではなくrouterの遷移を借りる。
+ */
+export function setNotificationNavigator(
+  navigate: ((key: PlaceKey) => void) | null,
+): void {
+  notificationNavigate = navigate;
+}
+
+/** placeに効いている通知レベル。place個別の指定が無ければ既定に落ちる。 */
+export function notificationLevelFor(
+  state: Pick<
+    MessagingState,
+    "notificationLevelByPlace" | "notificationDefaultLevel"
+  >,
+  key: PlaceKey,
+): NotificationLevel {
+  return state.notificationLevelByPlace[key] ?? state.notificationDefaultLevel;
+}
+
+/**
+ * 通知の見出しに使う場所の名前。DMは相手の名前が発言者の名前と同じなので
+ * 場所を名乗らせない（「Haru — Haru」は情報が無い）。
+ */
+function notificationPlaceLabel(state: MessagingState, key: PlaceKey): string {
+  const place = parsePlaceKey(key);
+  if (!place) return "";
+  if (place.kind === "channel") {
+    const channel = state.channels.find(
+      (entry) => entry.channelId === place.channelId,
+    );
+    return channel ? `#${channel.name}` : "";
+  }
+  if (place.kind === "dm") return "";
+  const dm = state.dms.find(
+    (entry) => entry.kind === place.kind && entry.dmId === place.dmId,
+  );
+  if (!dm) return "";
+  return dm.participants
+    .filter((ref) => participantKey(ref) !== state.selfKey)
+    .map(
+      (ref) => state.membersByKey[participantKey(ref)]?.displayName ?? "不明",
+    )
+    .join("、");
+}
 
 export const useMessaging = create<MessagingState>((set, get) => {
   if (import.meta.env.DEV) {
@@ -532,6 +637,38 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
   };
 
+  /**
+   * 呼ばれたことの提示。「呼ぶかどうか」はサーバーが送信時に判定済みで、
+   * ここに来る `notify` はその答えそのもの。クライアントは提示の仕方だけを
+   * 決める——見ている画面に通知を重ねない、音を鳴らすか。
+   */
+  const presentNotification = (
+    event: Extract<ServerEvent, { type: "message_created" }>,
+  ) => {
+    const state = get();
+    if (!state.capabilities.notifications) return;
+    const key = placeKey(event.message.place);
+    const presentation = presentationFor({
+      notify: event.notify,
+      authorIsSelf: participantKey(event.message.author) === state.selfKey,
+      tabActive: isTabActive(),
+      placeIsActive: state.activePlaceKey === key,
+      permission: notificationPermission(),
+      soundEnabled: state.notificationSoundEnabled,
+    });
+    if (presentation.sound) playNotificationSound();
+    if (!presentation.desktop) return;
+    const authorName =
+      state.membersByKey[participantKey(event.message.author)]?.displayName ??
+      "誰か";
+    presentDesktopNotification({
+      title: notificationTitle(notificationPlaceLabel(state, key), authorName),
+      body: notificationBody(event.message.content),
+      placeKey: key,
+      onActivate: () => notificationNavigate?.(key),
+    });
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
@@ -599,6 +736,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      if (event.type === "message_created") presentNotification(event);
       return;
     }
     if (event.type === "message_deleted") {
@@ -852,6 +990,67 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
   };
 
+  /**
+   * 通知設定は丸ごと置き換える。手元を先に動かして即座に反映し、失敗したら
+   * 元に戻す——設定が効いたふりをして黙って効いていないのが一番困る。
+   * 送信は列に並べる。手元だけ新しくてサーバーが古いままになる形の食い違いは、
+   * 次に読み直すまで誰も気付けないので、着順に頼らない。
+   */
+  const pushNotificationSetting = (next: {
+    defaultLevel: NotificationLevel;
+    levelByPlace: Record<PlaceKey, NotificationLevel>;
+    keywords: string[];
+  }) => {
+    const sessionBackend = backend;
+    const state = get();
+    const previous: NotificationSettingState = {
+      notificationDefaultLevel: state.notificationDefaultLevel,
+      notificationLevelByPlace: state.notificationLevelByPlace,
+      notificationKeywords: state.notificationKeywords,
+    };
+    const generation = ++notificationWriteGeneration;
+    set({
+      notificationDefaultLevel: next.defaultLevel,
+      notificationLevelByPlace: next.levelByPlace,
+      notificationKeywords: next.keywords,
+    });
+    notificationWriteChain = notificationWriteChain.then(async () => {
+      // bindMessagingSessionIdentity resets the public chain, but a callback
+      // already queued on the old promise still exists. Never let it use the
+      // replacement backend or mutate the replacement session's confirmed
+      // rollback point.
+      if (backend !== sessionBackend) return;
+      // 送る番が来るまでにもっと新しい設定になっていたら、この一本は要らない。
+      if (generation !== notificationWriteGeneration) return;
+      const perPlace: { place: Place; level: NotificationLevel }[] = [];
+      for (const [key, level] of Object.entries(next.levelByPlace)) {
+        const place = parsePlaceKey(key);
+        if (place) perPlace.push({ place, level });
+      }
+      try {
+        const confirmed = notificationSettingState(
+          await sessionBackend.setNotificationSetting({
+            defaults: { level: next.defaultLevel },
+            perPlace,
+            keywords: next.keywords,
+          }),
+        );
+        if (backend !== sessionBackend) return;
+        confirmedNotificationSetting = confirmed;
+        // 追い越されていれば後続の書き込みが正。確定値は覚えるが手元は触らない。
+        if (generation === notificationWriteGeneration) set(confirmed);
+      } catch {
+        if (
+          backend !== sessionBackend ||
+          generation !== notificationWriteGeneration
+        ) {
+          return;
+        }
+        set(confirmedNotificationSetting ?? previous);
+      }
+    });
+  };
+
   return {
     capabilities: backend.capabilities,
     ready: false,
@@ -871,6 +1070,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     draftByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
+    notificationDefaultLevel: "all",
+    notificationLevelByPlace: {},
+    notificationKeywords: [],
+    notificationSoundEnabled: isNotificationSoundEnabled(),
     employedAgents: [],
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
@@ -907,6 +1110,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
             mentionCountByPlace[key] = summary.mentionCount;
             sinceByPlace[key] = summary.latestSeq;
           }
+          // bootstrapが運ぶ設定はサーバーの確定値。書き込みが失敗したときの
+          // 戻り先はここから始まる。
+          confirmedNotificationSetting = notificationSettingState(
+            snapshot.notificationSetting,
+          );
           set({
             ready: true,
             capabilities: backend.capabilities,
@@ -921,6 +1129,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             unreadCountByPlace,
             mentionCountByPlace,
             replyLaterById,
+            ...confirmedNotificationSetting,
             employedAgents: snapshot.employedAgents,
           });
           scheduleStatusExpiry();
@@ -1168,6 +1377,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
       );
     },
 
+    setPlaceNotificationLevel(key, level) {
+      const state = get();
+      pushNotificationSetting({
+        defaultLevel: state.notificationDefaultLevel,
+        levelByPlace: { ...state.notificationLevelByPlace, [key]: level },
+        keywords: state.notificationKeywords,
+      });
+    },
+
+    setNotificationDefaultLevel(level) {
+      const state = get();
+      pushNotificationSetting({
+        defaultLevel: level,
+        levelByPlace: state.notificationLevelByPlace,
+        keywords: state.notificationKeywords,
+      });
+    },
+
+    setNotificationKeywords(keywords) {
+      const state = get();
+      pushNotificationSetting({
+        defaultLevel: state.notificationDefaultLevel,
+        levelByPlace: state.notificationLevelByPlace,
+        keywords,
+      });
+    },
+
+    // 音は端末の設定。サーバーへは送らないので、他の端末の鳴り方は変わらない。
+    setNotificationSoundEnabled(enabled) {
+      persistNotificationSound(enabled);
+      set({ notificationSoundEnabled: enabled });
+    },
+
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
@@ -1320,6 +1562,10 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   pendingPresenceResync = null;
   if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
   statusExpiryTimer = null;
+  // 前の人宛ての書き込みは、次の人の手元にも新しいbackendにも届かせない。
+  notificationWriteChain = Promise.resolve();
+  notificationWriteGeneration = 0;
+  confirmedNotificationSetting = null;
   useMessaging.setState({
     capabilities: backend.capabilities,
     ready: false,
@@ -1339,6 +1585,10 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
     draftByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
+    notificationDefaultLevel: "all",
+    notificationLevelByPlace: {},
+    notificationKeywords: [],
+    notificationSoundEnabled: isNotificationSoundEnabled(),
     employedAgents: [],
     hasMoreByPlace: {},
     loadingOlderByPlace: {},

@@ -1,9 +1,13 @@
-import { Check, Hash, Plus, X } from "lucide-react";
+import { BellOff, Check, Hash, MoreVertical, Plus, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { PlaceKey, StatusKind } from "../model";
+import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
-import { getMessagingSessionIdentity, useMessaging } from "../store";
+import {
+  getMessagingSessionIdentity,
+  notificationLevelFor,
+  useMessaging,
+} from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const INPUT_CLASS =
@@ -15,11 +19,31 @@ const STATUS_LABEL: Record<StatusKind, string> = {
   away: "離席中",
 };
 
-function Badge({ count, urgent }: { count: number; urgent: boolean }) {
-  if (count <= 0) return null;
+export const NOTIFICATION_LEVEL_LABEL: Record<NotificationLevel, string> = {
+  all: "すべて通知",
+  mentions: "メンションのみ",
+  mute: "ミュート",
+};
+
+const NOTIFICATION_LEVEL_HINT: Record<NotificationLevel, string> = {
+  all: "この場所の発言で呼ばれます",
+  mentions: "名前を呼ばれたときだけ",
+  mute: "通知も未読バッジも出しません",
+};
+
+export function Badge({
+  count,
+  urgent,
+  muted,
+}: {
+  count: number;
+  urgent: boolean;
+  muted: boolean;
+}) {
+  if (count <= 0 || muted) return null;
   return (
     <span
-      className={`ml-auto rounded-full px-1.5 py-px font-semibold text-[10px] tabular-nums ${
+      className={`rounded-full px-1.5 py-px font-semibold text-[10px] tabular-nums ${
         urgent
           ? "bg-rose-500 text-white"
           : "bg-muted-foreground/20 text-foreground"
@@ -27,6 +51,97 @@ function Badge({ count, urgent }: { count: number; urgent: boolean }) {
     >
       {count > 99 ? "99+" : count}
     </span>
+  );
+}
+
+/**
+ * placeごとの通知レベル。右クリックとホバーの「…」の両方から開く——
+ * 右クリックはDiscordを知っている手が最初に試す操作で、ホバーは知らない手が
+ * 見つけられる導線。
+ */
+function PlaceNotificationMenu({
+  placeKey: key,
+  open,
+  onOpenChange,
+}: {
+  placeKey: PlaceKey;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const level = useMessaging((state) => notificationLevelFor(state, key));
+  const setPlaceNotificationLevel = useMessaging(
+    (state) => state.setPlaceNotificationLevel,
+  );
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) {
+        onOpenChange(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("mousedown", closeOnOutsideClick);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("mousedown", closeOnOutsideClick);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open, onOpenChange]);
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        aria-label="通知設定"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpenChange(!open);
+        }}
+        className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
+          open ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+        }`}
+      >
+        <MoreVertical className="size-3.5" />
+      </button>
+      {open ? (
+        <div className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md">
+          <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
+            通知
+          </p>
+          {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
+            (candidate) => (
+              <button
+                key={candidate}
+                type="button"
+                onClick={() => {
+                  setPlaceNotificationLevel(key, candidate);
+                  onOpenChange(false);
+                }}
+                className={`block w-full rounded-md px-2 py-1.5 text-left hover:bg-accent ${
+                  level === candidate ? "bg-accent/60" : ""
+                }`}
+              >
+                <span
+                  className={`block text-[13px] ${
+                    level === candidate ? "font-medium" : ""
+                  }`}
+                >
+                  {NOTIFICATION_LEVEL_LABEL[candidate]}
+                </span>
+                <span className="block text-[11px] text-muted-foreground">
+                  {NOTIFICATION_LEVEL_HINT[candidate]}
+                </span>
+              </button>
+            ),
+          )}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -44,24 +159,56 @@ function PlaceRow({
   mentions: number;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
+  const canConfigure = useMessaging(
+    (state) => state.capabilities.notifications,
+  );
+  const level = useMessaging((state) => notificationLevelFor(state, key));
   const placeNavigate = usePlaceNavigate();
+  const [menuOpen, setMenuOpen] = useState(false);
   const active = activePlaceKey === key;
+  const muted = level === "mute";
   return (
-    <button
-      type="button"
-      onClick={() => placeNavigate(key)}
-      className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
+    <div
+      className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors ${
         active
           ? "bg-accent text-foreground"
-          : unread > 0
+          : unread > 0 && !muted
             ? "font-medium text-foreground hover:bg-accent/60"
             : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
       }`}
     >
-      {icon}
-      <span className="min-w-0 flex-1 truncate">{label}</span>
-      <Badge count={mentions > 0 ? mentions : unread} urgent={mentions > 0} />
-    </button>
+      <button
+        type="button"
+        onClick={() => placeNavigate(key)}
+        onContextMenu={(event) => {
+          if (!canConfigure) return;
+          event.preventDefault();
+          setMenuOpen(true);
+        }}
+        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+      >
+        {icon}
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+      </button>
+      {muted ? (
+        <BellOff
+          aria-label="ミュート中"
+          className="size-3 shrink-0 text-muted-foreground/60"
+        />
+      ) : null}
+      <Badge
+        count={mentions > 0 ? mentions : unread}
+        urgent={mentions > 0}
+        muted={muted}
+      />
+      {canConfigure ? (
+        <PlaceNotificationMenu
+          placeKey={key}
+          open={menuOpen}
+          onOpenChange={setMenuOpen}
+        />
+      ) : null}
+    </div>
   );
 }
 

@@ -139,3 +139,50 @@ func (s *Store) ParticipantVisible(ctx context.Context, viewer, target Participa
 	}
 	return sharedPlace, nil
 }
+
+// ParticipantsVisibleTo returns everyone currently allowed to receive a
+// participant-scoped event about target. It is the batched form of
+// ParticipantVisible used by Hub; the visibility vocabulary remains owned by
+// the messaging store rather than being reconstructed in fanout code.
+func (s *Store) ParticipantsVisibleTo(
+	ctx context.Context, target ParticipantRef,
+) (map[ParticipantRef]struct{}, error) {
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx,
+		`WITH target_workspaces AS (
+		   SELECT workspace_id FROM workspace_members
+		   WHERE member_kind = $1 AND member_id = $2 AND left_at IS NULL
+		 ), target_places AS (
+		   SELECT place_id FROM place_members
+		   WHERE member_kind = $1 AND member_id = $2 AND left_at IS NULL
+		 )
+		 SELECT $1::text, $2::uuidv7
+		 UNION
+		 SELECT wm.member_kind, wm.member_id
+		 FROM workspace_members wm
+		 JOIN target_workspaces tw USING (workspace_id)
+		 WHERE wm.left_at IS NULL
+		 UNION
+		 SELECT pm.member_kind, pm.member_id
+		 FROM place_members pm
+		 JOIN target_places tp USING (place_id)
+		 WHERE pm.left_at IS NULL`, target.Kind, target.ID)
+	if err != nil {
+		return nil, fmt.Errorf("query participants visible to target: %w", err)
+	}
+	defer rows.Close()
+	audience := map[ParticipantRef]struct{}{}
+	for rows.Next() {
+		var kind, id string
+		if err := rows.Scan(&kind, &id); err != nil {
+			return nil, fmt.Errorf("scan participant visible to target: %w", err)
+		}
+		audience[ParticipantRef{Kind: ParticipantKind(kind), ID: id}] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate participants visible to target: %w", err)
+	}
+	return audience, nil
+}

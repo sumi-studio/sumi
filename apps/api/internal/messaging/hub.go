@@ -24,15 +24,19 @@ type Event struct {
 	DM       *dmWire             `json:"dm,omitempty"`
 	Status   *statusWire         `json:"status,omitempty"`
 	Marker   *replyLaterWire     `json:"marker,omitempty"`
-	MarkerID string              `json:"marker_id,omitempty"`
+	// Notify rides only on the copy addressed to a recipient the server decided
+	// to interrupt. Its absence is the answer "this is not worth calling you
+	// for", which is why it is per-recipient rather than part of the message.
+	Notify   *notifyWire `json:"notify,omitempty"`
+	MarkerID string      `json:"marker_id,omitempty"`
 
 	// Delivery controls; never serialized. Subject scopes a place-less event to
 	// subscribers who can see that participant. OnlyFor/ExceptFor split one
 	// logical event into per-audience payloads (remind_at は本人以外の wire に
-	// 載せない — the owner's copy and everyone else's copy differ).
-	Subject   *ParticipantRef `json:"-"`
-	OnlyFor   *ParticipantRef `json:"-"`
-	ExceptFor *ParticipantRef `json:"-"`
+	// 載せない; notify は呼ばれた人の wire にしか載らない).
+	Subject   *ParticipantRef  `json:"-"`
+	OnlyFor   *ParticipantRef  `json:"-"`
+	ExceptFor []ParticipantRef `json:"-"`
 }
 
 // Durable event types. The wire names match the web model's ServerEvent.
@@ -49,12 +53,11 @@ const (
 	EventPlaceUpdated       = "place_updated"
 )
 
-// subscriber is one live WebSocket connection's delivery state. visible is a
-// positive cache of place visibility: places the subscriber was allowed to see
-// at first contact. Unknown places are re-checked against the store (so places
-// created mid-connection are delivered); revocations take effect on reconnect,
-// like most live-session permission models. The messaging surface's authority
-// for what exists is always the store — the hub only decides who is told now.
+// subscriber is one live WebSocket connection's delivery state. visible keeps
+// the most recent observation for catch-up bookkeeping and the store-less
+// session-revocation harness, but a live store-backed publish never trusts it:
+// membership is re-authorized for every event so revocation fences content
+// without requiring reconnect.
 type subscriber struct {
 	viewer ParticipantRef
 	send   chan []byte
@@ -86,15 +89,31 @@ func (s *subscriber) visibility(placeID string) (bool, bool) {
 // 配送はbest-effort、正本はstoreにあり、落ちてもseqから再構成できる) — a
 // subscriber whose buffer overflows is dropped and reconnects with cursors.
 type Hub struct {
-	store *Store
+	authorizer hubAuthorizer
 
 	mu          sync.Mutex
 	subscribers map[*subscriber]struct{}
 }
 
-// NewHub returns a hub that consults the store for place visibility.
+// hubAuthorizer is the narrow adapter from in-memory fanout to Messaging's
+// authorization model. Hub asks for a current participant set; channel/DM and
+// participant-visibility vocabulary stays in Store.
+type hubAuthorizer interface {
+	ActiveParticipantsForPlace(context.Context, string) (map[ParticipantRef]struct{}, error)
+	ParticipantsVisibleTo(context.Context, ParticipantRef) (map[ParticipantRef]struct{}, error)
+}
+
+// NewHub returns a hub that obtains current authorized participant sets from
+// the messaging store before in-memory fanout.
 func NewHub(store *Store) *Hub {
-	return &Hub{store: store, subscribers: map[*subscriber]struct{}{}}
+	if store == nil {
+		return newHub(nil)
+	}
+	return newHub(store)
+}
+
+func newHub(authorizer hubAuthorizer) *Hub {
+	return &Hub{authorizer: authorizer, subscribers: map[*subscriber]struct{}{}}
 }
 
 func (h *Hub) subscribe(viewer ParticipantRef) *subscriber {
@@ -125,15 +144,69 @@ func (h *Hub) unsubscribe(sub *subscriber) {
 // its scope (place, or subject participant for place-less events). Slow
 // subscribers are dropped rather than blocking the publisher.
 func (h *Hub) Publish(ctx context.Context, event Event) {
+	h.PublishVariants(ctx, []Event{event})
+}
+
+// PublishVariants delivers mutually exclusive recipient variants of one
+// logical event. Current authorization is resolved once for the shared scope,
+// then OnlyFor/ExceptFor partitions the already-authorized subscribers fully
+// in memory. A subscriber receives at most one variant.
+func (h *Hub) PublishVariants(ctx context.Context, events []Event) {
 	if h == nil {
 		return
 	}
-	frame, err := json.Marshal(struct {
-		Type  string `json:"type"`
-		Event Event  `json:"event"`
-	}{Type: "event", Event: event})
-	if err != nil {
+	if len(events) == 0 {
 		return
+	}
+	scope, ok := eventScope(events[0])
+	if !ok {
+		return
+	}
+	frames := make([][]byte, len(events))
+	onlyFor := make(map[ParticipantRef]int, len(events))
+	fallbacks := make([]int, 0, 1)
+	excludedByEvent := make([]map[ParticipantRef]struct{}, len(events))
+	for i, event := range events {
+		candidateScope, valid := eventScope(event)
+		if !valid || candidateScope != scope {
+			return
+		}
+		frame, err := json.Marshal(struct {
+			Type  string `json:"type"`
+			Event Event  `json:"event"`
+		}{Type: "event", Event: event})
+		if err != nil {
+			return
+		}
+		frames[i] = frame
+		if event.OnlyFor != nil {
+			if _, duplicate := onlyFor[*event.OnlyFor]; duplicate {
+				return
+			}
+			onlyFor[*event.OnlyFor] = i
+			continue
+		}
+		fallbacks = append(fallbacks, i)
+		if len(event.ExceptFor) > 0 {
+			excluded := make(map[ParticipantRef]struct{}, len(event.ExceptFor))
+			for _, participant := range event.ExceptFor {
+				excluded[participant] = struct{}{}
+			}
+			excludedByEvent[i] = excluded
+		}
+	}
+
+	var authorized map[ParticipantRef]struct{}
+	if h.authorizer != nil {
+		var err error
+		if events[0].PlaceID != "" {
+			authorized, err = h.authorizer.ActiveParticipantsForPlace(ctx, events[0].PlaceID)
+		} else {
+			authorized, err = h.authorizer.ParticipantsVisibleTo(ctx, *events[0].Subject)
+		}
+		if err != nil {
+			return
+		}
 	}
 	h.mu.Lock()
 	subs := make([]*subscriber, 0, len(h.subscribers))
@@ -144,18 +217,32 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 
 	var drop []*subscriber
 	for _, sub := range subs {
-		if event.OnlyFor != nil && sub.viewer != *event.OnlyFor {
+		visible := false
+		if h.authorizer == nil {
+			visible, _ = sub.visibility(scope)
+		} else {
+			_, visible = authorized[sub.viewer]
+		}
+		sub.markVisible(scope, visible)
+		if !visible {
 			continue
 		}
-		if event.ExceptFor != nil && sub.viewer == *event.ExceptFor {
-			continue
+		variant, found := onlyFor[sub.viewer]
+		if !found {
+			for _, candidate := range fallbacks {
+				if _, excluded := excludedByEvent[candidate][sub.viewer]; excluded {
+					continue
+				}
+				variant, found = candidate, true
+				break
+			}
 		}
-		if !h.visibleTo(ctx, sub, event) {
+		if !found {
 			continue
 		}
 		select {
 		case <-sub.done:
-		case sub.send <- frame:
+		case sub.send <- frames[variant]:
 		default:
 			drop = append(drop, sub)
 		}
@@ -165,30 +252,12 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 	}
 }
 
-// visibleTo answers "may this subscriber be told about this event now",
-// caching verdicts per scope key. Place events use place visibility;
-// participant-scoped events use ParticipantVisible under a prefixed key so the
-// two namespaces cannot collide. An event with neither scope is delivered to
-// no one (fail-closed).
-func (h *Hub) visibleTo(ctx context.Context, sub *subscriber, event Event) bool {
-	scope := event.PlaceID
-	if scope == "" {
-		if event.Subject == nil {
-			return false
-		}
-		scope = "participant|" + event.Subject.Key()
-	}
-	ok, known := sub.visibility(scope)
-	if known {
-		return ok
-	}
+func eventScope(event Event) (string, bool) {
 	if event.PlaceID != "" {
-		_, err := h.store.PlaceFor(ctx, event.PlaceID, sub.viewer)
-		ok = err == nil
-	} else {
-		visible, err := h.store.ParticipantVisible(ctx, sub.viewer, *event.Subject)
-		ok = err == nil && visible
+		return event.PlaceID, true
 	}
-	sub.markVisible(scope, ok)
-	return ok
+	if event.Subject != nil {
+		return "participant|" + event.Subject.Key(), true
+	}
+	return "", false
 }

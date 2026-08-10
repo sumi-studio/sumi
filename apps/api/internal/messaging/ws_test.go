@@ -352,6 +352,120 @@ func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 	}
 }
 
+func TestHubReauthorizesWarmedVisibilityAfterMembershipRemoval(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		participant func(world) ParticipantRef
+	}{
+		{name: "human", participant: func(w world) ParticipantRef { return w.humanB }},
+		{name: "personality_agent", participant: func(w world) ParticipantRef { return w.agent }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			ws, ch := w.workspaceWithChannel(t, ctx)
+			participant := test.participant(w)
+			hub := NewHub(w.store)
+			sub := hub.subscribe(participant)
+			defer hub.unsubscribe(sub)
+
+			audience, err := w.store.ActiveParticipantsForPlace(ctx, ch.PlaceID)
+			if err != nil {
+				t.Fatalf("load initial audience: %v", err)
+			}
+			if _, visible := audience[participant]; !visible {
+				t.Fatal("member was not initially authorized")
+			}
+			sub.markVisible(ch.PlaceID, true)
+			if cached, known := sub.visibility(ch.PlaceID); !known || !cached {
+				t.Fatal("positive visibility observation was not warmed")
+			}
+
+			msg := w.send(t, ctx, ch.PlaceID, w.humanA, "revocation後に漏らしてはいけない")
+			wire := messageToWire(ch, msg)
+			if err := w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, participant); err != nil {
+				t.Fatalf("remove member: %v", err)
+			}
+			// This is the broad fallback frame (no OnlyFor). Even though the
+			// subscriber once had a positive cache entry, current membership must
+			// fence the full message body after the removal commit.
+			hub.Publish(ctx, Event{
+				Type: EventMessageCreated, PlaceID: ch.PlaceID, Message: &wire,
+			})
+			if got := len(sub.send); got != 0 {
+				t.Fatalf("removed %s received %d queued content frames", participant.Key(), got)
+			}
+		})
+	}
+}
+
+type countingHubAuthorizer struct {
+	placeCalls       int
+	participantCalls int
+	audience         map[ParticipantRef]struct{}
+	store            *Store
+}
+
+func (a *countingHubAuthorizer) ActiveParticipantsForPlace(
+	ctx context.Context, placeID string,
+) (map[ParticipantRef]struct{}, error) {
+	a.placeCalls++
+	if a.store != nil {
+		return a.store.ActiveParticipantsForPlace(ctx, placeID)
+	}
+	return a.audience, nil
+}
+
+func (a *countingHubAuthorizer) ParticipantsVisibleTo(
+	ctx context.Context, participant ParticipantRef,
+) (map[ParticipantRef]struct{}, error) {
+	a.participantCalls++
+	if a.store != nil {
+		return a.store.ParticipantsVisibleTo(ctx, participant)
+	}
+	return a.audience, nil
+}
+
+func TestHubBatchesAuthorizationAndVariantFanout(t *testing.T) {
+	const subscriberCount = 500
+	authorizer := &countingHubAuthorizer{audience: map[ParticipantRef]struct{}{}}
+	hub := newHub(authorizer)
+	subs := make([]*subscriber, 0, subscriberCount)
+	for i := 0; i < subscriberCount; i++ {
+		participant := Human(fmt.Sprintf("participant-%d", i))
+		authorizer.audience[participant] = struct{}{}
+		subs = append(subs, hub.subscribe(participant))
+	}
+	events := make([]Event, 0, subscriberCount+1)
+	notified := make([]ParticipantRef, 0, subscriberCount)
+	for _, sub := range subs {
+		participant := sub.viewer
+		notified = append(notified, participant)
+		events = append(events, Event{
+			Type: EventMessageCreated, PlaceID: "place", OnlyFor: &participant,
+		})
+	}
+	events = append(events, Event{
+		Type: EventMessageCreated, PlaceID: "place", ExceptFor: notified,
+	})
+	hub.PublishVariants(context.Background(), events)
+	if authorizer.placeCalls != 1 {
+		t.Fatalf("place authorization queries = %d, want one batched lookup", authorizer.placeCalls)
+	}
+	for _, sub := range subs {
+		if got := len(sub.send); got != 1 {
+			t.Fatalf("subscriber %s received %d variants, want exactly one", sub.viewer.Key(), got)
+		}
+	}
+
+	subject := Human("subject")
+	hub.Publish(context.Background(), Event{Type: EventStatusUpdated, Subject: &subject})
+	if authorizer.participantCalls != 1 {
+		t.Fatalf("participant authorization queries = %d, want one batched lookup", authorizer.participantCalls)
+	}
+}
+
 func TestRESTSendReachesWSSubscribers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

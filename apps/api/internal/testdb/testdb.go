@@ -45,7 +45,16 @@ func Create(t *testing.T) *pgxpool.Pool {
 	}
 
 	testURL := replaceDatabaseName(databaseURL, testDBName)
-	pool, err := pgxpool.New(ctx, testURL)
+	config, err := pgxpool.ParseConfig(testURL)
+	if err != nil {
+		_, _ = maintenance.Exec(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS "%s" WITH (FORCE)`, testDBName))
+		t.Fatalf("parse test database config: %v", err)
+	}
+	// Match db.Open instead of inheriting pgxpool's CPU-dependent default.
+	// Concurrency tests exercise the production pool contract and may
+	// deliberately hold more than four connections at once.
+	config.MaxConns = 10
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		_, _ = maintenance.Exec(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS "%s" WITH (FORCE)`, testDBName))
 		t.Fatalf("connect test pool: %v", err)
