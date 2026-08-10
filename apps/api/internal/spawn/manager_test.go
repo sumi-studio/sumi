@@ -240,7 +240,7 @@ func (s *blockingSpawner) Spawn(ctx context.Context, _ AgentRuntimeConfig) (Proc
 	s.mu.Unlock()
 	select {
 	case <-s.release:
-		return &fakeProcess{}, nil
+		return &fakeProcess{done: make(chan struct{})}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
