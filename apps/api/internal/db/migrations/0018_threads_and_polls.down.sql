@@ -16,7 +16,9 @@ ALTER TABLE places
     DROP CONSTRAINT places_named,
     DROP CONSTRAINT places_dm_keyed,
     DROP CONSTRAINT places_thread_parented,
-    DROP CONSTRAINT places_thread_origin;
+    DROP CONSTRAINT places_thread_origin,
+    DROP CONSTRAINT places_parent_same_workspace,
+    DROP CONSTRAINT places_origin_in_parent;
 
 DROP INDEX places_one_thread_per_origin;
 DROP INDEX places_by_parent;
@@ -27,6 +29,6 @@ ALTER TABLE places
 
 ALTER TABLE places
     ADD CHECK (kind IN ('channel', 'dm', 'group_dm')),
-    ADD CHECK ((kind = 'channel') = (workspace_id IS NOT NULL)),
+    ADD CHECK (workspace_id IS NOT NULL),
     ADD CHECK ((kind = 'channel') = (name IS NOT NULL)),
     ADD CHECK ((kind = 'dm') = (dm_key IS NOT NULL));

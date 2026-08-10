@@ -1,0 +1,18 @@
+DROP TRIGGER IF EXISTS app_installation_owner_exists ON app_installations;
+DROP FUNCTION IF EXISTS validate_app_installation_owner();
+DROP TRIGGER IF EXISTS app_installation_address_immutable ON app_installations;
+DROP FUNCTION IF EXISTS prevent_app_installation_address_mutation();
+DROP TABLE IF EXISTS app_installations;
+DROP TABLE IF EXISTS app_catalog;
+DROP TABLE IF EXISTS workspace_invites;
+DROP TABLE IF EXISTS workspace_role_assignments;
+DROP TABLE IF EXISTS workspace_roles;
+ALTER TABLE IF EXISTS workspaces DROP CONSTRAINT IF EXISTS workspace_owner_is_own_membership;
+DROP TRIGGER IF EXISTS workspace_owner_immutable ON workspaces;
+DROP FUNCTION IF EXISTS prevent_workspace_owner_change();
+DROP TRIGGER IF EXISTS workspace_owner_membership_immutable ON workspace_members;
+DROP FUNCTION IF EXISTS prevent_workspace_owner_membership_mutation();
+DROP TRIGGER IF EXISTS workspace_member_participant_exists ON workspace_members;
+DROP FUNCTION IF EXISTS validate_workspace_member_participant();
+DROP TABLE IF EXISTS workspace_members;
+DROP TABLE IF EXISTS workspaces;
