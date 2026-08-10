@@ -207,13 +207,11 @@ func TestLocalReplyLaterAndResolveUseTheSharedStore(t *testing.T) {
 	w := newWorld(t, ctx)
 	server := NewServer(w.store, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
-		t.Fatalf("admit human: %v", err)
-	}
-	msg := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "手が空いたら見てください")
+	_, channel := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, channel.PlaceID, w.humanA, "手が空いたら見てください")
 
 	status, body := callLocal(t, ctx, server.localReplyLater, LocalReplyLaterPath, map[string]any{
-		"place_id": DefaultGeneralChannelID, "message_id": msg.MessageID,
+		"place_id": channel.PlaceID, "message_id": msg.MessageID,
 		"note": "他の対応中です。後で返信します", "remind_in_minutes": 45,
 	}, authorization)
 	if status != http.StatusCreated || body["created"] != true {
@@ -244,9 +242,9 @@ func TestLocalReplyLaterAndResolveUseTheSharedStore(t *testing.T) {
 	}
 
 	// The default reminder applies when the agent names no time.
-	other := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "こちらもいつか")
+	other := w.send(t, ctx, channel.PlaceID, w.humanA, "こちらもいつか")
 	status, body = callLocal(t, ctx, server.localReplyLater, LocalReplyLaterPath, map[string]any{
-		"place_id": DefaultGeneralChannelID, "message_id": other.MessageID,
+		"place_id": channel.PlaceID, "message_id": other.MessageID,
 	}, authorization)
 	if status != http.StatusCreated || body["marker"].(map[string]any)["note"] != DefaultReplyLaterNote {
 		t.Fatalf("default marker: status %d body %v", status, body)
@@ -261,7 +259,7 @@ func TestLocalReplyLaterAndResolveUseTheSharedStore(t *testing.T) {
 	// Another participant's marker is missing, not forbidden — the same answer
 	// the human lane gives.
 	humanMarker, _, err := w.store.CreateReplyLater(
-		ctx, DefaultGeneralChannelID, other.MessageID, w.humanA, "", time.Now().Add(time.Hour))
+		ctx, channel.PlaceID, other.MessageID, w.humanA, "", time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatalf("human marker: %v", err)
 	}

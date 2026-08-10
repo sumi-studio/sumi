@@ -123,7 +123,6 @@ struct VisibleMessage {
 
 #[derive(Default)]
 struct MessagingViewState {
-    initialized: bool,
     focused_place_id: Option<String>,
     pending_read_through: Option<(String, u64)>,
     visible_messages: Vec<VisibleMessage>,
@@ -299,9 +298,10 @@ impl Tool for MessagingTool {
         ToolDefinition {
             name: TOOL_NAME.to_owned(),
             description: concat!(
-                "Use Sumi's shared messaging app as a person. Start with overview, ",
-                "open a place to see its timeline/members/unread state, then write in ",
-                "that currently open place, or react or promise a later reply to a ",
+                "Use Sumi's shared messaging app as a person. Use overview to discover ",
+                "available places, or open an explicitly known place to see its timeline, ",
+                "members and unread state. Then write in that currently open place, or ",
+                "react or promise a later reply to a ",
                 "message visible in it. Declare your own availability with status. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare."
@@ -326,30 +326,12 @@ impl Tool for MessagingTool {
         let mut state = self.view.lock().await;
         self.flush_admitted_read(&mut state, &ctx.cancel).await?;
 
-        // The MVP control plane creates/joins the shared default Workspace in
-        // overview. Make that lifecycle precondition true even when the model
-        // follows a permalink and opens a place first.
-        let initial_overview = if state.initialized {
-            None
-        } else {
-            let response = tokio::select! {
+        let response = match action {
+            MessagingAction::Overview {} => tokio::select! {
                 _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
                 result = self.api.overview() => result,
             }
-            .map_err(|error| ToolError::Rpc(error.to_string()))?;
-            state.initialized = true;
-            Some(response)
-        };
-
-        let response = match action {
-            MessagingAction::Overview {} => match initial_overview {
-                Some(response) => response,
-                None => tokio::select! {
-                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.overview() => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?,
-            },
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
             MessagingAction::Open {
                 place_id,
                 before_seq,
@@ -1048,7 +1030,7 @@ mod tests {
         );
         assert_eq!(
             api.calls.lock().await.as_slice(),
-            &["overview", "open:general", "read:general", "overview"]
+            &["open:general", "read:general", "overview"]
         );
     }
 

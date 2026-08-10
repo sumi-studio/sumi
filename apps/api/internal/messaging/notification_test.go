@@ -138,15 +138,7 @@ func TestNotificationDecisionsTreatDMsAsTheirOwnReason(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	if _, err := w.store.CreateWorkspace(ctx, "sumi-dev", w.humanA); err != nil {
-		t.Fatalf("create workspace: %v", err)
-	}
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
-		t.Fatalf("admit humanA: %v", err)
-	}
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanB); err != nil {
-		t.Fatalf("admit humanB: %v", err)
-	}
+	w.workspaceWithChannel(t, ctx)
 	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
@@ -327,9 +319,6 @@ func TestNotificationSettingRoundTripsAndStaysItsOwners(t *testing.T) {
 	}
 	// …and a place the caller cannot see is missing, never forbidden: the
 	// setting route must not confirm places across the membership boundary.
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanB); err != nil {
-		t.Fatalf("admit humanB: %v", err)
-	}
 	private, _, err := w.store.EnsureDM(ctx, w.humanB, w.agent)
 	if err != nil {
 		t.Fatalf("ensure private dm: %v", err)
@@ -486,13 +475,7 @@ func TestLocalNotificationSettingsUseTheSharedStore(t *testing.T) {
 	if stored.Default() != NotifyLevelMentions || len(stored.Keywords) != 1 {
 		t.Fatalf("agent stored setting = %+v", stored)
 	}
-	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
-		t.Fatalf("admit humanA: %v", err)
-	}
-	general, err := w.store.PlaceFor(ctx, DefaultGeneralChannelID, w.humanA)
-	if err != nil {
-		t.Fatalf("load general: %v", err)
-	}
+	_, general := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, general.PlaceID, w.humanA, "今夜のリリースについて")
 	decisions, err := w.store.NotificationDecisionsFor(ctx, general, msg)
 	if err != nil {

@@ -1,45 +1,19 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect } from "react";
+import { createFileRoute } from "@tanstack/react-router";
 import { AuthGate } from "../auth/auth-gate";
-import { useMessaging } from "../messaging/store";
+import { MessagingScreen } from "../messaging/components/messaging-screen";
 
 /**
- * ルートはホームの入口。最初のchannelへリダイレクトし、以降の現在地は
- * URL（/c/:id、/dm/:id）が正本になる。
+ * ルートは特定のWorkspaceやplaceを推測しないホーム。現在地があるときは
+ * URL（/c/:id、/dm/:id）が正本になり、ここでは明示的な選択を待つ。
  */
 export const Route = createFileRoute("/")({
-  component: () => (
-    <AuthGate>
-      <HomeRedirect />
-    </AuthGate>
-  ),
+  component: HomeRoute,
 });
 
-function HomeRedirect() {
-  const init = useMessaging((state) => state.init);
-  const ready = useMessaging((state) => state.ready);
-  const channels = useMessaging((state) => state.channels);
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    init();
-  }, [init]);
-
-  useEffect(() => {
-    if (!ready) return;
-    const first = channels[0];
-    if (first) {
-      void navigate({
-        to: "/c/$channelId",
-        params: { channelId: first.channelId },
-        replace: true,
-      });
-    }
-  }, [ready, channels, navigate]);
-
+export function HomeRoute() {
   return (
-    <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground text-sm">
-      読み込み中…
-    </div>
+    <AuthGate>
+      <MessagingScreen />
+    </AuthGate>
   );
 }

@@ -1,7 +1,7 @@
 import { BellOff, Check, Hash, MoreVertical, Plus, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
-import { participantKey } from "../model";
+import { parsePlaceKey, participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import {
   getMessagingSessionIdentity,
@@ -147,25 +147,26 @@ function PlaceNotificationMenu({
 
 function PlaceRow({
   placeKey: key,
+  selectedPlaceKey,
   label,
   icon,
   unread,
   mentions,
 }: {
   placeKey: PlaceKey;
+  selectedPlaceKey: PlaceKey | null;
   label: React.ReactNode;
   icon: React.ReactNode;
   unread: number;
   mentions: number;
 }) {
-  const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const canConfigure = useMessaging(
     (state) => state.capabilities.notifications,
   );
   const level = useMessaging((state) => notificationLevelFor(state, key));
   const placeNavigate = usePlaceNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
-  const active = activePlaceKey === key;
+  const active = selectedPlaceKey === key;
   const muted = level === "mute";
   return (
     <div
@@ -179,6 +180,7 @@ function PlaceRow({
     >
       <button
         type="button"
+        aria-current={active ? "page" : undefined}
         onClick={() => placeNavigate(key)}
         onContextMenu={(event) => {
           if (!canConfigure) return;
@@ -253,7 +255,15 @@ function DialogShell({
   );
 }
 
-function CreateChannelDialog({ onClose }: { onClose: () => void }) {
+function CreateChannelDialog({
+  workspaceId,
+  isWorkspaceSelected,
+  onClose,
+}: {
+  workspaceId: string;
+  isWorkspaceSelected: () => boolean;
+  onClose: () => void;
+}) {
   const createChannel = useMessaging((state) => state.createChannel);
   const placeNavigate = usePlaceNavigate();
   const [name, setName] = useState("");
@@ -270,14 +280,28 @@ function CreateChannelDialog({ onClose }: { onClose: () => void }) {
     event.preventDefault();
     const trimmed = name.trim();
     if (!trimmed || busy) return;
+    const currentIdentity = getMessagingSessionIdentity();
+    const expectedSelfKey = useMessaging.getState().selfKey;
     setBusy(true);
     setFailed(false);
     try {
-      const key = await createChannel(trimmed, topic.trim());
+      const key = await createChannel(workspaceId, trimmed, topic.trim());
+      const sessionChanged =
+        getMessagingSessionIdentity() !== currentIdentity ||
+        useMessaging.getState().selfKey !== expectedSelfKey;
+      if (sessionChanged || !isWorkspaceSelected()) {
+        throw new Error("Messaging session changed before channel navigation");
+      }
       placeNavigate(key);
       onClose();
     } catch {
-      setFailed(true);
+      if (
+        getMessagingSessionIdentity() === currentIdentity &&
+        useMessaging.getState().selfKey === expectedSelfKey &&
+        isWorkspaceSelected()
+      ) {
+        setFailed(true);
+      }
       setBusy(false);
     }
   };
@@ -473,26 +497,32 @@ function SectionHeader({
 }: {
   label: string;
   actionTitle: string;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   return (
     <div className="group flex items-center justify-between px-2 pb-1">
       <p className="font-medium text-[11px] text-muted-foreground/80">
         {label}
       </p>
-      <button
-        type="button"
-        title={actionTitle}
-        onClick={onAction}
-        className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
-      >
-        <Plus className="size-3.5" />
-      </button>
+      {onAction ? (
+        <button
+          type="button"
+          title={actionTitle}
+          onClick={onAction}
+          className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Plus className="size-3.5" />
+        </button>
+      ) : null}
     </div>
   );
 }
 
-export function Sidebar() {
+export function Sidebar({
+  selectedPlaceKey,
+}: {
+  selectedPlaceKey: PlaceKey | null;
+}) {
   const workspaces = useMessaging((state) => state.workspaces);
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
@@ -507,7 +537,32 @@ export function Sidebar() {
   const setStatus = useMessaging((state) => state.setStatus);
   const canSetStatus = useMessaging((state) => state.capabilities.status);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
-  const [openDialog, setOpenDialog] = useState<"channel" | "dm" | null>(null);
+  const [openDialog, setOpenDialog] = useState<
+    { kind: "channel"; workspaceId: string } | { kind: "dm" } | null
+  >(null);
+
+  const activePlace = selectedPlaceKey ? parsePlaceKey(selectedPlaceKey) : null;
+  const activeChannel =
+    activePlace?.kind === "channel"
+      ? channels.find((channel) => channel.channelId === activePlace.channelId)
+      : undefined;
+  const activeWorkspace = activeChannel
+    ? workspaces.find(
+        (workspace) => workspace.workspaceId === activeChannel.workspaceId,
+      )
+    : undefined;
+  const selectedWorkspaceId = activeWorkspace?.workspaceId ?? null;
+  const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
+  selectedWorkspaceIdRef.current = selectedWorkspaceId;
+
+  useEffect(() => {
+    if (
+      openDialog?.kind === "channel" &&
+      openDialog.workspaceId !== selectedWorkspaceId
+    ) {
+      setOpenDialog(null);
+    }
+  }, [openDialog, selectedWorkspaceId]);
 
   const selfProfile = self ? membersByKey[selfKey] : undefined;
   const selfStatus = statusByKey[selfKey];
@@ -516,7 +571,8 @@ export function Sidebar() {
     <aside className="flex w-60 shrink-0 flex-col border-border/70 border-r bg-muted/20">
       <div className="flex h-12 shrink-0 items-center border-border/70 border-b px-4">
         <span className="truncate font-semibold text-[14px]">
-          {workspaces[0]?.name ?? "Sumi"}
+          {activeWorkspace?.name ??
+            (workspaces.length === 0 ? "ワークスペースなし" : "場所を選択")}
         </span>
       </div>
       <nav className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2">
@@ -524,7 +580,15 @@ export function Sidebar() {
           <SectionHeader
             label="チャンネル"
             actionTitle="チャンネルを作成"
-            onAction={() => setOpenDialog("channel")}
+            onAction={
+              activeWorkspace
+                ? () =>
+                    setOpenDialog({
+                      kind: "channel",
+                      workspaceId: activeWorkspace.workspaceId,
+                    })
+                : undefined
+            }
           />
         </div>
         {channels.map((channel) => {
@@ -535,6 +599,7 @@ export function Sidebar() {
             <PlaceRow
               key={key}
               placeKey={key}
+              selectedPlaceKey={selectedPlaceKey}
               label={channel.name}
               icon={<Hash className="size-3.5 shrink-0 opacity-60" />}
               unread={unread}
@@ -546,7 +611,7 @@ export function Sidebar() {
           <SectionHeader
             label="ダイレクトメッセージ"
             actionTitle="ダイレクトメッセージを開始"
-            onAction={() => setOpenDialog("dm")}
+            onAction={() => setOpenDialog({ kind: "dm" })}
           />
         </div>
         {dms.map((dm) => {
@@ -566,6 +631,7 @@ export function Sidebar() {
             <PlaceRow
               key={key}
               placeKey={key}
+              selectedPlaceKey={selectedPlaceKey}
               label={name}
               icon={
                 <ParticipantAvatar
@@ -638,10 +704,17 @@ export function Sidebar() {
           </span>
         </button>
       </div>
-      {openDialog === "channel" ? (
-        <CreateChannelDialog onClose={() => setOpenDialog(null)} />
+      {openDialog?.kind === "channel" &&
+      openDialog.workspaceId === selectedWorkspaceId ? (
+        <CreateChannelDialog
+          workspaceId={openDialog.workspaceId}
+          isWorkspaceSelected={() =>
+            selectedWorkspaceIdRef.current === openDialog.workspaceId
+          }
+          onClose={() => setOpenDialog(null)}
+        />
       ) : null}
-      {openDialog === "dm" ? (
+      {openDialog?.kind === "dm" ? (
         <StartDMDialog onClose={() => setOpenDialog(null)} />
       ) : null}
     </aside>
