@@ -151,7 +151,7 @@ func TestConcurrentMigrateCallsShareOneSerializedManifestTransition(t *testing.T
 	}
 }
 
-func TestMigrateAdoptsLegacyVersionOnlyRowsOnce(t *testing.T) {
+func TestMigrateRejectsLegacyVersionOnlyRowsWithoutBlessingThem(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -164,23 +164,18 @@ func TestMigrateAdoptsLegacyVersionOnlyRowsOnce(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("adopt and migrate: %v", err)
+	err := Migrate(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "reset the pre-cutover database") {
+		t.Fatalf("legacy migration history did not require a reset: %v", err)
 	}
-	status, err := MigrationManifestStatus(ctx, pool)
-	if err != nil || !status.Ready {
-		t.Fatalf("adopted manifest not ready: status=%+v err=%v", status, err)
-	}
-	var nullable string
-	if err := pool.QueryRow(ctx, `
-		SELECT is_nullable
-		FROM information_schema.columns
-		WHERE table_schema='public' AND table_name='schema_migrations' AND column_name='sha256'
-	`).Scan(&nullable); err != nil {
+	var name, digest *string
+	if err := pool.QueryRow(ctx,
+		"SELECT name, sha256 FROM schema_migrations WHERE version=1",
+	).Scan(&name, &digest); err != nil {
 		t.Fatal(err)
 	}
-	if nullable != "NO" {
-		t.Fatalf("adopted sha256 column remained nullable: %s", nullable)
+	if name != nil || digest != nil {
+		t.Fatalf("startup blessed unverifiable legacy history: name=%v sha256=%v", name, digest)
 	}
 }
 

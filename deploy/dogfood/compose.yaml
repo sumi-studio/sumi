@@ -83,6 +83,25 @@ services:
     networks: [data]
     restart: "no"
 
+  # Maintenance SQL never runs from the host. This digest-pinned client has
+  # only the internal data network and no database volume or published port.
+  # `compose-database.sh` supplies one fixed operation through /bin/sh.
+  database-client:
+    image: ${SUMI_POSTGRES_IMAGE:?set an image@sha256 digest}
+    profiles: [maintenance]
+    entrypoint: [/bin/sh]
+    command: [-ceu, "exit 2"]
+    environment:
+      SUMI_DB_URL: ${SUMI_DB_URL:?set the dogfood database URL}
+      SUMI_RESTORE_DB_URL: ${SUMI_RESTORE_DB_URL:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    networks: [data]
+    restart: "no"
+
   runtime-provisioner:
     image: ${SUMI_PROVISIONER_IMAGE:?set an image@sha256 digest}
     user: "0:0"

@@ -22,7 +22,7 @@ test("dedicated smoke runner cannot report success when real inputs are absent",
   );
 });
 
-test("browser smoke owns API restart, Tunnel restart, cursor catch-up, and nonce replay", async () => {
+test("browser smoke drives both shipped surfaces and keeps nonce replay as lower-level evidence", async () => {
   const source = await readFile(
     resolve(directory, "../../../apps/web/e2e/dogfood-restart.spec.ts"),
     "utf8",
@@ -30,10 +30,14 @@ test("browser smoke owns API restart, Tunnel restart, cursor catch-up, and nonce
   for (const evidence of [
     "SUMI_DOGFOOD_RESTART_API_HELPER",
     "SUMI_DOGFOOD_RESTART_TUNNEL_HELPER",
-    "caught_up",
-    "discarding a successful receipt",
+    "data-sumi-surface",
+    "openMessaging",
+    "openDirectChat",
+    "another client's outage commit",
+    "discarded receipt",
     "client_nonce",
   ]) {
     assert.match(source, new RegExp(evidence));
   }
+  assert.doesNotMatch(source, /new WebSocket/);
 });

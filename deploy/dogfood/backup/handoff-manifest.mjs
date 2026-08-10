@@ -31,6 +31,7 @@ if (mode === "create") {
         snapshot_id: snapshot.snapshot_id,
         app_sha: snapshot.app_sha,
         api_image: snapshot.api_image,
+        provisioner_image: snapshot.provisioner_image,
         postgres_image: snapshot.postgres_image,
         encrypted_size: encryptedInfo.size,
         encrypted_sha256: encryptedSHA256,
@@ -52,6 +53,7 @@ if (mode === "create") {
     !/^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/.test(recorded.snapshot_id ?? "") ||
     !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(recorded.app_sha ?? "") ||
     !imageDigest.test(recorded.api_image ?? "") ||
+    !imageDigest.test(recorded.provisioner_image ?? "") ||
     !imageDigest.test(recorded.postgres_image ?? "") ||
     !Number.isSafeInteger(recorded.encrypted_size) ||
     recorded.encrypted_size < 0 ||
@@ -70,6 +72,7 @@ if (mode === "create") {
       snapshot.snapshot_id !== recorded.snapshot_id ||
       snapshot.app_sha !== recorded.app_sha ||
       snapshot.api_image !== recorded.api_image ||
+      snapshot.provisioner_image !== recorded.provisioner_image ||
       snapshot.postgres_image !== recorded.postgres_image ||
       (await sha256(snapshotPath)) !== recorded.snapshot_manifest_sha256
     ) {
@@ -89,6 +92,7 @@ function validateSnapshotIdentity(snapshot) {
     !/^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/.test(snapshot.snapshot_id ?? "") ||
     !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(snapshot.app_sha ?? "") ||
     !imageDigest.test(snapshot.api_image ?? "") ||
+    !imageDigest.test(snapshot.provisioner_image ?? "") ||
     !imageDigest.test(snapshot.postgres_image ?? "")
   ) {
     throw new Error("snapshot manifest identity is invalid");

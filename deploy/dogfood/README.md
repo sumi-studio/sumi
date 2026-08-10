@@ -133,12 +133,16 @@ dynamic no-storeを実originで確認する。
   recordをversion管理する。それ以後、記録済みmigrationをrename/rewriteせず、
   新しいforward migrationだけを追加する。API readinessはapplied migrationの
   nameとSHA-256をembedded manifestへ照合する。
-- `backup/README.md`どおり、Postgresとattachment treeを一つのsnapshotとして
-  off-hostへ送り、空のscratch DB/rootへ復元する。
-- `smoke/README.md`の専用runnerでAPI restart、Tunnel restart、cursor catch-up、
-  same-nonce replayを実施する。入力不足によるskipはacceptance successではない。
-- command log、runtime state、PersonalityAgent private volumeはmessaging snapshotの
-  対象外である。別のrecovery contractなしに「Sumi全体をbackup済み」と言わない。
+- `backup/README.md`どおり、Postgres、API command/runtime state、attachment tree、
+  全PersonalityAgentのcanonical private volume setを一つのquiesced snapshotとして
+  off-hostへ送り、空のscratch DB/state root/volume setへ復元して照合する。
+- `smoke/README.md`の専用runnerで、shipped MessagingとDirect Chat UIがAPI/Tunnel
+  restart中の状態を表示し、別clientのoutage中commitをcursorから一度だけ再表示
+  することを確認する。same-nonce replayは補助的なlower-level evidenceとして残す。
+  入力不足によるskipはacceptance successではない。
+- repository checksやhelperのmock実行は、real hostの暗号化handoff、off-host durability、
+  scratch restore、browser recovery rehearsalの代替ではない。実値が入ったcutover
+  recordが作られるまでgateはpendingである。
 
 ## repository checks
 

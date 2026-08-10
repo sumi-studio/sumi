@@ -534,7 +534,7 @@ func TestHealthAndReadinessAreSeparateContracts(t *testing.T) {
 		wantStatus int
 		wantBody   string
 	}{
-		{path: "/health", wantStatus: http.StatusOK, wantBody: `"status":"alive"`},
+		{path: "/health", wantStatus: http.StatusOK, wantBody: `"status":"ok"`},
 		{path: "/ready", wantStatus: http.StatusOK, wantBody: `"status":"ready"`},
 	} {
 		recorder := httptest.NewRecorder()

@@ -145,6 +145,18 @@ func TestLocalChannelLifecycleMatchesTheHumanMenu(t *testing.T) {
 	world := newWorld(t, ctx)
 	server := NewServer(world.store, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: world.agent.ID}
+	// Channel administration is the same operation on both lanes, including
+	// the same manage_channels permission. Give this actor that capability so
+	// the test exercises lifecycle parity instead of accidentally depending on
+	// the pre-role-model default membership.
+	if err := world.store.EnsureDefaultWorkspaceMembership(ctx, world.humanA); err != nil {
+		t.Fatalf("admit founding admin: %v", err)
+	}
+	if _, err := world.store.SetParticipantRoles(
+		ctx, DefaultWorkspaceID, world.humanA, world.agent, []string{DefaultAdminRoleID},
+	); err != nil {
+		t.Fatalf("grant channel administration to agent: %v", err)
+	}
 
 	post := func(path, body string, handler func(http.ResponseWriter, *http.Request, agentevents.LocalRuntimeAuthorization)) (int, channelWire) {
 		t.Helper()

@@ -30,10 +30,7 @@ import {
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
 import { enablePushSubscription } from "../push";
-import {
-  setNotificationNavigator,
-  useMessaging,
-} from "../store";
+import { setNotificationNavigator, useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
@@ -335,6 +332,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
 export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const init = useMessaging((state) => state.init);
   const ready = useMessaging((state) => state.ready);
+  const connection = useMessaging((state) => state.connection);
   const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const selectPlace = useMessaging((state) => state.selectPlace);
@@ -462,7 +460,11 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   }
 
   return (
-    <div className="flex h-dvh bg-background text-foreground">
+    <div
+      className="flex h-dvh bg-background text-foreground"
+      data-sumi-surface="messaging"
+      data-sumi-connection-state={connection}
+    >
       <AppRail activeAppId="home" />
       <Sidebar />
       {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。

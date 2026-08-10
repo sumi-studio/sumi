@@ -138,7 +138,7 @@ func TestProviderUnlinkReconcilesAmbiguousAdminSuccessAndSameNonceRetry(t *testi
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	registered, err := store.AutoRegister(ctx, "firebase", "ambiguous-unlink-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +180,7 @@ func TestProviderUnlinkKeepsFenceUntilIndeterminatePostcheckReconciles(t *testin
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	registered, err := store.AutoRegister(ctx, "firebase", "postcheck-unlink-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +283,7 @@ func TestProviderOperationStatusMapsDurableSemanticOutcomes(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	owner, err := store.AutoRegister(ctx, "firebase", "status-controller-owner")
 	if err != nil {
 		t.Fatal(err)

@@ -2,13 +2,14 @@ import { execFile } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
-import { expect, type Page, test } from "@playwright/test";
+import { type Browser, expect, type Page, test } from "@playwright/test";
 
 const run = promisify(execFile);
 const configuration = {
   baseURL: process.env.SUMI_DOGFOOD_SMOKE_BASE_URL ?? "",
   storageState: process.env.SUMI_DOGFOOD_SMOKE_STORAGE_STATE ?? "",
   placeID: process.env.SUMI_DOGFOOD_SMOKE_PLACE_ID ?? "",
+  messagingPath: process.env.SUMI_DOGFOOD_SMOKE_MESSAGING_PATH ?? "",
   restartAPI: process.env.SUMI_DOGFOOD_RESTART_API_HELPER ?? "",
   restartTunnel: process.env.SUMI_DOGFOOD_RESTART_TUNNEL_HELPER ?? "",
 };
@@ -22,7 +23,7 @@ test.describe("dedicated dogfood restart recovery", () => {
     missing.length > 0,
     `NOT COVERED: real dogfood restart inputs are absent (${missing.join(", ")})`,
   );
-  test.setTimeout(180_000);
+  test.setTimeout(240_000);
 
   test.beforeAll(async () => {
     const url = new URL(configuration.baseURL);
@@ -31,85 +32,88 @@ test.describe("dedicated dogfood restart recovery", () => {
         "SUMI_DOGFOOD_SMOKE_BASE_URL must be a credential-free HTTPS origin",
       );
     }
+    if (
+      !/^\/(?:c|dm|group)\/[A-Za-z0-9_-]+$/.test(configuration.messagingPath)
+    ) {
+      throw new Error(
+        "SUMI_DOGFOOD_SMOKE_MESSAGING_PATH must be one canonical shipped Messaging route",
+      );
+    }
     await requireProtectedFile(configuration.storageState, false);
     await requireProtectedFile(configuration.restartAPI, true);
     await requireProtectedFile(configuration.restartTunnel, true);
   });
 
-  test("API restart closes the live socket and cursor replay catches the intervening commit once", async ({
+  test("Messaging WebApp shows API loss, then replays another client's outage commit exactly once", async ({
     browser,
   }) => {
-    const context = await browser.newContext({
-      baseURL: configuration.baseURL,
-      storageState: configuration.storageState,
-    });
+    await exerciseMessagingRecovery(browser, configuration.restartAPI, "api");
+  });
+
+  test("Messaging WebApp converges through a named Tunnel restart", async ({
+    browser,
+  }) => {
+    await exerciseMessagingRecovery(
+      browser,
+      configuration.restartTunnel,
+      "tunnel",
+    );
+  });
+
+  test("Direct Chat WebApp shows API loss, then cursor-replays another client's command", async ({
+    browser,
+  }) => {
+    const observerContext = await authenticatedContext(browser);
+    const writerContext = await authenticatedContext(browser);
     try {
-      const observer = await context.newPage();
-      const writer = await context.newPage();
-      await Promise.all([visitOrigin(observer), visitOrigin(writer)]);
+      const observer = await observerContext.newPage();
+      const writer = await writerContext.newPage();
+      await Promise.all([openDirectChat(observer), openDirectChat(writer)]);
 
-      const baseline = await openAndCatchUp(observer, configuration.placeID, 0);
-      await run(configuration.restartAPI, [], { timeout: 120_000 });
-      await expect
-        .poll(() => socketCloseCount(observer), { timeout: 30_000 })
-        .toBeGreaterThan(0);
-      await waitForHealth(writer);
-
-      const nonce = uniqueNonce("api-restart");
-      const receipt = await sendMessage(writer, configuration.placeID, nonce);
-      const frames = await reconnectAndCatchUp(
-        observer,
-        configuration.placeID,
-        baseline,
+      await observerContext.setOffline(true);
+      await expect(directStatus(observer)).toHaveAttribute(
+        "data-sumi-connection-state",
+        "closed",
       );
-      assertCaughtUpExactlyOnce(frames, nonce, receipt.seq);
+      await expect(
+        observer.getByText("再接続中", { exact: true }),
+      ).toBeVisible();
+
+      const restart = run(configuration.restartAPI, [], { timeout: 120_000 });
+      await expect(directStatus(writer)).toHaveAttribute(
+        "data-sumi-connection-state",
+        "closed",
+        { timeout: 30_000 },
+      );
+      await restart;
+      await waitForDirectConnected(writer);
+
+      const text = `dogfood direct replay ${uniqueNonce("direct")}`;
+      const composer = writer.getByRole("textbox", {
+        name: "メッセージ",
+        exact: true,
+      });
+      await composer.fill(text);
+      await writer.getByRole("button", { name: "送信", exact: true }).click();
+      await expect(writer.getByText(text, { exact: true })).toHaveCount(1);
+
+      await observerContext.setOffline(false);
+      await waitForDirectConnected(observer);
+      await expect(observer.getByText(text, { exact: true })).toHaveCount(1, {
+        timeout: 60_000,
+      });
     } finally {
-      await context.close();
+      await Promise.all([observerContext.close(), writerContext.close()]);
     }
   });
 
-  test("named Tunnel connector restart also converges through the same cursor contract", async ({
+  test("same Messaging nonce returns one durable message after a discarded receipt", async ({
     browser,
   }) => {
-    const context = await browser.newContext({
-      baseURL: configuration.baseURL,
-      storageState: configuration.storageState,
-    });
-    try {
-      const observer = await context.newPage();
-      const writer = await context.newPage();
-      await Promise.all([visitOrigin(observer), visitOrigin(writer)]);
-
-      const baseline = await openAndCatchUp(observer, configuration.placeID, 0);
-      await run(configuration.restartTunnel, [], { timeout: 120_000 });
-      await expect
-        .poll(() => socketCloseCount(observer), { timeout: 30_000 })
-        .toBeGreaterThan(0);
-      await waitForHealth(writer);
-
-      const nonce = uniqueNonce("tunnel-restart");
-      const receipt = await sendMessage(writer, configuration.placeID, nonce);
-      const frames = await reconnectAndCatchUp(
-        observer,
-        configuration.placeID,
-        baseline,
-      );
-      assertCaughtUpExactlyOnce(frames, nonce, receipt.seq);
-    } finally {
-      await context.close();
-    }
-  });
-
-  test("discarding a successful receipt and retrying the same nonce returns one durable message", async ({
-    browser,
-  }) => {
-    const context = await browser.newContext({
-      baseURL: configuration.baseURL,
-      storageState: configuration.storageState,
-    });
+    const context = await authenticatedContext(browser);
     try {
       const page = await context.newPage();
-      await visitOrigin(page);
+      await openMessaging(page);
       const nonce = uniqueNonce("discarded-receipt");
       const firstStatus = await sendAndDiscardReceipt(
         page,
@@ -127,144 +131,113 @@ test.describe("dedicated dogfood restart recovery", () => {
       expect(matches).toHaveLength(1);
       expect(matches[0]?.message_id).toBe(replay.messageID);
       expect(matches[0]?.seq).toBe(replay.seq);
+      await waitForMessagingConnected(page);
     } finally {
       await context.close();
     }
   });
 });
 
-type SocketFrame = Record<string, unknown>;
-type SmokeWindow = Window &
-  typeof globalThis & {
-    __sumiDogfoodSocket?: {
-      socket: WebSocket;
-      frames: SocketFrame[];
-      closes: number;
-    };
-  };
+async function exerciseMessagingRecovery(
+  browser: Browser,
+  restartHelper: string,
+  label: string,
+) {
+  const observerContext = await authenticatedContext(browser);
+  const writerContext = await authenticatedContext(browser);
+  try {
+    const observer = await observerContext.newPage();
+    const writer = await writerContext.newPage();
+    await Promise.all([openMessaging(observer), openMessaging(writer)]);
 
-async function visitOrigin(page: Page) {
-  const response = await page.goto("/", { waitUntil: "domcontentloaded" });
-  expect(response?.ok()).toBe(true);
-}
+    // Keep one shipped client offline after the shared failure has recovered.
+    // The second shipped client can then commit while the observer remains in
+    // its outage, forcing the observer's own cursor replay to surface it.
+    await observerContext.setOffline(true);
+    await expect(messagingSurface(observer)).toHaveAttribute(
+      "data-sumi-connection-state",
+      "reconnecting",
+    );
+    await expect(
+      observer.getByText(/再接続中… 新しいメッセージ/),
+    ).toBeVisible();
 
-async function openAndCatchUp(page: Page, placeID: string, cursor: number) {
-  await openSocket(page, placeID, cursor);
-  await expect
-    .poll(
-      async () => {
-        const frames = await socketFrames(page);
-        return frames.some(
-          (frame) => frame.type === "caught_up" && frame.place_id === placeID,
-        );
-      },
+    const restart = run(restartHelper, [], { timeout: 120_000 });
+    await expect(messagingSurface(writer)).toHaveAttribute(
+      "data-sumi-connection-state",
+      "reconnecting",
       { timeout: 30_000 },
-    )
-    .toBe(true);
-  const caughtUp = (await socketFrames(page)).findLast(
-    (frame) => frame.type === "caught_up" && frame.place_id === placeID,
-  );
-  const latest = caughtUp?.latest_seq;
-  if (!Number.isSafeInteger(latest) || Number(latest) < cursor) {
-    throw new Error(`invalid caught_up frame: ${JSON.stringify(caughtUp)}`);
+    );
+    await restart;
+    await waitForMessagingConnected(writer);
+
+    const text = `dogfood ${label} replay ${uniqueNonce(label)}`;
+    const composer = writer.locator('textarea[aria-label$="へメッセージ"]');
+    await expect(composer).toBeVisible();
+    await composer.fill(text);
+    await writer.getByRole("button", { name: "送信", exact: true }).click();
+    await expect(writer.getByText(text, { exact: true })).toHaveCount(1);
+
+    await observerContext.setOffline(false);
+    await waitForMessagingConnected(observer);
+    await expect(observer.getByText(text, { exact: true })).toHaveCount(1, {
+      timeout: 60_000,
+    });
+  } finally {
+    await Promise.all([observerContext.close(), writerContext.close()]);
   }
-  return Number(latest);
 }
 
-async function reconnectAndCatchUp(
-  page: Page,
-  placeID: string,
-  cursor: number,
-) {
-  await openAndCatchUp(page, placeID, cursor);
-  return socketFrames(page);
-}
-
-async function openSocket(page: Page, placeID: string, cursor: number) {
-  await page.evaluate(
-    ({ selectedPlaceID, selectedCursor }) => {
-      const state: NonNullable<SmokeWindow["__sumiDogfoodSocket"]> = {
-        socket: new WebSocket(new URL("/messaging/ws", window.location.href)),
-        frames: [],
-        closes: 0,
-      };
-      (window as SmokeWindow).__sumiDogfoodSocket = state;
-      state.socket.addEventListener("open", () => {
-        state.socket.send(
-          JSON.stringify({
-            type: "hello",
-            cursors: { [selectedPlaceID]: selectedCursor },
-          }),
-        );
-      });
-      state.socket.addEventListener("message", (event) => {
-        if (typeof event.data !== "string") return;
-        state.frames.push(JSON.parse(event.data) as SocketFrame);
-      });
-      state.socket.addEventListener("close", () => {
-        state.closes++;
-      });
-    },
-    { selectedPlaceID: placeID, selectedCursor: cursor },
-  );
-}
-
-function socketFrames(page: Page) {
-  return page.evaluate(
-    () => (window as SmokeWindow).__sumiDogfoodSocket?.frames ?? [],
-  );
-}
-
-function socketCloseCount(page: Page) {
-  return page.evaluate(
-    () => (window as SmokeWindow).__sumiDogfoodSocket?.closes ?? 0,
-  );
-}
-
-function assertCaughtUpExactlyOnce(
-  frames: SocketFrame[],
-  nonce: string,
-  minimumSeq: number,
-) {
-  const messages = frames.filter((frame) => {
-    if (
-      frame.type !== "event" ||
-      typeof frame.event !== "object" ||
-      frame.event === null
-    )
-      return false;
-    const event = frame.event as Record<string, unknown>;
-    if (
-      event.type !== "message_created" ||
-      typeof event.message !== "object" ||
-      event.message === null
-    )
-      return false;
-    return (event.message as Record<string, unknown>).client_nonce === nonce;
+function authenticatedContext(browser: Browser) {
+  return browser.newContext({
+    baseURL: configuration.baseURL,
+    storageState: configuration.storageState,
   });
-  expect(messages).toHaveLength(1);
-  const barrier = frames.findLast(
-    (frame) =>
-      frame.type === "caught_up" && frame.place_id === configuration.placeID,
-  );
-  expect(Number(barrier?.latest_seq)).toBeGreaterThanOrEqual(minimumSeq);
 }
 
-async function waitForHealth(page: Page) {
-  await expect
-    .poll(
-      () =>
-        page.evaluate(async () => {
-          try {
-            const response = await fetch("/health", { cache: "no-store" });
-            return response.status;
-          } catch {
-            return 0;
-          }
-        }),
-      { timeout: 60_000 },
-    )
-    .toBe(200);
+async function openMessaging(page: Page) {
+  const response = await page.goto(configuration.messagingPath, {
+    waitUntil: "domcontentloaded",
+  });
+  expect(response?.ok()).toBe(true);
+  await waitForMessagingConnected(page);
+}
+
+async function openDirectChat(page: Page) {
+  const response = await page.goto("/direct", {
+    waitUntil: "domcontentloaded",
+  });
+  expect(response?.ok()).toBe(true);
+  await waitForDirectConnected(page);
+}
+
+function messagingSurface(page: Page) {
+  return page.locator('[data-sumi-surface="messaging"]');
+}
+
+function directStatus(page: Page) {
+  return page.locator('[data-sumi-surface="direct-chat"]');
+}
+
+async function waitForMessagingConnected(page: Page) {
+  await expect(messagingSurface(page)).toHaveAttribute(
+    "data-sumi-connection-state",
+    "connected",
+    { timeout: 60_000 },
+  );
+}
+
+async function waitForDirectConnected(page: Page) {
+  await expect(directStatus(page)).toHaveAttribute(
+    "data-sumi-connection-state",
+    "connected",
+    { timeout: 60_000 },
+  );
+  await expect(directStatus(page)).toHaveAttribute(
+    "data-sumi-ready-state",
+    "ready",
+    { timeout: 60_000 },
+  );
 }
 
 async function sendAndDiscardReceipt(
@@ -343,9 +316,7 @@ async function history(page: Page, placeID: string) {
   const body = await page.evaluate(async (selectedPlaceID) => {
     const response = await fetch(
       `/messaging/places/${encodeURIComponent(selectedPlaceID)}/messages?limit=100`,
-      {
-        cache: "no-store",
-      },
+      { cache: "no-store" },
     );
     if (!response.ok) throw new Error(`history failed: ${response.status}`);
     return response.json() as Promise<unknown>;
@@ -359,21 +330,20 @@ async function history(page: Page, placeID: string) {
       `history returned an invalid body: ${JSON.stringify(body)}`,
     );
   }
-  return (body as { messages: Array<Record<string, unknown>> }).messages;
-}
-
-async function requireProtectedFile(path: string, executable: boolean) {
-  if (!isAbsolute(path))
-    throw new Error(`smoke input must be absolute: ${path}`);
-  const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink())
-    throw new Error(`smoke input must be a regular non-symlink: ${path}`);
-  if ((info.mode & 0o077) !== 0)
-    throw new Error(`smoke input grants group/other permissions: ${path}`);
-  if (executable && (info.mode & 0o100) === 0)
-    throw new Error(`smoke helper is not owner-executable: ${path}`);
+  return (body as { messages: Record<string, unknown>[] }).messages;
 }
 
 function uniqueNonce(prefix: string) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}-${Date.now()}-${crypto.randomUUID()}`;
+}
+
+async function requireProtectedFile(path: string, executable: boolean) {
+  if (!isAbsolute(path)) throw new Error(`${path} is not absolute`);
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
+    throw new Error(`${path} must be a protected regular non-symlink`);
+  }
+  if (executable && (info.mode & 0o100) === 0) {
+    throw new Error(`${path} must be owner-executable`);
+  }
 }

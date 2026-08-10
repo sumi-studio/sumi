@@ -6,7 +6,7 @@ COPY apps/api/ ./
 RUN CGO_ENABLED=0 go build -o /usr/local/bin/sumi-runtime-provisioner ./cmd/runtime-provisioner
 
 FROM docker:27-cli
-RUN apk add --no-cache bash coreutils util-linux
+RUN apk add --no-cache bash coreutils findutils tar util-linux
 WORKDIR /opt/sumi
 COPY . /opt/sumi
 COPY --from=build /usr/local/bin/sumi-runtime-provisioner /usr/local/bin/sumi-runtime-provisioner

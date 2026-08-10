@@ -20,7 +20,7 @@ func TestHealthIsExplicitLivenessNotReadiness(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body["status"] != "alive" {
+	if body["status"] != "ok" {
 		t.Fatalf("health claimed a dependency state: %v", body)
 	}
 }

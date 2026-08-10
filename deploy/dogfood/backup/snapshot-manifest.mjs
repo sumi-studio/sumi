@@ -3,19 +3,29 @@ import { createReadStream } from "node:fs";
 import { lstat, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const [mode, directoryArgument, snapshotID, appSHA, apiImage, postgresImage] =
-  process.argv.slice(2);
+const [
+  mode,
+  directoryArgument,
+  snapshotID,
+  appSHA,
+  apiImage,
+  provisionerImage,
+  postgresImage,
+] = process.argv.slice(2);
 const imageDigest = /^[a-z0-9./:_-]+@sha256:[0-9a-f]{64}$/;
 const requiredArtifacts = [
   "database.dump",
-  "attachments.tar",
+  "host-state.tar",
+  "host-state.manifest.json",
   "attachment-rows.tsv",
   "attachments.manifest.json",
+  "agent-volumes.tar",
+  "agent-volume-set.json",
   "migration-manifest.json",
 ];
 if (!mode || !directoryArgument) {
   throw new Error(
-    "usage: snapshot-manifest.mjs create|verify SNAPSHOT_DIR [SNAPSHOT_ID APP_SHA API_IMAGE POSTGRES_IMAGE]",
+    "usage: snapshot-manifest.mjs create|verify SNAPSHOT_DIR [SNAPSHOT_ID APP_SHA API_IMAGE PROVISIONER_IMAGE POSTGRES_IMAGE]",
   );
 }
 const directory = resolve(directoryArgument);
@@ -31,6 +41,7 @@ if (mode === "create") {
     throw new Error("app SHA is not exact");
   if (
     !imageDigest.test(apiImage ?? "") ||
+    !imageDigest.test(provisionerImage ?? "") ||
     !imageDigest.test(postgresImage ?? "")
   )
     throw new Error("snapshot images are not exact digests");
@@ -45,6 +56,7 @@ if (mode === "create") {
         snapshot_id: snapshotID,
         app_sha: appSHA,
         api_image: apiImage,
+        provisioner_image: provisionerImage,
         postgres_image: postgresImage,
         migration_manifest_sha256: migration.manifest_sha256,
         created_at: new Date().toISOString(),
@@ -71,6 +83,7 @@ if (mode === "create") {
   }
   if (
     !imageDigest.test(manifest.api_image ?? "") ||
+    !imageDigest.test(manifest.provisioner_image ?? "") ||
     !imageDigest.test(manifest.postgres_image ?? "")
   ) {
     throw new Error("snapshot image identity is invalid");

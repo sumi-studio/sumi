@@ -103,7 +103,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) (returnErr error) {
 	if _, err := connection.Exec(ctx, migrationBookkeepingSchema); err != nil {
 		return fmt.Errorf("ensure schema_migrations table: %w", err)
 	}
-	if err := adoptLegacyManifestRows(ctx, connection); err != nil {
+	if err := rejectLegacyManifestRows(ctx, connection); err != nil {
 		return err
 	}
 
@@ -115,6 +115,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) (returnErr error) {
 		if err := applyMigration(ctx, connection, m); err != nil {
 			return err
 		}
+	}
+	if err := sealMigrationManifestSchema(ctx, connection); err != nil {
+		return err
 	}
 	return nil
 }
@@ -343,66 +346,40 @@ func VerifyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	return err
 }
 
-// adoptLegacyManifestRows is a one-way upgrade for databases whose runner only
-// recorded version. It fills both identity fields together from the current
-// embedded manifest, then makes them mandatory. Once adopted, every subsequent
-// startup verifies exact identity before applying anything new.
-func adoptLegacyManifestRows(ctx context.Context, pool migrationStore) error {
-	embedded, err := embeddedUpMigrations()
-	if err != nil {
-		return err
-	}
-	byVersion := make(map[int]pendingMigration, len(embedded))
-	for _, migration := range embedded {
-		byVersion[migration.version] = migration
-	}
+// rejectLegacyManifestRows refuses the pre-durability runner's version-only
+// records. A current binary cannot prove which historical SQL bytes produced
+// such a row, so filling the current name and digest would manufacture evidence
+// rather than verify it. Dogfood has not cut over yet: reset the database and
+// let the current runner create the manifest from an empty schema.
+func rejectLegacyManifestRows(ctx context.Context, pool migrationStore) error {
 	rows, err := pool.Query(ctx,
-		"SELECT version, name, sha256 FROM schema_migrations ORDER BY version",
+		"SELECT version FROM schema_migrations WHERE name IS NULL OR sha256 IS NULL ORDER BY version",
 	)
 	if err != nil {
-		return fmt.Errorf("read legacy migration manifest: %w", err)
+		return fmt.Errorf("inspect migration manifest for legacy rows: %w", err)
 	}
-	type appliedRow struct {
-		version int
-		name    *string
-		sha256  *string
-	}
-	var applied []appliedRow
+	defer rows.Close()
+	var versions []int
 	for rows.Next() {
-		var row appliedRow
-		if err := rows.Scan(&row.version, &row.name, &row.sha256); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan legacy migration manifest: %w", err)
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return fmt.Errorf("scan legacy migration version: %w", err)
 		}
-		applied = append(applied, row)
+		versions = append(versions, version)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
 		return fmt.Errorf("iterate legacy migration manifest: %w", err)
 	}
-	rows.Close()
-	for _, row := range applied {
-		expected, ok := byVersion[row.version]
-		if !ok {
-			return fmt.Errorf("applied migration %d is absent from the embedded manifest", row.version)
-		}
-		switch {
-		case row.name == nil && row.sha256 == nil:
-			if _, err := pool.Exec(ctx,
-				"UPDATE schema_migrations SET name=$2, sha256=$3 WHERE version=$1 AND name IS NULL AND sha256 IS NULL",
-				row.version, expected.name, expected.sha256,
-			); err != nil {
-				return fmt.Errorf("adopt migration %d manifest: %w", row.version, err)
-			}
-		case row.name == nil || row.sha256 == nil:
-			return fmt.Errorf("applied migration %d has a partial manifest identity", row.version)
-		case *row.name != expected.name || *row.sha256 != expected.sha256:
-			return fmt.Errorf(
-				"applied migration %d manifest mismatch: database has %q sha256=%s, binary has %q sha256=%s",
-				row.version, *row.name, *row.sha256, expected.name, expected.sha256,
-			)
-		}
+	if len(versions) > 0 {
+		return fmt.Errorf(
+			"legacy version-only schema_migrations rows %v cannot be verified; reset the pre-cutover database before starting this binary",
+			versions,
+		)
 	}
+	return nil
+}
+
+func sealMigrationManifestSchema(ctx context.Context, pool migrationStore) error {
 	if _, err := pool.Exec(ctx, `
 		ALTER TABLE schema_migrations ALTER COLUMN name SET NOT NULL;
 		ALTER TABLE schema_migrations ALTER COLUMN sha256 SET NOT NULL;

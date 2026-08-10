@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +23,7 @@ const appSHA = "a".repeat(40);
 const attachmentID = "0190abcd-1234-7abc-8def-0123456789ab";
 const migrationDigest = "b".repeat(64);
 const apiImage = `ghcr.io/sumi-studio/sumi-api@sha256:${"c".repeat(64)}`;
+const provisionerImage = `ghcr.io/sumi-studio/sumi-runtime-provisioner@sha256:${"e".repeat(64)}`;
 const postgresImage = `postgres:17-alpine@sha256:${"d".repeat(64)}`;
 
 test("attachment inventory binds every database row to one canonical blob", async (t) => {
@@ -80,6 +83,7 @@ test("snapshot and handoff manifests detect mutation and bind to each other", as
     snapshotID,
     appSHA,
     apiImage,
+    provisionerImage,
     postgresImage,
   ]);
   const verified = await run(process.execPath, [
@@ -156,22 +160,309 @@ test("archive path validation permits tar root entries but rejects traversal", a
   }
 });
 
+test("agent volume set binds the exact canonical volume and artifact set", async (t) => {
+  const root = await temporary(t, "sumi-agent-volume-set-");
+  const artifacts = join(root, "artifacts");
+  const rows = join(root, "rows.tsv");
+  const output = join(root, "agent-volume-set.json");
+  const personalityAgentID = "0190abcd-1234-7abc-8def-0123456789ab";
+  const project = `sumi-${personalityAgentID.replaceAll("-", "")}`;
+  const logicalVolumes = JSON.parse(emptyAgentVolumeSet()).logical_volumes;
+  await mkdir(join(artifacts, personalityAgentID), { recursive: true });
+
+  const rowLines = [];
+  for (const logical of logicalVolumes) {
+    const archive = `${personalityAgentID}/${logical}.tar`;
+    const manifest = `${personalityAgentID}/${logical}.manifest`;
+    await writeFile(join(artifacts, archive), `archive:${logical}`);
+    await writeFile(join(artifacts, manifest), `manifest:${logical}`);
+    rowLines.push(
+      [
+        "V",
+        personalityAgentID,
+        project,
+        logical,
+        `${project}_${logical}`,
+        archive,
+        manifest,
+      ].join("\t"),
+    );
+  }
+  await writeFile(rows, `${rowLines.join("\n")}\n`);
+  await run(process.execPath, [
+    resolve(directory, "agent-volume-set.mjs"),
+    "create",
+    artifacts,
+    rows,
+    output,
+  ]);
+
+  await writeFile(join(artifacts, "unexpected"), "not in the set");
+  await assert.rejects(
+    run(process.execPath, [
+      resolve(directory, "agent-volume-set.mjs"),
+      "verify",
+      artifacts,
+      output,
+    ]),
+    /artifact root has an unexpected entry/,
+  );
+  await rm(join(artifacts, "unexpected"));
+  await run(process.execPath, [
+    resolve(directory, "agent-volume-set.mjs"),
+    "verify",
+    artifacts,
+    output,
+  ]);
+  const listed = await run(process.execPath, [
+    resolve(directory, "agent-volume-set.mjs"),
+    "list",
+    artifacts,
+    output,
+  ]);
+  assert.equal(listed.stdout.trim().split("\n").length, 10);
+
+  await writeFile(
+    join(artifacts, personalityAgentID, "workspace.tar"),
+    "mutated",
+  );
+  await assert.rejects(
+    run(process.execPath, [
+      resolve(directory, "agent-volume-set.mjs"),
+      "verify",
+      artifacts,
+      output,
+    ]),
+    /agent volume archive mismatch/,
+  );
+
+  const malformed = JSON.parse(await readFile(output, "utf8"));
+  malformed.agents[0].volumes[0].archive.name = `${personalityAgentID}/workspace.tar`;
+  await writeFile(
+    join(root, "malformed.json"),
+    `${JSON.stringify(malformed)}\n`,
+  );
+  await assert.rejects(
+    run(process.execPath, [
+      resolve(directory, "agent-volume-set.mjs"),
+      "verify",
+      artifacts,
+      join(root, "malformed.json"),
+    ]),
+    /noncanonical agent volume artifact binding/,
+  );
+});
+
+test("agent volume inspection requires canonical Compose ownership labels", async () => {
+  const project = "sumi-0190abcd12347abc8def0123456789ab";
+  const name = `${project}_workspace`;
+  const valid = JSON.stringify([
+    {
+      Name: name,
+      Driver: "local",
+      Scope: "local",
+      Labels: {
+        "com.docker.compose.project": project,
+        "com.docker.compose.volume": "workspace",
+      },
+    },
+  ]);
+  const script = resolve(directory, "validate-agent-volume.mjs");
+  assert.equal(
+    (await runWithInput(script, valid, [project, "workspace", name])).code,
+    0,
+  );
+  const wrongOwnerDocument = JSON.parse(valid);
+  wrongOwnerDocument[0].Labels["com.docker.compose.project"] =
+    "sumi-ffffffffffffffffffffffffffffffff";
+  const wrongOwner = JSON.stringify(wrongOwnerDocument);
+  const rejected = await runWithInput(script, wrongOwner, [
+    project,
+    "workspace",
+    name,
+  ]);
+  assert.notEqual(rejected.code, 0);
+  assert.match(rejected.stderr, /not the canonical local Compose volume/);
+});
+
+test("volume tree manifest is NUL-safe and rejects links", async (t) => {
+  const root = await temporary(t, "sumi-volume-tree-");
+  const nested = join(root, "nested");
+  const unusual = join(nested, "line\nbreak\t.bin");
+  await mkdir(nested);
+  await writeFile(unusual, "content");
+  await chmod(unusual, 0o640);
+  const script = resolve(directory, "volume-tree-manifest.sh");
+  const manifest = await run("bash", [script, root]);
+  const rootRow = manifest.stdout
+    .trimEnd()
+    .split("\n")
+    .find((line) => line.startsWith("d\t") && line.endsWith("\tLg=="));
+  assert.ok(rootRow, "volume root metadata is absent from the manifest");
+  const fileRow = manifest.stdout
+    .trimEnd()
+    .split("\n")
+    .find((line) => line.startsWith("f\t"));
+  assert.ok(fileRow);
+  const fields = fileRow.split("\t");
+  assert.equal(fields[3], "640");
+  assert.equal(fields[4], "7");
+  assert.equal(
+    Buffer.from(fields[6], "base64").toString("utf8"),
+    "nested/line\nbreak\t.bin",
+  );
+
+  await symlink("nested", join(root, "linked"));
+  await assert.rejects(run("bash", [script, root]), /symlink is forbidden/);
+  await rm(join(root, "linked"));
+  await link(unusual, join(nested, "second-link"));
+  await assert.rejects(run("bash", [script, root]), /hard-linked/);
+  await rm(join(nested, "second-link"));
+  await chmod(nested, 0o000);
+  await assert.rejects(run("bash", [script, root]));
+  await chmod(nested, 0o700);
+});
+
+test("agent volume restore uses isolated scratch volumes and verifies every tree", async (t) => {
+  const root = await temporary(t, "sumi-agent-volume-restore-");
+  const artifacts = join(root, "artifacts");
+  const helpers = join(root, "helpers");
+  const dockerConfigDirectory = join(root, "docker-config");
+  const dockerConfig = join(dockerConfigDirectory, "config.json");
+  const docker = join(helpers, "docker");
+  const log = join(root, "docker.log");
+  const rows = join(root, "rows.tsv");
+  const volumeSet = join(root, "agent-volume-set.json");
+  const snapshotID = "20260810T120010Z-aaaaaaaaaaaa";
+  const personalityAgentID = "0190abcd-1234-7abc-8def-0123456789ab";
+  const project = `sumi-${personalityAgentID.replaceAll("-", "")}`;
+  const logicalVolumes = JSON.parse(emptyAgentVolumeSet()).logical_volumes;
+  await mkdir(join(artifacts, personalityAgentID), { recursive: true });
+  await mkdir(helpers);
+  await mkdir(dockerConfigDirectory);
+  await writeFile(dockerConfig, "{}\n", { mode: 0o600 });
+  await writeFile(log, "");
+
+  const rowLines = [];
+  for (const logical of logicalVolumes) {
+    const archive = `${personalityAgentID}/${logical}.tar`;
+    const manifest = `${personalityAgentID}/${logical}.manifest`;
+    await run("/usr/bin/tar", [
+      "--create",
+      `--file=${join(artifacts, archive)}`,
+      "--files-from=/dev/null",
+    ]);
+    await writeFile(join(artifacts, manifest), `manifest:${logical}`);
+    rowLines.push(
+      [
+        "V",
+        personalityAgentID,
+        project,
+        logical,
+        `${project}_${logical}`,
+        archive,
+        manifest,
+      ].join("\t"),
+    );
+  }
+  await writeFile(rows, `${rowLines.join("\n")}\n`);
+  await run(process.execPath, [
+    resolve(directory, "agent-volume-set.mjs"),
+    "create",
+    artifacts,
+    rows,
+    volumeSet,
+  ]);
+
+  await writeExecutable(
+    docker,
+    `#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\\n' "$*" >> "\${SUMI_TEST_DOCKER_LOG}"
+arguments="$*"
+if [[ "\${arguments}" == *"context inspect"* ]]; then
+  printf 'unix:///var/run/docker.sock\\n'
+elif [[ "\${arguments}" == *"volume inspect"* ]]; then
+  exit 1
+elif [[ "\${arguments}" == *"volume create"* ]]; then
+  printf '%s\\n' "\${!#}"
+elif [[ "\${arguments}" == *"/usr/local/bin/sumi-volume-manifest /source"* ]]; then
+  for logical in ${logicalVolumes.join(" ")}; do
+    if [[ "\${arguments}" == *"-\${logical},dst=/source"* ]]; then
+      printf 'manifest:%s' "\${logical}"
+      exit 0
+    fi
+  done
+  exit 2
+elif [[ "\${arguments}" == *"run --rm"* ]]; then
+  exit 0
+else
+  exit 2
+fi
+`,
+  );
+
+  const restored = await run(
+    "bash",
+    [
+      resolve(directory, "restore-agent-volumes.sh"),
+      artifacts,
+      volumeSet,
+      snapshotID,
+    ],
+    {
+      env: {
+        ...process.env,
+        SUMI_DOCKER_BIN: docker,
+        SUMI_DOGFOOD_DOCKER_CONTEXT: "dogfood-test",
+        SUMI_DOCKER_CONFIG_FILE: dockerConfig,
+        SUMI_PROVISIONER_IMAGE: provisionerImage,
+        SUMI_TAR_BIN: "/usr/bin/tar",
+        SUMI_TEST_DOCKER_LOG: log,
+      },
+    },
+  );
+  assert.match(restored.stdout, /scratch volumes are recorded/);
+  const restoredMap = await readFile(
+    join(artifacts, "restored-agent-volumes.tsv"),
+    "utf8",
+  );
+  if (restoredMap.trim().split("\n").length !== 10) {
+    throw new Error(`unexpected restored map: ${JSON.stringify(restoredMap)}`);
+  }
+  const operations = await readFile(log, "utf8");
+  assert.match(
+    operations,
+    /sumi\.backup\.snapshot=20260810T120010Z-aaaaaaaaaaaa/,
+  );
+  assert.match(
+    operations,
+    /--extract --preserve-permissions --same-owner --numeric-owner --acls --xattrs/,
+  );
+});
+
 test("coordinated snapshot resumes only after a successful quiesce", async (t) => {
   const root = await temporary(t, "sumi-backup-create-");
   const work = join(root, "work");
-  const blobs = join(root, "blobs");
+  const state = join(root, "state");
   const helpers = join(root, "helpers");
   const dockerConfigDirectory = join(root, "docker");
   const log = join(root, "operations.log");
-  const operationLock = join(root, "operations.lock");
+  const operationLock = join(state, ".operations.lock");
   await mkdir(work);
-  await mkdir(join(blobs, "01", "90"), { recursive: true });
+  await mkdir(state);
+  await mkdir(join(state, "command-log"));
+  await mkdir(join(state, "runtime-state"));
+  await mkdir(join(state, "attachments", "01", "90"), { recursive: true });
   await mkdir(helpers);
   await mkdir(dockerConfigDirectory);
   const dockerConfig = join(dockerConfigDirectory, "config.json");
   await writeFile(dockerConfig, "{}\n", { mode: 0o600 });
   await writeFile(operationLock, "", { mode: 0o600 });
-  await writeFile(join(blobs, "01", "90", `${attachmentID}.bin`), "hello");
+  await writeFile(
+    join(state, "attachments", "01", "90", `${attachmentID}.bin`),
+    "hello",
+  );
 
   const paths = await fakeHelpers(helpers);
   const baseEnvironment = {
@@ -179,12 +470,14 @@ test("coordinated snapshot resumes only after a successful quiesce", async (t) =
     SUMI_DB_URL: "postgres://backup.invalid/sumi",
     SUMI_APP_SHA: appSHA,
     SUMI_API_IMAGE: apiImage,
+    SUMI_PROVISIONER_IMAGE: provisionerImage,
     SUMI_POSTGRES_IMAGE: postgresImage,
     SUMI_BACKUP_WORK_ROOT: work,
-    SUMI_ATTACHMENT_ROOT: blobs,
+    SUMI_DOGFOOD_STATE_ROOT: state,
+    SUMI_ATTACHMENT_ROOT: join(state, "attachments"),
     SUMI_MIGRATE_BIN: paths.migrate,
-    SUMI_PSQL_BIN: paths.psql,
-    SUMI_PG_DUMP_BIN: paths.pgDump,
+    SUMI_DATABASE_HELPER: paths.database,
+    SUMI_AGENT_VOLUME_HELPER: paths.agentVolume,
     SUMI_TAR_BIN: "/usr/bin/tar",
     SUMI_QUIESCE_HELPER: paths.quiesce,
     SUMI_RESUME_HELPER: paths.resume,
@@ -241,19 +534,25 @@ test("coordinated snapshot resumes only after a successful quiesce", async (t) =
   assert.equal(await readFile(log, "utf8"), "quiesce\n");
 });
 
-test("scratch restore reconstructs and verifies the coordinated attachment set", async (t) => {
+test("scratch restore reconstructs and verifies the coordinated host state", async (t) => {
   const root = await temporary(t, "sumi-backup-restore-");
   const snapshot = join(root, "snapshot");
-  const sourceBlobs = join(root, "source-blobs");
-  const restoreBlobs = join(root, "restore-blobs");
+  const sourceState = join(root, "source-state");
+  const restoreState = join(root, "restore-state");
   const helpers = join(root, "helpers");
   const snapshotID = "20260810T120004Z-aaaaaaaaaaaa";
   await mkdir(snapshot);
-  await mkdir(join(sourceBlobs, "01", "90"), { recursive: true });
-  await mkdir(restoreBlobs);
+  await mkdir(sourceState);
+  await mkdir(join(sourceState, "command-log"));
+  await mkdir(join(sourceState, "runtime-state"));
+  await mkdir(join(sourceState, "attachments", "01", "90"), {
+    recursive: true,
+  });
+  await writeFile(join(sourceState, ".operations.lock"), "", { mode: 0o600 });
+  await mkdir(restoreState);
   await mkdir(helpers);
   await writeFile(
-    join(sourceBlobs, "01", "90", `${attachmentID}.bin`),
+    join(sourceState, "attachments", "01", "90", `${attachmentID}.bin`),
     "hello",
   );
   await writeFile(
@@ -262,15 +561,32 @@ test("scratch restore reconstructs and verifies the coordinated attachment set",
   );
   await run(process.execPath, [
     resolve(directory, "verify-attachments.mjs"),
-    sourceBlobs,
+    join(sourceState, "attachments"),
     join(snapshot, "attachment-rows.tsv"),
     join(snapshot, "attachments.manifest.json"),
   ]);
+  await run(process.execPath, [
+    resolve(directory, "host-state-manifest.mjs"),
+    "create",
+    sourceState,
+    join(snapshot, "host-state.manifest.json"),
+  ]);
   await run("/usr/bin/tar", [
     "--create",
-    `--file=${join(snapshot, "attachments.tar")}`,
-    `--directory=${sourceBlobs}`,
-    ".",
+    `--file=${join(snapshot, "host-state.tar")}`,
+    `--directory=${sourceState}`,
+    "command-log",
+    "runtime-state",
+    "attachments",
+  ]);
+  await writeFile(
+    join(snapshot, "agent-volume-set.json"),
+    emptyAgentVolumeSet(),
+  );
+  await run("/usr/bin/tar", [
+    "--create",
+    `--file=${join(snapshot, "agent-volumes.tar")}`,
+    "--files-from=/dev/null",
   ]);
   await writeFile(join(snapshot, "database.dump"), "database");
   await writeFile(
@@ -287,6 +603,7 @@ test("scratch restore reconstructs and verifies the coordinated attachment set",
     snapshotID,
     appSHA,
     apiImage,
+    provisionerImage,
     postgresImage,
   ]);
 
@@ -298,9 +615,12 @@ test("scratch restore reconstructs and verifies the coordinated attachment set",
     `--file=${bundle}`,
     `--directory=${snapshot}`,
     "database.dump",
-    "attachments.tar",
+    "host-state.tar",
+    "host-state.manifest.json",
     "attachment-rows.tsv",
     "attachments.manifest.json",
+    "agent-volumes.tar",
+    "agent-volume-set.json",
     "migration-manifest.json",
     "snapshot.json",
   ]);
@@ -314,8 +634,8 @@ test("scratch restore reconstructs and verifies the coordinated attachment set",
   ]);
 
   const migrate = join(helpers, "migrate");
-  const psql = join(helpers, "psql");
-  const pgRestore = join(helpers, "pg-restore");
+  const database = join(helpers, "database");
+  const agentRestore = join(helpers, "agent-restore");
   const decrypt = join(helpers, "decrypt");
   await writeExecutable(
     migrate,
@@ -327,18 +647,21 @@ fi
 `,
   );
   await writeExecutable(
-    psql,
+    database,
     `#!/usr/bin/env bash
 set -Eeuo pipefail
-arguments="$*"
-if [[ "\${arguments}" == *pg_class* ]]; then
-  printf '0\\n'
-else
-  printf '%s\\t5\\n' "\${SUMI_TEST_ATTACHMENT_ID}"
-fi
+case "\${1:-}" in
+  scratch-object-count) printf '0\\n';;
+  scratch-restore) cat >/dev/null;;
+  scratch-attachment-rows) printf '%s\\t5\\n' "\${SUMI_TEST_ATTACHMENT_ID}";;
+  *) exit 2;;
+esac
 `,
   );
-  await writeExecutable(pgRestore, "#!/usr/bin/env bash\nset -Eeuo pipefail\n");
+  await writeExecutable(
+    agentRestore,
+    "#!/usr/bin/env bash\nset -Eeuo pipefail\n",
+  );
   await writeExecutable(
     decrypt,
     '#!/usr/bin/env bash\nset -Eeuo pipefail\ncp -- "$1" "$2"\n',
@@ -350,7 +673,7 @@ fi
       resolve(directory, "restore-scratch.sh"),
       encrypted,
       handoff,
-      restoreBlobs,
+      restoreState,
     ],
     {
       env: {
@@ -359,11 +682,12 @@ fi
         SUMI_RESTORE_CONFIRM_SCRATCH: snapshotID,
         SUMI_RESTORE_WORK_ROOT: root,
         SUMI_DECRYPT_HELPER: decrypt,
-        SUMI_PSQL_BIN: psql,
-        SUMI_PG_RESTORE_BIN: pgRestore,
+        SUMI_DATABASE_HELPER: database,
+        SUMI_AGENT_RESTORE_HELPER: agentRestore,
         SUMI_MIGRATE_BIN: migrate,
         SUMI_TAR_BIN: "/usr/bin/tar",
         SUMI_TEST_ATTACHMENT_ID: attachmentID,
+        SUMI_RESTORE_ALLOW_NONROOT_FOR_TESTS: "1",
       },
     },
   );
@@ -373,7 +697,7 @@ fi
   );
   assert.equal(
     await readFile(
-      join(restoreBlobs, "01", "90", `${attachmentID}.bin`),
+      join(restoreState, "attachments", "01", "90", `${attachmentID}.bin`),
       "utf8",
     ),
     "hello",
@@ -389,12 +713,15 @@ async function temporary(t, prefix) {
 async function writeSnapshotInputs(root) {
   await Promise.all([
     writeFile(join(root, "database.dump"), "database"),
-    writeFile(join(root, "attachments.tar"), "attachments"),
+    writeFile(join(root, "host-state.tar"), "host-state"),
+    writeFile(join(root, "host-state.manifest.json"), '{"version":1}\n'),
     writeFile(join(root, "attachment-rows.tsv"), ""),
     writeFile(
       join(root, "attachments.manifest.json"),
       '{"version":1,"files":[]}\n',
     ),
+    writeFile(join(root, "agent-volumes.tar"), "agent-volumes"),
+    writeFile(join(root, "agent-volume-set.json"), emptyAgentVolumeSet()),
     writeFile(
       join(root, "migration-manifest.json"),
       `${JSON.stringify({
@@ -408,8 +735,8 @@ async function writeSnapshotInputs(root) {
 async function fakeHelpers(root) {
   const paths = {
     migrate: join(root, "migrate"),
-    psql: join(root, "psql"),
-    pgDump: join(root, "pg-dump"),
+    database: join(root, "database"),
+    agentVolume: join(root, "agent-volume"),
     quiesce: join(root, "quiesce"),
     resume: join(root, "resume"),
     encrypt: join(root, "encrypt"),
@@ -427,20 +754,22 @@ fi
 `,
   );
   await writeExecutable(
-    paths.psql,
+    paths.database,
     `#!/usr/bin/env bash
 set -Eeuo pipefail
-printf '%s\\t5\\n' "\${SUMI_TEST_ATTACHMENT_ID}"
+case "\${1:-}" in
+  attachment-rows) printf '%s\\t5\\n' "\${SUMI_TEST_ATTACHMENT_ID}";;
+  dump) printf database;;
+  *) exit 2;;
+esac
 `,
   );
   await writeExecutable(
-    paths.pgDump,
+    paths.agentVolume,
     `#!/usr/bin/env bash
 set -Eeuo pipefail
-for argument in "$@"; do
-  case "\${argument}" in --file=*) output="\${argument#--file=}";; esac
-done
-printf database > "\${output:?}"
+printf agent-volumes > "$1/agent-volumes.tar"
+printf '%s' '${emptyAgentVolumeSet().trim()}' > "$1/agent-volume-set.json"
 `,
   );
   await writeExecutable(
@@ -476,14 +805,33 @@ printf 'handoff\\n' >> "\${SUMI_TEST_LOG}"
   return paths;
 }
 
+function emptyAgentVolumeSet() {
+  return `${JSON.stringify({
+    version: 1,
+    logical_volumes: [
+      "allocator-root",
+      "allocator-state",
+      "artifacts",
+      "broker-identity",
+      "broker-ipc",
+      "executor-identity",
+      "executor-ipc",
+      "runtime-identity",
+      "state",
+      "workspace",
+    ],
+    agents: [],
+  })}\n`;
+}
+
 async function writeExecutable(path, body) {
   await writeFile(path, body);
   await chmod(path, 0o700);
 }
 
-function runWithInput(script, input) {
+function runWithInput(script, input, arguments_ = []) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(process.execPath, [script], {
+    const child = spawn(process.execPath, [script, ...arguments_], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

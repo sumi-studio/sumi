@@ -149,6 +149,9 @@ function ChatScreenContent() {
           <span
             className="flex items-center gap-1.5 text-muted-foreground text-xs"
             role="status"
+            data-sumi-surface="direct-chat"
+            data-sumi-connection-state={connection}
+            data-sumi-ready-state={ready}
           >
             <span
               className={`size-2 rounded-full ${

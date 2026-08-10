@@ -40,6 +40,25 @@ if (
 ) {
   throw new Error("Postgres data is not on the declared persistent volume");
 }
+const databaseClient = services["database-client"];
+if (
+  (services.postgres?.ports ?? []).length !== 0 ||
+  databaseClient?.image !== services.postgres?.image ||
+  JSON.stringify(databaseClient?.profiles) !==
+    JSON.stringify(["maintenance"]) ||
+  databaseClient?.read_only !== true ||
+  !(databaseClient?.cap_drop ?? []).includes("ALL") ||
+  databaseClient?.networks?.data === undefined ||
+  (databaseClient?.networks
+    ? Object.keys(databaseClient.networks).some((network) => network !== "data")
+    : true) ||
+  (databaseClient?.volumes ?? []).length !== 0 ||
+  config.networks?.data?.internal !== true
+) {
+  throw new Error(
+    "database maintenance must use a volume-free client on the internal data network",
+  );
+}
 if (
   !services.api?.volumes?.some((volume) => volume.target === "/var/lib/sumi")
 ) {

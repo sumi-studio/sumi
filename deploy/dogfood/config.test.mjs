@@ -174,7 +174,17 @@ test("origin preflight uses a local explicit Docker context and performs no muta
           { source: "postgres-data", target: "/var/lib/postgresql/data" },
         ],
       },
+      "database-client": {
+        image: `postgres@sha256:${"3".repeat(64)}`,
+        ports: [],
+        profiles: ["maintenance"],
+        read_only: true,
+        cap_drop: ["ALL"],
+        networks: { data: null },
+        volumes: [],
+      },
     },
+    networks: { data: { internal: true } },
   });
   await writeFile(
     docker,

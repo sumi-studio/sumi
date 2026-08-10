@@ -47,7 +47,7 @@ context_endpoint="$("${docker[@]}" context inspect "${docker_context}" --format 
   printf 'dogfood Docker context must target a local Unix socket, got %s\n' "${context_endpoint}" >&2
   exit 2
 }
-"${compose[@]}" config --format json | node "${script_dir}/validate-compose.mjs"
+"${compose[@]}" --profile maintenance config --format json | node "${script_dir}/validate-compose.mjs"
 if [[ "${mode}" == "--check" ]]; then
   printf 'dogfood origin preflight valid; no image pull, migration, restart, or deploy was performed\n'
   exit 0

@@ -20,7 +20,8 @@
   "backup_rehearsal": {
     "snapshot_id": null,
     "handoff_manifest_sha256": null,
-    "restored_at": null
+    "restored_at": null,
+    "restored_agent_volume_map_sha256": null
   },
   "restart_smoke": {
     "ran_at": null,
@@ -31,7 +32,10 @@
     "postgres_control_plane",
     "messaging_metadata",
     "messaging_read_state",
-    "messaging_attachments"
+    "messaging_attachments",
+    "api_command_log",
+    "api_runtime_state",
+    "personality_agent_private_volumes"
   ],
   "policy": "After cutover_at, applied migration files are immutable and schema changes are forward-only."
 }
