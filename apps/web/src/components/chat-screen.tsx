@@ -54,8 +54,7 @@ function ChatScreenContent() {
     ready,
     lastError,
     recoverableDrafts,
-    connect,
-    disconnect,
+    acquireConnection,
     sendMessage,
     restoreDraft,
     abort,
@@ -80,9 +79,8 @@ function ChatScreenContent() {
   );
 
   useEffect(() => {
-    connect();
-    return disconnect;
-  }, [connect, disconnect]);
+    return acquireConnection();
+  }, [acquireConnection]);
 
   const available = connection === "connected" && ready === "ready";
   const send = () => {

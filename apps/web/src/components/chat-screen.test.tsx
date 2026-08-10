@@ -3,7 +3,12 @@
 import "@testing-library/jest-dom/vitest";
 import { SduiView } from "@sumi/sdui";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { forwardRef, type ReactNode, useImperativeHandle } from "react";
+import {
+  forwardRef,
+  type ReactNode,
+  StrictMode,
+  useImperativeHandle,
+} from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatScreen } from "./chat-screen";
 
@@ -16,7 +21,11 @@ const state = vi.hoisted(() => ({
     reason: string;
   }>,
   restoreDraft: vi.fn<(key: string) => string | undefined>(),
+  releaseConnection: vi.fn(),
+  acquireConnection: vi.fn(),
 }));
+
+state.acquireConnection.mockImplementation(() => state.releaseConnection);
 
 vi.mock("../agent/store", () => ({
   useConversation: () => ({
@@ -49,8 +58,7 @@ vi.mock("../agent/store", () => ({
     ready: "ready",
     lastError: null,
     recoverableDrafts: state.recoverableDrafts,
-    connect: vi.fn(),
-    disconnect: vi.fn(),
+    acquireConnection: state.acquireConnection,
     sendMessage: state.sendMessage,
     restoreDraft: state.restoreDraft,
     discardDraft: vi.fn(),
@@ -127,9 +135,24 @@ afterEach(() => {
   state.scrollToEnd.mockClear();
   state.recoverableDrafts = [];
   state.restoreDraft.mockReset();
+  state.acquireConnection.mockClear();
+  state.releaseConnection.mockClear();
 });
 
 describe("SDUI action boundary", () => {
+  it("releases the exact connection lease from each StrictMode effect", () => {
+    const view = render(
+      <StrictMode>
+        <ChatScreen />
+      </StrictMode>,
+    );
+
+    expect(state.acquireConnection).toHaveBeenCalledTimes(2);
+    expect(state.releaseConnection).toHaveBeenCalledTimes(1);
+    view.unmount();
+    expect(state.releaseConnection).toHaveBeenCalledTimes(2);
+  });
+
   it("renders conversation items through the virtualized log", () => {
     render(<ChatScreen />);
 

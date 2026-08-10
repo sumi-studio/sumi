@@ -27,6 +27,109 @@ test("UUIDv5 derivation matches the Rust USER_MESSAGE_ID_NAMESPACE contract", ()
   assert.throws(() => userMessageIdFromCommandId("not-a-uuid"));
 });
 
+test("one mounted owner opens one connection and releases it promptly", async () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+
+  const release = store.getState().acquireConnection();
+  assert.equal(transport.connectCalls, 0);
+
+  await flushConnectionMicrotasks();
+  assert.equal(transport.connectCalls, 1);
+  assert.equal(store.getState().connection, "connected");
+
+  release();
+  assert.equal(transport.closeCalls, 1);
+  assert.equal(store.getState().connection, "closed");
+});
+
+test("StrictMode probe cleanup cannot create or close the live socket", async () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+  const connectionStates: DirectChatConnectionState[] = [];
+  const unsubscribe = store.subscribe((state) => {
+    connectionStates.push(state.connection);
+  });
+
+  const releaseProbe = store.getState().acquireConnection();
+  releaseProbe();
+  const releaseLive = store.getState().acquireConnection();
+
+  await flushConnectionMicrotasks();
+  assert.equal(transport.connectCalls, 1);
+  assert.equal(transport.closeCalls, 0);
+  assert.equal(connectionStates.includes("closed"), false);
+
+  releaseLive();
+  assert.equal(transport.closeCalls, 1);
+  unsubscribe();
+});
+
+test("a real unmount before deferred connect leaves no phantom socket", async () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+
+  const release = store.getState().acquireConnection();
+  release();
+  await flushConnectionMicrotasks();
+
+  assert.equal(transport.connectCalls, 0);
+  assert.equal(transport.closeCalls, 0);
+  assert.equal(store.getState().connection, "closed");
+});
+
+test("stale owner cleanup cannot close a later owner's connection", async () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+
+  const releaseStale = store.getState().acquireConnection();
+  const releaseCurrent = store.getState().acquireConnection();
+  await flushConnectionMicrotasks();
+
+  releaseStale();
+  assert.equal(transport.connectCalls, 1);
+  assert.equal(transport.closeCalls, 0);
+
+  releaseCurrent();
+  assert.equal(transport.closeCalls, 1);
+});
+
+test("rapid authority switches connect only the latest mounted generation", async () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+  const release = store.getState().acquireConnection();
+
+  await flushConnectionMicrotasks();
+  assert.equal(transport.connectCalls, 1);
+
+  assert.equal(store.getState().resetAuthority(), true);
+  store.getState().resumeMountedConnection();
+  assert.equal(store.getState().resetAuthority(), true);
+  store.getState().resumeMountedConnection();
+  await flushConnectionMicrotasks();
+
+  assert.equal(transport.resetAuthorityCalls, 2);
+  assert.equal(transport.connectCalls, 2);
+  assert.equal(store.getState().connection, "connected");
+
+  release();
+  assert.equal(transport.closeCalls, 3);
+});
+
+test("authority rebind invalidates a deferred pre-reset connection", async () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+  const release = store.getState().acquireConnection();
+
+  assert.equal(store.getState().resetAuthority(), true);
+  store.getState().resumeMountedConnection();
+  await flushConnectionMicrotasks();
+
+  assert.equal(transport.resetAuthorityCalls, 1);
+  assert.equal(transport.connectCalls, 1);
+  release();
+});
+
 test("admission is provisional and canonical user arrival replaces it", () => {
   const transport = new FakeTransport();
   const outbox = new PrivateOutbox();
@@ -1115,9 +1218,16 @@ class MemoryStorage implements PrivateOutboxStorage {
   }
 }
 
+function flushConnectionMicrotasks(): Promise<void> {
+  return new Promise((resolve) => queueMicrotask(resolve));
+}
+
 class FakeTransport implements DirectChatTransport {
   readonly sent: Array<{ command: unknown; idempotencyKey?: string }> = [];
   sendResult = true;
+  connectCalls = 0;
+  closeCalls = 0;
+  resetAuthorityCalls = 0;
   private readonly frameListeners = new Set<
     (frame: DirectChatServerFrame) => void
   >();
@@ -1129,13 +1239,20 @@ class FakeTransport implements DirectChatTransport {
   >();
 
   connect() {
+    this.connectCalls += 1;
     for (const listener of this.connectionListeners) listener("connected");
     for (const listener of this.readyListeners) listener("ready");
   }
 
   close() {
+    this.closeCalls += 1;
     for (const listener of this.connectionListeners) listener("closed");
     for (const listener of this.readyListeners) listener("unknown");
+  }
+
+  resetAuthority() {
+    this.resetAuthorityCalls += 1;
+    this.close();
   }
 
   sendCommand(command: unknown, idempotencyKey?: string) {
