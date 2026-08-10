@@ -18,3 +18,18 @@ CREATE TABLE message_reactions (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (message_id, member_kind, member_id, emoji)
 );
+
+-- A toggle is otherwise not retry-safe: losing the response and repeating the
+-- same request would flip the state twice. Keep one durable result per acting
+-- participant and client operation so Human and PersonalityAgent transports
+-- can both retry an indeterminate request without changing the result again.
+CREATE TABLE message_reaction_mutations (
+    member_kind  text    NOT NULL
+        CHECK (member_kind IN ('human', 'personality_agent')),
+    member_id    uuidv7  NOT NULL,
+    client_nonce text    NOT NULL CHECK (length(client_nonce) BETWEEN 1 AND 128),
+    message_id   uuidv7  NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    emoji        text    NOT NULL CHECK (length(emoji) BETWEEN 1 AND 32),
+    reacted      boolean NOT NULL,
+    PRIMARY KEY (member_kind, member_id, client_nonce)
+);

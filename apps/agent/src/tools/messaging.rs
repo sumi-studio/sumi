@@ -342,13 +342,15 @@ impl Tool for MessagingTool {
                             "that message is not visible in the currently open place; open the place (paging with before_seq if needed) so the message is on screen, then react"
                                 .to_owned(),
                         )
-                    })?;
+                })?;
+                let nonce = client_nonce(ctx.flow_id, ctx.call_id);
                 tokio::select! {
                     _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.react(ReactMessagingReactionRequest {
                         place_id: &place_id,
                         message_id: &target.message_id,
                         emoji: &emoji,
+                        client_nonce: &nonce,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?
@@ -540,7 +542,7 @@ mod tests {
             self.reacts.lock().await.push((
                 request.place_id.to_owned(),
                 request.message_id.to_owned(),
-                request.emoji.to_owned(),
+                format!("{}:{}", request.emoji, request.client_nonce),
             ));
             Ok(json!({
                 "message": {"message_id": request.message_id,
@@ -825,8 +827,16 @@ mod tests {
         assert_eq!(
             api.reacts.lock().await.as_slice(),
             &[
-                ("general".to_owned(), "m7".to_owned(), "👍".to_owned()),
-                ("general".to_owned(), "m6".to_owned(), "🎉".to_owned()),
+                (
+                    "general".to_owned(),
+                    "m7".to_owned(),
+                    format!("👍:{}", client_nonce("flow", "r1"))
+                ),
+                (
+                    "general".to_owned(),
+                    "m6".to_owned(),
+                    format!("🎉:{}", client_nonce("flow", "r2"))
+                ),
             ]
         );
 
@@ -895,7 +905,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             api.reacts.lock().await.as_slice(),
-            &[("general".to_owned(), "m8".to_owned(), "✅".to_owned())]
+            &[(
+                "general".to_owned(),
+                "m8".to_owned(),
+                format!("✅:{}", client_nonce("flow", "react"))
+            )]
         );
     }
 }

@@ -35,6 +35,7 @@ pub(crate) struct ReactMessagingReactionRequest<'a> {
     pub place_id: &'a str,
     pub message_id: &'a str,
     pub emoji: &'a str,
+    pub client_nonce: &'a str,
 }
 
 #[derive(Debug, Serialize)]

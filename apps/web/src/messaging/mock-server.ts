@@ -521,6 +521,7 @@ export class MockMessagingServer implements MessagingBackend {
     place: Place,
     messageId: string,
     emoji: string,
+    _clientNonce: string,
   ): Promise<ReactionMutationResult> {
     return this.applyReaction(place, messageId, SELF, emoji);
   }

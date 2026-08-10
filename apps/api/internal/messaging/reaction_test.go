@@ -180,7 +180,7 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 
 	conn := dialWS(t, ts, w.humanB.ID, nil)
 	path := "/messaging/places/" + ch.PlaceID + "/messages/" + msg.MessageID + "/reactions"
-	resp, body := call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍"})
+	resp, body := call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍", "client_nonce": "human-reaction-1"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("toggle: status %d body %v", resp.StatusCode, body)
 	}
@@ -218,7 +218,7 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	}
 
 	// Bad emoji fails closed before the store.
-	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": ""})
+	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "", "client_nonce": "human-reaction-invalid"})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty emoji: status %d, want 400", resp.StatusCode)
 	}
@@ -237,7 +237,7 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 
 	// Removing the last reaction publishes an empty set rather than omitting
 	// the field, so a client can tell "cleared" from "unchanged".
-	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍"})
+	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍", "client_nonce": "human-reaction-2"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("untoggle: status %d", resp.StatusCode)
 	}
@@ -267,7 +267,7 @@ func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
 		actor := actor
 		go func() {
 			<-start
-			_, _, err := server.toggleReaction(ctx, ch.PlaceID, msg.MessageID, actor, "👍")
+			_, _, err := server.toggleReaction(ctx, ch.PlaceID, msg.MessageID, actor, "👍", "concurrent-"+actor.Key())
 			errs <- err
 		}()
 	}
@@ -311,14 +311,15 @@ func TestLocalReactTogglesForTheAgent(t *testing.T) {
 	}
 	msg := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "generalの発言")
 
-	react := func(emoji string) (int, map[string]any) {
+	react := func(emoji, clientNonce string) (int, map[string]any) {
 		t.Helper()
 		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{
 			"place_id": DefaultGeneralChannelID, "message_id": msg.MessageID, "emoji": emoji,
+			"client_nonce": clientNonce,
 		}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
 	}
 
-	status, body := react("🎉")
+	status, body := react("🎉", "agent-reaction-add")
 	if status != http.StatusOK || body["reacted"] != true {
 		t.Fatalf("agent react: status %d body %v", status, body)
 	}
@@ -327,13 +328,167 @@ func TestLocalReactTogglesForTheAgent(t *testing.T) {
 	if participant["kind"] != "personality_agent" || participant["personality_agent_id"] != w.agent.ID {
 		t.Fatalf("agent reaction participant = %v", participant)
 	}
+	status, body = react("🎉", "agent-reaction-add")
+	if status != http.StatusOK || body["reacted"] != true || len(body["message"].(map[string]any)["reactions"].([]any)) != 1 {
+		t.Fatalf("agent reaction replay changed state: status %d body %v", status, body)
+	}
 
-	// The identical toggle removes it again.
-	status, body = react("🎉")
+	// A fresh gesture removes it again.
+	status, body = react("🎉", "agent-reaction-remove")
 	if status != http.StatusOK || body["reacted"] != false {
 		t.Fatalf("agent un-react: status %d body %v", status, body)
 	}
 	if n := len(body["message"].(map[string]any)["reactions"].([]any)); n != 0 {
 		t.Fatalf("reactions after un-react = %d, want 0", n)
+	}
+}
+
+func TestToggleReactionIdempotentReplayAndConcurrentDuplicate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "retry-safe reaction")
+
+	first, reacted, err := w.store.ToggleReactionIdempotent(
+		ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", "gesture-add")
+	if err != nil || !reacted || len(first.Reactions) != 1 {
+		t.Fatalf("first idempotent toggle: reacted=%v reactions=%+v err=%v", reacted, first.Reactions, err)
+	}
+	replayed, replayedReacted, err := w.store.ToggleReactionIdempotent(
+		ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", "gesture-add")
+	if err != nil || !replayedReacted || len(replayed.Reactions) != 1 {
+		t.Fatalf("replayed toggle changed result: reacted=%v reactions=%+v err=%v", replayedReacted, replayed.Reactions, err)
+	}
+
+	start := make(chan struct{})
+	type result struct {
+		message Message
+		reacted bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			message, reacted, err := w.store.ToggleReactionIdempotent(
+				ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", "gesture-remove")
+			results <- result{message: message, reacted: reacted, err: err}
+		}()
+	}
+	close(start)
+	for range 2 {
+		got := <-results
+		if got.err != nil || got.reacted || len(got.message.Reactions) != 0 {
+			t.Fatalf("concurrent duplicate did not converge: reacted=%v reactions=%+v err=%v", got.reacted, got.message.Reactions, got.err)
+		}
+	}
+
+	if _, _, err := w.store.ToggleReactionIdempotent(
+		ctx, ch.PlaceID, msg.MessageID, w.humanB, "🎉", "gesture-remove"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("nonce reuse for another mutation: got %v, want ErrIdempotencyConflict", err)
+	}
+	var reactions, mutations int
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM message_reactions WHERE message_id = $1", msg.MessageID).Scan(&reactions); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM message_reaction_mutations WHERE message_id = $1", msg.MessageID).Scan(&mutations); err != nil {
+		t.Fatal(err)
+	}
+	if reactions != 0 || mutations != 2 {
+		t.Fatalf("durable reaction state: reactions=%d mutations=%d, want 0/2", reactions, mutations)
+	}
+}
+
+func TestToggleReactionNonceConflictAcrossMessageRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	first := w.send(t, ctx, ch.PlaceID, w.humanA, "first target")
+	second := w.send(t, ctx, ch.PlaceID, w.humanA, "second target")
+
+	type result struct {
+		messageID string
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, messageID := range []string{first.MessageID, second.MessageID} {
+		messageID := messageID
+		go func() {
+			<-start
+			_, _, err := w.store.ToggleReactionIdempotent(
+				ctx, ch.PlaceID, messageID, w.humanB, "👍", "same-gesture")
+			results <- result{messageID: messageID, err: err}
+		}()
+	}
+	close(start)
+	var succeeded, conflicted int
+	for range 2 {
+		got := <-results
+		switch {
+		case got.err == nil:
+			succeeded++
+		case errors.Is(got.err, ErrIdempotencyConflict):
+			conflicted++
+		default:
+			t.Fatalf("toggle %s: unexpected error %v", got.messageID, got.err)
+		}
+	}
+	if succeeded != 1 || conflicted != 1 {
+		t.Fatalf("cross-message nonce race: succeeded=%d conflicted=%d, want 1/1", succeeded, conflicted)
+	}
+	var reactions, mutations int
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM message_reactions WHERE message_id = ANY($1)",
+		[]string{first.MessageID, second.MessageID}).Scan(&reactions); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM message_reaction_mutations WHERE client_nonce = 'same-gesture'").Scan(&mutations); err != nil {
+		t.Fatal(err)
+	}
+	if reactions != 1 || mutations != 1 {
+		t.Fatalf("cross-message durable state: reactions=%d mutations=%d, want 1/1", reactions, mutations)
+	}
+}
+
+func TestReactionNonceConflictMapsToRESTAndLocalControl409(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	first := w.send(t, ctx, ch.PlaceID, w.humanA, "first REST target")
+	second := w.send(t, ctx, ch.PlaceID, w.humanA, "second REST target")
+
+	restPath := func(messageID string) string {
+		return "/messaging/places/" + ch.PlaceID + "/messages/" + messageID + "/reactions"
+	}
+	request := map[string]any{"emoji": "👍", "client_nonce": "rest-conflict"}
+	if response, body := call(t, ts, http.MethodPost, restPath(first.MessageID), w.humanB.ID, request); response.StatusCode != http.StatusOK {
+		t.Fatalf("first REST reaction: status=%d body=%v", response.StatusCode, body)
+	}
+	response, body := call(t, ts, http.MethodPost, restPath(second.MessageID), w.humanB.ID, request)
+	if response.StatusCode != http.StatusConflict || body["error"] != "idempotency_conflict" {
+		t.Fatalf("REST nonce conflict: status=%d body=%v", response.StatusCode, body)
+	}
+
+	server := NewServer(w.store, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	localRequest := func(messageID string) (int, map[string]any) {
+		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{
+			"place_id": ch.PlaceID, "message_id": messageID,
+			"emoji": "🎉", "client_nonce": "local-conflict",
+		}, authorization)
+	}
+	if status, localBody := localRequest(first.MessageID); status != http.StatusOK {
+		t.Fatalf("first local reaction: status=%d body=%v", status, localBody)
+	}
+	status, localBody := localRequest(second.MessageID)
+	if status != http.StatusConflict || localBody["error"] != "idempotency_conflict" {
+		t.Fatalf("local nonce conflict: status=%d body=%v", status, localBody)
 	}
 }

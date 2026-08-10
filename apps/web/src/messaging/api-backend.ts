@@ -200,11 +200,12 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     emoji: string,
+    clientNonce: string,
   ): Promise<ReactionMutationResult> {
     const body = asRecord(
       await this.request(
         `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
-        { method: "POST", body: { emoji } },
+        { method: "POST", body: { emoji, client_nonce: clientNonce } },
       ),
     );
     const message = asRecord(body.message);

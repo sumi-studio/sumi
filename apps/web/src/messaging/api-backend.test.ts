@@ -150,12 +150,17 @@ describe("ApiMessagingBackend", () => {
       sinceByPlace: { "channel:channel-1": 4 },
     });
 
-    const canonical = await backend.toggleReaction(channel, "message-1", "👍");
+    const canonical = await backend.toggleReaction(
+      channel,
+      "message-1",
+      "👍",
+      "reaction-nonce-1",
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reactions",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ emoji: "👍" }),
+        body: JSON.stringify({ emoji: "👍", client_nonce: "reaction-nonce-1" }),
       }),
     );
     expect(canonical).toEqual({

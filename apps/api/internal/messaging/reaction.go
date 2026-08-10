@@ -2,9 +2,13 @@ package messaging
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // MaxReactionEmojiChars matches the schema CHECK on message_reactions.emoji.
@@ -22,11 +26,11 @@ type ReactionSummary struct {
 // commit, authoritative snapshot assembly, and live publish. ToggleReaction's
 // row lock alone orders commits, but callers used to publish after it returned;
 // two requests could therefore deliver an older absolute snapshot last.
-func (s *Server) toggleReaction(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji string) (Message, bool, error) {
+func (s *Server) toggleReaction(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji, clientNonce string) (Message, bool, error) {
 	s.reactionMu.Lock()
 	defer s.reactionMu.Unlock()
 
-	message, reacted, err := s.Store.ToggleReaction(ctx, placeID, messageID, actor, emoji)
+	message, reacted, err := s.Store.ToggleReactionIdempotent(ctx, placeID, messageID, actor, emoji, clientNonce)
 	if err != nil {
 		return Message{}, false, err
 	}
@@ -44,6 +48,21 @@ func (s *Server) toggleReaction(ctx context.Context, placeID, messageID string, 
 // is reported as ErrPlaceNotFound; a tombstone rejects new reactions.
 // The returned message carries its full reaction and mention state.
 func (s *Store) ToggleReaction(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji string) (Message, bool, error) {
+	return s.toggleReaction(ctx, placeID, messageID, actor, emoji, "")
+}
+
+// ToggleReactionIdempotent applies one client operation at most once. Reusing
+// clientNonce with the same target returns the first operation's reacted flag
+// and the current authoritative message snapshot; reusing it for a different
+// mutation fails closed.
+func (s *Store) ToggleReactionIdempotent(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji, clientNonce string) (Message, bool, error) {
+	if clientNonce == "" || len(clientNonce) > 128 {
+		return Message{}, false, fmt.Errorf("client nonce must be 1..128 bytes")
+	}
+	return s.toggleReaction(ctx, placeID, messageID, actor, emoji, clientNonce)
+}
+
+func (s *Store) toggleReaction(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji, clientNonce string) (Message, bool, error) {
 	if err := actor.Validate(); err != nil {
 		return Message{}, false, err
 	}
@@ -67,12 +86,50 @@ func (s *Store) ToggleReaction(ctx context.Context, placeID, messageID string, a
 	if !visible {
 		return Message{}, false, ErrPlaceNotFound
 	}
+	if clientNonce != "" {
+		// The mutation ledger is keyed independently of the target message. Lock
+		// that key before taking a message-row lock so two requests that reuse one
+		// nonce against different messages cannot both miss the ledger and race at
+		// its unique constraint. Hash collisions only serialize unrelated calls.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)",
+			reactionMutationLockKey(actor, clientNonce)); err != nil {
+			return Message{}, false, fmt.Errorf("lock reaction mutation: %w", err)
+		}
+	}
 	msg, err := lockMessage(ctx, tx, placeID, messageID)
 	if err != nil {
 		return Message{}, false, err
 	}
 	if msg.Deleted {
 		return Message{}, false, ErrMessageDeleted
+	}
+	if clientNonce != "" {
+		var existingMessageID, existingEmoji string
+		var existingReacted bool
+		err := tx.QueryRow(ctx,
+			`SELECT message_id, emoji, reacted
+			 FROM message_reaction_mutations
+			 WHERE member_kind = $1 AND member_id = $2 AND client_nonce = $3`,
+			actor.Kind, actor.ID, clientNonce).Scan(&existingMessageID, &existingEmoji, &existingReacted)
+		switch {
+		case err == nil:
+			if existingMessageID != messageID || existingEmoji != emoji {
+				return Message{}, false, ErrIdempotencyConflict
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Message{}, false, fmt.Errorf("commit idempotent reaction toggle: %w", err)
+			}
+			messages := []Message{msg}
+			if err := s.attachMentions(ctx, messages); err != nil {
+				return Message{}, false, err
+			}
+			if err := s.attachReactions(ctx, messages); err != nil {
+				return Message{}, false, err
+			}
+			return messages[0], existingReacted, nil
+		case err != pgx.ErrNoRows:
+			return Message{}, false, fmt.Errorf("query reaction mutation: %w", err)
+		}
 	}
 
 	tag, err := tx.Exec(ctx,
@@ -92,6 +149,15 @@ func (s *Store) ToggleReaction(ctx context.Context, placeID, messageID string, a
 		}
 		reacted = true
 	}
+	if clientNonce != "" {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO message_reaction_mutations
+			 (member_kind, member_id, client_nonce, message_id, emoji, reacted)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			actor.Kind, actor.ID, clientNonce, messageID, emoji, reacted); err != nil {
+			return Message{}, false, fmt.Errorf("record reaction mutation: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit toggle reaction: %w", err)
 	}
@@ -103,6 +169,17 @@ func (s *Store) ToggleReaction(ctx context.Context, placeID, messageID string, a
 		return Message{}, false, err
 	}
 	return messages[0], reacted, nil
+}
+
+func reactionMutationLockKey(actor ParticipantRef, clientNonce string) int64 {
+	digest := sha256.New()
+	for _, value := range []string{string(actor.Kind), actor.ID, clientNonce} {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = digest.Write(length[:])
+		_, _ = digest.Write([]byte(value))
+	}
+	return int64(binary.BigEndian.Uint64(digest.Sum(nil)[:8]))
 }
 
 // validateReactionEmoji bounds the emoji the same way the schema does. The

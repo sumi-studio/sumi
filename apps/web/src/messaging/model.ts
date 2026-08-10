@@ -244,6 +244,7 @@ export interface MessagingBackend {
     place: Place,
     messageId: string,
     emoji: string,
+    clientNonce: string,
   ): Promise<ReactionMutationResult>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;

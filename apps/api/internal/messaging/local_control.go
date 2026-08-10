@@ -173,14 +173,15 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 // the server enforces the shared permission model.
 func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
-		PlaceID   string `json:"place_id"`
-		MessageID string `json:"message_id"`
-		Emoji     string `json:"emoji"`
+		PlaceID     string `json:"place_id"`
+		MessageID   string `json:"message_id"`
+		Emoji       string `json:"emoji"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.PlaceID == "" || request.MessageID == "" || validateReactionEmoji(request.Emoji) != nil {
+	if request.PlaceID == "" || request.MessageID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || validateReactionEmoji(request.Emoji) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -194,7 +195,7 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		writeStoreError(w, err)
 		return
 	}
-	message, reacted, err := s.toggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji)
+	message, reacted, err := s.toggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji, request.ClientNonce)
 	if err != nil {
 		writeStoreError(w, err)
 		return

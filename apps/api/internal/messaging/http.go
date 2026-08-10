@@ -723,13 +723,18 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Emoji string `json:"emoji"`
+		Emoji       string `json:"emoji"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if validateReactionEmoji(req.Emoji) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_emoji")
+		return
+	}
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
 	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
@@ -744,7 +749,7 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
 		msg, reacted, opErr = s.toggleReaction(
-			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji)
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -836,6 +841,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "not_reachable")
 	case errors.Is(err, ErrMessageDeleted):
 		writeError(w, http.StatusConflict, "message_deleted")
+	case errors.Is(err, ErrIdempotencyConflict):
+		writeError(w, http.StatusConflict, "idempotency_conflict")
 	case errors.Is(err, ErrSeqBeyondLatest):
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	default:

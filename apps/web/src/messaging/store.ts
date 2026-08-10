@@ -852,6 +852,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     toggleReaction(message, emoji) {
+      const clientNonce = secureRandomUUID();
       void enqueueReactionProjection(
         message.place,
         async (operationBackend, isCurrent) => {
@@ -859,6 +860,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             message.place,
             message.messageId,
             emoji,
+            clientNonce,
           );
           if (!isCurrent()) return () => undefined;
           if (canonical.messageId !== message.messageId) {
