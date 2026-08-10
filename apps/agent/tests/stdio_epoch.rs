@@ -91,6 +91,13 @@ fn run_agent(input: &[u8]) -> (bool, Vec<serde_json::Value>, String) {
     result
 }
 
+fn command_acks(frames: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    frames
+        .iter()
+        .filter(|frame| frame["frame_type"] == "command_ack")
+        .collect()
+}
+
 fn assert_outer_protocol_violation_closes_epoch(first_frame: &[u8]) {
     let mut input = first_frame.to_vec();
     input.extend_from_slice(
@@ -152,19 +159,20 @@ fn invalid_control_payloads_are_rejected_without_closing_the_epoch() {
         success,
         "typed command rejections keep the epoch readable; stderr: {stderr}"
     );
-    assert_eq!(frames.len(), 4, "stderr: {stderr}");
-    assert_eq!(frames[0]["ack"]["status"], "rejected", "stderr: {stderr}");
+    let acks = command_acks(&frames);
+    assert_eq!(acks.len(), 4, "stderr: {stderr}");
+    assert_eq!(acks[0]["ack"]["status"], "rejected", "stderr: {stderr}");
     assert_eq!(
-        frames[0]["ack"]["reject_reason"], "schema_violation",
+        acks[0]["ack"]["reject_reason"], "schema_violation",
         "stderr: {stderr}"
     );
-    assert_eq!(frames[1]["ack"]["status"], "rejected", "stderr: {stderr}");
+    assert_eq!(acks[1]["ack"]["status"], "rejected", "stderr: {stderr}");
     assert_eq!(
-        frames[1]["ack"]["reject_reason"], "schema_violation",
+        acks[1]["ack"]["reject_reason"], "schema_violation",
         "stderr: {stderr}"
     );
-    assert_eq!(frames[2]["ack"]["status"], "received", "stderr: {stderr}");
-    assert_eq!(frames[3]["ack"]["status"], "applied", "stderr: {stderr}");
+    assert_eq!(acks[2]["ack"]["status"], "received", "stderr: {stderr}");
+    assert_eq!(acks[3]["ack"]["status"], "applied", "stderr: {stderr}");
 }
 
 #[test]
@@ -179,15 +187,16 @@ fn live_user_message_then_abort_is_received_and_terminalized_in_one_epoch() {
         success,
         "live admission must preserve the reserved Abort window; stderr: {stderr}"
     );
-    assert_eq!(frames.len(), 4, "stderr: {stderr}");
-    assert_eq!(frames[0]["ack"]["seq"], 1);
-    assert_eq!(frames[0]["ack"]["status"], "received");
-    assert_eq!(frames[1]["ack"]["seq"], 1);
-    assert_eq!(frames[1]["ack"]["status"], "superseded");
-    assert_eq!(frames[2]["ack"]["seq"], 2);
-    assert_eq!(frames[2]["ack"]["status"], "received");
-    assert_eq!(frames[3]["ack"]["seq"], 2);
-    assert_eq!(frames[3]["ack"]["status"], "applied");
+    let acks = command_acks(&frames);
+    assert_eq!(acks.len(), 4, "stderr: {stderr}");
+    assert_eq!(acks[0]["ack"]["seq"], 1);
+    assert_eq!(acks[0]["ack"]["status"], "received");
+    assert_eq!(acks[1]["ack"]["seq"], 1);
+    assert_eq!(acks[1]["ack"]["status"], "superseded");
+    assert_eq!(acks[2]["ack"]["seq"], 2);
+    assert_eq!(acks[2]["ack"]["status"], "received");
+    assert_eq!(acks[3]["ack"]["seq"], 2);
+    assert_eq!(acks[3]["ack"]["status"], "applied");
 }
 
 #[test]
@@ -201,16 +210,16 @@ fn malformed_command_value_is_durably_rejected_and_replays_the_same_ack() {
             success,
             "identity-readable malformed command attempt {attempt} must be terminal; stderr: {stderr}"
         );
-        assert_eq!(frames.len(), 1, "stderr: {stderr}");
-        assert_eq!(frames[0]["frame_type"], "command_ack");
-        assert_eq!(frames[0]["ack"]["seq"], 1);
+        let acks = command_acks(&frames);
+        assert_eq!(acks.len(), 1, "stderr: {stderr}");
+        assert_eq!(acks[0]["ack"]["seq"], 1);
         assert_eq!(
-            frames[0]["ack"]["command_id"],
+            acks[0]["ack"]["command_id"],
             "00000000-0000-4000-8000-000000000036"
         );
-        assert_eq!(frames[0]["ack"]["status"], "rejected");
+        assert_eq!(acks[0]["ack"]["status"], "rejected");
         assert_eq!(
-            frames[0]["ack"]["reject_reason"], "schema_violation",
+            acks[0]["ack"]["reject_reason"], "schema_violation",
             "stderr: {stderr}"
         );
     }
@@ -230,14 +239,15 @@ fn duplicate_command_keys_are_rejected_and_changed_raw_replay_fails_authenticati
             success,
             "duplicate-key command attempt {attempt} must be terminally rejected; stderr: {stderr}"
         );
-        assert_eq!(frames.len(), 1, "stderr: {stderr}");
-        assert_eq!(frames[0]["ack"]["seq"], 1);
+        let acks = command_acks(&frames);
+        assert_eq!(acks.len(), 1, "stderr: {stderr}");
+        assert_eq!(acks[0]["ack"]["seq"], 1);
         assert_eq!(
-            frames[0]["ack"]["command_id"],
+            acks[0]["ack"]["command_id"],
             "00000000-0000-4000-8000-000000000043"
         );
-        assert_eq!(frames[0]["ack"]["status"], "rejected");
-        assert_eq!(frames[0]["ack"]["reject_reason"], "schema_violation");
+        assert_eq!(acks[0]["ack"]["status"], "rejected");
+        assert_eq!(acks[0]["ack"]["reject_reason"], "schema_violation");
     }
 
     let changed = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000043\",\"command\":{\"type\":\"user_message\",\"text\":\"changed!\",\"text\":\"stable\",\"attachments\":[]}}\n";
@@ -279,9 +289,10 @@ fn oversized_command_replay_uses_incremental_keyed_digest_without_persisting_bod
         success,
         "oversized receipt must be terminal; stderr: {stderr}"
     );
-    assert_eq!(frames.len(), 1, "stderr: {stderr}");
-    assert_eq!(frames[0]["ack"]["status"], "rejected");
-    assert_eq!(frames[0]["ack"]["reject_reason"], "oversized");
+    let acks = command_acks(&frames);
+    assert_eq!(acks.len(), 1, "stderr: {stderr}");
+    assert_eq!(acks[0]["ack"]["status"], "rejected");
+    assert_eq!(acks[0]["ack"]["reject_reason"], "oversized");
     assert!(
         !stderr.contains(&"x".repeat(256)),
         "initial rejection diagnostics must not contain payload bytes"
@@ -289,8 +300,9 @@ fn oversized_command_replay_uses_incremental_keyed_digest_without_persisting_bod
 
     let (success, frames, stderr) = run_agent_at(&database_path, &original);
     assert!(success, "exact replay must succeed; stderr: {stderr}");
-    assert_eq!(frames.len(), 1, "stderr: {stderr}");
-    assert_eq!(frames[0]["ack"]["status"], "rejected");
+    let acks = command_acks(&frames);
+    assert_eq!(acks.len(), 1, "stderr: {stderr}");
+    assert_eq!(acks[0]["ack"]["status"], "rejected");
     assert!(
         !stderr.contains(&"x".repeat(256)),
         "replay diagnostics must not contain payload bytes"
