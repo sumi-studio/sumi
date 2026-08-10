@@ -22,10 +22,10 @@ import {
   SmilePlus,
   Trash2,
 } from "lucide-react";
-import { Fragment, memo, type ReactNode } from "react";
-import { displayMentionPattern } from "../mention";
+import { memo, type ReactNode, useMemo } from "react";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
+import { MessageContent } from "./message-content";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const TIME_FORMAT = new Intl.DateTimeFormat("ja-JP", {
@@ -47,94 +47,6 @@ const REPLY_LATER_OPTIONS: { label: string; delayMs: number }[] = [
   { label: "1時間後", delayMs: 60 * 60_000 },
   { label: "3時間後", delayMs: 3 * 60 * 60_000 },
 ];
-
-const URL_PATTERN = /https?:\/\/[^\s<>"）」』】]+/g;
-
-/** プレーン文中のURLをリンク化する。開発チームの会話はURLだらけになるので必須の道具。 */
-function linkifyText(text: string, keyBase: string): ReactNode[] {
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  let index = 0;
-  for (const match of text.matchAll(URL_PATTERN)) {
-    const start = match.index ?? 0;
-    if (start > cursor) {
-      parts.push(
-        <Fragment key={`${keyBase}t${index}`}>
-          {text.slice(cursor, start)}
-        </Fragment>,
-      );
-      index += 1;
-    }
-    parts.push(
-      <a
-        key={`${keyBase}u${index}`}
-        href={match[0]}
-        target="_blank"
-        rel="noreferrer noopener"
-        className="break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
-      >
-        {match[0]}
-      </a>,
-    );
-    index += 1;
-    cursor = start + match[0].length;
-  }
-  if (cursor < text.length) {
-    parts.push(
-      <Fragment key={`${keyBase}t${index}`}>{text.slice(cursor)}</Fragment>,
-    );
-  }
-  return parts;
-}
-
-function renderContent(
-  content: string,
-  members: Record<ParticipantKey, MemberProfile>,
-  selfKey: ParticipantKey,
-): ReactNode {
-  const names = Object.values(members)
-    .map((member) => member.displayName)
-    .sort((a, b) => b.length - a.length);
-  if (names.length === 0) return linkifyText(content, "c");
-  const pattern = displayMentionPattern(names);
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  let match = pattern.exec(content);
-  let index = 0;
-  while (match) {
-    if (match.index > cursor) {
-      parts.push(
-        ...linkifyText(content.slice(cursor, match.index), `s${index}`),
-      );
-      index += 1;
-    }
-    const mentioned = Object.values(members).find(
-      (member) => member.displayName === match?.[1],
-    );
-    const isSelf = mentioned
-      ? participantKey(mentioned.participant) === selfKey
-      : false;
-    parts.push(
-      <span
-        key={`m${index}`}
-        className={
-          isSelf
-            ? "rounded bg-amber-500/15 px-0.5 font-medium text-amber-700 dark:text-amber-400"
-            : "rounded bg-primary/10 px-0.5 font-medium text-primary"
-        }
-      >
-        {match[0]}
-      </span>,
-    );
-    index += 1;
-    cursor = match.index + match[0].length;
-    match = pattern.exec(content);
-  }
-  if (cursor < content.length) {
-    parts.push(...linkifyText(content.slice(cursor), `s${index}`));
-  }
-  return parts;
-}
 
 function UrgencyChip({ urgency }: { urgency: Message["urgency"] }) {
   if (urgency === "urgent") {
@@ -282,6 +194,14 @@ export const MessageItem = memo(function MessageItem({
   const replyAuthor = replyTarget
     ? membersByKey[participantKey(replyTarget.author)]
     : undefined;
+  const editedAt = message.editedAt;
+  const editedTrailer = useMemo(
+    () =>
+      editedAt
+        ? { text: "(編集済み)", title: FULL_FORMAT.format(editedAt) }
+        : undefined,
+    [editedAt],
+  );
 
   return (
     <div
@@ -329,21 +249,18 @@ export const MessageItem = memo(function MessageItem({
               <UrgencyChip urgency={message.urgency} />
             </div>
           )}
-          <div className="whitespace-pre-wrap break-words text-[13.5px] leading-6">
+          <div className="break-words text-[13.5px] leading-6">
             {grouped && message.urgency !== "normal" ? (
-              <span className="mr-1.5 align-middle">
+              <span className="float-left mt-0.5 mr-1.5">
                 <UrgencyChip urgency={message.urgency} />
               </span>
             ) : null}
-            {renderContent(message.content, membersByKey, selfKey)}
-            {message.editedAt ? (
-              <span
-                className="ml-1 text-[10px] text-muted-foreground"
-                title={FULL_FORMAT.format(message.editedAt)}
-              >
-                (編集済み)
-              </span>
-            ) : null}
+            <MessageContent
+              content={message.content}
+              members={membersByKey}
+              selfKey={selfKey}
+              trailer={editedTrailer}
+            />
           </div>
           {allowReactions ? (
             <ReactionChips
