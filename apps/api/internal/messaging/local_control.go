@@ -2,6 +2,9 @@ package messaging
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -14,8 +17,12 @@ const (
 	LocalOverviewPath = "/local-control/v1/messaging:overview"
 	LocalOpenPath     = "/local-control/v1/messaging:open"
 	LocalWritePath    = "/local-control/v1/messaging:write"
-	LocalReactPath    = "/local-control/v1/messaging:react"
-	LocalStatusPath   = "/local-control/v1/messaging:status"
+	// Attachment bytes cross only the PAID-bound local-control transport. The
+	// browser surface has separate cookie-authenticated upload/download routes.
+	LocalUploadAttachmentPath = "/local-control/v1/messaging:upload"
+	LocalAttachmentPath       = "/local-control/v1/messaging:attachment"
+	LocalReactPath            = "/local-control/v1/messaging:react"
+	LocalStatusPath           = "/local-control/v1/messaging:status"
 	// LocalProfilePath は agent が自分の名乗り（表示名・tagline）を読み書きする口。
 	// 人間が個人設定画面から行うのと同じ Store 経路を通る（AX: UIだけにある操作を
 	// 作らない）。
@@ -70,6 +77,10 @@ const (
 	LocalAttentionPath = "/local-control/v1/messaging:attention"
 )
 
+// MaxLocalAttachmentFetchBytes bounds what the local-control lane inlines in a
+// JSON tool result. Files above the bound are refused, never truncated.
+const MaxLocalAttachmentFetchBytes int64 = 2 << 20
+
 // maxRelativeMinutes bounds every relative duration the agent lane accepts.
 // The agent names durations ("30分後に"), not wall-clock instants, so the
 // server's clock decides the moment and a drifting workspace clock cannot
@@ -87,6 +98,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalOverviewPath, s.localOverview},
 		{"POST " + LocalOpenPath, s.localOpen},
 		{"POST " + LocalWritePath, s.localWrite},
+		{"POST " + LocalUploadAttachmentPath, s.localUploadAttachment},
+		{"POST " + LocalAttachmentPath, s.localAttachment},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
 		{"POST " + LocalProfilePath, s.localProfile},
@@ -296,31 +309,27 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
-		PlaceID     string  `json:"place_id"`
-		Content     string  `json:"content"`
-		Urgency     string  `json:"urgency"`
-		ReplyTo     *string `json:"reply_to,omitempty"`
-		ClientNonce string  `json:"client_nonce"`
+		PlaceID     string   `json:"place_id"`
+		Content     string   `json:"content"`
+		Urgency     string   `json:"urgency"`
+		ReplyTo     *string  `json:"reply_to,omitempty"`
+		ClientNonce string   `json:"client_nonce"`
+		Attachments []string `json:"attachments,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
-		return
-	}
-	switch request.Urgency {
-	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_urgency")
 		return
 	}
 	// Validate the entire mutation shape before default-workspace admission.
 	// An oversized or otherwise unstorable write must not create membership,
 	// allocate a place, or advance its sequence as a side effect of rejection.
-	if request.PlaceID == "" || request.Content == "" ||
-		!messageContentFitsStorage(request.Content) {
+	if request.PlaceID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
-	if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+	if code := validateSendRequest(
+		request.Content, request.Urgency, request.ClientNonce, request.Attachments, false,
+	); code != "" {
+		writeError(w, http.StatusBadRequest, code)
 		return
 	}
 	viewer := localViewer(authorization)
@@ -340,6 +349,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	message, created, err := s.Store.AppendMessage(r.Context(), AppendInput{
 		PlaceID: request.PlaceID, Author: viewer, Content: request.Content,
 		Urgency: request.Urgency, ReplyTo: replyTo, ClientNonce: request.ClientNonce,
+		AttachmentIDs: request.Attachments,
 	})
 	if err != nil {
 		writeStoreError(w, err)
@@ -353,6 +363,124 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		status = http.StatusOK
 	}
 	writeJSON(w, status, messageReceiptToWire(message, created))
+}
+
+// localUploadAttachment accepts multipart bytes through the agent's
+// generation-fenced authorization lease. Filename sanitizing, MIME sniffing,
+// blob persistence, and metadata creation are exactly the browser upload path's
+// storeUpload operation; the only transport-specific input is agent identity.
+func (s *Server) localUploadAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, MaxAttachmentBytes+maxAttachmentEnvelopeBytes)
+	parts, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_multipart")
+		return
+	}
+	var (
+		att   Attachment
+		found bool
+	)
+	for {
+		part, nextErr := parts.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(nextErr, &tooLarge) {
+				err = nextErr
+			} else {
+				err = errInvalidMultipart
+			}
+			break
+		}
+		if part.FormName() != "file" || part.FileName() == "" {
+			_ = part.Close()
+			continue
+		}
+		att, err = s.storeUpload(r.Context(), viewer, part)
+		_ = part.Close()
+		if err == nil {
+			found = true
+		}
+		break
+	}
+	switch {
+	case errors.Is(err, errInvalidMultipart):
+		writeError(w, http.StatusBadRequest, "invalid_multipart")
+	case errors.Is(err, ErrAttachmentTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+	case err != nil:
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+			return
+		}
+		writeStoreError(w, err)
+	case !found:
+		writeError(w, http.StatusBadRequest, "missing_file")
+	default:
+		writeJSON(w, http.StatusCreated, attachmentToWire(att))
+	}
+}
+
+// localAttachment returns bytes only after the shared AttachmentForViewer
+// visibility check. That preserves place membership, unbound ownership,
+// profile-image visibility, and tombstone semantics without a second policy.
+func (s *Server) localAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		AttachmentID string `json:"attachment_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	att, err := s.Store.AttachmentForViewer(r.Context(), request.AttachmentID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if att.SizeBytes > MaxLocalAttachmentFetchBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	}
+	blob, err := s.Attachments.Open(att.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	defer blob.Close()
+	payload, err := io.ReadAll(io.LimitReader(blob, MaxLocalAttachmentFetchBytes+1))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if int64(len(payload)) > MaxLocalAttachmentFetchBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		attachmentWire
+		MessageID string `json:"message_id,omitempty"`
+		Data      string `json:"data"`
+	}{attachmentToWire(att), att.MessageID, base64.StdEncoding.EncodeToString(payload)})
 }
 
 // localReact states the agent's desired emoji state through the identical

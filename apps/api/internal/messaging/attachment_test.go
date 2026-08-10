@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +24,11 @@ import (
 var pngBytes = append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte("pixel"), 8)...)
 
 func newAttachmentServer(t *testing.T, ctx context.Context) (world, *httptest.Server) {
+	w, _, ts := newAttachmentServerWithServer(t, ctx)
+	return w, ts
+}
+
+func newAttachmentServerWithServer(t *testing.T, ctx context.Context) (world, *Server, *httptest.Server) {
 	t.Helper()
 	w := newWorld(t, ctx)
 	blobs, err := NewDiskAttachments(t.TempDir())
@@ -34,7 +42,7 @@ func newAttachmentServer(t *testing.T, ctx context.Context) (world, *httptest.Se
 	server.RegisterRoutes(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	return w, ts
+	return w, server, ts
 }
 
 // upload posts one multipart file as the given participant.
@@ -415,6 +423,147 @@ func TestAttachmentDraftSpoilerAndAlt(t *testing.T) {
 	}
 }
 
+func TestActiveAttachmentDraftLeaseRenewsBeforeReclamation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, server, ts := newAttachmentServerWithServer(t, ctx)
+	blobs := server.Attachments.(*DiskAttachments)
+
+	_, body := upload(t, ts, w.humanA.ID, "long-lived.png", "image/png", pngBytes)
+	id := attachmentID(t, body)
+	_, foreignBody := upload(t, ts, w.humanB.ID, "foreign.png", "image/png", pngBytes)
+	foreignID := attachmentID(t, foreignBody)
+	aged := time.Now().Add(-48 * time.Hour)
+	backdateAttachment(t, ctx, w, blobs, id, aged)
+
+	resp, body := call(t, ts, http.MethodPost, "/messaging/attachments:renew", w.humanB.ID,
+		map[string]any{"attachment_ids": []string{id}})
+	if resp.StatusCode != http.StatusNotFound || body["error"] != "attachment_not_found" {
+		t.Fatalf("foreign renewal = %d %v, want 404 attachment_not_found", resp.StatusCode, body)
+	}
+	resp, body = call(t, ts, http.MethodPost, "/messaging/attachments:renew", w.humanA.ID,
+		map[string]any{"attachment_ids": []string{id, foreignID}})
+	if resp.StatusCode != http.StatusNotFound || body["error"] != "attachment_not_found" {
+		t.Fatalf("mixed renewal = %d %v, want atomic 404", resp.StatusCode, body)
+	}
+	var stillExpired time.Time
+	if err := w.store.pool.QueryRow(ctx,
+		`SELECT draft_expires_at FROM message_attachments WHERE attachment_id = $1`, id).
+		Scan(&stillExpired); err != nil {
+		t.Fatalf("load draft after rejected mixed renewal: %v", err)
+	}
+	if stillExpired.Sub(aged).Abs() > time.Millisecond {
+		t.Fatalf("mixed renewal partially changed owned draft: got %s, want %s", stillExpired, aged)
+	}
+
+	before := time.Now()
+	resp, body = call(t, ts, http.MethodPost, "/messaging/attachments:renew", w.humanA.ID,
+		map[string]any{"attachment_ids": []string{id}})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("owner renewal = %d %v, want 204", resp.StatusCode, body)
+	}
+	var expiresAt time.Time
+	if err := w.store.pool.QueryRow(ctx,
+		`SELECT draft_expires_at FROM message_attachments WHERE attachment_id = $1`, id).
+		Scan(&expiresAt); err != nil {
+		t.Fatalf("load renewed draft lease: %v", err)
+	}
+	if expiresAt.Before(before.Add(AttachmentDraftLease - time.Minute)) {
+		t.Fatalf("renewed draft expires at %s, want roughly one full lease after %s", expiresAt, before)
+	}
+
+	swept, err := server.SweepAttachments(ctx, AttachmentOrphanGrace)
+	if err != nil || swept.Expired != 0 || !blobExists(t, blobs, id) {
+		t.Fatalf("active draft sweep = %+v, error %v, blob present %v", swept, err, blobExists(t, blobs, id))
+	}
+
+	if _, err := w.store.pool.Exec(ctx,
+		`UPDATE message_attachments SET draft_expires_at = $1 WHERE attachment_id = $2`, aged, id); err != nil {
+		t.Fatalf("expire renewed draft: %v", err)
+	}
+	swept, err = server.SweepAttachments(ctx, AttachmentOrphanGrace)
+	if err != nil || swept.Expired != 1 || blobExists(t, blobs, id) {
+		t.Fatalf("expired draft sweep = %+v, error %v, blob present %v", swept, err, blobExists(t, blobs, id))
+	}
+}
+
+func TestAttachmentDraftRenewalSerializesWithReclamation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, server, ts := newAttachmentServerWithServer(t, ctx)
+	blobs := server.Attachments.(*DiskAttachments)
+
+	_, body := upload(t, ts, w.humanA.ID, "renew-race.png", "image/png", pngBytes)
+	id := attachmentID(t, body)
+	backdateAttachment(t, ctx, w, blobs, id, time.Now().Add(-48*time.Hour))
+
+	const gateKey int32 = 24502
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION gate_attachment_draft_renew() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.draft_expires_at > OLD.draft_expires_at THEN
+				PERFORM pg_advisory_xact_lock(24502);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER gate_attachment_draft_renew
+		BEFORE UPDATE OF draft_expires_at ON message_attachments
+		FOR EACH ROW EXECUTE FUNCTION gate_attachment_draft_renew()`); err != nil {
+		t.Fatalf("install draft renewal gate: %v", err)
+	}
+	release := holdProfileTestGate(t, ctx, w, gateKey)
+
+	renewDone := make(chan error, 1)
+	go func() {
+		renewDone <- w.store.RenewDraftAttachments(ctx, w.humanA, []string{id}, time.Now())
+	}()
+	waitForProfileTestGate(t, ctx, w, gateKey)
+
+	type sweepResult struct {
+		sweep AttachmentSweep
+		err   error
+	}
+	sweepDone := make(chan sweepResult, 1)
+	go func() {
+		sweep, err := server.SweepAttachments(ctx, AttachmentOrphanGrace)
+		sweepDone <- sweepResult{sweep: sweep, err: err}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	waiting := false
+	for !waiting && time.Now().Before(deadline) {
+		if err := w.store.pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks l
+			JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE a.datname = current_database() AND NOT l.granted
+			  AND l.locktype = 'transactionid'
+		)`).Scan(&waiting); err != nil {
+			t.Fatalf("inspect sweep/renew waiter: %v", err)
+		}
+		if !waiting {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !waiting {
+		t.Fatal("attachment sweep did not wait for the in-flight draft renewal")
+	}
+
+	release()
+	if err := <-renewDone; err != nil {
+		t.Fatalf("renew draft: %v", err)
+	}
+	result := <-sweepDone
+	if result.err != nil || result.sweep != (AttachmentSweep{}) {
+		t.Fatalf("racing renewal sweep = %+v, error %v, want renewed draft preserved",
+			result.sweep, result.err)
+	}
+	if !blobExists(t, blobs, id) {
+		t.Fatal("racing sweep removed the renewed draft blob")
+	}
+}
+
 func TestSanitizeAttachmentAlt(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"  結末の一枚  ", "結末の一枚"},
@@ -425,5 +574,344 @@ func TestSanitizeAttachmentAlt(t *testing.T) {
 		if got := sanitizeAttachmentAlt(tc.in); got != tc.want {
 			t.Fatalf("sanitizeAttachmentAlt(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestAttachmentSendOrderPersistsTheSenderSelection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newAttachmentServer(t, ctx)
+	_, channel := w.workspaceWithChannel(t, ctx)
+
+	// Upload completion order is deliberately the reverse of send selection.
+	byName := make(map[string]string, 3)
+	for _, name := range []string{"third.png", "second.png", "first.png"} {
+		resp, body := upload(t, ts, w.humanA.ID, name, "image/png", pngBytes)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload %s = %d %v, want 201", name, resp.StatusCode, body)
+		}
+		byName[name] = attachmentID(t, body)
+	}
+	want := []string{"first.png", "second.png", "third.png"}
+	ids := make([]string, len(want))
+	for i, name := range want {
+		ids[i] = byName[name]
+	}
+
+	resp, receipt := call(t, ts, http.MethodPost,
+		"/messaging/places/"+channel.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "three shots", "client_nonce": "n-order", "attachments": ids})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send = %d %v, want 201", resp.StatusCode, receipt)
+	}
+	if _, hasMessage := receipt["message"]; hasMessage {
+		t.Fatalf("send returned a full message instead of the compact receipt: %v", receipt)
+	}
+
+	history, err := w.store.History(ctx, channel.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil || len(history) != 1 {
+		t.Fatalf("stored history = %#v, error %v", history, err)
+	}
+	got := make([]string, len(history[0].Attachments))
+	for i, attachment := range history[0].Attachments {
+		got[i] = attachment.Filename
+	}
+	if len(got) != len(want) {
+		t.Fatalf("stored attachment order = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stored attachment order = %v, want %v", got, want)
+		}
+	}
+}
+
+func backdateAttachment(t *testing.T, ctx context.Context, w world, blobs *DiskAttachments, id string, when time.Time) {
+	t.Helper()
+	if _, err := w.store.pool.Exec(ctx,
+		`UPDATE message_attachments
+		 SET created_at = $1, draft_expires_at = $1
+		 WHERE attachment_id = $2`, when, id); err != nil {
+		t.Fatalf("backdate attachment row %s: %v", id, err)
+	}
+	backdateBlob(t, blobs, id, when)
+}
+
+func backdateBlob(t *testing.T, blobs *DiskAttachments, id string, when time.Time) {
+	t.Helper()
+	path, err := blobs.path(id)
+	if err != nil {
+		t.Fatalf("blob path %s: %v", id, err)
+	}
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatalf("backdate blob %s: %v", id, err)
+	}
+}
+
+func blobExists(t *testing.T, blobs *DiskAttachments, id string) bool {
+	t.Helper()
+	path, err := blobs.path(id)
+	if err != nil {
+		t.Fatalf("blob path %s: %v", id, err)
+	}
+	_, err = os.Stat(path)
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat blob %s: %v", id, err)
+	}
+	return false
+}
+
+func TestAttachmentSweepReclaimsOnlyExpiredUnusedUploads(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, server, ts := newAttachmentServerWithServer(t, ctx)
+	blobs := server.Attachments.(*DiskAttachments)
+	_, channel := w.workspaceWithChannel(t, ctx)
+
+	_, body := upload(t, ts, w.humanA.ID, "sent.png", "image/png", pngBytes)
+	sentID := attachmentID(t, body)
+	resp, receipt := call(t, ts, http.MethodPost,
+		"/messaging/places/"+channel.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "", "client_nonce": "n-sent", "attachments": []string{sentID}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send = %d %v, want 201", resp.StatusCode, receipt)
+	}
+
+	_, body = upload(t, ts, w.humanA.ID, "abandoned.png", "image/png", pngBytes)
+	abandonedID := attachmentID(t, body)
+	_, body = upload(t, ts, w.humanA.ID, "fresh.png", "image/png", pngBytes)
+	freshID := attachmentID(t, body)
+	_, body = upload(t, ts, w.humanA.ID, "avatar.png", "image/png", pngBytes)
+	profileID := attachmentID(t, body)
+	if _, err := w.store.SetProfile(ctx, w.humanA, "Yohaku", "", profileID, ""); err != nil {
+		t.Fatalf("set profile image: %v", err)
+	}
+
+	orphanID := NewAttachmentID()
+	if _, err := blobs.Put(orphanID, bytes.NewReader(pngBytes)); err != nil {
+		t.Fatalf("put orphan blob: %v", err)
+	}
+	tempPath := filepath.Join(blobs.Root, ".upload-dead")
+	if err := os.WriteFile(tempPath, pngBytes, 0o600); err != nil {
+		t.Fatalf("write stale temp: %v", err)
+	}
+
+	aged := time.Now().Add(-48 * time.Hour)
+	backdateAttachment(t, ctx, w, blobs, sentID, aged)
+	backdateAttachment(t, ctx, w, blobs, abandonedID, aged)
+	backdateAttachment(t, ctx, w, blobs, profileID, aged)
+	backdateBlob(t, blobs, orphanID, aged)
+	if err := os.Chtimes(tempPath, aged, aged); err != nil {
+		t.Fatalf("backdate temp: %v", err)
+	}
+
+	swept, err := server.SweepAttachments(ctx, AttachmentOrphanGrace)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if swept.Expired != 1 || swept.Orphaned != 1 {
+		t.Fatalf("sweep = %+v, want one expired and one orphaned", swept)
+	}
+	if blobExists(t, blobs, abandonedID) || blobExists(t, blobs, orphanID) {
+		t.Fatal("sweep retained an abandoned or orphaned blob")
+	}
+	if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale temp survived sweep: %v", err)
+	}
+	if resp, _ := fetchAttachment(t, ts, w.humanA.ID, abandonedID); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expired upload fetch = %d, want 404", resp.StatusCode)
+	}
+	for label, id := range map[string]string{
+		"sent": sentID, "fresh": freshID, "profile": profileID,
+	} {
+		if resp, _ := fetchAttachment(t, ts, w.humanA.ID, id); resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s attachment fetch after sweep = %d, want 200", label, resp.StatusCode)
+		}
+	}
+	if resp, _ := fetchAttachment(t, ts, w.humanB.ID, profileID); resp.StatusCode != http.StatusOK {
+		t.Fatalf("visible profile image fetch after sweep = %d, want 200", resp.StatusCode)
+	}
+
+	swept, err = server.SweepAttachments(ctx, AttachmentOrphanGrace)
+	if err != nil || swept != (AttachmentSweep{}) {
+		t.Fatalf("second sweep = %+v, error %v, want no work", swept, err)
+	}
+}
+
+func TestAttachmentSweepSerializesWithProfilePublication(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, server, ts := newAttachmentServerWithServer(t, ctx)
+	blobs := server.Attachments.(*DiskAttachments)
+
+	_, body := upload(t, ts, w.humanA.ID, "racing-avatar.png", "image/png", pngBytes)
+	profileAttachmentID := attachmentID(t, body)
+	backdateAttachment(t, ctx, w, blobs, profileAttachmentID, time.Now().Add(-48*time.Hour))
+
+	const gateKey int32 = 24501
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION gate_sweep_profile_publish() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.tagline = 'profile-beats-sweep' THEN
+				PERFORM pg_advisory_xact_lock(24501);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER gate_sweep_profile_publish
+		BEFORE INSERT OR UPDATE ON participant_profiles
+		FOR EACH ROW EXECUTE FUNCTION gate_sweep_profile_publish()`); err != nil {
+		t.Fatalf("install sweep/profile gate: %v", err)
+	}
+	release := holdProfileTestGate(t, ctx, w, gateKey)
+
+	profileDone := make(chan profileResult, 1)
+	go func() {
+		profile, err := w.store.SetProfile(
+			ctx, w.humanA, "Yohaku", "profile-beats-sweep", profileAttachmentID, "",
+		)
+		profileDone <- profileResult{profile: profile, err: err}
+	}()
+	waitForProfileTestGate(t, ctx, w, gateKey)
+
+	type sweepResult struct {
+		sweep AttachmentSweep
+		err   error
+	}
+	sweepDone := make(chan sweepResult, 1)
+	go func() {
+		sweep, err := server.SweepAttachments(ctx, AttachmentOrphanGrace)
+		sweepDone <- sweepResult{sweep: sweep, err: err}
+	}()
+
+	// The reclaimer selected the row while the profile reference was still
+	// uncommitted, then blocked on the attachment lock held by SetProfile.
+	deadline := time.Now().Add(5 * time.Second)
+	waiting := false
+	for !waiting && time.Now().Before(deadline) {
+		if err := w.store.pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks l
+			JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE a.datname = current_database() AND NOT l.granted
+			  AND l.locktype = 'transactionid'
+		)`).Scan(&waiting); err != nil {
+			t.Fatalf("inspect sweep attachment waiter: %v", err)
+		}
+		if !waiting {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !waiting {
+		t.Fatal("attachment sweep did not wait for the profile publication")
+	}
+
+	release()
+	profileResult := <-profileDone
+	if profileResult.err != nil || profileResult.profile.AvatarAttachmentID != profileAttachmentID {
+		t.Fatalf("profile publication = %#v, error %v", profileResult.profile, profileResult.err)
+	}
+	result := <-sweepDone
+	if result.err != nil || result.sweep != (AttachmentSweep{}) {
+		t.Fatalf("racing sweep = %+v, error %v, want profile image preserved", result.sweep, result.err)
+	}
+	if !blobExists(t, blobs, profileAttachmentID) {
+		t.Fatal("racing sweep removed the committed profile image blob")
+	}
+}
+
+func TestDiskAttachmentSweepIsBoundedResumableAndLocationSafe(t *testing.T) {
+	blobs, err := NewDiskAttachments(t.TempDir())
+	if err != nil {
+		t.Fatalf("new disk attachments: %v", err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	cutoff := time.Now().Add(-24 * time.Hour)
+
+	orphanID := NewAttachmentID()
+	if _, err := blobs.Put(orphanID, bytes.NewReader(pngBytes)); err != nil {
+		t.Fatalf("put orphan: %v", err)
+	}
+	backdateBlob(t, blobs, orphanID, old)
+
+	misplacedID := NewAttachmentID()
+	misplacedPath := filepath.Join(blobs.Root, misplacedID+".bin")
+	if err := os.WriteFile(misplacedPath, pngBytes, 0o600); err != nil {
+		t.Fatalf("write misplaced blob: %v", err)
+	}
+	if err := os.Chtimes(misplacedPath, old, old); err != nil {
+		t.Fatalf("backdate misplaced blob: %v", err)
+	}
+	staleTemp := filepath.Join(blobs.Root, ".upload-stale")
+	freshTemp := filepath.Join(blobs.Root, ".upload-fresh")
+	for _, path := range []string{staleTemp, freshTemp} {
+		if err := os.WriteFile(path, pngBytes, 0o600); err != nil {
+			t.Fatalf("write temp %s: %v", path, err)
+		}
+	}
+	if err := os.Chtimes(staleTemp, old, old); err != nil {
+		t.Fatalf("backdate stale temp: %v", err)
+	}
+
+	seen := map[string]bool{}
+	complete := false
+	for pass := 0; pass < 32 && !complete; pass++ {
+		page, err := blobs.Sweep(context.Background(), cutoff, 1)
+		if err != nil {
+			t.Fatalf("bounded sweep pass %d: %v", pass, err)
+		}
+		if page.Visited > 1 {
+			t.Fatalf("bounded sweep visited %d entries with budget 1", page.Visited)
+		}
+		for _, id := range page.Candidates {
+			seen[id] = true
+		}
+		complete = page.CycleComplete
+	}
+	if !complete {
+		t.Fatal("bounded sweep did not complete one small filesystem cycle")
+	}
+	if !seen[orphanID] || seen[misplacedID] {
+		t.Fatalf("sweep candidates = %v, want canonical %s only", seen, orphanID)
+	}
+	if _, err := os.Stat(staleTemp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale temp survived: %v", err)
+	}
+	if _, err := os.Stat(freshTemp); err != nil {
+		t.Fatalf("fresh temp was removed: %v", err)
+	}
+	if _, err := os.Stat(misplacedPath); err != nil {
+		t.Fatalf("misplaced blob was mutated: %v", err)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := blobs.Sweep(canceled, cutoff, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled sweep error = %v, want context.Canceled", err)
+	}
+
+	lateID := NewAttachmentID()
+	if _, err := blobs.Put(lateID, bytes.NewReader(pngBytes)); err != nil {
+		t.Fatalf("put late orphan: %v", err)
+	}
+	backdateBlob(t, blobs, lateID, old)
+	foundLate := false
+	for pass := 0; pass < 64; pass++ {
+		page, err := blobs.Sweep(context.Background(), cutoff, 1)
+		if err != nil {
+			t.Fatalf("restarted sweep pass %d: %v", pass, err)
+		}
+		for _, id := range page.Candidates {
+			foundLate = foundLate || id == lateID
+		}
+		if page.CycleComplete {
+			break
+		}
+	}
+	if !foundLate {
+		t.Fatal("a sweep after cancellation/reset did not discover a later orphan")
 	}
 }

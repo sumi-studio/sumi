@@ -98,6 +98,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/poll/vote", s.serveVotePoll)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
+	mux.HandleFunc("POST /messaging/attachments:renew", s.serveRenewAttachments)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
 	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
@@ -1367,25 +1368,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	switch req.Urgency {
-	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_urgency")
-		return
-	}
-	// Attachment-only and poll-only messages are legitimate; empty with
-	// nothing attached is not.
-	if (req.Content == "" && len(req.Attachments) == 0 && req.Poll == nil) ||
-		!messageContentFitsStorage(req.Content) {
-		writeError(w, http.StatusBadRequest, "invalid_content")
-		return
-	}
-	if len(req.Attachments) > MaxAttachmentsPerMessage {
-		writeError(w, http.StatusBadRequest, "too_many_attachments")
-		return
-	}
-	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+	if code := validateSendRequest(
+		req.Content, req.Urgency, req.ClientNonce, req.Attachments, req.Poll != nil,
+	); code != "" {
+		writeError(w, http.StatusBadRequest, code)
 		return
 	}
 	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
@@ -1422,6 +1408,28 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		publishMessageCreated(r.Context(), s.Store, s.Hub, place, msg)
 	}
 	writeJSON(w, status, messageReceiptToWire(msg, created))
+}
+
+// validateSendRequest keeps browser REST and agent local control on one
+// admission contract. A poll is a browser-only request shape today, but it is
+// still an ordinary alternative to message text for the shared validation.
+func validateSendRequest(content, urgency, clientNonce string, attachments []string, hasPoll bool) string {
+	switch urgency {
+	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
+	default:
+		return "invalid_urgency"
+	}
+	if (content == "" && len(attachments) == 0 && !hasPoll) ||
+		!messageContentFitsStorage(content) {
+		return "invalid_content"
+	}
+	if len(attachments) > MaxAttachmentsPerMessage {
+		return "too_many_attachments"
+	}
+	if clientNonce == "" || len(clientNonce) > 128 {
+		return "invalid_client_nonce"
+	}
+	return ""
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
@@ -2215,6 +2223,38 @@ func (s *Server) serveUploadAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, attachmentToWire(att))
+}
+
+// serveRenewAttachments keeps uploads held by an active composer from being
+// reclaimed as abandoned. It extends only the authenticated uploader's own
+// still-unbound drafts and therefore does not grant a capability beyond the
+// existing upload/edit/bind lifecycle.
+func (s *Server) serveRenewAttachments(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		AttachmentIDs []string `json:"attachment_ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.AttachmentIDs) == 0 || len(req.AttachmentIDs) > MaxAttachmentDraftRenewal {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	done, err := s.mutate(w, r, claims, func() error {
+		return s.Store.RenewDraftAttachments(r.Context(), viewer, req.AttachmentIDs, time.Now())
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 var errInvalidMultipart = errors.New("invalid multipart body")

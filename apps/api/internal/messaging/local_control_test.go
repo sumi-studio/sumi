@@ -3,16 +3,135 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
+
+const localMessagingTestBearer = "messaging-local-control-bearer-32-bytes-minimum"
+
+func localMessagingAuthorization(bearer, personalityAgentID string, generation uint64, bootNonce string) agentevents.LocalRuntimeAuthorization {
+	return agentevents.LocalRuntimeAuthorization{
+		BearerToken:           bearer,
+		TenantID:              "tenant-messaging-test",
+		PersonalityAgentID:    personalityAgentID,
+		Generation:            generation,
+		RPCBootNonce:          bootNonce,
+		Audience:              "sumi:agent:events",
+		DeliveryAuthorization: agentevents.LocalDeliveryRaw,
+	}
+}
+
+func newAuthorizedAttachmentLocalControlServer(t *testing.T, ctx context.Context) (world, Place, *Server, *httptest.Server) {
+	t.Helper()
+	w := newWorld(t, ctx)
+	_, place := w.workspaceWithChannel(t, ctx)
+	blobs, err := NewDiskAttachments(t.TempDir())
+	if err != nil {
+		t.Fatalf("disk attachments: %v", err)
+	}
+	messagingServer := NewServer(w.store, nil)
+	messagingServer.Attachments = blobs
+
+	commands, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open local control command store: %v", err)
+	}
+	t.Cleanup(func() { _ = commands.Close() })
+	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), commands)
+	if err != nil {
+		t.Fatalf("open local control gateway: %v", err)
+	}
+	control, err := agentevents.NewLocalControlServer(
+		gateway,
+		[]byte("messaging-local-control-signing-secret-32-bytes-minimum"),
+		[]agentevents.LocalRuntimeAuthorization{
+			localMessagingAuthorization(localMessagingTestBearer, w.agent.ID, 1, "messaging-test-boot"),
+		},
+	)
+	if err != nil {
+		t.Fatalf("new local control server: %v", err)
+	}
+	if err := messagingServer.RegisterLocalControlRoutes(control); err != nil {
+		t.Fatalf("register messaging local control routes: %v", err)
+	}
+	handler, err := control.HandlerForLocalRuntime(w.agent.ID)
+	if err != nil {
+		t.Fatalf("bind local control handler: %v", err)
+	}
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return w, place, messagingServer, ts
+}
+
+func postLocalMultipart(t *testing.T, ctx context.Context, ts *httptest.Server, bearer, filename string, payload []byte) (*http.Response, []byte) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename=%q`, filename))
+	header.Set("Content-Type", "application/octet-stream")
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatalf("create local upload part: %v", err)
+	}
+	if _, err := part.Write(payload); err != nil {
+		t.Fatalf("write local upload part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close local upload body: %v", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+LocalUploadAttachmentPath, &body)
+	if err != nil {
+		t.Fatalf("new local upload request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+bearer)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := ts.Client().Do(request)
+	if err != nil {
+		t.Fatalf("local upload request: %v", err)
+	}
+	return response, readLocalResponse(t, response)
+}
+
+func postLocalJSON(t *testing.T, ctx context.Context, ts *httptest.Server, path string, value any) (*http.Response, []byte) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal local request: %v", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+path, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("new local request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+localMessagingTestBearer)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := ts.Client().Do(request)
+	if err != nil {
+		t.Fatalf("local request: %v", err)
+	}
+	return response, readLocalResponse(t, response)
+}
+
+func readLocalResponse(t *testing.T, response *http.Response) []byte {
+	t.Helper()
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read local response: %v", err)
+	}
+	return raw
+}
 
 func TestLocalWriteBoundaryThroughAuthenticatedControlRoute(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -366,5 +485,205 @@ func TestLocalChannelLifecycleMatchesTheHumanMenu(t *testing.T) {
 	}
 	if code, _ := post(LocalCreateChannelPath, `{"name":""}`, server.localCreateChannel); code != http.StatusBadRequest {
 		t.Fatalf("empty name status = %d, want 400", code)
+	}
+}
+
+func TestAgentUploadsAndSendsAttachmentThroughPAIDBoundControl(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, place, _, ts := newAuthorizedAttachmentLocalControlServer(t, ctx)
+	prior := w.send(t, ctx, place.PlaceID, w.humanA, "before attachment")
+	payload := append([]byte("\x89PNG\r\n\x1a\n"), []byte{0, 1, 2, 0xff, 0, 3}...)
+
+	response, raw := postLocalMultipart(
+		t, ctx, ts, "wrong-local-control-bearer-32-bytes-minimum", "wrong.png", payload,
+	)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized local upload = %d %s, want 401", response.StatusCode, raw)
+	}
+
+	response, raw = postLocalMultipart(
+		t, ctx, ts, localMessagingTestBearer, "../../screen.png", payload,
+	)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("local upload = %d %s, want 201", response.StatusCode, raw)
+	}
+	var uploaded attachmentWire
+	if err := json.Unmarshal(raw, &uploaded); err != nil {
+		t.Fatalf("decode local upload: %v", err)
+	}
+	if uploaded.AttachmentID == "" || uploaded.Filename != "screen.png" ||
+		uploaded.MIME != "image/png" || uploaded.Size != int64(len(payload)) {
+		t.Fatalf("local upload = %#v", uploaded)
+	}
+
+	response, raw = postLocalJSON(t, ctx, ts, LocalWritePath, map[string]any{
+		"place_id":     place.PlaceID,
+		"content":      "",
+		"urgency":      UrgencyNormal,
+		"client_nonce": "agent-attachment-1",
+		"attachments":  []string{uploaded.AttachmentID},
+	})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("local attachment-only write = %d %s, want 201", response.StatusCode, raw)
+	}
+	var receipt messageReceiptWire
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		t.Fatalf("decode local write receipt: %v", err)
+	}
+	var receiptFields map[string]any
+	if err := json.Unmarshal(raw, &receiptFields); err != nil {
+		t.Fatalf("decode local write receipt fields: %v", err)
+	}
+	if receipt.MessageID == "" || receipt.Seq != prior.Seq+1 || !receipt.Created ||
+		receipt.ClientNonce != "agent-attachment-1" || len(receiptFields) != 4 {
+		t.Fatalf("compact local write receipt = %s", raw)
+	}
+	if _, hasMessage := receiptFields["message"]; hasMessage {
+		t.Fatalf("local write returned a full message: %s", raw)
+	}
+
+	history, err := w.store.History(ctx, place.PlaceID, w.agent, HistoryOptions{Limit: 20})
+	if err != nil || len(history) != 2 {
+		t.Fatalf("stored local write history = %#v, error %v", history, err)
+	}
+	written := history[1]
+	if written.MessageID != receipt.MessageID || written.Author != w.agent ||
+		len(written.Attachments) != 1 || written.Attachments[0].AttachmentID != uploaded.AttachmentID ||
+		written.Attachments[0].Uploader != w.agent {
+		t.Fatalf("stored local attachment message = %#v", written)
+	}
+
+	response, raw = postLocalJSON(t, ctx, ts, LocalAttachmentPath, map[string]any{
+		"attachment_id": uploaded.AttachmentID,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("local attachment fetch = %d %s, want 200", response.StatusCode, raw)
+	}
+	var fetched struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &fetched); err != nil {
+		t.Fatalf("decode local attachment fetch: %v", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(fetched.Data)
+	if err != nil || !bytes.Equal(decoded, payload) {
+		t.Fatalf("local attachment bytes = %v, decode error %v", decoded, err)
+	}
+}
+
+func localAttachmentFetch(t *testing.T, ctx context.Context, server *Server, agentID, attachmentID string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, LocalAttachmentPath,
+		strings.NewReader(`{"attachment_id":"`+attachmentID+`"}`)).WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.localAttachment(response, request, agentevents.LocalRuntimeAuthorization{
+		PersonalityAgentID: agentID,
+	})
+	var decoded map[string]any
+	_ = json.Unmarshal(response.Body.Bytes(), &decoded)
+	return response, decoded
+}
+
+func TestLocalAttachmentAppliesVisibilityTombstonesAndInlineBound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, server, ts := newAttachmentServerWithServer(t, ctx)
+	_, shared := w.workspaceWithChannel(t, ctx)
+
+	private, err := w.store.CreateWorkspace(ctx, "private", w.humanA)
+	if err != nil {
+		t.Fatalf("create private workspace: %v", err)
+	}
+	privateChannel, err := w.store.CreateChannel(ctx, private.WorkspaceID, "solo", "", w.humanA, false)
+	if err != nil {
+		t.Fatalf("create private channel: %v", err)
+	}
+
+	_, body := upload(t, ts, w.humanA.ID, "shot.png", "image/png", pngBytes)
+	visibleID := attachmentID(t, body)
+	resp, receipt := call(t, ts, http.MethodPost,
+		"/messaging/places/"+shared.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "見て", "client_nonce": "n-see", "attachments": []string{visibleID}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send visible = %d %v, want 201", resp.StatusCode, receipt)
+	}
+	visibleMessageID, _ := receipt["message_id"].(string)
+
+	response, fetched := localAttachmentFetch(t, ctx, server, w.agent.ID, visibleID)
+	if response.Code != http.StatusOK {
+		t.Fatalf("agent fetch visible attachment = %d %s", response.Code, response.Body.String())
+	}
+	encoded, _ := fetched["data"].(string)
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || !bytes.Equal(decoded, pngBytes) {
+		t.Fatalf("visible local attachment bytes = %v, error %v", decoded, err)
+	}
+
+	_, body = upload(t, ts, w.humanA.ID, "secret.png", "image/png", pngBytes)
+	hiddenID := attachmentID(t, body)
+	resp, receipt = call(t, ts, http.MethodPost,
+		"/messaging/places/"+privateChannel.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "内緒", "client_nonce": "n-hide", "attachments": []string{hiddenID}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send hidden = %d %v, want 201", resp.StatusCode, receipt)
+	}
+	if response, _ := localAttachmentFetch(t, ctx, server, w.agent.ID, hiddenID); response.Code != http.StatusNotFound {
+		t.Fatalf("agent fetch hidden attachment = %d, want 404", response.Code)
+	}
+
+	_, body = upload(t, ts, w.humanA.ID, "draft.png", "image/png", pngBytes)
+	if response, _ := localAttachmentFetch(t, ctx, server, w.agent.ID, attachmentID(t, body)); response.Code != http.StatusNotFound {
+		t.Fatalf("agent fetch another participant's unbound upload = %d, want 404", response.Code)
+	}
+
+	big := bytes.Repeat([]byte("x"), int(MaxLocalAttachmentFetchBytes)+1)
+	_, body = upload(t, ts, w.humanA.ID, "dump.bin", "application/octet-stream", big)
+	bigID := attachmentID(t, body)
+	resp, receipt = call(t, ts, http.MethodPost,
+		"/messaging/places/"+shared.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "log", "client_nonce": "n-big", "attachments": []string{bigID}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send large attachment = %d %v, want 201", resp.StatusCode, receipt)
+	}
+	response, fetched = localAttachmentFetch(t, ctx, server, w.agent.ID, bigID)
+	if response.Code != http.StatusRequestEntityTooLarge || fetched["error"] != "attachment_too_large" || fetched["data"] != nil {
+		t.Fatalf("large local fetch = %d %v, want 413 without truncated data", response.Code, fetched)
+	}
+
+	resp, receipt = call(t, ts, http.MethodDelete,
+		"/messaging/places/"+shared.PlaceID+"/messages/"+visibleMessageID, w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete visible message = %d %v, want 204", resp.StatusCode, receipt)
+	}
+	if response, _ := localAttachmentFetch(t, ctx, server, w.agent.ID, visibleID); response.Code != http.StatusNotFound {
+		t.Fatalf("agent fetch tombstoned attachment = %d, want 404", response.Code)
+	}
+}
+
+func TestLocalWriteUsesSharedAttachmentValidation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, place, _, ts := newAuthorizedAttachmentLocalControlServer(t, ctx)
+	for _, test := range []struct {
+		name      string
+		request   map[string]any
+		wantError string
+	}{
+		{"empty", map[string]any{"content": "", "client_nonce": "empty"}, "invalid_content"},
+		{"urgency", map[string]any{"content": "hi", "urgency": "emergency", "client_nonce": "urgency"}, "invalid_urgency"},
+		{"too many", map[string]any{"content": "files", "client_nonce": "many", "attachments": make([]string, MaxAttachmentsPerMessage+1)}, "too_many_attachments"},
+		{"nonce", map[string]any{"content": "hi", "client_nonce": strings.Repeat("n", 129)}, "invalid_client_nonce"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.request["place_id"] = place.PlaceID
+			response, raw := postLocalJSON(t, ctx, ts, LocalWritePath, test.request)
+			var failure map[string]string
+			_ = json.Unmarshal(raw, &failure)
+			if response.StatusCode != http.StatusBadRequest || failure["error"] != test.wantError {
+				t.Fatalf("local write = %d %s, want 400 %s", response.StatusCode, raw, test.wantError)
+			}
+		})
 	}
 }

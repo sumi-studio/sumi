@@ -67,6 +67,138 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestAttachmentOrderAndDraftLeaseMigrationUpgradesVersion21Database(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 21)
+
+	var migration13AppliedAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT applied_at FROM schema_migrations WHERE version = 13`).
+		Scan(&migration13AppliedAt); err != nil {
+		t.Fatalf("load historical migration 13 record: %v", err)
+	}
+	var newColumnCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'message_attachments'
+		  AND column_name IN ('position', 'draft_expires_at')`).
+		Scan(&newColumnCount); err != nil {
+		t.Fatalf("inspect pre-upgrade attachment columns: %v", err)
+	}
+	if newColumnCount != 0 {
+		t.Fatalf("version 21 database already has %d version-22 attachment columns", newColumnCount)
+	}
+
+	const (
+		uploaderID = "0198f0f4-9b72-7000-8000-000000000001"
+		messageID  = "0198f0f4-9b72-7000-8000-000000000100"
+		unboundID  = "0198f0f4-9b72-7000-8000-000000000200"
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO messages (
+			message_id, place_id, seq, author_kind, author_id, content, client_nonce
+		) VALUES (
+			$1, '01900000-0000-7000-8000-000000000002', 1,
+			'human', $2, 'migration fixture', 'migration-0022'
+		)`, messageID, uploaderID); err != nil {
+		t.Fatalf("insert historical message: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_attachments (
+			attachment_id, message_id, uploader_kind, uploader_id,
+			filename, mime, size_bytes, created_at
+		) VALUES
+			('0198f0f4-9b72-7000-8000-000000000103', $1, 'human', $2,
+			 'first', 'text/plain', 1, '2026-01-01 10:00:00Z'),
+			('0198f0f4-9b72-7000-8000-000000000102', $1, 'human', $2,
+			 'third', 'text/plain', 1, '2026-01-01 11:00:00Z'),
+			('0198f0f4-9b72-7000-8000-000000000101', $1, 'human', $2,
+			 'second', 'text/plain', 1, '2026-01-01 11:00:00Z'),
+			($3, NULL, 'human', $2, 'draft', 'text/plain', 1, '2026-01-01 12:00:00Z')`,
+		messageID, uploaderID, unboundID); err != nil {
+		t.Fatalf("insert historical attachments: %v", err)
+	}
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("upgrade version 21 database: %v", err)
+	}
+	latest, err := LatestAppliedVersion(ctx, pool)
+	if err != nil || latest != 22 {
+		t.Fatalf("latest migration = %d, error %v, want 22", latest, err)
+	}
+	var migration13StillAppliedAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT applied_at FROM schema_migrations WHERE version = 13`).
+		Scan(&migration13StillAppliedAt); err != nil {
+		t.Fatalf("reload historical migration 13 record: %v", err)
+	}
+	if !migration13StillAppliedAt.Equal(migration13AppliedAt) {
+		t.Fatalf("migration 13 record changed during forward upgrade: before=%s after=%s",
+			migration13AppliedAt, migration13StillAppliedAt)
+	}
+
+	rows, err := pool.Query(ctx,
+		`SELECT attachment_id::text, position
+		 FROM message_attachments WHERE message_id = $1 ORDER BY position`, messageID)
+	if err != nil {
+		t.Fatalf("load migrated attachment order: %v", err)
+	}
+	defer rows.Close()
+	wantOrder := []string{
+		"0198f0f4-9b72-7000-8000-000000000103",
+		"0198f0f4-9b72-7000-8000-000000000101",
+		"0198f0f4-9b72-7000-8000-000000000102",
+	}
+	var gotOrder []string
+	for rows.Next() {
+		var id string
+		var position int
+		if err := rows.Scan(&id, &position); err != nil {
+			t.Fatalf("scan migrated attachment order: %v", err)
+		}
+		if position != len(gotOrder) {
+			t.Fatalf("migrated attachment %s has position %d, want %d", id, position, len(gotOrder))
+		}
+		gotOrder = append(gotOrder, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migrated attachment order: %v", err)
+	}
+	if strings.Join(gotOrder, ",") != strings.Join(wantOrder, ",") {
+		t.Fatalf("migrated order = %v, want %v", gotOrder, wantOrder)
+	}
+
+	var unboundPosition int
+	var unboundExpiry time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT position, draft_expires_at FROM message_attachments WHERE attachment_id = $1`, unboundID).
+		Scan(&unboundPosition, &unboundExpiry); err != nil {
+		t.Fatalf("load migrated unbound attachment: %v", err)
+	}
+	if unboundPosition != 0 || unboundExpiry.Before(time.Now().Add(6*24*time.Hour)) {
+		t.Fatalf("migrated draft position/lease = %d/%s", unboundPosition, unboundExpiry)
+	}
+
+	const newDraftID = "0198f0f4-9b72-7000-8000-000000000201"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_attachments (
+			attachment_id, uploader_kind, uploader_id, filename, mime, size_bytes
+		) VALUES ($1, 'human', $2, 'new draft', 'text/plain', 1)`,
+		newDraftID, uploaderID); err != nil {
+		t.Fatalf("insert post-upgrade draft with defaults: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT position, draft_expires_at FROM message_attachments WHERE attachment_id = $1`, newDraftID).
+		Scan(&unboundPosition, &unboundExpiry); err != nil {
+		t.Fatalf("load post-upgrade draft defaults: %v", err)
+	}
+	if unboundPosition != 0 || unboundExpiry.Before(time.Now().Add(6*24*time.Hour)) {
+		t.Fatalf("post-upgrade draft defaults = %d/%s", unboundPosition, unboundExpiry)
+	}
+}
+
 // TestKosekiSchemaConstraints verifies the 戸籍 invariants from issue #119
 // against a migrated database: a credential cannot be rebound to a different
 // Human, and an agent has at most one active Employer at a time.
