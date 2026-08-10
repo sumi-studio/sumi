@@ -17,8 +17,8 @@ messaging service と agent runtime は別々に実装される。境界が動�
 
 | | 担当 | 持つもの |
 | --- | --- | --- |
-| messaging service | Claude/Fable | `/messaging` REST・WS、message / place / read cursor / presence の永続化、delivery eligibility の評価、AttentionCandidate の発行 |
-| agent runtime | Codex | Surface 契約の受信口、候補を受けてからの注意の判断（interrupt / inject / defer / observe）、messaging 道具、人生ログ |
+| messaging service | Workspace app / API boundary | `/messaging` REST・WS、message / place / read cursor / presence の永続化、delivery eligibility の評価、AttentionCandidate の発行 |
+| agent runtime | personality-agent foundation boundary | Surface 契約の受信口、候補を受けてからの注意の判断（interrupt / inject / defer / observe）、messaging 道具、人生ログ |
 
 **境界の原則**（ADR 0011 §8）: messaging service が持つのは **権限と安全**
 ——membership / authority / privacy、相手側の block、rate limit——だけである。
@@ -26,17 +26,32 @@ messaging service と agent runtime は別々に実装される。境界が動�
 
 ## 境界を越えるもの（4つ）
 
-### 1. InboundProvenanceV1 — 実装済み
+### ADR 0015 acceptanceと同時に凍結するv2 scope delta
+
+ADR 0015がAcceptedになった時点で、global Messaging placeを前提にしたv1のidentity scopeを
+次で置き換える。ADRだけをAcceptedにして本deltaを未反映のままにしない。
+
+- Messaging command / event / provenance / read marker / notification intentは、いずれも
+  `WorkspaceId`とWorkspace-owned Messaging `AppInstallationId`を必須にする。
+- `read_through`は`(WorkspaceId, AppInstallationId, PlaceId, Seq)`を受け、current membership、
+  installation enabled、place visibilityをcommit時に再認可する。
+- Agent tool snapshotは同じWorkspace / installation contextから作り、appへ見せる前のadvertisementと
+  effect直前のauthorizationを別に保つ。
+- Direct ChatはParticipant-owned境界のままであり、上記fieldを架空のWorkspaceから補わない。
+- v1とのdual-read、current UI Workspaceからのscope推測、global DMのcompatibility branchは作らない。
+
+### 1. InboundProvenanceV1 — 境界凍結・実装未完（#172）
 
 `contracts/agent-events.yaml` の `InboundProvenanceV1`。surface 一般
 （direct chat / messaging）、actor は human | personality_agent、human は
 canonical `HumanId`（UUIDv7）。messaging は place と配送された一件の
 メッセージを必ず伴う。
 
-Rust `apps/agent/src/runtime/contracts.rs`、Go
-`apps/api/internal/agentevents/wire.go`、生成 TS 型が同じ形を共有し、
-`contracts/agent-events-fixtures.json` の `messaging_mention_command` で
-三者が同じバイト列を往復することを検証している。
+2026-08-10時点のruntime / wireは`DirectChatProvenanceV1`だけを実装しており、surface-neutralな
+`InboundProvenanceV1`、生成TS型、`messaging_mention_command`の三言語fixtureは未実装である。
+実装済みとみなしてAttention経路を開かない。#172ではADR 0015のWorkspace-owned Messagingに従い、
+Messaging provenanceへ`WorkspaceId`と`AppInstallationId`を必須で束縛し、Direct Chatの
+Participant-owned provenanceを混ぜない。
 
 ### 2. AttentionCandidate — 本書で凍結
 

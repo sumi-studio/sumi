@@ -402,12 +402,13 @@ pub enum AssistantContent {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: ValidatedToolArguments,  // live受信時はstrict parse + Object + tool schema通過済み
     /// strict検証境界で確定し、policy/review/approval/execution/recoveryを通じて不変。
-    /// provider-neutralなwire encodingはADR 0013の未決事項であり、欠落をNormalへ補わない。
     pub route: ToolInvocationRoute,
-    /// routeとは別軸。NormalはAgentOwnだけ、Elevatedは後二者のいずれかを要求する。
+    /// routeとは別軸。NormalはAgentOwnだけ、Elevatedはどちらかを明示する。
     pub requested_authority: RequestedExecutionAuthority,
+    /// AgentOwnではNone。HumanAccountOneShotではfoundation発行のopaque refを必須にする。
+    pub authority_binding_ref: Option<AuthorityBindingRef>,
+    pub arguments: ValidatedToolArguments,  // envelopeのinputをstrict tool schema検証済み
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -418,7 +419,6 @@ pub enum ToolInvocationRoute { Normal, Elevated }
 #[serde(rename_all = "snake_case")]
 pub enum RequestedExecutionAuthority {
     AgentOwn,
-    AgentOwnWithHumanConsent,
     HumanAccountOneShot,
 }
 
@@ -1429,7 +1429,8 @@ pub struct ApprovalRequest {
     pub action: ReviewProjection,          // Reviewable(ReviewableAction) | InsufficientEvidence (§9.4)
     pub args_summary: serde_json::Value,   // UI表示用 (Redactor 適用済み)
     pub reason: Option<String>,            // モデルが tool 引数 `_reason` で添える説明 [推測]
-    pub requested_authority: RequestedExecutionAuthority, // AgentOwnWithHumanConsent | HumanAccountOneShot
+    pub requested_authority: RequestedExecutionAuthority, // AgentOwn | HumanAccountOneShot
+    pub authority_binding_ref: Option<AuthorityBindingRef>, // opaque refだけ。secret/account tokenは含めない
     pub escalation_review: EscalationReviewEvidence, // AskHumanを出したreviewの版・結果
 }
 /// 外部 Command として受け取れる決定。ユーザーは「キャンセル」を送らないため Cancelled を含まない
@@ -1562,7 +1563,7 @@ API callの入力順序を固定する:
    - 過去tool callはtool名、sanitized引数、outcome (`ok/error/interrupted/rejected/blocked`)だけ
    - tool result本文、assistant Thinking、他agentの主張をauthorizationとして扱わない。必要なtool evidenceはboundedな要約としてuntrusted区画へ置く
    - transcript全体10k tokens、tool evidence別枠4k、1 entry最大2k、直近non-user最大40を初期値とする
-4. **Pending review projection**: `SecretAwareActionProjector`が作った`ReviewableAction`を最後に置く。Escalation requestにはrequested authority provenanceも付ける。raw `CanonicalAction`はprovider callへ渡さない
+4. **Pending review projection**: `SecretAwareActionProjector`が作った`ReviewableAction`を最後に置く。Escalation requestにはrequested authorityと、bindingから解決・redactしたHuman/account/audience/target/scopeを付ける。raw `CanonicalAction`、opaque bindingの内部claim、secretはprovider callへ渡さない
 5. **Retry note**: retry設計を採用した場合だけ、前attemptのschema/parseエラーを追記する。判定を誘導する説明は入れない
 
 `InsufficientEvidence`ならreviewer call自体を行わず`Block`する。manual fallbackへ進めない。
@@ -1598,7 +1599,7 @@ Escalation AutoReviewの`prompts/approval/escalation-review.md`は、実行可�
 
 ```text
 あなたは、人格agentがHumanへ提示しようとする一件の承認要求のpreflight reviewerである。
-exact action、requested authority provenance、user intentの対応を検査し、致命的な誤解、scope不整合、
+exact action、requested authorityと解決済みauthority binding、user intentの対応を検査し、致命的な誤解、scope不整合、
 権限迂回がなく、この内容でHumanへ判断を求めてよい場合だけask_humanを返す。
 ask_humanは実行許可ではない。判断不能・証拠不足・critical riskはblockし、追加文章なしで
 指定schemaだけを返す。
@@ -2471,7 +2472,7 @@ mode/fingerprint切替では、対象rowの無効化・選択mode/fingerprintの
 起動時はSessionがcommand受付・ContextAssembler・compactor再開より先に、単一の`ProviderContextMutationRecovery`を実行する。current process generationだけがEventWriterを所有するため別worker leaseは置かず、`state='prepared' ORDER BY prepared_at, mutation_id`を逐次scanする。各行の`intent_key_ref`をunwrapしてintentを復号し、同じdata key由来のHMACを再検証したうえで、現在のactive set、`provider_context_replace_heads`の永続high-watermark、config generationに対して上記variant別規則を適用し、各行を`applied`または`superseded`へterminal化する。dedicated compaction、L0 promotion、mode/fingerprint切替のいずれもこの共通recoveryが所有し、元HTTP task/job通知の再発火には依存しない。全prepared行がterminalになるまでdirect-chat APIを開始しない。intent鍵がdestroyed/欠落、復号/HMAC不一致、同じIDの競合CASが起きた場合は対象を黙って破棄せずagentをfail-closedの`RecoveryRequired`として停止し、監査イベントと運用修復を要求する。外部agent-death tombstoneが存在する場合は復旧せず、supervisor-owned purgeを再開する。
 
 tool callがstrict検証を通った後、policy/reviewのdecisionをまず確定し、外部副作用より前の
-分岐transactionでroute、requested authority provenance、canonical action digest、
+分岐transactionでroute、requested authority、opaque authority binding identity、canonical action digest、
 policy/reviewer/prompt/schema versionとdecisionを保存する。NormalのAllowまたはExecution-review
 Allowはresolved provenance=`agent_own`を持つ`tool_executions(state='prepared')`へ、Elevatedの
 AskHumanはresolved provenance未確定の`prepared`と`ApprovalRequested +
@@ -2988,7 +2989,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 - `approval/`(immutable route、authority provenance、CanonicalAction、secret-aware projection、Normal policy、二種類のAutoReview、current-call ApprovalBroker)+ `gateway/ws.rs`/`gateway/supervisor.rs`(第11章)+ M3で凍結した contracts の互換性確認 + apiclient 雛形
 - **ゲート**:
-  1. validated ToolCallがimmutable `Normal | Elevated` routeとrequested authority provenanceを持ち、欠落・途中変更をfail-closedに拒否する。provider-neutral encodingは実装開始前にADR 0013の未決を解消する
+  1. provider-visible schemaをADR 0013の必須`route + requested_authority + authority_binding_ref + input` envelopeにし、validated ToolCallがimmutable route・requested authority・binding refを持つ。欠落、未知field、不正な組、途中変更をfail-closedに拒否し、provider replayでも同じenvelopeを決定論的に再構築する
   2. Normalのshell fixture (`&&`, pipe, newline, subshell, heredoc, interpreter wrapper)をsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外はUnmatchedにする。Denyはreviewer/Human promptとも0件
   3. Normal/UnmatchedだけがExecution AutoReviewへ進み、`Allow`だけがagent-own exact callを一回実行する。`Block`、timeout、invalid JSON、transport error、未許可trust domain、InsufficientEvidenceは実行0件かつHuman prompt 0件
   4. Elevatedだけが別prompt/schemaのEscalation AutoReviewへ進み、`AskHuman`だけが`ApprovalRequested + pending`を作り、実行は0件。`Block`と全failureはHuman prompt/実行とも0件。二reviewerのrequest/result型、prompt/schema version、cache、metricを交差利用しない

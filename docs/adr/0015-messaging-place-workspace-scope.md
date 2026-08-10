@@ -8,7 +8,7 @@
   - [ADR 0011](0011-messaging-surface-and-agent-participation.md)
   - [#130](https://github.com/sumi-studio/sumi/issues/130)
   - [#132](https://github.com/sumi-studio/sumi/issues/132)
-- Supersedes:
+- Supersedes upon acceptance:
   - ADR 0011と[Messaging契約ドラフト](../messaging-contracts-draft.md)にある
     「DM / group DMはparentを持たないglobal place」という規定
 - Preserves:
@@ -51,6 +51,17 @@ current Workspaceから推測するとdomain identityがUI stateに依存する�
    新規read、write、deliveryを許可しない。message、authorship、membership履歴は削除しない。
    Workspaceへの再加入だけで旧DMへのaccessを暗黙復元せず、明示的なplace admissionを必要とする。
 
+   一対一DMでは、canonical pairのどちらかが、双方ともactive Workspace memberである状態で
+   `ensure_dm`を明示実行したときだけ、欠けているcurrent place-membership tenureを同じtransactionで
+   作る。Workspace再加入、一覧取得、DM画面を開くだけでは作らない。双方のWorkspace membershipと
+   place membershipがactiveでない間は、そのDMへ新しいmessageをappendできない。pairが変わらないため、
+   明示再admission後は同じDMの全履歴を再び閲覧できる。
+
+   group DMへの再admissionは、activeなplace memberがactive Workspace memberを明示的に招待する
+   app-owned operationとする。Workspace owner / adminであるだけでは実行できない。新しいtenureは
+   admission時点の`visible_from_seq`を持ち、それ以前のgroup履歴を既定では読めない。過去履歴の共有は
+   現参加者の同意と範囲を示す別operationが定義されるまで行わない。
+
 5. 一対一DMの同一性は
    `(WorkspaceId, canonical unordered participant pair)`で定める。同じ2名がWorkspace Aと
    Workspace Bに所属する場合、AとBのDMは別placeであり、message、seq、read marker、
@@ -84,14 +95,18 @@ current Workspaceから推測するとdomain identityがUI stateに依存する�
 ## Workspace admission
 
 Humanがcanonical UUIDを入力する画面や、公開participant directoryをcutover条件にはしない。
-最初の明示admissionは、認可されたmemberが作るopaqueなsingle-use invite linkとする。
+最初の明示admissionは、current tenureで`manage_members`を持つmemberが作るopaqueなsingle-use
+invite linkとする。
 
 - tokenは128 bit以上のentropyを持ち、serverはhashだけを保存して返却時に一度だけ平文を返す。
-- 既定expiryは絶対時刻で24時間、未使用tokenは発行者がrevokeできる。
+- expiryはserverが発行時に固定する絶対時刻で24時間、未使用tokenは発行者またはcurrent
+  `manage_members` authorityを持つmemberがrevokeできる。
 - linkの`GET`は最小限のWorkspace previewだけを返し、scannerやpreviewで消費しない。
 - 認証済み参加者の明示`POST`が、自分自身の`ParticipantRef`をtransport認証から導出する。
-- redemptionはtoken lock、未使用・未期限切れ・未失効、発行者のcurrent authority、membership insert、
-  token consumptionを一transactionで行う。同じactorのretryだけをidempotentにする。
+- redemptionはtoken lock、未使用・未期限切れ・未失効、発行者の同じtenureがactiveかつ現在も
+  `manage_members`を持つこと、base membership insert、token consumptionを一transactionで行う。
+  inviteはroleを運ばず、role付与は別の`manage_roles` commandを必要とする。同じactorのretryだけは
+  保存済みmembership tenureを返してidempotentにし、別actorへの再利用は拒否する。
 - Secretary / Employment relationからmembershipを導出しない。Human UIとPersonalityAgent toolは
   同じredemption commandを使う。
 

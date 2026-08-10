@@ -50,20 +50,52 @@ routeはpolicy評価、review、Human approval、実行開始、audit、recovery
 各tool callごとにrouteを選ぶ。deploymentや人格agent全体へ設定するproduct-wide
 `ReviewerMode`は置かない。
 
-providerへ公開する全tool input schemaは、app固有のschemaを次の共通envelopeで包む。
+PersonalityAgentのprovider requestへ実行可能toolとして公開するfoundation / app toolのinput
+schemaは、app固有のschemaを次の共通envelopeで包む。
 
 ```json
 {
   "route": "normal | elevated",
+  "requested_authority": "agent_own | human_account_one_shot",
+  "authority_binding_ref": "opaque foundation-issued ref | null",
   "input": { "...": "app固有の元引数" }
 }
 ```
 
-`route`と`input`は必須で、envelopeの未知field、route欠落、未知routeをstrictに拒否する。
+四fieldはすべて必須で、envelopeの未知field、欠落field、未知値をstrictに拒否する。
 provider adapter / strict assemblerはenvelopeを一度だけ解き、immutableな
-`ToolInvocationRoute`とapp固有argumentsを持つ内部`ToolCall`へ変換する。app adapterへ渡すのは
-`input`だけであり、routeをappのaction語彙や引数へ混ぜない。provider transcript、wire、durable
-event、recoveryは内部`ToolCall`のrouteを保持し、再構築時にも暗黙のNormalを作らない。
+`ToolInvocationRoute`、`RequestedExecutionAuthority`、nullableな`AuthorityBindingRef`、app固有
+argumentsを持つ内部`ToolCall`へ変換する。app adapterへ渡すのは`input`だけであり、foundation fieldを
+appのaction語彙や引数へ混ぜない。provider transcript、wire、durable event、recoveryは内部
+`ToolCall`の三つのfoundation fieldを保持し、再構築時にも暗黙値を作らない。providerへ履歴を
+再projectionするときは、内部`ToolCall`から同じ四field envelopeを決定論的に再構築する。provider
+wireのJSON byte列を内部のaction identityやapproval identityにはしない。
+
+```text
+RequestedExecutionAuthority = AgentOwn | HumanAccountOneShot
+```
+
+許される組は次の三つだけであり、後から基盤が一方を他方へ変換、推測、fallbackしない。
+
+| route | requested authority | binding ref |
+|---|---|---|
+| Normal | `AgentOwn` | `null` |
+| Elevated | `AgentOwn` | `null` |
+| Elevated | `HumanAccountOneShot` | non-null |
+
+`AuthorityBindingRef`はfoundationが事前発行したopaque handleであり、それ自体はgrantでもsecretでもない。
+server側で具体的なHuman actor、account / credential binding、audienceへ解決できる。providerが自由記述した
+Human ID、account名、最新sender、current user、app input中の自己申告actorからbindingを合成しない。
+`HumanAccountOneShot`ではbindingがcurrentかつ一意で、対象tool / app / audienceと整合することを
+Escalation AutoReviewと`ApprovalRequested`より前に検証し、appのtarget resolverからtarget / scopeも
+確定する。unknown、stale、revoked、mismatchedなbindingはHumanへpromptせずblockする。bindingの存在は
+Human approvalやeffect直前のaccount再認可を置き換えない。
+
+canonical action digestはversion付きかつdomain-separatedなcanonical executable action――少なくとも
+tool名、immutable route、requested authority、binding identityと解決済みHuman / account / audience、
+canonical app input、解決済みtarget / scope――を束縛する。secret、redactedなHuman表示、provider固有
+envelopeのserialization、object field順序をdigestの正本にしない。Human decision、pending request、
+one-shot grant、execution startは同じdigest versionと値を照合する。
 
 tool名を`*_elevated`のように複製する案、provider固有metadataへ依存する案、全appのschemaへ
 予約fieldを直挿しする案は採らない。このenvelopeはagent foundationのinvocation contractであり、
@@ -265,6 +297,9 @@ compatibility branchを作らない。
 4. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
 5. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
 6. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
+7. providerが所有しSumi側でinput schemaを包めないnative toolを将来使う場合のroute表現と、
+   foundation-owned toolとの同一audit / approval contract。別途決定するまでnative toolを
+   envelope済みの実行可能callとして扱わない。
 
 これらが未決でも、non-positive reviewをHumanへfallbackしないこと、routeとauthority sourceを
 同一視しないこと、Human-account one-shotをstanding policyへ変換しないこと、hard deny・
@@ -294,5 +329,5 @@ sandbox・app authorizationを迂回しないことは確定事項である。
 8. 二つのreviewerのprompt/schema/cache/metricが型で分離されているか。
 9. route、authority provenance、version、Human event-time contextがeffect前にdurableか。
 10. productionの固定prompt本文が用途ごとの`.md`を正本とし、Rustへinlineされていないか。
-11. provider-visible schemaが必須の`route + input` envelopeを使い、appへrouteを漏らしたり
-    route欠落をNormalへdefaultしたりしていないか。
+11. provider-visible schemaが必須の`route + requested_authority + authority_binding_ref + input`
+    envelopeを使い、appへfoundation fieldを漏らしたり欠落値をdefaultしたりしていないか。
