@@ -3,6 +3,7 @@
 - Status: Partially Superseded
 - Date: 2026-07-15
 - Amended-by: [ADR 0002](0002-agent-stack.md) — ADR 0002 をエージェント基盤と、それに関係するリポジトリ/API 構成の現行仕様とする。前提5(pi が TypeScript)、リポジトリ構成の「agent (TS エージェント基盤)」、および「`@sumi/api-client` 経由」の各記述は ADR 0002 により置換された(agent は Rust、ドメイン操作は契約ファーストの Rust `apiclient` 経由)。本文は歴史的記録としてそのまま残す
+- Superseded-by: [ADR 0014](0014-webapp-and-electron-runtime.md) — React / Vite / SDUIをrenderer正本とする判断は維持し、Tauri desktop/mobile shell、`src-tauri`、native mobile packaging、通知統合の選定をWebApp + Electronへ置換する。本文は2026-07-15時点の歴史的記録としてそのまま残す
 
 ## コンテキスト
 

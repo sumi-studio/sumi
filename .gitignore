@@ -684,5 +684,7 @@ apps/web/test-results/
 # Claude Code local settings
 .claude/settings.local.json
 
-# Local agent operating playbook
+# Local agent harness files
 /AGENTS.md
+/CLAUDE.md
+/.claude/
