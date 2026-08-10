@@ -222,6 +222,124 @@ func waitForAdvisoryLocks(
 	t.Fatalf("advisory locks for %q (granted=%v) did not reach %d", key, granted, want)
 }
 
+func assertDefaultMembershipTombstoned(
+	t *testing.T, ctx context.Context, store *Store, participant ParticipantRef,
+) {
+	t.Helper()
+	var active, historical int
+	if err := store.pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE left_at IS NULL),
+		        count(*) FILTER (WHERE left_at IS NOT NULL)
+		 FROM workspace_members
+		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3`,
+		DefaultWorkspaceID, participant.Kind, participant.ID).Scan(&active, &historical); err != nil {
+		t.Fatalf("inspect default membership for %s: %v", participant.Key(), err)
+	}
+	if active != 0 || historical != 1 {
+		t.Fatalf("default membership for %s = active %d historical %d, want 0/1",
+			participant.Key(), active, historical)
+	}
+}
+
+func TestEnsureDefaultWorkspaceMembershipPreservesExplicitRemoval(t *testing.T) {
+	t.Run("direct Human and PersonalityAgent calls", func(t *testing.T) {
+		for _, kind := range []ParticipantKind{KindHuman, KindPersonalityAgent} {
+			t.Run(string(kind), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				w := newWorld(t, ctx)
+				participant := w.agent
+				if kind == KindHuman {
+					participant = w.humanA
+				}
+				if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+					t.Fatalf("initial default admission: %v", err)
+				}
+				if err := w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, participant); err != nil {
+					t.Fatalf("remove default member: %v", err)
+				}
+				if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+					t.Fatalf("ensure after removal: %v", err)
+				}
+				assertDefaultMembershipTombstoned(t, ctx, w.store, participant)
+			})
+		}
+	})
+
+	t.Run("Human admission does not resurrect an owned PersonalityAgent", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+			t.Fatalf("initial Human admission: %v", err)
+		}
+		if err := w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, w.agent); err != nil {
+			t.Fatalf("remove owned PersonalityAgent: %v", err)
+		}
+		if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+			t.Fatalf("ensure Human after agent removal: %v", err)
+		}
+		assertDefaultMembershipTombstoned(t, ctx, w.store, w.agent)
+	})
+}
+
+func TestEnsureDefaultWorkspaceMembershipAndRemovalCommitInLockOrder(t *testing.T) {
+	for _, kind := range []ParticipantKind{KindHuman, KindPersonalityAgent} {
+		for _, removalFirst := range []bool{true, false} {
+			order := "ensure first"
+			if removalFirst {
+				order = "removal first"
+			}
+			t.Run(string(kind)+"/"+order, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				w := newWorld(t, ctx)
+				participant := w.agent
+				if kind == KindHuman {
+					participant = w.humanA
+				}
+				if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+					t.Fatalf("initial default admission: %v", err)
+				}
+
+				blocker, err := w.store.pool.Begin(ctx)
+				if err != nil {
+					t.Fatalf("begin blocker: %v", err)
+				}
+				defer func() { _ = blocker.Rollback(ctx) }()
+				if err := lockWorkspaceMembershipScope(ctx, blocker, DefaultWorkspaceID); err != nil {
+					t.Fatalf("lock blocker: %v", err)
+				}
+
+				removeDone := make(chan error, 1)
+				ensureDone := make(chan error, 1)
+				first := func() { ensureDone <- w.store.EnsureDefaultWorkspaceMembership(ctx, participant) }
+				second := func() {
+					removeDone <- w.store.RemoveWorkspaceMember(ctx, DefaultWorkspaceID, participant)
+				}
+				if removalFirst {
+					first, second = second, first
+				}
+				go first()
+				key := workspaceMembershipScopeKey(DefaultWorkspaceID)
+				waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
+				go second()
+				waitForAdvisoryLocks(t, ctx, w.store, key, false, 2)
+				if err := blocker.Commit(ctx); err != nil {
+					t.Fatalf("release blocker: %v", err)
+				}
+				if err := <-ensureDone; err != nil {
+					t.Fatalf("ensure default membership: %v", err)
+				}
+				if err := <-removeDone; err != nil {
+					t.Fatalf("remove default membership: %v", err)
+				}
+				assertDefaultMembershipTombstoned(t, ctx, w.store, participant)
+			})
+		}
+	}
+}
+
 func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
 	t.Run("removal first fences the send", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -285,7 +285,10 @@ agentにとってより適した方法があるときだけそちらで代替す
 8. **通知配送**: shared notification delivery service/control planeの管轄。
    messagingはtyped notification intentの発行まで。device token、permission、
    quiet hours、retry、dedupeは所有しない。HumanのWeb Pushとagentのattention
-   triggerは同じintentから分かれる別adapter。
+   triggerは同じintentから分かれる別adapter。intent rowはlive配信でconsume/delete
+   せずdurableなcanonical outboxとして保持し、message lifecycleにFK cascadeで従う。
+   recipient/time indexは将来のPush/Attention adapterが自身のcursorからintentを
+   走査する境界である。
 
    *未確定（ADR 0011 Open questions）*: この記述と ADR 0011 §9「通知設定の保管と
    評価は shared messaging service 側」は、quiet hours の保持者について割れて

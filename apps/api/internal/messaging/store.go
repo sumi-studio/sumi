@@ -66,10 +66,13 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// EnsureDefaultWorkspaceMembership idempotently admits a participant to the
-// shared MVP Workspace. When a Human arrives, all of that Human's durable
-// PersonalityAgents are admitted through the identical membership shape. The
-// Human remains the caller; this does not act or speak on an agent's behalf.
+// EnsureDefaultWorkspaceMembership idempotently admits a participant that has
+// never joined the shared MVP Workspace. A historical membership is an
+// explicit do-not-auto-admit marker: only AddWorkspaceMember may re-enroll a
+// participant after removal. When a Human first arrives, all of that Human's
+// never-enrolled durable PersonalityAgents are admitted through the identical
+// membership shape. The Human remains the caller; this does not act or speak
+// on an agent's behalf.
 func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participant ParticipantRef) error {
 	if err := participant.Validate(); err != nil {
 		return err
@@ -169,17 +172,25 @@ func defaultWorkspaceAdmissionComplete(
 		`SELECT
 		   EXISTS (SELECT 1 FROM workspaces WHERE workspace_id = $1)
 		   AND EXISTS (SELECT 1 FROM places WHERE place_id = $2 AND workspace_id = $1)
-		   AND EXISTS (
-		     SELECT 1 FROM workspace_members
-		     WHERE workspace_id = $1 AND member_kind = $3 AND member_id = $4 AND left_at IS NULL)
-		   AND ($3 <> 'human' OR NOT EXISTS (
-		     SELECT 1 FROM agents a
-		     WHERE a.human_id = $4 AND NOT EXISTS (
-		       SELECT 1 FROM workspace_members wm
-		       WHERE wm.workspace_id = $1
-		         AND wm.member_kind = 'personality_agent'
-		         AND wm.member_id = a.personality_agent_id
-		         AND wm.left_at IS NULL)))`,
+		   AND (
+		     EXISTS (
+		       SELECT 1 FROM workspace_members
+		       WHERE workspace_id = $1 AND member_kind = $3 AND member_id = $4
+		         AND left_at IS NOT NULL)
+		     OR (
+		       EXISTS (
+		         SELECT 1 FROM workspace_members
+		         WHERE workspace_id = $1 AND member_kind = $3 AND member_id = $4
+		           AND left_at IS NULL)
+		       AND ($3 <> 'human' OR NOT EXISTS (
+		         SELECT 1 FROM agents a
+		         WHERE a.human_id = $4 AND NOT EXISTS (
+		           SELECT 1 FROM workspace_members wm
+		           WHERE wm.workspace_id = $1
+		             AND wm.member_kind = 'personality_agent'
+		             AND wm.member_id = a.personality_agent_id)))
+		     )
+		   )`,
 		DefaultWorkspaceID, DefaultGeneralChannelID, participant.Kind, participant.ID).Scan(&complete)
 	if err != nil {
 		return false, err
@@ -190,7 +201,10 @@ func defaultWorkspaceAdmissionComplete(
 func addDefaultMember(ctx context.Context, tx pgx.Tx, participant ParticipantRef) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO workspace_members (workspace_id, member_kind, member_id, role)
-		 VALUES ($1, $2, $3, 'member')
+		 SELECT $1::uuidv7, $2::text, $3::uuidv7, 'member'
+		 WHERE NOT EXISTS (
+		   SELECT 1 FROM workspace_members
+		   WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3)
 		 ON CONFLICT (workspace_id, member_kind, member_id) WHERE left_at IS NULL
 		 DO NOTHING`, DefaultWorkspaceID, participant.Kind, participant.ID)
 	if err != nil {
