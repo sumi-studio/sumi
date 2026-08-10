@@ -14,7 +14,7 @@
     {
       "binding": "DB",
       "database_name": "sumi-decision-inbox",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "4f7aca87-b5f3-4e85-9292-335ff60b6ef0",
       "migrations_dir": "migrations"
     }
   ],

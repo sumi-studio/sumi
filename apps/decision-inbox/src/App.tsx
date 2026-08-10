@@ -13,6 +13,7 @@ import { registerPushSubscription } from "./push-client";
 
 const api = new DecisionApi();
 const CACHE_PREFIX = "sumi-decision-inbox:v1:";
+type CachedSession = Omit<HumanSessionPayload, "csrfToken">;
 
 type AuthState = "checking" | "required" | "ready";
 type View = "pending" | "history" | "settings";
@@ -50,6 +51,31 @@ function cacheClear(): void {
   } catch {
     // Sign-out still invalidates the authoritative server session.
   }
+}
+
+function cacheClearDecisions(): void {
+  try {
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(CACHE_PREFIX) && !key.endsWith(":session"))
+        localStorage.removeItem(key);
+    }
+  } catch {
+    // A failed cache cleanup must not prevent an authoritative sign-in.
+  }
+}
+
+function cachedSession(): CachedSession | null {
+  const saved = cacheRead<CachedSession>("session");
+  if (
+    !saved ||
+    !Number.isFinite(Date.parse(saved.expiresAt)) ||
+    Date.parse(saved.expiresAt) <= Date.now()
+  ) {
+    cacheClear();
+    return null;
+  }
+  return saved;
 }
 
 function requestIdFromPath(): string | null {
@@ -179,10 +205,10 @@ function LoadingScreen() {
 
 function SignIn({
   initialError,
-  onReady,
+  onBootstrapped,
 }: {
   initialError: string;
-  onReady: (session: HumanSessionPayload) => void;
+  onBootstrapped: (session: HumanSessionPayload) => void;
 }) {
   const [token, setToken] = useState("");
   const [error, setError] = useState(initialError);
@@ -195,7 +221,7 @@ function SignIn({
     setBusy(true);
     setError("");
     try {
-      onReady(await api.bootstrap(token));
+      onBootstrapped(await api.bootstrap(token));
     } catch (cause) {
       setError(
         cause instanceof Error
@@ -269,6 +295,20 @@ function EmptyState({ view }: { view: "pending" | "history" }) {
   );
 }
 
+function RequestAnswer({ request }: { request: DecisionRequest }) {
+  const selected = request.choices.find(
+    (choice) => choice.id === request.response?.choiceId,
+  );
+  const summary = selected?.label ?? request.response?.reply;
+  if (!summary) return null;
+  return (
+    <span className="request-answer">
+      <Icon name="check" size={14} />
+      <span>{selected ? summary : `“${summary}”`}</span>
+    </span>
+  );
+}
+
 function RequestList({
   requests,
   view,
@@ -281,27 +321,39 @@ function RequestList({
   if (requests.length === 0) return <EmptyState view={view} />;
   return (
     <div className="request-list" aria-live="polite">
-      {requests.map((request) => (
-        <button
-          className="request-row"
-          key={request.id}
-          onClick={() => navigate(`/requests/${request.id}`)}
-          type="button"
-        >
-          <span className="request-row__top">
-            <span className="source">{request.source}</span>
-            <StatusPill status={request.status} />
-          </span>
-          <strong>{request.title}</strong>
-          <span className="request-preview">{request.body}</span>
-          <span className="request-time">
-            {request.status === "pending"
-              ? `Expires ${relativeTime(request.expiresAt)}`
-              : `Updated ${relativeTime(request.updatedAt)}`}
-            {stale ? " · saved" : ""}
-          </span>
-        </button>
-      ))}
+      {requests.map((request) => {
+        const urgent =
+          request.status === "pending" &&
+          Date.parse(request.expiresAt) - Date.now() > 0 &&
+          Date.parse(request.expiresAt) - Date.now() < 3_600_000;
+        return (
+          <button
+            className="request-row"
+            key={request.id}
+            onClick={() => navigate(`/requests/${request.id}`)}
+            type="button"
+          >
+            <span className="request-row__top">
+              <span className="source">{request.source}</span>
+              {view === "history" && <StatusPill status={request.status} />}
+            </span>
+            <strong>{request.title}</strong>
+            {request.status === "resolved" && request.response ? (
+              <RequestAnswer request={request} />
+            ) : (
+              <span className="request-preview">{request.body}</span>
+            )}
+            <span
+              className={`request-time${urgent ? " request-time--urgent" : ""}`}
+            >
+              {request.status === "pending"
+                ? `Expires ${relativeTime(request.expiresAt)}`
+                : `Updated ${relativeTime(request.updatedAt)}`}
+              {stale ? " · saved" : ""}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -467,7 +519,12 @@ function SettingsView({
           <h2>Private session</h2>
           <p>Active until {fullTime(session.expiresAt)}.</p>
           <div className="button-row">
-            <button className="button" onClick={onLogout} type="button">
+            <button
+              className="button"
+              disabled={!online}
+              onClick={onLogout}
+              type="button"
+            >
               Sign out on this device
             </button>
           </div>
@@ -532,9 +589,14 @@ function DecisionDetail({
     request.status === "pending" &&
     Boolean(selected || reply.trim()) &&
     online &&
+    !stale &&
     !busy;
 
   async function submit() {
+    if (stale)
+      return setError(
+        "This saved view may be out of date. Reconnect before sending.",
+      );
     if (!online)
       return setError(
         "Connect to the internet before sending. Nothing has been queued.",
@@ -579,10 +641,14 @@ function DecisionDetail({
           <h1>{request.title}</h1>
           <div className="metadata">
             <span>Sent {relativeTime(request.createdAt)}</span>
-            <span aria-hidden="true">·</span>
-            <span title={fullTime(request.expiresAt)}>
-              Expires {relativeTime(request.expiresAt)}
-            </span>
+            {request.status === "pending" && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span title={fullTime(request.expiresAt)}>
+                  Expires {relativeTime(request.expiresAt)}
+                </span>
+              </>
+            )}
             {stale && (
               <>
                 <span aria-hidden="true">·</span>
@@ -603,6 +669,7 @@ function DecisionDetail({
                   aria-pressed={selected === choice.id}
                   className={`choice choice--${choice.tone}${selected === choice.id ? " choice--selected" : ""}`}
                   key={choice.id}
+                  disabled={!online || stale || busy}
                   onClick={() => setSelected(choice.id)}
                   type="button"
                 >
@@ -625,6 +692,7 @@ function DecisionDetail({
                   value={reply}
                   onChange={(event) => setReply(event.target.value)}
                   placeholder="What should the agent know?"
+                  disabled={!online || stale || busy}
                 />
                 <span className="character-count">{reply.length}/500</span>
               </div>
@@ -633,6 +701,11 @@ function DecisionDetail({
               <p className="inline-warning" role="status">
                 You are offline. Review is available, but sending is paused and
                 will not be queued.
+              </p>
+            )}
+            {stale && online && (
+              <p className="inline-warning" role="status">
+                This saved view may be out of date. Reconnect before sending.
               </p>
             )}
             {error && (
@@ -679,6 +752,8 @@ export function App() {
   const [error, setError] = useState("");
   const [online, setOnline] = useState(navigator.onLine);
   const [pushState, setPushState] = useState<PushState>("checking");
+  const [verified, setVerified] = useState(false);
+  const [, setClock] = useState(Date.now());
 
   useEffect(() => {
     const onPop = () => setRequestId(requestIdFromPath());
@@ -694,16 +769,60 @@ export function App() {
     };
   }, []);
 
+  const revokeSession = useCallback(() => {
+    api.setCsrfToken("");
+    cacheClear();
+    setDetail(null);
+    setRequests([]);
+    setStale(false);
+    setSession(null);
+    setVerified(false);
+    setAuth("required");
+  }, []);
+
+  useEffect(() => {
+    const refresh = () => setClock(Date.now());
+    const interval = window.setInterval(refresh, 60_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, []);
+
   useEffect(() => {
     if (!("serviceWorker" in navigator)) return;
     void navigator.serviceWorker.register("/sw.js");
   }, []);
 
-  const acceptSession = useCallback((value: HumanSessionPayload) => {
-    api.setCsrfToken(value.csrfToken);
-    setSession(value);
+  const acceptAuthoritativeSession = useCallback(
+    (value: HumanSessionPayload) => {
+      api.setCsrfToken(value.csrfToken);
+      const { csrfToken: _csrfToken, ...saved } = value;
+      cacheWrite("session", saved);
+      setSession(value);
+      setVerified(true);
+      setAuth("ready");
+    },
+    [],
+  );
+
+  const acceptCachedSession = useCallback((value: CachedSession) => {
+    api.setCsrfToken("");
+    setSession({ ...value, csrfToken: "" });
+    setVerified(false);
     setAuth("ready");
   }, []);
+
+  const acceptBootstrappedSession = useCallback(
+    (value: HumanSessionPayload) => {
+      cacheClearDecisions();
+      acceptAuthoritativeSession(value);
+    },
+    [acceptAuthoritativeSession],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -720,9 +839,23 @@ export function App() {
         const result = bootstrap
           ? await api.bootstrap(bootstrap)
           : await api.session();
-        if (!cancelled) acceptSession(result);
+        if (!cancelled)
+          bootstrap
+            ? acceptBootstrappedSession(result)
+            : acceptAuthoritativeSession(result);
       } catch (cause) {
         if (cancelled) return;
+        // A network failure is not a rejected session: reopening the app
+        // offline keeps the last saved views instead of a sign-in wall.
+        if (!bootstrap && !(cause instanceof ApiClientError)) {
+          const saved = cachedSession();
+          if (saved) {
+            acceptCachedSession(saved);
+            return;
+          }
+        }
+        if (cause instanceof ApiClientError && cause.status === 401)
+          revokeSession();
         setAuthError(bootstrap && cause instanceof Error ? cause.message : "");
         setAuth("required");
       }
@@ -731,10 +864,72 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [acceptSession]);
+  }, [
+    acceptAuthoritativeSession,
+    acceptBootstrappedSession,
+    acceptCachedSession,
+    revokeSession,
+  ]);
 
   useEffect(() => {
-    if (auth !== "ready" || !session) return;
+    if (auth !== "ready" || !session || verified || !online) return;
+    let cancelled = false;
+    void api
+      .session()
+      .then((result) => {
+        if (!cancelled) acceptAuthoritativeSession(result);
+      })
+      .catch((cause: unknown) => {
+        if (
+          !cancelled &&
+          cause instanceof ApiClientError &&
+          cause.status === 401
+        )
+          revokeSession();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    auth,
+    acceptAuthoritativeSession,
+    online,
+    revokeSession,
+    session,
+    verified,
+  ]);
+
+  useEffect(() => {
+    if (!session) return;
+    const checkExpiry = () => {
+      if (Date.parse(session.expiresAt) <= Date.now()) revokeSession();
+    };
+    let timeout: number | undefined;
+    const scheduleExpiry = () => {
+      const remaining = Date.parse(session.expiresAt) - Date.now();
+      if (remaining <= 0) {
+        revokeSession();
+        return;
+      }
+      // Browser timers are signed 32-bit values. Recheck long-lived sessions
+      // in bounded steps, then schedule the final step at the exact expiry.
+      timeout = window.setTimeout(
+        scheduleExpiry,
+        Math.min(remaining, 3_600_000),
+      );
+    };
+    scheduleExpiry();
+    window.addEventListener("focus", checkExpiry);
+    document.addEventListener("visibilitychange", checkExpiry);
+    return () => {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      window.removeEventListener("focus", checkExpiry);
+      document.removeEventListener("visibilitychange", checkExpiry);
+    };
+  }, [revokeSession, session]);
+
+  useEffect(() => {
+    if (auth !== "ready" || !session || !verified) return;
     if (
       !("Notification" in window) ||
       !("serviceWorker" in navigator) ||
@@ -747,23 +942,26 @@ export function App() {
       setPushState("denied");
       return;
     }
+    if (!online) return;
     void navigator.serviceWorker.ready
       .then((registration) => registration.pushManager.getSubscription())
       .then(async (subscription) => {
         if (subscription) {
           await api.subscribe(subscription.toJSON());
           setPushState("on");
-        } else if (
-          Notification.permission === "granted" ||
-          session.pushSubscriptionCount > 0
-        ) {
-          setPushState("expired");
         } else {
           setPushState("off");
         }
       })
-      .catch(() => setPushState("expired"));
-  }, [auth, session]);
+      .catch((cause: unknown) =>
+        setPushState(
+          cause instanceof ApiClientError &&
+            cause.code === "expired_subscription"
+            ? "expired"
+            : "off",
+        ),
+      );
+  }, [auth, online, session, verified]);
 
   const load = useCallback(async () => {
     if (auth !== "ready") return;
@@ -797,8 +995,7 @@ export function App() {
       setStale(false);
     } catch (cause) {
       if (cause instanceof ApiClientError && cause.status === 401) {
-        setAuth("required");
-        setSession(null);
+        revokeSession();
         return;
       }
       const cached = requestId
@@ -818,7 +1015,7 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }, [auth, online, requestId, view]);
+  }, [auth, online, requestId, revokeSession, view]);
 
   useEffect(() => {
     void load();
@@ -833,11 +1030,9 @@ export function App() {
   );
 
   async function logout() {
-    if (!online) return;
+    if (!online || !verified) return;
     await api.logout();
-    cacheClear();
-    setSession(null);
-    setAuth("required");
+    revokeSession();
   }
 
   function changeView(next: View) {
@@ -864,7 +1059,12 @@ export function App() {
 
   if (auth === "checking") return <LoadingScreen />;
   if (auth === "required" || !session)
-    return <SignIn initialError={authError} onReady={acceptSession} />;
+    return (
+      <SignIn
+        initialError={authError}
+        onBootstrapped={acceptBootstrappedSession}
+      />
+    );
 
   if (requestId) {
     const currentDetail = detail?.id === requestId ? detail : null;
@@ -899,8 +1099,8 @@ export function App() {
           {!online && <OfflineBanner />}
           <DecisionDetail
             request={currentDetail}
-            online={online}
-            stale={stale}
+            online={online && verified}
+            stale={stale || !verified}
             onResolved={recordResolution}
           />
         </>
@@ -937,7 +1137,7 @@ export function App() {
             session={session}
             pushState={pushState}
             setPushState={setPushState}
-            online={online}
+            online={online && verified}
             onLogout={logout}
           />
         ) : (
@@ -972,6 +1172,27 @@ export function App() {
             ) : (
               <RequestList requests={requests} view={view} stale={stale} />
             )}
+            {view === "pending" &&
+              pendingCount > 0 &&
+              (pushState === "expired" || pushState === "off") && (
+                <div className="push-nudge" role="status">
+                  <Icon name="bell" size={16} />
+                  <p>
+                    {pushState === "expired"
+                      ? "Push on this device needs renewal."
+                      : "Push is off on this device."}
+                  </p>
+                  <button
+                    className="button"
+                    onClick={() => changeView("settings")}
+                    type="button"
+                  >
+                    {pushState === "expired"
+                      ? "Renew notifications"
+                      : "Turn on notifications"}
+                  </button>
+                </div>
+              )}
           </>
         )}
       </main>

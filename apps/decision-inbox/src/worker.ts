@@ -591,10 +591,16 @@ async function handleHumanList(request: Request, env: Env): Promise<Response> {
   await enforceRateLimit(env, session.sessionHash, "human-read", 240, 60);
   await expireRequests(env.DB, Date.now());
   const mode = new URL(request.url).searchParams.get("view") ?? "pending";
-  const predicate =
-    mode === "history" ? "r.status <> 'pending'" : "r.status = 'pending'";
+  // Pending is a to-do queue: the decision closest to expiring goes first.
+  const [predicate, order] =
+    mode === "history"
+      ? ["r.status <> 'pending'", "r.updated_at DESC"]
+      : [
+          "r.status = 'pending'",
+          "r.expires_at ASC, r.created_at ASC, r.id ASC",
+        ];
   const results = await env.DB.prepare(
-    `${DECISION_SELECT} WHERE ${predicate} ORDER BY r.updated_at DESC LIMIT 100`,
+    `${DECISION_SELECT} WHERE ${predicate} ORDER BY ${order} LIMIT 100`,
   ).all<DecisionRow>();
   return json({ requests: results.results.map(decisionFromRow) });
 }

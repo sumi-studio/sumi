@@ -277,6 +277,56 @@ describe("Human decision flow", () => {
     expect(stored?.count).toBe(1);
   });
 
+  it("orders the pending queue by soonest expiry first", async () => {
+    const later = (await (
+      await createDecision("request-key-order-later", {
+        expiresAt: new Date(Date.now() + 7_200_000).toISOString(),
+      })
+    ).json()) as { request: { id: string } };
+    const sooner = (await (
+      await createDecision("request-key-order-sooner", {
+        expiresAt: new Date(Date.now() + 1_800_000).toISOString(),
+      })
+    ).json()) as { request: { id: string } };
+    const { cookie } = await signIn();
+    const list = await call("/api/human/requests?view=pending", {
+      headers: { Cookie: cookie },
+    });
+    expect(list.status).toBe(200);
+    const body = (await list.json()) as { requests: { id: string }[] };
+    expect(body.requests.map((entry) => entry.id)).toEqual([
+      sooner.request.id,
+      later.request.id,
+    ]);
+  });
+
+  it("orders equal-expiry pending rows deterministically in D1", async () => {
+    const first = (await (
+      await createDecision("request-key-order-tie-first")
+    ).json()) as { request: { id: string } };
+    const second = (await (
+      await createDecision("request-key-order-tie-second")
+    ).json()) as { request: { id: string } };
+    const expiresAt = Date.now() + 3_600_000;
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE decision_requests SET expires_at = ?, created_at = ? WHERE id = ?",
+      ).bind(expiresAt, 10, first.request.id),
+      env.DB.prepare(
+        "UPDATE decision_requests SET expires_at = ?, created_at = ? WHERE id = ?",
+      ).bind(expiresAt, 10, second.request.id),
+    ]);
+    const { cookie } = await signIn();
+    const list = await call("/api/human/requests?view=pending", {
+      headers: { Cookie: cookie },
+    });
+    expect(list.status).toBe(200);
+    const body = (await list.json()) as { requests: { id: string }[] };
+    expect(body.requests.slice(0, 2).map((entry) => entry.id)).toEqual(
+      [first.request.id, second.request.id].sort(),
+    );
+  });
+
   it("does not accept Human writes without same-origin CSRF proof", async () => {
     const created = (await (
       await createDecision("request-key-csrf")

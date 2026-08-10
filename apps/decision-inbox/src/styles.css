@@ -313,6 +313,47 @@ textarea:focus-visible {
   font-size: 11px;
 }
 
+.request-time--urgent {
+  color: var(--pending);
+  font-weight: 680;
+}
+
+.request-answer {
+  display: flex;
+  overflow: hidden;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--positive);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.request-answer span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.push-nudge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px solid #e4c982;
+  border-radius: 10px;
+  background: var(--pending-bg);
+  color: #684910;
+}
+
+.push-nudge p {
+  flex: 1;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .empty-state,
 .center-state {
   display: flex;
@@ -673,6 +714,13 @@ textarea:focus-visible {
   background: #e8e6df;
   color: #9a978f;
   cursor: not-allowed;
+}
+
+.push-nudge .button {
+  min-height: 38px;
+  flex: none;
+  padding: 5px 8px;
+  font-size: 12px;
 }
 
 .resolution {

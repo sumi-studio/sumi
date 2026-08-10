@@ -1,8 +1,18 @@
-const SHELL_CACHE = "decision-shell-v1";
-const ASSET_CACHE = "decision-assets-v1";
+const CACHE_VERSION = "v2";
+const SHELL_CACHE = `decision-shell-${CACHE_VERSION}`;
+const ASSET_CACHE = `decision-assets-${CACHE_VERSION}`;
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(SHELL_CACHE).then((cache) => cache.addAll(["/", "/manifest.webmanifest", "/icon.svg"])));
+  event.waitUntil((async () => {
+    const shell = await caches.open(SHELL_CACHE);
+    await shell.addAll(["/", "/manifest.webmanifest", "/icon.svg"]);
+    // The first page load fetches its hashed assets before this worker
+    // controls the page, so runtime caching alone would leave the offline
+    // shell without JS/CSS until a second visit.
+    const html = await (await shell.match("/")).text();
+    const assets = [...new Set(html.match(/\/assets\/[A-Za-z0-9._-]+/g) ?? [])];
+    await (await caches.open(ASSET_CACHE)).addAll(assets);
+  })());
   self.skipWaiting();
 });
 
@@ -29,7 +39,12 @@ self.addEventListener("fetch", (event) => {
 
   event.respondWith(caches.match(request).then((cached) => {
     const network = fetch(request).then((response) => {
-      if (response.ok) event.waitUntil(caches.open(ASSET_CACHE).then((cache) => cache.put(request, response.clone())));
+      // Clone before the page starts streaming the body; a deferred clone
+      // throws "Response body is already used" and silently skips the cache.
+      if (response.ok) {
+        const copy = response.clone();
+        event.waitUntil(caches.open(ASSET_CACHE).then((cache) => cache.put(request, copy)));
+      }
       return response;
     });
     if (cached) {
