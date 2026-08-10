@@ -179,7 +179,11 @@ export type ServerEvent =
    * placeのcatch-up完了。cursorより手前のmessageに付いたreactionはreplayされ
    * ないので、受け手はロード済み範囲を読み直して収束させる。
    */
-  | { type: "caught_up"; place: Place };
+  | { type: "caught_up"; place: Place }
+  /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
+  | { type: "place_created"; channel?: ChannelSummary; dm?: DmSummary }
+  /** channelのmutable属性（v0: topic）の変更。 */
+  | { type: "place_updated"; channel: ChannelSummary };
 
 export interface SendMessageInput {
   place: Place;
@@ -229,6 +233,15 @@ export interface MessagingBackend {
     place: Place,
     options?: { beforeSeq?: number; limit?: number },
   ): Promise<Message[]>;
+  createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<ChannelSummary>;
+  /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
+  ensureDM(participant: ParticipantRef): Promise<DmSummary>;
+  createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
+  updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;

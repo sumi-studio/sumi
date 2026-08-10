@@ -1,4 +1,5 @@
 import type {
+  ChannelSummary,
   ConnectionState,
   DmSummary,
   MemberProfile,
@@ -58,31 +59,12 @@ export class ApiMessagingBackend implements MessagingBackend {
         name: asString(value.name),
       };
     });
-    const channels = asArray(body.channels).map((entry) => {
-      const value = asRecord(entry);
-      const channel = {
-        channelId: asString(value.channel_id),
-        workspaceId: asString(value.workspace_id),
-        name: asString(value.name),
-        topic: asString(value.topic),
-        visibility: asVisibility(value.visibility),
-      };
-      this.places.set(channel.channelId, {
-        kind: "channel",
-        channelId: channel.channelId,
-      });
-      return channel;
-    });
-    const dms: DmSummary[] = asArray(body.dms).map((entry) => {
-      const value = asRecord(entry);
-      const dm: DmSummary = {
-        dmId: asString(value.dm_id),
-        kind: asDMKind(value.kind),
-        participants: asArray(value.participants).map(parseParticipant),
-      };
-      this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
-      return dm;
-    });
+    const channels = asArray(body.channels).map((entry) =>
+      this.registerChannel(entry),
+    );
+    const dms: DmSummary[] = asArray(body.dms).map((entry) =>
+      this.registerDm(entry),
+    );
     const members: MemberProfile[] = asArray(body.members).map((entry) => {
       const value = asRecord(entry);
       return {
@@ -141,6 +123,45 @@ export class ApiMessagingBackend implements MessagingBackend {
       ),
     );
     return asArray(body.messages).map(parseMessage);
+  }
+
+  async createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.request("/messaging/channels", {
+      method: "POST",
+      body: { workspace_id: workspaceId, name, topic },
+    });
+    return this.registerChannel(body);
+  }
+
+  async ensureDM(participant: ParticipantRef): Promise<DmSummary> {
+    const body = await this.request("/messaging/dms", {
+      method: "POST",
+      body: { participant: participantToWire(participant) },
+    });
+    return this.registerDm(body);
+  }
+
+  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+    const body = await this.request("/messaging/group-dms", {
+      method: "POST",
+      body: { participants: participants.map(participantToWire) },
+    });
+    return this.registerDm(body);
+  }
+
+  async updateChannelTopic(
+    channelId: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(channelId)}`,
+      { method: "PATCH", body: { topic } },
+    );
+    return this.registerChannel(body);
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -350,6 +371,19 @@ export class ApiMessagingBackend implements MessagingBackend {
         place,
         participant: parseParticipant(wire.actor),
       };
+    } else if (eventType === "place_created") {
+      parsed =
+        wire.channel === undefined || wire.channel === null
+          ? { type: "place_created", dm: this.registerDm(wire.dm) }
+          : {
+              type: "place_created",
+              channel: this.registerChannel(wire.channel),
+            };
+    } else if (eventType === "place_updated") {
+      parsed = {
+        type: "place_updated",
+        channel: this.registerChannel(wire.channel),
+      };
     } else {
       return;
     }
@@ -358,6 +392,39 @@ export class ApiMessagingBackend implements MessagingBackend {
 
   private emit(event: ServerEvent): void {
     for (const listener of this.listeners) listener(event);
+  }
+
+  /** Parses a channel wire shape and remembers the place for event routing. */
+  private registerChannel(value: unknown): ChannelSummary {
+    const wire = asRecord(value);
+    const channel: ChannelSummary = {
+      channelId: asString(wire.channel_id),
+      workspaceId: asString(wire.workspace_id),
+      name: asString(wire.name),
+      topic: asString(wire.topic),
+      visibility: asVisibility(wire.visibility),
+    };
+    if (!this.cursors.has(channel.channelId)) {
+      this.cursors.set(channel.channelId, 0);
+    }
+    this.places.set(channel.channelId, {
+      kind: "channel",
+      channelId: channel.channelId,
+    });
+    return channel;
+  }
+
+  /** Parses a dm wire shape and remembers the place for event routing. */
+  private registerDm(value: unknown): DmSummary {
+    const wire = asRecord(value);
+    const dm: DmSummary = {
+      dmId: asString(wire.dm_id),
+      kind: asDMKind(wire.kind),
+      participants: asArray(wire.participants).map(parseParticipant),
+    };
+    if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
+    this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
+    return dm;
   }
 
   private stopSocket(): void {
@@ -412,6 +479,15 @@ function unsupported(): Promise<void> {
 
 function placeID(place: Place): string {
   return place.kind === "channel" ? place.channelId : place.dmId;
+}
+
+function participantToWire(ref: ParticipantRef): Record<string, string> {
+  return ref.kind === "human"
+    ? { kind: "human", human_id: ref.humanId }
+    : {
+        kind: "personality_agent",
+        personality_agent_id: ref.personalityAgentId,
+      };
 }
 
 function parseParticipant(value: unknown): ParticipantRef {

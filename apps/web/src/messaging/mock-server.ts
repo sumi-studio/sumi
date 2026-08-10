@@ -406,6 +406,62 @@ export class MockMessagingServer implements MessagingBackend {
     return slice.slice(Math.max(0, slice.length - limit));
   }
 
+  async createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const channel: ChannelSummary = {
+      channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
+      workspaceId,
+      name,
+      topic,
+      visibility: "public",
+    };
+    CHANNELS.push(channel);
+    this.emit({ type: "place_created", channel });
+    return channel;
+  }
+
+  async ensureDM(participant: ParticipantRef): Promise<DmSummary> {
+    const existing = DMS.find(
+      (dm) =>
+        dm.kind === "dm" &&
+        dm.participants.some((ref) => sameParticipant(ref, participant)),
+    );
+    if (existing) return existing;
+    const dm: DmSummary = {
+      dmId: `dm-${secureRandomUUID().slice(0, 8)}`,
+      kind: "dm",
+      participants: [SELF, participant],
+    };
+    DMS.push(dm);
+    this.emit({ type: "place_created", dm });
+    return dm;
+  }
+
+  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+    const dm: DmSummary = {
+      dmId: `gdm-${secureRandomUUID().slice(0, 8)}`,
+      kind: "group_dm",
+      participants: [SELF, ...participants],
+    };
+    DMS.push(dm);
+    this.emit({ type: "place_created", dm });
+    return dm;
+  }
+
+  async updateChannelTopic(
+    channelId: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const channel = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!channel) throw new Error("unknown channel");
+    channel.topic = topic;
+    this.emit({ type: "place_updated", channel });
+    return channel;
+  }
+
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {
     // idempotency: 同じclientNonceの再送はcommit済みmessageのreceiptを返すだけ。
     const existing = (this.history.get(placeKey(input.place)) ?? []).find(

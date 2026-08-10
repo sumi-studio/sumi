@@ -16,6 +16,9 @@ import (
 // message content plus envelope headroom.
 const maxRequestBytes = MaxContentBytes + 64*1024
 
+// maxTopicBytes bounds a channel topic: one header line, not a document.
+const maxTopicBytes = 1000
+
 // Server is the /messaging REST surface. It authenticates the browser session
 // (exact-origin allowlist + signed HttpOnly cookie, the same policy as the
 // direct-chat routes) and acts as the session's Human participant. Every
@@ -49,6 +52,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/dms", s.serveEnsureDM)
 	mux.HandleFunc("POST /messaging/group-dms", s.serveCreateGroupDM)
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
+	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
@@ -417,6 +421,10 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
+	if len(req.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_topic")
+		return
+	}
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
@@ -430,7 +438,43 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, channelToWire(place))
+	wire := channelToWire(place)
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	writeJSON(w, http.StatusCreated, wire)
+}
+
+// serveUpdatePlace edits a channel's mutable fields (v0: topic only).
+func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Topic string `json:"topic"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_topic")
+		return
+	}
+	var place Place
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		place, opErr = s.Store.UpdateChannelTopic(r.Context(), r.PathValue("place_id"), req.Topic, viewer)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire})
+	writeJSON(w, http.StatusOK, wire)
 }
 
 func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
@@ -449,10 +493,13 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_participant")
 		return
 	}
-	var place Place
+	var (
+		place   Place
+		created bool
+	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.EnsureDM(r.Context(), viewer, other)
+		place, created, opErr = s.Store.EnsureDM(r.Context(), viewer, other)
 		return opErr
 	})
 	if !done {
@@ -462,10 +509,14 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, dmWire{
+	wire := dmWire{
 		DMID: place.PlaceID, Kind: place.Kind,
 		Participants: []participantWire{participantToWire(viewer), participantToWire(other)},
-	})
+	}
+	if created {
+		s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	}
+	writeJSON(w, http.StatusOK, wire)
 }
 
 func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
@@ -501,10 +552,12 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, dmWire{
+	wire := dmWire{
 		DMID: place.PlaceID, Kind: place.Kind,
 		Participants: append([]participantWire{participantToWire(viewer)}, req.Participants...),
-	})
+	}
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	writeJSON(w, http.StatusCreated, wire)
 }
 
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
@@ -845,6 +898,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "idempotency_conflict")
 	case errors.Is(err, ErrSeqBeyondLatest):
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
+	case errors.Is(err, ErrNotAChannel):
+		writeError(w, http.StatusBadRequest, "not_a_channel")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

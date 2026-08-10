@@ -36,6 +36,7 @@ const bootstrap = {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -254,6 +255,197 @@ describe("ApiMessagingBackend", () => {
       vi.useRealTimers();
     }
   });
+
+  it("creates channels, dms, and group dms and edits topics over REST", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          return json(channelSummaryWire("開発の相談"), 201);
+        }
+        if (path === "/messaging/dms" && init?.method === "POST") {
+          return json({
+            dm_id: "dm-1",
+            kind: "dm",
+            participants: [
+              { kind: "human", human_id: "human-1" },
+              { kind: "human", human_id: "human-2" },
+            ],
+          });
+        }
+        if (path === "/messaging/group-dms" && init?.method === "POST") {
+          return json(
+            {
+              dm_id: "group-dm-1",
+              kind: "group_dm",
+              participants: [
+                { kind: "human", human_id: "human-1" },
+                { kind: "human", human_id: "human-2" },
+                { kind: "personality_agent", personality_agent_id: "agent-1" },
+              ],
+            },
+            201,
+          );
+        }
+        if (
+          path === "/messaging/places/channel-2" &&
+          init?.method === "PATCH"
+        ) {
+          return json(channelSummaryWire("新しいトピック"));
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+
+    await expect(
+      backend.createChannel("workspace-1", "dev", "開発の相談"),
+    ).resolves.toEqual({
+      channelId: "channel-2",
+      workspaceId: "workspace-1",
+      name: "dev",
+      topic: "開発の相談",
+      visibility: "public",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/channels",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          workspace_id: "workspace-1",
+          name: "dev",
+          topic: "開発の相談",
+        }),
+      }),
+    );
+
+    await expect(
+      backend.ensureDM({ kind: "human", humanId: "human-2" }),
+    ).resolves.toMatchObject({ dmId: "dm-1", kind: "dm" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/dms",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          participant: { kind: "human", human_id: "human-2" },
+        }),
+      }),
+    );
+
+    await expect(
+      backend.createGroupDM([
+        { kind: "human", humanId: "human-2" },
+        { kind: "personality_agent", personalityAgentId: "agent-1" },
+      ]),
+    ).resolves.toMatchObject({ dmId: "group-dm-1", kind: "group_dm" });
+
+    await expect(
+      backend.updateChannelTopic("channel-2", "新しいトピック"),
+    ).resolves.toMatchObject({ topic: "新しいトピック" });
+  });
+
+  it("projects place_created and place_updated from the socket", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "channel-2",
+        channel: channelSummaryWire(""),
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "dm-9",
+        dm: {
+          dm_id: "dm-9",
+          kind: "dm",
+          participants: [
+            { kind: "human", human_id: "human-1" },
+            { kind: "human", human_id: "human-2" },
+          ],
+        },
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_updated",
+        place_id: "channel-2",
+        channel: channelSummaryWire("更新後"),
+      },
+    });
+    expect(events).toMatchObject([
+      { type: "place_created", channel: { channelId: "channel-2" } },
+      { type: "place_created", dm: { dmId: "dm-9", kind: "dm" } },
+      { type: "place_updated", channel: { topic: "更新後" } },
+    ]);
+  });
+
+  it("replays live-learned places after reconnecting", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    backend.subscribe(() => {}, {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const firstSocket = FakeWebSocket.instances[0];
+    firstSocket?.open();
+    firstSocket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "channel-2",
+        channel: channelSummaryWire(""),
+      },
+    });
+    firstSocket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "dm-9",
+        dm: {
+          dm_id: "dm-9",
+          kind: "dm",
+          participants: [
+            { kind: "human", human_id: "human-1" },
+            { kind: "human", human_id: "human-2" },
+          ],
+        },
+      },
+    });
+
+    firstSocket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnectSocket = FakeWebSocket.instances[0];
+    expect(reconnectSocket).not.toBe(firstSocket);
+    reconnectSocket?.open();
+
+    expect(JSON.parse(reconnectSocket?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "channel-2": 0, "dm-9": 0 },
+    });
+  });
 });
 
 class FakeWebSocket extends EventTarget {
@@ -294,6 +486,16 @@ class FakeWebSocket extends EventTarget {
 
 function channelWire() {
   return { kind: "channel", channel_id: "channel-1" };
+}
+
+function channelSummaryWire(topic: string) {
+  return {
+    channel_id: "channel-2",
+    workspace_id: "workspace-1",
+    name: "dev",
+    topic,
+    visibility: "public",
+  };
 }
 
 function messageWire(

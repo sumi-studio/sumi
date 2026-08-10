@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
+import type { DmSummary } from "./model";
 import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
@@ -132,5 +133,41 @@ describe("messaging session boundary", () => {
       "personality_agent:agent-a": { displayName: "Sumi（After）" },
     });
     expect(useMessaging.getState().messagesByPlace).toBe(messagesByPlace);
+  });
+
+  it("rejects a deferred DM result after the messaging identity changes", async () => {
+    bindMessagingSessionIdentity("human-a");
+    const server = new MockMessagingServer();
+    let resolveDM!: (dm: DmSummary) => void;
+    const deferredDM = new Promise<DmSummary>((resolve) => {
+      resolveDM = resolve;
+    });
+    vi.spyOn(server, "ensureDM").mockReturnValue(deferredDM);
+    installMessagingBackend(server);
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "human-a" },
+      selfKey: "human:human-a",
+      dms: [],
+    });
+
+    const operation = useMessaging
+      .getState()
+      .startDM([{ kind: "human", humanId: "human-b" }]);
+    bindMessagingSessionIdentity(null);
+    bindMessagingSessionIdentity("human-b");
+    resolveDM({
+      dmId: "stale-dm",
+      kind: "dm",
+      participants: [
+        { kind: "human", humanId: "human-a" },
+        { kind: "human", humanId: "human-b" },
+      ],
+    });
+
+    await expect(operation).rejects.toThrow(
+      "Messaging session changed during DM start",
+    );
+    expect(useMessaging.getState().dms).toEqual([]);
   });
 });

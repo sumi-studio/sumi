@@ -674,6 +674,10 @@ class StubBackend implements MessagingBackend {
     });
   }
 
+  createChannel = vi.fn();
+  ensureDM = vi.fn();
+  createGroupDM = vi.fn();
+  updateChannelTopic = vi.fn();
   sendMessage = vi.fn();
   editMessage = vi.fn(async () => undefined);
   deleteMessage = vi.fn(async () => undefined);

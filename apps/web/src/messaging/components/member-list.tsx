@@ -1,6 +1,7 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { participantKey } from "../model";
-import { useMessaging } from "../store";
+import { usePlaceNavigate } from "../place-route";
+import { getMessagingSessionIdentity, useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 
 /**
@@ -11,6 +12,10 @@ export function MemberList() {
   const membersByKey = useMessaging((state) => state.membersByKey);
   const statusByKey = useMessaging((state) => state.statusByKey);
   const selfKey = useMessaging((state) => state.selfKey);
+  const startDM = useMessaging((state) => state.startDM);
+  const placeNavigate = usePlaceNavigate();
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [failedKey, setFailedKey] = useState<string | null>(null);
 
   const members = useMemo(
     () =>
@@ -29,11 +34,8 @@ export function MemberList() {
         {members.map((member) => {
           const key = participantKey(member.participant);
           const status = statusByKey[key];
-          return (
-            <div
-              key={key}
-              className="flex items-center gap-2.5 rounded-md px-2 py-1.5"
-            >
+          const content = (
+            <>
               <ParticipantAvatar
                 participantKey={key}
                 name={member.displayName}
@@ -50,9 +52,73 @@ export function MemberList() {
                   ) : null}
                 </span>
                 <span className="block truncate text-[11px] text-muted-foreground">
-                  {status?.note ? status.note : member.tagline}
+                  {pendingKey === key
+                    ? "DMを開始しています…"
+                    : status?.note
+                      ? status.note
+                      : member.tagline}
                 </span>
               </span>
+            </>
+          );
+          if (key === selfKey) {
+            return (
+              <div
+                key={key}
+                className="flex items-center gap-2.5 rounded-md px-2 py-1.5"
+              >
+                {content}
+              </div>
+            );
+          }
+          return (
+            <div key={key}>
+              <button
+                type="button"
+                title={`${member.displayName}にDMを送る`}
+                aria-label={`${member.displayName}にDMを送る`}
+                aria-busy={pendingKey === key}
+                disabled={pendingKey !== null}
+                onClick={async () => {
+                  const currentIdentity = getMessagingSessionIdentity();
+                  const expectedSelfKey = selfKey;
+                  setPendingKey(key);
+                  setFailedKey(null);
+                  try {
+                    const place = await startDM([member.participant]);
+                    const sessionChanged =
+                      getMessagingSessionIdentity() !== currentIdentity ||
+                      useMessaging.getState().selfKey !== expectedSelfKey;
+                    if (sessionChanged) {
+                      throw new Error(
+                        "Messaging session changed before DM navigation",
+                      );
+                    }
+                    placeNavigate(place);
+                  } catch {
+                    if (
+                      getMessagingSessionIdentity() === currentIdentity &&
+                      useMessaging.getState().selfKey === expectedSelfKey
+                    ) {
+                      setFailedKey(key);
+                    }
+                  } finally {
+                    setPendingKey(null);
+                  }
+                }}
+                className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-accent/60 disabled:opacity-60"
+              >
+                {content}
+              </button>
+              {failedKey === key ? (
+                <p
+                  role="alert"
+                  aria-live="assertive"
+                  className="px-2 pb-1 text-[11px] text-rose-500"
+                >
+                  DMを開始できませんでした。もう一度押してください
+                </p>
+              ) : null}
             </div>
           );
         })}
