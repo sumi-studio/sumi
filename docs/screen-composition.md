@@ -169,7 +169,7 @@ agentが実際のtarget ToolCallを`Elevated`として提案したときの受�
 
 「将来のルールを設定…」では、常に許可、明示した期限まで許可、永続拒否を選べる。
 これはcurrent-call decisionと同じpayloadにせず、別の認証済みstanding-policy mutationとして
-送る。対象scope、precedence、expiry上限、appごとのrule語彙はADR 0012の未決事項であり、
+送る。対象scope、precedence、expiry上限、appごとのrule語彙はADR 0013の未決事項であり、
 opaqueな`ApproveAlways` ruleを先にwireへ戻さない。設定にはruleの一覧・編集・削除画面を置く。
 Humanがcard上で対象やscopeを狭める場合は部分承認せず、digestの異なる新callとして
 Escalation AutoReviewから再提示する。Human-account one-shotをstanding grantへ変換しない。

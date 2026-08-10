@@ -1,4 +1,4 @@
-# ADR 0012: Tool invocation route・二種類のAutoReview・execution authority provenance
+# ADR 0013: Tool invocation route・二種類のAutoReview・execution authority provenance
 
 - Status: Accepted
 - Date: 2026-08-10
@@ -240,13 +240,17 @@ compatibility branchを作らない。
 
 次は本ADRで推測して埋めず、実装前に明示決定する。
 
-1. Normalのexplicit `Deny`を観測した後、同じactionをElevatedで提案できる条件。
-2. Normal/Elevatedおよび要求authority provenanceを各providerのtool-call表現へ載せる
+1. agentがNormalとして提案したcallに対し、pre-routing / standing policyが
+   「Elevatedとして新しいcallを提案し直すこと」を要求できるか。許す場合も、
+   既存のNormal callを途中変換・replayしたり、Deny / BlockをHuman promptへ
+   fallbackしたりせず、別のexplicit Elevated ToolCall proposalとして型付ける。
+2. Normalのexplicit `Deny`を観測した後、同じactionをElevatedで提案できる条件。
+3. Normal/Elevatedおよび要求authority provenanceを各providerのtool-call表現へ載せる
    provider-neutral encoding。
-3. reviewerのretry回数、timeout、circuit breakerの具体値。
-4. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
-5. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
-6. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
+4. reviewerのretry回数、timeout、circuit breakerの具体値。
+5. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
+6. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
+7. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
 
 これらが未決でも、non-positive reviewをHumanへfallbackしないこと、routeとauthority sourceを
 同一視しないこと、Human-account one-shotをstanding policyへ変換しないこと、hard deny・

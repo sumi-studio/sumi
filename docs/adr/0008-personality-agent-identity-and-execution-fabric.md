@@ -154,6 +154,42 @@ public route contractとしたりしない。name、membership、scope-local add
 `Sumi Workspace`は共有のproduct/domain resourceである。各人格agentの
 private VMはWorkspaceそのものではなく、agentの私物PCに相当する。
 
+Workspaceに`personal | organization`のkindは置かない。personalは、一人のHumanと
+そのHumanが明示的に参加させた人格agentだけがいる通常のWorkspaceという
+縮退トポロジである。参加者が増えたり将来Organizationとrelationを持ったりしても
+Workspaceの種類やidentityを変換しない。billing、SSO、organization policyは
+Workspace kindではなく、必要になった時に明示的なrelation / policyとして追加する。
+
+appの所属先は次の和型で表し、全appをWorkspaceに押し込まない。
+
+```text
+AppInstallationOwnerRef = Workspace(WorkspaceId) | Participant(ParticipantRef)
+```
+
+Messagingのような共有appはWorkspaceに、alarm・Direct Chat・個人のlife logのような
+personal appはParticipantにinstallする。appのcanonical descriptorは使えるowner kindを
+明示し、client都合で別scopeへ推測・複製しない。両scopeを持つappは、
+Workspace installationとParticipant installationを別recordとして持つ。
+
+`AppInstallationOwnerRef`はinstallation・config・lifecycleを束縛するownerであり、
+app内の全data resourceのownerやauthorization principalを上書きしない。たとえば
+Direct Chatのmessage、参加者、可視性はDirect Chat自身のdomain contractに従う。
+
+install / enable / disable / uninstallは`AppInstallationOwnerRef`を受ける同じdomain
+operationとauthorization ruleにする。HumanとPersonalityAgentに別operationを作らず、
+transportだけをUIとtool/APIで変える。同じoperationは同じ権限を無条件に与える意味ではなく、
+appはactorのmembership・role・owner relationを同じcommit時認可で評価する。disableは
+entry surfaceとbackground activityを停める可逆操作で、dataとinstallation recordは保持する。
+uninstallはinstallation bindingを外すが、
+app dataの消去やretention、credential・permission grantの取消はapp所有の明示的な別operationとし、
+uninstallの暗黙の副作用にしない。
+
+現行Webの`AppDescriptor`はUI projectionであり、このinstallation lifecycleや
+owner bindingの正本ではない。canonical app catalog / descriptor、installation正本、
+config、credential、permission grantの実装は別incrementで行うが、そこでこのowner和型と
+Human / Agent parityを崩さない。appのenable/disableはWorkspace・Participant・place・
+provenance・notification intent・membership / roleといった共通spineのidentityを切断しない。
+
 人格agent同士の協働は同じVMへ入ることではなく、Workspace上の共有resource、
 会話、task、権限付きaction、明示的なdelegationを通して行う。
 
@@ -358,7 +394,7 @@ process epochを識別する。VM boot、runtime generation、RPC process boot�
 みなさない。T26は後続のauthority verifierを差し込める明示的なseamを保つ。
 exact action、scope、audience、lifetime、idempotencyへ束縛する具体contractは
 [#77](https://github.com/sumi-studio/sumi/issues/77)で実装する。その意味論は
-[ADR 0012](0012-tool-invocation-routes-and-authority-provenance.md)に従い、
+[ADR 0013](0013-tool-invocation-routes-and-authority-provenance.md)に従い、
 人格agent自身のauthorityで行う`Normal`と、認証済みHumanのaccount/authorityを
 exact call一件だけ借りるauthority provenanceを混同しない。
 
@@ -495,7 +531,7 @@ resultを保存できる。
   typeはT26 completionに含めない。人格agent本人をworker-poolの一variantや
   必須proxyのclientとして実装しない。
 - #77のper-call authority verifierの完全実装もT26 completionに含めない。
-  ただしADR 0012の`Normal | Elevated` route、Human one-shot authority、effect前の
+  ただしADR 0013の`Normal | Elevated` route、Human one-shot authority、effect前の
   provenance永続化を後続で実装できるseamを保ち、RPC lifecycle identityをaction
   authorityとみなさない。
 - full PTY実装もT26 completionの自動条件にしない。現行Bashを人格agent本人の

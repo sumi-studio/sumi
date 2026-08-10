@@ -404,7 +404,7 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: ValidatedToolArguments,  // live受信時はstrict parse + Object + tool schema通過済み
     /// strict検証境界で確定し、policy/review/approval/execution/recoveryを通じて不変。
-    /// provider-neutralなwire encodingはADR 0012の未決事項であり、欠落をNormalへ補わない。
+    /// provider-neutralなwire encodingはADR 0013の未決事項であり、欠落をNormalへ補わない。
     pub route: ToolInvocationRoute,
     /// routeとは別軸。NormalはAgentOwnだけ、Elevatedは後二者のいずれかを要求する。
     pub requested_authority: RequestedExecutionAuthority,
@@ -1374,7 +1374,7 @@ broker page末尾がUTF-8 scalar途中で`artifact_eof=false`なら、`valid_up_
 pi の `beforeToolCall` フック(block 可能)**[事実]**(`pi:agent/src/types.ts`、`agent-loop.ts` の該当 await 箇所)が土台。**pi のフックは Promise を返す非同期フックで、ループ側も await している** — つまり「ユーザーに聞いて返事を待つ」承認待ちは、既存のフック構造にそのまま自然に載る。Sumi はその上に承認の**状態機械**を実装する。
 
 ただしSumiの正本はpiの単一approval latticeではなく、
-[ADR 0012](../adr/0012-tool-invocation-routes-and-authority-provenance.md)の
+[ADR 0013](../adr/0013-tool-invocation-routes-and-authority-provenance.md)の
 `Normal | Elevated` routeである。strict検証済み`ToolCall`自身がrouteをimmutableに持ち、
 globalなreviewer/approval modeで一括切替しない。
 genericな別`request_permission` toolは置かない。authority requestは実際のtarget ToolCallを
@@ -1477,7 +1477,7 @@ Human/agent membership、role、resource visibility、domain invariantをcommit�
 両者から借りる設計原則は、**決定論的policy・sandbox・model review・永続rule追加を
 別レイヤにし、モデル判定を権限境界そのものにしないこと**である。上記は参照実装の
 事実であり、Sumiが`NeedsApproval → reviewer → manual fallback`やglobal modeを採用する
-根拠ではない。Sumi固有のrouteと二種類のreview semanticsは§9.2およびADR 0012を正本とする。
+根拠ではない。Sumi固有のrouteと二種類のreview semanticsは§9.2およびADR 0013を正本とする。
 
 ### 9.4 CanonicalAction と決定論的policy (`action.rs` + `policy.rs`)
 
@@ -1521,7 +1521,7 @@ pub enum NormalPolicyDecision {
 - standing Allow/Deny policyは「常に許可」「明示した絶対expiryまで許可」「永続拒否」と一覧・編集・削除UIを提供する。ただしrule表現、scope、duration上限、優先順位は未決であり、Elevatedのcurrent-call decisionから作らない。旧`approval_rules`/opaqueな`ApproveAlways`をM5の完成contractにせず、別の認証済みpolicy mutationとして設計する
 - Execution AutoReviewのAllowは永続化しない。policy変更時はExecution review cacheだけを全破棄し、Escalation review cacheと共有しない
 - `CanonicalAction`はexecutor/決定論的policy用のruntime内部正本であり、reviewer APIへserializeしない。`SecretAwareActionProjector`はargv、環境代入、header、URL query/userinfo、justification、path中のcredentialをRedactor+credential inventoryで分類し、secret値をkindとkeyed digestだけの`SecretRef`へ置換する。同じsecretの同一性比較はできるが値は復元できない。redactionでhost/operation/affected path/permission scope等の判定材料が失われる場合は推測で埋めず`InsufficientEvidence`とする
-- routeはrisk categoryから自動導出しない。Normal/Elevatedはagentがcallごとに選び、policy bundleが何をexplicit Allow/Denyするか、およびmissing/stale bundleの挙動はADR 0012の未決事項として残す
+- routeはrisk categoryから自動導出しない。Normal/Elevatedはagentがcallごとに選ぶ。policyが新しいElevated proposalを要求できるか、policy bundleが何をexplicit Allow/Denyするか、およびmissing/stale bundleの挙動はADR 0013の未決事項として残す。どの決定でも既存Normal callの途中変換・replayやDeny/BlockからHuman promptへのfallbackは許さない
 
 ### 9.5 二種類のreviewer (`reviewer.rs`)
 
@@ -1657,7 +1657,7 @@ snapshotし、1回の`TurnStart`後に各user `MessageStart/End`をseq順で同�
 
 ## 10. 永続化(`store/`)
 
-SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・公開チャット transcript・暗号化 provider context・恒久イベント・current-call approval/review監査)だけで、ドメインデータは複製しない。standing Allow/Deny policyの正本とagent-local materialized cacheはADR 0012の未決を解消してから置き、現行agent DBを暗黙の正本にしない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する。
+SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・公開チャット transcript・暗号化 provider context・恒久イベント・current-call approval/review監査)だけで、ドメインデータは複製しない。standing Allow/Deny policyの正本とagent-local materialized cacheはADR 0013の未決を解消してから置き、現行agent DBを暗黙の正本にしない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する。
 
 Cloud 版は volume/backup の基盤暗号化に加えて、置換可能な control-plane の tenant KEK outer wrap → `PersonalityAgentId` が所有する agent 鍵 → transcript/event/memory-summary/artifact/provider-context/workspace の用途別鍵、という階層で envelope encryption する。tenant／Workspace／org は認可・所属contextであって、agent 鍵やdataのowner identityではない。control-plane policyによるouter agent-key wrapの交換は、life logやdata本体を再暗号化せずに行う。multi-wrap、membership/transfer、recovery ceremonyはこの縦切りでは実装しない。
 
@@ -1908,7 +1908,7 @@ CREATE TABLE memory_apply_cursors (
   next_batch_seq INTEGER NOT NULL
 );
 
--- standing Allow/Deny policyの正本・scope・precedence・expiry/revocationはADR 0012の未決事項。
+-- standing Allow/Deny policyの正本・scope・precedence・expiry/revocationはADR 0013の未決事項。
 -- current-call approvalと同じmutation/tableへ偽装せず、contract確定後に別schemaで追加する。
 CREATE TABLE approval_log (
   id TEXT PRIMARY KEY,              -- request_id
@@ -2988,12 +2988,12 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 - `approval/`(immutable route、authority provenance、CanonicalAction、secret-aware projection、Normal policy、二種類のAutoReview、current-call ApprovalBroker)+ `gateway/ws.rs`/`gateway/supervisor.rs`(第11章)+ M3で凍結した contracts の互換性確認 + apiclient 雛形
 - **ゲート**:
-  1. validated ToolCallがimmutable `Normal | Elevated` routeとrequested authority provenanceを持ち、欠落・途中変更をfail-closedに拒否する。provider-neutral encodingは実装開始前にADR 0012の未決を解消する
+  1. validated ToolCallがimmutable `Normal | Elevated` routeとrequested authority provenanceを持ち、欠落・途中変更をfail-closedに拒否する。provider-neutral encodingは実装開始前にADR 0013の未決を解消する
   2. Normalのshell fixture (`&&`, pipe, newline, subshell, heredoc, interpreter wrapper)をsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外はUnmatchedにする。Denyはreviewer/Human promptとも0件
   3. Normal/UnmatchedだけがExecution AutoReviewへ進み、`Allow`だけがagent-own exact callを一回実行する。`Block`、timeout、invalid JSON、transport error、未許可trust domain、InsufficientEvidenceは実行0件かつHuman prompt 0件
   4. Elevatedだけが別prompt/schemaのEscalation AutoReviewへ進み、`AskHuman`だけが`ApprovalRequested + pending`を作り、実行は0件。`Block`と全failureはHuman prompt/実行とも0件。二reviewerのrequest/result型、prompt/schema version、cache、metricを交差利用しない
   5. Gateway認証済みcurrent-call decisionのApproveOnceだけがexact callを一回進め、DenyOnce、wrong actor/action/scope、stale/replay、二重消費はblockする。approval後のprovenanceを`AgentOwnWithHumanConsent | HumanAccountOneShot`で区別し、後者だけが本当のHuman accountとevent-time auth contextを使う
-  6. current-call UIは「今回だけ承認」「今回だけ拒否」を扱う。別のstanding policy UIは「常に許可」「明示expiryまで許可」「永続拒否」とrule一覧・編集・削除を扱う。current-call decisionとpolicy mutationを別payload/audit/transactionにし、Human-account one-shotをstanding grantへ変換しない。rule scope/precedence/expiry上限は実装前にADR 0012の未決を解消する
+  6. current-call UIは「今回だけ承認」「今回だけ拒否」を扱う。別のstanding policy UIは「常に許可」「明示expiryまで許可」「永続拒否」とrule一覧・編集・削除を扱う。current-call decisionとpolicy mutationを別payload/audit/transactionにし、Human-account one-shotをstanding grantへ変換しない。rule scope/precedence/expiry上限は実装前にADR 0013の未決を解消する
   7. 承認待ち中のuser_messageがsoft steerとして機能し、current-call decisionとAbortも即時処理される。`ApprovalRequested + pending`直後をkillし、再起動後にpendingをCancelledで閉じて保存済みsoft steerへ一度だけ継続する。route、authority provenance、action digest、policy/reviewer/prompt/schema version、Human event-time contextを`ToolExecutionStart`前にdurable化する
   8. review Allow、Human consent、standing Allowの後もexecutor sandboxとapp-owned commit-time authorizationを維持し、内部状態・追加network・別principalの権限を暗黙に得ない。web→api→agent E2Eでstream/tool/steer/current-call approvalと別のpolicy管理操作を確認する
   9. 1MB 超または non-empty `attachments` の user_message は API が command の seq 採番前に拒否し、直後の正常 command が欠番なく agent へ届く。この一次検証が漏れて envelope 外形(`seq`/`command_id`/canonical `personality_agent_id`)が読め、認証済みGateway内のinternal targetが接続claimと一致する超過分が agent まで届いた場合、agent 側の保険経路は接続を切らず `reject_reason=oversized` の terminal `Rejected` ACK で seq を消費する。oversizedは`payload_ciphertext=NULL`だが`payload_key_ref/payload_hmac/reject_actual_bytes`は非NULLで保存する。commit直後にkill/restart・再接続しても同じACKを再送し、同じseq/command_id/sizeで1byteだけ異なる本文を再送したfixtureはHMAC不一致のfatal protocol violationになり、両half終了後にcredential refresh/connect/new epochを行わない。non-empty attachments/schema violationでは暗号化payloadとdigest/reject reasonから同じACKを再構築する。外形をparse/validateできない場合、internal targetが接続claimと不一致の場合、または既存`command_id`の`seq`・HMAC・payloadが保存値と不一致の場合は、seqを消費せずepochを閉じfatal protocol violationとしてsupervisorを停止する
@@ -3027,13 +3027,13 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 |---|---|---|
 | D1 | **暗号化チャット原文の置き場所** | agent ローカル SQLite を実行・復旧の正本とし、api 側へ暗号化イベント/履歴projectionをdurable mirrorする。web の履歴取得はapiから行う。平文projectionは常にredactedとする |
 | D2 | **Compact 用モデル** | 既定はdirect-chatと同じモデル。event-time authorization policyが明示許可した同一data-processing/trust domain内では別のCompactモデルを選べる。どちらも内部に`Vec<PublicMessage>`だけを持つ専用`CompactionInput`を送り、Thinking(constructorが除去)/opaque provider contextは送らない。trust domain未設定の別providerは拒否する |
-| D3 | **tool callの通常/昇格経路** | tool categoryごとのglobal Auto/Askは置かない。agentがcallごとに`Normal | Elevated`をimmutableに選ぶ。Normalはexplicit Allow/Deny/Unmatched、Elevatedは別preflight後のcurrent-call Human decisionへ進む。policy bundleの初期値とmissing/stale時の挙動はADR 0012の未決として実装前に決める |
+| D3 | **tool callの通常/昇格経路** | tool categoryごとのglobal Auto/Askは置かない。agentがcallごとに`Normal | Elevated`をimmutableに選ぶ。Normalはexplicit Allow/Deny/Unmatched、Elevatedは別preflight後のcurrent-call Human decisionへ進む。policyが別のElevated proposalを要求できるか、policy bundleの初期値とmissing/stale時の挙動はADR 0013の未決として実装前に決める。既存Normal callは途中変換・replayしない |
 | D4 | **承認待ちのタイムアウト** | 無限待ち+通知タブに滞留。§9.8 のとおり待機中のuserメッセージはPendingをCancelledにして閉じ、モデルが必要ならtool callを再発行する。**Founder確認済み(2026-07-18)** |
 | D5 | **ツール実行中のハードステア** | ツールは完走させて次の注入境界でsoft steerする。「今すぐ止めて」はabortとして分離する |
 | D6 | **current-call decision / standing Allow・Deny policy** | current-call UIの今回だけ承認/拒否と、別の認証済みstanding-policy mutationを分ける。standing policy UIは常に許可、明示expiryまで許可、永続拒否とrule一覧/編集/削除を扱う。正本候補はapi/control plane、agentはversioned materialized cacheだが、scope/precedence/expiry/revocationとmissing/stale挙動は未決。Human-account one-shotをstanding grantへ変換しない |
 | D7 | **モデル構成** | Cloud production/live acceptance profile は OpenAI Responses を使う。Chat Completions と Anthropic の adapter/profile 実装は維持し、fixture/contract coverageを必須とする。Moonshot/Z.ai/Umans direct credential と課金設定はdeveloper qualification用であり、T25 Cloud live gateの前提にしない |
 | D8 | **OpenAPI→Rust クライアント生成** | 現状1 endpointなので手書きで開始し、domain APIが3本を超えたらprogenitor導入を別ADRで判断する |
-| D9 | **二種類のAutoReview / model** | product-wide ReviewerModeは置かない。Normal/UnmatchedはExecution(`Allow|Block`)、ElevatedはEscalation(`AskHuman|Block`)へ型で分岐し、prompt/schema/cache/metricを共有しない。固定prompt本文は用途ごとの`.md`を正本とし、Rustへinlineしない。non-positive/failureはBlockで、ExecutionからHuman、Escalationから実行へfallbackしない。許可済みtrust domainだけへsecret-aware projectionを送り、raw CanonicalActionは送らない。retry/timeout/Strict shadow instrumentationの具体形はADR 0012の未決 |
+| D9 | **二種類のAutoReview / model** | product-wide ReviewerModeは置かない。Normal/UnmatchedはExecution(`Allow|Block`)、ElevatedはEscalation(`AskHuman|Block`)へ型で分岐し、prompt/schema/cache/metricを共有しない。固定prompt本文は用途ごとの`.md`を正本とし、Rustへinlineしない。non-positive/failureはBlockで、ExecutionからHuman、Escalationから実行へfallbackしない。許可済みtrust domainだけへsecret-aware projectionを送り、raw CanonicalActionは送らない。retry/timeout/Strict shadow instrumentationの具体形はADR 0013の未決 |
 | D10 | **`provider_native` mode の運用** | agentのprovider-context設定で`sumi_three_layer`(既定)または`provider_native`を選択できる。native対応とfingerprint一致を組立時に必須とし、非対応・不一致・native call失敗時はイベントを残して`sumi_three_layer`へ安全にfallbackする。native発火点は `min(native_compaction_trigger_tokens, context_window×0.8)`、通常は完了turnあたり最大1回、provider overflow時だけ即時1回を許す。mode切替はprovider contextを同一transactionでinvalidateし、公開transcriptと3層メモリの保守は常に継続する |
 | D11 | **production runtime bootstrap境界** | T15は注入済みSession/Run coreに加え、限定的なretry-wait control injection、idle/post-run Abort cutoff、bounded control/cancellation/phase seamsを既に所有する。T16はactive/live分類、run/provider/tool/approval active中のcutoff、steer group snapshot、owner移譲、live selectsを完成・受入し、T15の限定挙動で代替しない。完了済みT13はtools/executor境界までとし、未完了のT13Bが現行executor-local usersを中立`runtime/contracts.rs`へ移してProcessGeneration/lease/fence/nonce値型だけを凍結する。T17は認証identity/`ProcessGeneration`/共有型のlease-backed recovery fence下でStoreをhydrationし、`HydratedRunState`/physical recovery intents/stable identity付きhydration receiptだけを返す。空intentsはT26発行fenceだけで完了し、非空intentsはT27が`receipt_id`+digest+lease+`tool_call_id` canonical exact intent setを束縛・永続化した`PhysicalRecoveryReceipt`再注入までfail-closedにする。`command_id/run_id/executor_generation`は親tool executionのimmutable attestationである。T17はT27 proof storeと別のapplication ledgerへcanonical key/attestation、logical suffix、`indeterminate` terminalを同一transactionで記録し、完全一致のcrash後replayだけをalready-appliedへ収束させ、stale/mismatch/conflict/reused-ID-different-digestを拒否する。T26は共有型を再定義せずpersistent monotonic `ProcessGeneration` allocator/issuanceとproduction lease acquisition、およびT21 ThreeLayerMemory、T23 ApprovalBroker、production ToolRegistry、T24 Gateway、executor境界から唯一のproduction RunCoreを構成する。`HydrationReady`はgenerationごとのNotReady→immutable Ready latchで、stable receipt identityへ束縛し、rollover前/同時に旧Readyをinvalidateする。各helloはcurrent stateを観測し、旧generation Readyを拒否する。`ConnectionEpoch`はT24-local、T24は各ConnectionEpochへopaque `DeliveryEpoch`をexactly onceで1つmint/mapして終了時にinvalidateし、旧DeliveryEpochのlate frame/errorを拒否・dropする。T17 DeliveryPumpは現在install済みのopaque DeliveryEpochだけを受け入れ、構築・invalid化・stale判定を行わない。`RpcBootNonce`はexecutor/broker RPC専用でProcessGenerationと対にする。T27は非空intentsとT26 leaseを使う旧世代reap・quota・descendant cleanup・crash recoveryとphysical proof receiptを所有し、T17 application ledgerを所有しない。NotReady中はbounded hold/backpressureまたはfail-closedで、ready前のACK/provider/executorを禁止する。M0 admission echoはT26まで維持するが完成証拠にせず、stdioはlocal注入harnessに限定し、env/default identity、silent empty context、no-tool、fresh-only縮退を置かない |
 

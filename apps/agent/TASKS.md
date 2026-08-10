@@ -238,15 +238,15 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 ### T22: approval/ action + policy 【要T16】
 
-- 読む: ADR 0012、§9.1〜§9.4 **全体**(Codex/Claude Code 調査結果含む)、#54/#77/#134、pi: `agent-loop.ts` の beforeToolCall 部
+- 読む: ADR 0013、§9.1〜§9.4 **全体**(Codex/Claude Code 調査結果含む)、#54/#77/#134、pi: `agent-loop.ts` の beforeToolCall 部
 - 作る: `src/approval/mod.rs`(ApprovalBroker 骨格)、`action.rs`、`policy.rs`
-- やること: strict検証済み`ToolCall`にimmutable `Normal | Elevated` routeとrequested authority provenanceを持たせる(provider-neutral encodingはADR 0012の未決事項として先に決定)。`CanonicalAction`はruntime内部正本でwire/DBへraw保存しない。Normal policyはexplicit `Allow | Deny | Unmatched`だけを返す。shell複合commandをsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外(heredoc・動的eval・解析不能を含む)はUnmatched。managed hard deny/sandbox/app commit時認可は別の非override境界にする。`SecretAwareActionProjector`はsecretをkind+keyed digestへ置換し、判定材料不足を`InsufficientEvidence`にする。standing policyはcurrent-call approvalと別contractであり、旧`ApproveAlways`/`NeedsApproval`をNormal latticeへ残さない
+- やること: strict検証済み`ToolCall`にimmutable `Normal | Elevated` routeとrequested authority provenanceを持たせる(provider-neutral encodingはADR 0013の未決事項として先に決定)。policyがagentに別のElevated proposalを要求できるかも先に決定し、どちらでも既存Normal callの途中変換・replayやDeny/BlockからHuman promptへのfallbackは実装しない。`CanonicalAction`はruntime内部正本でwire/DBへraw保存しない。Normal policyはexplicit `Allow | Deny | Unmatched`だけを返す。shell複合commandをsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外(heredoc・動的eval・解析不能を含む)はUnmatched。managed hard deny/sandbox/app commit時認可は別の非override境界にする。`SecretAwareActionProjector`はsecretをkind+keyed digestへ置換し、判定材料不足を`InsufficientEvidence`にする。standing policyはcurrent-call approvalと別contractであり、旧`ApproveAlways`/`NeedsApproval`をNormal latticeへ残さない
 - 受け入れ: route欠落/変更をfail-closed、NormalのAllow/Deny/Unmatchedをshell fixtureで固定、explicit Denyでreviewer/Human prompt 0件、raw action/secretがwire・DB・reviewerへ出ないこと。policy missing/staleの挙動とstanding ruleのscope/precedence/expiryは未決を解消してからfixture化する
 - コミット: `agent: CanonicalActionと決定論的policy (M5 1/3)`
 
 ### T23: approval/ reviewer + broker 統合 【要T22】
 
-- 読む: ADR 0012、§9.2(状態機械)、§9.5〜§9.8 **全体**、D4/D6/D9
+- 読む: ADR 0013、§9.2(状態機械)、§9.5〜§9.8 **全体**、D4/D6/D9
 - 作る: `src/approval/reviewer.rs`、`prompt.rs`、`prompts/approval/execution-review.md`、`prompts/approval/escalation-review.md`、ApprovalBroker 完成+Session 結線(T15 の fixture driver を置換。T12 で凍結した `approval_log` transaction 契約へ接続)
 - やること: §9.2の二経路を型で実装する。Normal/UnmatchedはExecution AutoReview(`Allow | Block`)へ進み、non-AllowはblockしてHuman prompt 0件。Elevatedは別prompt/schemaのEscalation AutoReview(`AskHuman | Block`)へ進み、AskHumanだけがPendingを作る。Human current-call decisionは`ApproveOnce | DenyOnce`で、approval後のprovenanceを`AgentOwnWithHumanConsent | HumanAccountOneShot`として別に確定する。後者はGateway認証済みHuman actor・event-time authorization context・exact action digest・one-shot消費へ束縛する。route/authority/digest/policy/reviewer/prompt/schema versionを`ToolExecutionStart`前にdurable化する。productionの固定prompt本文は人格system/Compact/reviewerを含め用途ごとの`.md`を正本とし、Rustへinlineしない。二reviewerの型/prompt `.md`/schema/cache/metricを共有しない。soft steer/abort/recoveryはPendingをCancelledに閉じ、同一batchの未開始toolもCancelled確定する。retry/timeout/circuit breaker、Strictのshadow扱いはADR未決を先に解消する
 - 受け入れ: Normal explicit AllowとExecution-review Allowだけがagent-own実行、Normal Deny/Execution non-AllowでHuman prompt 0件、Escalation AskHumanは実行0件でpendingだけ、Escalation non-AskHumanはprompt/実行0件。Human consent付きagent実行とHuman-account one-shotを別provenanceでE2Eし、wrong actor/action/scope、replay、二重消費を拒否する。current-call decisionにopaque`ApproveAlways`がなく、standing policy mutationが別command/auditであること、productionの固定prompt本文が用途ごとの`.md`だけに存在してRust inline promptがないこと、secret置換、承認待ちsteer、sandbox/app認可非拡大、M2 durability fixtureを固定する
