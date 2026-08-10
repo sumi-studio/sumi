@@ -17,11 +17,10 @@ const (
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
-	// LocalNotificationSettingsPath is both the read and the write of the
-	// agent's own notification setting. The agent owns the identical resource a
-	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
-	// agentはtool). The messaging tool that calls it lands with #209; the口 is
-	// here so the capability is not UI-only in the meantime.
+	// LocalNotificationSettingsPath reads and writes the same app-owned
+	// notification-setting resource for a PersonalityAgent that the Human UI
+	// uses for a Human. This adapter route does not itself define which agent
+	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
 )
 
