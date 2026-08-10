@@ -14,14 +14,17 @@ import (
 // created/updated events are not replayed either — the durable truth is the
 // places table, and a reconnecting client re-reads it via bootstrap.
 type Event struct {
-	Type    string           `json:"type"`
-	PlaceID string           `json:"place_id,omitempty"`
-	Message *messageWire     `json:"message,omitempty"`
-	Actor   *participantWire `json:"actor,omitempty"`
-	Status  *statusWire      `json:"status,omitempty"`
-	Marker  *replyLaterWire  `json:"marker,omitempty"`
-	Channel *channelWire     `json:"channel,omitempty"`
-	DM      *dmWire          `json:"dm,omitempty"`
+	Type    string       `json:"type"`
+	PlaceID string       `json:"place_id,omitempty"`
+	Message *messageWire `json:"message,omitempty"`
+	// Reaction is an absolute reaction-only projection. It deliberately does
+	// not carry the rest of a message, which may have been edited concurrently.
+	Reaction *reactionUpdateWire `json:"reaction,omitempty"`
+	Actor    *participantWire    `json:"actor,omitempty"`
+	Status   *statusWire         `json:"status,omitempty"`
+	Marker   *replyLaterWire     `json:"marker,omitempty"`
+	Channel  *channelWire        `json:"channel,omitempty"`
+	DM       *dmWire             `json:"dm,omitempty"`
 	// Thread rides on place_created scoped to the parent place, so everyone
 	// who can see the parent learns the side conversation exists.
 	Thread *threadWire `json:"thread,omitempty"`
@@ -51,8 +54,8 @@ const (
 	EventMessageEdited   = "message_edited"
 	EventMessageDeleted  = "message_deleted"
 	EventReactionUpdated = "reaction_updated"
-	// EventPollUpdated carries the whole message after a vote, like
-	// reaction_updated: the durable truth is the vote rows, this is the fan-out.
+	// EventPollUpdated carries the whole message after a vote. The durable truth
+	// is the vote rows; this event is only the fan-out projection.
 	EventPollUpdated        = "poll_updated"
 	EventTyping             = "typing"
 	EventStatusUpdated      = "status_updated"

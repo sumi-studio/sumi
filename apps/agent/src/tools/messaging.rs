@@ -115,13 +115,14 @@ enum MessagingAction {
         #[serde(default)]
         reply_to: Option<String>,
     },
-    /// Toggle an emoji reaction on a message visible in the open place.
+    /// State the desired emoji reaction on a message visible in the open place.
     React {
         #[serde(default)]
         message_id: Option<String>,
         #[serde(default)]
         seq: Option<u64>,
         emoji: String,
+        reacted: bool,
     },
     /// Declare one's own attention state.  Unlike every other action this one
     /// is not about a place: it is about the person, so no view need be open.
@@ -436,7 +437,7 @@ fn messaging_parameters_schema() -> Value {
             "Choose one messaging action and include only the fields used by that action. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
             "or limit; write requires content and may include urgency or reply_to; react ",
-            "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
+            "requires emoji, reacted, and exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; profile may include display_name ",
             "or tagline and reads the current profile when neither is given; ",
@@ -471,7 +472,7 @@ fn messaging_parameters_schema() -> Value {
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
                     "shows one place and focuses it for later writes; write sends a message to ",
-                    "the currently open place; react toggles an emoji reaction on a message ",
+                    "the currently open place; react states whether your emoji reaction is ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; profile reads or changes your own display name and the ",
@@ -633,8 +634,16 @@ fn messaging_parameters_schema() -> Value {
             "emoji": {
                 "type": "string",
                 "description": concat!(
-                    "Required for react and omitted for other actions. Emoji to toggle on the ",
-                    "target message; reacting again with the same emoji removes your reaction."
+                    "Required for react and omitted for other actions. Emoji whose desired ",
+                    "state is being stated on the target message."
+                )
+            },
+            "reacted": {
+                "type": "boolean",
+                "description": concat!(
+                    "Required for react and omitted for other actions. True ensures your ",
+                    "reaction is present; false ensures it is absent. Repeating either state ",
+                    "is safe and does not invert it."
                 )
             },
             "status": {
@@ -996,6 +1005,7 @@ impl Tool for MessagingTool {
                 message_id,
                 seq,
                 emoji,
+                reacted,
             } => {
                 let place_id = state.focused_place_id.clone().ok_or_else(|| {
                     ToolError::Protocol(
@@ -1010,6 +1020,7 @@ impl Tool for MessagingTool {
                         place_id: &place_id,
                         message_id: &target.message_id,
                         emoji: &emoji,
+                        reacted,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?
@@ -1463,6 +1474,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             message_id,
             seq,
             emoji,
+            ..
         } => {
             validate_visible_selector(message_id, seq)?;
             if emoji.is_empty()
@@ -1978,7 +1990,7 @@ mod tests {
         calls: AsyncMutex<Vec<String>>,
         reads: AsyncMutex<Vec<(String, u64)>>,
         writes: AsyncMutex<Vec<(String, String, String)>>,
-        reacts: AsyncMutex<Vec<(String, String, String)>>,
+        reacts: AsyncMutex<Vec<(String, String, String, bool)>>,
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
         profiles: AsyncMutex<Vec<(Option<String>, Option<String>)>>,
         role_reads: AsyncMutex<Vec<Option<String>>>,
@@ -2050,11 +2062,12 @@ mod tests {
                 request.place_id.to_owned(),
                 request.message_id.to_owned(),
                 request.emoji.to_owned(),
+                request.reacted,
             ));
             Ok(json!({
-                "message": {"message_id": request.message_id,
-                            "reactions": [{"emoji": request.emoji, "participants": []}]},
-                "reacted": true
+                "message_id": request.message_id,
+                "reactions": [{"emoji": request.emoji, "participants": []}],
+                "reacted": request.reacted
             }))
         }
 
@@ -2515,6 +2528,7 @@ mod tests {
         );
         assert_eq!(schema["properties"]["seq"]["minimum"], 1);
         assert_eq!(schema["properties"]["emoji"]["type"], "string");
+        assert_eq!(schema["properties"]["reacted"]["type"], "boolean");
         assert_eq!(schema["properties"]["message_id"]["type"], "string");
         assert_eq!(
             schema["properties"]["status"]["enum"],
@@ -2568,7 +2582,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            39
+            40
         );
     }
 
@@ -2613,7 +2627,8 @@ mod tests {
         let react: MessagingAction = serde_json::from_value(json!({
             "action": "react",
             "seq": 7,
-            "emoji": "👍"
+            "emoji": "👍",
+            "reacted": true
         }))
         .unwrap();
         assert!(matches!(
@@ -2621,7 +2636,8 @@ mod tests {
             MessagingAction::React {
                 message_id: None,
                 seq: Some(7),
-                emoji
+                emoji,
+                reacted: true
             } if emoji == "👍"
         ));
 
@@ -2984,7 +3000,7 @@ mod tests {
         let tool = MessagingTool::new(api.clone());
         let error = execute(
             &tool,
-            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            json!({"action": "react", "seq": 7, "emoji": "👍", "reacted": true}),
             "react",
         )
         .await
@@ -3008,14 +3024,14 @@ mod tests {
         // By seq and by message_id, both against the visible screen.
         execute(
             &tool,
-            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            json!({"action": "react", "seq": 7, "emoji": "👍", "reacted": true}),
             "r1",
         )
         .await
         .unwrap();
         execute(
             &tool,
-            json!({"action": "react", "message_id": "m6", "emoji": "🎉"}),
+            json!({"action": "react", "message_id": "m6", "emoji": "🎉", "reacted": false}),
             "r2",
         )
         .await
@@ -3023,8 +3039,13 @@ mod tests {
         assert_eq!(
             api.reacts.lock().await.as_slice(),
             &[
-                ("general".to_owned(), "m7".to_owned(), "👍".to_owned()),
-                ("general".to_owned(), "m6".to_owned(), "🎉".to_owned()),
+                ("general".to_owned(), "m7".to_owned(), "👍".to_owned(), true),
+                (
+                    "general".to_owned(),
+                    "m6".to_owned(),
+                    "🎉".to_owned(),
+                    false
+                ),
             ]
         );
 
@@ -3032,7 +3053,7 @@ mod tests {
         // addressed by id or by seq (ADR 0011 §3).
         let error = execute(
             &tool,
-            json!({"action": "react", "message_id": "m404", "emoji": "👍"}),
+            json!({"action": "react", "message_id": "m404", "emoji": "👍", "reacted": true}),
             "r3",
         )
         .await
@@ -3040,7 +3061,7 @@ mod tests {
         assert!(matches!(error, ToolError::Protocol(_)));
         let error = execute(
             &tool,
-            json!({"action": "react", "seq": 99, "emoji": "👍"}),
+            json!({"action": "react", "seq": 99, "emoji": "👍", "reacted": true}),
             "r4",
         )
         .await
@@ -3054,11 +3075,12 @@ mod tests {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = MessagingTool::new(api.clone());
         for arguments in [
-            json!({"action": "react", "emoji": "👍"}),
-            json!({"action": "react", "message_id": "m7", "seq": 7, "emoji": "👍"}),
-            json!({"action": "react", "seq": 0, "emoji": "👍"}),
-            json!({"action": "react", "seq": 7, "emoji": ""}),
-            json!({"action": "react", "seq": 7, "emoji": "a b"}),
+            json!({"action": "react", "emoji": "👍", "reacted": true}),
+            json!({"action": "react", "message_id": "m7", "seq": 7, "emoji": "👍", "reacted": true}),
+            json!({"action": "react", "seq": 0, "emoji": "👍", "reacted": true}),
+            json!({"action": "react", "seq": 7, "emoji": "", "reacted": true}),
+            json!({"action": "react", "seq": 7, "emoji": "a b", "reacted": true}),
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
         ] {
             let error = execute(&tool, arguments, "invalid").await.unwrap_err();
             assert!(matches!(error, ToolError::InvalidArguments));
@@ -3530,7 +3552,7 @@ mod tests {
         // react to there yet.
         let error = execute(
             &tool,
-            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            json!({"action": "react", "seq": 7, "emoji": "👍", "reacted": true}),
             "react",
         )
         .await
@@ -3670,7 +3692,7 @@ mod tests {
         assert_eq!(api.writes.lock().await[0].0, "th-1");
         let error = execute(
             &tool,
-            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            json!({"action": "react", "seq": 7, "emoji": "👍", "reacted": true}),
             "react",
         )
         .await
@@ -3848,14 +3870,14 @@ mod tests {
         .unwrap();
         execute(
             &tool,
-            json!({"action": "react", "seq": 8, "emoji": "✅"}),
+            json!({"action": "react", "seq": 8, "emoji": "✅", "reacted": true}),
             "react",
         )
         .await
         .unwrap();
         assert_eq!(
             api.reacts.lock().await.as_slice(),
-            &[("general".to_owned(), "m8".to_owned(), "✅".to_owned())]
+            &[("general".to_owned(), "m8".to_owned(), "✅".to_owned(), true)]
         );
     }
 
@@ -3917,7 +3939,7 @@ mod tests {
         // opening the place first (ADR 0011 §3).
         let error = execute(
             &tool,
-            json!({"action": "react", "seq": 6, "emoji": "👍"}),
+            json!({"action": "react", "seq": 6, "emoji": "👍", "reacted": true}),
             "react-after-search",
         )
         .await

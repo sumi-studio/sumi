@@ -63,6 +63,12 @@ type Server struct {
 	// locks still provide the cross-process correctness of partial patches.
 	// Server must not be copied after first use.
 	profileMu sync.Mutex
+
+	// Reaction commits and their live projections are ordered per message.
+	// Separate messages keep independent lanes, so one hot thread cannot stall
+	// reactions everywhere else. Server must not be copied after first use.
+	reactionLocksMu sync.Mutex
+	reactionLocks   map[string]*reactionPublishLock
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -86,7 +92,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
-	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveSetReaction)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/poll/vote", s.serveVotePoll)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
@@ -373,6 +379,21 @@ func reactionsToWire(summaries []ReactionSummary) []reactionWire {
 		}
 	}
 	return out
+}
+
+// reactionUpdateWire carries only the projection it owns. A reaction event
+// must never carry stale content, mentions, edit timestamps, or poll state and
+// thereby roll a concurrent message mutation back in a client.
+type reactionUpdateWire struct {
+	MessageID string         `json:"message_id"`
+	Reactions []reactionWire `json:"reactions"`
+}
+
+func reactionUpdateToWire(messageID string, reactions []ReactionSummary) reactionUpdateWire {
+	return reactionUpdateWire{
+		MessageID: messageID,
+		Reactions: reactionsToWire(reactions),
+	}
 }
 
 func messageToWire(place Place, m Message) messageWire {
@@ -1454,37 +1475,31 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// serveToggleReaction toggles the viewer's emoji on a message. The same store
-// toggle backs the agent tool path (AX: UIだけにある操作を作らない).
-func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
+// serveSetReaction states the viewer's desired emoji state. Repeating the same
+// request is a no-op, so retries cannot accidentally undo a successful call.
+// The agent tool uses the identical store and publication boundary.
+func (s *Server) serveSetReaction(w http.ResponseWriter, r *http.Request) {
 	viewer, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Emoji string `json:"emoji"`
+		Emoji   string `json:"emoji"`
+		Reacted *bool  `json:"reacted"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if validateReactionEmoji(req.Emoji) != nil {
-		writeError(w, http.StatusBadRequest, "invalid_emoji")
+	if req.Reacted == nil || validateReactionEmoji(req.Emoji) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_reaction")
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	var (
-		msg     Message
-		reacted bool
-	)
+	var result ReactionMutationResult
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, reacted, opErr = s.Store.ToggleReaction(
-			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji)
+		result, opErr = s.setReaction(
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji, *req.Reacted)
 		return opErr
 	})
 	if !done {
@@ -1494,12 +1509,15 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	wire := messageToWire(place, msg)
-	s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: placeID, Message: &wire})
 	writeJSON(w, http.StatusOK, struct {
-		Message messageWire `json:"message"`
-		Reacted bool        `json:"reacted"`
-	}{Message: wire, Reacted: reacted})
+		MessageID string         `json:"message_id"`
+		Reactions []reactionWire `json:"reactions"`
+		Reacted   bool           `json:"reacted"`
+	}{
+		MessageID: result.MessageID,
+		Reactions: reactionsToWire(result.Reactions),
+		Reacted:   result.Reacted,
+	})
 }
 
 // serveVotePoll restates the viewer's whole choice on one poll. An empty

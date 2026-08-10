@@ -167,7 +167,9 @@ class StubBackend implements MessagingBackend {
   async resolveReplyLater(): ReturnType<MessagingBackend["resolveReplyLater"]> {
     throw new Error("not used");
   }
-  async toggleReaction(): Promise<void> {}
+  async setReaction(): ReturnType<MessagingBackend["setReaction"]> {
+    throw new Error("not used");
+  }
   async setNotificationSetting(
     input: NotificationSettingInput,
   ): Promise<NotificationSetting> {

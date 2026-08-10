@@ -85,6 +85,13 @@ export interface ReactionSummary {
   participants: ParticipantRef[];
 }
 
+/** Canonical absolute reaction state returned by a successful mutation. */
+export interface ReactionMutationResult {
+  messageId: string;
+  reactions: ReactionSummary[];
+  reacted: boolean;
+}
+
 /**
  * メッセージが運ぶ添付ファイル。実体はwireに載らず、urlから取得する。
  * urlはbackend境界が決める（実APIは同一originの `/messaging/attachments/<id>`、
@@ -294,10 +301,7 @@ export interface ProfileInput {
  * なるので増やさない。
  */
 export type Permission =
-  | "manage_channels"
-  | "manage_roles"
-  | "manage_members"
-  | "mention_all";
+  "manage_channels" | "manage_roles" | "manage_members" | "mention_all";
 
 export const PERMISSIONS: Permission[] = [
   "manage_channels",
@@ -466,8 +470,13 @@ export type ServerEvent =
   | { type: "profile_updated"; member: MemberProfile }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
-  | { type: "reaction_updated"; message: Message }
-  /** 票の更新。reaction_updatedと同じくmessage全体を運び、seqは進めない。 */
+  | {
+      type: "reaction_updated";
+      place: Place;
+      messageId: string;
+      reactions: ReactionSummary[];
+    }
+  /** 票の更新はmessage全体を運ぶが、reactionは上の部分更新だけを運ぶ。 */
   | { type: "poll_updated"; message: Message }
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
   | {
@@ -655,7 +664,12 @@ export interface MessagingBackend {
     remindAt: number,
   ): Promise<ReplyLaterMarker>;
   resolveReplyLater(markerId: string): Promise<ReplyLaterMarker>;
-  toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
+  setReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+    reacted: boolean,
+  ): Promise<ReactionMutationResult>;
   /**
    * 投票の回答を丸ごと置き換える。空配列は取り消し——気が変わることと
    * 取り下げることを別の道具にしない。

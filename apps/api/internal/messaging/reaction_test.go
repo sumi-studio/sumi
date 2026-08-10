@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
@@ -37,36 +38,41 @@ func callLocal(
 	return response.Code, decoded
 }
 
-func TestToggleReactionFlipsAndAggregates(t *testing.T) {
+func TestSetReactionIsIdempotentAndAggregates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
 	_, ch := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "リアクションして")
 
-	// First toggle adds.
-	got, reacted, err := w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍")
+	// First desired-state add.
+	got, err := w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", true)
 	if err != nil {
-		t.Fatalf("first toggle: %v", err)
+		t.Fatalf("first set: %v", err)
 	}
-	if !reacted || len(got.Reactions) != 1 || got.Reactions[0].Emoji != "👍" ||
+	if !got.Reacted || len(got.Reactions) != 1 || got.Reactions[0].Emoji != "👍" ||
 		len(got.Reactions[0].Participants) != 1 || got.Reactions[0].Participants[0] != w.humanB {
-		t.Fatalf("first toggle state = reacted %v, reactions %+v", reacted, got.Reactions)
+		t.Fatalf("first set state = reacted %v, reactions %+v", got.Reacted, got.Reactions)
+	}
+	// Repeating the same call cannot invert the already-committed intent.
+	got, err = w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", true)
+	if err != nil || len(got.Reactions) != 1 || len(got.Reactions[0].Participants) != 1 {
+		t.Fatalf("idempotent add = result %+v, err %v", got, err)
 	}
 
 	// The agent joins the same emoji through the identical path; participants
 	// aggregate in reaction order.
-	got, reacted, err = w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.agent, "👍")
+	got, err = w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.agent, "👍", true)
 	if err != nil {
-		t.Fatalf("agent toggle: %v", err)
+		t.Fatalf("agent set: %v", err)
 	}
-	if !reacted || len(got.Reactions) != 1 || len(got.Reactions[0].Participants) != 2 ||
+	if !got.Reacted || len(got.Reactions) != 1 || len(got.Reactions[0].Participants) != 2 ||
 		got.Reactions[0].Participants[0] != w.humanB || got.Reactions[0].Participants[1] != w.agent {
 		t.Fatalf("aggregate state = %+v", got.Reactions)
 	}
 
 	// A different emoji becomes a second summary, ordered by first reaction.
-	got, _, err = w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanA, "🎉")
+	got, err = w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanA, "🎉", true)
 	if err != nil {
 		t.Fatalf("second emoji: %v", err)
 	}
@@ -74,18 +80,22 @@ func TestToggleReactionFlipsAndAggregates(t *testing.T) {
 		t.Fatalf("summary order = %+v", got.Reactions)
 	}
 
-	// Second toggle removes only the actor's own reaction.
-	got, reacted, err = w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍")
+	// Desired false removes only the actor's own reaction.
+	got, err = w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", false)
 	if err != nil {
-		t.Fatalf("remove toggle: %v", err)
+		t.Fatalf("remove: %v", err)
 	}
-	if reacted || len(got.Reactions) != 2 || len(got.Reactions[0].Participants) != 1 ||
+	if got.Reacted || len(got.Reactions) != 2 || len(got.Reactions[0].Participants) != 1 ||
 		got.Reactions[0].Participants[0] != w.agent {
-		t.Fatalf("after removal = reacted %v, reactions %+v", reacted, got.Reactions)
+		t.Fatalf("after removal = reacted %v, reactions %+v", got.Reacted, got.Reactions)
+	}
+	got, err = w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", false)
+	if err != nil || len(got.Reactions) != 2 || len(got.Reactions[0].Participants) != 1 {
+		t.Fatalf("idempotent remove = result %+v, err %v", got, err)
 	}
 
 	// Removing the last participant removes the summary.
-	got, _, err = w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.agent, "👍")
+	got, err = w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.agent, "👍", false)
 	if err != nil {
 		t.Fatalf("final removal: %v", err)
 	}
@@ -103,7 +113,7 @@ func TestToggleReactionFlipsAndAggregates(t *testing.T) {
 	}
 }
 
-func TestToggleReactionAuthorizationAndTombstones(t *testing.T) {
+func TestSetReactionAuthorizationAndTombstones(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
@@ -112,24 +122,24 @@ func TestToggleReactionAuthorizationAndTombstones(t *testing.T) {
 
 	// A stranger is not told the place exists.
 	stranger := Human("018f3f8d-7b2c-7a10-8f9e-00000000ab99")
-	if _, _, err := w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, stranger, "👍"); !errors.Is(err, ErrPlaceNotFound) {
-		t.Fatalf("stranger toggle: got %v, want ErrPlaceNotFound", err)
+	if _, err := w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, stranger, "👍", true); !errors.Is(err, ErrPlaceNotFound) {
+		t.Fatalf("stranger set: got %v, want ErrPlaceNotFound", err)
 	}
 
 	// Emoji shape is bounded.
 	for _, emoji := range []string{"", "a b", "\n", string(make([]rune, MaxReactionEmojiChars+1))} {
-		if _, _, err := w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, emoji); err == nil {
+		if _, err := w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, emoji, true); err == nil {
 			t.Fatalf("emoji %q must be rejected", emoji)
 		}
 	}
 
 	// An unknown message in a visible place is reported as missing.
-	if _, _, err := w.store.ToggleReaction(ctx, ch.PlaceID, newUUIDv7(), w.humanB, "👍"); !errors.Is(err, ErrMessageNotFound) {
+	if _, err := w.store.SetReaction(ctx, ch.PlaceID, newUUIDv7(), w.humanB, "👍", true); !errors.Is(err, ErrMessageNotFound) {
 		t.Fatalf("missing message: got %v, want ErrMessageNotFound", err)
 	}
 
 	// A tombstone rejects reactions, and deletion clears existing ones.
-	if _, _, err := w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍"); err != nil {
+	if _, err := w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", true); err != nil {
 		t.Fatalf("react before delete: %v", err)
 	}
 	deleted, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA)
@@ -139,7 +149,7 @@ func TestToggleReactionAuthorizationAndTombstones(t *testing.T) {
 	if len(deleted.Reactions) != 0 {
 		t.Fatalf("tombstone reactions = %+v", deleted.Reactions)
 	}
-	if _, _, err := w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍"); !errors.Is(err, ErrMessageDeleted) {
+	if _, err := w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", true); !errors.Is(err, ErrMessageDeleted) {
 		t.Fatalf("react to tombstone: got %v, want ErrMessageDeleted", err)
 	}
 	history, err := w.store.History(ctx, ch.PlaceID, w.humanA, HistoryOptions{})
@@ -151,13 +161,38 @@ func TestToggleReactionAuthorizationAndTombstones(t *testing.T) {
 	}
 }
 
+func TestSetReactionRollsBackWhenSnapshotConstructionFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "snapshot failure")
+
+	_, err := w.store.setReaction(
+		ctx, ch.PlaceID, msg.MessageID, w.humanB, "👍", true,
+		func(context.Context, pgx.Tx, string) ([]ReactionSummary, error) {
+			return nil, errors.New("induced snapshot failure")
+		},
+	)
+	if err == nil {
+		t.Fatal("set reaction succeeded despite snapshot failure")
+	}
+	history, err := w.store.History(ctx, ch.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil {
+		t.Fatalf("history after rollback: %v", err)
+	}
+	if len(history) != 1 || len(history[0].Reactions) != 0 {
+		t.Fatalf("reaction mutation escaped rollback: %+v", history)
+	}
+}
+
 func TestEditKeepsReactionsOnTheReturnedMessage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
 	_, ch := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "編集前")
-	if _, _, err := w.store.ToggleReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👀"); err != nil {
+	if _, err := w.store.SetReaction(ctx, ch.PlaceID, msg.MessageID, w.humanB, "👀", true); err != nil {
 		t.Fatalf("react: %v", err)
 	}
 	edited, err := w.store.EditMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA, "編集後")
@@ -171,7 +206,7 @@ func TestEditKeepsReactionsOnTheReturnedMessage(t *testing.T) {
 	}
 }
 
-func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
+func TestReactionDesiredStateOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w, ts := newWSWorld(t, ctx)
@@ -180,16 +215,21 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 
 	conn := dialWS(t, ts, w.humanB.ID, nil)
 	path := "/messaging/places/" + ch.PlaceID + "/messages/" + msg.MessageID + "/reactions"
-	resp, body := call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍"})
+	resp, body := call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{
+		"emoji": "👍", "reacted": true,
+	})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("toggle: status %d body %v", resp.StatusCode, body)
+		t.Fatalf("set reaction: status %d body %v", resp.StatusCode, body)
 	}
 	if body["reacted"] != true {
-		t.Fatalf("toggle body = %v", body)
+		t.Fatalf("set reaction body = %v", body)
 	}
-	reactions := body["message"].(map[string]any)["reactions"].([]any)
+	if body["message_id"] != msg.MessageID {
+		t.Fatalf("reaction message id = %v, want %s", body["message_id"], msg.MessageID)
+	}
+	reactions := body["reactions"].([]any)
 	if len(reactions) != 1 || reactions[0].(map[string]any)["emoji"] != "👍" {
-		t.Fatalf("toggle reactions = %v", reactions)
+		t.Fatalf("set reactions = %v", reactions)
 	}
 
 	// Live fan-out: the other participant sees the durable event.
@@ -201,16 +241,29 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	if event["type"] != EventReactionUpdated {
 		t.Fatalf("event = %v", event)
 	}
-	eventReactions := event["message"].(map[string]any)["reactions"].([]any)
+	if _, ok := event["message"]; ok {
+		t.Fatalf("reaction event carried unrelated message fields: %v", event)
+	}
+	update := event["reaction"].(map[string]any)
+	if update["message_id"] != msg.MessageID {
+		t.Fatalf("reaction event message id = %v", update["message_id"])
+	}
+	eventReactions := update["reactions"].([]any)
 	participants := eventReactions[0].(map[string]any)["participants"].([]any)
 	if len(participants) != 1 || participants[0].(map[string]any)["human_id"] != w.humanA.ID {
 		t.Fatalf("event participants = %v", participants)
 	}
 
 	// Bad emoji fails closed before the store.
-	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": ""})
+	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{
+		"emoji": "", "reacted": true,
+	})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty emoji: status %d, want 400", resp.StatusCode)
+	}
+	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing desired state: status %d, want 400", resp.StatusCode)
 	}
 
 	// Reconnect catch-up replays the message with its current reactions.
@@ -224,9 +277,103 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	if len(replayedReactions) != 1 || replayedReactions[0].(map[string]any)["emoji"] != "👍" {
 		t.Fatalf("replayed reactions = %v", replayedReactions)
 	}
+
+	resp, body = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{
+		"emoji": "👍", "reacted": false,
+	})
+	if resp.StatusCode != http.StatusOK || body["reacted"] != false {
+		t.Fatalf("clear reaction: status %d body %v", resp.StatusCode, body)
+	}
+	frame = readFrame(t, conn)
+	cleared := frame["event"].(map[string]any)["reaction"].(map[string]any)
+	if got, ok := cleared["reactions"].([]any); !ok || len(got) != 0 {
+		t.Fatalf("cleared reactions = %v", cleared["reactions"])
+	}
 }
 
-func TestLocalReactTogglesForTheAgent(t *testing.T) {
+func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "ordered reactions")
+	hub := NewHub(w.store)
+	server := NewServer(w.store, nil)
+	server.Hub = hub
+	sub := hub.subscribe(w.humanA)
+	sub.markVisible(ch.PlaceID, true)
+	t.Cleanup(func() { hub.unsubscribe(sub) })
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, actor := range []ParticipantRef{w.humanA, w.humanB} {
+		actor := actor
+		go func() {
+			<-start
+			_, err := server.setReaction(
+				ctx, ch.PlaceID, msg.MessageID, actor, "👍", true,
+			)
+			errs <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent set reaction: %v", err)
+		}
+	}
+
+	for wantParticipants := 1; wantParticipants <= 2; wantParticipants++ {
+		select {
+		case raw := <-sub.send:
+			var frame struct {
+				Event Event `json:"event"`
+			}
+			if err := json.Unmarshal(raw, &frame); err != nil {
+				t.Fatalf("decode reaction event: %v", err)
+			}
+			if frame.Event.Reaction == nil || len(frame.Event.Reaction.Reactions) != 1 {
+				t.Fatalf("reaction event = %+v", frame.Event)
+			}
+			if got := len(frame.Event.Reaction.Reactions[0].Participants); got != wantParticipants {
+				t.Fatalf("published participant count = %d, want %d", got, wantParticipants)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for reaction event")
+		}
+	}
+}
+
+func TestReactionPublishLockDoesNotSerializeDifferentMessages(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	first := w.send(t, ctx, ch.PlaceID, w.humanA, "first")
+	second := w.send(t, ctx, ch.PlaceID, w.humanA, "second")
+	server := NewServer(w.store, nil)
+
+	unlockFirst := server.lockReactionPublish(first.MessageID)
+	defer unlockFirst()
+	result := make(chan error, 1)
+	go func() {
+		_, err := server.setReaction(
+			ctx, ch.PlaceID, second.MessageID, w.humanB, "👍", true,
+		)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("different-message reaction: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("different message was blocked by unrelated reaction lane")
+	}
+}
+
+func TestLocalReactStatesDesiredAgentReaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
@@ -236,29 +383,34 @@ func TestLocalReactTogglesForTheAgent(t *testing.T) {
 	}
 	msg := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "generalの発言")
 
-	react := func(emoji string) (int, map[string]any) {
+	react := func(emoji string, reacted bool) (int, map[string]any) {
 		t.Helper()
 		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{
-			"place_id": DefaultGeneralChannelID, "message_id": msg.MessageID, "emoji": emoji,
+			"place_id": DefaultGeneralChannelID, "message_id": msg.MessageID,
+			"emoji": emoji, "reacted": reacted,
 		}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
 	}
 
-	status, body := react("🎉")
+	status, body := react("🎉", true)
 	if status != http.StatusOK || body["reacted"] != true {
 		t.Fatalf("agent react: status %d body %v", status, body)
 	}
-	reactions := body["message"].(map[string]any)["reactions"].([]any)
+	reactions := body["reactions"].([]any)
 	participant := reactions[0].(map[string]any)["participants"].([]any)[0].(map[string]any)
 	if participant["kind"] != "personality_agent" || participant["personality_agent_id"] != w.agent.ID {
 		t.Fatalf("agent reaction participant = %v", participant)
 	}
 
-	// The identical toggle removes it again.
-	status, body = react("🎉")
+	// Repeating true is idempotent; false is the explicit removal intent.
+	status, body = react("🎉", true)
+	if status != http.StatusOK || body["reacted"] != true || len(body["reactions"].([]any)) != 1 {
+		t.Fatalf("agent repeated react: status %d body %v", status, body)
+	}
+	status, body = react("🎉", false)
 	if status != http.StatusOK || body["reacted"] != false {
 		t.Fatalf("agent un-react: status %d body %v", status, body)
 	}
-	if n := len(body["message"].(map[string]any)["reactions"].([]any)); n != 0 {
+	if n := len(body["reactions"].([]any)); n != 0 {
 		t.Fatalf("reactions after un-react = %d, want 0", n)
 	}
 }

@@ -997,12 +997,21 @@ export class MockMessagingServer implements MessagingBackend {
     return marker;
   }
 
-  async toggleReaction(
+  async setReaction(
     place: Place,
     messageId: string,
     emoji: string,
-  ): Promise<void> {
-    this.applyReaction(place, messageId, SELF, emoji);
+    reacted: boolean,
+  ): ReturnType<MessagingBackend["setReaction"]> {
+    const reactions = this.applyReaction(
+      place,
+      messageId,
+      SELF,
+      emoji,
+      reacted,
+    );
+    if (!reactions) throw new Error("unknown or deleted message");
+    return { messageId, reactions, reacted };
   }
 
   /**
@@ -1030,22 +1039,26 @@ export class MockMessagingServer implements MessagingBackend {
     this.emit({ type: "poll_updated", message: { ...message } });
   }
 
-  /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
+  /** Desired reaction state. Human and agent calls share this exact shape. */
   private applyReaction(
     place: Place,
     messageId: string,
     participant: ParticipantRef,
     emoji: string,
-  ): void {
+    reacted = true,
+  ): ReactionSummary[] | null {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted) return;
+    if (!message || message.deleted) return null;
     const summary = message.reactions.find((entry) => entry.emoji === emoji);
-    if (!summary) {
+    const alreadyReacted =
+      summary?.participants.some((ref) => sameParticipant(ref, participant)) ??
+      false;
+    if (reacted && !alreadyReacted && !summary) {
       message.reactions.push({ emoji, participants: [participant] });
-    } else if (
-      summary.participants.some((ref) => sameParticipant(ref, participant))
-    ) {
+    } else if (reacted && !alreadyReacted && summary) {
+      summary.participants.push(participant);
+    } else if (!reacted && alreadyReacted && summary) {
       summary.participants = summary.participants.filter(
         (ref) => !sameParticipant(ref, participant),
       );
@@ -1054,10 +1067,18 @@ export class MockMessagingServer implements MessagingBackend {
           (entry) => entry.emoji !== emoji,
         );
       }
-    } else {
-      summary.participants.push(participant);
     }
-    this.emit({ type: "reaction_updated", message: { ...message } });
+    const reactions = message.reactions.map((entry) => ({
+      ...entry,
+      participants: [...entry.participants],
+    }));
+    this.emit({
+      type: "reaction_updated",
+      place,
+      messageId,
+      reactions,
+    });
+    return reactions;
   }
 
   sendTyping(_place: Place): void {

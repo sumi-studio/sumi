@@ -25,6 +25,7 @@ import type {
   PlaceKey,
   PollInput,
   ProfileInput,
+  ReactionSummary,
   ReplyLaterMarker,
   RoleAssignment,
   RoleInput,
@@ -52,6 +53,29 @@ import { mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
+const REACTION_RESYNC_LIMIT = 200;
+
+function reactionsEqual(
+  left: readonly ReactionSummary[],
+  right: readonly ReactionSummary[],
+): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((reaction, index) => {
+    const other = right[index];
+    return (
+      other !== undefined &&
+      reaction.emoji === other.emoji &&
+      reaction.participants.length === other.participants.length &&
+      reaction.participants.every((participant, participantIndex) => {
+        const otherParticipant = other.participants[participantIndex];
+        return (
+          otherParticipant !== undefined &&
+          participantKey(participant) === participantKey(otherParticipant)
+        );
+      })
+    );
+  });
+}
 
 let backend: MessagingBackend = new ApiMessagingBackend();
 
@@ -239,6 +263,25 @@ let pendingPresenceResync: {
   generation: number;
   events: PresenceServerEvent[];
 } | null = null;
+
+type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
+interface ReactionProjectionOperation {
+  epoch: number;
+  journal: ReactionUpdatedEvent[];
+}
+interface ReactionProjectionCoordinator {
+  active: ReactionProjectionOperation | null;
+  backend: MessagingBackend;
+  epoch: number;
+  pending: number;
+  generation: number;
+  tail: Promise<void>;
+}
+let reactionProjectionGeneration = 0;
+const reactionProjectionQueues = new Map<
+  string,
+  ReactionProjectionCoordinator
+>();
 
 /** Bound long-lived timers and re-evaluate the nearest deadline periodically. */
 const STATUS_EXPIRY_MAX_DELAY_MS = 60 * 60_000;
@@ -445,6 +488,209 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
   };
 
+  const reactionPlaceQueueKey = (place: Place) => `place:${placeKey(place)}`;
+  const reactionMessageQueueKey = (place: Place, messageId: string) =>
+    `message:${placeKey(place)}:${messageId}`;
+
+  const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
+    const key = placeKey(event.place);
+    set((state) => {
+      const current = state.messagesByPlace[key];
+      if (!current) return {};
+      let changed = false;
+      const next = current.map((message) => {
+        if (message.messageId !== event.messageId || message.deleted) {
+          return message;
+        }
+        if (reactionsEqual(message.reactions, event.reactions)) {
+          return message;
+        }
+        changed = true;
+        return { ...message, reactions: event.reactions };
+      });
+      if (!changed) return {};
+      return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+    });
+  };
+
+  const currentReactionCoordinator = (queueKey: string) => {
+    const coordinator = reactionProjectionQueues.get(queueKey);
+    return coordinator?.backend === backend &&
+      coordinator.generation === reactionProjectionGeneration
+      ? coordinator
+      : null;
+  };
+
+  const journalReaction = (queueKey: string, event: ReactionUpdatedEvent) => {
+    currentReactionCoordinator(queueKey)?.active?.journal.push(event);
+  };
+
+  const applyReactionUpdate = (event: ReactionUpdatedEvent) => {
+    journalReaction(reactionPlaceQueueKey(event.place), event);
+    journalReaction(
+      reactionMessageQueueKey(event.place, event.messageId),
+      event,
+    );
+    applyReactionUpdateRaw(event);
+  };
+
+  const enqueueReactionProjection = (
+    queueKey: string,
+    produce: (
+      operationBackend: MessagingBackend,
+      isCurrent: () => boolean,
+    ) => Promise<() => void>,
+    expectedBackend: MessagingBackend = backend,
+  ): Promise<void> => {
+    if (backend !== expectedBackend) return Promise.resolve();
+    const operationBackend = expectedBackend;
+    const generation = reactionProjectionGeneration;
+    let coordinator = reactionProjectionQueues.get(queueKey);
+    if (
+      !coordinator ||
+      coordinator.backend !== operationBackend ||
+      coordinator.generation !== generation
+    ) {
+      coordinator = {
+        active: null,
+        backend: operationBackend,
+        epoch: 0,
+        pending: 0,
+        generation,
+        tail: Promise.resolve(),
+      };
+      reactionProjectionQueues.set(queueKey, coordinator);
+    }
+    const target = coordinator;
+    target.pending += 1;
+    const task = target.tail.then(async () => {
+      const isCurrent = () =>
+        backend === operationBackend &&
+        reactionProjectionGeneration === generation &&
+        reactionProjectionQueues.get(queueKey) === target;
+      if (!isCurrent()) return;
+      const operation: ReactionProjectionOperation = {
+        epoch: ++target.epoch,
+        journal: [],
+      };
+      target.active = operation;
+      try {
+        const applySnapshot = await produce(operationBackend, isCurrent);
+        if (
+          !isCurrent() ||
+          target.active !== operation ||
+          target.epoch !== operation.epoch
+        ) {
+          return;
+        }
+        applySnapshot();
+        for (const event of operation.journal) {
+          applyReactionUpdateRaw(event);
+        }
+      } finally {
+        if (target.active === operation) target.active = null;
+      }
+    });
+    const settled = task
+      .catch(() => undefined)
+      .finally(() => {
+        target.pending -= 1;
+        if (
+          target.pending === 0 &&
+          target.active === null &&
+          reactionProjectionQueues.get(queueKey) === target
+        ) {
+          reactionProjectionQueues.delete(queueKey);
+        }
+      });
+    target.tail = settled;
+    return task;
+  };
+
+  const resyncReactions = (
+    sessionBackend: MessagingBackend,
+    place: Place,
+  ): Promise<void> =>
+    enqueueReactionProjection(
+      reactionPlaceQueueKey(place),
+      async (resyncBackend, isCurrent) => {
+        const key = placeKey(place);
+        // caught_up can race the first history request after selecting a
+        // place. Reconcile only after that request has installed its snapshot;
+        // otherwise this would no-op on an empty store and the older response
+        // could become permanently authoritative for reaction-only changes.
+        const inFlightLoad = placeLoads.get(key);
+        if (inFlightLoad) await inFlightLoad;
+        if (!isCurrent()) return () => undefined;
+        const loaded = get().messagesByPlace[key];
+        if (!loaded || loaded.length === 0) return () => undefined;
+
+        const reactionsById = new Map<string, ReactionSummary[]>();
+        const ranges: { oldestSeq: number; newestSeq: number }[] = [];
+        for (const message of [...loaded].sort(
+          (left, right) => left.seq - right.seq,
+        )) {
+          const current = ranges.at(-1);
+          if (current && message.seq <= current.newestSeq + 1) {
+            current.newestSeq = Math.max(current.newestSeq, message.seq);
+          } else {
+            ranges.push({ oldestSeq: message.seq, newestSeq: message.seq });
+          }
+        }
+
+        for (const range of ranges.reverse()) {
+          let beforeSeq: number | undefined =
+            range.newestSeq === MAX_SEQ ? undefined : range.newestSeq + 1;
+          while (beforeSeq === undefined || beforeSeq > range.oldestSeq) {
+            const remaining =
+              beforeSeq === undefined
+                ? range.newestSeq - range.oldestSeq + 1
+                : beforeSeq - range.oldestSeq;
+            const limit = Math.min(remaining, REACTION_RESYNC_LIMIT);
+            const fresh = await resyncBackend.fetchMessages(
+              place,
+              beforeSeq === undefined ? { limit } : { beforeSeq, limit },
+            );
+            if (!isCurrent()) return () => undefined;
+            if (fresh.length === 0) break;
+            for (const message of fresh) {
+              reactionsById.set(message.messageId, message.reactions);
+            }
+            const nextBeforeSeq = Math.min(
+              ...fresh.map((message) => message.seq),
+            );
+            if (beforeSeq !== undefined && nextBeforeSeq >= beforeSeq) break;
+            beforeSeq = nextBeforeSeq;
+          }
+        }
+
+        return () => {
+          set((state) => {
+            const current = state.messagesByPlace[key];
+            if (!current) return {};
+            let changed = false;
+            const next = current.map((message) => {
+              const reactions = reactionsById.get(message.messageId);
+              if (
+                message.deleted ||
+                !reactions ||
+                reactionsEqual(reactions, message.reactions)
+              ) {
+                return message;
+              }
+              changed = true;
+              return { ...message, reactions };
+            });
+            if (!changed) return {};
+            return {
+              messagesByPlace: { ...state.messagesByPlace, [key]: next },
+            };
+          });
+        };
+      },
+      sessionBackend,
+    );
+
   /**
    * 呼ばれたことの提示。「呼ぶかどうか」はサーバーが送信時に判定済みで、
    * ここに来る `notify` はその答えそのもの。クライアントは提示の仕方だけを
@@ -587,10 +833,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
+    if (event.type === "reaction_updated") {
+      applyReactionUpdate(event);
+      return;
+    }
     if (
       event.type === "message_created" ||
       event.type === "message_edited" ||
-      event.type === "reaction_updated" ||
       event.type === "poll_updated"
     ) {
       const key = placeKey(event.message.place);
@@ -598,15 +847,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
-        const projected =
-          event.type === "poll_updated" && existing
-            ? {
-                ...existing,
-                // A delayed poll frame is a delta for the poll projection. It
-                // must not revert a later edit or revive a tombstone.
-                poll: existing.deleted ? null : (event.message.poll ?? null),
-              }
-            : event.message;
+        let projected = event.message;
+        if (event.type === "poll_updated" && existing) {
+          projected = {
+            ...existing,
+            // A delayed poll frame is a delta for the poll projection. It
+            // must not revert a later edit or revive a tombstone.
+            poll: existing.deleted ? null : (event.message.poll ?? null),
+          };
+        } else if (event.type === "message_edited" && existing) {
+          // Edit and reaction projections are independent. A full edit frame
+          // assembled before a later reaction must not roll that reaction
+          // back, and an edit frame must never revive a tombstone.
+          projected = existing.deleted
+            ? existing
+            : { ...event.message, reactions: existing.reactions };
+        }
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           projected,
@@ -1270,7 +1526,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           });
           scheduleStatusExpiry();
           (currentBackend as CatchUpAwareMessagingBackend).subscribeCatchUp?.(
-            (place) => reconcileLoadedPolls(currentBackend, place),
+            async (place) => {
+              await Promise.all([
+                reconcileLoadedPolls(currentBackend, place),
+                resyncReactions(currentBackend, place),
+              ]);
+            },
           );
           currentBackend.subscribe(applyEvent, { sinceByPlace });
           let previousConnection: ConnectionState | null = null;
@@ -1693,9 +1954,52 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     toggleReaction(message, emoji) {
-      void backend
-        .toggleReaction(message.place, message.messageId, emoji)
-        .catch(() => undefined);
+      const state = get();
+      const key = placeKey(message.place);
+      const current = (state.messagesByPlace[key] ?? []).find(
+        (entry) => entry.messageId === message.messageId,
+      );
+      if (!current || current.deleted || !state.selfKey) return;
+      const reacted = !current.reactions.some(
+        (reaction) =>
+          reaction.emoji === emoji &&
+          reaction.participants.some(
+            (participant) => participantKey(participant) === state.selfKey,
+          ),
+      );
+      void enqueueReactionProjection(
+        reactionMessageQueueKey(message.place, message.messageId),
+        async (operationBackend, isCurrent) => {
+          const canonical = await operationBackend.setReaction(
+            message.place,
+            message.messageId,
+            emoji,
+            reacted,
+          );
+          if (!isCurrent()) return () => undefined;
+          if (
+            canonical.messageId !== message.messageId ||
+            canonical.reacted !== reacted
+          ) {
+            throw new Error("Reaction acknowledgement does not match intent");
+          }
+          const acknowledgement: ReactionUpdatedEvent = {
+            type: "reaction_updated",
+            place: message.place,
+            messageId: canonical.messageId,
+            reactions: canonical.reactions,
+          };
+          return () => {
+            // A place-wide reconnect snapshot may be in flight concurrently.
+            // Journal this newer acknowledgement so that snapshot cannot win.
+            journalReaction(
+              reactionPlaceQueueKey(message.place),
+              acknowledgement,
+            );
+            applyReactionUpdateRaw(acknowledgement);
+          };
+        },
+      ).catch(() => undefined);
     },
 
     async loadOlder(key) {
@@ -1814,6 +2118,8 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   confirmedNotificationSetting = null;
   presenceResyncGeneration += 1;
   pendingPresenceResync = null;
+  reactionProjectionGeneration += 1;
+  reactionProjectionQueues.clear();
   if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
   statusExpiryTimer = null;
   useMessaging.setState({

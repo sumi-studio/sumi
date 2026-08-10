@@ -894,19 +894,20 @@ describe("ApiMessagingBackend", () => {
     backend.dispose();
   });
 
-  it("toggles reactions over REST and projects reaction_updated", async () => {
+  it("sets reactions over REST and projects reaction_updated", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (path.endsWith("/reactions") && init?.method === "POST") {
           return json({
-            message: messageWire(1, "hello", [
+            message_id: "message-1",
+            reactions: [
               {
                 emoji: "👍",
                 participants: [{ kind: "human", human_id: "human-1" }],
               },
-            ]),
+            ],
             reacted: true,
           });
         }
@@ -919,12 +920,18 @@ describe("ApiMessagingBackend", () => {
     expect(backend.capabilities.reactions).toBe(true);
     await backend.bootstrap();
 
-    await backend.toggleReaction(channel, "message-1", "👍");
+    await expect(
+      backend.setReaction(channel, "message-1", "👍", true),
+    ).resolves.toMatchObject({
+      messageId: "message-1",
+      reacted: true,
+      reactions: [{ emoji: "👍" }],
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reactions",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ emoji: "👍" }),
+        body: JSON.stringify({ emoji: "👍", reacted: true }),
       }),
     );
 
@@ -941,26 +948,28 @@ describe("ApiMessagingBackend", () => {
         event: {
           type: "reaction_updated",
           place_id: "channel-1",
-          message: messageWire(1, "hello", [
-            {
-              emoji: "👍",
-              participants: [{ kind: "human", human_id: "human-1" }],
-            },
-          ]),
+          reaction: {
+            message_id: "message-1",
+            reactions: [
+              {
+                emoji: "👍",
+                participants: [{ kind: "human", human_id: "human-1" }],
+              },
+            ],
+          },
         },
       });
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
         type: "reaction_updated",
-        message: {
-          seq: 1,
-          reactions: [
-            {
-              emoji: "👍",
-              participants: [{ kind: "human", humanId: "human-1" }],
-            },
-          ],
-        },
+        place: channel,
+        messageId: "message-1",
+        reactions: [
+          {
+            emoji: "👍",
+            participants: [{ kind: "human", humanId: "human-1" }],
+          },
+        ],
       });
       // A reaction to an old message must not rewind the replay cursor: the
       // reconnect hello still asks for everything after seq 4.

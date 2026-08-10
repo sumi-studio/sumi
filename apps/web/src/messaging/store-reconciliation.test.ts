@@ -58,10 +58,14 @@ describe("messaging catch-up reconciliation", () => {
           ?.options[0]?.voters,
       ).toEqual([{ kind: "human", humanId: "human-2" }]),
     );
-    expect(historyReads).toBe(2);
-    expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain(
-      "/messaging/places/channel-1/messages?before_seq=3&limit=1",
-    );
+    expect(historyReads).toBe(3);
+    const historyPaths = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(
+      historyPaths.filter(
+        (path) =>
+          path === "/messaging/places/channel-1/messages?before_seq=3&limit=1",
+      ),
+    ).toHaveLength(2);
   });
 
   it("applies a poll frame without reverting a later edit or reviving a tombstone", async () => {
@@ -94,7 +98,9 @@ describe("messaging catch-up reconciliation", () => {
       place_id: "channel-1",
       latest_seq: 4,
     });
-    await vi.waitFor(() => expect(historyReads).toBe(2));
+    // Poll and reaction projections have independent durable snapshots. Both
+    // must reconcile the loaded message after catch-up.
+    await vi.waitFor(() => expect(historyReads).toBe(3));
 
     socket?.message({
       type: "event",
@@ -310,7 +316,9 @@ describe("messaging catch-up reconciliation", () => {
     });
     releaseHistory();
 
-    await vi.waitFor(() => expect(historyReads).toBe(2));
+    // Initial history, poll reconciliation, and reaction reconciliation all
+    // complete after the held load. The live poll frame must still win.
+    await vi.waitFor(() => expect(historyReads).toBe(3));
     await vi.waitFor(() =>
       expect(
         useMessaging.getState().messagesByPlace[CHANNEL_KEY]?.[0]?.poll

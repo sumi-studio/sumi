@@ -341,7 +341,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	}{message.MessageID, message.Seq, messageToWire(place, message)})
 }
 
-// localReact toggles the agent's emoji on a message through the identical
+// localReact states the agent's desired emoji state through the identical
 // store path the human UI uses. The tool layer scopes it to messages visible
 // in the currently open view (ADR 0011 §3: 見えていないものは操作できない);
 // the server enforces the shared permission model.
@@ -350,11 +350,12 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		PlaceID   string `json:"place_id"`
 		MessageID string `json:"message_id"`
 		Emoji     string `json:"emoji"`
+		Reacted   *bool  `json:"reacted"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.PlaceID == "" || request.MessageID == "" || validateReactionEmoji(request.Emoji) != nil {
+	if request.PlaceID == "" || request.MessageID == "" || request.Reacted == nil || validateReactionEmoji(request.Emoji) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -363,24 +364,17 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		writeStoreError(w, err)
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	result, err := s.setReaction(
+		r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji, *request.Reacted)
 	if err != nil {
 		writeStoreError(w, err)
 		return
-	}
-	message, reacted, err := s.Store.ToggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	wire := messageToWire(place, message)
-	if s.Hub != nil {
-		s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: request.PlaceID, Message: &wire})
 	}
 	writeJSON(w, http.StatusOK, struct {
-		Message messageWire `json:"message"`
-		Reacted bool        `json:"reacted"`
-	}{wire, reacted})
+		MessageID string         `json:"message_id"`
+		Reactions []reactionWire `json:"reactions"`
+		Reacted   bool           `json:"reacted"`
+	}{result.MessageID, reactionsToWire(result.Reactions), result.Reacted})
 }
 
 // localStatus sets the agent's own status through the identical store path the

@@ -21,6 +21,7 @@ import type {
   PlaceKey,
   PollOption,
   ProfileInput,
+  ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -491,15 +492,23 @@ export class ApiMessagingBackend implements MessagingBackend {
     return parseReplyLater(body.marker);
   }
 
-  async toggleReaction(
+  async setReaction(
     place: Place,
     messageId: string,
     emoji: string,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
-      { method: "POST", body: { emoji } },
+    reacted: boolean,
+  ): Promise<ReactionMutationResult> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
+        { method: "POST", body: { emoji, reacted } },
+      ),
     );
+    return {
+      messageId: asString(body.message_id),
+      reactions: asArray(body.reactions).map(parseReaction),
+      reacted: asBoolean(body.reacted),
+    };
   }
 
   async votePoll(
@@ -673,12 +682,22 @@ export class ApiMessagingBackend implements MessagingBackend {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
-    } else if (
-      eventType === "reaction_updated" ||
-      eventType === "poll_updated"
-    ) {
-      // A reaction or a vote can target a message older than the replay
-      // cursor, so it must never move the cursor (backwards or at all).
+    } else if (eventType === "reaction_updated") {
+      // A reaction can target a message older than the replay cursor, so it
+      // never moves the cursor. Its partial payload cannot roll back an edit.
+      const id = asString(wire.place_id);
+      const place = this.places.get(id);
+      if (!place) return;
+      const update = asRecord(wire.reaction);
+      parsed = {
+        type: eventType,
+        place,
+        messageId: asString(update.message_id),
+        reactions: asArray(update.reactions).map(parseReaction),
+      };
+    } else if (eventType === "poll_updated") {
+      // A vote can target a message older than the replay cursor, so it must
+      // never move the cursor (backwards or at all).
       parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。

@@ -508,9 +508,9 @@ impl MessagingApi for LocalControlHttpClient {
     }
 
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<serde_json::Value> {
-        // The response echoes the full message (content up to 64 KiB plus its
-        // reaction state), so it shares the messaging screen bound rather than
-        // the tighter control-plane bound.
+        // The response is reaction-only, but the authoritative set scales with
+        // participants and emoji. Keep the bounded messaging-screen lane until
+        // the domain defines a smaller cardinality cap.
         self.post_json_bounded(
             "/local-control/v1/messaging:react",
             &request,
