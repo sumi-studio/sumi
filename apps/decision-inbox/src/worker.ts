@@ -249,6 +249,17 @@ function callbackDeliveryFromRow(
   };
 }
 
+async function pushSessionState(env: Env) {
+  await prunePushSubscriptions(env.DB);
+  const subscriptions = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM push_subscriptions",
+  ).first<{ count: number }>();
+  return {
+    vapidPublicKey: env.VAPID_PUBLIC_KEY,
+    pushSubscriptionCount: subscriptions?.count ?? 0,
+  };
+}
+
 async function handlePublisherCreate(
   request: Request,
   env: Env,
@@ -529,11 +540,13 @@ async function handleBootstrap(request: Request, env: Env): Promise<Response> {
     env.SESSION_SIGNING_SECRET,
     `csrf:${rawSession}`,
   );
+  const push = await pushSessionState(env);
   return json(
     {
       authenticated: true,
       csrfToken,
       expiresAt: new Date(expiresAt).toISOString(),
+      ...push,
     },
     200,
     { "Set-Cookie": setSessionCookie(env, signed) },
@@ -548,16 +561,12 @@ async function handleSession(request: Request, env: Env): Promise<Response> {
       "human_auth_required",
       "Open the private sign-in link again",
     );
-  await prunePushSubscriptions(env.DB);
-  const pushSubscriptions = await env.DB.prepare(
-    "SELECT endpoint_hash FROM push_subscriptions ORDER BY last_seen_at DESC, created_at DESC",
-  ).all<{ endpoint_hash: string }>();
+  const push = await pushSessionState(env);
   return json({
     authenticated: true,
     csrfToken: session.csrfToken,
     expiresAt: new Date(session.expiresAt).toISOString(),
-    vapidPublicKey: env.VAPID_PUBLIC_KEY,
-    pushSubscriptionCount: pushSubscriptions.results.length,
+    ...push,
   });
 }
 

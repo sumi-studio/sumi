@@ -9,6 +9,7 @@ import {
 } from "react";
 import { ApiClientError, DecisionApi, type HumanSessionPayload } from "./api";
 import type { Choice, DecisionRequest } from "./contracts";
+import { registerPushSubscription } from "./push-client";
 
 const api = new DecisionApi();
 const CACHE_PREFIX = "sumi-decision-inbox:v1:";
@@ -336,14 +337,12 @@ function PushSettings({
         return;
       }
       const registration = await navigator.serviceWorker.ready;
-      let subscription = await registration.pushManager.getSubscription();
-      if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: base64UrlToBytes(session.vapidPublicKey),
-        });
-      }
-      await api.subscribe(subscription.toJSON());
+      await registerPushSubscription({
+        pushManager: registration.pushManager,
+        applicationServerKey: base64UrlToBytes(session.vapidPublicKey),
+        register: (subscription) => api.subscribe(subscription),
+        replaceExisting: pushState === "expired",
+      });
       setPushState("on");
       setMessage("Push notifications are on for this device.");
     } catch (cause) {
