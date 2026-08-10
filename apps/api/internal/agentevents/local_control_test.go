@@ -45,7 +45,7 @@ func localControlAuthorization(
 }
 
 func TestLocalControlRuntimeUpdateFlockHonorsCancellation(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	lock, err := gateway.openRuntimeLock(localControlTestPAID)
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +211,7 @@ func credentialRequest(id, personalityAgentID string, generation uint64, nonce s
 }
 
 func TestLocalControlLifecycleIssuesStrictCredentialAndLatchesReady(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	control, server := newLocalControlHTTPServer(
 		t,
 		gateway,
@@ -404,7 +404,7 @@ func TestLocalControlLifecycleIssuesStrictCredentialAndLatchesReady(t *testing.T
 }
 
 func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, gateway := openLocalControlTestGateway(t, runtimeDir)
 	oldAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	newAuthorization := localControlAuthorization(localControlNextBearer, localControlTestPAID, 8, "boot-b")
@@ -508,7 +508,7 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 }
 
 func TestFreshControlProcessFencesSurvivingSignedReadyWithoutAuthorizationRegistry(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, firstGateway := openLocalControlTestGateway(t, runtimeDir)
 	_, server := newLocalControlHTTPServer(
 		t,
@@ -545,7 +545,7 @@ func TestFreshControlProcessFencesSurvivingSignedReadyWithoutAuthorizationRegist
 }
 
 func TestLocalControlExpectedRevisionIsSerializedAcrossConcurrentPublications(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	_, server := newLocalControlHTTPServer(
 		t,
 		gateway,
@@ -593,7 +593,7 @@ func TestLocalControlExpectedRevisionIsSerializedAcrossConcurrentPublications(t 
 }
 
 func TestLocalControlDurableHistoryTamperingFailsClosed(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	oldAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	newAuthorization := localControlAuthorization(localControlNextBearer, localControlTestPAID, 8, "boot-b")
 	control, server := newLocalControlHTTPServer(t, gateway, oldAuthorization)
@@ -773,7 +773,7 @@ func TestLocalControlDurableHistoryTamperingFailsClosed(t *testing.T) {
 }
 
 func TestLocalControlRejectsPublicStateDirectoryAndSymlinkLock(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	_, gateway := openLocalControlTestGateway(t, runtimeDir)
 	authorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 
@@ -813,7 +813,7 @@ func TestLocalControlRejectsPublicStateDirectoryAndSymlinkLock(t *testing.T) {
 }
 
 func TestLocalControlRejectsNonLoopbackWrongScopeAndNonStrictJSON(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	control, server := newLocalControlHTTPServer(
 		t,
 		gateway,
@@ -925,7 +925,7 @@ func TestLocalControlRejectsNonLoopbackWrongScopeAndNonStrictJSON(t *testing.T) 
 }
 
 func TestLocalControlIsNeverRegisteredByProductionMux(t *testing.T) {
-	store, gateway := openLocalControlTestGateway(t, t.TempDir())
+	store, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	mux, _, _, err := NewProductionMux(store, gateway, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -942,7 +942,7 @@ func TestLocalControlIsNeverRegisteredByProductionMux(t *testing.T) {
 }
 
 func TestNewLocalControlServerRejectsAmbiguousOrWeakAuthorization(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	valid := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 
 	weak := valid
@@ -985,7 +985,7 @@ func TestNewLocalControlServerRejectsAmbiguousOrWeakAuthorization(t *testing.T) 
 }
 
 func TestLocalControlIntegrityKeyInstallIsIdempotentAndFencesUnconfiguredReaders(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, gateway := openLocalControlTestGateway(t, runtimeDir)
 	authorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	_, server := newLocalControlHTTPServer(t, gateway, authorization)
@@ -1077,7 +1077,7 @@ func TestLocalControlIntegrityKeyInstallIsIdempotentAndFencesUnconfiguredReaders
 }
 
 func TestLocalControlIntegrityRotationConstructorMigratesPreviousKeyState(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
 	authorization := localControlAuthorization(
 		localControlTestBearer,
@@ -1156,7 +1156,7 @@ func TestLocalControlIntegrityRotationConstructorMigratesPreviousKeyState(t *tes
 }
 
 func TestLocalControlIntegrityRotationRepairsPartialStateBeforePreviousKeyRetirement(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
 	authorization := localControlAuthorization(
 		localControlTestBearer,
@@ -1259,7 +1259,7 @@ func TestLocalControlIntegrityRotationRepairsPartialStateBeforePreviousKeyRetire
 }
 
 func TestDurableGatewayObserveDistinguishesStartupFromTerminalNotReady(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	authorization := localControlAuthorization(
 		localControlTestBearer,
 		localControlTestPAID,

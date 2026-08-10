@@ -123,7 +123,7 @@ func signTestSession(t *testing.T, secret []byte, claims testSessionClaims) stri
 func setTokenSecret(t *testing.T) {
 	t.Helper()
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
-	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", privateRuntimeDir(t))
 }
 
 func setSessionSecret(t *testing.T) {
@@ -131,7 +131,7 @@ func setSessionSecret(t *testing.T) {
 	t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
 	t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
 	t.Setenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS", testBrowserOrigin)
-	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", privateRuntimeDir(t))
 }
 
 func testBrowserSessionRevocationStore(
@@ -143,7 +143,7 @@ func testBrowserSessionRevocationStore(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+	gateway, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func testBrowserSessionRevocationStore(
 func setReadyRouterState(t *testing.T, personalityAgentID string) {
 	t.Helper()
 	commandDir := t.TempDir()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeDir)
 	store, err := agentevents.OpenCommandStore(commandDir)
@@ -330,7 +330,7 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+	runtime, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		_ = store.Close()
 		t.Fatal(err)
@@ -773,7 +773,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 func TestNewRouter_LocalControlRoutesAreAbsentFromPublicMux(t *testing.T) {
 	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "0")
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
-	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", privateRuntimeDir(t))
 	mux, err := newRouter()
 	if err != nil {
 		t.Fatal(err)
@@ -801,7 +801,7 @@ func TestNewRouter_LocalControlRoutesAreAbsentFromPublicMux(t *testing.T) {
 	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "127.0.0.1:0")
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
 	commandDir := t.TempDir()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeDir)
 	app, err := newApplicationFromEnv()
@@ -922,7 +922,7 @@ func setCompleteLocalControlEnv(t *testing.T) {
 	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
-	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", privateRuntimeDir(t))
 }
 
 func trustedSocketParent(t *testing.T) string {
@@ -2150,7 +2150,7 @@ func TestLocalControlServerFromEnvRejectsPartialOrAmbiguousEnablement(t *testing
 		t.Fatal(err)
 	}
 	defer store.Close()
-	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+	gateway, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2196,7 +2196,7 @@ func TestLocalControlServerFromEnvMigratesPreviousSigningSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	oldGateway, err := agentevents.OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)

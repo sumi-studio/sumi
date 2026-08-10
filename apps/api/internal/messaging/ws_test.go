@@ -112,7 +112,7 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = commandStore.Close() })
-	revocations, err := agentevents.OpenDurableGateway(t.TempDir(), commandStore)
+	revocations, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), commandStore)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func TestLocalRuntimeAuthorizationCanBeInstalledReplacedAndRemoved(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	control, err := NewLocalControlServer(gateway, localControlTestSigningSecret, nil)
 	if err != nil {
 		t.Fatalf("construct empty dynamic local control: %v", err)
@@ -121,7 +121,7 @@ func TestLocalRuntimeAuthorizationCanBeInstalledReplacedAndRemoved(t *testing.T)
 }
 
 func TestFenceLocalRuntimeAuthorizationClearsExactReadyEpochEvenAfterAPIRestart(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	control, server := newLocalControlHTTPServer(
 		t,
 		gateway,
@@ -164,7 +164,7 @@ func TestFenceLocalRuntimeAuthorizationClearsExactReadyEpochEvenAfterAPIRestart(
 }
 
 func TestAuthorizationReplacementWaitsForCoherentCredentialSnapshot(t *testing.T) {
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	oldAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	control, server := newLocalControlHTTPServer(t, gateway, oldAuthorization)
 	startup := startupPublication("startup", localControlTestPAID, 7, "boot-a")

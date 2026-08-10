@@ -14,7 +14,7 @@ func TestNewProductionMux_NilStoreReturnsError(t *testing.T) {
 		t.Fatalf("open command store: %v", err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatalf("open durable gateway: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestNewProductionMux_WiresBrowserOriginPolicyToCommandIngress(t *testing.T)
 		t.Fatalf("open command store: %v", err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatalf("open durable gateway: %v", err)
 	}
