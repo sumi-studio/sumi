@@ -1,6 +1,14 @@
 export const originRoutes = Object.freeze({
-  exact: Object.freeze(["/health"]),
-  prefixes: Object.freeze(["/auth/", "/direct-chat/", "/messaging/"]),
+  exact: Object.freeze(["/health", "/workspaces", "/app-installations"]),
+  prefixes: Object.freeze([
+    "/auth/",
+    "/direct-chat/",
+    "/messaging/",
+    "/workspaces/",
+    "/workspace-invites/",
+    "/apps/",
+    "/app-installations/",
+  ]),
 });
 
 export const deniedRoutes = Object.freeze({
@@ -8,6 +16,8 @@ export const deniedRoutes = Object.freeze({
     "/auth",
     "/direct-chat",
     "/messaging",
+    "/workspace-invites",
+    "/apps",
     "/agent",
     "/local-control",
     "/ready",
@@ -44,6 +54,14 @@ export const workerFirstPatterns = Object.freeze([
   "/direct-chat/*",
   "/messaging",
   "/messaging/*",
+  "/workspaces",
+  "/workspaces/*",
+  "/workspace-invites",
+  "/workspace-invites/*",
+  "/apps",
+  "/apps/*",
+  "/app-installations",
+  "/app-installations/*",
   "/health",
   "/health/*",
   "/ready",

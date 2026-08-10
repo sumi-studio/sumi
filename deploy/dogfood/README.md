@@ -9,7 +9,9 @@ HAやzero-downtimeを装うものではない。短い停止は許容し、singl
 https://<canonical-host>/*
   Cloudflare Worker Route
     ├─ SPA / static assets -> Workers Static Assets
-    └─ /auth/*, /direct-chat/*, /messaging/*, /health
+    └─ /auth/*, /direct-chat/*, /messaging/*,
+       /workspaces*, /workspace-invites/*, /apps/*,
+       /app-installations*, /health
          -> named Cloudflare Tunnel -> api:8080
 
 dedicated origin host

@@ -18,6 +18,7 @@ const productionRouteSources = [
   "apps/api/internal/agentevents/browser_auth.go",
   "apps/api/internal/messaging/http.go",
   "apps/api/internal/messaging/call.go",
+  "apps/api/internal/workspace/http.go",
 ];
 
 test("every literal production browser route has an explicit edge disposition", async () => {
