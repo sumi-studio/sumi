@@ -56,12 +56,21 @@ T17はT16へ依存し、T16はT15へ依存するため、T15でproduction bootst
   既存`idempotency_key`とToolExecution Start/Finish APIは変更しない。完全な`RunCore`、
   T19〜T21のThreeLayerMemory、T23のApprovalBroker、production ToolRegistryを構築せず、物理kill/reapも
   実施済みと主張しない。決定論的テストは正しいproofを明示注入し、欠落・破損proofをfail-closedにする。
-- T29のconversation resetは、physical recovery適用済みconversationでも1つのagent DB transactionで
-  `physical_recovery_receipt_intents`子、`physical_recovery_receipt_applications`親、参照先`agent_events`/
-  `tool_executions`の順に削除する。1つのagent DBにはactive conversationが1つだけでledger行に`conversation_id`がないため、
-  fixtureは対象agent DBとは別のcontrol-plane tenant/agent identity、別agent DB、別artifact subtreeを持つ第二agentを使う。
-  対象の全行・旧artifact subtree消去と第二agentのledger/event/execution/artifact不変を同時に検証し、同一DBの
-  「別conversation」やFK回避のconstraint無効化を隔離証拠にしない。
+- T29は`conversation reset`を提供しない。[ADR 0008](0008-personality-agent-identity-and-execution-fabric.md)に従い、
+  canonical life logの消去は人格agentのdeath/deletionであり、同じ`PersonalityAgentId`を継続・再利用して
+  同じ本人が存続したことにはできない。後継は新しい`PersonalityAgentId`、DB、鍵、life log、VM、
+  private work environmentを持つ別個体としてprovisionする。agent deathの開始は認証済みproduct/control-plane
+  operationとagent-lifecycle domainが所有するcommit時認可を正本とし、
+  [ADR 0013](0013-tool-invocation-routes-and-authority-provenance.md)の
+  invocation route、AutoReview、Human approvalだけでこの認可を作成・拡張・迂回しない。
+  T29のうちagent death実装は[#76](https://github.com/sumi-studio/sumi/issues/76)が担う。対象VM外の
+  `deletion_tombstones`を正本として`requested → fenced → live_purged → backup_expired`を単調・冪等に進め、
+  supervisorが一つのcurrent `ProcessGeneration`をfenceした後に、対象agentのDB/canonical life log、recovery
+  ledger、event/execution、全key、private workspace、artifact volume、VM本体、VM credential、backupを破棄する。
+  shared Workspace data、外部tombstone/audit、他agentは存続する。同じWorkspace・administrative contextの
+  第二agentを使うfixtureで対象だけが消え第二agentのprivate stateが不変であることを固定し、同一DBの
+  「別conversation」やFK回避のconstraint無効化を隔離証拠にしない。この置換はT17/T27のphysical recovery
+  proof、fail-closed、idempotence契約を弱めない。
 - T24はproduction `GatewayConnector`/`ConnectionSupervisor`と認証済み接続fenceを所有する。
   `ConnectionEpoch`は再接続ごとに変わるT24-local identityであり、shared process identityではない。T24は各
   `ConnectionEpoch`についてtransport-neutral opaque `DeliveryEpoch`をexactly onceで1つmint/mapし、epoch終了時に対応mappingを
