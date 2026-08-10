@@ -28,16 +28,22 @@ BEGIN
 END $$;
 
 ALTER TABLE places
-    ADD COLUMN parent_place_id   uuidv7 REFERENCES places(place_id),
-    ADD COLUMN parent_message_id uuidv7 REFERENCES messages(message_id);
+    ADD COLUMN parent_place_id   uuidv7,
+    ADD COLUMN parent_message_id uuidv7,
+    ADD CONSTRAINT places_parent_same_workspace
+        FOREIGN KEY (workspace_id, parent_place_id)
+        REFERENCES places (workspace_id, place_id),
+    ADD CONSTRAINT places_origin_in_parent
+        FOREIGN KEY (parent_place_id, parent_message_id)
+        REFERENCES messages (place_id, message_id);
 
 ALTER TABLE places
     ADD CONSTRAINT places_kind_known
         CHECK (kind IN ('channel', 'dm', 'group_dm', 'thread')),
-    -- channel と thread は Workspace の中にあり、名前を持つ。dm/group_dm は
-    -- どちらも持たない（表示名は参加者から導かれる）。
+    -- Every Messaging place belongs to a Workspace. channel/thread have a
+    -- name; dm/group_dm derive their display name from participants.
     ADD CONSTRAINT places_workspace_scoped
-        CHECK ((kind IN ('channel', 'thread')) = (workspace_id IS NOT NULL)),
+        CHECK (workspace_id IS NOT NULL),
     ADD CONSTRAINT places_named
         CHECK ((kind IN ('channel', 'thread')) = (name IS NOT NULL)),
     ADD CONSTRAINT places_dm_keyed
