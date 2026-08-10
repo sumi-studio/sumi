@@ -3,7 +3,7 @@
 - Status: Draft (v1)
 - Original date: 2026-07-15
 - Last amended: 2026-08-10
-- 前提: [ADR 0001](adr/0001-frontend-stack.md) の技術選定 (React 19 + Vite + Tailwind v4 + Tauri 2、`packages/ui` カタログ、`packages/sdui`)
+- 前提: [ADR 0001](adr/0001-frontend-stack.md) と [ADR 0014](adr/0014-webapp-and-electron-runtime.md) の技術選定 (React 19 + Vite + Tailwind v4のcanonical WebApp、Electron desktop shell、`packages/ui` カタログ、`packages/sdui`)
 
 ## 設計原則
 
@@ -23,8 +23,8 @@
 | 3 | 通知 | 通知センター + 権限リクエストの承認キュー | 早期 |
 | 4 | 設定 | エージェント管理・権限管理・アカウント | MVP (最小) |
 
-- デスクトップ / Web: 左サイドバー (ナビ + 一覧 | 本体 の 2 ペイン) を常時表示
-- モバイル (Tauri シェル): 同じ中身 (ナビ + 一覧) をハンバーガーメニューから開くドロワーとして表示。チャット画面のヘッダー左の ☰ が開閉トリガー
+- デスクトップ Web / Electron: 左サイドバー (ナビ + 一覧 | 本体 の 2 ペイン) を常時表示
+- mobile WebApp: 同じ中身 (ナビ + 一覧) をハンバーガーメニューから開くドロワーとして表示。チャット画面のヘッダー左の ☰ が開閉トリガー
 
 MVP は 1 と 4 のガワのみ。2・3 はタブだけ用意して空で良い。
 
@@ -122,7 +122,7 @@ idle ──送信──▶ streaming ──完了──▶ idle
 #### 音声入力
 
 - Web Speech API (ブラウザネイティブ)。[🎤] 押下で録音開始、認識テキストを入力欄にライブ反映、確定後に手直しして送信
-- 注意: Tauri iOS の WKWebView では `SpeechRecognition` の挙動が Safari 準拠。Web で動いても iOS シェルで要再検証
+- 注意: iOSのmobile WebAppではWebKit / Safariの対応範囲になる。desktop Chromiumで動いても、iOS実機で`SpeechRecognition`の有無・権限・中断復帰を再検証する
 
 #### コンテンツの貼り付け
 

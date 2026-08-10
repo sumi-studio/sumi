@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-17
-- Amends: [ADR 0001](0001-frontend-stack.md) — 前提5(pi が TypeScript)を無効化し、`apps/agent` の実装言語(TS → Rust)と `@sumi/api-client` 経由のドメイン操作(→ 契約ファーストの Rust `apiclient`)を置換する。ADR 0001 のフロントエンド選定と「権限モデルの強制点を API 層に保つ」原則自体は有効なまま
+- Amends: [ADR 0001](0001-frontend-stack.md) — 前提5(pi が TypeScript)を無効化し、`apps/agent` の実装言語(TS → Rust)と `@sumi/api-client` 経由のドメイン操作(→ 契約ファーストの Rust `apiclient`)を置換する。ADR 0001 のReact / SDUI renderer選定と「権限モデルの強制点を API 層に保つ」原則は維持するが、shell選定は後の[ADR 0014](0014-webapp-and-electron-runtime.md)が置換する
 
 ## コンテキスト
 
