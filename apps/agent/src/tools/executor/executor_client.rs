@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -27,8 +28,11 @@ use super::{
 };
 use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity};
 use crate::tools::{
-    ToolError,
-    fs::{GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_SCAN_ENTRIES},
+    ResourceLimit, ToolError,
+    fs::{
+        GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_RAW_FILE_CHUNK_BYTES,
+        MAX_SCAN_ENTRIES, WorkspaceFileChunk,
+    },
     truncate::{DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, GREP_TRUNCATION_SUFFIX, RetainedOutput},
 };
 
@@ -52,6 +56,12 @@ pub fn classify_executor_error(error: &ToolError) -> Option<ExecutorErrorClassif
         }
         _ => None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +127,103 @@ impl ExecutorClient {
     pub async fn health(&self) -> Result<(), ToolError> {
         self.health_with_cancellation(CancellationToken::new(), self.deadlines.overall)
             .await
+    }
+
+    /// Read a regular workspace file as exact bytes through the executor's
+    /// dirfd-confined filesystem boundary.
+    ///
+    /// `execution_id_prefix` must identify this logical read uniquely within
+    /// the executor generation. Each page derives its own bounded execution
+    /// identity from that prefix, the path, and the byte offset.
+    pub async fn read_workspace_file_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        execution_id_prefix: &str,
+        cancel: CancellationToken,
+    ) -> Result<WorkspaceFile, ToolError> {
+        if execution_id_prefix.is_empty() {
+            return Err(ToolError::Protocol(
+                "raw workspace read execution_id_prefix must be non-empty".to_owned(),
+            ));
+        }
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let mut bytes = Vec::new();
+        let mut filename = None;
+        let mut version = None;
+        let mut content_digest = None;
+        let mut total_bytes = None;
+        let mut offset = 0u64;
+
+        loop {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            let limit = max_bytes
+                .saturating_sub(bytes.len())
+                .saturating_add(1)
+                .clamp(1, MAX_RAW_FILE_CHUNK_BYTES);
+            let execution_id = raw_file_page_execution_id(execution_id_prefix, path, offset);
+            let response = self
+                .execute(
+                    ExecutorOperation::ReadRawFile {
+                        path: path.to_owned(),
+                        offset,
+                        limit,
+                        max_total_bytes: max_bytes_u64,
+                        expected_version: version.clone(),
+                        expected_content_digest: content_digest.clone(),
+                        execution_id,
+                    },
+                    cancel.clone(),
+                    Arc::new(|_| {}),
+                )
+                .await?;
+            let ExecutorResponse::RawFile { chunk } = response else {
+                return Err(ToolError::Protocol(
+                    "raw workspace read returned a non-file response".to_owned(),
+                ));
+            };
+            if chunk.total_bytes > max_bytes_u64 {
+                return Err(ToolError::ResourceLimit(ResourceLimit::InputBytes {
+                    observed: chunk.total_bytes,
+                    limit: max_bytes_u64,
+                }));
+            }
+            if total_bytes.is_some_and(|known| known != chunk.total_bytes) {
+                return Err(ToolError::Protocol(
+                    "raw workspace file size changed between pages".to_owned(),
+                ));
+            }
+            if filename
+                .as_ref()
+                .is_some_and(|known: &String| known != &chunk.filename)
+            {
+                return Err(ToolError::Protocol(
+                    "raw workspace file basename changed between pages".to_owned(),
+                ));
+            }
+            filename.get_or_insert_with(|| chunk.filename.clone());
+            version.get_or_insert_with(|| chunk.version.clone());
+            content_digest.get_or_insert_with(|| chunk.content_digest.clone());
+            total_bytes.get_or_insert(chunk.total_bytes);
+            bytes.extend_from_slice(&chunk.content);
+            if chunk.eof {
+                let actual_digest = format!("{:x}", Sha256::digest(&bytes));
+                if content_digest.as_deref() != Some(actual_digest.as_str()) {
+                    return Err(ToolError::Protocol(
+                        "raw workspace content digest did not match the assembled bytes".to_owned(),
+                    ));
+                }
+                return Ok(WorkspaceFile {
+                    filename: filename.unwrap_or_default(),
+                    bytes,
+                });
+            }
+            offset = offset
+                .checked_add(u64::try_from(chunk.content.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| ToolError::Protocol("raw workspace offset overflowed".to_owned()))?;
+        }
     }
 
     /// Run one authenticated Health exchange on a fresh Unix connection.
@@ -436,6 +543,7 @@ fn cancellation_mode(operation: &ExecutorOperation) -> CancellationMode {
         }
         ExecutorOperation::Bash { .. } => CancellationMode::ActiveBash,
         ExecutorOperation::ReadFile { .. }
+        | ExecutorOperation::ReadRawFile { .. }
         | ExecutorOperation::WriteFile { .. }
         | ExecutorOperation::EditFile { .. }
         | ExecutorOperation::RemoveFile { .. }
@@ -546,6 +654,7 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     match operation {
         ExecutorOperation::Health { .. } => "",
         ExecutorOperation::ReadFile { execution_id, .. }
+        | ExecutorOperation::ReadRawFile { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
         | ExecutorOperation::RemoveFile { execution_id, .. }
@@ -582,6 +691,26 @@ fn validate_response_for_personality_agent(
                 response: ArtifactResponse::Read { content, .. },
             },
         ) => path.starts_with("artifact://") && content.len() <= *limit,
+        (
+            ExecutorOperation::ReadRawFile {
+                path,
+                offset,
+                limit,
+                max_total_bytes,
+                expected_version,
+                expected_content_digest,
+                ..
+            },
+            ExecutorResponse::RawFile { chunk },
+        ) => raw_file_chunk_matches_operation(
+            chunk,
+            path,
+            *offset,
+            *limit,
+            *max_total_bytes,
+            expected_version.as_deref(),
+            expected_content_digest.as_deref(),
+        ),
         (ExecutorOperation::Grep { path, .. }, ExecutorResponse::Grepped { matches }) => {
             !path.starts_with("artifact://") && workspace_grep_matches_are_bounded(matches)
         }
@@ -662,6 +791,59 @@ fn read_file_result_within_limit(
     result.max_lines == DEFAULT_MAX_LINES
         && result.max_bytes == limit
         && result.is_consistent(RetainedOutput::Head)
+}
+
+fn raw_file_chunk_matches_operation(
+    chunk: &WorkspaceFileChunk,
+    requested_path: &str,
+    offset: u64,
+    limit: usize,
+    max_total_bytes: u64,
+    expected_version: Option<&str>,
+    expected_content_digest: Option<&str>,
+) -> bool {
+    let Ok(content_bytes) = u64::try_from(chunk.content.len()) else {
+        return false;
+    };
+    let Some(end) = chunk.offset.checked_add(content_bytes) else {
+        return false;
+    };
+    let expected_page_bytes = chunk
+        .total_bytes
+        .checked_sub(offset)
+        .map(|remaining| remaining.min(u64::try_from(limit).unwrap_or(u64::MAX)));
+    chunk.offset == offset
+        && chunk.content.len() <= limit
+        && expected_page_bytes == Some(content_bytes)
+        && chunk.total_bytes <= max_total_bytes
+        && end <= chunk.total_bytes
+        && chunk.eof == (end == chunk.total_bytes)
+        && valid_entry(&chunk.filename)
+        && Path::new(requested_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == chunk.filename)
+        && valid_raw_file_version(&chunk.version)
+        && expected_version.is_none_or(|expected| expected == chunk.version)
+        && valid_raw_file_version(&chunk.content_digest)
+        && expected_content_digest.is_none_or(|expected| expected == chunk.content_digest)
+}
+
+fn valid_raw_file_version(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn raw_file_page_execution_id(prefix: &str, path: &str, offset: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(prefix.as_bytes());
+    digest.update([0]);
+    digest.update(path.as_bytes());
+    digest.update([0]);
+    digest.update(offset.to_le_bytes());
+    format!("raw-{:x}", digest.finalize())
 }
 
 fn valid_entry(entry: &str) -> bool {
@@ -930,6 +1112,152 @@ mod tests {
             content: content.to_owned(),
             execution_id: execution_id.to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn reads_binary_workspace_file_through_real_service() {
+        let root = temp_root("raw-binary");
+        let bytes = vec![0, 0xff, b'\n', 0x80, b's', b'u', b'm', b'i'];
+        let (socket, service) = spawn_real_service(&root, 1);
+        std::fs::write(root.join("workspace/image.bin"), &bytes).unwrap();
+
+        let file = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .read_workspace_file_bounded(
+                "image.bin",
+                bytes.len(),
+                "attachment-image",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(file.filename, "image.bin");
+        assert_eq!(file.bytes, bytes);
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_multi_page_binary_workspace_file_exactly() {
+        let root = temp_root("raw-binary-pages");
+        let bytes = (0..MAX_RAW_FILE_CHUNK_BYTES + 137)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let (socket, service) = spawn_real_service(&root, 2);
+        std::fs::write(root.join("workspace/archive.bin"), &bytes).unwrap();
+
+        let file = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .read_workspace_file_bounded(
+                "archive.bin",
+                bytes.len(),
+                "attachment-archive",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(file.filename, "archive.bin");
+        assert_eq!(file.bytes, bytes);
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_workspace_file_after_one_bounded_page() {
+        let root = temp_root("raw-binary-oversized");
+        let bytes = vec![0xa5; MAX_RAW_FILE_CHUNK_BYTES + 1];
+        let (socket, service) = spawn_real_service(&root, 1);
+        std::fs::write(root.join("workspace/oversized.bin"), &bytes).unwrap();
+
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .read_workspace_file_bounded(
+                "oversized.bin",
+                MAX_RAW_FILE_CHUNK_BYTES,
+                "attachment-oversized",
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("oversized source must not return a completed buffer");
+
+        assert!(matches!(
+            error,
+            ToolError::ResourceLimit(ResourceLimit::InputBytes {
+                observed,
+                limit,
+            }) if observed == bytes.len() as u64 && limit == MAX_RAW_FILE_CHUNK_BYTES as u64
+        ));
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_mixed_pages_when_metadata_version_and_size_are_unchanged() {
+        let root = temp_root("raw-binary-mixed-pages");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut committed = vec![0x41; MAX_RAW_FILE_CHUNK_BYTES];
+        committed.push(0x42);
+        let content_digest = format!("{:x}", Sha256::digest(&committed));
+        let server_digest = content_digest.clone();
+        let server = tokio::spawn(async move {
+            for page in 0..2 {
+                let accepted = timeout(Duration::from_millis(500), listener.accept()).await;
+                let Ok(Ok((stream, _))) = accepted else {
+                    return;
+                };
+                let (read, mut write) = stream.into_split();
+                let request = read_request(&mut BufReader::new(read)).await;
+                let (offset, content, eof) = if page == 0 {
+                    (0, vec![0x41; MAX_RAW_FILE_CHUNK_BYTES], false)
+                } else {
+                    (MAX_RAW_FILE_CHUNK_BYTES as u64, vec![0x43], true)
+                };
+                write_json_line(
+                    &mut write,
+                    json!({
+                        "type":"terminal",
+                        "personality_agent_id":PAID,
+                        "generation":7,
+                        "nonce":"boot-nonce",
+                        "request_id":request["request_id"],
+                        "result":{"Ok":{
+                            "type":"raw_file",
+                            "chunk":{
+                                "filename":"archive.bin",
+                                "offset":offset,
+                                "total_bytes":MAX_RAW_FILE_CHUNK_BYTES + 1,
+                                "version":"a".repeat(64),
+                                "content_digest":server_digest,
+                                "content":content,
+                                "eof":eof
+                            }
+                        }}
+                    }),
+                )
+                .await;
+            }
+        });
+
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .read_workspace_file_bounded(
+                "archive.bin",
+                committed.len(),
+                "attachment-mixed-pages",
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("mixed source pages must not satisfy the initial content commitment");
+
+        assert!(
+            matches!(error, ToolError::Protocol(ref message) if message.contains("content digest")),
+            "unexpected mixed-page error: {error:?}"
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1648,6 +1976,70 @@ mod tests {
                 )
                 .is_err(),
                 "accepted a bounded cross-personality-agent artifact response"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_file_response_validation_requires_exact_page_and_version() {
+        let version = "a".repeat(64);
+        let operation = ExecutorOperation::ReadRawFile {
+            path: "image.bin".to_owned(),
+            offset: 2,
+            limit: 3,
+            max_total_bytes: 5,
+            expected_version: Some(version.clone()),
+            expected_content_digest: Some("b".repeat(64)),
+            execution_id: "raw-response".to_owned(),
+        };
+        let valid = WorkspaceFileChunk {
+            filename: "image.bin".to_owned(),
+            offset: 2,
+            total_bytes: 5,
+            version: version.clone(),
+            content_digest: "b".repeat(64),
+            content: vec![0xff, 0x80, 0],
+            eof: true,
+        };
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::RawFile {
+                    chunk: valid.clone()
+                }
+            )
+            .is_ok()
+        );
+
+        for invalid in [
+            WorkspaceFileChunk {
+                offset: 1,
+                ..valid.clone()
+            },
+            WorkspaceFileChunk {
+                content: vec![0xff, 0x80],
+                ..valid.clone()
+            },
+            WorkspaceFileChunk {
+                version: "b".repeat(64),
+                ..valid.clone()
+            },
+            WorkspaceFileChunk {
+                filename: "nested/image.bin".to_owned(),
+                ..valid.clone()
+            },
+            WorkspaceFileChunk {
+                filename: "other.bin".to_owned(),
+                ..valid.clone()
+            },
+            WorkspaceFileChunk {
+                eof: false,
+                ..valid.clone()
+            },
+        ] {
+            assert!(
+                validate_response(&operation, &ExecutorResponse::RawFile { chunk: invalid })
+                    .is_err()
             );
         }
     }

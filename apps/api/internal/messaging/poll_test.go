@@ -363,23 +363,30 @@ func TestPollOverHTTPRidesTheOrdinarySend(t *testing.T) {
 		t.Fatalf("send poll: status %d body %v", resp.StatusCode, body)
 	}
 	messageID := body["message_id"].(string)
-	poll, ok := body["message"].(map[string]any)["poll"].(map[string]any)
-	if !ok {
-		t.Fatalf("the poll was dropped between the request and the store: %v", body["message"])
+	history, err := w.store.History(ctx, DefaultGeneralChannelID, w.humanA, HistoryOptions{})
+	if err != nil || len(history) != 1 || history[0].Poll == nil {
+		t.Fatalf("poll was dropped between request and store: %#v, err %v", history, err)
 	}
-	if poll["question"] != "リリースはいつ？" || poll["allow_multi"] != false {
-		t.Fatalf("poll = %v", poll)
+	poll := history[0].Poll
+	if poll.Question != "リリースはいつ？" || poll.AllowMulti {
+		t.Fatalf("poll = %#v", poll)
 	}
-	options := poll["options"].([]any)
-	today := options[0].(map[string]any)["option_id"].(string)
-	tomorrow := options[1].(map[string]any)["option_id"].(string)
+	today := poll.Options[0].OptionID
+	tomorrow := poll.Options[1].OptionID
 
 	// An ordinary message carries no poll key at all.
 	_, plain := call(t, ts, http.MethodPost, messages, w.humanA.ID, map[string]any{
 		"content": "ただの発言", "client_nonce": "web-plain-1",
 	})
-	if _, present := plain["message"].(map[string]any)["poll"]; present {
-		t.Fatal("a message that asks nothing must not carry a poll")
+	plainID, _ := plain["message_id"].(string)
+	history, err = w.store.History(ctx, DefaultGeneralChannelID, w.humanA, HistoryOptions{})
+	if err != nil {
+		t.Fatalf("history after plain message: %v", err)
+	}
+	for _, message := range history {
+		if message.MessageID == plainID && message.Poll != nil {
+			t.Fatal("a message that asks nothing must not carry a poll")
+		}
 	}
 
 	vote := "/messaging/places/" + DefaultGeneralChannelID + "/messages/" + messageID + "/poll/vote"

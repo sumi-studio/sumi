@@ -2,7 +2,13 @@ package messaging
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -14,8 +20,16 @@ const (
 	LocalOverviewPath = "/local-control/v1/messaging:overview"
 	LocalOpenPath     = "/local-control/v1/messaging:open"
 	LocalWritePath    = "/local-control/v1/messaging:write"
-	LocalReactPath    = "/local-control/v1/messaging:react"
-	LocalStatusPath   = "/local-control/v1/messaging:status"
+	// Attachment bytes cross only the PAID-bound local-control transport. The
+	// browser surface has separate cookie-authenticated upload/download routes.
+	LocalUploadAttachmentPath = "/local-control/v1/messaging:upload"
+	LocalAttachmentPath       = "/local-control/v1/messaging:attachment"
+	// LocalDownloadAttachmentPath streams the complete authorized blob to the
+	// Agent runtime. The runtime, not Messaging, owns the destination workspace
+	// path and atomic file installation.
+	LocalDownloadAttachmentPath = "/local-control/v1/messaging:attachment-download"
+	LocalReactPath              = "/local-control/v1/messaging:react"
+	LocalStatusPath             = "/local-control/v1/messaging:status"
 	// LocalProfilePath は agent が自分の名乗り（表示名・tagline）を読み書きする口。
 	// 人間が個人設定画面から行うのと同じ Store 経路を通る（AX: UIだけにある操作を
 	// 作らない）。
@@ -70,6 +84,10 @@ const (
 	LocalAttentionPath = "/local-control/v1/messaging:attention"
 )
 
+// MaxLocalAttachmentFetchBytes bounds what the local-control lane inlines in a
+// JSON tool result. Files above the bound are refused, never truncated.
+const MaxLocalAttachmentFetchBytes int64 = 2 << 20
+
 // maxRelativeMinutes bounds every relative duration the agent lane accepts.
 // The agent names durations ("30分後に"), not wall-clock instants, so the
 // server's clock decides the moment and a drifting workspace clock cannot
@@ -87,6 +105,9 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalOverviewPath, s.localOverview},
 		{"POST " + LocalOpenPath, s.localOpen},
 		{"POST " + LocalWritePath, s.localWrite},
+		{"POST " + LocalUploadAttachmentPath, s.localUploadAttachment},
+		{"POST " + LocalAttachmentPath, s.localAttachment},
+		{"POST " + LocalDownloadAttachmentPath, s.localDownloadAttachment},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
 		{"POST " + LocalProfilePath, s.localProfile},
@@ -296,13 +317,27 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
-		PlaceID     string  `json:"place_id"`
-		Content     string  `json:"content"`
-		Urgency     string  `json:"urgency"`
-		ReplyTo     *string `json:"reply_to,omitempty"`
-		ClientNonce string  `json:"client_nonce"`
+		PlaceID     string   `json:"place_id"`
+		Content     string   `json:"content"`
+		Urgency     string   `json:"urgency"`
+		ReplyTo     *string  `json:"reply_to,omitempty"`
+		ClientNonce string   `json:"client_nonce"`
+		Attachments []string `json:"attachments,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
+		return
+	}
+	// Validate the entire mutation shape before default-workspace admission.
+	// An oversized or otherwise unstorable write must not create membership,
+	// allocate a place, or advance its sequence as a side effect of rejection.
+	if request.PlaceID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_content")
+		return
+	}
+	if code := validateSendRequest(
+		request.Content, request.Urgency, request.ClientNonce, request.Attachments, false,
+	); code != "" {
+		writeError(w, http.StatusBadRequest, code)
 		return
 	}
 	viewer := localViewer(authorization)
@@ -322,6 +357,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	message, created, err := s.Store.AppendMessage(r.Context(), AppendInput{
 		PlaceID: request.PlaceID, Author: viewer, Content: request.Content,
 		Urgency: request.Urgency, ReplyTo: replyTo, ClientNonce: request.ClientNonce,
+		AttachmentIDs: request.Attachments,
 	})
 	if err != nil {
 		writeStoreError(w, err)
@@ -334,14 +370,185 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	if !created {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, struct {
-		MessageID string      `json:"message_id"`
-		Seq       int64       `json:"seq"`
-		Message   messageWire `json:"message"`
-	}{message.MessageID, message.Seq, messageToWire(place, message)})
+	writeJSON(w, status, messageReceiptToWire(message, created))
 }
 
-// localReact toggles the agent's emoji on a message through the identical
+// localUploadAttachment accepts multipart bytes through the agent's
+// generation-fenced authorization lease. Filename sanitizing, MIME sniffing,
+// blob persistence, and metadata creation are exactly the browser upload path's
+// storeUpload operation; the only transport-specific input is agent identity.
+func (s *Server) localUploadAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, MaxAttachmentBytes+maxAttachmentEnvelopeBytes)
+	parts, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_multipart")
+		return
+	}
+	var (
+		att   Attachment
+		found bool
+	)
+	for {
+		part, nextErr := parts.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(nextErr, &tooLarge) {
+				err = nextErr
+			} else {
+				err = errInvalidMultipart
+			}
+			break
+		}
+		if part.FormName() != "file" || part.FileName() == "" {
+			_ = part.Close()
+			continue
+		}
+		att, err = s.storeUpload(r.Context(), viewer, part)
+		_ = part.Close()
+		if err == nil {
+			found = true
+		}
+		break
+	}
+	switch {
+	case errors.Is(err, errInvalidMultipart):
+		writeError(w, http.StatusBadRequest, "invalid_multipart")
+	case errors.Is(err, ErrAttachmentTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+	case err != nil:
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+			return
+		}
+		writeStoreError(w, err)
+	case !found:
+		writeError(w, http.StatusBadRequest, "missing_file")
+	default:
+		writeJSON(w, http.StatusCreated, attachmentToWire(att))
+	}
+}
+
+// localAttachment returns bytes only after the shared AttachmentForViewer
+// visibility check. That preserves place membership, unbound ownership,
+// profile-image visibility, and tombstone semantics without a second policy.
+func (s *Server) localAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		AttachmentID string `json:"attachment_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	att, err := s.Store.AttachmentForViewer(r.Context(), request.AttachmentID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if att.SizeBytes > MaxLocalAttachmentFetchBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	}
+	blob, err := s.Attachments.Open(att.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	defer blob.Close()
+	payload, err := io.ReadAll(io.LimitReader(blob, MaxLocalAttachmentFetchBytes+1))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if int64(len(payload)) > MaxLocalAttachmentFetchBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		attachmentWire
+		MessageID string `json:"message_id,omitempty"`
+		Data      string `json:"data"`
+	}{attachmentToWire(att), att.MessageID, base64.StdEncoding.EncodeToString(payload)})
+}
+
+// localDownloadAttachment is the full Human/Agent capability-parity lane for
+// attachment bytes. Messaging resolves and authorizes the exact attachment,
+// then streams an immutable byte commitment. The Agent foundation separately
+// confines and atomically installs those bytes at its chosen private-workspace
+// path; no host path or base64 payload enters the model-visible result.
+func (s *Server) localDownloadAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		AttachmentID string `json:"attachment_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	att, err := s.Store.AttachmentForViewer(r.Context(), request.AttachmentID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if att.SizeBytes <= 0 || att.SizeBytes > MaxAttachmentBytes {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	blob, err := s.Attachments.Open(att.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	defer blob.Close()
+
+	digest := sha256.New()
+	size, err := io.Copy(digest, io.LimitReader(blob, MaxAttachmentBytes+1))
+	if err != nil || size != att.SizeBytes {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if _, err := blob.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	header := w.Header()
+	header.Set("Content-Type", "application/octet-stream")
+	header.Set("Content-Length", strconv.FormatInt(size, 10))
+	header.Set("X-Sumi-Content-SHA256", hex.EncodeToString(digest.Sum(nil)))
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Cache-Control", "private, no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.CopyN(w, blob, size)
+}
+
+// localReact states the agent's desired emoji state through the identical
 // store path the human UI uses. The tool layer scopes it to messages visible
 // in the currently open view (ADR 0011 §3: 見えていないものは操作できない);
 // the server enforces the shared permission model.
@@ -350,11 +557,12 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		PlaceID   string `json:"place_id"`
 		MessageID string `json:"message_id"`
 		Emoji     string `json:"emoji"`
+		Reacted   *bool  `json:"reacted"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.PlaceID == "" || request.MessageID == "" || validateReactionEmoji(request.Emoji) != nil {
+	if request.PlaceID == "" || request.MessageID == "" || request.Reacted == nil || validateReactionEmoji(request.Emoji) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -363,24 +571,17 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		writeStoreError(w, err)
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	result, err := s.setReaction(
+		r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji, *request.Reacted)
 	if err != nil {
 		writeStoreError(w, err)
 		return
-	}
-	message, reacted, err := s.Store.ToggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	wire := messageToWire(place, message)
-	if s.Hub != nil {
-		s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: request.PlaceID, Message: &wire})
 	}
 	writeJSON(w, http.StatusOK, struct {
-		Message messageWire `json:"message"`
-		Reacted bool        `json:"reacted"`
-	}{wire, reacted})
+		MessageID string         `json:"message_id"`
+		Reactions []reactionWire `json:"reactions"`
+		Reacted   bool           `json:"reacted"`
+	}{result.MessageID, reactionsToWire(result.Reactions), result.Reacted})
 }
 
 // localStatus sets the agent's own status through the identical store path the

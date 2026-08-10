@@ -21,6 +21,7 @@ import type {
   PlaceKey,
   PollOption,
   ProfileInput,
+  ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -126,12 +127,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
     // status_updated は replay されないvolatile eventなので、現在値はここでしか
     // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
-    const statuses: ParticipantStatus[] = asArray(body.statuses).map(
-      parseStatus,
-    );
-    const replyLaterMarkers: ReplyLaterMarker[] = asArray(
-      body.reply_later_markers,
-    ).map(parseReplyLater);
+    const presence = parsePresence(body);
     return {
       self: parseParticipant(body.self),
       workspaces,
@@ -139,10 +135,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       dms,
       threads,
       members,
-      statuses,
+      statuses: presence.statuses,
       readMarkers,
       unreadSummaries,
-      replyLaterMarkers,
+      replyLaterMarkers: presence.replyLaterMarkers,
       notificationSetting: parseNotificationSetting(body.notification_setting),
       roles: asArray(body.roles ?? []).map(parseRole),
       roleAssignments: asArray(body.role_assignments ?? []).map(
@@ -151,6 +147,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       permissions: parsePermissions(body.permissions),
       employedAgents: [],
     };
+  }
+
+  async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
+    return parsePresence(asRecord(await this.request("/messaging/bootstrap")));
   }
 
   async fetchMessages(
@@ -295,7 +295,12 @@ export class ApiMessagingBackend implements MessagingBackend {
         },
       ),
     );
-    return { messageId: asString(body.message_id), seq: asSeq(body.seq) };
+    return {
+      clientNonce: asString(body.client_nonce),
+      messageId: asString(body.message_id),
+      seq: asSeq(body.seq),
+      created: asBoolean(body.created),
+    };
   }
 
   /**
@@ -343,6 +348,13 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  async renewAttachments(attachmentIds: string[]): Promise<void> {
+    await this.request("/messaging/attachments:renew", {
+      method: "POST",
+      body: { attachment_ids: attachmentIds },
+    });
+  }
+
   async editMessage(
     place: Place,
     messageId: string,
@@ -373,16 +385,18 @@ export class ApiMessagingBackend implements MessagingBackend {
     status: StatusKind,
     note: string,
     expiresAt: number | null,
-  ): Promise<void> {
-    await this.request("/messaging/status", {
-      method: "PUT",
-      body: {
-        status,
-        note,
-        expires_at:
-          expiresAt === null ? null : new Date(expiresAt).toISOString(),
-      },
-    });
+  ): Promise<ParticipantStatus> {
+    return parseStatus(
+      await this.request("/messaging/status", {
+        method: "PUT",
+        body: {
+          status,
+          note,
+          expires_at:
+            expiresAt === null ? null : new Date(expiresAt).toISOString(),
+        },
+      }),
+    );
   }
 
   /** PUTは全置換。誰の名乗りかはsessionが決め、bodyには載せない。 */
@@ -467,29 +481,46 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
-      { method: "POST", body: { remind_at: new Date(remindAt).toISOString() } },
+  ): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
+        {
+          method: "POST",
+          body: { remind_at: new Date(remindAt).toISOString() },
+        },
+      ),
     );
+    return parseReplyLater(body.marker);
   }
 
-  async resolveReplyLater(markerId: string): Promise<void> {
-    await this.request(
-      `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
-      { method: "POST", body: {} },
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
+        { method: "POST", body: {} },
+      ),
     );
+    return parseReplyLater(body.marker);
   }
 
-  async toggleReaction(
+  async setReaction(
     place: Place,
     messageId: string,
     emoji: string,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
-      { method: "POST", body: { emoji } },
+    reacted: boolean,
+  ): Promise<ReactionMutationResult> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
+        { method: "POST", body: { emoji, reacted } },
+      ),
     );
+    return {
+      messageId: asString(body.message_id),
+      reactions: asArray(body.reactions).map(parseReaction),
+      reacted: asBoolean(body.reacted),
+    };
   }
 
   async votePoll(
@@ -504,8 +535,10 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 
   /** PUTは全置換。クライアントは常に現在値を持っているので差分は要らない。 */
-  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
-    await this.request("/messaging/notification-settings", {
+  async setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting> {
+    const body = await this.request("/messaging/notification-settings", {
       method: "PUT",
       body: {
         defaults: { level: input.defaults.level },
@@ -516,6 +549,7 @@ export class ApiMessagingBackend implements MessagingBackend {
         keywords: input.keywords,
       },
     });
+    return parseNotificationSetting(body);
   }
 
   sendTyping(place: Place): void {
@@ -660,12 +694,22 @@ export class ApiMessagingBackend implements MessagingBackend {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
-    } else if (
-      eventType === "reaction_updated" ||
-      eventType === "poll_updated"
-    ) {
-      // A reaction or a vote can target a message older than the replay
-      // cursor, so it must never move the cursor (backwards or at all).
+    } else if (eventType === "reaction_updated") {
+      // A reaction can target a message older than the replay cursor, so it
+      // never moves the cursor. Its partial payload cannot roll back an edit.
+      const id = asString(wire.place_id);
+      const place = this.places.get(id);
+      if (!place) return;
+      const update = asRecord(wire.reaction);
+      parsed = {
+        type: eventType,
+        place,
+        messageId: asString(update.message_id),
+        reactions: asArray(update.reactions).map(parseReaction),
+      };
+    } else if (eventType === "poll_updated") {
+      // A vote can target a message older than the replay cursor, so it must
+      // never move the cursor (backwards or at all).
       parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
@@ -792,6 +836,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       // voiceが無いwireは「話す場所ではない」——欠損として扱わない。
       voice: wire.voice === true,
     };
+    if (!this.cursors.has(channel.channelId)) {
+      this.cursors.set(channel.channelId, 0);
+    }
     this.places.set(channel.channelId, {
       kind: "channel",
       channelId: channel.channelId,
@@ -818,6 +865,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       participants: asArray(wire.participants).map(parseParticipant),
       latestSeq: asSeq(wire.latest_seq),
     };
+    if (!this.cursors.has(thread.threadId)) {
+      this.cursors.set(thread.threadId, 0);
+    }
     this.places.set(thread.threadId, {
       kind: "thread",
       threadId: thread.threadId,
@@ -833,6 +883,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
+    if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
     this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
     return dm;
   }
@@ -1039,6 +1090,16 @@ function parseAssignment(value: unknown): RoleAssignment {
   return {
     participant: parseParticipant(wire.participant),
     roleIds: asArray(wire.role_ids).map(asString),
+  };
+}
+
+function parsePresence(body: Record<string, unknown>): {
+  statuses: ParticipantStatus[];
+  replyLaterMarkers: ReplyLaterMarker[];
+} {
+  return {
+    statuses: asArray(body.statuses).map(parseStatus),
+    replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
   };
 }
 

@@ -17,6 +17,7 @@ import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { notificationLevelFor, useMessaging, usePermissions } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 import { PlaceContextMenu } from "./place-context-menu";
 import { SettingsOverlay } from "./settings-overlay";
 import { StatusMenu, statusSummary } from "./status-menu";
@@ -57,6 +58,7 @@ function PlaceRow({
   channelId,
   label,
   icon,
+  profile,
   unread,
   mentions,
   onEditChannel,
@@ -70,6 +72,8 @@ function PlaceRow({
   channelId: string | null;
   label: React.ReactNode;
   icon: React.ReactNode;
+  /** When present, the avatar opens a profile while the label still opens the place. */
+  profile?: { participantKey: string; displayName: string };
   unread: number;
   mentions: number;
   onEditChannel: (channelId: string) => void;
@@ -102,6 +106,17 @@ function PlaceRow({
             : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
       }`}
     >
+      {profile ? (
+        <ParticipantProfilePopover
+          participantKey={profile.participantKey}
+          label={`${profile.displayName}のプロフィール`}
+          side="right"
+          align="start"
+          className="flex shrink-0 rounded-full"
+        >
+          {icon}
+        </ParticipantProfilePopover>
+      ) : null}
       <button
         type="button"
         onClick={() => {
@@ -115,7 +130,7 @@ function PlaceRow({
         }}
         className="flex min-w-0 flex-1 items-center gap-2 text-left"
       >
-        {icon}
+        {profile ? null : icon}
         <span className="min-w-0 flex-1 truncate">{label}</span>
       </button>
       {muted ? (
@@ -740,6 +755,8 @@ export function Sidebar() {
             )
             .join("、");
           const unread = unreadCountByPlace[key] ?? 0;
+          const mentions = mentionCountByPlace[key] ?? 0;
+          const firstName = membersByKey[firstKey]?.displayName ?? "?";
           return (
             <PlaceRow
               key={key}
@@ -749,14 +766,19 @@ export function Sidebar() {
               icon={
                 <ParticipantAvatar
                   participantKey={firstKey}
-                  name={membersByKey[firstKey]?.displayName ?? "?"}
+                  name={firstName}
                   size={18}
                   status={statusByKey[firstKey]?.status}
                   src={membersByKey[firstKey]?.avatarUrl}
                 />
               }
+              profile={
+                others.length === 1 && firstKey
+                  ? { participantKey: firstKey, displayName: firstName }
+                  : undefined
+              }
               unread={unread}
-              mentions={unread}
+              mentions={mentions}
               canManageChannels={canManageChannels}
               {...menuActions}
             />
@@ -767,38 +789,50 @@ export function Sidebar() {
         {canSetStatus ? (
           <StatusMenu open={statusMenuOpen} onOpenChange={setStatusMenuOpen} />
         ) : null}
-        <button
-          type="button"
-          aria-label="アカウントとステータス"
-          aria-expanded={statusMenuOpen}
-          disabled={!canSetStatus}
-          aria-haspopup="menu"
-          onMouseDown={(event) => {
-            // トリガー上のmousedownをStatusMenuの外側クリック判定に拾わせない。
-            // 拾わせると「mousedownで閉じ→clickで再オープン」になり閉じられない。
-            event.stopPropagation();
-          }}
-          onClick={() => {
-            if (canSetStatus) setStatusMenuOpen((open) => !open);
-          }}
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
+        <div
+          className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+            canSetStatus ? "hover:bg-accent/60" : ""
+          }`}
         >
-          <ParticipantAvatar
+          <ParticipantProfilePopover
             participantKey={selfKey}
-            name={selfProfile?.displayName ?? "?"}
-            size={26}
-            status={selfStatus?.status}
-            src={selfProfile?.avatarUrl}
-          />
-          <span className="min-w-0 flex-1">
+            label={`${selfProfile?.displayName ?? "自分"}のプロフィール`}
+            side="top"
+            align="start"
+            className="flex shrink-0 rounded-full"
+          >
+            <ParticipantAvatar
+              participantKey={selfKey}
+              name={selfProfile?.displayName ?? "?"}
+              size={26}
+              status={selfStatus?.status}
+              src={selfProfile?.avatarUrl}
+            />
+          </ParticipantProfilePopover>
+          <button
+            type="button"
+            aria-label="アカウントとステータス"
+            aria-expanded={statusMenuOpen}
+            disabled={!canSetStatus}
+            aria-haspopup="menu"
+            onMouseDown={(event) => {
+              // トリガー上のmousedownをStatusMenuの外側クリック判定に拾わせない。
+              // 拾わせると「mousedownで閉じ→clickで再オープン」になり閉じられない。
+              event.stopPropagation();
+            }}
+            onClick={() => {
+              if (canSetStatus) setStatusMenuOpen((open) => !open);
+            }}
+            className="min-w-0 flex-1 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-default"
+          >
             <span className="block truncate font-medium text-[13px]">
               {selfProfile?.displayName ?? "…"}
             </span>
             <span className="block truncate text-[11px] text-muted-foreground">
               {statusSummary(selfStatus, now)}
             </span>
-          </span>
-        </button>
+          </button>
+        </div>
       </div>
       {openDialog === "channel" && canManageChannels ? (
         <CreateChannelDialog onClose={() => setOpenDialog(null)} />

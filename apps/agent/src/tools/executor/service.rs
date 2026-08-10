@@ -1275,6 +1275,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
                 run_critical_executor_service(
                     first_line,
+                    read,
                     ExecutorWriter::start(write),
                     identity,
                     fs,
@@ -1306,30 +1307,45 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
 /// Health plus workspace-dirfd read and discovery operations. The broader
 /// stdio fixture service remains separate and cannot be reached through
 /// production bootstrap.
-async fn run_critical_executor_service(
+async fn run_critical_executor_service<R>(
     first_line: Vec<u8>,
+    mut read: R,
     (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
     identity: RpcIdentity,
     fs: Arc<WorkspaceFs>,
     manager: Arc<ExecutorManager>,
     blocking_fs: BlockingFsRegistry,
-) -> Result<()> {
-    let result =
-        run_critical_executor_exchange(first_line, &writer, identity, fs, manager, blocking_fs)
-            .await;
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let result = run_critical_executor_exchange(
+        first_line,
+        &mut read,
+        &writer,
+        identity,
+        fs,
+        manager,
+        blocking_fs,
+    )
+    .await;
     writer_task.abort();
     let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
 }
 
-async fn run_critical_executor_exchange(
+async fn run_critical_executor_exchange<R>(
     first_line: Vec<u8>,
+    read: &mut R,
     writer: &ExecutorWriter,
     identity: RpcIdentity,
     fs: Arc<WorkspaceFs>,
     manager: Arc<ExecutorManager>,
     blocking_fs: BlockingFsRegistry,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
     let request = match decode_executor_request(&first_line, &identity)? {
         Ok(request) => request,
         Err((request_id, error)) => {
@@ -1357,25 +1373,31 @@ async fn run_critical_executor_exchange(
                 .await?;
         }
         operation @ (ExecutorOperation::ReadFile { .. }
+        | ExecutorOperation::ReadRawFile { .. }
         | ExecutorOperation::ListDir { .. }
         | ExecutorOperation::Glob { .. }
         | ExecutorOperation::Grep { .. }) => {
             let execution_id = operation_execution_id(&operation).to_owned();
-            let registration =
-                match manager.register_execution(request.request_id.clone(), execution_id, None) {
-                    Ok(registration) => registration,
-                    Err(error) if is_typed_admission_error(&error) => {
-                        writer
-                            .terminal(&identity, request.request_id, Err(rpc_error(error)))
-                            .await?;
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error.into()),
-                };
+            let registration = match manager.register_execution(
+                request.request_id.clone(),
+                execution_id.clone(),
+                None,
+            ) {
+                Ok(registration) => registration,
+                Err(error) if is_typed_admission_error(&error) => {
+                    writer
+                        .terminal(&identity, request.request_id, Err(rpc_error(error)))
+                        .await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             let execution = match registration {
                 ExecutionRegistration::Replay(result) => {
                     writer
                         .terminal(&identity, request.request_id, result)
+                        .await?;
+                    settle_critical_read_cancel(read, writer, &identity, &manager, &execution_id)
                         .await?;
                     return Ok(());
                 }
@@ -1398,6 +1420,7 @@ async fn run_critical_executor_exchange(
             writer
                 .terminal(&identity, request.request_id, result)
                 .await?;
+            settle_critical_read_cancel(read, writer, &identity, &manager, &execution_id).await?;
         }
         _ => {
             let result = match manager.reject_request(&request.request_id) {
@@ -1413,6 +1436,74 @@ async fn run_critical_executor_exchange(
     Ok(())
 }
 
+async fn settle_critical_read_cancel<R>(
+    read: &mut R,
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    manager: &ExecutorManager,
+    execution_id: &str,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let line = match timeout(EXECUTOR_CANCEL_SETTLEMENT_DEADLINE, read_frame(read)).await {
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Ok(Some(line))) => line,
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_) => {
+            return Err(ToolError::Protocol(
+                "critical executor timed out waiting for cancellation settlement or EOF".to_owned(),
+            )
+            .into());
+        }
+    };
+    let request = match decode_executor_request(&line, identity)? {
+        Ok(request) => request,
+        Err((request_id, error)) => {
+            let result = match manager.reject_request(&request_id) {
+                Ok(()) => Err(error),
+                Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                Err(error) => return Err(error.into()),
+            };
+            writer.terminal(identity, request_id, result).await?;
+            return Ok(());
+        }
+    };
+    let cancel_request_id = request.request_id;
+    let result = match request.operation {
+        ExecutorOperation::Cancel {
+            execution_id: requested,
+        } if requested == execution_id => {
+            match manager.cancel_execution(&cancel_request_id, execution_id) {
+                Ok(CancelDecision::Accepted(completed)) => settle_manager_cancel(completed).await,
+                Ok(CancelDecision::TooLate) => Ok(ExecutorResponse::CancelTooLate {}),
+                Ok(CancelDecision::Unknown) => Err(bounded_error("protocol")),
+                Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        _ => match manager.reject_request(&cancel_request_id) {
+            Ok(()) => Err(bounded_error("protocol")),
+            Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+            Err(error) => return Err(error.into()),
+        },
+    };
+    writer.terminal(identity, cancel_request_id, result).await?;
+
+    match timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, read_frame(read)).await {
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some(_))) => Err(ToolError::Protocol(
+            "critical executor received an extra frame after cancellation settlement".to_owned(),
+        )
+        .into()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(ToolError::Protocol(
+            "critical executor peer did not close after cancellation settlement".to_owned(),
+        )
+        .into()),
+    }
+}
+
 fn start_critical_read_discovery_execution(
     mut execution: ExecutionLease,
     fs: Arc<WorkspaceFs>,
@@ -1421,6 +1512,36 @@ fn start_critical_read_discovery_execution(
 ) -> JoinHandle<Result<ExecutorResponse, RpcError>> {
     tokio::spawn(async move {
         let result = match operation {
+            ExecutorOperation::ReadRawFile {
+                path,
+                offset,
+                limit,
+                max_total_bytes,
+                expected_version,
+                expected_content_digest,
+                ..
+            } => match resolve_input("read_raw_file", &path) {
+                Ok(InputRoute::Workspace) => {
+                    blocking_fs
+                        .execute(move || {
+                            Ok(ExecutorResponse::RawFile {
+                                chunk: fs.read_raw_file(
+                                    Path::new(&path),
+                                    offset,
+                                    limit,
+                                    max_total_bytes,
+                                    expected_version.as_deref(),
+                                    expected_content_digest.as_deref(),
+                                )?,
+                            })
+                        })
+                        .await
+                }
+                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                    "production executor does not expose artifact raw reads".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
             ExecutorOperation::ReadFile {
                 path,
                 offset,
@@ -2492,6 +2613,35 @@ async fn execute_non_bash(
     operation: ExecutorOperation,
 ) -> Result<ExecutorResponse, ToolError> {
     match operation {
+        ExecutorOperation::ReadRawFile {
+            path,
+            offset,
+            limit,
+            max_total_bytes,
+            expected_version,
+            expected_content_digest,
+            ..
+        } => match resolve_input("read_raw_file", &path)? {
+            InputRoute::Workspace => {
+                blocking_fs
+                    .execute(move || {
+                        Ok(ExecutorResponse::RawFile {
+                            chunk: fs.read_raw_file(
+                                Path::new(&path),
+                                offset,
+                                limit,
+                                max_total_bytes,
+                                expected_version.as_deref(),
+                                expected_content_digest.as_deref(),
+                            )?,
+                        })
+                    })
+                    .await
+            }
+            InputRoute::Artifact => Err(ToolError::Protocol(
+                "raw workspace reads cannot target artifacts".to_owned(),
+            )),
+        },
         ExecutorOperation::ReadFile {
             path,
             offset,
@@ -2591,6 +2741,7 @@ async fn execute_non_bash(
 fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     match operation {
         ExecutorOperation::ReadFile { execution_id, .. }
+        | ExecutorOperation::ReadRawFile { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
         | ExecutorOperation::RemoveFile { execution_id, .. }
@@ -2919,17 +3070,21 @@ mod tests {
         (client, task)
     }
 
-    async fn read_test_terminal(stream: &mut tokio::io::DuplexStream) -> Value {
+    async fn read_test_terminal_from<R>(stream: &mut R) -> Value
+    where
+        R: AsyncBufRead + Unpin,
+    {
         let mut line = String::new();
-        timeout(
-            Duration::from_secs(2),
-            BufReader::new(stream).read_line(&mut line),
-        )
-        .await
-        .expect("test terminal deadline")
-        .expect("read test terminal");
+        timeout(Duration::from_secs(2), stream.read_line(&mut line))
+            .await
+            .expect("test terminal deadline")
+            .expect("read test terminal");
         assert!(!line.is_empty(), "service closed before terminal");
         serde_json::from_str(&line).expect("decode test terminal")
+    }
+
+    async fn read_test_terminal(stream: &mut tokio::io::DuplexStream) -> Value {
+        read_test_terminal_from(&mut BufReader::new(stream)).await
     }
 
     fn start_critical_test_session(
@@ -2949,9 +3104,10 @@ mod tests {
         };
         let line = serde_json::to_vec(&request).expect("encode critical test request");
         let (client, server) = tokio::io::duplex(MAX_RPC_LINE_BYTES);
-        let (_read, write) = tokio::io::split(server);
+        let (read, write) = tokio::io::split(server);
         let task = tokio::spawn(run_critical_executor_service(
             line,
+            BufReader::new(read),
             ExecutorWriter::start(write),
             identity,
             fs,
@@ -3025,10 +3181,43 @@ mod tests {
                     .len(),
                 2
             );
+            client
+                .shutdown()
+                .await
+                .expect("close critical test request");
             task.await
                 .expect("join critical endpoint")
                 .expect("critical endpoint result");
         }
+
+        std::fs::write(workspace.join("image.bin"), [0, 0xff, 0x80])
+            .expect("write binary workspace fixture");
+        let (mut client, task) = start_critical_test_session(
+            identity.clone(),
+            fs.clone(),
+            manager.clone(),
+            blocking_fs.clone(),
+            "critical-raw-file",
+            ExecutorOperation::ReadRawFile {
+                path: "image.bin".to_owned(),
+                offset: 0,
+                limit: 3,
+                max_total_bytes: 3,
+                expected_version: None,
+                expected_content_digest: None,
+                execution_id: "critical-raw-file".to_owned(),
+            },
+        );
+        let terminal = read_test_terminal(&mut client).await;
+        assert_eq!(terminal["result"]["Ok"]["type"], "raw_file");
+        assert_eq!(
+            terminal["result"]["Ok"]["chunk"]["content"],
+            serde_json::json!([0, 255, 128])
+        );
+        client.shutdown().await.expect("close critical raw request");
+        task.await
+            .expect("join critical endpoint")
+            .expect("critical endpoint result");
 
         for (request_id, operation) in [
             (
@@ -3058,6 +3247,10 @@ mod tests {
             );
             let terminal = read_test_terminal(&mut client).await;
             assert_eq!(terminal["result"]["Err"]["code"], "protocol");
+            client
+                .shutdown()
+                .await
+                .expect("close rejected critical request");
             task.await
                 .expect("join critical endpoint")
                 .expect("critical endpoint result");
@@ -3067,6 +3260,75 @@ mod tests {
             "critical endpoint accepted a mutation"
         );
         std::fs::remove_dir_all(root).expect("remove critical endpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn critical_raw_read_settles_a_buffered_matching_cancel_as_too_late() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-critical-raw-cancel-{}", uuid::Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create cancellation workspace");
+        std::fs::write(workspace.join("image.bin"), [0, 0xff, 0x80])
+            .expect("write cancellation fixture");
+        let fs = Arc::new(WorkspaceFs::open(&workspace).expect("open cancellation workspace"));
+        let identity = test_identity();
+        let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
+        let gate = Arc::new(BlockingFsGate::default());
+        let hook_gate = gate.clone();
+        let blocking_fs =
+            BlockingFsRegistry::with_test_hook(1, 1, Arc::new(move || hook_gate.block()));
+        let (mut client, task) = start_critical_test_session(
+            identity.clone(),
+            fs,
+            manager,
+            blocking_fs,
+            "critical-raw-cancel-read",
+            ExecutorOperation::ReadRawFile {
+                path: "image.bin".to_owned(),
+                offset: 0,
+                limit: 3,
+                max_total_bytes: 3,
+                expected_version: None,
+                expected_content_digest: None,
+                execution_id: "critical-raw-cancel-execution".to_owned(),
+            },
+        );
+        wait_for_blocking_fs_starts(&gate, 1).await;
+
+        let cancel = RpcRequest {
+            personality_agent_id: identity.personality_agent_id().clone(),
+            generation: identity.generation().to_wire(),
+            nonce: identity.nonce().as_str().to_owned(),
+            request_id: "critical-raw-cancel-request".to_owned(),
+            operation: ExecutorOperation::Cancel {
+                execution_id: "critical-raw-cancel-execution".to_owned(),
+            },
+        };
+        let mut cancel = serde_json::to_vec(&cancel).expect("encode cancellation request");
+        cancel.push(b'\n');
+        let cancel_write = client.write_all(&cancel).await;
+        gate.release();
+        assert!(
+            cancel_write.is_ok(),
+            "critical endpoint dropped its buffered reader before cancellation settlement"
+        );
+
+        let mut client = BufReader::new(client);
+        let original = read_test_terminal_from(&mut client).await;
+        let settlement = read_test_terminal_from(&mut client).await;
+        assert_eq!(original["request_id"], "critical-raw-cancel-read");
+        assert_eq!(original["result"]["Ok"]["type"], "raw_file");
+        assert_eq!(settlement["request_id"], "critical-raw-cancel-request");
+        assert_eq!(settlement["result"]["Ok"]["type"], "cancel_too_late");
+        client
+            .get_mut()
+            .shutdown()
+            .await
+            .expect("close critical cancellation request stream");
+        task.await
+            .expect("join critical cancellation endpoint")
+            .expect("critical cancellation endpoint result");
+        std::fs::remove_dir_all(root).expect("remove cancellation fixture");
     }
 
     #[tokio::test]

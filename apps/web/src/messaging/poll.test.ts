@@ -93,7 +93,15 @@ describe("ApiMessagingBackend polls", () => {
           path === "/messaging/places/ch-general/messages" &&
           init?.method === "POST"
         ) {
-          return json({ message_id: "m-1", seq: 1 }, 201);
+          return json(
+            {
+              client_nonce: "n-1",
+              message_id: "m-1",
+              seq: 1,
+              created: true,
+            },
+            201,
+          );
         }
         throw new Error(`unexpected request ${path}`);
       },

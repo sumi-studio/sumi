@@ -51,7 +51,7 @@ type ReplyLaterMarker struct {
 // Placing the marker is the actor's own declaration — the platform never
 // promises on anyone's behalf. Idempotent per (actor, message): repeating the
 // tap returns the existing open marker with created=false. The message row is
-// locked so concurrent taps serialize, mirroring ToggleReaction; a place the
+// locked so concurrent taps serialize, mirroring SetReaction; a place the
 // actor cannot see is ErrPlaceNotFound, a tombstone rejects new markers.
 func (s *Store) CreateReplyLater(ctx context.Context, placeID, messageID string, actor ParticipantRef, note string, remindAt time.Time) (ReplyLaterMarker, bool, error) {
 	if err := actor.Validate(); err != nil {

@@ -21,7 +21,16 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 
 const human: ParticipantRef = { kind: "human", humanId: "h1" };
+const agent: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a1",
+};
+const secondAgent: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a2",
+};
 const humanKey = participantKey(human);
+const agentKey = participantKey(agent);
 const self: MemberProfile = {
   participant: human,
   displayName: "余白",
@@ -176,5 +185,90 @@ describe("Sidebar", () => {
     });
 
     expect(note).toHaveValue("入力途中");
+  });
+
+  it("1対1 DMのアバターはプロフィール、名前はplace遷移を開く", () => {
+    useMessaging.setState({
+      membersByKey: {
+        [humanKey]: self,
+        [agentKey]: {
+          participant: agent,
+          displayName: "墨",
+          tagline: "秘書",
+        },
+      },
+      dms: [{ dmId: "d1", kind: "dm", participants: [human, agent] }],
+    });
+    render(<Sidebar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
+    expect(screen.getByText("秘書")).toBeInTheDocument();
+    expect(mocks.navigate).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "墨" }));
+    expect(mocks.navigate).toHaveBeenCalledWith({
+      to: "/dm/$dmId",
+      params: { dmId: "d1" },
+    });
+  });
+
+  it("group DMは先頭参加者のプロフィールと誤認させない", () => {
+    const secondKey = participantKey(secondAgent);
+    useMessaging.setState({
+      membersByKey: {
+        [humanKey]: self,
+        [agentKey]: {
+          participant: agent,
+          displayName: "墨",
+          tagline: "秘書",
+        },
+        [secondKey]: {
+          participant: secondAgent,
+          displayName: "筆",
+          tagline: "編集",
+        },
+      },
+      dms: [
+        {
+          dmId: "group-1",
+          kind: "group_dm",
+          participants: [human, agent, secondAgent],
+        },
+      ],
+    });
+    render(<Sidebar />);
+
+    expect(
+      screen.queryByRole("button", { name: "墨のプロフィール" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "墨、筆" })).toBeInTheDocument();
+  });
+
+  it("DMの未読数ではなくメンション数だけをurgent表示する", () => {
+    useMessaging.setState({
+      membersByKey: {
+        [humanKey]: self,
+        [agentKey]: { participant: agent, displayName: "墨", tagline: "" },
+      },
+      dms: [{ dmId: "d1", kind: "dm", participants: [human, agent] }],
+      unreadCountByPlace: { "dm:d1": 3 },
+      mentionCountByPlace: { "dm:d1": 1 },
+    });
+    render(<Sidebar />);
+
+    const badge = screen.getByText("1");
+    expect(badge).toHaveClass("bg-rose-500");
+    expect(screen.queryByText("3")).not.toBeInTheDocument();
+  });
+
+  it("自分のプロフィールとステータス操作を別buttonに保つ", () => {
+    const { container } = render(<Sidebar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "余白のプロフィール" }));
+    expect(screen.getByText("創業・デザイン")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menu", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelectorAll("button button")).toHaveLength(0);
   });
 });

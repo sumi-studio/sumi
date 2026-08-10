@@ -3,8 +3,11 @@ package messaging
 import (
 	"context"
 	"fmt"
+	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // MaxReactionEmojiChars matches the schema CHECK on message_reactions.emoji.
@@ -18,78 +21,152 @@ type ReactionSummary struct {
 	Participants []ParticipantRef
 }
 
-// ToggleReaction flips actor × message × emoji: absent becomes present,
-// present becomes absent (人間のUIとagentの道具が同じトグルを同じ経路で使う).
-// The message row is locked for the duration, so concurrent toggles serialize
-// and the returned state is the committed one. A place the actor cannot see
-// is reported as ErrPlaceNotFound; a tombstone rejects new reactions.
-// The returned message carries its full reaction and mention state.
-func (s *Store) ToggleReaction(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji string) (Message, bool, error) {
+// ReactionMutationResult is the complete projection owned by one successful
+// desired-state mutation. It contains no unrelated message fields.
+type ReactionMutationResult struct {
+	MessageID string
+	Reactions []ReactionSummary
+	Reacted   bool
+}
+
+type reactionSnapshotLoader func(context.Context, pgx.Tx, string) ([]ReactionSummary, error)
+
+// SetReaction states the desired actor × message × emoji membership. Both add
+// and remove are idempotent: a retry repeats intent instead of toggling it.
+// The authoritative absolute snapshot is read through the same transaction
+// before commit. If snapshot construction fails, the mutation rolls back and
+// no success can be published without a corresponding projection.
+func (s *Store) SetReaction(
+	ctx context.Context,
+	placeID, messageID string,
+	actor ParticipantRef,
+	emoji string,
+	reacted bool,
+) (ReactionMutationResult, error) {
+	return s.setReaction(ctx, placeID, messageID, actor, emoji, reacted, loadReactionSnapshot)
+}
+
+func (s *Store) setReaction(
+	ctx context.Context,
+	placeID, messageID string,
+	actor ParticipantRef,
+	emoji string,
+	reacted bool,
+	loadSnapshot reactionSnapshotLoader,
+) (ReactionMutationResult, error) {
 	if err := actor.Validate(); err != nil {
-		return Message{}, false, err
+		return ReactionMutationResult{}, err
 	}
 	if err := validateReactionEmoji(emoji); err != nil {
-		return Message{}, false, err
+		return ReactionMutationResult{}, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Message{}, false, fmt.Errorf("begin toggle reaction: %w", err)
+		return ReactionMutationResult{}, fmt.Errorf("begin set reaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	place, err := s.loadPlace(ctx, tx, placeID)
 	if err != nil {
-		return Message{}, false, err
+		return ReactionMutationResult{}, err
 	}
 	visible, err := s.canAccess(ctx, tx, place, actor)
 	if err != nil {
-		return Message{}, false, err
+		return ReactionMutationResult{}, err
 	}
 	if !visible {
-		return Message{}, false, ErrPlaceNotFound
+		return ReactionMutationResult{}, ErrPlaceNotFound
 	}
 	msg, err := lockMessage(ctx, tx, placeID, messageID)
 	if err != nil {
-		return Message{}, false, err
+		return ReactionMutationResult{}, err
 	}
 	if msg.Deleted {
-		return Message{}, false, ErrMessageDeleted
+		return ReactionMutationResult{}, ErrMessageDeleted
 	}
 
-	tag, err := tx.Exec(ctx,
-		`DELETE FROM message_reactions
-		 WHERE message_id = $1 AND member_kind = $2 AND member_id = $3 AND emoji = $4`,
-		messageID, actor.Kind, actor.ID, emoji)
-	if err != nil {
-		return Message{}, false, fmt.Errorf("remove reaction: %w", err)
-	}
-	reacted := false
-	if tag.RowsAffected() == 0 {
+	if reacted {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO message_reactions (message_id, member_kind, member_id, emoji)
-			 VALUES ($1, $2, $3, $4)`,
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (message_id, member_kind, member_id, emoji) DO NOTHING`,
 			messageID, actor.Kind, actor.ID, emoji); err != nil {
-			return Message{}, false, fmt.Errorf("add reaction: %w", err)
+			return ReactionMutationResult{}, fmt.Errorf("add reaction: %w", err)
 		}
-		reacted = true
+	} else if _, err := tx.Exec(ctx,
+		`DELETE FROM message_reactions
+		 WHERE message_id = $1 AND member_kind = $2 AND member_id = $3 AND emoji = $4`,
+		messageID, actor.Kind, actor.ID, emoji); err != nil {
+		return ReactionMutationResult{}, fmt.Errorf("remove reaction: %w", err)
+	}
+
+	reactions, err := loadSnapshot(ctx, tx, messageID)
+	if err != nil {
+		return ReactionMutationResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Message{}, false, fmt.Errorf("commit toggle reaction: %w", err)
+		return ReactionMutationResult{}, fmt.Errorf("commit set reaction: %w", err)
 	}
-	messages := []Message{msg}
-	if err := s.attachMentions(ctx, messages); err != nil {
-		return Message{}, false, err
+	return ReactionMutationResult{
+		MessageID: messageID,
+		Reactions: reactions,
+		Reacted:   reacted,
+	}, nil
+}
+
+type reactionPublishLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockReactionPublish keeps commit→Hub.Publish ordered for one message while
+// leaving unrelated messages fully concurrent.
+func (s *Server) lockReactionPublish(messageID string) func() {
+	s.reactionLocksMu.Lock()
+	if s.reactionLocks == nil {
+		s.reactionLocks = make(map[string]*reactionPublishLock)
 	}
-	if err := s.attachReactions(ctx, messages); err != nil {
-		return Message{}, false, err
+	entry := s.reactionLocks[messageID]
+	if entry == nil {
+		entry = &reactionPublishLock{}
+		s.reactionLocks[messageID] = entry
 	}
-	// The reaction event carries the whole message and live consumers replace
-	// their copy with it, so a poll on the message must ride along or reacting
-	// would erase the question.
-	if err := s.attachPolls(ctx, messages); err != nil {
-		return Message{}, false, err
+	entry.refs++
+	s.reactionLocksMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		s.reactionLocksMu.Lock()
+		entry.refs--
+		if entry.refs == 0 && s.reactionLocks[messageID] == entry {
+			delete(s.reactionLocks, messageID)
+		}
+		s.reactionLocksMu.Unlock()
 	}
-	return messages[0], reacted, nil
+}
+
+func (s *Server) setReaction(
+	ctx context.Context,
+	placeID, messageID string,
+	actor ParticipantRef,
+	emoji string,
+	reacted bool,
+) (ReactionMutationResult, error) {
+	unlock := s.lockReactionPublish(messageID)
+	defer unlock()
+
+	result, err := s.Store.SetReaction(ctx, placeID, messageID, actor, emoji, reacted)
+	if err != nil {
+		return ReactionMutationResult{}, err
+	}
+	if s.Hub != nil {
+		update := reactionUpdateToWire(result.MessageID, result.Reactions)
+		s.Hub.Publish(ctx, Event{
+			Type: EventReactionUpdated, PlaceID: placeID, Reaction: &update,
+		})
+	}
+	return result, nil
 }
 
 // validateReactionEmoji bounds the emoji the same way the schema does. The
@@ -105,6 +182,42 @@ func validateReactionEmoji(emoji string) error {
 		}
 	}
 	return nil
+}
+
+func loadReactionSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	messageID string,
+) ([]ReactionSummary, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT emoji, member_kind, member_id
+		 FROM message_reactions
+		 WHERE message_id = $1
+		 ORDER BY created_at, member_kind, member_id`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("query reaction snapshot: %w", err)
+	}
+	defer rows.Close()
+	summaries := make([]ReactionSummary, 0)
+	indexByEmoji := make(map[string]int)
+	for rows.Next() {
+		var emoji, kind, id string
+		if err := rows.Scan(&emoji, &kind, &id); err != nil {
+			return nil, fmt.Errorf("scan reaction snapshot: %w", err)
+		}
+		participant := ParticipantRef{Kind: ParticipantKind(kind), ID: id}
+		index, ok := indexByEmoji[emoji]
+		if !ok {
+			index = len(summaries)
+			indexByEmoji[emoji] = index
+			summaries = append(summaries, ReactionSummary{Emoji: emoji})
+		}
+		summaries[index].Participants = append(summaries[index].Participants, participant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate reaction snapshot: %w", err)
+	}
+	return summaries, nil
 }
 
 // attachReactions loads reaction rows for the given messages in one query and

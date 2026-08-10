@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1241,6 +1243,88 @@ func TestUnixLocalControlRoundTripRequiresBearerAndNeverUsesPublicMux(t *testing
 	}
 	if socketInfo.Mode().Perm() != localControlSocketMode {
 		t.Fatalf("socket mode: got %04o, want %04o", socketInfo.Mode().Perm(), localControlSocketMode)
+	}
+}
+
+func TestLocalControlHTTPServerAllowsTheAttachmentUploadWindow(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts, err := r.MultipartReader()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		part, err := parts.NextPart()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer part.Close()
+		if _, err := io.Copy(io.Discard, part); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	})
+	server := newLocalControlHTTPServer(handler)
+	if server.ReadHeaderTimeout != 2*time.Second ||
+		server.ReadTimeout != localControlRequestTimeout ||
+		server.WriteTimeout != localControlRequestTimeout ||
+		server.MaxHeaderBytes != 16*1024 {
+		t.Fatalf("local-control server bounds changed: headers=%s read=%s write=%s max-header=%d",
+			server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout, server.MaxHeaderBytes)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Shutdown(context.Background())
+		if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve local-control fixture: %v", err)
+		}
+	})
+
+	reader, writer := io.Pipe()
+	multipartWriter := multipart.NewWriter(writer)
+	writeDone := make(chan error, 1)
+	go func() {
+		part, err := multipartWriter.CreateFormFile("file", "slow.bin")
+		if err == nil {
+			_, err = part.Write([]byte("first"))
+		}
+		if err == nil {
+			time.Sleep(5250 * time.Millisecond)
+			_, err = part.Write([]byte("second"))
+		}
+		if closeErr := multipartWriter.Close(); err == nil {
+			err = closeErr
+		}
+		if closeErr := writer.CloseWithError(err); err == nil {
+			err = closeErr
+		}
+		writeDone <- err
+	}()
+
+	req, err := http.NewRequest(http.MethodPost,
+		"http://"+listener.Addr().String()+"/local-control/v1/messaging:upload", reader)
+	if err != nil {
+		t.Fatalf("new slow upload request: %v", err)
+	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("slow upload inside the 120-second client window: %v", err)
+	}
+	resp.Body.Close()
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write slow multipart body: %v", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("slow upload status = %d, want 201", resp.StatusCode)
 	}
 }
 

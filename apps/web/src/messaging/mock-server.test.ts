@@ -9,6 +9,7 @@ const DEV = { kind: "channel", channelId: "ch-dev" } as const;
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("MockMessagingServer admission", () => {
@@ -86,5 +87,41 @@ describe("MockMessagingServer admission", () => {
     );
 
     expect(dev).toMatchObject({ unreadCount: 6, mentionCount: 1 });
+  });
+
+  it("未送信のuploadだけをrenew対象として検証する", async () => {
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn(() => "blob:attachment"),
+    });
+    vi.useFakeTimers();
+    const server = new MockMessagingServer();
+    const first = await server.uploadAttachment(
+      new File(["first"], "first.txt", { type: "text/plain" }),
+    );
+    const second = await server.uploadAttachment(
+      new File(["second"], "second.txt", { type: "text/plain" }),
+    );
+
+    await expect(
+      server.renewAttachments([first.attachmentId, second.attachmentId]),
+    ).resolves.toBeUndefined();
+
+    const receipt = server.sendMessage({
+      place: GENERAL,
+      content: "first attachment",
+      urgency: "normal",
+      replyTo: null,
+      clientNonce: "bind-first-attachment",
+      attachments: [first.attachmentId],
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    await receipt;
+
+    await expect(
+      server.renewAttachments([first.attachmentId, second.attachmentId]),
+    ).rejects.toThrow("attachment_not_found");
+    await expect(
+      server.renewAttachments([second.attachmentId]),
+    ).resolves.toBeUndefined();
   });
 });

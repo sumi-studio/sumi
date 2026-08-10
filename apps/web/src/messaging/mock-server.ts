@@ -550,8 +550,11 @@ export class MockMessagingServer implements MessagingBackend {
     return assignment;
   }
 
-  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+  async setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting> {
     this.notificationSetting = { owner: SELF, ...input };
+    return this.notificationSetting;
   }
 
   /**
@@ -745,8 +748,10 @@ export class MockMessagingServer implements MessagingBackend {
     );
     if (existing) {
       return Promise.resolve({
+        clientNonce: input.clientNonce,
         messageId: existing.messageId,
         seq: existing.seq,
+        created: false,
       });
     }
     return new Promise((resolve) => {
@@ -776,7 +781,12 @@ export class MockMessagingServer implements MessagingBackend {
           notify: this.notifyFor(message),
         });
         this.scheduleAgentResponses(message);
-        resolve({ messageId: message.messageId, seq: message.seq });
+        resolve({
+          clientNonce: input.clientNonce,
+          messageId: message.messageId,
+          seq: message.seq,
+          created: true,
+        });
       }, SEND_LATENCY_MS);
     });
   }
@@ -819,6 +829,13 @@ export class MockMessagingServer implements MessagingBackend {
     return next;
   }
 
+  async renewAttachments(attachmentIds: string[]): Promise<void> {
+    // 実APIと同じく一件でも既に束ね済み/未知なら、部分成功にしない。
+    if (attachmentIds.some((attachmentId) => !this.uploads.has(attachmentId))) {
+      throw new Error("attachment_not_found");
+    }
+  }
+
   async editMessage(
     place: Place,
     messageId: string,
@@ -856,11 +873,26 @@ export class MockMessagingServer implements MessagingBackend {
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
+  async fetchPresence(): Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }> {
+    const now = Date.now();
+    return {
+      statuses: [...this.statuses.values()].filter(
+        (status) => status.expiresAt === null || status.expiresAt > now,
+      ),
+      replyLaterMarkers: [...this.replyLaterMarkers.values()].filter(
+        (marker) => !marker.resolved,
+      ),
+    };
+  }
+
   async setStatus(
     status: StatusKind,
     note: string,
     expiresAt: number | null = null,
-  ): Promise<void> {
+  ): Promise<ParticipantStatus> {
     const key = participantKey(SELF);
     const current = this.statuses.get(key);
     // 一時ステータスは「その前に言っていたこと」を覚えて、期限で戻る。
@@ -885,7 +917,7 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.statuses.set(key, next);
     this.emit({ type: "status_updated", status: next });
-    if (expiresAt === null) return;
+    if (expiresAt === null) return next;
     window.setTimeout(
       () => {
         // 期限が来ても、途中で置き換えられていたら何もしない。
@@ -908,6 +940,7 @@ export class MockMessagingServer implements MessagingBackend {
       },
       Math.max(0, expiresAt - Date.now()),
     );
+    return next;
   }
 
   /**
@@ -947,14 +980,14 @@ export class MockMessagingServer implements MessagingBackend {
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void> {
+  ): Promise<ReplyLaterMarker> {
     const existing = [...this.replyLaterMarkers.values()].find(
       (marker) =>
         !marker.resolved &&
         marker.messageId === messageId &&
         sameParticipant(marker.participant, SELF),
     );
-    if (existing) return;
+    if (existing) return existing;
     const marker: ReplyLaterMarker = {
       markerId: secureRandomUUID(),
       participant: SELF,
@@ -966,21 +999,33 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.replyLaterMarkers.set(marker.markerId, marker);
     this.emit({ type: "reply_later_created", marker });
+    return marker;
   }
 
-  async resolveReplyLater(markerId: string): Promise<void> {
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
     const marker = this.replyLaterMarkers.get(markerId);
-    if (!marker || marker.resolved) return;
+    if (!marker) throw new Error("unknown reply-later marker");
+    if (marker.resolved) return marker;
     marker.resolved = true;
     this.emit({ type: "reply_later_resolved", markerId });
+    return marker;
   }
 
-  async toggleReaction(
+  async setReaction(
     place: Place,
     messageId: string,
     emoji: string,
-  ): Promise<void> {
-    this.applyReaction(place, messageId, SELF, emoji);
+    reacted: boolean,
+  ): ReturnType<MessagingBackend["setReaction"]> {
+    const reactions = this.applyReaction(
+      place,
+      messageId,
+      SELF,
+      emoji,
+      reacted,
+    );
+    if (!reactions) throw new Error("unknown or deleted message");
+    return { messageId, reactions, reacted };
   }
 
   /**
@@ -1008,22 +1053,26 @@ export class MockMessagingServer implements MessagingBackend {
     this.emit({ type: "poll_updated", message: { ...message } });
   }
 
-  /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
+  /** Desired reaction state. Human and agent calls share this exact shape. */
   private applyReaction(
     place: Place,
     messageId: string,
     participant: ParticipantRef,
     emoji: string,
-  ): void {
+    reacted = true,
+  ): ReactionSummary[] | null {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted) return;
+    if (!message || message.deleted) return null;
     const summary = message.reactions.find((entry) => entry.emoji === emoji);
-    if (!summary) {
+    const alreadyReacted =
+      summary?.participants.some((ref) => sameParticipant(ref, participant)) ??
+      false;
+    if (reacted && !alreadyReacted && !summary) {
       message.reactions.push({ emoji, participants: [participant] });
-    } else if (
-      summary.participants.some((ref) => sameParticipant(ref, participant))
-    ) {
+    } else if (reacted && !alreadyReacted && summary) {
+      summary.participants.push(participant);
+    } else if (!reacted && alreadyReacted && summary) {
       summary.participants = summary.participants.filter(
         (ref) => !sameParticipant(ref, participant),
       );
@@ -1032,10 +1081,18 @@ export class MockMessagingServer implements MessagingBackend {
           (entry) => entry.emoji !== emoji,
         );
       }
-    } else {
-      summary.participants.push(participant);
     }
-    this.emit({ type: "reaction_updated", message: { ...message } });
+    const reactions = message.reactions.map((entry) => ({
+      ...entry,
+      participants: [...entry.participants],
+    }));
+    this.emit({
+      type: "reaction_updated",
+      place,
+      messageId,
+      reactions,
+    });
+    return reactions;
   }
 
   sendTyping(_place: Place): void {

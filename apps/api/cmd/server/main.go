@@ -95,25 +95,39 @@ func run(ctx context.Context) (runErr error) {
 		expiryCtx, cancelExpiry := context.WithCancel(ctx)
 		defer cancelExpiry()
 		go app.messaging.RunStatusExpiry(expiryCtx, messaging.DefaultStatusExpiryInterval)
+
+		sweepCtx, cancelSweep := context.WithCancel(ctx)
+		defer cancelSweep()
+		go app.messaging.RunAttachmentSweeper(
+			sweepCtx, messaging.AttachmentOrphanGrace, messaging.AttachmentSweepInterval)
 	}
 	if app.localMux == nil {
 		return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
 	}
 
-	localServer := &http.Server{
-		Handler:           app.localListener.handler(app.localMux),
-		ReadHeaderTimeout: 2 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       15 * time.Second,
-		MaxHeaderBytes:    16 * 1024,
-	}
+	localServer := newLocalControlHTTPServer(app.localListener.handler(app.localMux))
 	log.Printf("sumi local control listening on %s", app.localListener.description())
 	return serveHTTPServers(
 		ctx,
 		serverAndListener{server: publicServer, listener: publicListener},
 		serverAndListener{server: localServer, listener: localListener},
 	)
+}
+
+// The Agent upload client allows 120 seconds for a bounded 20 MiB multipart
+// transfer. The server adds five seconds for request dispatch and response
+// delivery instead of invalidating that client contract after five seconds.
+const localControlRequestTimeout = 125 * time.Second
+
+func newLocalControlHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       localControlRequestTimeout,
+		WriteTimeout:      localControlRequestTimeout,
+		IdleTimeout:       15 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
+	}
 }
 
 // runIdleReaper periodically stops cold-mode agents that have been idle longer

@@ -7,7 +7,11 @@ use sha2::{Digest, Sha256};
 use super::super::{ResourceLimit, ToolError};
 use super::ArtifactResponse;
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
-use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::TruncationResult};
+use crate::tools::{
+    bash::BashExecutionResult,
+    fs::{GrepMatch, MAX_RAW_FILE_CHUNK_BYTES, MAX_RAW_FILE_TOTAL_BYTES, WorkspaceFileChunk},
+    truncate::TruncationResult,
+};
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RPC_READ_BYTES: usize = 50 * 1024;
@@ -120,6 +124,17 @@ pub enum ExecutorOperation {
         limit: usize,
         execution_id: String,
     },
+    ReadRawFile {
+        path: String,
+        offset: u64,
+        limit: usize,
+        max_total_bytes: u64,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        expected_version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        expected_content_digest: Option<String>,
+        execution_id: String,
+    },
     WriteFile {
         path: String,
         content: String,
@@ -162,6 +177,7 @@ pub enum ExecutorOperation {
 pub enum ExecutorResponse {
     Healthy { service_role: ExecutorServiceRole },
     ReadFile { result: TruncationResult },
+    RawFile { chunk: WorkspaceFileChunk },
     Written {},
     Edited {},
     Removed {},
@@ -237,6 +253,44 @@ impl RpcOperationValidation for ExecutorOperation {
             } => {
                 validate_rpc_read_limit(*limit)?;
                 validate_routable_input(path)?;
+                validate_executor_execution_id(execution_id)
+            }
+            Self::ReadRawFile {
+                path,
+                offset,
+                limit,
+                max_total_bytes,
+                expected_version,
+                expected_content_digest,
+                execution_id,
+                ..
+            } => {
+                if *limit == 0 || *limit > MAX_RAW_FILE_CHUNK_BYTES {
+                    return Err(ToolError::Protocol(format!(
+                        "RPC raw file limit must be 1..={MAX_RAW_FILE_CHUNK_BYTES} bytes"
+                    )));
+                }
+                if *max_total_bytes == 0 || *max_total_bytes > MAX_RAW_FILE_TOTAL_BYTES {
+                    return Err(ToolError::Protocol(format!(
+                        "RPC raw file total limit must be 1..={MAX_RAW_FILE_TOTAL_BYTES} bytes"
+                    )));
+                }
+                validate_workspace_input(path, "path")?;
+                if let Some(version) = expected_version {
+                    validate_raw_file_version(version)?;
+                }
+                if let Some(content_digest) = expected_content_digest {
+                    validate_raw_file_version(content_digest)?;
+                }
+                let first_page = *offset == 0;
+                if first_page != expected_version.is_none()
+                    || first_page != expected_content_digest.is_none()
+                {
+                    return Err(ToolError::Protocol(
+                        "raw workspace first page creates one version and content commitment; later pages must carry both"
+                            .to_owned(),
+                    ));
+                }
                 validate_executor_execution_id(execution_id)
             }
             Self::WriteFile {
@@ -696,6 +750,19 @@ fn validate_attachment_digest(value: &str) -> Result<(), ToolError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ToolError::Protocol(
             "attachment content_digest must be a SHA-256 hex digest".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raw_file_version(value: &str) -> Result<(), ToolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ToolError::Protocol(
+            "raw workspace file version must be a lowercase SHA-256 hex digest".to_owned(),
         ));
     }
     Ok(())
@@ -1749,6 +1816,68 @@ mod tests {
             })
             .unwrap();
             assert!(decode_rpc_line::<ExecutorOperation>(&encoded, &identity()).is_ok());
+        }
+    }
+
+    #[test]
+    fn raw_file_operation_is_workspace_only_versioned_and_page_bounded() {
+        let operation = |path: &str,
+                         offset: u64,
+                         limit: usize,
+                         max_total_bytes: u64,
+                         expected_version: Option<String>,
+                         expected_content_digest: Option<String>| {
+            ExecutorOperation::ReadRawFile {
+                path: path.to_owned(),
+                offset,
+                limit,
+                max_total_bytes,
+                expected_version,
+                expected_content_digest,
+                execution_id: "raw-file".to_owned(),
+            }
+        };
+        assert!(
+            operation("image.bin", 0, MAX_RAW_FILE_CHUNK_BYTES, 1024, None, None)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            operation(
+                "image.bin",
+                1,
+                1,
+                1024,
+                Some("a".repeat(64)),
+                Some("b".repeat(64))
+            )
+            .validate()
+            .is_ok()
+        );
+        for invalid in [
+            operation("artifact://malformed", 0, 1, 1024, None, None),
+            operation("image.bin", 0, 0, 1024, None, None),
+            operation(
+                "image.bin",
+                0,
+                MAX_RAW_FILE_CHUNK_BYTES + 1,
+                1024,
+                None,
+                None,
+            ),
+            operation("image.bin", 0, 1, 0, None, None),
+            operation("image.bin", 0, 1, u64::MAX, None, None),
+            operation(
+                "image.bin",
+                1,
+                1,
+                1024,
+                Some("A".repeat(64)),
+                Some("b".repeat(64)),
+            ),
+            operation("image.bin", 1, 1, 1024, Some("a".repeat(64)), None),
+        ] {
+            assert!(invalid.validate().is_err());
         }
     }
 

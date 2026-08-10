@@ -23,6 +23,7 @@ use std::{
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
@@ -42,6 +43,12 @@ const OPENAT2_UNAVAILABLE: &str = "workspace filesystem requires Linux openat2(2
 /// `edit_file` is a whole-file unique-replacement operation. Keep its snapshot
 /// inside the same explicit 10 MiB local-input envelope used by bounded scans.
 pub const MAX_EDIT_FILE_BYTES: u64 = MAX_SCAN_BYTES;
+/// Keeps raw workspace reads comfortably inside the 1 MiB JSON-line RPC
+/// envelope even though `Vec<u8>` is encoded as a JSON array.
+pub const MAX_RAW_FILE_CHUNK_BYTES: usize = 64 * 1024;
+/// The executor's private raw-read contract is intentionally limited to the
+/// same one-file envelope accepted by Messaging attachments.
+pub const MAX_RAW_FILE_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditTemporaryOwnership {
@@ -76,6 +83,18 @@ pub struct GrepMatch {
     pub line_number: u64,
     pub line: String,
     pub line_truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceFileChunk {
+    pub filename: String,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub version: String,
+    pub content_digest: String,
+    pub content: Vec<u8>,
+    pub eof: bool,
 }
 
 #[derive(Serialize)]
@@ -238,6 +257,93 @@ impl WorkspaceFs {
         // consistent with that contract.
         result.output_lines = result.output_lines.min(total_lines);
         Ok(result)
+    }
+
+    /// Read one exact binary page from a regular workspace file.
+    ///
+    /// The version is derived from inode metadata and is checked before and
+    /// after the page read. Passing the first page's version to later pages
+    /// makes a multi-request read fail closed if the source is replaced or
+    /// modified between requests.
+    pub fn read_raw_file(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+        max_total_bytes: u64,
+        expected_version: Option<&str>,
+        expected_content_digest: Option<&str>,
+    ) -> Result<WorkspaceFileChunk, ToolError> {
+        if max_bytes == 0 || max_bytes > MAX_RAW_FILE_CHUNK_BYTES {
+            return Err(ToolError::Protocol(format!(
+                "raw workspace read must request 1..={MAX_RAW_FILE_CHUNK_BYTES} bytes"
+            )));
+        }
+        let relative = self.relative(path)?;
+        let fd = self.open_beneath(
+            &relative,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )?;
+        ensure_regular_file(&fd, "raw workspace read source")?;
+        let mut file = File::from(fd);
+        let before = file.metadata()?;
+        let version = raw_file_version(&before);
+        if expected_version.is_some_and(|expected| expected != version) {
+            return Err(ToolError::Protocol(
+                "raw workspace file changed between pages".to_owned(),
+            ));
+        }
+        let total_bytes = before.len();
+        if total_bytes > max_total_bytes {
+            return Err(ToolError::ResourceLimit(ResourceLimit::InputBytes {
+                observed: total_bytes,
+                limit: max_total_bytes,
+            }));
+        }
+        if offset > total_bytes {
+            return Err(ToolError::InvalidArguments);
+        }
+
+        let content_digest = match expected_content_digest {
+            Some(expected) => expected.to_owned(),
+            None => digest_raw_file(&mut file, total_bytes)?,
+        };
+
+        let remaining = total_bytes - offset;
+        let page_bytes = remaining.min(u64::try_from(max_bytes).unwrap_or(u64::MAX));
+        let page_bytes = usize::try_from(page_bytes).map_err(|_| {
+            ToolError::Protocol("raw workspace page size was not representable".to_owned())
+        })?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut content = vec![0; page_bytes];
+        file.read_exact(&mut content)?;
+
+        let after = file.metadata()?;
+        if raw_file_version(&after) != version {
+            return Err(ToolError::Protocol(
+                "raw workspace file changed during page read".to_owned(),
+            ));
+        }
+        let filename = relative
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                ToolError::InvalidPath("workspace file has no UTF-8 basename".to_owned())
+            })?
+            .to_owned();
+        let next_offset = offset
+            .checked_add(u64::try_from(content.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| ToolError::Protocol("raw workspace offset overflowed".to_owned()))?;
+        Ok(WorkspaceFileChunk {
+            filename,
+            offset,
+            total_bytes,
+            version,
+            content_digest,
+            content,
+            eof: next_offset == total_bytes,
+        })
     }
 
     pub fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), ToolError> {
@@ -930,6 +1036,33 @@ fn validate_utf8_chunk(tail: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ToolError
         }
     }
     Ok(())
+}
+
+fn raw_file_version(metadata: &std::fs::Metadata) -> String {
+    let mut digest = Sha256::new();
+    digest.update(metadata.dev().to_le_bytes());
+    digest.update(metadata.ino().to_le_bytes());
+    digest.update(metadata.len().to_le_bytes());
+    digest.update(metadata.mtime().to_le_bytes());
+    digest.update(metadata.mtime_nsec().to_le_bytes());
+    digest.update(metadata.ctime().to_le_bytes());
+    digest.update(metadata.ctime_nsec().to_le_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn digest_raw_file(file: &mut File, total_bytes: u64) -> Result<String, ToolError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut remaining = total_bytes;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| ToolError::Protocol("raw workspace digest size overflowed".to_owned()))?;
+        file.read_exact(&mut buffer[..length])?;
+        digest.update(&buffer[..length]);
+        remaining -= length as u64;
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn text_path(path: &Path) -> Result<String, ToolError> {
@@ -1705,6 +1838,55 @@ mod tests {
                 .content,
             "a"
         );
+    }
+
+    #[test]
+    fn raw_file_pages_preserve_binary_bytes_and_reject_a_changed_source_version() {
+        let root = TempWorkspace::new();
+        let path = root.path.join("image.bin");
+        std::fs::write(&path, [0, 0xff, 0x80, 1, 2]).expect("write binary fixture");
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+
+        let first = fs
+            .read_raw_file(&path, 0, 3, 5, None, None)
+            .expect("read first binary page");
+        assert_eq!(first.filename, "image.bin");
+        assert_eq!(first.content, [0, 0xff, 0x80]);
+        assert_eq!(
+            first.content_digest,
+            format!("{:x}", Sha256::digest([0, 0xff, 0x80, 1, 2]))
+        );
+        assert!(!first.eof);
+
+        std::fs::write(&path, [9, 8, 7, 6, 5, 4]).expect("replace binary fixture");
+        assert!(matches!(
+            fs.read_raw_file(
+                Path::new("image.bin"),
+                3,
+                3,
+                6,
+                Some(&first.version),
+                Some(&first.content_digest),
+            ),
+            Err(ToolError::Protocol(message))
+                if message == "raw workspace file changed between pages"
+        ));
+    }
+
+    #[test]
+    fn raw_file_read_rejects_escape_symlink_and_nonregular_paths() {
+        let root = TempWorkspace::new();
+        std::fs::create_dir(root.path.join("directory")).expect("create directory fixture");
+        symlink("/etc/passwd", root.path.join("linked-file")).expect("create escape symlink");
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+
+        for path in ["../outside", "linked-file", "directory"] {
+            assert!(
+                fs.read_raw_file(Path::new(path), 0, 1, 1, None, None)
+                    .is_err(),
+                "raw read accepted {path}"
+            );
+        }
     }
 
     #[test]

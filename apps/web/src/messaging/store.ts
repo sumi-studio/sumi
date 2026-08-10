@@ -15,6 +15,7 @@ import type {
   MessagingBackend,
   MessagingCapabilities,
   NotificationLevel,
+  NotificationSetting,
   ParticipantKey,
   ParticipantRef,
   ParticipantStatus,
@@ -24,6 +25,7 @@ import type {
   PlaceKey,
   PollInput,
   ProfileInput,
+  ReactionSummary,
   ReplyLaterMarker,
   RoleAssignment,
   RoleInput,
@@ -51,6 +53,29 @@ import { mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
+const REACTION_RESYNC_LIMIT = 200;
+
+function reactionsEqual(
+  left: readonly ReactionSummary[],
+  right: readonly ReactionSummary[],
+): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((reaction, index) => {
+    const other = right[index];
+    return (
+      other !== undefined &&
+      reaction.emoji === other.emoji &&
+      reaction.participants.length === other.participants.length &&
+      reaction.participants.every((participant, participantIndex) => {
+        const otherParticipant = other.participants[participantIndex];
+        return (
+          otherParticipant !== undefined &&
+          participantKey(participant) === participantKey(otherParticipant)
+        );
+      })
+    );
+  });
+}
 
 let backend: MessagingBackend = new ApiMessagingBackend();
 
@@ -153,6 +178,8 @@ interface MessagingState {
     attachmentId: string,
     patch: AttachmentDraftPatch,
   ): Promise<Attachment>;
+  /** session ownerが保持中の未送信添付をreclaimerから守る。 */
+  renewAttachments(attachmentIds: string[]): Promise<void>;
   retrySend(clientNonce: string): void;
   startEdit(messageId: string): void;
   cancelEdit(): void;
@@ -222,6 +249,71 @@ function unreadContribution(
 }
 
 let initialized = false;
+let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+type PresenceServerEvent = Extract<
+  ServerEvent,
+  {
+    type:
+      | "status_updated"
+      | "status_cleared"
+      | "reply_later_created"
+      | "reply_later_resolved";
+  }
+>;
+let presenceResyncGeneration = 0;
+let pendingPresenceResync: {
+  generation: number;
+  events: PresenceServerEvent[];
+} | null = null;
+
+type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
+interface ReactionProjectionOperation {
+  epoch: number;
+  journal: ReactionUpdatedEvent[];
+}
+interface ReactionProjectionCoordinator {
+  active: ReactionProjectionOperation | null;
+  backend: MessagingBackend;
+  epoch: number;
+  pending: number;
+  generation: number;
+  tail: Promise<void>;
+}
+let reactionProjectionGeneration = 0;
+const reactionProjectionQueues = new Map<
+  string,
+  ReactionProjectionCoordinator
+>();
+
+/** Bound long-lived timers and re-evaluate the nearest deadline periodically. */
+const STATUS_EXPIRY_MAX_DELAY_MS = 60 * 60_000;
+
+type NotificationSettingState = Pick<
+  MessagingState,
+  | "notificationDefaultLevel"
+  | "notificationLevelByPlace"
+  | "notificationKeywords"
+>;
+
+function notificationSettingState(
+  setting: NotificationSetting,
+): NotificationSettingState {
+  const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> = {};
+  for (const entry of setting.perPlace) {
+    notificationLevelByPlace[placeKey(entry.place)] = entry.level;
+  }
+  return {
+    notificationDefaultLevel: setting.defaults.level,
+    notificationLevelByPlace,
+    notificationKeywords: setting.keywords,
+  };
+}
+
+// Notification settings are full-snapshot PUTs. Serializing them prevents an
+// older, slower response from becoming the server's final state.
+let notificationWriteChain: Promise<void> = Promise.resolve();
+let notificationWriteGeneration = 0;
+let confirmedNotificationSetting: NotificationSettingState | null = null;
 
 let notificationNavigate: ((key: PlaceKey) => void) | null = null;
 
@@ -277,6 +369,330 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+
+  const withoutExpired = (
+    statuses: Record<ParticipantKey, ParticipantStatus>,
+    now: number,
+  ): Record<ParticipantKey, ParticipantStatus> => {
+    const live: Record<ParticipantKey, ParticipantStatus> = {};
+    let dropped = false;
+    for (const [key, status] of Object.entries(statuses)) {
+      if (status.expiresAt !== null && status.expiresAt <= now) {
+        dropped = true;
+        continue;
+      }
+      live[key] = status;
+    }
+    return dropped ? live : statuses;
+  };
+
+  const scheduleStatusExpiry = () => {
+    if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+    statusExpiryTimer = null;
+    let nearest: number | null = null;
+    for (const status of Object.values(get().statusByKey)) {
+      if (status.expiresAt === null) continue;
+      if (nearest === null || status.expiresAt < nearest) {
+        nearest = status.expiresAt;
+      }
+    }
+    if (nearest === null) return;
+    const delay = Math.min(
+      Math.max(0, nearest - Date.now()),
+      STATUS_EXPIRY_MAX_DELAY_MS,
+    );
+    statusExpiryTimer = setTimeout(() => {
+      statusExpiryTimer = null;
+      set((state) => ({
+        statusByKey: withoutExpired(state.statusByKey, Date.now()),
+      }));
+      scheduleStatusExpiry();
+    }, delay);
+  };
+
+  const statusSnapshot = (statuses: ParticipantStatus[]) => {
+    const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
+    for (const status of statuses) {
+      statusByKey[participantKey(status.participant)] = status;
+    }
+    return withoutExpired(statusByKey, Date.now());
+  };
+
+  const applyStatus = (status: ParticipantStatus) => {
+    set((state) => ({
+      statusByKey: withoutExpired(
+        { ...state.statusByKey, [participantKey(status.participant)]: status },
+        Date.now(),
+      ),
+    }));
+    scheduleStatusExpiry();
+  };
+
+  const clearStatus = (participant: ParticipantRef) => {
+    set((state) => {
+      const key = participantKey(participant);
+      if (!(key in state.statusByKey)) return {};
+      const statusByKey = { ...state.statusByKey };
+      delete statusByKey[key];
+      return { statusByKey };
+    });
+    scheduleStatusExpiry();
+  };
+
+  const applyReplyLater = (marker: ReplyLaterMarker) => {
+    set((state) => {
+      const known = state.replyLaterById[marker.markerId];
+      return {
+        replyLaterById: {
+          ...state.replyLaterById,
+          [marker.markerId]: {
+            ...marker,
+            remindAt: marker.remindAt ?? known?.remindAt ?? null,
+            resolved: marker.resolved || (known?.resolved ?? false),
+          },
+        },
+      };
+    });
+  };
+
+  const resyncPresence = async (
+    sessionBackend: MessagingBackend,
+    sessionIdentity: string | null,
+  ) => {
+    const resync = {
+      generation: ++presenceResyncGeneration,
+      events: [] as PresenceServerEvent[],
+    };
+    pendingPresenceResync = resync;
+    try {
+      const presence = await sessionBackend.fetchPresence();
+      if (
+        backend !== sessionBackend ||
+        messagingSessionIdentity !== sessionIdentity ||
+        pendingPresenceResync !== resync ||
+        presenceResyncGeneration !== resync.generation
+      ) {
+        return;
+      }
+      const replyLaterById: Record<string, ReplyLaterMarker> = {};
+      for (const marker of presence.replyLaterMarkers) {
+        replyLaterById[marker.markerId] = marker;
+      }
+      // Stop buffering before replay, otherwise replay would append to itself.
+      // Events were already shown live; replay restores anything an older
+      // wholesale snapshot would otherwise overwrite.
+      pendingPresenceResync = null;
+      set({ statusByKey: statusSnapshot(presence.statuses), replyLaterById });
+      scheduleStatusExpiry();
+      for (const event of resync.events) applyEvent(event);
+    } finally {
+      if (pendingPresenceResync === resync) pendingPresenceResync = null;
+    }
+  };
+
+  const reactionPlaceQueueKey = (place: Place) => `place:${placeKey(place)}`;
+  const reactionMessageQueueKey = (place: Place, messageId: string) =>
+    `message:${placeKey(place)}:${messageId}`;
+
+  const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
+    const key = placeKey(event.place);
+    set((state) => {
+      const current = state.messagesByPlace[key];
+      if (!current) return {};
+      let changed = false;
+      const next = current.map((message) => {
+        if (message.messageId !== event.messageId || message.deleted) {
+          return message;
+        }
+        if (reactionsEqual(message.reactions, event.reactions)) {
+          return message;
+        }
+        changed = true;
+        return { ...message, reactions: event.reactions };
+      });
+      if (!changed) return {};
+      return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+    });
+  };
+
+  const currentReactionCoordinator = (queueKey: string) => {
+    const coordinator = reactionProjectionQueues.get(queueKey);
+    return coordinator?.backend === backend &&
+      coordinator.generation === reactionProjectionGeneration
+      ? coordinator
+      : null;
+  };
+
+  const journalReaction = (queueKey: string, event: ReactionUpdatedEvent) => {
+    currentReactionCoordinator(queueKey)?.active?.journal.push(event);
+  };
+
+  const applyReactionUpdate = (event: ReactionUpdatedEvent) => {
+    journalReaction(reactionPlaceQueueKey(event.place), event);
+    journalReaction(
+      reactionMessageQueueKey(event.place, event.messageId),
+      event,
+    );
+    applyReactionUpdateRaw(event);
+  };
+
+  const enqueueReactionProjection = (
+    queueKey: string,
+    produce: (
+      operationBackend: MessagingBackend,
+      isCurrent: () => boolean,
+    ) => Promise<() => void>,
+    expectedBackend: MessagingBackend = backend,
+  ): Promise<void> => {
+    if (backend !== expectedBackend) return Promise.resolve();
+    const operationBackend = expectedBackend;
+    const generation = reactionProjectionGeneration;
+    let coordinator = reactionProjectionQueues.get(queueKey);
+    if (
+      !coordinator ||
+      coordinator.backend !== operationBackend ||
+      coordinator.generation !== generation
+    ) {
+      coordinator = {
+        active: null,
+        backend: operationBackend,
+        epoch: 0,
+        pending: 0,
+        generation,
+        tail: Promise.resolve(),
+      };
+      reactionProjectionQueues.set(queueKey, coordinator);
+    }
+    const target = coordinator;
+    target.pending += 1;
+    const task = target.tail.then(async () => {
+      const isCurrent = () =>
+        backend === operationBackend &&
+        reactionProjectionGeneration === generation &&
+        reactionProjectionQueues.get(queueKey) === target;
+      if (!isCurrent()) return;
+      const operation: ReactionProjectionOperation = {
+        epoch: ++target.epoch,
+        journal: [],
+      };
+      target.active = operation;
+      try {
+        const applySnapshot = await produce(operationBackend, isCurrent);
+        if (
+          !isCurrent() ||
+          target.active !== operation ||
+          target.epoch !== operation.epoch
+        ) {
+          return;
+        }
+        applySnapshot();
+        for (const event of operation.journal) {
+          applyReactionUpdateRaw(event);
+        }
+      } finally {
+        if (target.active === operation) target.active = null;
+      }
+    });
+    const settled = task
+      .catch(() => undefined)
+      .finally(() => {
+        target.pending -= 1;
+        if (
+          target.pending === 0 &&
+          target.active === null &&
+          reactionProjectionQueues.get(queueKey) === target
+        ) {
+          reactionProjectionQueues.delete(queueKey);
+        }
+      });
+    target.tail = settled;
+    return task;
+  };
+
+  const resyncReactions = (
+    sessionBackend: MessagingBackend,
+    place: Place,
+  ): Promise<void> =>
+    enqueueReactionProjection(
+      reactionPlaceQueueKey(place),
+      async (resyncBackend, isCurrent) => {
+        const key = placeKey(place);
+        // caught_up can race the first history request after selecting a
+        // place. Reconcile only after that request has installed its snapshot;
+        // otherwise this would no-op on an empty store and the older response
+        // could become permanently authoritative for reaction-only changes.
+        const inFlightLoad = placeLoads.get(key);
+        if (inFlightLoad) await inFlightLoad;
+        if (!isCurrent()) return () => undefined;
+        const loaded = get().messagesByPlace[key];
+        if (!loaded || loaded.length === 0) return () => undefined;
+
+        const reactionsById = new Map<string, ReactionSummary[]>();
+        const ranges: { oldestSeq: number; newestSeq: number }[] = [];
+        for (const message of [...loaded].sort(
+          (left, right) => left.seq - right.seq,
+        )) {
+          const current = ranges.at(-1);
+          if (current && message.seq <= current.newestSeq + 1) {
+            current.newestSeq = Math.max(current.newestSeq, message.seq);
+          } else {
+            ranges.push({ oldestSeq: message.seq, newestSeq: message.seq });
+          }
+        }
+
+        for (const range of ranges.reverse()) {
+          let beforeSeq: number | undefined =
+            range.newestSeq === MAX_SEQ ? undefined : range.newestSeq + 1;
+          while (beforeSeq === undefined || beforeSeq > range.oldestSeq) {
+            const remaining =
+              beforeSeq === undefined
+                ? range.newestSeq - range.oldestSeq + 1
+                : beforeSeq - range.oldestSeq;
+            const limit = Math.min(remaining, REACTION_RESYNC_LIMIT);
+            const fresh = await resyncBackend.fetchMessages(
+              place,
+              beforeSeq === undefined ? { limit } : { beforeSeq, limit },
+            );
+            if (!isCurrent()) return () => undefined;
+            if (fresh.length === 0) break;
+            for (const message of fresh) {
+              reactionsById.set(message.messageId, message.reactions);
+            }
+            const nextBeforeSeq = Math.min(
+              ...fresh.map((message) => message.seq),
+            );
+            if (beforeSeq !== undefined && nextBeforeSeq >= beforeSeq) break;
+            beforeSeq = nextBeforeSeq;
+          }
+        }
+
+        return () => {
+          set((state) => {
+            const current = state.messagesByPlace[key];
+            if (!current) return {};
+            let changed = false;
+            const next = current.map((message) => {
+              const reactions = reactionsById.get(message.messageId);
+              if (
+                message.deleted ||
+                !reactions ||
+                reactionsEqual(reactions, message.reactions)
+              ) {
+                return message;
+              }
+              changed = true;
+              return { ...message, reactions };
+            });
+            if (!changed) return {};
+            return {
+              messagesByPlace: { ...state.messagesByPlace, [key]: next },
+            };
+          });
+        };
+      },
+      sessionBackend,
+    );
+
   /**
    * 呼ばれたことの提示。「呼ぶかどうか」はサーバーが送信時に判定済みで、
    * ここに来る `notify` はその答えそのもの。クライアントは提示の仕方だけを
@@ -419,10 +835,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
+    if (event.type === "reaction_updated") {
+      applyReactionUpdate(event);
+      return;
+    }
     if (
       event.type === "message_created" ||
       event.type === "message_edited" ||
-      event.type === "reaction_updated" ||
       event.type === "poll_updated"
     ) {
       const key = placeKey(event.message.place);
@@ -430,15 +849,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
-        const projected =
-          event.type === "poll_updated" && existing
-            ? {
-                ...existing,
-                // A delayed poll frame is a delta for the poll projection. It
-                // must not revert a later edit or revive a tombstone.
-                poll: existing.deleted ? null : (event.message.poll ?? null),
-              }
-            : event.message;
+        let projected = event.message;
+        if (event.type === "poll_updated" && existing) {
+          projected = {
+            ...existing,
+            // A delayed poll frame is a delta for the poll projection. It
+            // must not revert a later edit or revive a tombstone.
+            poll: existing.deleted ? null : (event.message.poll ?? null),
+          };
+        } else if (event.type === "message_edited" && existing) {
+          // Edit and reaction projections are independent. A full edit frame
+          // assembled before a later reaction must not roll that reaction
+          // back, and an edit frame must never revive a tombstone.
+          projected = existing.deleted
+            ? existing
+            : { ...event.message, reactions: existing.reactions };
+        }
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           projected,
@@ -565,35 +991,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "status_updated") {
-      set((state) => ({
-        statusByKey: {
-          ...state.statusByKey,
-          [participantKey(event.status.participant)]: event.status,
-        },
-      }));
+      pendingPresenceResync?.events.push(event);
+      applyStatus(event.status);
       return;
     }
     if (event.type === "status_cleared") {
-      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
-      set((state) => {
-        const key = participantKey(event.participant);
-        if (!(key in state.statusByKey)) return {};
-        const statusByKey = { ...state.statusByKey };
-        delete statusByKey[key];
-        return { statusByKey };
-      });
+      pendingPresenceResync?.events.push(event);
+      clearStatus(event.participant);
       return;
     }
     if (event.type === "reply_later_created") {
-      set((state) => ({
-        replyLaterById: {
-          ...state.replyLaterById,
-          [event.marker.markerId]: event.marker,
-        },
-      }));
+      pendingPresenceResync?.events.push(event);
+      applyReplyLater(event.marker);
       return;
     }
     if (event.type === "reply_later_resolved") {
+      pendingPresenceResync?.events.push(event);
       set((state) => {
         const marker = state.replyLaterById[event.markerId];
         if (!marker) return {};
@@ -645,6 +1058,100 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 通話の在室（ADR 0012）はメッセージングのstateではなくcall storeが持つ。
     if (event.type === "call_state") {
       useCall.getState().applyCallState(event.call);
+    }
+  };
+
+  let placeReconcileGeneration = 0;
+
+  /**
+   * Place lifecycle events are live-only, so a reconnect must compare the
+   * durable bootstrap snapshot with the places this client already knows.
+   * Existing local timelines, drafts, and read progress remain authoritative
+   * for known places; bootstrap counters are adopted only for newly learned
+   * places. A generation fence prevents an older REST response from replacing
+   * a later reconnect's snapshot.
+   */
+  const reconcilePlaces = async (
+    currentBackend: MessagingBackend,
+    currentIdentity: string | null,
+    expectedSelfKey: ParticipantKey,
+    generation: number,
+  ) => {
+    const snapshot = await currentBackend.bootstrap();
+    if (
+      backend !== currentBackend ||
+      messagingSessionIdentity !== currentIdentity ||
+      get().selfKey !== expectedSelfKey ||
+      participantKey(snapshot.self) !== expectedSelfKey ||
+      placeReconcileGeneration !== generation
+    ) {
+      return;
+    }
+
+    const state = get();
+    const known = new Set<PlaceKey>([
+      ...state.channels.map((entry) =>
+        placeKey({ kind: "channel", channelId: entry.channelId }),
+      ),
+      ...state.dms.map((entry) =>
+        placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+      ...Object.keys(state.threadsById).map(
+        (threadId) => `thread:${threadId}` as PlaceKey,
+      ),
+    ]);
+    const discovered = new Set<PlaceKey>([
+      ...snapshot.channels.map((entry) =>
+        placeKey({ kind: "channel", channelId: entry.channelId }),
+      ),
+      ...snapshot.dms.map((entry) =>
+        placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+      ...snapshot.threads.map(
+        (entry) => `thread:${entry.threadId}` as PlaceKey,
+      ),
+    ]);
+    for (const key of known) discovered.delete(key);
+
+    const membersByKey: Record<ParticipantKey, MemberProfile> = {};
+    for (const member of snapshot.members) {
+      membersByKey[participantKey(member.participant)] = member;
+    }
+    const threadsById = { ...state.threadsById };
+    for (const thread of snapshot.threads) {
+      threadsById[thread.threadId] = thread;
+    }
+    const lastReadByPlace = { ...state.lastReadByPlace };
+    for (const marker of snapshot.readMarkers) {
+      const key = placeKey(marker.place);
+      if (!known.has(key)) lastReadByPlace[key] = marker.lastReadSeq;
+    }
+    const unreadCountByPlace = { ...state.unreadCountByPlace };
+    const mentionCountByPlace = { ...state.mentionCountByPlace };
+    const sinceByPlace: Record<PlaceKey, number> = {};
+    for (const key of discovered) sinceByPlace[key] = 0;
+    for (const summary of snapshot.unreadSummaries) {
+      const key = placeKey(summary.place);
+      if (known.has(key)) continue;
+      unreadCountByPlace[key] = summary.unreadCount;
+      mentionCountByPlace[key] = summary.mentionCount;
+      sinceByPlace[key] = summary.latestSeq;
+    }
+
+    set({
+      workspaces: snapshot.workspaces,
+      channels: snapshot.channels,
+      dms: snapshot.dms,
+      threadsById,
+      membersByKey,
+      lastReadByPlace,
+      unreadCountByPlace,
+      mentionCountByPlace,
+    });
+    if (Object.keys(sinceByPlace).length > 0) {
+      // ApiMessagingBackend keeps listeners in a Set, so this updates cursors
+      // without registering a duplicate event delivery path.
+      currentBackend.subscribe(applyEvent, { sinceByPlace });
     }
   };
 
@@ -765,21 +1272,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const existingLoad = placeLoads.get(key);
     if (existingLoad) return existingLoad;
     const currentBackend = backend;
-    const load = currentBackend
-      .fetchMessages(place, { limit: PAGE_SIZE })
-      .then((messages) => {
-        if (backend !== currentBackend) return;
-        set((state) => ({
-          messagesByPlace: {
-            ...state.messagesByPlace,
-            [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
-          },
-          hasMoreByPlace: {
-            ...state.hasMoreByPlace,
-            [key]: messages.length >= PAGE_SIZE,
-          },
-        }));
-      });
+    const load = enqueueReactionProjection(
+      reactionPlaceQueueKey(place),
+      async (loadBackend, isCurrent) => {
+        const messages = await loadBackend.fetchMessages(place, {
+          limit: PAGE_SIZE,
+        });
+        if (!isCurrent()) return () => undefined;
+        return () => {
+          set((state) => ({
+            messagesByPlace: {
+              ...state.messagesByPlace,
+              [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+            },
+            hasMoreByPlace: {
+              ...state.hasMoreByPlace,
+              [key]: messages.length >= PAGE_SIZE,
+            },
+          }));
+        };
+      },
+      currentBackend,
+    );
     placeLoads.set(key, load);
     try {
       await load;
@@ -793,7 +1307,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const dispatchSend = (key: PlaceKey, pending: PendingMessage) => {
     const place = parsePlaceKey(key);
     if (!place) return;
-    backend
+    const currentBackend = backend;
+    currentBackend
       .sendMessage({
         place,
         content: pending.content,
@@ -806,6 +1321,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         poll: pending.poll ?? null,
       })
       .then(async (receipt) => {
+        if (backend !== currentBackend) return;
         let confirmed = (get().messagesByPlace[key] ?? []).some(
           (message) =>
             message.messageId === receipt.messageId ||
@@ -813,25 +1329,37 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         if (!confirmed) {
           // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
-          const messages = await backend.fetchMessages(place, {
-            beforeSeq: receipt.seq + 1,
-            limit: 1,
-          });
-          const committed = messages.find(
-            (message) => message.messageId === receipt.messageId,
+          let committed: Message | undefined;
+          await enqueueReactionProjection(
+            reactionPlaceQueueKey(place),
+            async (historyBackend, isCurrent) => {
+              const messages = await historyBackend.fetchMessages(place, {
+                beforeSeq:
+                  receipt.seq === MAX_SEQ ? undefined : receipt.seq + 1,
+                limit: 1,
+              });
+              if (!isCurrent()) return () => undefined;
+              const foundMessage = messages.find(
+                (message) => message.messageId === receipt.messageId,
+              );
+              committed = foundMessage;
+              return () => {
+                if (!foundMessage) return;
+                set((state) => ({
+                  messagesByPlace: {
+                    ...state.messagesByPlace,
+                    [key]: upsertMessage(
+                      state.messagesByPlace[key] ?? [],
+                      foundMessage,
+                    ),
+                  },
+                }));
+              };
+            },
+            currentBackend,
           );
-          if (committed) {
-            set((state) => ({
-              messagesByPlace: {
-                ...state.messagesByPlace,
-                [key]: upsertMessage(
-                  state.messagesByPlace[key] ?? [],
-                  committed,
-                ),
-              },
-            }));
-            confirmed = true;
-          }
+          if (backend !== currentBackend) return;
+          confirmed = committed !== undefined;
         }
         if (!confirmed) throw new Error("Committed message was not found");
         set((state) => ({
@@ -844,6 +1372,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }));
       })
       .catch(() => {
+        if (backend !== currentBackend) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -866,8 +1395,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     levelByPlace: Record<PlaceKey, NotificationLevel>;
     keywords: string[];
   }) => {
+    const sessionBackend = backend;
     const state = get();
-    const previous = {
+    const previous: NotificationSettingState = {
       notificationDefaultLevel: state.notificationDefaultLevel,
       notificationLevelByPlace: state.notificationLevelByPlace,
       notificationKeywords: state.notificationKeywords,
@@ -877,18 +1407,40 @@ export const useMessaging = create<MessagingState>((set, get) => {
       notificationLevelByPlace: next.levelByPlace,
       notificationKeywords: next.keywords,
     });
-    const perPlace: { place: Place; level: NotificationLevel }[] = [];
-    for (const [key, level] of Object.entries(next.levelByPlace)) {
-      const place = parsePlaceKey(key);
-      if (place) perPlace.push({ place, level });
-    }
-    void backend
-      .setNotificationSetting({
-        defaults: { level: next.defaultLevel },
-        perPlace,
-        keywords: next.keywords,
-      })
-      .catch(() => set(previous));
+    const generation = ++notificationWriteGeneration;
+    notificationWriteChain = notificationWriteChain.then(async () => {
+      if (
+        backend !== sessionBackend ||
+        generation !== notificationWriteGeneration
+      ) {
+        return;
+      }
+      const perPlace: { place: Place; level: NotificationLevel }[] = [];
+      for (const [key, level] of Object.entries(next.levelByPlace)) {
+        const place = parsePlaceKey(key);
+        if (place) perPlace.push({ place, level });
+      }
+      try {
+        const confirmed = notificationSettingState(
+          await sessionBackend.setNotificationSetting({
+            defaults: { level: next.defaultLevel },
+            perPlace,
+            keywords: next.keywords,
+          }),
+        );
+        if (backend !== sessionBackend) return;
+        confirmedNotificationSetting = confirmed;
+        if (generation === notificationWriteGeneration) set(confirmed);
+      } catch {
+        if (
+          backend !== sessionBackend ||
+          generation !== notificationWriteGeneration
+        ) {
+          return;
+        }
+        set(confirmedNotificationSetting ?? previous);
+      }
+    });
   };
 
   return {
@@ -934,6 +1486,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       appliedThreadDeletions.clear();
       placeLoads.clear();
       pollReconciliationVersions.clear();
+      placeReconcileGeneration += 1;
       const currentBackend = backend;
       const currentSessionIdentity = messagingSessionIdentity;
       void currentBackend
@@ -949,10 +1502,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
           }
-          const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
-          for (const status of snapshot.statuses) {
-            statusByKey[participantKey(status.participant)] = status;
-          }
+          const statusByKey = statusSnapshot(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
           for (const marker of snapshot.readMarkers) {
             lastReadByPlace[placeKey(marker.place)] = marker.lastReadSeq;
@@ -974,11 +1524,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           for (const thread of snapshot.threads) {
             threadsById[thread.threadId] = thread;
           }
-          const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> =
-            {};
-          for (const entry of snapshot.notificationSetting.perPlace) {
-            notificationLevelByPlace[placeKey(entry.place)] = entry.level;
-          }
+          confirmedNotificationSetting = notificationSettingState(
+            snapshot.notificationSetting,
+          );
           set({
             ready: true,
             capabilities: currentBackend.capabilities,
@@ -994,27 +1542,53 @@ export const useMessaging = create<MessagingState>((set, get) => {
             unreadCountByPlace,
             mentionCountByPlace,
             replyLaterById,
-            notificationDefaultLevel:
-              snapshot.notificationSetting.defaults.level,
-            notificationLevelByPlace,
-            notificationKeywords: snapshot.notificationSetting.keywords,
+            ...confirmedNotificationSetting,
             employedAgents: snapshot.employedAgents,
             roles: snapshot.roles,
             roleAssignments: snapshot.roleAssignments,
             permissions: snapshot.permissions,
           });
+          scheduleStatusExpiry();
           (currentBackend as CatchUpAwareMessagingBackend).subscribeCatchUp?.(
-            (place) => reconcileLoadedPolls(currentBackend, place),
+            async (place) => {
+              await Promise.all([
+                reconcileLoadedPolls(currentBackend, place),
+                resyncReactions(currentBackend, place),
+              ]);
+            },
           );
           currentBackend.subscribe(applyEvent, { sinceByPlace });
           let previousConnection: ConnectionState | null = null;
+          let connectedOnce = false;
           currentBackend.subscribeConnection((state) => {
             set({ connection: state });
+            if (state !== "connected") {
+              // Invalidate a REST snapshot that belongs to the connection we
+              // just lost, even before the next socket reaches hello_ack.
+              placeReconcileGeneration += 1;
+              presenceResyncGeneration += 1;
+              pendingPresenceResync = null;
+            }
             // call_stateはreplayされない。初回接続と再接続のどちらでも、WSが
             // live配送可能になった時点の全量を読み、取得中のeventはcall storeで
             // snapshotの後へreplayする。
             if (state === "connected" && previousConnection !== "connected") {
               void useCall.getState().hydrate();
+              if (connectedOnce) {
+                const generation = ++placeReconcileGeneration;
+                void reconcilePlaces(
+                  currentBackend,
+                  currentSessionIdentity,
+                  participantKey(snapshot.self),
+                  generation,
+                ).catch(() => undefined);
+                void resyncPresence(
+                  currentBackend,
+                  currentSessionIdentity,
+                ).catch(() => undefined);
+              } else {
+                connectedOnce = true;
+              }
             }
             previousConnection = state;
           });
@@ -1160,17 +1734,32 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return true;
       }
-      const messages = await backend.fetchMessages(place, {
-        beforeSeq: seq + 1,
-        limit: 50,
-      });
-      set((state) => ({
-        messagesByPlace: {
-          ...state.messagesByPlace,
-          [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+      const currentBackend = backend;
+      let found = false;
+      await enqueueReactionProjection(
+        reactionPlaceQueueKey(place),
+        async (historyBackend, isCurrent) => {
+          const messages = await historyBackend.fetchMessages(place, {
+            beforeSeq: seq === MAX_SEQ ? undefined : seq + 1,
+            limit: 50,
+          });
+          if (!isCurrent()) return () => undefined;
+          found = messages.some((message) => message.seq === seq);
+          return () => {
+            set((state) => ({
+              messagesByPlace: {
+                ...state.messagesByPlace,
+                [key]: mergeMessages(
+                  state.messagesByPlace[key] ?? [],
+                  messages,
+                ),
+              },
+            }));
+          };
         },
-      }));
-      return messages.some((message) => message.seq === seq);
+        currentBackend,
+      );
+      return found;
     },
 
     searchMessages(query) {
@@ -1219,6 +1808,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     updateAttachment(attachmentId, patch) {
       return backend.updateAttachment(attachmentId, patch);
+    },
+
+    renewAttachments(attachmentIds) {
+      return backend.renewAttachments(attachmentIds);
     },
 
     retrySend(clientNonce) {
@@ -1300,7 +1893,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     setStatus(status, note, expiresAt = null) {
-      void backend.setStatus(status, note, expiresAt).catch(() => undefined);
+      void backend
+        .setStatus(status, note, expiresAt)
+        .then(applyStatus, () => undefined);
     },
 
     async refreshRoles() {
@@ -1392,7 +1987,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           message.messageId,
           Date.now() + delayMs,
         )
-        .catch(() => undefined);
+        .then(applyReplyLater, () => undefined);
     },
 
     votePoll(message, optionIds) {
@@ -1402,9 +1997,52 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     toggleReaction(message, emoji) {
-      void backend
-        .toggleReaction(message.place, message.messageId, emoji)
-        .catch(() => undefined);
+      const state = get();
+      const key = placeKey(message.place);
+      const current = (state.messagesByPlace[key] ?? []).find(
+        (entry) => entry.messageId === message.messageId,
+      );
+      if (!current || current.deleted || !state.selfKey) return;
+      const reacted = !current.reactions.some(
+        (reaction) =>
+          reaction.emoji === emoji &&
+          reaction.participants.some(
+            (participant) => participantKey(participant) === state.selfKey,
+          ),
+      );
+      void enqueueReactionProjection(
+        reactionMessageQueueKey(message.place, message.messageId),
+        async (operationBackend, isCurrent) => {
+          const canonical = await operationBackend.setReaction(
+            message.place,
+            message.messageId,
+            emoji,
+            reacted,
+          );
+          if (!isCurrent()) return () => undefined;
+          if (
+            canonical.messageId !== message.messageId ||
+            canonical.reacted !== reacted
+          ) {
+            throw new Error("Reaction acknowledgement does not match intent");
+          }
+          const acknowledgement: ReactionUpdatedEvent = {
+            type: "reaction_updated",
+            place: message.place,
+            messageId: canonical.messageId,
+            reactions: canonical.reactions,
+          };
+          return () => {
+            // A place-wide reconnect snapshot may be in flight concurrently.
+            // Journal this newer acknowledgement so that snapshot cannot win.
+            journalReaction(
+              reactionPlaceQueueKey(message.place),
+              acknowledgement,
+            );
+            applyReactionUpdateRaw(acknowledgement);
+          };
+        },
+      ).catch(() => undefined);
     },
 
     async loadOlder(key) {
@@ -1416,30 +2054,52 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((entry) => ({
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
-      const older = await backend.fetchMessages(place, {
-        beforeSeq: current[0].seq,
-        limit: PAGE_SIZE,
-      });
-      set((entry) => {
-        const existing = entry.messagesByPlace[key] ?? [];
-        const known = new Set(existing.map((m) => m.messageId));
-        const fresh = older.filter((m) => !known.has(m.messageId));
-        return {
-          messagesByPlace: {
-            ...entry.messagesByPlace,
-            [key]: [...fresh, ...existing],
+      const currentBackend = backend;
+      try {
+        await enqueueReactionProjection(
+          reactionPlaceQueueKey(place),
+          async (historyBackend, isCurrent) => {
+            const older = await historyBackend.fetchMessages(place, {
+              beforeSeq: current[0].seq,
+              limit: PAGE_SIZE,
+            });
+            if (!isCurrent()) return () => undefined;
+            return () => {
+              set((entry) => {
+                const existing = entry.messagesByPlace[key] ?? [];
+                const known = new Set(existing.map((m) => m.messageId));
+                const fresh = older.filter((m) => !known.has(m.messageId));
+                return {
+                  messagesByPlace: {
+                    ...entry.messagesByPlace,
+                    [key]: [...fresh, ...existing],
+                  },
+                  hasMoreByPlace: {
+                    ...entry.hasMoreByPlace,
+                    [key]: older.length >= PAGE_SIZE,
+                  },
+                };
+              });
+            };
           },
-          hasMoreByPlace: {
-            ...entry.hasMoreByPlace,
-            [key]: older.length >= PAGE_SIZE,
-          },
-          loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: false },
-        };
-      });
+          currentBackend,
+        );
+      } finally {
+        if (backend === currentBackend) {
+          set((entry) => ({
+            loadingOlderByPlace: {
+              ...entry.loadingOlderByPlace,
+              [key]: false,
+            },
+          }));
+        }
+      }
     },
 
     resolveReplyLater(markerId) {
-      void backend.resolveReplyLater(markerId).catch(() => undefined);
+      void backend
+        .resolveReplyLater(markerId)
+        .then(applyReplyLater, () => undefined);
     },
 
     sendTyping() {
@@ -1516,6 +2176,15 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;
+  notificationWriteChain = Promise.resolve();
+  notificationWriteGeneration = 0;
+  confirmedNotificationSetting = null;
+  presenceResyncGeneration += 1;
+  pendingPresenceResync = null;
+  reactionProjectionGeneration += 1;
+  reactionProjectionQueues.clear();
+  if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+  statusExpiryTimer = null;
   useMessaging.setState({
     capabilities: backend.capabilities,
     ready: false,

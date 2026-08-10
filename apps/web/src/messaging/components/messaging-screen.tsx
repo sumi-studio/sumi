@@ -352,6 +352,9 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const mentionCountByPlace = useMessaging(
     (state) => state.mentionCountByPlace,
   );
+  const channels = useMessaging((state) => state.channels);
+  const dms = useMessaging((state) => state.dms);
+  const threadsById = useMessaging((state) => state.threadsById);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
   const notificationLevelByPlace = useMessaging(
     (state) => state.notificationLevelByPlace,
@@ -369,11 +372,21 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     init();
   }, [init]);
 
-  // URLが現在地の正本。route paramのplaceをstoreへ同期する。
+  // URLが現在地の正本。route paramのplaceをstoreへ同期する。未知だった
+  // placeがlive eventや再接続snapshotで現れた時にも選び直す。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: place collections intentionally retrigger selection
   useEffect(() => {
     if (!ready || !placeKey) return;
     if (placeKey !== activePlaceKey) selectPlace(placeKey);
-  }, [ready, placeKey, activePlaceKey, selectPlace]);
+  }, [
+    ready,
+    placeKey,
+    activePlaceKey,
+    selectPlace,
+    channels,
+    dms,
+    threadsById,
+  ]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   // muteしたplaceはここから外す——サイドバーには件数が残るが、タブの数字は

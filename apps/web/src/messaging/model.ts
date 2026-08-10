@@ -85,6 +85,13 @@ export interface ReactionSummary {
   participants: ParticipantRef[];
 }
 
+/** Canonical absolute reaction state returned by a successful mutation. */
+export interface ReactionMutationResult {
+  messageId: string;
+  reactions: ReactionSummary[];
+  reacted: boolean;
+}
+
 /**
  * メッセージが運ぶ添付ファイル。実体はwireに載らず、urlから取得する。
  * urlはbackend境界が決める（実APIは同一originの `/messaging/attachments/<id>`、
@@ -466,8 +473,13 @@ export type ServerEvent =
   | { type: "profile_updated"; member: MemberProfile }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
-  | { type: "reaction_updated"; message: Message }
-  /** 票の更新。reaction_updatedと同じくmessage全体を運び、seqは進めない。 */
+  | {
+      type: "reaction_updated";
+      place: Place;
+      messageId: string;
+      reactions: ReactionSummary[];
+    }
+  /** 票の更新はmessage全体を運ぶが、reactionは上の部分更新だけを運ぶ。 */
   | { type: "poll_updated"; message: Message }
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
   | {
@@ -499,8 +511,10 @@ export interface SendMessageInput {
 
 /** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
 export interface SendReceipt {
+  clientNonce: string;
   messageId: string;
   seq: number;
+  created: boolean;
 }
 
 export type ConnectionState = "connected" | "reconnecting" | "disconnected";
@@ -605,6 +619,8 @@ export interface MessagingBackend {
     attachmentId: string,
     patch: AttachmentDraftPatch,
   ): Promise<Attachment>;
+  /** まだ送信に束ねていない自分の添付下書きのleaseを更新する。 */
+  renewAttachments(attachmentIds: string[]): Promise<void>;
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
@@ -616,7 +632,15 @@ export interface MessagingBackend {
     status: StatusKind,
     note: string,
     expiresAt: number | null,
-  ): Promise<void>;
+  ): Promise<ParticipantStatus>;
+  /**
+   * Volatile presence is not recovered by the per-place durable cursor.
+   * Re-read the authoritative current values after a connection gap.
+   */
+  fetchPresence(): Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }>;
   /**
    * 自分の名乗りを丸ごと置き換える。人間はこれを個人設定画面から、agentは
    * 同じ契約をtool経由で使う（AX: UIだけにある操作を作らない）。
@@ -645,16 +669,26 @@ export interface MessagingBackend {
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void>;
-  resolveReplyLater(markerId: string): Promise<void>;
-  toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
+  ): Promise<ReplyLaterMarker>;
+  resolveReplyLater(markerId: string): Promise<ReplyLaterMarker>;
+  setReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+    reacted: boolean,
+  ): Promise<ReactionMutationResult>;
   /**
    * 投票の回答を丸ごと置き換える。空配列は取り消し——気が変わることと
    * 取り下げることを別の道具にしない。
    */
   votePoll(place: Place, messageId: string, optionIds: string[]): Promise<void>;
-  /** 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。 */
-  setNotificationSetting(input: NotificationSettingInput): Promise<void>;
+  /**
+   * 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。
+   * サーバーが正規化した確定値を返し、クライアントはそれを正本にする。
+   */
+  setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**

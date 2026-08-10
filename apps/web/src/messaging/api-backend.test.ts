@@ -70,7 +70,15 @@ describe("ApiMessagingBackend", () => {
           return json({ messages: [messageWire(1, "hello")] });
         }
         if (path.endsWith("/messages") && init?.method === "POST") {
-          return json({ message_id: "message-2", seq: 2 }, 201);
+          return json(
+            {
+              client_nonce: "nonce-1",
+              message_id: "message-2",
+              seq: 2,
+              created: true,
+            },
+            201,
+          );
         }
         if (path.endsWith("/read-through") && init?.method === "PUT") {
           return new Response(null, { status: 204 });
@@ -94,7 +102,12 @@ describe("ApiMessagingBackend", () => {
         clientNonce: "nonce-1",
         attachments: [],
       }),
-    ).resolves.toEqual({ messageId: "message-2", seq: 2 });
+    ).resolves.toEqual({
+      clientNonce: "nonce-1",
+      messageId: "message-2",
+      seq: 2,
+      created: true,
+    });
     await backend.markRead(channel, 2);
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -174,7 +187,15 @@ describe("ApiMessagingBackend", () => {
           );
         }
         if (path.endsWith("/messages") && init?.method === "POST") {
-          return json({ message_id: "message-2", seq: 2 }, 201);
+          return json(
+            {
+              client_nonce: "nonce-1",
+              message_id: "message-2",
+              seq: 2,
+              created: true,
+            },
+            201,
+          );
         }
         throw new Error(`unexpected request ${path}`);
       },
@@ -219,6 +240,41 @@ describe("ApiMessagingBackend", () => {
       reply_to: "",
       client_nonce: "nonce-1",
       attachments: ["attachment-1"],
+    });
+  });
+
+  it("renews unbound attachment draft leases with the bounded id payload", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input) === "/messaging/attachments:renew" &&
+          init?.method === "POST"
+        ) {
+          return new Response(null, { status: 204 });
+        }
+        throw new Error(`unexpected request ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+
+    await backend.renewAttachments(["attachment-1", "attachment-2"]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/attachments:renew",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: expect.objectContaining({
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+    const request = fetchMock.mock.calls[0]?.[1];
+    expect(JSON.parse(String(request?.body))).toEqual({
+      attachment_ids: ["attachment-1", "attachment-2"],
     });
   });
 
@@ -843,19 +899,71 @@ describe("ApiMessagingBackend", () => {
     ]);
   });
 
-  it("toggles reactions over REST and projects reaction_updated", async () => {
+  it("includes live-learned places in the next reconnect cursor set", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    backend.subscribe(() => {}, {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const firstSocket = FakeWebSocket.instances[0];
+    firstSocket?.open();
+    firstSocket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "channel-2",
+        channel: channelSummaryWire(""),
+      },
+    });
+    firstSocket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "dm-9",
+        dm: {
+          dm_id: "dm-9",
+          kind: "dm",
+          participants: [
+            { kind: "human", human_id: "human-1" },
+            { kind: "human", human_id: "human-2" },
+          ],
+        },
+      },
+    });
+
+    firstSocket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnectSocket = FakeWebSocket.instances[0];
+    expect(reconnectSocket).not.toBe(firstSocket);
+    reconnectSocket?.open();
+
+    expect(JSON.parse(reconnectSocket?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "channel-2": 0, "dm-9": 0 },
+    });
+    backend.dispose();
+  });
+
+  it("sets reactions over REST and projects reaction_updated", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (path.endsWith("/reactions") && init?.method === "POST") {
           return json({
-            message: messageWire(1, "hello", [
+            message_id: "message-1",
+            reactions: [
               {
                 emoji: "👍",
                 participants: [{ kind: "human", human_id: "human-1" }],
               },
-            ]),
+            ],
             reacted: true,
           });
         }
@@ -868,12 +976,18 @@ describe("ApiMessagingBackend", () => {
     expect(backend.capabilities.reactions).toBe(true);
     await backend.bootstrap();
 
-    await backend.toggleReaction(channel, "message-1", "👍");
+    await expect(
+      backend.setReaction(channel, "message-1", "👍", true),
+    ).resolves.toMatchObject({
+      messageId: "message-1",
+      reacted: true,
+      reactions: [{ emoji: "👍" }],
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reactions",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ emoji: "👍" }),
+        body: JSON.stringify({ emoji: "👍", reacted: true }),
       }),
     );
 
@@ -890,26 +1004,28 @@ describe("ApiMessagingBackend", () => {
         event: {
           type: "reaction_updated",
           place_id: "channel-1",
-          message: messageWire(1, "hello", [
-            {
-              emoji: "👍",
-              participants: [{ kind: "human", human_id: "human-1" }],
-            },
-          ]),
+          reaction: {
+            message_id: "message-1",
+            reactions: [
+              {
+                emoji: "👍",
+                participants: [{ kind: "human", human_id: "human-1" }],
+              },
+            ],
+          },
         },
       });
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
         type: "reaction_updated",
-        message: {
-          seq: 1,
-          reactions: [
-            {
-              emoji: "👍",
-              participants: [{ kind: "human", humanId: "human-1" }],
-            },
-          ],
-        },
+        place: channel,
+        messageId: "message-1",
+        reactions: [
+          {
+            emoji: "👍",
+            participants: [{ kind: "human", humanId: "human-1" }],
+          },
+        ],
       });
       // A reaction to an old message must not rewind the replay cursor: the
       // reconnect hello still asks for everything after seq 4.
@@ -955,7 +1071,10 @@ describe("ApiMessagingBackend", () => {
         }
         if (path.endsWith("/resolve") && init?.method === "POST") {
           return json({
-            marker: replyLaterWire("marker-3", "human-1"),
+            marker: {
+              ...replyLaterWire("marker-3", "human-1"),
+              resolved: true,
+            },
           });
         }
         throw new Error(`unexpected request ${path}`);
@@ -984,7 +1103,21 @@ describe("ApiMessagingBackend", () => {
       Date.parse("2026-08-01T11:00:00Z"),
     ]);
 
-    await backend.setStatus("busy", "取り込み中", null);
+    await expect(backend.fetchPresence()).resolves.toEqual({
+      statuses: snapshot.statuses,
+      replyLaterMarkers: snapshot.replyLaterMarkers,
+    });
+
+    await expect(
+      backend.setStatus("busy", "取り込み中", null),
+    ).resolves.toEqual({
+      participant: { kind: "human", humanId: "human-1" },
+      status: "busy",
+      note: "取り込み中",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/status",
       expect.objectContaining({
@@ -1016,7 +1149,13 @@ describe("ApiMessagingBackend", () => {
     );
 
     const remindAt = Date.parse("2026-08-01T11:00:00Z");
-    await backend.createReplyLater(channel, "message-1", remindAt);
+    await expect(
+      backend.createReplyLater(channel, "message-1", remindAt),
+    ).resolves.toMatchObject({
+      markerId: "marker-3",
+      remindAt,
+      resolved: false,
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reply-later",
       expect.objectContaining({
@@ -1024,7 +1163,10 @@ describe("ApiMessagingBackend", () => {
         body: JSON.stringify({ remind_at: "2026-08-01T11:00:00.000Z" }),
       }),
     );
-    await backend.resolveReplyLater("marker-3");
+    await expect(backend.resolveReplyLater("marker-3")).resolves.toMatchObject({
+      markerId: "marker-3",
+      resolved: true,
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/reply-later/marker-3/resolve",
       expect.objectContaining({ method: "POST" }),

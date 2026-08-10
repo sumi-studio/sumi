@@ -21,9 +21,11 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
-// maxRequestBytes bounds any /messaging request body: the largest legal
-// message content plus envelope headroom.
-const maxRequestBytes = MaxContentBytes + 64*1024
+// maxRequestBytes bounds any /messaging JSON request body. A legal content
+// byte can occupy six wire bytes when JSON escapes a control character
+// ("\\u0001"), so the cap covers that worst case plus the surrounding poll,
+// attachment and identity envelope.
+const maxRequestBytes = 6*MaxContentBytes + 64*1024
 
 // maxTopicBytes bounds a channel topic: one header line, not a document.
 const maxTopicBytes = 1000
@@ -63,6 +65,12 @@ type Server struct {
 	// locks still provide the cross-process correctness of partial patches.
 	// Server must not be copied after first use.
 	profileMu sync.Mutex
+
+	// Reaction commits and their live projections are ordered per message.
+	// Separate messages keep independent lanes, so one hot thread cannot stall
+	// reactions everywhere else. Server must not be copied after first use.
+	reactionLocksMu sync.Mutex
+	reactionLocks   map[string]*reactionPublishLock
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -86,10 +94,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
-	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveSetReaction)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/poll/vote", s.serveVotePoll)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
+	mux.HandleFunc("POST /messaging/attachments:renew", s.serveRenewAttachments)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
 	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
@@ -373,6 +382,42 @@ func reactionsToWire(summaries []ReactionSummary) []reactionWire {
 		}
 	}
 	return out
+}
+
+// reactionUpdateWire carries only the projection it owns. A reaction event
+// must never carry stale content, mentions, edit timestamps, or poll state and
+// thereby roll a concurrent message mutation back in a client.
+type reactionUpdateWire struct {
+	MessageID string         `json:"message_id"`
+	Reactions []reactionWire `json:"reactions"`
+}
+
+func reactionUpdateToWire(messageID string, reactions []ReactionSummary) reactionUpdateWire {
+	return reactionUpdateWire{
+		MessageID: messageID,
+		Reactions: reactionsToWire(reactions),
+	}
+}
+
+// messageReceiptWire is the shared mutation ACK for browser REST and the
+// agent's local-control route. It intentionally excludes message content: a
+// successful maximum-size write must remain observable under the bounded
+// control-plane response, and the durable message arrives through the normal
+// timeline/event projection.
+type messageReceiptWire struct {
+	ClientNonce string `json:"client_nonce"`
+	MessageID   string `json:"message_id"`
+	Seq         int64  `json:"seq"`
+	Created     bool   `json:"created"`
+}
+
+func messageReceiptToWire(message Message, created bool) messageReceiptWire {
+	return messageReceiptWire{
+		ClientNonce: message.ClientNonce,
+		MessageID:   message.MessageID,
+		Seq:         message.Seq,
+		Created:     created,
+	}
 }
 
 func messageToWire(place Place, m Message) messageWire {
@@ -1323,25 +1368,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	switch req.Urgency {
-	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_urgency")
-		return
-	}
-	// Attachment-only and poll-only messages are legitimate; empty with
-	// nothing attached is not.
-	if (req.Content == "" && len(req.Attachments) == 0 && req.Poll == nil) ||
-		len(req.Content) > MaxContentBytes {
-		writeError(w, http.StatusBadRequest, "invalid_content")
-		return
-	}
-	if len(req.Attachments) > MaxAttachmentsPerMessage {
-		writeError(w, http.StatusBadRequest, "too_many_attachments")
-		return
-	}
-	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+	if code := validateSendRequest(
+		req.Content, req.Urgency, req.ClientNonce, req.Attachments, req.Poll != nil,
+	); code != "" {
+		writeError(w, http.StatusBadRequest, code)
 		return
 	}
 	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
@@ -1377,11 +1407,29 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	if created {
 		publishMessageCreated(r.Context(), s.Store, s.Hub, place, msg)
 	}
-	writeJSON(w, status, struct {
-		MessageID string      `json:"message_id"`
-		Seq       int64       `json:"seq"`
-		Message   messageWire `json:"message"`
-	}{MessageID: msg.MessageID, Seq: msg.Seq, Message: messageToWire(place, msg)})
+	writeJSON(w, status, messageReceiptToWire(msg, created))
+}
+
+// validateSendRequest keeps browser REST and agent local control on one
+// admission contract. A poll is a browser-only request shape today, but it is
+// still an ordinary alternative to message text for the shared validation.
+func validateSendRequest(content, urgency, clientNonce string, attachments []string, hasPoll bool) string {
+	switch urgency {
+	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
+	default:
+		return "invalid_urgency"
+	}
+	if (content == "" && len(attachments) == 0 && !hasPoll) ||
+		!messageContentFitsStorage(content) {
+		return "invalid_content"
+	}
+	if len(attachments) > MaxAttachmentsPerMessage {
+		return "too_many_attachments"
+	}
+	if clientNonce == "" || len(clientNonce) > 128 {
+		return "invalid_client_nonce"
+	}
+	return ""
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
@@ -1396,7 +1444,7 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Content == "" || len(req.Content) > MaxContentBytes {
+	if req.Content == "" || !messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
@@ -1454,37 +1502,31 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// serveToggleReaction toggles the viewer's emoji on a message. The same store
-// toggle backs the agent tool path (AX: UIだけにある操作を作らない).
-func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
+// serveSetReaction states the viewer's desired emoji state. Repeating the same
+// request is a no-op, so retries cannot accidentally undo a successful call.
+// The agent tool uses the identical store and publication boundary.
+func (s *Server) serveSetReaction(w http.ResponseWriter, r *http.Request) {
 	viewer, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Emoji string `json:"emoji"`
+		Emoji   string `json:"emoji"`
+		Reacted *bool  `json:"reacted"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if validateReactionEmoji(req.Emoji) != nil {
-		writeError(w, http.StatusBadRequest, "invalid_emoji")
+	if req.Reacted == nil || validateReactionEmoji(req.Emoji) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_reaction")
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	var (
-		msg     Message
-		reacted bool
-	)
+	var result ReactionMutationResult
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, reacted, opErr = s.Store.ToggleReaction(
-			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji)
+		result, opErr = s.setReaction(
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji, *req.Reacted)
 		return opErr
 	})
 	if !done {
@@ -1494,12 +1536,15 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	wire := messageToWire(place, msg)
-	s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: placeID, Message: &wire})
 	writeJSON(w, http.StatusOK, struct {
-		Message messageWire `json:"message"`
-		Reacted bool        `json:"reacted"`
-	}{Message: wire, Reacted: reacted})
+		MessageID string         `json:"message_id"`
+		Reactions []reactionWire `json:"reactions"`
+		Reacted   bool           `json:"reacted"`
+	}{
+		MessageID: result.MessageID,
+		Reactions: reactionsToWire(result.Reactions),
+		Reacted:   result.Reacted,
+	})
 }
 
 // serveVotePoll restates the viewer's whole choice on one poll. An empty
@@ -2178,6 +2223,38 @@ func (s *Server) serveUploadAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, attachmentToWire(att))
+}
+
+// serveRenewAttachments keeps uploads held by an active composer from being
+// reclaimed as abandoned. It extends only the authenticated uploader's own
+// still-unbound drafts and therefore does not grant a capability beyond the
+// existing upload/edit/bind lifecycle.
+func (s *Server) serveRenewAttachments(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		AttachmentIDs []string `json:"attachment_ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.AttachmentIDs) == 0 || len(req.AttachmentIDs) > MaxAttachmentDraftRenewal {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	done, err := s.mutate(w, r, claims, func() error {
+		return s.Store.RenewDraftAttachments(r.Context(), viewer, req.AttachmentIDs, time.Now())
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 var errInvalidMultipart = errors.New("invalid multipart body")

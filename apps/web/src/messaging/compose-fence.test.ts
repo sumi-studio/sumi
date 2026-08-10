@@ -35,4 +35,43 @@ describe("isInsideUnclosedCodeFence", () => {
     const value = "~~~\ncode";
     expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
   });
+
+  it("closes a tilde fence only with a tilde fence", () => {
+    const closed = "~~~\ncode\n~~~";
+    const mismatched = "~~~\ncode\n```";
+    expect(isInsideUnclosedCodeFence(closed, closed.length)).toBe(false);
+    expect(isInsideUnclosedCodeFence(mismatched, mismatched.length)).toBe(true);
+  });
+
+  it("does not let a tilde line close a backtick fence", () => {
+    const value = "```\ncode\n~~~";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("requires a closing fence at least as long as its opener", () => {
+    const short = "````\ncode\n```";
+    const long = "```\ncode\n````";
+    expect(isInsideUnclosedCodeFence(short, short.length)).toBe(true);
+    expect(isInsideUnclosedCodeFence(long, long.length)).toBe(false);
+  });
+
+  it("does not treat a fence with an info string as closing", () => {
+    const value = "```\ncode\n```ts";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("allows whitespace and up to three-space indent on closing fences", () => {
+    const value = "```ts\ncode\n   ```   ";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
+
+  it("reopens after a closed fence", () => {
+    const value = "```\na\n```\ntext\n```";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("ignores a backtick opener whose info string contains a backtick", () => {
+    const value = "```a`b\ncode";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
 });
