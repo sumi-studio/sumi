@@ -5,16 +5,13 @@ import {
   getMessagingSessionIdentity,
 } from "../messaging/store";
 import { useAuth } from "./auth-context";
-import { AuthOutcomeNotice } from "./auth-outcome-notice";
 import { LoginScreen } from "./login-screen";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const {
     canUseDirectChat,
     emailLinkCallbackPending,
-    dismissOutcomeNotice,
     loading,
-    outcomeNotice,
     sessionState,
     refreshSession,
     user,
@@ -36,17 +33,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     if (!identityMatches) {
       return <AuthStatus title="セッションを切り替えています…" />;
     }
-    return (
-      <>
-        {outcomeNotice && (
-          <AuthOutcomeNotice
-            notice={outcomeNotice}
-            onDismiss={dismissOutcomeNotice}
-          />
-        )}
-        {children}
-      </>
-    );
+    return children;
   }
   if (loading || sessionState === "checking") {
     return <AuthStatus title="ログイン状態を確認しています…" />;
