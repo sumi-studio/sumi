@@ -653,8 +653,13 @@ export interface MessagingBackend {
    * 取り下げることを別の道具にしない。
    */
   votePoll(place: Place, messageId: string, optionIds: string[]): Promise<void>;
-  /** 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。 */
-  setNotificationSetting(input: NotificationSettingInput): Promise<void>;
+  /**
+   * 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。
+   * サーバーが正規化した確定値を返し、クライアントはそれを正本にする。
+   */
+  setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**

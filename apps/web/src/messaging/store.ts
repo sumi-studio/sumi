@@ -15,6 +15,7 @@ import type {
   MessagingBackend,
   MessagingCapabilities,
   NotificationLevel,
+  NotificationSetting,
   ParticipantKey,
   ParticipantRef,
   ParticipantStatus,
@@ -222,6 +223,33 @@ function unreadContribution(
 }
 
 let initialized = false;
+
+type NotificationSettingState = Pick<
+  MessagingState,
+  | "notificationDefaultLevel"
+  | "notificationLevelByPlace"
+  | "notificationKeywords"
+>;
+
+function notificationSettingState(
+  setting: NotificationSetting,
+): NotificationSettingState {
+  const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> = {};
+  for (const entry of setting.perPlace) {
+    notificationLevelByPlace[placeKey(entry.place)] = entry.level;
+  }
+  return {
+    notificationDefaultLevel: setting.defaults.level,
+    notificationLevelByPlace,
+    notificationKeywords: setting.keywords,
+  };
+}
+
+// Notification settings are full-snapshot PUTs. Serializing them prevents an
+// older, slower response from becoming the server's final state.
+let notificationWriteChain: Promise<void> = Promise.resolve();
+let notificationWriteGeneration = 0;
+let confirmedNotificationSetting: NotificationSettingState | null = null;
 
 let notificationNavigate: ((key: PlaceKey) => void) | null = null;
 
@@ -960,8 +988,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     levelByPlace: Record<PlaceKey, NotificationLevel>;
     keywords: string[];
   }) => {
+    const sessionBackend = backend;
     const state = get();
-    const previous = {
+    const previous: NotificationSettingState = {
       notificationDefaultLevel: state.notificationDefaultLevel,
       notificationLevelByPlace: state.notificationLevelByPlace,
       notificationKeywords: state.notificationKeywords,
@@ -971,18 +1000,40 @@ export const useMessaging = create<MessagingState>((set, get) => {
       notificationLevelByPlace: next.levelByPlace,
       notificationKeywords: next.keywords,
     });
-    const perPlace: { place: Place; level: NotificationLevel }[] = [];
-    for (const [key, level] of Object.entries(next.levelByPlace)) {
-      const place = parsePlaceKey(key);
-      if (place) perPlace.push({ place, level });
-    }
-    void backend
-      .setNotificationSetting({
-        defaults: { level: next.defaultLevel },
-        perPlace,
-        keywords: next.keywords,
-      })
-      .catch(() => set(previous));
+    const generation = ++notificationWriteGeneration;
+    notificationWriteChain = notificationWriteChain.then(async () => {
+      if (
+        backend !== sessionBackend ||
+        generation !== notificationWriteGeneration
+      ) {
+        return;
+      }
+      const perPlace: { place: Place; level: NotificationLevel }[] = [];
+      for (const [key, level] of Object.entries(next.levelByPlace)) {
+        const place = parsePlaceKey(key);
+        if (place) perPlace.push({ place, level });
+      }
+      try {
+        const confirmed = notificationSettingState(
+          await sessionBackend.setNotificationSetting({
+            defaults: { level: next.defaultLevel },
+            perPlace,
+            keywords: next.keywords,
+          }),
+        );
+        if (backend !== sessionBackend) return;
+        confirmedNotificationSetting = confirmed;
+        if (generation === notificationWriteGeneration) set(confirmed);
+      } catch {
+        if (
+          backend !== sessionBackend ||
+          generation !== notificationWriteGeneration
+        ) {
+          return;
+        }
+        set(confirmedNotificationSetting ?? previous);
+      }
+    });
   };
 
   return {
@@ -1069,11 +1120,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           for (const thread of snapshot.threads) {
             threadsById[thread.threadId] = thread;
           }
-          const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> =
-            {};
-          for (const entry of snapshot.notificationSetting.perPlace) {
-            notificationLevelByPlace[placeKey(entry.place)] = entry.level;
-          }
+          confirmedNotificationSetting = notificationSettingState(
+            snapshot.notificationSetting,
+          );
           set({
             ready: true,
             capabilities: currentBackend.capabilities,
@@ -1089,10 +1138,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             unreadCountByPlace,
             mentionCountByPlace,
             replyLaterById,
-            notificationDefaultLevel:
-              snapshot.notificationSetting.defaults.level,
-            notificationLevelByPlace,
-            notificationKeywords: snapshot.notificationSetting.keywords,
+            ...confirmedNotificationSetting,
             employedAgents: snapshot.employedAgents,
             roles: snapshot.roles,
             roleAssignments: snapshot.roleAssignments,
@@ -1628,6 +1674,9 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;
+  notificationWriteChain = Promise.resolve();
+  notificationWriteGeneration = 0;
+  confirmedNotificationSetting = null;
   useMessaging.setState({
     capabilities: backend.capabilities,
     ready: false,
