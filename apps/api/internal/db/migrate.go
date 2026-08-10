@@ -11,8 +11,10 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -47,6 +49,15 @@ type pendingMigration struct {
 	sha256  string
 }
 
+// migrationStore is implemented by both a pool and one acquired pool
+// connection. Migrate uses the latter so its session-scoped advisory lock and
+// every operation protected by that lock stay on the same Postgres session.
+type migrationStore interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	Begin(context.Context) (pgx.Tx, error)
+}
+
 // MigrationManifestEntry is the immutable identity of one embedded migration.
 // Version, file name, and the SHA-256 of the exact SQL bytes are all retained:
 // a version number alone cannot detect a rewritten migration after dogfood has
@@ -71,34 +82,67 @@ type MigrationStatus struct {
 // Migrate applies every embedded up-migration that has not yet been recorded in
 // schema_migrations. It is idempotent: re-running against an up-to-date database
 // is a no-op. A session-level advisory lock serializes concurrent runners.
-func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID); err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
+func Migrate(ctx context.Context, pool *pgxpool.Pool) (returnErr error) {
+	connection, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	if _, err := connection.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID); err != nil {
+		// Cancellation can race with lock acquisition. Do not return a session
+		// whose lock state is uncertain to the pool.
+		raw := connection.Hijack()
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+		closeErr := raw.Close(closeCtx)
+		cancelClose()
+		return errors.Join(fmt.Errorf("acquire migration lock: %w", err), closeErr)
 	}
 	defer func() {
-		_, _ = pool.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
+		returnErr = errors.Join(returnErr, releaseMigrationConnection(connection))
 	}()
 
-	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {
+	if _, err := connection.Exec(ctx, migrationBookkeepingSchema); err != nil {
 		return fmt.Errorf("ensure schema_migrations table: %w", err)
 	}
-	if err := adoptLegacyManifestRows(ctx, pool); err != nil {
+	if err := adoptLegacyManifestRows(ctx, connection); err != nil {
 		return err
 	}
 
-	pending, err := pendingMigrations(ctx, pool)
+	pending, err := pendingMigrations(ctx, connection)
 	if err != nil {
 		return err
 	}
 	for _, m := range pending {
-		if err := applyMigration(ctx, pool, m); err != nil {
+		if err := applyMigration(ctx, connection, m); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]pendingMigration, error) {
+func releaseMigrationConnection(connection *pgxpool.Conn) error {
+	unlockCtx, cancelUnlock := context.WithTimeout(context.Background(), 5*time.Second)
+	var unlocked bool
+	err := connection.QueryRow(unlockCtx, "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID).Scan(&unlocked)
+	cancelUnlock()
+	if err != nil || !unlocked {
+		// Never return a session with an uncertain session-level lock to the pool.
+		raw := connection.Hijack()
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+		closeErr := raw.Close(closeCtx)
+		cancelClose()
+		if err == nil {
+			err = errors.New("Postgres session did not hold the migration lock")
+		}
+		return errors.Join(
+			fmt.Errorf("release migration lock: %w", err),
+			closeErr,
+		)
+	}
+	connection.Release()
+	return nil
+}
+
+func pendingMigrations(ctx context.Context, pool migrationStore) ([]pendingMigration, error) {
 	embedded, err := embeddedUpMigrations()
 	if err != nil {
 		return nil, err
@@ -148,7 +192,7 @@ func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]pendingMigrat
 	return pending, nil
 }
 
-func applyMigration(ctx context.Context, pool *pgxpool.Pool, m pendingMigration) error {
+func applyMigration(ctx context.Context, pool migrationStore, m pendingMigration) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin migration %d: %w", m.version, err)
@@ -303,7 +347,7 @@ func VerifyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // recorded version. It fills both identity fields together from the current
 // embedded manifest, then makes them mandatory. Once adopted, every subsequent
 // startup verifies exact identity before applying anything new.
-func adoptLegacyManifestRows(ctx context.Context, pool *pgxpool.Pool) error {
+func adoptLegacyManifestRows(ctx context.Context, pool migrationStore) error {
 	embedded, err := embeddedUpMigrations()
 	if err != nil {
 		return err

@@ -548,6 +548,22 @@ func TestHealthAndReadinessAreSeparateContracts(t *testing.T) {
 	}
 }
 
+func TestPublicAPIResponsesAreNeverCacheable(t *testing.T) {
+	handler := noStoreAPIResponses(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Add("Set-Cookie", "first=1; Secure")
+		response.Header().Add("Set-Cookie", "second=2; Secure")
+		response.WriteHeader(http.StatusUnauthorized)
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/auth/session", nil))
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("API response is cacheable: %v", recorder.Header())
+	}
+	if cookies := recorder.Header().Values("Set-Cookie"); len(cookies) != 2 {
+		t.Fatalf("no-store middleware collapsed Set-Cookie: %v", cookies)
+	}
+}
+
 func TestReadinessDetectsLostWritableDirectory(t *testing.T) {
 	commandRoot := t.TempDir()
 	runtimeRoot := t.TempDir()

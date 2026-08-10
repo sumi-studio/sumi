@@ -4,9 +4,11 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -97,6 +99,55 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 	}
 	if !status.Ready || len(status.Pending) != 0 || len(status.Applied) != len(status.Expected) {
 		t.Fatalf("unexpected ready manifest status: %+v", status)
+	}
+}
+
+func TestConcurrentMigrateCallsShareOneSerializedManifestTransition(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const runners = 4
+	start := make(chan struct{})
+	errorsByRunner := make([]error, runners)
+	var wait sync.WaitGroup
+	for index := range runners {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			errorsByRunner[index] = Migrate(ctx, pool)
+		}()
+	}
+	close(start)
+	wait.Wait()
+	for index, err := range errorsByRunner {
+		if err != nil {
+			t.Fatalf("concurrent migrate runner %d: %v", index, err)
+		}
+	}
+	status, err := MigrationManifestStatus(ctx, pool)
+	if err != nil || !status.Ready || len(status.Pending) != 0 {
+		t.Fatalf("serialized migration manifest not ready: status=%+v err=%v", status, err)
+	}
+	connection, err := pgx.Connect(ctx, pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(ctx)
+	var lockAvailable bool
+	if err := connection.QueryRow(ctx,
+		"SELECT pg_try_advisory_lock($1)", migrationAdvisoryLockID,
+	).Scan(&lockAvailable); err != nil {
+		t.Fatal(err)
+	}
+	if !lockAvailable {
+		t.Fatal("migration returned with its session advisory lock still held")
+	}
+	if _, err := connection.Exec(ctx,
+		"SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID,
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 

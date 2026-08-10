@@ -214,7 +214,7 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux     *http.ServeMux
+	publicMux     http.Handler
 	localMux      *http.ServeMux
 	localListener *localControlListenerConfig
 	store         *agentevents.CommandStore
@@ -265,7 +265,7 @@ func (a *application) Close() error {
 	return a.closeErr
 }
 
-func newRouter() (*http.ServeMux, error) {
+func newRouter() (http.Handler, error) {
 	app, err := newApplicationFromEnv()
 	if err != nil {
 		return nil, err
@@ -459,7 +459,7 @@ func newApplicationFromEnv() (*application, error) {
 		Checks: readinessChecks(databasePool),
 	})
 	return &application{
-		publicMux:     mux,
+		publicMux:     noStoreAPIResponses(mux),
 		localMux:      localMux,
 		localListener: localListener,
 		store:         store,
@@ -469,6 +469,17 @@ func newApplicationFromEnv() (*application, error) {
 		localRuntimes: localRuntimes,
 		messaging:     messagingServer,
 	}, nil
+}
+
+// noStoreAPIResponses leaves response bodies, Set-Cookie multiplicity, and
+// WebSocket upgrades untouched while making the API listener an explicit
+// no-cache origin. The edge Worker can therefore stream the origin response
+// directly instead of reconstructing it merely to add cache policy.
+func noStoreAPIResponses(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(response, request)
+	})
 }
 
 func readinessChecks(databasePool *pgxpool.Pool) []handler.ReadinessCheck {
