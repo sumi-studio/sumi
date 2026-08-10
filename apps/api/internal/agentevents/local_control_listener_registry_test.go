@@ -24,7 +24,7 @@ func TestLocalControlListenerRegistryUsesIndependentPAIDBoundSockets(t *testing.
 		t.Fatal(err)
 	}
 
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	firstAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	secondAuthorization := localControlAuthorization(localControlOtherBearer, localControlOtherPAID, 9, "boot-other")
 	control, err := NewLocalControlServer(
@@ -148,7 +148,7 @@ func TestLocalControlListenerRegistryRejectsUntrustedOrNoncanonicalRoot(t *testi
 	}
 	t.Cleanup(func() { _ = os.Remove(link) })
 
-	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	control, err := NewLocalControlServer(gateway, localControlTestSigningSecret, nil)
 	if err != nil {
 		t.Fatal(err)

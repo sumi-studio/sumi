@@ -522,7 +522,7 @@ func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListen
 	recorder := &provisioningRecorder{}
 	provisioner := newFakeRuntimeProvisioner(recorder)
 	commandDir := t.TempDir()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	root, err := os.MkdirTemp("/tmp", "lc-")
 	if err != nil {
 		t.Fatal(err)

@@ -40,7 +40,7 @@ func openSharedBrowserSessionGateways(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	first, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -506,7 +506,7 @@ func TestHMACUserSessionVerifierBoundsAndReclaimsRotationLineage(t *testing.T) {
 
 func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T) {
 	commandDir := t.TempDir()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, err := OpenCommandStore(commandDir)
 	if err != nil {
 		t.Fatal(err)
@@ -995,7 +995,7 @@ func TestDurableBrowserSessionLogoutThenRotationRejectsSuccessor(
 
 func TestDurableBrowserSessionRevocationFailuresFailClosed(t *testing.T) {
 	commandDir := t.TempDir()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, err := OpenCommandStore(commandDir)
 	if err != nil {
 		t.Fatal(err)

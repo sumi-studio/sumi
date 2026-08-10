@@ -48,7 +48,7 @@ func openRuntimeGateway(t *testing.T) *DurableGateway {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestDurableGatewayRejectsMutableDirectoryAndReplacedPinnedLock(t *testing.T
 		t.Fatal("gateway accepted a runtime directory beneath a symlink path component")
 	}
 
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	gateway, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -530,7 +530,7 @@ func TestBrowserCommandAdmissionFencesNotReadyAcrossGateways(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	first, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -574,7 +574,7 @@ func TestBrowserCommandAdmissionSerializesGenerationRolloverWithDurableAppend(t 
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	first, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -673,7 +673,7 @@ func TestConnectionLeaseIntegrityKeyRotationResignsConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	oldGateway, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -831,7 +831,7 @@ func TestDurableGatewaySerializesEventSequenceAcrossInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer commandStore.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	first, err := OpenDurableGateway(runtimeDir, commandStore)
 	if err != nil {
 		t.Fatal(err)
@@ -928,7 +928,7 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 }
 
 func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t *testing.T) {
-	storeDir, runtimeDir := t.TempDir(), t.TempDir()
+	storeDir, runtimeDir := t.TempDir(), privateRuntimeDir(t)
 	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
 	if err != nil {
 		t.Fatal(err)
@@ -1004,7 +1004,7 @@ func TestDurableGatewayNextCommandSeqSupportsOutOfOrderTerminalAcks(t *testing.T
 func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T) {
 	const commandCount = 4096
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-012345678972"
-	storeDir, runtimeDir := t.TempDir(), t.TempDir()
+	storeDir, runtimeDir := t.TempDir(), privateRuntimeDir(t)
 	var commandLog, ackLog bytes.Buffer
 	for i := 1; i <= commandCount; i++ {
 		commandID := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
@@ -1177,7 +1177,7 @@ func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *te
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			storeDir, runtimeDir := t.TempDir(), t.TempDir()
+			storeDir, runtimeDir := t.TempDir(), privateRuntimeDir(t)
 			store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
 			if err != nil {
 				t.Fatal(err)
@@ -1232,7 +1232,7 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedRestartAck(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			storeDir, runtimeDir := t.TempDir(), t.TempDir()
+			storeDir, runtimeDir := t.TempDir(), privateRuntimeDir(t)
 			store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
 			if err != nil {
 				t.Fatal(err)

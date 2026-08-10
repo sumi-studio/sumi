@@ -600,7 +600,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 		t.Fatal(err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1083,7 +1083,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	firstGateway, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -1224,7 +1224,7 @@ func TestWebSocketReplacementClaimsLeaseBeforeSnapshottingDurableCursors(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	firstGateway, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -1408,7 +1408,7 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	firstGateway, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)
@@ -1553,7 +1553,7 @@ func TestSideEffectCancellationViolationRetainsLeaseUntilCallbackReturns(t *test
 		t.Fatal(err)
 	}
 	defer store.Close()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	firstGateway, err := OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		t.Fatal(err)

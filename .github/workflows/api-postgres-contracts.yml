@@ -52,17 +52,5 @@ jobs:
             psql --username postgres --dbname postgres --set ON_ERROR_STOP=1 \
             --command "CREATE ROLE sumi_test_creator WITH LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOREPLICATION PASSWORD 'sumi_test_password'"
 
-      - name: Diagnose gateway runtime filesystem contract
-        run: |
-          set -eu
-          for base in "${TMPDIR:-/tmp}" "${RUNNER_TEMP}" "${GITHUB_WORKSPACE}"; do
-            probe="$(mktemp -d "${base%/}/sumi-nlink.XXXXXX")"
-            stat --format='[DEBUG-nlink-ci] path=%n mode=%a uid=%u nlink=%h' "${probe}"
-            findmnt --target "${probe}" --output TARGET,FSTYPE,SOURCE,OPTIONS --noheadings \
-              | sed 's/^/[DEBUG-nlink-ci] mount=/'
-            rmdir "${probe}"
-          done
-          echo "[DEBUG-nlink-ci] euid=$(id -u) egid=$(id -g)"
-
       - name: Run API contract tests
         run: go test -count=1 ./...

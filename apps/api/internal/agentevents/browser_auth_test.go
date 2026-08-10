@@ -549,7 +549,7 @@ func TestBrowserAuthLogoutRetainsValidCookieWhenDurableRevocationIsUnavailable(t
 		t.Fatal(err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -724,7 +724,7 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 
 func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 	commandDir := t.TempDir()
-	runtimeDir := t.TempDir()
+	runtimeDir := privateRuntimeDir(t)
 	store, err := OpenCommandStore(commandDir)
 	if err != nil {
 		t.Fatal(err)
