@@ -152,7 +152,7 @@ pub fn build_request(
                 context
                     .tools
                     .iter()
-                    .map(|tool| convert_tool(tool, compat))
+                    .map(|tool| convert_tool(tool, spec, compat))
                     .collect(),
             ),
         );
@@ -325,6 +325,11 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                 }
                 if !tool_calls.is_empty() {
                     assistant.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+                    if compat.requires_content_on_tool_only_assistant
+                        && !assistant.contains_key("content")
+                    {
+                        assistant.insert("content".to_owned(), json!(""));
+                    }
                 }
                 if compat.requires_reasoning_content_on_assistant
                     && !assistant.contains_key("reasoning_content")
@@ -440,17 +445,65 @@ fn convert_tool_result(message: &ToolResultMessage, supports_images: bool) -> Va
     })
 }
 
-fn convert_tool(tool: &ToolDefinition, compat: &ChatCompat) -> Value {
+fn convert_tool(tool: &ToolDefinition, spec: &ModelSpec, compat: &ChatCompat) -> Value {
+    let parameters = if spec.id.to_lowercase().contains("kimi") {
+        sanitize_kimi_tool_parameters(&tool.parameters)
+    } else {
+        tool.parameters.clone()
+    };
+    let disable_strict = compat.supports_strict_mode && !is_mfjs_strict_safe(&parameters);
     let mut function = Map::new();
     function.insert("name".to_owned(), json!(tool.name));
     function.insert("description".to_owned(), json!(tool.description));
-    function.insert("parameters".to_owned(), tool.parameters.clone());
-    if compat.supports_strict_mode && !is_mfjs_strict_safe(&tool.parameters) {
+    function.insert("parameters".to_owned(), parameters);
+    if disable_strict {
         // Kimi strict defaults to true; omission would not disable an
         // schema whose MFJS semantics we cannot prove.
         function.insert("strict".to_owned(), json!(false));
     }
     json!({"type": "function", "function": function})
+}
+
+/// Part of the Console Go kimi fleet returns an opaque
+/// `400 Upstream request failed` for tool `parameters` whose root schema does
+/// not declare `"type": "object"` (schemars emits a bare `oneOf` root for
+/// tagged enums). Tool arguments are always JSON objects, so annotating the
+/// root is universally sound; `$ref`-only roots are left untouched because
+/// Kimi rejects `$ref` siblings.
+fn sanitize_kimi_tool_parameters(value: &Value) -> Value {
+    let mut sanitized = sanitize_kimi_tool_schema(value);
+    if let Value::Object(root) = &mut sanitized {
+        if !root.contains_key("type") && !root.contains_key("$ref") {
+            root.insert("type".to_owned(), json!("object"));
+        }
+    }
+    sanitized
+}
+
+fn sanitize_kimi_tool_schema(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_kimi_tool_schema).collect()),
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                return json!({"$ref": reference});
+            }
+            let mut sanitized: Map<String, Value> = object
+                .iter()
+                .map(|(key, value)| (key.clone(), sanitize_kimi_tool_schema(value)))
+                .collect();
+            let tuple_item = match sanitized.get("items") {
+                Some(Value::Array(items)) => {
+                    Some(items.first().cloned().unwrap_or_else(|| json!({})))
+                }
+                _ => None,
+            };
+            if let Some(item) = tuple_item {
+                sanitized.insert("items".to_owned(), item);
+            }
+            Value::Object(sanitized)
+        }
+        _ => value.clone(),
+    }
 }
 
 const MFJS_MAX_SCHEMA_BYTES: usize = 120_000;
@@ -2392,6 +2445,193 @@ mod tests {
             provenance["fixtures"]["opencode_kimi_k2_7_code_text.sse"]["request_body"],
             send_snapshot_matrix()["opencode_live_capture_request"]
         );
+    }
+
+    #[test]
+    fn opencode_kimi_tool_schema_collapses_ref_nodes_to_the_ref_only() {
+        let mut tool = tool_definition();
+        tool.parameters = json!({
+            "type":"object",
+            "properties":{
+                "node":{
+                    "$ref":"#/$defs/node",
+                    "description":"must be removed",
+                    "type":"string",
+                    "default":"also removed"
+                }
+            },
+            "$defs":{
+                "node":{
+                    "type":"object",
+                    "properties":{"value":{"type":"string"}}
+                }
+            }
+        });
+        let request = build_request(
+            &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
+            &simple_context(vec![user_message("Use the tool.")], vec![tool]),
+            &RequestOptions::default(),
+        )
+        .expect("OpenCode request");
+
+        assert_eq!(
+            request["tools"][0]["function"]["parameters"]["properties"]["node"],
+            json!({"$ref":"#/$defs/node"})
+        );
+    }
+
+    #[test]
+    fn opencode_kimi_tool_schema_lowers_tuple_items_to_one_schema_or_empty_object() {
+        let mut tool = tool_definition();
+        tool.parameters = json!({
+            "type":"object",
+            "properties":{
+                "non_empty":{
+                    "type":"array",
+                    "items":[
+                        {"type":"string","description":"kept first"},
+                        {"type":"integer"}
+                    ]
+                },
+                "empty":{
+                    "type":"array",
+                    "items":[]
+                }
+            }
+        });
+        let request = build_request(
+            &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
+            &simple_context(vec![user_message("Use the tool.")], vec![tool]),
+            &RequestOptions::default(),
+        )
+        .expect("OpenCode request");
+        let properties = &request["tools"][0]["function"]["parameters"]["properties"];
+
+        assert_eq!(
+            properties["non_empty"]["items"],
+            json!({"type":"string","description":"kept first"})
+        );
+        assert_eq!(properties["empty"]["items"], json!({}));
+    }
+
+    #[test]
+    fn opencode_replays_reasoning_content_on_every_assistant_message_including_empty() {
+        let spec = ModelSpec::preset("opencode-go").expect("OpenCode preset");
+        let assistant = |content| {
+            Message::Assistant(AssistantMessage {
+                content,
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                interrupted: false,
+                timestamp: Utc::now(),
+            })
+        };
+        let request = build_request(
+            &spec,
+            &simple_context(
+                vec![
+                    user_message("First."),
+                    assistant(vec![
+                        AssistantContent::Thinking {
+                            thinking: "first thought".to_owned(),
+                            signature_field: "reasoning_content".to_owned(),
+                            wire_item_index: 0,
+                        },
+                        AssistantContent::Text {
+                            text: "First answer.".to_owned(),
+                            wire_item_index: 1,
+                        },
+                    ]),
+                    user_message("Second."),
+                    assistant(vec![AssistantContent::Text {
+                        text: "Second answer.".to_owned(),
+                        wire_item_index: 0,
+                    }]),
+                ],
+                vec![],
+            ),
+            &RequestOptions::default(),
+        )
+        .expect("OpenCode request");
+        let reasoning: Vec<Value> = request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .map(|message| message["reasoning_content"].clone())
+            .collect();
+
+        assert_eq!(reasoning, vec![json!("first thought"), json!("")]);
+    }
+
+    #[test]
+    fn opencode_tool_only_assistant_has_empty_string_content() {
+        let spec = ModelSpec::preset("opencode-go").expect("OpenCode preset");
+        let assistant = Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::ToolCall {
+                tool_call: ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: ValidatedToolArguments::from_schema_validated(
+                        json!({"path":"a.txt"}).as_object().expect("object").clone(),
+                    ),
+                },
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: Some("tool_calls".to_owned()),
+            interrupted: false,
+            timestamp: Utc::now(),
+        });
+        let result = Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            content: vec![UserContent::Text {
+                text: "contents".to_owned(),
+            }],
+            details: json!({}),
+            is_error: false,
+            timestamp: Utc::now(),
+        });
+        let request = build_request(
+            &spec,
+            &simple_context(
+                vec![user_message("Read it."), assistant, result],
+                vec![tool_definition()],
+            ),
+            &RequestOptions::default(),
+        )
+        .expect("OpenCode request");
+        let assistant = &request["messages"][2];
+
+        assert_eq!(assistant["content"], json!(""));
+        assert_eq!(assistant["reasoning_content"], json!(""));
+        assert!(assistant["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn opencode_omits_temperature_even_when_requested() {
+        let request = build_request(
+            &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
+            &simple_context(vec![user_message("Hello.")], vec![]),
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("OpenCode request");
+
+        assert!(request.get("temperature").is_none());
     }
 
     #[test]

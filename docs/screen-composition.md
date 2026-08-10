@@ -1,8 +1,9 @@
 # 画面構成書
 
 - Status: Draft (v1)
-- Date: 2026-07-15
-- 前提: [ADR 0001](adr/0001-frontend-stack.md) の技術選定 (React 19 + Vite + Tailwind v4 + Tauri 2、`packages/ui` カタログ、`packages/sdui`)
+- Original date: 2026-07-15
+- Last amended: 2026-08-10
+- 前提: [ADR 0001](adr/0001-frontend-stack.md) と [ADR 0014](adr/0014-webapp-and-electron-runtime.md) の技術選定 (React 19 + Vite + Tailwind v4のcanonical WebApp、Electron desktop shell、`packages/ui` カタログ、`packages/sdui`)
 
 ## 設計原則
 
@@ -22,8 +23,8 @@
 | 3 | 通知 | 通知センター + 権限リクエストの承認キュー | 早期 |
 | 4 | 設定 | エージェント管理・権限管理・アカウント | MVP (最小) |
 
-- デスクトップ / Web: 左サイドバー (ナビ + 一覧 | 本体 の 2 ペイン) を常時表示
-- モバイル (Tauri シェル): 同じ中身 (ナビ + 一覧) をハンバーガーメニューから開くドロワーとして表示。チャット画面のヘッダー左の ☰ が開閉トリガー
+- デスクトップ Web / Electron: 左サイドバー (ナビ + 一覧 | 本体 の 2 ペイン) を常時表示
+- mobile WebApp: 同じ中身 (ナビ + 一覧) をハンバーガーメニューから開くドロワーとして表示。チャット画面のヘッダー左の ☰ が開閉トリガー
 
 MVP は 1 と 4 のガワのみ。2・3 はタブだけ用意して空で良い。
 
@@ -121,7 +122,7 @@ idle ──送信──▶ streaming ──完了──▶ idle
 #### 音声入力
 
 - Web Speech API (ブラウザネイティブ)。[🎤] 押下で録音開始、認識テキストを入力欄にライブ反映、確定後に手直しして送信
-- 注意: Tauri iOS の WKWebView では `SpeechRecognition` の挙動が Safari 準拠。Web で動いても iOS シェルで要再検証
+- 注意: iOSのmobile WebAppではWebKit / Safariの対応範囲になる。desktop Chromiumで動いても、iOS実機で`SpeechRecognition`の有無・権限・中断復帰を再検証する
 
 #### コンテンツの貼り付け
 
@@ -148,24 +149,36 @@ UI 要件というよりアーキテクチャ制約。最初から効かせる�
 - API は `SUMI_BROWSER_SESSION_SECRET`（base64 HMAC key）、任意の `SUMI_BROWSER_SESSION_AUDIENCE`、および browser origin allowlist `SUMI_BROWSER_WS_ALLOWED_ORIGINS` を必要とする。現在は `GET /auth/csrf`、`POST/GET /auth/session`、`POST /auth/logout` を実装済みで、Firebase Admin が検証した ID token と server-owned な UID/tenant/user/PersonalityAgent binding から session を発行する。ローカルの正式な入口は既定の `http://127.0.0.1:5173`、または明示した literal Tailnet IPv4 の `http://<ip>:5173` で、API はその 1 origin だけを許可し、Vite が `/auth` と `/direct-chat` を同一 origin proxy する。設定と human smoke は [Real local stack](local-development.md) を参照。
 - browser-session cookie の署名鍵は上記base secretからprotocol-version付きの `v2` domainで導出する。pre-lineage cookieはupgrade後に局所検証で失効し、次のFirebase exchangeだけがv2 cookieを発行する一方、authority binding IDは元のbase secretから導出し続けるため同じbindingでは変わらない。この境界をまたぐ旧版とv2版のAPI replicaは互いのcookieを受理できないため、同一deploymentで混在させず、全replicaをdrainして同時に切り替える。このcutoverはone-wayであり、v2を有効化した後に同じ `SUMI_BROWSER_SESSION_SECRET` のまま旧binaryへrollbackしてはならない。rollbackが不可避ならsecretをrotateして全browser sessionとauthority bindingを安全側へresetするか、v2を最大session TTLの1時間より長く停止して既発行cookieがすべて失効してから旧版またはv2を再開する。
 
-### C. 権限リクエストフロー
+### C. current-call承認とstanding policy管理
 
-「権限を要求する権限」の受け皿。専用画面は作らず、**チャット内のシステムカード + 通知タブのキュー**の 2 箇所に同じ承認 UI を出す。
+agentが実際のtarget ToolCallを`Elevated`として提案したときの受け皿。genericな
+`request_permission`画面は作らず、**チャット内のsystem card + 通知tabのqueue**の
+2箇所に同じcurrent-call approval UIを出す。cardは、agent自身のcapabilityにHumanが
+同意する操作か、Human accountを本当に一回使う操作かを明示する。
 
 ```
 ┌──────────────────────┐
-│ 🔐 Sumi が権限を要求    │
-│ 「カレンダーの読み取り」  │
-│ 理由: 予定の確認のため   │
-│ [今回のみ][常に許可][拒否]│
+│ 🔐 Sumi が操作承認を要求  │
+│ 「予定Aを移動」           │
+│ 実行主体: Sumi自身        │
+│ 理由: 時間調整のため      │
+│ [今回だけ承認][今回だけ拒否]│
+│ 将来のルールを設定…       │
 └──────────────────────┘
 ```
+
+「将来のルールを設定…」では、常に許可、明示した期限まで許可、永続拒否を選べる。
+これはcurrent-call decisionと同じpayloadにせず、別の認証済みstanding-policy mutationとして
+送る。対象scope、precedence、expiry上限、appごとのrule語彙はADR 0013の未決事項であり、
+opaqueな`ApproveAlways` ruleを先にwireへ戻さない。設定にはruleの一覧・編集・削除画面を置く。
+Humanがcard上で対象やscopeを狭める場合は部分承認せず、digestの異なる新callとして
+Escalation AutoReviewから再提示する。Human-account one-shotをstanding grantへ変換しない。
 
 ### D. タスク / 通知 / 設定 (骨のみ)
 
 - **タスク**: ToDo・リマインダー・タイマー・アラームを種別フィルタ付きの 1 リストで横断表示。項目タップで生成元の会話位置へジャンプ (シームレス接続)
 - **通知**: 時系列のアクティビティ + 未処理の権限リクエストを上部に固定
-- **設定**: エージェント一覧、アカウント、外部接続 (GitHub 等は後日)
+- **設定**: エージェント一覧、権限rule管理、アカウント、外部接続 (GitHub 等は後日)
 
 ## パッケージへの割り付け
 

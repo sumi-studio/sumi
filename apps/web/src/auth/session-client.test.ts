@@ -7,6 +7,7 @@ import {
   postAuthJSON,
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
+  updateSumiProfile,
   verifyCommittedSumiSession,
 } from "./session-client";
 
@@ -62,7 +63,7 @@ describe("Sumi browser session client", () => {
         JSON.stringify({
           authenticated: true,
           authority_binding_id: authorityBindingA,
-          user: { id: "user-1" },
+          user: { id: "user-1", display_name: "薄明色の忘れ路" },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
@@ -72,12 +73,39 @@ describe("Sumi browser session client", () => {
     await expect(getSumiSession()).resolves.toEqual({
       authenticated: true,
       authorityBindingId: authorityBindingA,
-      user: { id: "user-1" },
+      user: { id: "user-1", displayName: "薄明色の忘れ路" },
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "/auth/session",
       expect.objectContaining({ credentials: "include", cache: "no-store" }),
     );
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["null", null],
+    ["empty", ""],
+  ])("maps a %s legacy display name to a neutral profile", async (_name, displayName) => {
+    const user: Record<string, unknown> = { id: "legacy-user" };
+    if (displayName !== undefined) user.display_name = displayName;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority_binding_id: authorityBindingA,
+            user,
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await expect(getSumiSession()).resolves.toMatchObject({
+      authenticated: true,
+      user: { id: "legacy-user", displayName: null },
+    });
   });
 
   it.each([
@@ -89,7 +117,7 @@ describe("Sumi browser session client", () => {
   ])("rejects a %s authority binding ID", async (_name, authorityBindingID) => {
     const body: Record<string, unknown> = {
       authenticated: true,
-      user: { id: "user-1" },
+      user: { id: "user-1", display_name: "薄明色の忘れ路" },
     };
     if (authorityBindingID !== undefined) {
       body.authority_binding_id = authorityBindingID;
@@ -102,6 +130,48 @@ describe("Sumi browser session client", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(getSumiSession()).rejects.toBeInstanceOf(AuthAPIError);
+  });
+
+  it("updates the canonical Human display name through the authenticated profile endpoint", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "p".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            user: { id: "user-1", display_name: "かずい" },
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(updateSumiProfile("かずい")).resolves.toEqual({
+      id: "user-1",
+      displayName: "かずい",
+    });
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/auth/profile",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        body: JSON.stringify({ display_name: "かずい" }),
+      }),
+    ]);
+  });
+
+  it("rejects more than 80 Unicode code points before sending a profile request", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(updateSumiProfile("🌙".repeat(81))).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("compensates a committed terminal flow before surfacing status failure", async () => {

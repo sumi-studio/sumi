@@ -30,6 +30,9 @@ pub fn is_retryable(message: &AssistantMessage) -> bool {
         }
         _ => {}
     }
+    if let Some(retryable) = classify_opencode_go_console_400(message) {
+        return retryable;
+    }
     let Some(error) = message.error_message.as_deref() else {
         return false;
     };
@@ -37,6 +40,43 @@ pub fn is_retryable(message: &AssistantMessage) -> bool {
         return false;
     }
     retryable_patterns().is_match(error)
+}
+
+/// OpenCode Go's Console proxy can surface a selected upstream's transient
+/// failure as an HTTP 400. Console intentionally does not retry generic 400s,
+/// so keep this exception pinned to the exact observed envelope instead of
+/// teaching the generic classifier that bad requests are transient.
+fn classify_opencode_go_console_400(message: &AssistantMessage) -> Option<bool> {
+    if message.provider != "opencode-go"
+        || message.origin.protocol != super::types::ApiProtocol::OpenAiChatCompletions
+        || message.provider_code.as_deref() != Some("http_400")
+    {
+        return None;
+    }
+
+    let Some(body) = message
+        .error_message
+        .as_deref()
+        .and_then(|error| error.strip_prefix("400: "))
+    else {
+        return Some(false);
+    };
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Some(false);
+    };
+    let Some(error) = envelope.get("error").and_then(serde_json::Value::as_object) else {
+        return Some(false);
+    };
+
+    Some(
+        error.get("message").and_then(serde_json::Value::as_str)
+            == Some("Error from provider (Console Go): Upstream request failed")
+            && error.get("type").and_then(serde_json::Value::as_str)
+                == Some("invalid_request_error")
+            && error.get("code").and_then(serde_json::Value::as_str)
+                == Some("invalid_request_error")
+            && error.get("param").is_some_and(serde_json::Value::is_null),
+    )
 }
 
 pub(crate) fn retryable_machine_code(code: &str) -> bool {
@@ -298,6 +338,109 @@ mod tests {
             assert!(
                 !is_retryable(&error_with_code(terse_display, Some(code))),
                 "near-match code {code} must not become retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retries_only_the_exact_opencode_go_console_upstream_400() {
+        const EXACT: &str = concat!(
+            "400: {\"error\":{",
+            "\"message\":\"Error from provider (Console Go): Upstream request failed\",",
+            "\"type\":\"invalid_request_error\",",
+            "\"param\":null,",
+            "\"code\":\"invalid_request_error\"}}"
+        );
+        let mut message = error_with_code(EXACT, Some("http_400"));
+        message.provider = "opencode-go".to_owned();
+        assert!(is_retryable(&message));
+
+        message.error_message = Some(
+            concat!(
+                "400: {\n  \"error\": {",
+                "\n    \"code\": \"invalid_request_error\",",
+                "\n    \"param\": null,",
+                "\n    \"message\": \"Error from provider (Console Go): Upstream request failed\",",
+                "\n    \"type\": \"invalid_request_error\"\n  }\n}"
+            )
+            .to_owned(),
+        );
+        assert!(
+            is_retryable(&message),
+            "JSON whitespace and key order are not semantic"
+        );
+
+        let exact = message.clone();
+        let mut near_misses = Vec::new();
+
+        let mut wrong_provider = exact.clone();
+        wrong_provider.provider = "kimi".to_owned();
+        near_misses.push(("provider", wrong_provider));
+
+        let mut wrong_protocol = exact.clone();
+        wrong_protocol.origin.protocol = ApiProtocol::OpenAiResponses;
+        near_misses.push(("protocol", wrong_protocol));
+
+        let mut wrong_status = exact.clone();
+        wrong_status.provider_code = Some("http_401".to_owned());
+        near_misses.push(("status", wrong_status));
+
+        let mut raw_json_without_transport_status = exact.clone();
+        raw_json_without_transport_status.error_message = raw_json_without_transport_status
+            .error_message
+            .as_deref()
+            .and_then(|error| error.strip_prefix("400: "))
+            .map(str::to_owned);
+        near_misses.push(("transport prefix", raw_json_without_transport_status));
+
+        for (field, replacement) in [
+            (
+                "message",
+                "Error from provider (Console Go): Upstream request failed.",
+            ),
+            ("type", "server_error"),
+            ("code", "server_error"),
+        ] {
+            let mut changed = exact.clone();
+            let mut body: serde_json::Value = serde_json::from_str(
+                changed
+                    .error_message
+                    .as_deref()
+                    .expect("error")
+                    .strip_prefix("400: ")
+                    .expect("transport prefix"),
+            )
+            .expect("fixture JSON");
+            body["error"][field] = serde_json::Value::String(replacement.to_owned());
+            changed.error_message = Some(format!("400: {body}"));
+            near_misses.push((field, changed));
+        }
+
+        let mut missing_param = exact.clone();
+        let mut body: serde_json::Value = serde_json::from_str(
+            missing_param
+                .error_message
+                .as_deref()
+                .expect("error")
+                .strip_prefix("400: ")
+                .expect("transport prefix"),
+        )
+        .expect("fixture JSON");
+        body["error"]
+            .as_object_mut()
+            .expect("error object")
+            .remove("param");
+        missing_param.error_message = Some(format!("400: {body}"));
+        near_misses.push(("param", missing_param));
+
+        let mut non_error = exact;
+        non_error.stop_reason = StopReason::Stop;
+        near_misses.push(("stop reason", non_error));
+
+        for (difference, message) in near_misses {
+            assert!(
+                !is_retryable(&message),
+                "near-match {difference} must remain terminal"
             );
         }
     }

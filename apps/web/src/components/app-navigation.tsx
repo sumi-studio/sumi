@@ -9,11 +9,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@sumi/ui/components/tooltip";
+import { useNavigate } from "@tanstack/react-router";
 import {
   Check,
   ChevronRight,
   LogOut,
-  MessageCircle,
   Monitor,
   Moon,
   Palette,
@@ -22,9 +22,12 @@ import {
   UserRound,
 } from "lucide-react";
 import type { ComponentType, ReactElement } from "react";
-import { useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
+import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
+import { refreshMessagingMemberProfiles } from "../messaging/store";
+import { LOCAL_APP_DESCRIPTORS } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
 const THEME_OPTIONS: Array<{
@@ -38,24 +41,34 @@ const THEME_OPTIONS: Array<{
 ];
 
 /**
- * Only the working Talk surface is exposed. Future shared-workspace apps should
- * appear here when they have real product routes, not as local demo state.
+ * direct chat（直通）画面のレール。アプリ一覧はshell/app-descriptorsの
+ * local providerから描画し、ホーム（メッセージング）へ戻れる。
  */
 export function AppNavigation() {
+  const navigate = useNavigate();
   return (
     <aside className="app-sidebar flex h-dvh w-12 shrink-0 flex-col overflow-clip">
       <nav className="flex flex-col gap-1 px-1 py-2" aria-label="Sumi">
-        <NavigationTooltip label="トーク">
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="トーク"
-            aria-current="page"
-            className="size-10 bg-interactive-active"
-          >
-            <MessageCircle className="size-4" />
-          </Button>
-        </NavigationTooltip>
+        {LOCAL_APP_DESCRIPTORS.map((app) => {
+          const Icon = app.icon;
+          const active = app.id === "direct";
+          return (
+            <NavigationTooltip key={app.id} label={app.label}>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={app.label}
+                aria-current={active ? "page" : undefined}
+                onClick={
+                  active ? undefined : () => void navigate({ to: app.route })
+                }
+                className={`size-10 ${active ? "bg-interactive-active" : ""}`}
+              >
+                <Icon className="size-4" />
+              </Button>
+            </NavigationTooltip>
+          );
+        })}
       </nav>
       <div className="mt-auto px-2 pb-3">
         <SettingsPopover />
@@ -64,9 +77,17 @@ export function AppNavigation() {
   );
 }
 
-function SettingsPopover() {
-  const { authenticated, user, logout } = useAuth();
+export function SettingsPopover() {
+  const { authenticated, user, logout, updateDisplayName } = useAuth();
   const [logoutError, setLogoutError] = useState<string | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const [displayName, setDisplayName] = useState("");
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  useEffect(() => {
+    setDisplayName(user?.displayName ?? "");
+  }, [user?.displayName]);
 
   const handleLogout = async () => {
     setLogoutError(null);
@@ -76,6 +97,40 @@ function SettingsPopover() {
       setLogoutError("ログアウトを完了できませんでした。");
     }
   };
+
+  const handleProfileSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const nextDisplayName = displayName.trim();
+    if (
+      !nextDisplayName ||
+      Array.from(nextDisplayName).length > 80 ||
+      nextDisplayName === user?.displayName
+    ) {
+      return;
+    }
+    setProfileError(null);
+    setProfileNotice(null);
+    setSavingProfile(true);
+    try {
+      await updateDisplayName(nextDisplayName);
+      try {
+        await refreshMessagingMemberProfiles();
+      } catch {
+        setProfileNotice("保存済み。トークの表示は再読み込みで反映されます。");
+      }
+    } catch (error) {
+      setProfileError(
+        error instanceof SumiProfileUpdateIndeterminateError
+          ? "更新結果を確認できませんでした。再読み込みしてください。"
+          : "表示名を更新できませんでした。",
+      );
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const displayNameCodePoints = Array.from(displayName.trim()).length;
+  const displayNameTooLong = displayNameCodePoints > 80;
 
   return (
     <Popover>
@@ -104,9 +159,60 @@ function SettingsPopover() {
             <div className="flex items-center gap-2 px-2.5 py-2 text-sm">
               <UserRound className="size-4 shrink-0" />
               <span className="max-w-44 truncate">
-                {user?.displayName ?? user?.email ?? user?.id ?? "アカウント"}
+                {user?.displayName ?? "アカウント"}
               </span>
             </div>
+            <form
+              onSubmit={(event) => void handleProfileSubmit(event)}
+              className="px-2.5 pb-2"
+            >
+              <label
+                htmlFor="sumi-settings-display-name"
+                className="mb-1 block text-muted-foreground text-xs"
+              >
+                表示名
+              </label>
+              <div className="flex gap-1.5">
+                <input
+                  id="sumi-settings-display-name"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  disabled={user?.displayName === null}
+                  maxLength={160}
+                  aria-invalid={displayNameTooLong || undefined}
+                  autoComplete="name"
+                  className="min-w-0 flex-1 rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={
+                    savingProfile ||
+                    user?.displayName === null ||
+                    !displayName.trim() ||
+                    displayNameTooLong ||
+                    displayName.trim() === user?.displayName
+                  }
+                >
+                  {savingProfile ? "保存中" : "保存"}
+                </Button>
+              </div>
+              {profileError ? (
+                <p role="alert" className="mt-1 text-red-600 text-xs">
+                  {profileError}
+                </p>
+              ) : null}
+              {displayNameTooLong ? (
+                <p role="alert" className="mt-1 text-red-600 text-xs">
+                  表示名は1〜80文字で入力してください。
+                </p>
+              ) : null}
+              {profileNotice ? (
+                <p role="status" className="mt-1 text-muted-foreground text-xs">
+                  {profileNotice}
+                </p>
+              ) : null}
+            </form>
             <ProviderSettings humanId={user?.id ?? ""} />
             <Button
               variant="ghost"

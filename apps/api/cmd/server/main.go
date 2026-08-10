@@ -26,6 +26,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	"golang.org/x/sys/unix"
@@ -217,6 +218,16 @@ type application struct {
 	closeErr      error
 }
 
+type browserSessionConnectionClosers []agentevents.BrowserSessionConnectionCloser
+
+func (closers browserSessionConnectionClosers) CloseBrowserSession(sessionID string) {
+	for _, closer := range closers {
+		if closer != nil {
+			closer.CloseBrowserSession(sessionID)
+		}
+	}
+}
+
 func (a *application) Close() error {
 	if a == nil {
 		return nil
@@ -287,6 +298,7 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, fmt.Errorf("control-plane database: %w", err)
 	}
 	var databasePool *pgxpool.Pool
+	var messagingServer *messaging.Server
 	if database != nil {
 		databasePool = database.Pool
 	}
@@ -316,13 +328,49 @@ func newApplicationFromEnv() (*application, error) {
 		}
 	}
 	if authEnabled {
-		authServer.Connections = browser
 		authServer.RegisterRoutes(mux)
+		if database != nil {
+			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
+		}
+	}
+	// The /messaging surface requires the control-plane database. Without a
+	// session verifier the routes stay mounted but fail closed (401), matching
+	// the direct-chat browser routes. sv is a concrete pointer, so guard the
+	// nil before it becomes a non-nil interface.
+	var messagingWS *messaging.WSServer
+	if database != nil {
+		var messagingSessions agentevents.UserSessionAuthorizer
+		if sv != nil {
+			messagingSessions = sv
+		}
+		messagingStore := messaging.New(database.Pool)
+		messagingHub := messaging.NewHub(messagingStore)
+		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
+		messagingServer.AllowedOrigins = browserOrigins
+		messagingServer.Hub = messagingHub
+		messagingServer.RegisterRoutes(mux)
+		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
+		messagingWS.AllowedOrigins = browserOrigins
+		mux.Handle("GET /messaging/ws", messagingWS)
+		log.Print("messaging routes ready (REST + WS)")
+	}
+	if authEnabled {
+		closers := browserSessionConnectionClosers{browser}
+		if messagingWS != nil {
+			closers = append(closers, messagingWS)
+		}
+		authServer.Connections = closers
 	}
 	localControl, enabled, err := localControlServerFromEnvWithDB(runtime, databasePool)
 	if err != nil {
 		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
+	}
+	if localControl != nil && messagingServer != nil {
+		if err := messagingServer.RegisterLocalControlRoutes(localControl); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("register messaging local control routes: %w", err)
+		}
 	}
 	localListener, err := localControlListenerFromEnv(enabled)
 	if err != nil {

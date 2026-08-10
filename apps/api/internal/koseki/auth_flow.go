@@ -69,6 +69,7 @@ type AuthFlow struct {
 	HumanID                 string
 	AgentID                 string
 	VerifiedProviderSubject string
+	VerifiedDisplayName     string
 	ExpiresAt               time.Time
 }
 
@@ -78,6 +79,7 @@ type VerifiedIdentity struct {
 	EmailVerified   bool
 	SignInProvider  string
 	ProviderSubject string
+	DisplayName     string
 }
 
 // NormalizeEmail canonicalizes the email value used only to bind a magic-link
@@ -261,6 +263,9 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 		}
 		switch {
 		case flow.Intent == IntentSignIn && exists:
+			if err := seedHumanDisplayNameTx(ctx, tx, humanID, identity.DisplayName); err != nil {
+				return AuthFlow{}, fmt.Errorf("seed returning Human display name: %w", err)
+			}
 			if flow.Channel == ChannelProvider {
 				if err := syncVerifiedProviderTx(ctx, tx, humanID, flow.ExpectedProvider, identity.ProviderSubject, "provider_sign_in"); err != nil {
 					return AuthFlow{}, err
@@ -273,18 +278,23 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 			flow.ConfirmationAction = ActionCreateAccount
 			flow.Status = "confirmation_required"
 			flow.VerifiedProviderSubject = identity.ProviderSubject
+			flow.VerifiedDisplayName = initialHumanDisplayName(identity.DisplayName)
 			_, err = tx.Exec(ctx, `UPDATE auth_flows SET status='confirmation_required',
-				confirmation_action=$2, firebase_uid=$3, provider_subject=NULLIF($4,''), proved_at=now() WHERE flow_id=$1`,
-				flow.FlowID, flow.ConfirmationAction, firebaseUID, identity.ProviderSubject)
+				confirmation_action=$2, firebase_uid=$3, provider_subject=NULLIF($4,''),
+				verified_display_name=NULLIF($5,''), proved_at=now() WHERE flow_id=$1`,
+				flow.FlowID, flow.ConfirmationAction, firebaseUID, identity.ProviderSubject, flow.VerifiedDisplayName)
 		case flow.Intent == IntentSignUp && exists:
 			flow.ConfirmationAction = ActionSignIn
 			flow.Status = "confirmation_required"
 			flow.HumanID, flow.AgentID = humanID, agentID
 			flow.VerifiedProviderSubject = identity.ProviderSubject
+			flow.VerifiedDisplayName = initialHumanDisplayName(identity.DisplayName)
 			_, err = tx.Exec(ctx, `UPDATE auth_flows SET status='confirmation_required',
 				confirmation_action=$2, firebase_uid=$3, human_id=$4,
-				personality_agent_id=$5, provider_subject=NULLIF($6,''), proved_at=now() WHERE flow_id=$1`,
-				flow.FlowID, flow.ConfirmationAction, firebaseUID, humanID, agentID, identity.ProviderSubject)
+				personality_agent_id=$5, provider_subject=NULLIF($6,''),
+				verified_display_name=NULLIF($7,''), proved_at=now() WHERE flow_id=$1`,
+				flow.FlowID, flow.ConfirmationAction, firebaseUID, humanID, agentID,
+				identity.ProviderSubject, flow.VerifiedDisplayName)
 		}
 		if err != nil {
 			return AuthFlow{}, err
@@ -304,10 +314,16 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 			if exists {
 				return AuthFlow{}, ErrCredentialAlreadyBound
 			}
-			flow, err = s.provisionFromFlow(ctx, tx, flow, VerifiedIdentity{FirebaseUID: firebaseUID, SignInProvider: flow.ExpectedProvider, ProviderSubject: flow.VerifiedProviderSubject})
+			flow, err = s.provisionFromFlow(ctx, tx, flow, VerifiedIdentity{
+				FirebaseUID: firebaseUID, SignInProvider: flow.ExpectedProvider,
+				ProviderSubject: flow.VerifiedProviderSubject, DisplayName: flow.VerifiedDisplayName,
+			})
 		} else {
 			if !exists {
 				return AuthFlow{}, ErrAuthProofMismatch
+			}
+			if err := seedHumanDisplayNameTx(ctx, tx, humanID, flow.VerifiedDisplayName); err != nil {
+				return AuthFlow{}, fmt.Errorf("seed confirmed Human display name: %w", err)
 			}
 			if flow.Channel == ChannelProvider {
 				if err := syncVerifiedProviderTx(ctx, tx, humanID, flow.ExpectedProvider, flow.VerifiedProviderSubject, "provider_sign_in"); err != nil {
@@ -333,12 +349,14 @@ func scanAuthFlowForUpdate(ctx context.Context, tx pgx.Tx, flowID string, nonceH
 		COALESCE(normalized_email, ''), continuation, status,
 		COALESCE(confirmation_action, ''), COALESCE(terminal_outcome, ''),
 		COALESCE(human_id::text, ''), COALESCE(personality_agent_id::text, ''),
-		expires_at, COALESCE(firebase_uid, ''), COALESCE(provider_subject, '') FROM auth_flows
+		expires_at, COALESCE(firebase_uid, ''), COALESCE(provider_subject, ''),
+		COALESCE(verified_display_name, '') FROM auth_flows
 		WHERE flow_id=$1 AND nonce_hash=$2 FOR UPDATE`, flowID, nonceHash).Scan(
 		&flow.FlowID, &flow.Intent, &flow.Channel, &flow.ExpectedProvider,
 		&flow.NormalizedEmail, &flow.Continuation, &flow.Status,
 		&flow.ConfirmationAction, &flow.TerminalOutcome, &flow.HumanID,
-		&flow.AgentID, &flow.ExpiresAt, &firebaseUID, &flow.VerifiedProviderSubject)
+		&flow.AgentID, &flow.ExpiresAt, &firebaseUID, &flow.VerifiedProviderSubject,
+		&flow.VerifiedDisplayName)
 	return flow, firebaseUID, err
 }
 
@@ -379,11 +397,12 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	if err != nil {
 		return AuthFlow{}, err
 	}
+	displayName := initialHumanDisplayName(identity.DisplayName)
 	statements := []struct {
 		query string
 		args  []any
 	}{
-		{"INSERT INTO humans (human_id) VALUES ($1)", []any{humanID}},
+		{"INSERT INTO humans (human_id, display_name) VALUES ($1, COALESCE(NULLIF($2, ''), 'Sumi'))", []any{humanID, displayName}},
 		{"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)", []any{agentID, humanID}},
 		{"INSERT INTO employments (agent_id, employer_type, employer_id) VALUES ($1, $2, $3)", []any{agentID, EmployerHuman, humanID}},
 		{"INSERT INTO agent_secrets (personality_agent_id, wrapping_key_id, wrapping_key) VALUES ($1, $2, $3)", []any{agentID, wrappingKeyID, wrappingKey}},

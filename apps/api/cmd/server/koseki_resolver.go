@@ -40,6 +40,9 @@ func (r *kosekiIdentityBindingResolver) ResolveIdentity(
 	}
 	humanID, err := r.store.ResolveCredential(ctx, r.provider, identity.UID)
 	if err == nil {
+		if err := r.store.SeedHumanDisplayName(ctx, humanID, identity.DisplayName); err != nil {
+			return agentevents.UserSessionClaims{}, fmt.Errorf("seed Human display name: %w", err)
+		}
 		agentID, aerr := r.store.AgentForHuman(ctx, humanID)
 		if aerr != nil {
 			return agentevents.UserSessionClaims{}, fmt.Errorf("resolve secretary for human %s: %w", humanID, aerr)
@@ -50,7 +53,7 @@ func (r *kosekiIdentityBindingResolver) ResolveIdentity(
 		return agentevents.UserSessionClaims{}, fmt.Errorf("lookup credential: %w", err)
 	}
 	// Unbound credential: auto-register (first-login self-serve signup).
-	reg, err := r.store.AutoRegister(ctx, r.provider, identity.UID)
+	reg, err := r.store.AutoRegisterWithDisplayName(ctx, r.provider, identity.UID, identity.DisplayName)
 	if err != nil {
 		return agentevents.UserSessionClaims{}, fmt.Errorf("auto-register credential: %w", err)
 	}

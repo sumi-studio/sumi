@@ -1,5 +1,5 @@
 pub const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
-pub const SYSTEM_PROMPT_VERSION: &str = "1";
+pub const SYSTEM_PROMPT_VERSION: &str = "2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactPrompt {

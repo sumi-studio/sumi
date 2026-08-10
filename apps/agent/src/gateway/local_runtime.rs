@@ -35,12 +35,20 @@ use super::supervisor::seams::T17HydrationLatch;
 use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
+use crate::apiclient::messaging::{
+    MessagingApi, OpenMessagingPlaceRequest, ReadMessagingThroughRequest,
+    WriteMessagingMessageRequest,
+};
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 use crate::store::HydrationReceiptIdentity;
 
 pub(crate) const LOCAL_AGENT_AUDIENCE: &str = "sumi:agent:events";
 const MAX_LOCAL_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
+// A messaging screen may contain up to fifty full messages plus its member
+// list. Keep that cohesive response bounded independently without widening the
+// credential and runtime-state control-plane boundary above.
+const MAX_MESSAGING_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOCAL_CONTROL_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
@@ -272,6 +280,20 @@ impl LocalControlHttpClient {
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
     {
+        self.post_json_bounded(path, body, MAX_LOCAL_CONTROL_RESPONSE_BYTES)
+            .await
+    }
+
+    async fn post_json_bounded<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
         self.credential
             .validate_at(&self.authority, SystemTime::now())?;
         let (http, unix_endpoint) = match &self.transport {
@@ -312,7 +334,7 @@ impl LocalControlHttpClient {
         }
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_LOCAL_CONTROL_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > max_response_bytes as u64)
         {
             bail!("local control response exceeds bounded size");
         }
@@ -320,7 +342,7 @@ impl LocalControlHttpClient {
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read local control response")?;
-            if body.len().saturating_add(chunk.len()) > MAX_LOCAL_CONTROL_RESPONSE_BYTES {
+            if body.len().saturating_add(chunk.len()) > max_response_bytes {
                 bail!("local control response exceeds bounded size");
             }
             body.extend_from_slice(&chunk);
@@ -450,6 +472,40 @@ impl LocalControlPlane for LocalControlHttpClient {
         )
         .map_err(LocalPublicationError::terminal)?;
         self.post_runtime_state(&publication).await
+    }
+}
+
+#[async_trait]
+impl MessagingApi for LocalControlHttpClient {
+    async fn overview(&self) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:overview",
+            &serde_json::json!({}),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:open",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:write", &request)
+            .await
+    }
+
+    async fn read_through(
+        &self,
+        request: ReadMessagingThroughRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:read-through", &request)
+            .await
     }
 }
 
@@ -2470,6 +2526,83 @@ mod tests {
     struct HttpFixtureState {
         expected_authorization: String,
         publications: Arc<StdMutex<Vec<LocalRuntimeStatePublication>>>,
+    }
+
+    async fn bounded_json_fixture(State(payload_bytes): State<usize>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "messages": [{"content": "x".repeat(payload_bytes)}]
+        }))
+    }
+
+    async fn response_limit_fixture(
+        payload_bytes: usize,
+    ) -> (LocalControlHttpClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:open",
+                post(bounded_json_fixture),
+            )
+            .route("/default", post(bounded_json_fixture))
+            .with_state(payload_bytes);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn messaging_open_has_a_dedicated_response_bound_without_widening_control_responses() {
+        let payload_bytes = MAX_LOCAL_CONTROL_RESPONSE_BYTES + 1024;
+        let (client, server) = response_limit_fixture(payload_bytes).await;
+        let response = client
+            .open(OpenMessagingPlaceRequest {
+                place_id: "01900000-0000-7000-8000-000000000002",
+                before_seq: None,
+                limit: Some(20),
+            })
+            .await
+            .expect("messaging screen larger than 64 KiB remains readable");
+        assert_eq!(
+            response["messages"][0]["content"].as_str().unwrap().len(),
+            payload_bytes
+        );
+
+        let error = client
+            .post_json::<_, serde_json::Value>("/default", &serde_json::json!({}))
+            .await
+            .expect_err("non-messaging local control responses remain capped at 64 KiB");
+        assert!(error.to_string().contains("exceeds bounded size"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_open_rejects_a_response_above_its_dedicated_bound() {
+        let (client, server) = response_limit_fixture(MAX_MESSAGING_RESPONSE_BYTES + 1).await;
+        let error = client
+            .open(OpenMessagingPlaceRequest {
+                place_id: "01900000-0000-7000-8000-000000000002",
+                before_seq: None,
+                limit: Some(50),
+            })
+            .await
+            .expect_err("messaging responses must remain bounded");
+        assert!(error.to_string().contains("exceeds bounded size"));
+        server.abort();
     }
 
     async fn issue_http_fixture(

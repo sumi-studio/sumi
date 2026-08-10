@@ -55,6 +55,12 @@ type UserSessionClaims struct {
 	authorityBindingID string
 }
 
+// BrowserSessionID exposes the opaque lifecycle identifier to in-process
+// transports that must register live connections for eager revocation. It is
+// not an authorization credential; every sensitive operation must still pass
+// through AuthorizeSession.
+func (c UserSessionClaims) BrowserSessionID() string { return c.sessionID }
+
 // UserSessionVerifier validates the signed HttpOnly browser session cookie.
 // The Firebase exchange control-plane issues this format server-side.
 type UserSessionVerifier interface {

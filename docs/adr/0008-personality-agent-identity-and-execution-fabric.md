@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-28
+- Last amended: 2026-08-10
 - Amends:
   - [ADR 0002](0002-agent-stack.md)
   - [ADR 0004](0004-agent-local-platform-support.md)
@@ -36,7 +37,7 @@ toolやAI harnessは本人が意思を持って利用する道具である。
 これはanthropomorphicなUI表現や、実装後に付与するpersona metadataではない。
 人格agentを誰かから呼びかけられ、出来事を経験し、複数の約束を抱え、注意を
 向け、判断し、行為し、その帰結と共に生き続ける一人の主体として設計するという
-domain ontologyである。session、memory、VM、tool、権限、lifecycleを先に
+domain ontologyである。single thread、memory、VM、tool、権限、lifecycleを先に
 serviceとして設計してから、owner fieldへagent名を足すことでは実現できない。
 
 `run`、`turn`、tool execution、terminal process、将来本人が利用するAI harnessは、
@@ -117,7 +118,7 @@ parallel workerへfan-outしたり、本人に代わって複数の約束の意�
 Sumi
 ├── PersonalityAgent 0..N
 │   ├── PersonalityAgentId 1
-│   ├── one continuous agent session
+│   ├── one continuous single thread
 │   ├── one canonical life log
 │   ├── one logical direct-address backend surface
 │   ├── one private Agent VM / private work environment
@@ -133,14 +134,14 @@ Sumi
 ```
 
 `PersonalityAgentMembership`は、Workspaceからglobalな本人を参照するmutableな
-relationであり、本人、session、life log、VMをWorkspaceごとに複製しない。
+relationであり、本人、single thread、life log、VMをWorkspaceごとに複製しない。
 membershipのcardinality、workflow、storageは今回実装しない。
 
 `PersonalityAgentId`は本人をsystem内で一意に識別する正本identityであり、
 人間が本人を呼ぶ名前でも、すべてのscopeへ露出するrouteでもない。
 human-facing nameはmutableかつ同名を許し、Workspace membershipごとのnicknameや
 表示名も持ち得る。scope-local addressは認証済みlookupを通して
-`PersonalityAgentId`へ解決する交換可能な参照であり、本人、session、life logの
+`PersonalityAgentId`へ解決する交換可能な参照であり、本人、single thread、life logの
 identityにはしない。名前やaddressの変更で本人を作り直さず、認可を名前の
 一意性や`PersonalityAgentId`の秘匿性へ依存させない。
 
@@ -152,6 +153,42 @@ public route contractとしたりしない。name、membership、scope-local add
 
 `Sumi Workspace`は共有のproduct/domain resourceである。各人格agentの
 private VMはWorkspaceそのものではなく、agentの私物PCに相当する。
+
+Workspaceに`personal | organization`のkindは置かない。personalは、一人のHumanと
+そのHumanが明示的に参加させた人格agentだけがいる通常のWorkspaceという
+縮退トポロジである。参加者が増えたり将来Organizationとrelationを持ったりしても
+Workspaceの種類やidentityを変換しない。billing、SSO、organization policyは
+Workspace kindではなく、必要になった時に明示的なrelation / policyとして追加する。
+
+appの所属先は次の和型で表し、全appをWorkspaceに押し込まない。
+
+```text
+AppInstallationOwnerRef = Workspace(WorkspaceId) | Participant(ParticipantRef)
+```
+
+Messagingのような共有appはWorkspaceに、alarm・Direct Chat・個人のlife logのような
+personal appはParticipantにinstallする。appのcanonical descriptorは使えるowner kindを
+明示し、client都合で別scopeへ推測・複製しない。両scopeを持つappは、
+Workspace installationとParticipant installationを別recordとして持つ。
+
+`AppInstallationOwnerRef`はinstallation・config・lifecycleを束縛するownerであり、
+app内の全data resourceのownerやauthorization principalを上書きしない。たとえば
+Direct Chatのmessage、参加者、可視性はDirect Chat自身のdomain contractに従う。
+
+install / enable / disable / uninstallは`AppInstallationOwnerRef`を受ける同じdomain
+operationとauthorization ruleにする。HumanとPersonalityAgentに別operationを作らず、
+transportだけをUIとtool/APIで変える。同じoperationは同じ権限を無条件に与える意味ではなく、
+appはactorのmembership・role・owner relationを同じcommit時認可で評価する。disableは
+entry surfaceとbackground activityを停める可逆操作で、dataとinstallation recordは保持する。
+uninstallはinstallation bindingを外すが、
+app dataの消去やretention、credential・permission grantの取消はapp所有の明示的な別operationとし、
+uninstallの暗黙の副作用にしない。
+
+現行Webの`AppDescriptor`はUI projectionであり、このinstallation lifecycleや
+owner bindingの正本ではない。canonical app catalog / descriptor、installation正本、
+config、credential、permission grantの実装は別incrementで行うが、そこでこのowner和型と
+Human / Agent parityを崩さない。appのenable/disableはWorkspace・Participant・place・
+provenance・notification intent・membership / roleといった共通spineのidentityを切断しない。
 
 人格agent同士の協働は同じVMへ入ることではなく、Workspace上の共有resource、
 会話、task、権限付きaction、明示的なdelegationを通して行う。
@@ -224,29 +261,29 @@ transfer、recovery ceremony自体は今回実装しない。AADのowner成分�
 schema versionとimmutableなevent-time provenanceのcryptographic integrityは
 維持する。current membershipから過去rowのAADを再構成しない。
 
-人格agentには一つの連続したagent sessionがある。そのsessionで経験した
-direct chat、Workspace由来の出来事、判断、actionがagentの人生ログになる。
+人格agentは一人の本人として一つの連続したsingle threadを生きる。その人が経験した
+direct chat、Workspace由来の出来事、判断、actionがcanonical life logになる。
 初期のfrontend chatは内部ログviewerではなく、人間がそのagent本人へ直接
 話しかける可視の正面入口である。これは唯一のfrontend UIであることを意味しない。
 web、mobile、voiceその他の複数entry pointが、同じlogical direct-address
-backend surfaceを通して同じ本人とagent sessionへ接続できる。
+backend surfaceを通して同じ本人へ接続できる。
 
-この唯一性はdatabase keyのcardinalityだけを意味しない。agent sessionは
-人格agent本人が出来事を経験し判断し続ける場所であり、exchangeable workerの
-poolではない。複数の独立model continuationを同じ人格として同時に起動し、
+このsingle threadはdatabase keyやruntime actorのcardinalityだけを意味しない。
+人格agent本人が出来事を経験し判断し続ける時間であり、exchangeable workerの
+poolや長寿命のconversation containerではない。複数の独立model continuationを同じ人格として同時に起動し、
 事後的に人生ログを結合して並行性を得ない。
 
 一方、一人のagentが複数の呼びかけ、約束、保留中の仕事、進行中の外部actionを
 持つことはできる。外部processは並行して進み得るが、新しい呼びかけ、注意の
-変更、判断、actionの結果は同じagent sessionへ戻り、その人の一つの経験になる。
+変更、判断、actionの結果は同じ本人のsingle threadへ戻り、その人の一つの経験になる。
 現行Rustのsingle-active-runはこのproduct ontologyそのものではない。
 複数入力の知覚、acknowledgement、interrupt、defer、resume、attentionと
 life-log orderingは[#87](https://github.com/sumi-studio/sumi/issues/87)で設計し、
-人格複製や別conversation sessionを解決策にしない。
+人格複製や別continuationを解決策にしない。
 
-人格agentはWorkspace内の場所ごとに別sessionを持たない。後続のtask、
+人格agentをWorkspace内の場所ごとに別人格・別continuationとして表現しない。後続のtask、
 mail、calendar、app等は、source/resource/actor/correlation metadataを伴って
-同じagent sessionへ入り、同じ人格agentが各surfaceへ作用する。
+同じ本人へ届き、同じ人格agentが各surfaceへ作用する。
 
 公開contractに独立した交換可能な`ConversationId`を持たせない。frontendは、
 human-facing nameとtarget identityを別に扱う。将来のscope-local addressは
@@ -356,7 +393,15 @@ process epochを識別する。VM boot、runtime generation、RPC process boot�
 同一視しない。同じRPC endpointへ到達できることを本人の個別action authorityと
 みなさない。T26は後続のauthority verifierを差し込める明示的なseamを保つ。
 exact action、scope、audience、lifetime、idempotencyへ束縛する具体contractは
-[#77](https://github.com/sumi-studio/sumi/issues/77)へ延期する。
+[#77](https://github.com/sumi-studio/sumi/issues/77)で実装する。その意味論は
+[ADR 0013](0013-tool-invocation-routes-and-authority-provenance.md)に従い、
+人格agent自身のauthorityで行う`Normal`と、認証済みHumanのaccount/authorityを
+exact call一件だけ借りるauthority provenanceを混同しない。
+
+`Elevated`はauthority sourceの名称ではなく、agentがHumanの明示判断を求めるrouteである。
+Humanがagent自身のcapabilityによる実行へ一回同意する場合と、Human accountを本当に
+exact call一件だけ委ねる場合をprovenanceで区別する。人格agentに権限lifetimeとして
+使える長寿命の会話境界は存在しない。Human-account grantはexact call一件へだけ束縛する。
 
 この延期は、一体のtrusted personality-agent runtimeだけがexecutorを呼び、
 subagent、AI harness、その他のcomponentへendpoint credentialを渡さないcurrent
@@ -485,9 +530,10 @@ resultを保存できる。
 - subagent lifecycle、delegation、result collection、`ExecutionPrincipal` sum
   typeはT26 completionに含めない。人格agent本人をworker-poolの一variantや
   必須proxyのclientとして実装しない。
-- #77のper-call authority modelの完全実装もT26 completionに含めない。
-  RPC lifecycle identityをaction authorityとみなさず、後続verifierのseamだけを
-  保つ。
+- #77のper-call authority verifierの完全実装もT26 completionに含めない。
+  ただしADR 0013の`Normal | Elevated` route、Human one-shot authority、effect前の
+  provenance永続化を後続で実装できるseamを保ち、RPC lifecycle identityをaction
+  authorityとみなさない。
 - full PTY実装もT26 completionの自動条件にしない。現行Bashを人格agent本人の
   shell ontology全体として正典化せず、#79/#82の後続拡張を妨げない。
 
@@ -508,7 +554,7 @@ resultを保存できる。
   global public addressにしない。
 - browserで認証済みのhuman actorをcommand append時に捨てず、#78のprovenanceへ
   束縛する。
-- UI chatが、同じagent sessionへ届くlogical direct-address backend surfaceの
+- UI chatが、同じ本人へ届くlogical direct-address backend surfaceの
   一つのfrontend entry pointであることをRust → Go → browserのrepresentative
   journeyで証明する。
 
@@ -542,10 +588,10 @@ deletionを分離できないため採用しない。
 Sumi Workspaceの共有をfilesystem共有へ還元し、人格agentごとのprivate PCと
 権限境界を失うため採用しない。
 
-### 人格agentごとの複数conversation session
+### 場所ごとに人格・continuationを分割する
 
-場所ごとに人格・時間・memoryを分断する。人格agentは一つのagent sessionに
-継続し、各Workspace surfaceへ同じ個体が現れるため採用しない。
+場所ごとに人格・時間・memoryを分断する。人格agentは一人として一つのsingle threadを
+生き、各Workspace surfaceへ同じ本人が現れるため採用しない。
 
 ### 同じ人格の独立continuationを並列起動する
 
@@ -594,10 +640,10 @@ agent deathとして扱う。
 
 このADRのreviewでは、実装詳細より次を確認する。
 
-1. runtimeやowner labelではなく、一人の主体からidentity、session、memory、
+1. runtimeやowner labelではなく、一人の主体からidentity、single thread、memory、
    action、VM、lifecycleが導かれているか。
-2. `PersonalityAgentId`、human-facing name／scope-local address、唯一のagent
-   session、人生ログ、logical direct-address backend surfaceの関係。
+2. `PersonalityAgentId`、human-facing name／scope-local address、single thread、
+   canonical life log、logical direct-address backend surfaceの関係。
 3. globalな人格identityと、mutableなtenant／Workspace／org membershipを
    混同せず、global IDの公開を強制せずにfuture mobilityを妨げないcurrent
    boundary。

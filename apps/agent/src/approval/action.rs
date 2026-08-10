@@ -140,6 +140,28 @@ impl CanonicalAction {
                     justification: None,
                 }
             }
+            "messaging" => {
+                let operation = get_string(map, tool_name, "action")?;
+                let permission = match operation.as_str() {
+                    "overview" | "open" => Permission::ReadDomain,
+                    "write" => Permission::DomainMutation,
+                    _ => {
+                        return Err(ActionError::InvalidAction("unknown messaging operation"));
+                    }
+                };
+                Self {
+                    tool: tool_name.to_owned(),
+                    operation: operation.clone(),
+                    // Message content is intentionally absent from the
+                    // canonical argv/review projection.
+                    argv: vec![tool_name.to_owned(), operation],
+                    cwd: workspace_root.clone(),
+                    affected_paths: vec![],
+                    sandbox: SandboxSummary::workspace(),
+                    requested_permissions: vec![permission],
+                    justification: None,
+                }
+            }
             // The canonical live Responses gate uses a deterministic test-only
             // read-only tool. Keep this mapping out of production builds while
             // still routing the gate through the real ApprovalBroker path.
@@ -189,6 +211,9 @@ impl CanonicalAction {
             "edit_file" => "edit",
             "delete" => "delete",
             BASH_TOOL_NAME => "exec",
+            "messaging" if matches!(self.operation.as_str(), "overview" | "open" | "write") => {
+                self.operation.as_str()
+            }
             _ => return Err(ActionError::InvalidAction("unknown canonical tool")),
         };
         if self.operation != expected_operation {
@@ -203,6 +228,8 @@ impl CanonicalAction {
             "edit_file" => Permission::EditWorkspace,
             "delete" => Permission::DeleteWorkspace,
             BASH_TOOL_NAME => Permission::Exec,
+            "messaging" if self.operation == "write" => Permission::DomainMutation,
+            "messaging" => Permission::ReadDomain,
             _ => unreachable!("tool matched above"),
         };
         if !self.requested_permissions.contains(&expected_permission)
@@ -240,6 +267,15 @@ impl CanonicalAction {
                     != self.requested_permissions.contains(&Permission::Network)
             {
                 return Err(ActionError::InvalidAction("shell action shape mismatch"));
+            }
+        } else if self.tool == "messaging" {
+            if !self.affected_paths.is_empty()
+                || self.argv != [self.tool.clone(), self.operation.clone()]
+                || self.requested_permissions != [expected_permission]
+            {
+                return Err(ActionError::InvalidAction(
+                    "messaging action shape mismatch",
+                ));
             }
         } else if self.affected_paths.len() != 1 {
             return Err(ActionError::InvalidAction(
@@ -340,6 +376,7 @@ impl fmt::Debug for CanonicalAction {
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
     ReadWorkspace,
+    ReadDomain,
     WriteWorkspace,
     EditWorkspace,
     DeleteWorkspace,

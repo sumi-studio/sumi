@@ -745,7 +745,6 @@ mod tests {
 
     use axum::{Json, Router, body::Body, http::Response, routing::post};
     use serde_json::json;
-    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::{mpsc, oneshot};
 
@@ -797,16 +796,7 @@ mod tests {
     }
 
     fn expected_tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
-        let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
-        let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
-        let mut pair_digest = [0_u8; 64];
-        pair_digest[..32].copy_from_slice(&assistant_digest);
-        pair_digest[32..].copy_from_slice(&tool_call_digest);
-        uuid::Uuid::new_v5(
-            &super::super::run::TOOL_RESULT_MESSAGE_ID_NAMESPACE,
-            &pair_digest,
-        )
-        .to_string()
+        crate::store::tool_result_message_id(assistant_message_id, tool_call_id)
     }
 
     struct FakeTool {
