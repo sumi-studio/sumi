@@ -8,11 +8,15 @@ import {
 
 const authorityMocks = vi.hoisted(() => ({
   resetAuthority: vi.fn(() => true),
+  resumeMountedConnection: vi.fn(),
 }));
 
 vi.mock("./store", () => ({
   useConversation: {
-    getState: () => ({ resetAuthority: authorityMocks.resetAuthority }),
+    getState: () => ({
+      resetAuthority: authorityMocks.resetAuthority,
+      resumeMountedConnection: authorityMocks.resumeMountedConnection,
+    }),
   },
 }));
 
@@ -49,6 +53,7 @@ describe("direct-chat authority binding", () => {
     bindDirectChatAuthority(authorityBindingB);
 
     expect(authorityMocks.resetAuthority).toHaveBeenCalledTimes(1);
+    expect(authorityMocks.resumeMountedConnection).toHaveBeenCalledTimes(1);
     expect(globalThis.sessionStorage.getItem(authorityBindingStorageKey)).toBe(
       authorityBindingB,
     );

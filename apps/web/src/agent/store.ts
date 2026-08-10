@@ -45,8 +45,10 @@ export interface ConversationState {
   ready: DirectChatReadyState;
   lastError: string | null;
   recoverableDrafts: RecoverableDraft[];
+  acquireConnection: () => () => void;
   connect: () => void;
   disconnect: () => void;
+  resumeMountedConnection: () => void;
   resetAuthority: () => boolean;
   sendMessage: (text: string) => boolean;
   restoreDraft: (idempotencyKey: string) => string | undefined;
@@ -78,6 +80,9 @@ export function createConversationStore({
   let ready: DirectChatReadyState = "unknown";
   let started = false;
   let privateStateQuarantined = false;
+  const connectionOwners = new Set<symbol>();
+  let connectionGeneration = 0;
+  let pendingConnectionGeneration: number | null = null;
   const approvalSubmissionLatches = new Set<string>();
   const undurableAdmissions = new Map<
     string,
@@ -111,6 +116,81 @@ export function createConversationStore({
           ? []
           : outbox.recoverableDrafts(),
       }));
+    };
+
+    const cancelPendingConnection = () => {
+      connectionGeneration += 1;
+      pendingConnectionGeneration = null;
+    };
+
+    const startConnection = () => {
+      if (started) return;
+      if (privateStateQuarantined) {
+        publish(
+          "Private delivery state must be cleared before direct chat can reconnect",
+        );
+        return;
+      }
+      started = true;
+      connection = "connecting";
+      ready = "unknown";
+      publish(null);
+      transport.connect();
+    };
+
+    const stopConnection = () => {
+      const wasStarted = started;
+      started = false;
+      if (wasStarted) transport.close();
+      connection = "closed";
+      ready = "unknown";
+      publish();
+    };
+
+    const scheduleMountedConnection = () => {
+      if (
+        connectionOwners.size === 0 ||
+        started ||
+        pendingConnectionGeneration !== null ||
+        privateStateQuarantined
+      ) {
+        return;
+      }
+      connection = "connecting";
+      ready = "unknown";
+      publish();
+      const generation = ++connectionGeneration;
+      pendingConnectionGeneration = generation;
+      queueMicrotask(() => {
+        if (pendingConnectionGeneration === generation) {
+          pendingConnectionGeneration = null;
+        }
+        if (
+          connectionGeneration !== generation ||
+          connectionOwners.size === 0 ||
+          started
+        ) {
+          return;
+        }
+        startConnection();
+      });
+    };
+
+    const settleOwnerlessConnection = () => {
+      const generation = connectionGeneration;
+      queueMicrotask(() => {
+        if (
+          connectionGeneration !== generation ||
+          connectionOwners.size !== 0 ||
+          pendingConnectionGeneration !== null ||
+          started
+        ) {
+          return;
+        }
+        connection = "closed";
+        ready = "unknown";
+        publish();
+      });
     };
 
     const removeOptimistic = (idempotencyKey: string) => {
@@ -391,29 +471,39 @@ export function createConversationStore({
       ready,
       lastError: null,
       recoverableDrafts: outbox.recoverableDrafts(),
+      acquireConnection() {
+        const owner = Symbol("direct-chat-connection-owner");
+        connectionOwners.add(owner);
+        scheduleMountedConnection();
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          connectionOwners.delete(owner);
+          if (connectionOwners.size !== 0) return;
+          cancelPendingConnection();
+          if (started) {
+            stopConnection();
+          } else {
+            // A StrictMode probe releases and reacquires in one task. Settle
+            // the display state only after a later owner has had that chance.
+            settleOwnerlessConnection();
+          }
+        };
+      },
       connect() {
-        if (started) return;
-        if (privateStateQuarantined) {
-          publish(
-            "Private delivery state must be cleared before direct chat can reconnect",
-          );
-          return;
-        }
-        started = true;
-        connection = "connecting";
-        ready = "unknown";
-        publish(null);
-        transport.connect();
+        cancelPendingConnection();
+        startConnection();
       },
       disconnect() {
-        if (!started) return;
-        started = false;
-        transport.close();
-        connection = "closed";
-        ready = "unknown";
-        publish();
+        cancelPendingConnection();
+        stopConnection();
+      },
+      resumeMountedConnection() {
+        scheduleMountedConnection();
       },
       resetAuthority() {
+        cancelPendingConnection();
         started = false;
         if (transport.resetAuthority) {
           transport.resetAuthority();

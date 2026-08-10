@@ -15,7 +15,8 @@ export function resetDirectChatAuthority(): boolean {
 
 export function bindDirectChatAuthority(authorityBindingID: string): void {
   const previous = readCurrentBindingID();
-  if (previous !== authorityBindingID && !resetDirectChatAuthority()) {
+  const changed = previous !== authorityBindingID;
+  if (changed && !resetDirectChatAuthority()) {
     throw new Error(
       "Direct-chat private state could not be cleared for the new authority",
     );
@@ -30,6 +31,7 @@ export function bindDirectChatAuthority(authorityBindingID: string): void {
   } catch {
     // In-memory binding still protects transitions in this document.
   }
+  if (changed) useConversation.getState().resumeMountedConnection();
 }
 
 export function clearDirectChatAuthority(): boolean {
