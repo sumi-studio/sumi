@@ -66,7 +66,7 @@ T17はT16へ依存し、T16はT15へ依存するため、T15でproduction bootst
   T29のうちagent death実装は[#76](https://github.com/sumi-studio/sumi/issues/76)が担う。対象VM外の
   `deletion_tombstones`を正本として`requested → fenced → live_purged → backup_expired`を単調・冪等に進め、
   supervisorが一つのcurrent `ProcessGeneration`をfenceした後に、対象agentのDB/canonical life log、recovery
-  ledger、event/execution、全key、private workspace、artifact volume、VM credential、backupを破棄する。
+  ledger、event/execution、全key、private workspace、artifact volume、VM本体、VM credential、backupを破棄する。
   shared Workspace data、外部tombstone/audit、他agentは存続する。同じWorkspace・administrative contextの
   第二agentを使うfixtureで対象だけが消え第二agentのprivate stateが不変であることを固定し、同一DBの
   「別conversation」やFK回避のconstraint無効化を隔離証拠にしない。この置換はT17/T27のphysical recovery
