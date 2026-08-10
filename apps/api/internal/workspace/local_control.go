@@ -16,6 +16,7 @@ const (
 	LocalLeavePath            = "/local-control/v1/workspace:leave"
 	LocalRemoveMemberPath     = "/local-control/v1/workspace:remove-member"
 	LocalInviteCreatePath     = "/local-control/v1/workspace:invite-create"
+	LocalInvitePreviewPath    = "/local-control/v1/workspace:invite-preview"
 	LocalInviteRedeemPath     = "/local-control/v1/workspace:invite-redeem"
 	LocalInviteRevokePath     = "/local-control/v1/workspace:invite-revoke"
 	LocalRolesPath            = "/local-control/v1/workspace:roles"
@@ -46,6 +47,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalLeavePath, s.localLeave},
 		{"POST " + LocalRemoveMemberPath, s.localRemoveMember},
 		{"POST " + LocalInviteCreatePath, s.localCreateInvite},
+		{"POST " + LocalInvitePreviewPath, s.localPreviewInvite},
 		{"POST " + LocalInviteRedeemPath, s.localRedeemInvite},
 		{"POST " + LocalInviteRevokePath, s.localRevokeInvite},
 		{"POST " + LocalRolesPath, s.localRoles},
@@ -192,11 +194,34 @@ func (s *Server) localCreateInvite(w http.ResponseWriter, r *http.Request, autho
 	writeJSON(w, http.StatusCreated, inviteToWire(invite))
 }
 
+func (s *Server) localPreviewInvite(w http.ResponseWriter, r *http.Request, _ agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		Code string `json:"code"`
+	}
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	if request.Code == "" || len(request.Code) > 128 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	preview, err := s.Store.PreviewInvite(r.Context(), request.Code)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, invitePreviewToWire(preview))
+}
+
 func (s *Server) localRedeemInvite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		Code string `json:"code"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	if request.Code == "" || len(request.Code) > 128 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	membership, err := s.Store.RedeemInvite(r.Context(), request.Code, localActor(authorization))
@@ -250,9 +275,13 @@ func (s *Server) localCreateRole(w http.ResponseWriter, r *http.Request, authori
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
-	role, err := s.Store.CreateRole(r.Context(), request.WorkspaceID,
+	if request.Permissions == nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	role, err := s.Store.CreateRoleWithPosition(r.Context(), request.WorkspaceID,
 		localActor(authorization), request.Name, request.Color,
-		permissionMap(request.Permissions))
+		permissionMap(*request.Permissions), request.Position)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -269,9 +298,13 @@ func (s *Server) localUpdateRole(w http.ResponseWriter, r *http.Request, authori
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
-	role, err := s.Store.UpdateRole(r.Context(), request.WorkspaceID, request.RoleID,
+	if request.Permissions == nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	role, err := s.Store.UpdateRoleWithPosition(r.Context(), request.WorkspaceID, request.RoleID,
 		localActor(authorization), request.Name, request.Color,
-		permissionMap(request.Permissions))
+		permissionMap(*request.Permissions), request.Position)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -297,15 +330,19 @@ func (s *Server) localDeleteRole(w http.ResponseWriter, r *http.Request, authori
 
 func (s *Server) localSetMemberRoles(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
-		WorkspaceID       string   `json:"workspace_id"`
-		WorkspaceMemberID string   `json:"workspace_member_id"`
-		RoleIDs           []string `json:"role_ids"`
+		WorkspaceID       string    `json:"workspace_id"`
+		WorkspaceMemberID string    `json:"workspace_member_id"`
+		RoleIDs           *[]string `json:"role_ids"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
+	if request.RoleIDs == nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
 	roleIDs, err := s.Store.SetMembershipRoles(r.Context(), request.WorkspaceID,
-		request.WorkspaceMemberID, localActor(authorization), request.RoleIDs)
+		request.WorkspaceMemberID, localActor(authorization), *request.RoleIDs)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -382,17 +419,17 @@ func (s *Server) localInstallApp(w http.ResponseWriter, r *http.Request, authori
 func (s *Server) localSetAppEnabled(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		InstallationID string `json:"installation_id"`
-		Enabled        bool   `json:"enabled"`
+		Enabled        *bool  `json:"enabled"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
-	if request.InstallationID == "" {
+	if request.InstallationID == "" || request.Enabled == nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	installation, err := s.Apps.SetEnabledByID(r.Context(), request.InstallationID,
-		localActor(authorization), request.Enabled)
+		localActor(authorization), *request.Enabled)
 	if err != nil {
 		writeDomainError(w, err)
 		return

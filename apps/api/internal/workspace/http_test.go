@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,15 +127,66 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		`{"name":"Agent apps"}`, http.StatusCreated, w.agentA.ID)
 
 	roleResponse := invokeLocal(server.localCreateRole, fmt.Sprintf(
-		`{"workspace_id":%q,"name":"Inviter","permissions":["manage_members"]}`,
+		`{"workspace_id":%q,"name":"Inviter","position":7,"permissions":["manage_members"]}`,
 		agentWorkspace.WorkspaceID), w.agentA.ID)
 	if roleResponse.Code != http.StatusCreated {
 		t.Fatalf("Agent role create status = %d, body=%s", roleResponse.Code, roleResponse.Body.String())
 	}
 	var role roleWire
 	decodeRecorder(t, roleResponse, &role)
-	if role.Name != "Inviter" || len(role.Permissions) != 1 || role.Permissions[0] != PermissionManageMembers {
+	if role.Name != "Inviter" || role.Position != 7 || len(role.Permissions) != 1 || role.Permissions[0] != PermissionManageMembers {
 		t.Fatalf("Agent-created role = %#v", role)
+	}
+	browserRole := browserCall(mux, http.MethodPost,
+		"/workspaces/"+humanWorkspace.WorkspaceID+"/roles",
+		`{"name":"Ordered","position":9,"permissions":[]}`)
+	if browserRole.Code != http.StatusCreated {
+		t.Fatalf("Human role create status = %d, body=%s", browserRole.Code, browserRole.Body.String())
+	}
+	var humanRole roleWire
+	decodeRecorder(t, browserRole, &humanRole)
+	if humanRole.Position != 9 {
+		t.Fatalf("Human-created role position = %d", humanRole.Position)
+	}
+	browserRoleUpdate := browserCall(mux, http.MethodPatch,
+		"/workspaces/"+humanWorkspace.WorkspaceID+"/roles/"+humanRole.RoleID,
+		`{"name":"Ordered browser","position":10,"permissions":[]}`)
+	if browserRoleUpdate.Code != http.StatusOK {
+		t.Fatalf("Human role position update = %d, body=%s", browserRoleUpdate.Code, browserRoleUpdate.Body.String())
+	}
+	decodeRecorder(t, browserRoleUpdate, &humanRole)
+	if humanRole.Position != 10 {
+		t.Fatalf("Human-updated role position = %d", humanRole.Position)
+	}
+	preservedRole := invokeLocal(server.localUpdateRole, fmt.Sprintf(
+		`{"workspace_id":%q,"role_id":%q,"name":"Inviter preserved","permissions":["manage_members"]}`,
+		agentWorkspace.WorkspaceID, role.RoleID), w.agentA.ID)
+	if preservedRole.Code != http.StatusOK {
+		t.Fatalf("Agent role preserve status = %d, body=%s", preservedRole.Code, preservedRole.Body.String())
+	}
+	decodeRecorder(t, preservedRole, &role)
+	if role.Position != 7 {
+		t.Fatalf("omitted role position was not preserved: %#v", role)
+	}
+	positionedRole := invokeLocal(server.localUpdateRole, fmt.Sprintf(
+		`{"workspace_id":%q,"role_id":%q,"name":"Inviter moved","position":5,"permissions":["manage_members"]}`,
+		agentWorkspace.WorkspaceID, role.RoleID), w.agentA.ID)
+	if positionedRole.Code != http.StatusOK {
+		t.Fatalf("Agent role position update = %d, body=%s", positionedRole.Code, positionedRole.Body.String())
+	}
+	decodeRecorder(t, positionedRole, &role)
+	if role.Position != 5 {
+		t.Fatalf("Agent-updated role position = %d", role.Position)
+	}
+	if invalid := browserCall(mux, http.MethodPatch,
+		"/workspaces/"+humanWorkspace.WorkspaceID+"/roles/"+humanRole.RoleID,
+		`{"name":"invalid","position":-1,"permissions":[]}`); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("negative browser role position = %d: %s", invalid.Code, invalid.Body.String())
+	}
+	if invalid := invokeLocal(server.localUpdateRole, fmt.Sprintf(
+		`{"workspace_id":%q,"role_id":%q,"name":"invalid","position":1000001,"permissions":[]}`,
+		agentWorkspace.WorkspaceID, role.RoleID), w.agentA.ID); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("oversized Agent role position = %d: %s", invalid.Code, invalid.Body.String())
 	}
 
 	humanInstall := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
@@ -195,6 +247,229 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		personalInstallation.Owner.Participant == nil ||
 		personalInstallation.Owner.Participant.PersonalityAgentID != w.agentA.ID {
 		t.Fatalf("nested Agent Participant owner wire = %#v", personalInstallation.Owner)
+	}
+}
+
+func TestInvitePreviewAndRequiredRequestPresenceAcrossTransports(t *testing.T) {
+	w := newTestWorld(t)
+	sessions := &transportTestSessions{
+		claims: agentevents.UserSessionClaims{UserID: w.humanA.ID},
+	}
+	appStore := applicationapps.New(w.pool, w.store)
+	server := NewServer(w.store, appStore, sessions)
+	server.AllowedOrigins = []string{"https://sumi.test"}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	created := browserWorkspaceMutation(t, mux, http.MethodPost, "/workspaces",
+		`{"name":"Presence"}`, http.StatusCreated)
+	inviteResponse := browserCall(mux, http.MethodPost,
+		"/workspaces/"+created.WorkspaceID+"/invites", `{}`)
+	if inviteResponse.Code != http.StatusCreated {
+		t.Fatalf("create invite = %d: %s", inviteResponse.Code, inviteResponse.Body.String())
+	}
+	var invite inviteWire
+	decodeRecorder(t, inviteResponse, &invite)
+
+	// Public scanner-style GET and authenticated Agent preview converge on the
+	// same non-consuming minimal projection.
+	publicPreview := httptest.NewRecorder()
+	publicPreviewRequest := httptest.NewRequest(http.MethodGet,
+		"/workspace-invites/preview?code="+invite.Code, nil)
+	mux.ServeHTTP(publicPreview, publicPreviewRequest)
+	if publicPreview.Code != http.StatusOK {
+		t.Fatalf("public preview = %d: %s", publicPreview.Code, publicPreview.Body.String())
+	}
+	localPreview := invokeLocal(server.localPreviewInvite,
+		fmt.Sprintf(`{"code":%q}`, invite.Code), w.agentA.ID)
+	if localPreview.Code != http.StatusOK || localPreview.Body.String() != publicPreview.Body.String() {
+		t.Fatalf("preview parity public=%d %s local=%d %s", publicPreview.Code,
+			publicPreview.Body.String(), localPreview.Code, localPreview.Body.String())
+	}
+	var preview invitePreviewWire
+	decodeRecorder(t, publicPreview, &preview)
+	if preview.WorkspaceID != created.WorkspaceID || preview.WorkspaceName != "Presence" {
+		t.Fatalf("invite preview leaked or omitted identity: %#v", preview)
+	}
+
+	for label, response := range map[string]*httptest.ResponseRecorder{
+		"browser missing redeem code": browserCall(mux, http.MethodPost, "/workspace-invites/redeem", `{}`),
+		"browser empty redeem code":   browserCall(mux, http.MethodPost, "/workspace-invites/redeem", `{"code":""}`),
+		"agent missing redeem code":   invokeLocal(server.localRedeemInvite, `{}`, w.agentA.ID),
+		"agent empty redeem code":     invokeLocal(server.localRedeemInvite, `{"code":""}`, w.agentA.ID),
+		"browser missing permissions": browserCall(mux, http.MethodPost, "/workspaces/"+created.WorkspaceID+"/roles", `{"name":"missing"}`),
+		"agent missing permissions": invokeLocal(server.localCreateRole,
+			fmt.Sprintf(`{"workspace_id":%q,"name":"missing"}`, created.WorkspaceID), w.agentA.ID),
+		"browser missing role ids": browserCall(mux, http.MethodPut,
+			"/workspaces/"+created.WorkspaceID+"/members/"+created.OwnerWorkspaceMemberID+"/roles", `{}`),
+		"agent missing role ids": invokeLocal(server.localSetMemberRoles,
+			fmt.Sprintf(`{"workspace_id":%q,"workspace_member_id":%q}`,
+				created.WorkspaceID, created.OwnerWorkspaceMemberID), w.agentA.ID),
+		"agent missing enabled": invokeLocal(server.localSetAppEnabled,
+			`{"installation_id":"0198f0f4-9b72-7000-8000-000000000199"}`, w.agentA.ID),
+	} {
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d, body=%s", label, response.Code, response.Body.String())
+		}
+	}
+
+	// Explicit empty arrays and false remain real values rather than being
+	// confused with omission.
+	emptyRole := browserCall(mux, http.MethodPost,
+		"/workspaces/"+created.WorkspaceID+"/roles",
+		`{"name":"Empty","permissions":[]}`)
+	if emptyRole.Code != http.StatusCreated {
+		t.Fatalf("explicit empty permissions = %d: %s", emptyRole.Code, emptyRole.Body.String())
+	}
+	emptyAssignments := browserCall(mux, http.MethodPut,
+		"/workspaces/"+created.WorkspaceID+"/members/"+created.OwnerWorkspaceMemberID+"/roles",
+		`{"role_ids":[]}`)
+	if emptyAssignments.Code != http.StatusOK {
+		t.Fatalf("explicit empty role_ids = %d: %s", emptyAssignments.Code, emptyAssignments.Body.String())
+	}
+	agentWorkspace := localWorkspaceMutation(t, server, server.localCreateWorkspace,
+		`{"name":"Agent presence"}`, http.StatusCreated, w.agentA.ID)
+	install := invokeLocal(server.localInstallApp, fmt.Sprintf(
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
+		agentWorkspace.WorkspaceID), w.agentA.ID)
+	if install.Code != http.StatusCreated {
+		t.Fatalf("install app = %d: %s", install.Code, install.Body.String())
+	}
+	var installation appInstallationWire
+	decodeRecorder(t, install, &installation)
+	disabled := invokeLocal(server.localSetAppEnabled, fmt.Sprintf(
+		`{"installation_id":%q,"enabled":false}`, installation.InstallationID), w.agentA.ID)
+	if disabled.Code != http.StatusOK {
+		t.Fatalf("explicit false was not admitted as a value: %d %s", disabled.Code, disabled.Body.String())
+	}
+}
+
+func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *testing.T) {
+	w := newTestWorld(t)
+	appStore := applicationapps.New(w.pool, w.store)
+	server := NewServer(w.store, appStore, nil)
+
+	commandStore, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = commandStore.Close() })
+	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), commandStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := agentevents.LocalRuntimeAuthorization{
+		BearerToken:           "workspace-local-control-bearer-generation-one",
+		TenantID:              "workspace-test",
+		PersonalityAgentID:    w.agentA.ID,
+		Generation:            1,
+		RPCBootNonce:          "workspace-boot-1",
+		Audience:              agentevents.DefaultAgentAudience(),
+		DeliveryAuthorization: agentevents.LocalDeliveryRaw,
+	}
+	otherAuthorization := authorization
+	otherAuthorization.BearerToken = "workspace-local-control-other-agent-bearer"
+	otherAuthorization.PersonalityAgentID = "0198f0f4-9b72-7000-8000-0000000001a2"
+	control, err := agentevents.NewLocalControlServer(gateway,
+		[]byte("workspace-local-control-signing-secret-32-bytes"),
+		[]agentevents.LocalRuntimeAuthorization{authorization, otherAuthorization})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.RegisterLocalControlRoutes(control); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := control.HandlerForLocalRuntime(w.agentA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	call := func(path, bearer, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodPost, httpServer.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			request.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		raw, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder := httptest.NewRecorder()
+		recorder.Code = response.StatusCode
+		_, _ = recorder.Body.Write(raw)
+		return recorder
+	}
+	if response := call(LocalWorkspaceCreatePath, "", `{"name":"no auth"}`); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated registered route = %d: %s", response.Code, response.Body.String())
+	}
+	if response := call(LocalWorkspaceCreatePath, otherAuthorization.BearerToken,
+		`{"name":"wrong PAID"}`); response.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-PAID bearer on bound handler = %d: %s", response.Code, response.Body.String())
+	}
+	createdResponse := call(LocalWorkspaceCreatePath, authorization.BearerToken,
+		`{"name":"Registered Agent Workspace"}`)
+	if createdResponse.Code != http.StatusCreated {
+		t.Fatalf("registered create route = %d: %s", createdResponse.Code, createdResponse.Body.String())
+	}
+	var created workspaceWire
+	decodeRecorder(t, createdResponse, &created)
+	assertOwnerParticipant(t, w, created, w.agentA)
+	inviteResponse := call(LocalInviteCreatePath, authorization.BearerToken,
+		fmt.Sprintf(`{"workspace_id":%q}`, created.WorkspaceID))
+	if inviteResponse.Code != http.StatusCreated {
+		t.Fatalf("registered invite-create route = %d: %s", inviteResponse.Code, inviteResponse.Body.String())
+	}
+	var invite inviteWire
+	decodeRecorder(t, inviteResponse, &invite)
+	if preview := call(LocalInvitePreviewPath, authorization.BearerToken,
+		fmt.Sprintf(`{"code":%q}`, invite.Code)); preview.Code != http.StatusOK {
+		t.Fatalf("registered invite-preview route = %d: %s", preview.Code, preview.Body.String())
+	}
+	installResponse := call(LocalAppInstallPath, authorization.BearerToken, fmt.Sprintf(
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
+		created.WorkspaceID))
+	if installResponse.Code != http.StatusCreated {
+		t.Fatalf("registered app-install route = %d: %s", installResponse.Code, installResponse.Body.String())
+	}
+	var installation appInstallationWire
+	decodeRecorder(t, installResponse, &installation)
+
+	replacement := authorization
+	replacement.BearerToken = "workspace-local-control-bearer-generation-two"
+	replacement.Generation = 2
+	replacement.RPCBootNonce = "workspace-boot-2"
+	if err := control.InstallLocalRuntimeAuthorization(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	if response := call(LocalWorkspaceUpdatePath, authorization.BearerToken,
+		fmt.Sprintf(`{"workspace_id":%q,"name":"stale"}`, created.WorkspaceID)); response.Code != http.StatusUnauthorized {
+		t.Fatalf("stale generation bearer = %d: %s", response.Code, response.Body.String())
+	}
+	updated := call(LocalWorkspaceUpdatePath, replacement.BearerToken,
+		fmt.Sprintf(`{"workspace_id":%q,"name":"Current generation"}`, created.WorkspaceID))
+	if updated.Code != http.StatusOK {
+		t.Fatalf("current generation mutation route = %d: %s", updated.Code, updated.Body.String())
+	}
+	var updatedWorkspace workspaceWire
+	decodeRecorder(t, updated, &updatedWorkspace)
+	if updatedWorkspace.Name != "Current generation" {
+		t.Fatalf("registered mutation result = %#v", updatedWorkspace)
+	}
+	disabled := call(LocalAppSetEnabledPath, replacement.BearerToken, fmt.Sprintf(
+		`{"installation_id":%q,"enabled":false}`, installation.InstallationID))
+	if disabled.Code != http.StatusOK {
+		t.Fatalf("registered app mutation route = %d: %s", disabled.Code, disabled.Body.String())
 	}
 }
 

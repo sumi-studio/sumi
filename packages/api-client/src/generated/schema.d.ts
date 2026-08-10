@@ -165,6 +165,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspace-invites/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview the Workspace named by an opaque invite without consuming it
+         * @description Possession of the code reveals only the Workspace ID, display name, and fixed expiry. It reveals no member list or issuer identity.
+         */
+        get: operations["previewWorkspaceInvite"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/workspace-invites/redeem": {
         parameters: {
             query?: never;
@@ -428,6 +448,8 @@ export interface components {
             role_ids: components["schemas"]["UUIDv7"][];
             /** Format: date-time */
             joined_at: string;
+            /** @description Null while this exact membership tenure is active; replay never reopens a closed tenure. */
+            left_at: string | null;
         };
         WorkspaceInvite: {
             invite_id: components["schemas"]["UUIDv7"];
@@ -439,11 +461,19 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        WorkspaceInvitePreview: {
+            workspace_id: components["schemas"]["UUIDv7"];
+            workspace_name: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
         /** @enum {string} */
         WorkspacePermission: "manage_workspace" | "manage_members" | "manage_roles" | "manage_apps" | "manage_channels" | "mention_all";
         WorkspaceRoleMutation: {
             name: string;
             color?: string;
+            /** @description Optional ordering hint. Higher roles render first; omission preserves the stored value on update and uses zero on create. */
+            position?: number;
             permissions: components["schemas"]["WorkspacePermission"][];
         };
         WorkspaceRole: {
@@ -1389,6 +1419,30 @@ export interface operations {
                 content?: never;
             };
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    previewWorkspaceInvite: {
+        parameters: {
+            query: {
+                code: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Minimal non-consuming invite preview */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceInvitePreview"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
             404: components["responses"]["NotFound"];
         };
     };

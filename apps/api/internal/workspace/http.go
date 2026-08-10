@@ -37,6 +37,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/members/{workspace_member_id}", s.serveRemoveMember)
 	mux.HandleFunc("POST /workspaces/{workspace_id}/invites", s.serveCreateInvite)
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/invites/{invite_id}", s.serveRevokeInvite)
+	mux.HandleFunc("GET /workspace-invites/preview", s.servePreviewInvite)
 	mux.HandleFunc("POST /workspace-invites/redeem", s.serveRedeemInvite)
 	mux.HandleFunc("GET /workspaces/{workspace_id}/roles", s.serveRoles)
 	mux.HandleFunc("POST /workspaces/{workspace_id}/roles", s.serveCreateRole)
@@ -110,6 +111,7 @@ type membershipWire struct {
 	Owner             bool            `json:"owner"`
 	RoleIDs           []string        `json:"role_ids"`
 	JoinedAt          time.Time       `json:"joined_at"`
+	LeftAt            *time.Time      `json:"left_at"`
 }
 
 func membershipToWire(item Membership) membershipWire {
@@ -120,7 +122,7 @@ func membershipToWire(item Membership) membershipWire {
 	return membershipWire{
 		WorkspaceMemberID: item.WorkspaceMemberID, WorkspaceID: item.WorkspaceID,
 		Participant: participantToWire(item.Participant), Owner: item.Owner,
-		RoleIDs: roleIDs, JoinedAt: item.JoinedAt,
+		RoleIDs: roleIDs, JoinedAt: item.JoinedAt, LeftAt: item.LeftAt,
 	}
 }
 
@@ -154,6 +156,19 @@ func inviteToWire(item Invite) inviteWire {
 	return inviteWire{
 		InviteID: item.InviteID, WorkspaceID: item.WorkspaceID, Code: item.Code,
 		ExpiresAt: item.ExpiresAt, CreatedAt: item.CreatedAt,
+	}
+}
+
+type invitePreviewWire struct {
+	WorkspaceID   string    `json:"workspace_id"`
+	WorkspaceName string    `json:"workspace_name"`
+	ExpiresAt     time.Time `json:"expires_at"`
+}
+
+func invitePreviewToWire(item InvitePreview) invitePreviewWire {
+	return invitePreviewWire{
+		WorkspaceID: item.WorkspaceID, WorkspaceName: item.WorkspaceName,
+		ExpiresAt: item.ExpiresAt,
 	}
 }
 
@@ -336,7 +351,8 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		errors.Is(err, applicationapps.ErrAlreadyInstalled):
 		writeAPIError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, ErrInvalidName), errors.Is(err, ErrInvalidColor),
-		errors.Is(err, ErrInvalidPermission), errors.Is(err, ErrInvalidInvite),
+		errors.Is(err, ErrInvalidPosition), errors.Is(err, ErrInvalidPermission),
+		errors.Is(err, ErrInvalidInvite),
 		errors.Is(err, applicationapps.ErrOwnerKindUnsupported):
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 	default:

@@ -43,6 +43,7 @@ var (
 	ErrForbidden         = errors.New("workspace operation forbidden")
 	ErrInvalidName       = errors.New("invalid workspace or role name")
 	ErrInvalidColor      = errors.New("invalid role color")
+	ErrInvalidPosition   = errors.New("invalid role position")
 	ErrInvalidPermission = errors.New("invalid workspace permission")
 	ErrRoleNotFound      = errors.New("workspace role not found")
 	ErrRoleNameTaken     = errors.New("workspace role name is already used")
@@ -90,6 +91,7 @@ type Membership struct {
 	Owner             bool
 	RoleIDs           []string
 	JoinedAt          time.Time
+	LeftAt            *time.Time
 }
 
 type Role struct {
@@ -108,4 +110,13 @@ type Invite struct {
 	Code        string
 	ExpiresAt   time.Time
 	CreatedAt   time.Time
+}
+
+// InvitePreview is deliberately smaller than Workspace. Possession of an
+// unconsumed invite code reveals only enough information to make an informed
+// redemption choice; it is not a Workspace directory or membership view.
+type InvitePreview struct {
+	WorkspaceID   string
+	WorkspaceName string
+	ExpiresAt     time.Time
 }

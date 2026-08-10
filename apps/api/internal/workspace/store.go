@@ -164,7 +164,7 @@ func (s *Store) Members(ctx context.Context, workspaceID string, actor participa
 		       wm.workspace_member_id = w.owner_workspace_member_id,
 		       COALESCE(array_agg(wra.role_id ORDER BY wr.position DESC, wr.name)
 		           FILTER (WHERE wra.role_id IS NOT NULL), ARRAY[]::text[]),
-		       wm.joined_at
+		       wm.joined_at, wm.left_at
 		FROM workspace_members wm
 		JOIN workspaces w ON w.workspace_id = wm.workspace_id
 		LEFT JOIN workspace_role_assignments wra
@@ -185,7 +185,7 @@ func (s *Store) Members(ctx context.Context, workspaceID string, actor participa
 		var kind string
 		if err := rows.Scan(&member.WorkspaceMemberID, &member.WorkspaceID,
 			&kind, &member.Participant.ID, &member.Owner, &member.RoleIDs,
-			&member.JoinedAt); err != nil {
+			&member.JoinedAt, &member.LeftAt); err != nil {
 			return nil, fmt.Errorf("scan workspace member: %w", err)
 		}
 		member.Participant.Kind = participant.Kind(kind)
@@ -265,6 +265,34 @@ func (s *Store) CreateInvite(ctx context.Context, workspaceID string, actor part
 		return Invite{}, fmt.Errorf("commit workspace invite: %w", err)
 	}
 	return invite, nil
+}
+
+// PreviewInvite resolves only the minimal, non-consuming link preview. It
+// deliberately has no actor parameter: possession of the opaque code is the
+// sole preview capability, while redemption separately authenticates and
+// derives its participant from the transport.
+func (s *Store) PreviewInvite(ctx context.Context, code string) (InvitePreview, error) {
+	if code == "" || len(code) > 128 {
+		return InvitePreview{}, ErrInviteUnavailable
+	}
+	hash := sha256.Sum256([]byte(code))
+	var preview InvitePreview
+	err := s.pool.QueryRow(ctx, `
+		SELECT w.workspace_id, w.name, wi.expires_at
+		FROM workspace_invites wi
+		JOIN workspaces w ON w.workspace_id = wi.workspace_id
+		WHERE wi.code_hash = $1
+		  AND wi.revoked_at IS NULL
+		  AND wi.redeemed_at IS NULL
+		  AND wi.expires_at > $2`, hash[:], s.now().UTC(),
+	).Scan(&preview.WorkspaceID, &preview.WorkspaceName, &preview.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return InvitePreview{}, ErrInviteUnavailable
+	}
+	if err != nil {
+		return InvitePreview{}, fmt.Errorf("preview workspace invite: %w", err)
+	}
+	return preview, nil
 }
 
 func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant.Ref) (Membership, error) {
@@ -441,7 +469,11 @@ func (s *Store) RemoveMember(ctx context.Context, workspaceID, membershipID stri
 	if _, err := s.lockAndRequirePermission(ctx, tx, workspaceID, actor, PermissionManageMembers); err != nil {
 		return err
 	}
-	target, err := membershipByID(ctx, tx, workspaceID, membershipID, true)
+	// Lock the exact parent tenure before closing any child tenure. The
+	// place_members admission trigger takes a conflicting SHARE lock, so a
+	// racing admission either commits before this point and is included below,
+	// or waits and observes the closed parent.
+	target, err := membershipByIDForUpdate(ctx, tx, workspaceID, membershipID, true)
 	if err != nil {
 		return err
 	}
@@ -460,15 +492,15 @@ func (s *Store) RemoveMember(ctx context.Context, workspaceID, membershipID stri
 		return ErrForbidden
 	}
 	leftAt := s.now().UTC()
+	if err := closeBoundPlaceTenures(ctx, tx, workspaceID, membershipID, leftAt); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE workspace_members SET left_at = $3
 		WHERE workspace_id = $1 AND workspace_member_id = $2 AND left_at IS NULL`,
 		workspaceID, membershipID, leftAt,
 	); err != nil {
 		return fmt.Errorf("close workspace membership: %w", err)
-	}
-	if err := closeBoundPlaceTenures(ctx, tx, workspaceID, membershipID, leftAt); err != nil {
-		return err
 	}
 	if err := ensureEffectiveAdministrator(ctx, tx, workspaceID); err != nil {
 		return err
@@ -488,7 +520,7 @@ func (s *Store) Leave(ctx context.Context, workspaceID string, actor participant
 	if err := lockWorkspace(ctx, tx, workspaceID); err != nil {
 		return err
 	}
-	membership, err := activeMembership(ctx, tx, workspaceID, actor)
+	membership, err := activeMembershipForUpdate(ctx, tx, workspaceID, actor)
 	if err != nil {
 		return err
 	}
@@ -496,16 +528,16 @@ func (s *Store) Leave(ctx context.Context, workspaceID string, actor participant
 		return ErrOwnerProtected
 	}
 	leftAt := s.now().UTC()
+	if err := closeBoundPlaceTenures(ctx, tx, workspaceID,
+		membership.WorkspaceMemberID, leftAt); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE workspace_members SET left_at = $3
 		WHERE workspace_id = $1 AND workspace_member_id = $2 AND left_at IS NULL`,
 		workspaceID, membership.WorkspaceMemberID, leftAt,
 	); err != nil {
 		return fmt.Errorf("leave workspace: %w", err)
-	}
-	if err := closeBoundPlaceTenures(ctx, tx, workspaceID,
-		membership.WorkspaceMemberID, leftAt); err != nil {
-		return err
 	}
 	if err := ensureEffectiveAdministrator(ctx, tx, workspaceID); err != nil {
 		return err
@@ -597,6 +629,14 @@ func (s *Store) permissionsFor(ctx context.Context, q querier, workspaceID strin
 }
 
 func activeMembership(ctx context.Context, q querier, workspaceID string, actor participant.Ref) (Membership, error) {
+	return activeMembershipWithLock(ctx, q, workspaceID, actor, false)
+}
+
+func activeMembershipForUpdate(ctx context.Context, q querier, workspaceID string, actor participant.Ref) (Membership, error) {
+	return activeMembershipWithLock(ctx, q, workspaceID, actor, true)
+}
+
+func activeMembershipWithLock(ctx context.Context, q querier, workspaceID string, actor participant.Ref, forUpdate bool) (Membership, error) {
 	if err := actor.Validate(); err != nil {
 		return Membership{}, err
 	}
@@ -605,13 +645,17 @@ func activeMembership(ctx context.Context, q querier, workspaceID string, actor 
 	}
 	var membership Membership
 	var kind string
+	lockClause := ""
+	if forUpdate {
+		lockClause = " FOR UPDATE OF wm"
+	}
 	err := q.QueryRow(ctx, `
 		SELECT wm.workspace_member_id, wm.workspace_id, wm.member_kind, wm.member_id,
 		       wm.workspace_member_id = w.owner_workspace_member_id, wm.joined_at
 		FROM workspace_members wm
 		JOIN workspaces w ON w.workspace_id = wm.workspace_id
 		WHERE wm.workspace_id = $1 AND wm.member_kind = $2 AND wm.member_id = $3
-		  AND wm.left_at IS NULL`, workspaceID, actor.Kind, actor.ID,
+		  AND wm.left_at IS NULL`+lockClause, workspaceID, actor.Kind, actor.ID,
 	).Scan(&membership.WorkspaceMemberID, &membership.WorkspaceID, &kind,
 		&membership.Participant.ID, &membership.Owner, &membership.JoinedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -625,6 +669,14 @@ func activeMembership(ctx context.Context, q querier, workspaceID string, actor 
 }
 
 func membershipByID(ctx context.Context, q querier, workspaceID, membershipID string, activeOnly bool) (Membership, error) {
+	return membershipByIDWithLock(ctx, q, workspaceID, membershipID, activeOnly, false)
+}
+
+func membershipByIDForUpdate(ctx context.Context, q querier, workspaceID, membershipID string, activeOnly bool) (Membership, error) {
+	return membershipByIDWithLock(ctx, q, workspaceID, membershipID, activeOnly, true)
+}
+
+func membershipByIDWithLock(ctx context.Context, q querier, workspaceID, membershipID string, activeOnly, forUpdate bool) (Membership, error) {
 	if !isCanonicalUUIDv7(workspaceID) || !isCanonicalUUIDv7(membershipID) {
 		return Membership{}, ErrMemberNotFound
 	}
@@ -632,17 +684,32 @@ func membershipByID(ctx context.Context, q querier, workspaceID, membershipID st
 	if activeOnly {
 		activeClause = " AND wm.left_at IS NULL"
 	}
+	lockClause := ""
+	if forUpdate {
+		lockClause = " FOR UPDATE OF wm"
+	}
 	var membership Membership
 	var kind string
 	err := q.QueryRow(ctx, `
 		SELECT wm.workspace_member_id, wm.workspace_id, wm.member_kind, wm.member_id,
-		       wm.workspace_member_id = w.owner_workspace_member_id, wm.joined_at
+		       wm.workspace_member_id = w.owner_workspace_member_id,
+		       COALESCE(ARRAY(
+		           SELECT wra.role_id
+		           FROM workspace_role_assignments wra
+		           JOIN workspace_roles wr
+		             ON wr.workspace_id = wra.workspace_id AND wr.role_id = wra.role_id
+		           WHERE wra.workspace_id = wm.workspace_id
+		             AND wra.workspace_member_id = wm.workspace_member_id
+		           ORDER BY wr.position DESC, wr.name, wr.role_id
+		       ), ARRAY[]::text[]),
+		       wm.joined_at, wm.left_at
 		FROM workspace_members wm
 		JOIN workspaces w ON w.workspace_id = wm.workspace_id
-		WHERE wm.workspace_id = $1 AND wm.workspace_member_id = $2`+activeClause,
+		WHERE wm.workspace_id = $1 AND wm.workspace_member_id = $2`+activeClause+lockClause,
 		workspaceID, membershipID,
 	).Scan(&membership.WorkspaceMemberID, &membership.WorkspaceID, &kind,
-		&membership.Participant.ID, &membership.Owner, &membership.JoinedAt)
+		&membership.Participant.ID, &membership.Owner, &membership.RoleIDs,
+		&membership.JoinedAt, &membership.LeftAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Membership{}, ErrMemberNotFound
 	}
@@ -704,6 +771,9 @@ func lockWorkspace(ctx context.Context, q querier, workspaceID string) error {
 }
 
 func ensureEffectiveAdministrator(ctx context.Context, q querier, workspaceID string) error {
+	// The immutable distinguished owner makes this guard redundant today, but
+	// keep it as the mutation-level defense: a future audited owner-transfer
+	// operation must preserve (or deliberately replace) this invariant.
 	var administered bool
 	err := q.QueryRow(ctx, `
 		SELECT EXISTS (

@@ -176,6 +176,16 @@ func TestInviteAdmissionIsOpaqueBoundedAndHumanAgentSymmetric(t *testing.T) {
 	if !oneUse.ExpiresAt.Equal(now.Add(24 * time.Hour)) {
 		t.Fatalf("default invite expiry = %s", oneUse.ExpiresAt)
 	}
+	for i := 0; i < 2; i++ {
+		preview, err := w.store.PreviewInvite(ctx, oneUse.Code)
+		if err != nil {
+			t.Fatalf("non-consuming preview %d: %v", i, err)
+		}
+		if preview.WorkspaceID != created.WorkspaceID ||
+			preview.WorkspaceName != "shared" || !preview.ExpiresAt.Equal(oneUse.ExpiresAt) {
+			t.Fatalf("minimal invite preview = %#v", preview)
+		}
+	}
 	var storedHash []byte
 	if err := w.pool.QueryRow(ctx,
 		"SELECT code_hash FROM workspace_invites WHERE invite_id = $1", oneUse.InviteID,
@@ -204,6 +214,9 @@ func TestInviteAdmissionIsOpaqueBoundedAndHumanAgentSymmetric(t *testing.T) {
 	}
 	if humanMembership.Participant != w.humanB {
 		t.Fatalf("Human admission = %#v", humanMembership)
+	}
+	if _, err := w.store.PreviewInvite(ctx, oneUse.Code); !errors.Is(err, ErrInviteUnavailable) {
+		t.Fatalf("consumed invite preview error = %v", err)
 	}
 	now = now.Add(25 * time.Hour)
 	replayed, err := w.store.RedeemInvite(ctx, oneUse.Code, w.humanB)
@@ -257,6 +270,64 @@ func TestInviteAdmissionIsOpaqueBoundedAndHumanAgentSymmetric(t *testing.T) {
 	}
 	if agentOwned.OwnerWorkspaceMemberID == "" {
 		t.Fatal("agent-created Workspace lacks owner membership")
+	}
+}
+
+func TestInviteReplayReturnsCurrentRoleAndClosedTenureState(t *testing.T) {
+	w := newTestWorld(t)
+	ctx := context.Background()
+	created, err := w.store.CreateWorkspace(ctx, "replay state", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invite, err := w.store.CreateInvite(ctx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := w.store.RedeemInvite(ctx, invite.Code, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := w.store.CreateRole(ctx, created.WorkspaceID, w.humanA,
+		"Mentioner", "", map[string]bool{PermissionMentionAll: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.SetMembershipRoles(ctx, created.WorkspaceID,
+		membership.WorkspaceMemberID, w.humanA, []string{role.RoleID}); err != nil {
+		t.Fatal(err)
+	}
+
+	replayed, err := w.store.RedeemInvite(ctx, invite.Code, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed.RoleIDs) != 1 || replayed.RoleIDs[0] != role.RoleID || replayed.LeftAt != nil {
+		t.Fatalf("role-aware active replay = %#v", replayed)
+	}
+	if err := w.store.RemoveMember(ctx, created.WorkspaceID,
+		membership.WorkspaceMemberID, w.humanA); err != nil {
+		t.Fatal(err)
+	}
+	closedReplay, err := w.store.RedeemInvite(ctx, invite.Code, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closedReplay.WorkspaceMemberID != membership.WorkspaceMemberID ||
+		closedReplay.LeftAt == nil || len(closedReplay.RoleIDs) != 1 ||
+		closedReplay.RoleIDs[0] != role.RoleID {
+		t.Fatalf("closed-tenure replay = %#v", closedReplay)
+	}
+	var active int
+	if err := w.pool.QueryRow(ctx, `
+		SELECT count(*) FROM workspace_members
+		WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3
+		  AND left_at IS NULL`, created.WorkspaceID, w.humanB.Kind, w.humanB.ID,
+	).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("replay reopened %d membership tenures", active)
 	}
 }
 

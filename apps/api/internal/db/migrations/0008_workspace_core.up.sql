@@ -1,6 +1,10 @@
 -- 0008_workspace_core: application-wide Workspace, membership, role, invite,
--- and app-installation control plane. Messaging is a consumer of this schema;
--- it does not own or seed Workspace identity.
+-- and app-installation control plane. This file deliberately replaces the old
+-- pre-cutover 0008_messaging_schema migration. Only a fresh/reset database may
+-- cross this boundary; the migration runner rejects a database that recorded
+-- the legacy version instead of attempting compatibility or adoption.
+-- Messaging is a consumer of this schema; it does not own or seed Workspace
+-- identity.
 
 -- A Workspace has exactly one distinguished owner *membership*. The
 -- owner_workspace_member_id foreign key is installed after workspace_members
@@ -128,7 +132,10 @@ CREATE TABLE workspace_roles (
     workspace_id uuidv7      NOT NULL REFERENCES workspaces(workspace_id),
     name         text        NOT NULL CHECK (char_length(name) BETWEEN 1 AND 60),
     color        text        CHECK (color IS NULL OR color ~ '^#[0-9a-f]{6}$'),
-    position     integer     NOT NULL DEFAULT 0,
+    -- Ordering hint only: higher roles render first; duplicate positions use
+    -- the stable name/role_id tie-breakers in application queries.
+    position     integer     NOT NULL DEFAULT 0
+        CHECK (position BETWEEN 0 AND 1000000),
     permissions  jsonb       NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(permissions) = 'object'),
     created_at   timestamptz NOT NULL DEFAULT now(),

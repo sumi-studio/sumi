@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,47 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 	}
 	if first != second {
 		t.Fatalf("idempotency broken: first=%d second=%d", first, second)
+	}
+}
+
+func TestMigrateRejectsLegacyVersionEightWithResetRequiredError(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 7)
+
+	// This is the identifying shape of the replaced 0008 migration: it owns
+	// places, but its workspaces table has no distinguished owner membership.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE workspaces (
+			workspace_id uuidv7 PRIMARY KEY,
+			name text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE TABLE places (
+			place_id uuidv7 PRIMARY KEY,
+			workspace_id uuidv7 REFERENCES workspaces(workspace_id)
+		);
+		INSERT INTO schema_migrations (version) VALUES (8)
+	`); err != nil {
+		t.Fatalf("create legacy version-eight shape: %v", err)
+	}
+
+	err := Migrate(ctx, pool)
+	if !errors.Is(err, ErrPreCutoverResetRequired) {
+		t.Fatalf("legacy migration error = %v, want reset-required", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "reset this pre-cutover database") {
+		t.Fatalf("legacy migration error is not actionable: %v", err)
+	}
+	var versionNine bool
+	if err := pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 9)",
+	).Scan(&versionNine); err != nil {
+		t.Fatal(err)
+	}
+	if versionNine {
+		t.Fatal("legacy database advanced past the fail-fast boundary")
 	}
 }
 

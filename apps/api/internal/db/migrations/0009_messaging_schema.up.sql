@@ -58,6 +58,66 @@ CREATE INDEX place_members_by_participant
     ON place_members (member_kind, member_id, workspace_id, place_id)
     WHERE left_at IS NULL;
 
+-- An active place tenure may bind only an active Workspace tenure. Admission
+-- takes a SHARE row lock, which conflicts with the FOR UPDATE lock used by the
+-- Workspace closure protocol. A racing admission therefore either commits
+-- first and is closed by that protocol, or observes the closed parent and is
+-- rejected. Checking only the foreign key would incorrectly permit a child of
+-- a historical (left_at != NULL) membership.
+CREATE OR REPLACE FUNCTION require_active_workspace_tenure_for_place_member()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    parent_id uuidv7;
+BEGIN
+    IF NEW.left_at IS NULL THEN
+        SELECT wm.workspace_member_id INTO parent_id
+        FROM workspace_members wm
+        WHERE wm.workspace_id = NEW.workspace_id
+          AND wm.workspace_member_id = NEW.workspace_member_id
+          AND wm.member_kind = NEW.member_kind
+          AND wm.member_id = NEW.member_id
+          AND wm.left_at IS NULL
+        FOR SHARE;
+        IF parent_id IS NULL THEN
+            RAISE EXCEPTION 'active place membership requires an active workspace membership tenure';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER place_member_requires_active_workspace_tenure
+    BEFORE INSERT OR UPDATE OF workspace_id, workspace_member_id,
+        member_kind, member_id, left_at ON place_members
+    FOR EACH ROW
+    EXECUTE FUNCTION require_active_workspace_tenure_for_place_member();
+
+-- Direct SQL must not close a parent while active children remain. The Store
+-- protocol locks the parent, closes all children at the same timestamp, then
+-- closes the parent. Keeping this check in the database prevents a caller from
+-- silently bypassing that ordering.
+CREATE OR REPLACE FUNCTION reject_workspace_tenure_close_with_active_places()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.left_at IS NULL AND NEW.left_at IS NOT NULL AND EXISTS (
+        SELECT 1 FROM place_members pm
+        WHERE pm.workspace_id = OLD.workspace_id
+          AND pm.workspace_member_id = OLD.workspace_member_id
+          AND pm.left_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'close active place membership tenures before the workspace membership tenure';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER workspace_tenure_close_requires_closed_places
+    BEFORE UPDATE OF left_at ON workspace_members
+    FOR EACH ROW
+    EXECUTE FUNCTION reject_workspace_tenure_close_with_active_places();
+
 CREATE TABLE messages (
     message_id   uuidv7      PRIMARY KEY,
     place_id     uuidv7      NOT NULL REFERENCES places(place_id),

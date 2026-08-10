@@ -227,6 +227,30 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /workspace-invites/preview:
+    get:
+      operationId: previewWorkspaceInvite
+      summary: Preview the Workspace named by an opaque invite without consuming it
+      description: Possession of the code reveals only the Workspace ID, display name, and fixed expiry. It reveals no member list or issuer identity.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      responses:
+        "200":
+          description: Minimal non-consuming invite preview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceInvitePreview"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /workspace-invites/redeem:
     post:
       operationId: redeemWorkspaceInvite
@@ -792,7 +816,7 @@ components:
         propertyName: kind
     WorkspaceMembership:
       type: object
-      required: [workspace_member_id, workspace_id, participant, owner, role_ids, joined_at]
+      required: [workspace_member_id, workspace_id, participant, owner, role_ids, joined_at, left_at]
       additionalProperties: false
       properties:
         workspace_member_id:
@@ -811,6 +835,12 @@ components:
         joined_at:
           type: string
           format: date-time
+        left_at:
+          description: Null while this exact membership tenure is active; replay never reopens a closed tenure.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
     WorkspaceInvite:
       type: object
       required: [invite_id, workspace_id, code, expires_at, created_at]
@@ -831,6 +861,20 @@ components:
         created_at:
           type: string
           format: date-time
+    WorkspaceInvitePreview:
+      type: object
+      required: [workspace_id, workspace_name, expires_at]
+      additionalProperties: false
+      properties:
+        workspace_id:
+          $ref: "#/components/schemas/UUIDv7"
+        workspace_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        expires_at:
+          type: string
+          format: date-time
     WorkspacePermission:
       type: string
       enum: [manage_workspace, manage_members, manage_roles, manage_apps, manage_channels, mention_all]
@@ -846,6 +890,11 @@ components:
         color:
           type: string
           pattern: '^#[0-9a-f]{6}$'
+        position:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: Optional ordering hint. Higher roles render first; omission preserves the stored value on update and uses zero on create.
         permissions:
           type: array
           uniqueItems: true
@@ -869,6 +918,8 @@ components:
           pattern: '^#[0-9a-f]{6}$'
         position:
           type: integer
+          minimum: 0
+          maximum: 1000000
         permissions:
           type: array
           uniqueItems: true

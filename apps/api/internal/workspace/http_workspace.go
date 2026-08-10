@@ -197,6 +197,20 @@ func (s *Server) serveRevokeInvite(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) servePreviewInvite(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" || len(code) > 128 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	preview, err := s.Store.PreviewInvite(r.Context(), code)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, invitePreviewToWire(preview))
+}
+
 func (s *Server) serveRedeemInvite(w http.ResponseWriter, r *http.Request) {
 	actor, claims, ok := s.browserActor(w, r)
 	if !ok {
@@ -206,6 +220,10 @@ func (s *Server) serveRedeemInvite(w http.ResponseWriter, r *http.Request) {
 		Code string `json:"code"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	if request.Code == "" || len(request.Code) > 128 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	var membership Membership
@@ -244,9 +262,10 @@ func (s *Server) serveRoles(w http.ResponseWriter, r *http.Request) {
 }
 
 type roleMutationRequest struct {
-	Name        string   `json:"name"`
-	Color       string   `json:"color,omitempty"`
-	Permissions []string `json:"permissions"`
+	Name        string    `json:"name"`
+	Color       string    `json:"color,omitempty"`
+	Position    *int      `json:"position,omitempty"`
+	Permissions *[]string `json:"permissions"`
 }
 
 func permissionMap(keys []string) map[string]bool {
@@ -265,8 +284,8 @@ func (s *Server) serveCreateRole(w http.ResponseWriter, r *http.Request) {
 	var role Role
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var roleErr error
-		role, roleErr = s.Store.CreateRole(r.Context(), r.PathValue("workspace_id"),
-			actor, request.Name, request.Color, permissionMap(request.Permissions))
+		role, roleErr = s.Store.CreateRoleWithPosition(r.Context(), r.PathValue("workspace_id"),
+			actor, request.Name, request.Color, permissionMap(*request.Permissions), request.Position)
 		return roleErr
 	})
 	if !done {
@@ -287,9 +306,9 @@ func (s *Server) serveUpdateRole(w http.ResponseWriter, r *http.Request) {
 	var role Role
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var roleErr error
-		role, roleErr = s.Store.UpdateRole(r.Context(), r.PathValue("workspace_id"),
+		role, roleErr = s.Store.UpdateRoleWithPosition(r.Context(), r.PathValue("workspace_id"),
 			r.PathValue("role_id"), actor, request.Name, request.Color,
-			permissionMap(request.Permissions))
+			permissionMap(*request.Permissions), request.Position)
 		return roleErr
 	})
 	if !done {
@@ -309,6 +328,10 @@ func (s *Server) roleMutationAdmission(w http.ResponseWriter, r *http.Request) (
 	}
 	var request roleMutationRequest
 	if !decodeStrictJSON(w, r, &request) {
+		return participant.Ref{}, agentevents.UserSessionClaims{}, roleMutationRequest{}, false
+	}
+	if request.Permissions == nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return participant.Ref{}, agentevents.UserSessionClaims{}, roleMutationRequest{}, false
 	}
 	return actor, claims, request, true
@@ -339,9 +362,13 @@ func (s *Server) serveSetMemberRoles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		RoleIDs []string `json:"role_ids"`
+		RoleIDs *[]string `json:"role_ids"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	if request.RoleIDs == nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	var stored []string
@@ -349,7 +376,7 @@ func (s *Server) serveSetMemberRoles(w http.ResponseWriter, r *http.Request) {
 		var setErr error
 		stored, setErr = s.Store.SetMembershipRoles(r.Context(),
 			r.PathValue("workspace_id"), r.PathValue("workspace_member_id"),
-			actor, request.RoleIDs)
+			actor, *request.RoleIDs)
 		return setErr
 	})
 	if !done {

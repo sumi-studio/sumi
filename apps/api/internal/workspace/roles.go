@@ -12,7 +12,10 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
-const maxRoleNameChars = 60
+const (
+	maxRoleNameChars = 60
+	maxRolePosition  = 1_000_000
+)
 
 var roleColorPattern = regexp.MustCompile(`^#[0-9a-f]{6}$`)
 
@@ -61,8 +64,18 @@ func (s *Store) Roles(ctx context.Context, workspaceID string, actor participant
 }
 
 func (s *Store) CreateRole(ctx context.Context, workspaceID string, actor participant.Ref, name, color string, permissions map[string]bool) (Role, error) {
+	return s.CreateRoleWithPosition(ctx, workspaceID, actor, name, color, permissions, nil)
+}
+
+// CreateRoleWithPosition exposes the ordering hint used by both Human and
+// Agent transports. A missing position remains compatible with the current Web
+// role model and creates the role at position zero.
+func (s *Store) CreateRoleWithPosition(ctx context.Context, workspaceID string, actor participant.Ref, name, color string, permissions map[string]bool, position *int) (Role, error) {
 	name = strings.TrimSpace(name)
 	if err := validateRolePresentation(name, color); err != nil {
+		return Role{}, err
+	}
+	if err := validateRolePosition(position); err != nil {
 		return Role{}, err
 	}
 	normalized, err := validatePermissions(permissions)
@@ -88,12 +101,15 @@ func (s *Store) CreateRole(ctx context.Context, workspaceID string, actor partic
 		RoleID: newUUIDv7(), WorkspaceID: workspaceID, Name: name,
 		Color: color, Permissions: normalized, CreatedAt: s.now().UTC(),
 	}
+	if position != nil {
+		role.Position = *position
+	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO workspace_roles
-			(role_id, workspace_id, name, color, permissions, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(role_id, workspace_id, name, color, position, permissions, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING position`, role.RoleID, workspaceID, name, nullableColor(color),
-		normalized, role.CreatedAt,
+		role.Position, normalized, role.CreatedAt,
 	).Scan(&role.Position)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -108,8 +124,18 @@ func (s *Store) CreateRole(ctx context.Context, workspaceID string, actor partic
 }
 
 func (s *Store) UpdateRole(ctx context.Context, workspaceID, roleID string, actor participant.Ref, name, color string, permissions map[string]bool) (Role, error) {
+	return s.UpdateRoleWithPosition(ctx, workspaceID, roleID, actor, name, color, permissions, nil)
+}
+
+// UpdateRoleWithPosition preserves the stored ordering when position is
+// omitted and changes it only when the caller explicitly supplies a validated
+// value.
+func (s *Store) UpdateRoleWithPosition(ctx context.Context, workspaceID, roleID string, actor participant.Ref, name, color string, permissions map[string]bool, position *int) (Role, error) {
 	name = strings.TrimSpace(name)
 	if err := validateRolePresentation(name, color); err != nil {
+		return Role{}, err
+	}
+	if err := validateRolePosition(position); err != nil {
 		return Role{}, err
 	}
 	normalized, err := validatePermissions(permissions)
@@ -142,11 +168,15 @@ func (s *Store) UpdateRole(ctx context.Context, workspaceID, roleID string, acto
 	previous.Name = name
 	previous.Color = color
 	previous.Permissions = normalized
+	if position != nil {
+		previous.Position = *position
+	}
 	err = tx.QueryRow(ctx, `
-		UPDATE workspace_roles SET name = $3, color = $4, permissions = $5
+		UPDATE workspace_roles
+		SET name = $3, color = $4, position = $5, permissions = $6
 		WHERE workspace_id = $1 AND role_id = $2
 		RETURNING position, created_at`, workspaceID, roleID, name,
-		nullableColor(color), normalized,
+		nullableColor(color), previous.Position, normalized,
 	).Scan(&previous.Position, &previous.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -339,6 +369,13 @@ func validateRolePresentation(name, color string) error {
 	}
 	if color != "" && !roleColorPattern.MatchString(color) {
 		return ErrInvalidColor
+	}
+	return nil
+}
+
+func validateRolePosition(position *int) error {
+	if position != nil && (*position < 0 || *position > maxRolePosition) {
+		return ErrInvalidPosition
 	}
 	return nil
 }
