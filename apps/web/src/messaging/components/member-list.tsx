@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
-import { useMessaging } from "../store";
+import { getMessagingSessionIdentity, useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 
 /**
@@ -51,23 +51,13 @@ export function MemberList() {
                     </span>
                   ) : null}
                 </span>
-                {failedKey === key ? (
-                  <span
-                    role="alert"
-                    aria-live="assertive"
-                    className="block truncate text-[11px] text-rose-500"
-                  >
-                    DMを開始できませんでした。もう一度押してください
-                  </span>
-                ) : (
-                  <span className="block truncate text-[11px] text-muted-foreground">
-                    {pendingKey === key
-                      ? "DMを開始しています…"
-                      : status?.note
-                        ? status.note
-                        : member.tagline}
-                  </span>
-                )}
+                <span className="block truncate text-[11px] text-muted-foreground">
+                  {pendingKey === key
+                    ? "DMを開始しています…"
+                    : status?.note
+                      ? status.note
+                      : member.tagline}
+                </span>
               </span>
             </>
           );
@@ -82,29 +72,54 @@ export function MemberList() {
             );
           }
           return (
-            <button
-              key={key}
-              type="button"
-              title={`${member.displayName}にDMを送る`}
-              aria-label={`${member.displayName}にDMを送る`}
-              aria-busy={pendingKey === key}
-              disabled={pendingKey !== null}
-              onClick={async () => {
-                setPendingKey(key);
-                setFailedKey(null);
-                try {
-                  const place = await startDM([member.participant]);
-                  placeNavigate(place);
-                } catch {
-                  setFailedKey(key);
-                } finally {
-                  setPendingKey(null);
-                }
-              }}
-              className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-accent/60 disabled:opacity-60"
-            >
-              {content}
-            </button>
+            <div key={key}>
+              <button
+                type="button"
+                title={`${member.displayName}にDMを送る`}
+                aria-label={`${member.displayName}にDMを送る`}
+                aria-busy={pendingKey === key}
+                disabled={pendingKey !== null}
+                onClick={async () => {
+                  const currentIdentity = getMessagingSessionIdentity();
+                  const expectedSelfKey = selfKey;
+                  setPendingKey(key);
+                  setFailedKey(null);
+                  try {
+                    const place = await startDM([member.participant]);
+                    const sessionChanged =
+                      getMessagingSessionIdentity() !== currentIdentity ||
+                      useMessaging.getState().selfKey !== expectedSelfKey;
+                    if (sessionChanged) {
+                      throw new Error(
+                        "Messaging session changed before DM navigation",
+                      );
+                    }
+                    placeNavigate(place);
+                  } catch {
+                    if (
+                      getMessagingSessionIdentity() === currentIdentity &&
+                      useMessaging.getState().selfKey === expectedSelfKey
+                    ) {
+                      setFailedKey(key);
+                    }
+                  } finally {
+                    setPendingKey(null);
+                  }
+                }}
+                className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-accent/60 disabled:opacity-60"
+              >
+                {content}
+              </button>
+              {failedKey === key ? (
+                <p
+                  role="alert"
+                  aria-live="assertive"
+                  className="px-2 pb-1 text-[11px] text-rose-500"
+                >
+                  DMを開始できませんでした。もう一度押してください
+                </p>
+              ) : null}
+            </div>
           );
         })}
       </div>

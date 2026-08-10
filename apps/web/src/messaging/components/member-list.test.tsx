@@ -8,16 +8,19 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "../mock-server";
 import type { DmSummary, PlaceKey } from "../model";
 import {
   bindMessagingSessionIdentity,
+  getMessagingSessionIdentity,
   installMessagingBackend,
   useMessaging,
 } from "../store";
 import { MemberList } from "./member-list";
+import { Sidebar } from "./sidebar";
 
 const navigation = vi.hoisted(() => ({ navigate: vi.fn() }));
 
@@ -64,6 +67,16 @@ function setMembers() {
     },
     statusByKey: {},
     dms: [],
+  });
+}
+
+function resolveThenSwitchIdentity(): Promise<PlaceKey> {
+  return Promise.resolve<PlaceKey>("dm:dm-bob").then((place) => {
+    queueMicrotask(() => {
+      bindMessagingSessionIdentity(null);
+      bindMessagingSessionIdentity("human-b");
+    });
+    return place;
   });
 }
 
@@ -132,6 +145,7 @@ describe("MemberList DM action", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(bob).not.toContainElement(alert);
     expect(alert).toHaveTextContent(
       "DMを開始できませんでした。もう一度押してください",
     );
@@ -143,6 +157,36 @@ describe("MemberList DM action", () => {
     );
     expect(startDM).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("rechecks identity after store completion before member-row navigation", async () => {
+    const startDM = vi.fn(resolveThenSwitchIdentity);
+    useMessaging.setState({ startDM });
+    render(<MemberList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "BobにDMを送る" }));
+
+    await waitFor(() => expect(getMessagingSessionIdentity()).toBe("human-b"));
+    expect(startDM).toHaveBeenCalledTimes(1);
+    expect(navigation.navigate).not.toHaveBeenCalled();
+  });
+
+  it("rechecks identity after store completion before dialog navigation", async () => {
+    const startDM = vi.fn(resolveThenSwitchIdentity);
+    useMessaging.setState({ startDM });
+    render(<Sidebar />);
+
+    fireEvent.click(screen.getByTitle("ダイレクトメッセージを開始"));
+    const dialog = screen.getByRole("dialog", {
+      name: "ダイレクトメッセージを開始",
+    });
+    fireEvent.click(within(dialog).getByText("Bob", { exact: true }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "DMを開始" }));
+
+    await waitFor(() => expect(getMessagingSessionIdentity()).toBe("human-b"));
+    expect(startDM).toHaveBeenCalledTimes(1);
+    expect(navigation.navigate).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 
   it("does not navigate when a deferred ensureDM crosses an identity switch", async () => {

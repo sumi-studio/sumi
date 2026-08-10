@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
-import { useMessaging } from "../store";
+import { getMessagingSessionIdentity, useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const INPUT_CLASS =
@@ -214,14 +214,27 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
 
   const submit = async () => {
     if (busy || chosen.length === 0) return;
+    const currentIdentity = getMessagingSessionIdentity();
+    const expectedSelfKey = selfKey;
     setBusy(true);
     setFailed(false);
     try {
       const key = await startDM(chosen.map((member) => member.participant));
+      const sessionChanged =
+        getMessagingSessionIdentity() !== currentIdentity ||
+        useMessaging.getState().selfKey !== expectedSelfKey;
+      if (sessionChanged) {
+        throw new Error("Messaging session changed before DM navigation");
+      }
       placeNavigate(key);
       onClose();
     } catch {
-      setFailed(true);
+      if (
+        getMessagingSessionIdentity() === currentIdentity &&
+        useMessaging.getState().selfKey === expectedSelfKey
+      ) {
+        setFailed(true);
+      }
       setBusy(false);
     }
   };
