@@ -1218,7 +1218,7 @@ fn glob_regex(pattern: &str) -> Result<Regex, ToolError> {
     Regex::new(&regex).map_err(|error| ToolError::Protocol(error.to_string()))
 }
 
-fn normalize_glob_pattern(pattern: &str) -> Result<String, ToolError> {
+pub(crate) fn normalize_glob_pattern(pattern: &str) -> Result<String, ToolError> {
     if pattern.starts_with('/') {
         return Err(ToolError::InvalidPath(
             "glob pattern must be workspace-relative".to_owned(),

@@ -6,11 +6,15 @@
 //! Session-start validation; the bounded execution identifier below remains a
 //! retry-stable live invocation identity, not the durable T26 idempotency key.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{
+    fmt::Write as _,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -19,7 +23,11 @@ use super::{ArtifactResponse, ExecutorClient, ExecutorOperation, ExecutorRespons
 use crate::{
     provider::types::{ToolDefinition, ValidatedToolArguments},
     tools::{
-        Tool, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolRisk,
+        AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
+        BoundToolCtx, BoundToolExecutionOutcome, CapabilityClass, DescribeError, ResourceScope,
+        ReviewProjection, Tool, ToolBindCtx, ToolBinding, ToolCtx, ToolError, ToolOutput,
+        ToolRegistry, ToolRegistryBuilder, ToolRisk, WorkspacePaths,
+        fs::normalize_glob_pattern,
         text_output,
         truncate::{
             DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, RetainedOutput, TruncationOptions,
@@ -30,6 +38,11 @@ use crate::{
 
 const EXECUTION_ID_DOMAIN: &[u8] = b"sumi-live-executor-v1";
 const EXECUTION_ID_PREFIX: &str = "exec-";
+const BINDING_ADAPTER_ID: &str = "sumi.foundation.workspace";
+const BINDING_ADAPTER_VERSION: u32 = 1;
+const MAX_WORKSPACE_PATH_BYTES: usize = 4 * 1024;
+const MAX_GLOB_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_GREP_PATTERN_BYTES: usize = 16 * 1024;
 
 #[async_trait]
 trait ExecutorInvoker: Send + Sync {
@@ -68,12 +81,7 @@ pub(crate) fn remote_executor_registry_with_tools(
 ) -> Result<ToolRegistry, ToolError> {
     let identity = client.identity().clone();
     let mut builder = ToolRegistryBuilder::default();
-    for kind in [
-        RemoteToolKind::WorkspaceReadFile,
-        RemoteToolKind::ListDir,
-        RemoteToolKind::Glob,
-        RemoteToolKind::WorkspaceGrep,
-    ] {
+    for kind in PRODUCTION_REMOTE_TOOL_KINDS {
         builder.register(Arc::new(RemoteTool {
             kind,
             client: client.clone(),
@@ -82,7 +90,7 @@ pub(crate) fn remote_executor_registry_with_tools(
     for tool in extra_tools {
         builder.register(tool)?;
     }
-    Ok(builder.build_for_executor_identity(identity))
+    builder.build_bound_for_executor_identity(identity)
 }
 
 #[cfg(test)]
@@ -113,6 +121,20 @@ fn broad_test_registry_from_invoker(
     Ok(builder.build())
 }
 
+#[cfg(test)]
+fn bound_test_registry_from_invoker(
+    client: Arc<dyn ExecutorInvoker>,
+) -> Result<ToolRegistry, ToolError> {
+    let mut builder = ToolRegistryBuilder::default();
+    for kind in PRODUCTION_REMOTE_TOOL_KINDS {
+        builder.register(Arc::new(RemoteTool {
+            kind,
+            client: client.clone(),
+        }))?;
+    }
+    Ok(builder.build())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteToolKind {
     WorkspaceReadFile,
@@ -126,6 +148,13 @@ enum RemoteToolKind {
     Grep,
     Bash,
 }
+
+const PRODUCTION_REMOTE_TOOL_KINDS: [RemoteToolKind; 4] = [
+    RemoteToolKind::WorkspaceReadFile,
+    RemoteToolKind::ListDir,
+    RemoteToolKind::Glob,
+    RemoteToolKind::WorkspaceGrep,
+];
 
 struct RemoteTool {
     kind: RemoteToolKind,
@@ -190,10 +219,65 @@ impl Tool for RemoteTool {
         }
     }
 
+    fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+        self.kind
+            .supports_production_binding()
+            .then(|| self as Arc<dyn BoundToolAdapter>)
+    }
+
     async fn execute(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
         let execution_id = execution_id(ctx.flow_id, ctx.call_id);
         let operation = self.kind.operation(ctx.args, execution_id)?;
-        let read_context = match &operation {
+        let read_context = self.kind.read_context(&operation);
+        self.execute_operation(operation, read_context, ctx.cancel, ctx.on_update)
+            .await
+    }
+}
+
+#[async_trait]
+impl BoundToolAdapter for RemoteTool {
+    fn identity(&self) -> AdapterIdentity {
+        AdapterIdentity::new(BINDING_ADAPTER_ID, BINDING_ADAPTER_VERSION)
+            .expect("static foundation workspace binding adapter identity must be valid")
+    }
+
+    async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+        self.kind.bind(ctx)
+    }
+
+    async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError> {
+        let execution_id = execution_id(ctx.flow_id, ctx.call_id);
+        let (operation, read_context) = self.kind.bound_operation(ctx.args, execution_id)?;
+        let output = self
+            .execute_operation(operation, read_context, ctx.cancel, ctx.on_update)
+            .await?;
+        Ok(BoundToolExecutionOutcome::without_live_post_commit(output))
+    }
+}
+
+impl RemoteTool {
+    async fn execute_operation(
+        &self,
+        operation: ExecutorOperation,
+        read_context: Option<ReadContext>,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolOutput, ToolError> {
+        let response = self.client.execute(operation, cancel, on_update).await?;
+        self.kind.output(response, read_context)
+    }
+}
+
+impl RemoteToolKind {
+    fn supports_production_binding(self) -> bool {
+        matches!(
+            self,
+            Self::WorkspaceReadFile | Self::ListDir | Self::Glob | Self::WorkspaceGrep
+        )
+    }
+
+    fn read_context(self, operation: &ExecutorOperation) -> Option<ReadContext> {
+        match operation {
             ExecutorOperation::ReadFile {
                 path,
                 offset,
@@ -202,19 +286,116 @@ impl Tool for RemoteTool {
             } => Some(ReadContext {
                 request_offset: *offset,
                 rpc_limit: *limit,
-                artifact: self.kind == RemoteToolKind::ReadFile && path.starts_with("artifact://"),
+                artifact: self == Self::ReadFile && path.starts_with("artifact://"),
             }),
             _ => None,
-        };
-        let response = self
-            .client
-            .execute(operation, ctx.cancel, ctx.on_update)
-            .await?;
-        self.kind.output(response, read_context)
+        }
     }
-}
 
-impl RemoteToolKind {
+    fn bind(self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+        match self {
+            Self::WorkspaceReadFile => {
+                let args: WorkspaceReadFileArgs = decode_for_binding(ctx.args)?;
+                let args = BoundReadFileArgs {
+                    path: normalize_workspace_path(&args.path, ctx.workspace)?,
+                    offset: args.offset,
+                    limit: args.limit,
+                };
+                workspace_binding(
+                    "read_file",
+                    ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
+                    &args,
+                )
+            }
+            Self::ListDir => {
+                let args: PathArgs = decode_for_binding(ctx.args)?;
+                let args = BoundPathArgs {
+                    path: normalize_workspace_path(&args.path, ctx.workspace)?,
+                };
+                workspace_binding(
+                    "list_dir",
+                    ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
+                    &args,
+                )
+            }
+            Self::Glob => {
+                let args: GlobArgs = decode_for_binding(ctx.args)?;
+                let args = BoundGlobArgs {
+                    pattern: normalize_workspace_glob(&args.pattern)?,
+                };
+                workspace_binding(
+                    "glob",
+                    ResourceScope::resource(BINDING_ADAPTER_ID, "glob_selector", &args.pattern),
+                    &args,
+                )
+            }
+            Self::WorkspaceGrep => {
+                let args: WorkspaceGrepArgs = decode_for_binding(ctx.args)?;
+                validate_review_text(&args.pattern, MAX_GREP_PATTERN_BYTES)?;
+                regex::Regex::new(&args.pattern).map_err(|_| DescribeError::InvalidArguments)?;
+                let args = BoundGrepArgs {
+                    path: normalize_workspace_path(&args.path, ctx.workspace)?,
+                    pattern: args.pattern,
+                };
+                workspace_binding(
+                    "grep",
+                    ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
+                    &args,
+                )
+            }
+            _ => Err(DescribeError::InvalidDescriptor {
+                reason: "unpublished foundation tool has no bound adapter".to_owned(),
+            }),
+        }
+    }
+
+    fn bound_operation(
+        self,
+        args: &BoundExecutionArguments,
+        execution_id: String,
+    ) -> Result<(ExecutorOperation, Option<ReadContext>), ToolError> {
+        let operation = match self {
+            Self::WorkspaceReadFile => {
+                let args: BoundReadFileArgs = decode_bound(args)?;
+                ExecutorOperation::ReadFile {
+                    path: args.path,
+                    offset: args.offset,
+                    limit: args.limit,
+                    execution_id,
+                }
+            }
+            Self::ListDir => {
+                let args: BoundPathArgs = decode_bound(args)?;
+                ExecutorOperation::ListDir {
+                    path: args.path,
+                    execution_id,
+                }
+            }
+            Self::Glob => {
+                let args: BoundGlobArgs = decode_bound(args)?;
+                ExecutorOperation::Glob {
+                    pattern: args.pattern,
+                    execution_id,
+                }
+            }
+            Self::WorkspaceGrep => {
+                let args: BoundGrepArgs = decode_bound(args)?;
+                ExecutorOperation::Grep {
+                    path: args.path,
+                    pattern: args.pattern,
+                    execution_id,
+                }
+            }
+            _ => {
+                return Err(ToolError::Protocol(
+                    "executor tool has no bound-operation adapter".to_owned(),
+                ));
+            }
+        };
+        let read_context = self.read_context(&operation);
+        Ok((operation, read_context))
+    }
+
     fn operation(
         self,
         args: &ValidatedToolArguments,
@@ -406,6 +587,147 @@ fn definition<P: JsonSchema>(name: &str, description: &str) -> ToolDefinition {
 fn decode<P: DeserializeOwned>(args: &ValidatedToolArguments) -> Result<P, ToolError> {
     serde_json::from_value(Value::Object(args.as_object().clone()))
         .map_err(|_| ToolError::InvalidArguments)
+}
+
+fn decode_for_binding<P: DeserializeOwned>(
+    args: &ValidatedToolArguments,
+) -> Result<P, DescribeError> {
+    serde_json::from_value(Value::Object(args.as_object().clone()))
+        .map_err(|_| DescribeError::InvalidArguments)
+}
+
+fn decode_bound<P: DeserializeOwned>(args: &BoundExecutionArguments) -> Result<P, ToolError> {
+    serde_json::from_value(Value::Object(args.as_object().clone()))
+        .map_err(|_| ToolError::InvalidArguments)
+}
+
+fn workspace_binding<P: Serialize>(
+    operation: &str,
+    scope: ResourceScope,
+    args: &P,
+) -> Result<ToolBinding, DescribeError> {
+    let execution =
+        serde_json::to_value(args).map_err(|error| DescribeError::InvalidBoundArguments {
+            reason: format!("foundation workspace arguments could not be encoded: {error}"),
+        })?;
+    let Value::Object(execution_object) = execution else {
+        return Err(DescribeError::InvalidBoundArguments {
+            reason: "foundation workspace arguments must encode as an object".to_owned(),
+        });
+    };
+    let mut review = execution_object.clone();
+    review.insert("operation".to_owned(), Value::String(operation.to_owned()));
+    Ok(ToolBinding::new(
+        AppActionDescriptor::new(operation, CapabilityClass::Read, vec![scope])?,
+        ReviewProjection::from_value(Value::Object(review))?,
+        BoundExecutionArguments::from_value(Value::Object(execution_object))?,
+    ))
+}
+
+fn validate_review_text(value: &str, max_bytes: usize) -> Result<(), DescribeError> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(DescribeError::InvalidArguments);
+    }
+    Ok(())
+}
+
+fn validate_workspace_selector(value: &str, max_bytes: usize) -> Result<(), DescribeError> {
+    validate_review_text(value, max_bytes)?;
+    if value.starts_with("artifact://") {
+        return Err(DescribeError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// Bind a UTF-8 display path to one stable lexical pathname in the fixed
+/// executor workspace. This deliberately performs no filesystem lookup: the
+/// executor remains responsible for `openat2`/no-symlink enforcement when the
+/// operation is eventually run.
+fn normalize_workspace_path(
+    input: &str,
+    workspace: &WorkspacePaths,
+) -> Result<String, DescribeError> {
+    validate_workspace_selector(input, MAX_WORKSPACE_PATH_BYTES)?;
+    let candidate = Path::new(input);
+    let relative = if candidate.is_absolute() {
+        let root = normalize_absolute_workspace_root(workspace.root())?;
+        let absolute = normalize_absolute_candidate(candidate)?;
+        absolute
+            .strip_prefix(&root)
+            .map_err(|_| DescribeError::InvalidArguments)?
+            .to_path_buf()
+    } else {
+        normalize_relative_candidate(candidate)?
+    };
+    path_to_workspace_text(&relative)
+}
+
+fn normalize_absolute_workspace_root(root: &Path) -> Result<PathBuf, DescribeError> {
+    if !root.is_absolute() {
+        return Err(DescribeError::InvalidBoundArguments {
+            reason: "foundation workspace root must be absolute".to_owned(),
+        });
+    }
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| DescribeError::InvalidBoundArguments {
+            reason: "foundation workspace root must be valid UTF-8".to_owned(),
+        })?;
+    if root_text.chars().any(char::is_control) {
+        return Err(DescribeError::InvalidBoundArguments {
+            reason: "foundation workspace root contains a control character".to_owned(),
+        });
+    }
+    normalize_absolute_candidate(root).map_err(|_| DescribeError::InvalidBoundArguments {
+        reason: "foundation workspace root is not lexically normalized".to_owned(),
+    })
+}
+
+fn normalize_absolute_candidate(path: &Path) -> Result<PathBuf, DescribeError> {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(DescribeError::InvalidArguments);
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_relative_candidate(path: &Path) -> Result<PathBuf, DescribeError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(DescribeError::InvalidArguments);
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_to_workspace_text(path: &Path) -> Result<String, DescribeError> {
+    if path.as_os_str().is_empty() {
+        return Ok(".".to_owned());
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or(DescribeError::InvalidArguments)
+}
+
+fn normalize_workspace_glob(input: &str) -> Result<String, DescribeError> {
+    validate_workspace_selector(input, MAX_GLOB_PATTERN_BYTES)?;
+    let normalized = normalize_glob_pattern(input).map_err(|_| DescribeError::InvalidArguments)?;
+    if normalized.is_empty() {
+        Ok(".".to_owned())
+    } else {
+        Ok(normalized)
+    }
 }
 
 fn to_value(value: impl serde::Serialize) -> Result<Value, ToolError> {
@@ -634,7 +956,7 @@ where
 #[serde(deny_unknown_fields)]
 struct WorkspaceReadFileArgs {
     /// A workspace path. `artifact://` handles are not accepted.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 4096))]
     path: String,
     #[serde(default)]
     offset: u64,
@@ -679,7 +1001,7 @@ struct EditFileArgs {
 #[serde(deny_unknown_fields)]
 struct PathArgs {
     /// A workspace path. Artifact handles are not accepted.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 4096))]
     path: String,
 }
 
@@ -687,7 +1009,7 @@ struct PathArgs {
 #[serde(deny_unknown_fields)]
 struct GlobArgs {
     /// A workspace-relative glob pattern. Artifact handles are not accepted.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 4096))]
     pattern: String,
 }
 
@@ -704,9 +1026,36 @@ struct GrepArgs {
 #[serde(deny_unknown_fields)]
 struct WorkspaceGrepArgs {
     /// A workspace path. `artifact://` handles are not accepted.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 4096))]
     path: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 16384))]
+    pattern: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundReadFileArgs {
+    path: String,
+    offset: u64,
+    limit: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundPathArgs {
+    path: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundGlobArgs {
+    pattern: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundGrepArgs {
+    path: String,
     pattern: String,
 }
 
@@ -737,6 +1086,7 @@ mod tests {
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
+    use crate::provider::types::ToolCall;
     use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
@@ -844,6 +1194,14 @@ mod tests {
 
     fn validated(value: Value) -> ValidatedToolArguments {
         serde_json::from_value(value).unwrap()
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: validated(arguments),
+        }
     }
 
     fn text(output: &ToolOutput) -> &str {
@@ -1573,8 +1931,8 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn production_registry_binds_the_clients_complete_rpc_identity() {
+    #[tokio::test]
+    async fn production_registry_binds_the_clients_complete_rpc_identity() {
         let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
         let registry = remote_executor_registry(Arc::new(ExecutorClient::new(
             "/tmp/sumi-unused-executor.sock",
@@ -1644,6 +2002,417 @@ mod tests {
             glob.parameters["properties"]["pattern"]["description"],
             "A workspace-relative glob pattern. Artifact handles are not accepted."
         );
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        for (name, arguments) in [
+            ("read_file", json!({"path":"src/lib.rs"})),
+            ("list_dir", json!({"path":"src"})),
+            ("glob", json!({"pattern":"src/**/*.rs"})),
+            ("grep", json!({"path":"src","pattern":"mod"})),
+        ] {
+            let sealed = registry
+                .bind(
+                    &tool_call("production-binder", name, arguments),
+                    "flow-production-binder",
+                    &workspace,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                sealed.invocation().adapter,
+                AdapterIdentity::new(BINDING_ADAPTER_ID, 1).unwrap(),
+                "{name} must be bindable before its definition is exposed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_bindings_freeze_exact_normalized_operations_without_bind_rpc() {
+        let fake = Arc::new(FakeInvoker::default());
+        fake.responses.lock().unwrap().extend([
+            Ok(ExecutorResponse::ReadFile {
+                result: truncation("bound read"),
+            }),
+            Ok(ExecutorResponse::Listed {
+                entries: vec!["lib.rs".to_owned()],
+            }),
+            Ok(ExecutorResponse::Globbed {
+                paths: vec!["src/lib.rs".to_owned()],
+            }),
+            Ok(ExecutorResponse::Grepped { matches: vec![] }),
+        ]);
+        let registry = bound_test_registry_from_invoker(fake.clone()).unwrap();
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        let cases = [
+            (
+                "read_file",
+                json!({"path":"/workspace/src/./lib.rs"}),
+                json!({"path":"src/lib.rs","offset":0,"limit":51200}),
+            ),
+            (
+                "list_dir",
+                json!({"path":"./src//."}),
+                json!({"path":"src"}),
+            ),
+            (
+                "glob",
+                json!({"pattern":"./src/**/*.rs"}),
+                json!({"pattern":"src/**/*.rs"}),
+            ),
+            (
+                "grep",
+                json!({"path":"/workspace/src","pattern":"foo|bar"}),
+                json!({"path":"src","pattern":"foo|bar"}),
+            ),
+        ];
+
+        for (index, (name, proposal, expected_arguments)) in cases.into_iter().enumerate() {
+            let sealed = registry
+                .bind(
+                    &tool_call(&format!("bound-{index}"), name, proposal),
+                    "flow-bound",
+                    &workspace,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                fake.operations.lock().unwrap().len(),
+                index,
+                "binding {name} must not contact the executor"
+            );
+            assert_eq!(
+                Value::Object(sealed.invocation().execution_arguments.as_object().clone()),
+                expected_arguments
+            );
+            let mut expected_review = expected_arguments.as_object().unwrap().clone();
+            expected_review.insert("operation".to_owned(), Value::String(name.to_owned()));
+            assert_eq!(
+                sealed.invocation().review_projection.as_object(),
+                &expected_review
+            );
+            assert_eq!(
+                sealed.invocation().descriptor.capability,
+                CapabilityClass::Read
+            );
+            let (scope_kind, scope_id) = if name == "glob" {
+                (
+                    "glob_selector",
+                    expected_arguments["pattern"].as_str().unwrap(),
+                )
+            } else {
+                ("path", expected_arguments["path"].as_str().unwrap())
+            };
+            assert_eq!(
+                sealed.invocation().descriptor.resource_scopes,
+                vec![ResourceScope::resource(
+                    BINDING_ADAPTER_ID,
+                    scope_kind,
+                    scope_id
+                )]
+            );
+            assert_eq!(
+                sealed.invocation().adapter,
+                AdapterIdentity::new(BINDING_ADAPTER_ID, 1).unwrap()
+            );
+
+            let outcome = registry
+                .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+                .await
+                .unwrap();
+            assert!(
+                outcome.live_post_commit.is_none(),
+                "foundation reads must not produce process-local post-commit work"
+            );
+            assert_eq!(
+                fake.operations.lock().unwrap().len(),
+                index + 1,
+                "executing {name} must make exactly one executor call"
+            );
+        }
+
+        let operations = fake.operations.lock().unwrap();
+        assert!(matches!(
+            &operations[0],
+            ExecutorOperation::ReadFile { path, offset: 0, limit: 51200, .. }
+                if path == "src/lib.rs"
+        ));
+        assert!(matches!(
+            &operations[1],
+            ExecutorOperation::ListDir { path, .. } if path == "src"
+        ));
+        assert!(matches!(
+            &operations[2],
+            ExecutorOperation::Glob { pattern, .. } if pattern == "src/**/*.rs"
+        ));
+        assert!(matches!(
+            &operations[3],
+            ExecutorOperation::Grep { path, pattern, .. }
+                if path == "src" && pattern == "foo|bar"
+        ));
+    }
+
+    #[test]
+    fn workspace_binding_normalization_is_lexical_utf8_and_workspace_scoped() {
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        for (input, expected) in [
+            (".", "."),
+            ("./src//lib.rs", "src/lib.rs"),
+            ("/workspace", "."),
+            ("/workspace/src/界.rs", "src/界.rs"),
+            (r"literal\backslash.txt", r"literal\backslash.txt"),
+        ] {
+            assert_eq!(
+                normalize_workspace_path(input, &workspace).unwrap(),
+                expected
+            );
+        }
+
+        for input in [
+            "",
+            "..",
+            "src/../secret",
+            "/outside/workspace",
+            "/workspace-other/file",
+            "artifact://owner/tool-output/id",
+            "nul\0byte",
+            "line\nbreak",
+        ] {
+            assert!(
+                normalize_workspace_path(input, &workspace).is_err(),
+                "{input:?} must be rejected"
+            );
+        }
+        assert!(
+            normalize_workspace_path(&"x".repeat(MAX_WORKSPACE_PATH_BYTES + 1), &workspace)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn glob_binding_reuses_executor_normalization_and_rejects_unreviewable_selectors() {
+        for (input, expected) in [
+            ("**/*.rs", "**/*.rs"),
+            ("./src/./*.rs", "src/*.rs"),
+            (".", "."),
+        ] {
+            assert_eq!(normalize_workspace_glob(input).unwrap(), expected);
+            assert_eq!(
+                normalize_glob_pattern(&normalize_workspace_glob(input).unwrap()).unwrap(),
+                normalize_glob_pattern(input).unwrap()
+            );
+        }
+        for input in [
+            "",
+            "/workspace/*.rs",
+            "../*.rs",
+            "src/../*.rs",
+            "artifact://owner/tool-output/id",
+            "line\nbreak",
+        ] {
+            assert!(normalize_workspace_glob(input).is_err(), "{input:?}");
+        }
+        assert!(normalize_workspace_glob(&"*".repeat(MAX_GLOB_PATTERN_BYTES + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn grep_binding_validates_regex_and_bounds_without_executor_rpc() {
+        let fake = Arc::new(FakeInvoker::default());
+        let registry = bound_test_registry_from_invoker(fake.clone()).unwrap();
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        for (call_id, pattern) in [
+            ("invalid-regex", "[".to_owned()),
+            ("control-regex", "line\nbreak".to_owned()),
+            ("oversized-regex", "x".repeat(MAX_GREP_PATTERN_BYTES + 1)),
+        ] {
+            let result = registry
+                .bind(
+                    &tool_call(call_id, "grep", json!({"path":"src","pattern":pattern})),
+                    "flow-grep-validation",
+                    &workspace,
+                )
+                .await;
+            assert!(matches!(result, Err(DescribeError::InvalidArguments)));
+        }
+        registry
+            .bind(
+                &tool_call(
+                    "literal-artifact-regex",
+                    "grep",
+                    json!({"path":"src","pattern":"artifact://"}),
+                ),
+                "flow-grep-validation",
+                &workspace,
+            )
+            .await
+            .expect("artifact URI text is regex content here, not a target URI");
+        assert!(fake.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_absolute_selector_is_rejected_before_sealing_without_rpc() {
+        let fake = Arc::new(FakeInvoker::default());
+        let registry = bound_test_registry_from_invoker(fake.clone()).unwrap();
+        let bound_workspace = WorkspacePaths::new("/workspace-a").unwrap();
+        let result = registry
+            .bind(
+                &tool_call(
+                    "cross-root",
+                    "read_file",
+                    json!({"path":"/workspace-b/private.txt"}),
+                ),
+                "flow-cross-root",
+                &bound_workspace,
+            )
+            .await;
+        assert!(matches!(result, Err(DescribeError::InvalidArguments)));
+        assert!(fake.operations.lock().unwrap().is_empty());
+
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "bound-root",
+                    "read_file",
+                    json!({"path":"/workspace-a/private.txt"}),
+                ),
+                "flow-cross-root",
+                &bound_workspace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            Value::Object(sealed.invocation().execution_arguments.as_object().clone()),
+            json!({"path":"private.txt","offset":0,"limit":51200})
+        );
+        assert!(
+            !serde_json::to_string(sealed.invocation())
+                .unwrap()
+                .contains("workspace-a"),
+            "the absolute workspace root must not leak into durable evidence"
+        );
+
+        let other_workspace = WorkspacePaths::new("/workspace-b").unwrap();
+        let other_sealed = registry
+            .bind(
+                &tool_call("other-root", "read_file", json!({"path":"private.txt"})),
+                "flow-cross-root",
+                &other_workspace,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            sealed
+                .invocation()
+                .execution_identity
+                .workspace_digest
+                .as_bytes(),
+            other_sealed
+                .invocation()
+                .execution_identity
+                .workspace_digest
+                .as_bytes(),
+            "one relative selector under different workspace roots must have different identities"
+        );
+        assert_ne!(
+            sealed.invocation().descriptor_digest.as_bytes(),
+            other_sealed.invocation().descriptor_digest.as_bytes(),
+            "review and approval evidence must remain workspace-bound"
+        );
+        assert!(fake.operations.lock().unwrap().is_empty());
+    }
+
+    struct UnboundProductionExtra;
+
+    #[async_trait]
+    impl Tool for UnboundProductionExtra {
+        fn def(&self) -> ToolDefinition {
+            definition::<PathArgs>("unbound_extra", "must fail production composition")
+        }
+
+        fn risk(&self) -> ToolRisk {
+            ToolRisk::ReadOnly
+        }
+
+        async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+            unreachable!("production completeness test does not execute the fixture")
+        }
+    }
+
+    #[test]
+    fn production_composition_rejects_an_injected_unbound_tool() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let result = remote_executor_registry_with_tools(
+            Arc::new(ExecutorClient::new(
+                "/tmp/sumi-unused-executor.sock",
+                identity,
+            )),
+            [Arc::new(UnboundProductionExtra) as Arc<dyn Tool>],
+        );
+        assert!(
+            matches!(result, Err(ToolError::Protocol(message)) if message.contains("unbound_extra"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unpublished_executor_tools_remain_unbound_and_out_of_production() {
+        let broad = registry_from_invoker(Arc::new(FakeInvoker::default())).unwrap();
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        for (name, args) in [
+            ("bash", json!({"command":"pwd"})),
+            ("write_file", json!({"path":"a","content":"b"})),
+            (
+                "edit_file",
+                json!({"path":"a","old_string":"b","new_string":"c"}),
+            ),
+            ("delete", json!({"path":"a"})),
+            (
+                "read_file",
+                json!({"path":"artifact://owner/tool-output/id"}),
+            ),
+            (
+                "grep",
+                json!({"path":"artifact://owner/tool-output/id","pattern":"x"}),
+            ),
+        ] {
+            assert!(broad.get(name).unwrap().bound_adapter().is_none());
+            assert!(matches!(
+                broad
+                    .bind(
+                        &tool_call("unpublished", name, args),
+                        "flow-unpublished",
+                        &workspace
+                    )
+                    .await,
+                Err(DescribeError::MissingBoundAdapter { tool }) if tool == name
+            ));
+        }
+        let production = remote_executor_registry(Arc::new(ExecutorClient::new(
+            "/tmp/sumi-unused-executor.sock",
+            RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap(),
+        )))
+        .unwrap();
+        for name in ["bash", "write_file", "edit_file", "delete"] {
+            assert!(production.get(name).is_none());
+        }
+        for (name, arguments) in [
+            (
+                "read_file",
+                json!({"path":"artifact://owner/tool-output/id"}),
+            ),
+            (
+                "grep",
+                json!({"path":"artifact://owner/tool-output/id","pattern":"x"}),
+            ),
+        ] {
+            assert!(matches!(
+                production
+                    .bind(
+                        &tool_call("artifact-unpublished", name, arguments),
+                        "flow-artifact-unpublished",
+                        &workspace
+                    )
+                    .await,
+                Err(DescribeError::InvalidArguments)
+            ));
+        }
     }
 
     #[tokio::test]
