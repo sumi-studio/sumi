@@ -6,9 +6,8 @@ import {
   MessageMetadata,
   MessageResponse,
 } from "@sumi/ui/ai-elements/message";
-import { Button } from "@sumi/ui/components/button";
 import { Marker, MarkerContent } from "@sumi/ui/components/marker";
-import { useCallback, useId, useState } from "react";
+import { useCallback } from "react";
 import type { ChatItem } from "../agent/model";
 import { ApprovalConfirmation } from "./approval-confirmation";
 import { WorkSummary } from "./work-summary";
@@ -33,12 +32,6 @@ export function ChatItemView({
   onWorkSummaryOpen,
   onRichContentReady,
 }: ChatItemViewProps) {
-  const [revealed, setRevealed] = useState(false);
-  const metadataId = useId();
-  const toggleMeta = () => setRevealed((value) => !value);
-  const actionsLabel = revealed
-    ? "メッセージの操作を隠す"
-    : "メッセージの操作を表示";
   const handleRichContentReady = useCallback(
     () => onRichContentReady?.(item.id),
     [item.id, onRichContentReady],
@@ -58,26 +51,12 @@ export function ChatItemView({
           <MessageContent className="whitespace-pre-wrap">
             {item.text}
           </MessageContent>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            aria-expanded={revealed}
-            aria-controls={metadataId}
-            onClick={toggleMeta}
-            className="h-6 px-1 text-muted-foreground text-xs"
-          >
-            {actionsLabel}
-          </Button>
-          <div id={metadataId} hidden={!revealed}>
-            <MessageMetadata
-              timestamp={item.timestamp}
-              copyText={item.text}
-              align="right"
-              revealed={revealed}
-              className="pr-1"
-            />
-          </div>
+          <MessageMetadata
+            timestamp={item.timestamp}
+            copyText={item.text}
+            align="right"
+            className="pr-1"
+          />
           {item.delivery === "pending" && (
             <span className="pr-1 text-neutral-400 text-xs">送信中…</span>
           )}
@@ -103,28 +82,12 @@ export function ChatItemView({
             </MessageResponse>
           </MessageContent>
           {!item.streaming && item.agentMessageFinal && (
-            <>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                aria-expanded={revealed}
-                aria-controls={metadataId}
-                onClick={toggleMeta}
-                className="h-6 w-fit px-1 text-muted-foreground text-xs"
-              >
-                {actionsLabel}
-              </Button>
-              <div id={metadataId} hidden={!revealed}>
-                <MessageMetadata
-                  timestamp={item.timestamp}
-                  copyText={agentMessageCopyText ?? item.text}
-                  copyFirst
-                  copyAlwaysVisible={copyAlwaysVisible}
-                  revealed={revealed}
-                />
-              </div>
-            </>
+            <MessageMetadata
+              timestamp={item.timestamp}
+              copyText={agentMessageCopyText ?? item.text}
+              copyFirst
+              copyAlwaysVisible={copyAlwaysVisible}
+            />
           )}
         </Message>
       );

@@ -1,6 +1,8 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  type PointerEvent as ReactPointerEvent,
   type Ref,
   useCallback,
   useEffect,
@@ -52,6 +54,12 @@ export interface ConversationVirtualizerProps<
   estimateSize?: (item: TItem, index: number) => number;
   overscan?: number;
   scrollEndThreshold?: number;
+  /**
+   * Space kept below the last row, inside the scroll range. Prefer this over
+   * a trailing spacer item: a constant trailing key hides appends from the
+   * virtualizer's end-follow detection.
+   */
+  paddingEnd?: number;
   busy?: boolean;
   ariaLabel?: string;
   className?: string;
@@ -63,6 +71,17 @@ export interface ConversationVirtualizerProps<
 const DEFAULT_ESTIMATED_ITEM_SIZE = 96;
 const DEFAULT_OVERSCAN = 6;
 const DEFAULT_SCROLL_END_THRESHOLD = 80;
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
+const INTERACTIVE_SELECTOR =
+  'button, a[href], input, textarea, select, summary, [contenteditable]:not([contenteditable="false"])';
 
 export function ConversationVirtualizer<
   TItem extends ConversationVirtualizerItem,
@@ -75,6 +94,7 @@ export function ConversationVirtualizer<
   estimateSize,
   overscan = DEFAULT_OVERSCAN,
   scrollEndThreshold = DEFAULT_SCROLL_END_THRESHOLD,
+  paddingEnd = 0,
   busy = false,
   ariaLabel = "Sumiとの会話",
   className,
@@ -92,10 +112,9 @@ export function ConversationVirtualizer<
   const transcriptDialogRef = useRef<HTMLDivElement>(null);
   const transcriptCloseRef = useRef<HTMLButtonElement>(null);
   const transcriptWasOpenRef = useRef(false);
-  const programmaticScrollRef = useRef({
-    cancelled: false,
-    target: null as number | null,
-  });
+  const flightRef = useRef({ active: false, startedAt: 0 });
+  const followRef = useRef(true);
+  const lastGestureAtRef = useRef(0);
   const [transcriptOpen, setTranscriptOpen] = useState(false);
 
   itemsRef.current = items;
@@ -120,23 +139,15 @@ export function ConversationVirtualizer<
     anchorTo: "end",
     followOnAppend: true,
     scrollEndThreshold,
+    paddingEnd,
     overscan,
     useFlushSync: false,
-    scrollToFn: (offset, { adjustments, behavior }) => {
-      const viewport = viewportRef.current;
-      if (!viewport || programmaticScrollRef.current.cancelled) return;
-      const target = offset + (adjustments ?? 0);
-      programmaticScrollRef.current.target = target;
-      viewport.scrollTo({
-        top: target,
-        behavior: behavior === "instant" ? "auto" : behavior,
-      });
-    },
   });
 
   const scrollToEnd = useCallback(
     (options?: Pick<ConversationScrollOptions, "behavior">) => {
-      programmaticScrollRef.current.cancelled = false;
+      followRef.current = true;
+      flightRef.current = { active: true, startedAt: performance.now() };
       virtualizer.scrollToEnd(options);
     },
     [virtualizer],
@@ -145,12 +156,27 @@ export function ConversationVirtualizer<
     (id: string, options?: ConversationScrollOptions) => {
       const index = itemsRef.current.findIndex((item) => item.id === id);
       if (index < 0) return false;
-      programmaticScrollRef.current.cancelled = false;
+      followRef.current = false;
+      flightRef.current = { active: true, startedAt: performance.now() };
       virtualizer.scrollToIndex(index, options);
       return true;
     },
     [virtualizer],
   );
+  // A real user gesture must win over an in-flight programmatic scroll.
+  // The virtualizer keeps reconciling toward its last target for seconds,
+  // and any counter-write of ours would race the gesture, so the flight is
+  // cancelled by clearing the reconcile target itself. Writes are never
+  // dropped: dropped writes desynchronize the virtualizer's internal offset
+  // from the real one, which later teleports the viewport.
+  const interruptProgrammaticScroll = useCallback(() => {
+    followRef.current = false;
+    lastGestureAtRef.current = performance.now();
+    flightRef.current = { active: false, startedAt: 0 };
+    // virtual-core@3.17 exposes no public cancel; scrollState is the
+    // documented-by-source reconcile target and clearing it ends the flight.
+    (virtualizer as unknown as { scrollState: unknown }).scrollState = null;
+  }, [virtualizer]);
 
   useImperativeHandle(
     ref,
@@ -160,7 +186,10 @@ export function ConversationVirtualizer<
       scrollToMessage,
       getScrollOffset: () => viewportRef.current?.scrollTop ?? null,
       scrollToOffset: (offset: number) => {
-        programmaticScrollRef.current.cancelled = false;
+        // Scroll restoration lands mid-history; the follow backstop must
+        // not pull the view back to the end afterwards. It re-arms by
+        // itself when the restored position is the end.
+        followRef.current = false;
         viewportRef.current?.scrollTo({ top: offset, behavior: "auto" });
       },
       getScrollElement: () => viewportRef.current,
@@ -177,8 +206,35 @@ export function ConversationVirtualizer<
   useLayoutEffect(() => {
     if (didInitialEndAnchorRef.current || items.length === 0) return;
     didInitialEndAnchorRef.current = true;
-    virtualizer.scrollToEnd();
-  }, [items.length, virtualizer]);
+    scrollToEnd();
+  }, [items.length, scrollToEnd]);
+
+  // Follow-mode backstop. The virtualizer's own end-follow reacts to size
+  // changes only within its threshold and loses the end during fast
+  // streaming growth. While the user hasn't scrolled away, re-pin to the
+  // end whenever a render leaves the viewport behind it. Skipped during a
+  // programmatic flight so a smooth scroll isn't degraded to a snap; the
+  // flight ends on arrival, on a user gesture, or after a stale timeout.
+  useLayoutEffect(() => {
+    if (items.length === 0) return;
+    if (virtualizer.isAtEnd()) {
+      // A gesture event fires before its scroll movement lands, so being at
+      // the end right now doesn't mean the user wants to stay there. Only
+      // re-arm following once the gestures have gone quiet.
+      if (performance.now() - lastGestureAtRef.current > 300) {
+        followRef.current = true;
+      }
+      flightRef.current = { active: false, startedAt: 0 };
+      return;
+    }
+    const flightIsActive =
+      flightRef.current.active &&
+      performance.now() - flightRef.current.startedAt < 1_600;
+    if (followRef.current && !flightIsActive) {
+      flightRef.current = { active: true, startedAt: performance.now() };
+      virtualizer.scrollToEnd({ behavior: "auto" });
+    }
+  });
 
   const virtualItems = virtualizer.getVirtualItems();
   const virtualItemIds = virtualItems.map(
@@ -231,7 +287,6 @@ export function ConversationVirtualizer<
 
   const handleViewportScrollCapture = () => {
     const viewport = viewportRef.current;
-    const target = programmaticScrollRef.current.target;
     if (!viewport) return;
     const active = document.activeElement;
     const focusedRow =
@@ -243,20 +298,30 @@ export function ConversationVirtualizer<
       // before that rerender rather than letting React remove its control.
       viewport.focus({ preventScroll: true });
     }
-    if (target === null) return;
-    const maxOffset = Math.max(
-      viewport.scrollHeight - viewport.clientHeight,
-      0,
-    );
-    if (Math.abs(viewport.scrollTop - maxOffset) <= scrollEndThreshold) {
-      programmaticScrollRef.current.cancelled = false;
+  };
+
+  const handleViewportKeyDownCapture = (
+    event: ReactKeyboardEvent<HTMLElement>,
+  ) => {
+    if (!SCROLL_KEYS.has(event.key)) return;
+    if (
+      event.target instanceof Element &&
+      event.target.closest(INTERACTIVE_SELECTOR)
+    ) {
       return;
     }
-    if (Math.abs(viewport.scrollTop - target) > 2) {
-      // A real divergent gesture wins over a stale virtualizer reconciliation
-      // frame. Future automatic writes are ignored until the user reaches the
-      // end or explicitly asks to navigate.
-      programmaticScrollRef.current.cancelled = true;
+    interruptProgrammaticScroll();
+  };
+
+  const handleViewportPointerDownCapture = (
+    event: ReactPointerEvent<HTMLElement>,
+  ) => {
+    const viewport = event.currentTarget;
+    if (
+      event.target === viewport &&
+      event.nativeEvent.offsetX >= viewport.clientWidth
+    ) {
+      interruptProgrammaticScroll();
     }
   };
 
@@ -278,6 +343,10 @@ export function ConversationVirtualizer<
         aria-label={`${ariaLabel}（表示中）`}
         aria-busy={busy}
         onScrollCapture={handleViewportScrollCapture}
+        onWheelCapture={interruptProgrammaticScroll}
+        onTouchMoveCapture={interruptProgrammaticScroll}
+        onPointerDownCapture={handleViewportPointerDownCapture}
+        onKeyDownCapture={handleViewportKeyDownCapture}
         className={className}
         style={{
           height: "100%",
