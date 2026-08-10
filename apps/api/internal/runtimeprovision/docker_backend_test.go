@@ -199,6 +199,7 @@ func TestExecCommandRunnerBoundsInheritedPipeAndKillsProcessGroup(t *testing.T) 
 func TestExecCommandRunnerHonorsCleanupBoundForDetachedSession(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
+	nestedReadyPath := filepath.Join(dir, "nested-ready")
 	cleanedPath := filepath.Join(dir, "cleaned")
 	pidPath := filepath.Join(dir, "nested-pid")
 	scriptPath := filepath.Join(dir, "supervisor.sh")
@@ -206,8 +207,12 @@ func TestExecCommandRunnerHonorsCleanupBoundForDetachedSession(t *testing.T) {
 set -eu
 printf 'cleanup-bound-ms 600\n' >&3
 trap 'sleep 0.2; kill -TERM -- "-${nested}"; wait "${nested}" || true; printf "nested-done %s\n" "${nested}" >&3; printf cleaned >"${CLEANED_PATH}"; exit 143' TERM
-setsid /bin/bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' 3>&- &
+setsid /bin/bash -c 'trap "exit 0" TERM; printf ready >"${NESTED_READY_PATH}"; while :; do sleep 1; done' 3>&- &
 nested=$!
+while [[ ! -f "${NESTED_READY_PATH}" ]]; do
+  kill -0 "${nested}" 2>/dev/null || { wait "${nested}"; exit $?; }
+  sleep 0.005
+done
 printf 'nested-start %s\n' "${nested}" >&3
 printf '%s' "${nested}" >"${PID_PATH}"
 printf ready >"${READY_PATH}"
@@ -226,6 +231,7 @@ while :; do sleep 1; done
 			[]string{
 				"PATH=/usr/bin:/bin",
 				"READY_PATH=" + readyPath,
+				"NESTED_READY_PATH=" + nestedReadyPath,
 				"CLEANED_PATH=" + cleanedPath,
 				"PID_PATH=" + pidPath,
 			},
@@ -256,14 +262,19 @@ while :; do sleep 1; done
 func TestExecCommandRunnerKillsTrackedDetachedSessionAfterCleanupBound(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
+	nestedReadyPath := filepath.Join(dir, "nested-ready")
 	pidPath := filepath.Join(dir, "nested-pid")
 	scriptPath := filepath.Join(dir, "stuck-supervisor.sh")
 	script := `#!/bin/bash
 set -eu
 printf 'cleanup-bound-ms 100\n' >&3
 trap '' TERM
-setsid /bin/bash -c 'trap "" TERM; while :; do sleep 1; done' 3>&- &
+setsid /bin/bash -c 'trap "" TERM; printf ready >"${NESTED_READY_PATH}"; while :; do sleep 1; done' 3>&- &
 nested=$!
+while [[ ! -f "${NESTED_READY_PATH}" ]]; do
+  kill -0 "${nested}" 2>/dev/null || { wait "${nested}"; exit $?; }
+  sleep 0.005
+done
 printf 'nested-start %s\n' "${nested}" >&3
 printf '%s' "${nested}" >"${PID_PATH}"
 printf ready >"${READY_PATH}"
@@ -279,7 +290,12 @@ while :; do sleep 1; done
 			ctx,
 			scriptPath,
 			nil,
-			[]string{"PATH=/usr/bin:/bin", "READY_PATH=" + readyPath, "PID_PATH=" + pidPath},
+			[]string{
+				"PATH=/usr/bin:/bin",
+				"READY_PATH=" + readyPath,
+				"NESTED_READY_PATH=" + nestedReadyPath,
+				"PID_PATH=" + pidPath,
+			},
 		)
 		result <- err
 	}()

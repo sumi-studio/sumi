@@ -382,6 +382,23 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 		_ = store.Close()
 		t.Fatal("browser socket was not retained by the gateway")
 	}
+	// Active means the hijacked handler owns the connection; it does not mean
+	// the hello response has reached the client. Consume that response before
+	// shutdown so the next successful read cannot be a frame queued before
+	// Close.
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	var status struct {
+		Type   string `json:"type"`
+		Status string `json:"status"`
+	}
+	if err := conn.ReadJSON(&status); err != nil {
+		_ = store.Close()
+		t.Fatalf("read browser status before shutdown: %v", err)
+	}
+	if status.Type != "direct_chat_status" || status.Status != "unavailable" {
+		_ = store.Close()
+		t.Fatalf("browser status before shutdown = %+v", status)
+	}
 
 	app := &application{store: store, browser: browser}
 	if err := app.Close(); err != nil {
