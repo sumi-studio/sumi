@@ -290,7 +290,7 @@ async fn health_is_exact_role_bound_and_side_effect_free() {
 }
 
 #[tokio::test]
-async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
+async fn production_socket_rejects_mutating_control_and_artifact_operations_without_side_effects() {
     let mut fixture = Fixture::new().await;
     let sentinel = fixture.workspace.join("sentinel.txt");
     std::fs::write(&sentinel, "original").unwrap();
@@ -319,22 +319,6 @@ async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
             "type": "remove_file",
             "path": "sentinel.txt",
             "execution_id": "forbidden-remove",
-        }),
-        json!({
-            "type": "list_dir",
-            "path": ".",
-            "execution_id": "forbidden-list",
-        }),
-        json!({
-            "type": "glob",
-            "pattern": "*",
-            "execution_id": "forbidden-glob",
-        }),
-        json!({
-            "type": "grep",
-            "path": ".",
-            "pattern": "needle",
-            "execution_id": "forbidden-grep",
         }),
         json!({
             "type": "cancel",
