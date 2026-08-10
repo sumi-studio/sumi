@@ -51,19 +51,23 @@ export function MemberList() {
                     </span>
                   ) : null}
                 </span>
-                <span
-                  className={`block truncate text-[11px] ${
-                    failedKey === key
-                      ? "text-rose-500"
-                      : "text-muted-foreground"
-                  }`}
-                >
-                  {failedKey === key
-                    ? "DMを開始できませんでした。もう一度押してください"
-                    : status?.note
-                      ? status.note
-                      : member.tagline}
-                </span>
+                {failedKey === key ? (
+                  <span
+                    role="alert"
+                    aria-live="assertive"
+                    className="block truncate text-[11px] text-rose-500"
+                  >
+                    DMを開始できませんでした。もう一度押してください
+                  </span>
+                ) : (
+                  <span className="block truncate text-[11px] text-muted-foreground">
+                    {pendingKey === key
+                      ? "DMを開始しています…"
+                      : status?.note
+                        ? status.note
+                        : member.tagline}
+                  </span>
+                )}
               </span>
             </>
           );
@@ -82,6 +86,8 @@ export function MemberList() {
               key={key}
               type="button"
               title={`${member.displayName}にDMを送る`}
+              aria-label={`${member.displayName}にDMを送る`}
+              aria-busy={pendingKey === key}
               disabled={pendingKey !== null}
               onClick={async () => {
                 setPendingKey(key);

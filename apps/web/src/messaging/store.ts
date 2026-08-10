@@ -834,10 +834,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
     async startDM(participants) {
       const [first] = participants;
       if (!first) throw new Error("participants are required");
+      const currentBackend = backend;
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
       const dm =
         participants.length === 1
-          ? await backend.ensureDM(first)
-          : await backend.createGroupDM(participants);
+          ? await currentBackend.ensureDM(first)
+          : await currentBackend.createGroupDM(participants);
+      if (
+        backend !== currentBackend ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during DM start");
+      }
       set((state) =>
         state.dms.some((entry) => entry.dmId === dm.dmId)
           ? {}
