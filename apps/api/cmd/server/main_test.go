@@ -24,6 +24,7 @@ import (
 	firebaseauth "firebase.google.com/go/v4/auth"
 	"github.com/gorilla/websocket"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 )
 
@@ -517,6 +518,84 @@ func TestNewRouter_RequiresAgentRuntimeStateDir(t *testing.T) {
 	_, err := newRouter()
 	if err == nil || !strings.Contains(err.Error(), "SUMI_AGENT_RUNTIME_STATE_DIR") {
 		t.Fatalf("expected explicit runtime-state directory error, got %v", err)
+	}
+}
+
+func TestHealthAndReadinessAreSeparateContracts(t *testing.T) {
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	mux, err := newRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{path: "/health", wantStatus: http.StatusOK, wantBody: `"status":"alive"`},
+		{path: "/ready", wantStatus: http.StatusOK, wantBody: `"status":"ready"`},
+	} {
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, test.path, nil))
+		if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), test.wantBody) {
+			t.Fatalf("%s response=%d body=%s", test.path, recorder.Code, recorder.Body.String())
+		}
+		if recorder.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s omitted no-store", test.path)
+		}
+	}
+}
+
+func TestReadinessDetectsLostWritableDirectory(t *testing.T) {
+	commandRoot := t.TempDir()
+	runtimeRoot := t.TempDir()
+	t.Setenv("SUMI_COMMAND_LOG_DIR", commandRoot)
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeRoot)
+	app, err := newApplicationFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if err := os.RemoveAll(runtimeRoot); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	app.publicMux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"runtime_state":"failed"`) {
+		t.Fatalf("lost runtime root was not reported: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestReadinessChecksConfiguredProvisionerSocket(t *testing.T) {
+	socketRoot := t.TempDir()
+	socketPath := filepath.Join(socketRoot, "provisioner.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	t.Setenv("SUMI_RUNTIME_PROVISIONER_SOCKET", socketPath)
+	checks := readinessChecks(nil)
+	var provisioner handler.ReadinessCheck
+	for _, check := range checks {
+		if check.Name == "runtime_provisioner" {
+			provisioner = check
+			break
+		}
+	}
+	if provisioner.Check == nil {
+		t.Fatal("configured provisioner check is absent")
+	}
+	if err := provisioner.Check(context.Background()); err != nil {
+		t.Fatalf("live provisioner socket rejected: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisioner.Check(context.Background()); err == nil {
+		t.Fatal("closed provisioner socket reported ready")
 	}
 }
 

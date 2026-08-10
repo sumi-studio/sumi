@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -30,12 +31,37 @@ func TestEmbeddedUpMigrationsSortedAndUnique(t *testing.T) {
 		if strings.TrimSpace(m.content) == "" {
 			t.Fatalf("migration %d (%s) has empty content", m.version, m.name)
 		}
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(m.sha256) {
+			t.Fatalf("migration %d (%s) has invalid sha256 %q", m.version, m.name, m.sha256)
+		}
 	}
 	if migrations[0].version != 1 {
 		t.Fatalf("expected first migration version 1, got %d", migrations[0].version)
 	}
 	if !strings.HasSuffix(migrations[0].name, ".up.sql") {
 		t.Fatalf("expected up migration name, got %q", migrations[0].name)
+	}
+}
+
+func TestEmbeddedMigrationManifestIsDeterministic(t *testing.T) {
+	first, firstDigest, err := EmbeddedMigrationManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondDigest, err := EmbeddedMigrationManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) == 0 || len(first) != len(second) {
+		t.Fatalf("manifest sizes differ: %d and %d", len(first), len(second))
+	}
+	if firstDigest != secondDigest || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(firstDigest) {
+		t.Fatalf("manifest digest is not deterministic SHA-256: %q vs %q", firstDigest, secondDigest)
+	}
+	for index := range first {
+		if first[index] != second[index] {
+			t.Fatalf("manifest entry %d changed: %+v vs %+v", index, first[index], second[index])
+		}
 	}
 }
 
@@ -64,6 +90,88 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 	}
 	if first != second {
 		t.Fatalf("idempotency broken: first=%d second=%d", first, second)
+	}
+	status, err := MigrationManifestStatus(ctx, pool)
+	if err != nil {
+		t.Fatalf("verify manifest: %v", err)
+	}
+	if !status.Ready || len(status.Pending) != 0 || len(status.Applied) != len(status.Expected) {
+		t.Fatalf("unexpected ready manifest status: %+v", status)
+	}
+}
+
+func TestMigrateAdoptsLegacyVersionOnlyRowsOnce(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE schema_migrations (
+			version bigint PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		);
+		INSERT INTO schema_migrations(version) VALUES (1)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("adopt and migrate: %v", err)
+	}
+	status, err := MigrationManifestStatus(ctx, pool)
+	if err != nil || !status.Ready {
+		t.Fatalf("adopted manifest not ready: status=%+v err=%v", status, err)
+	}
+	var nullable string
+	if err := pool.QueryRow(ctx, `
+		SELECT is_nullable
+		FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='schema_migrations' AND column_name='sha256'
+	`).Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != "NO" {
+		t.Fatalf("adopted sha256 column remained nullable: %s", nullable)
+	}
+}
+
+func TestMigrateRejectsChangedAppliedManifest(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("content digest", func(t *testing.T) {
+		if _, err := pool.Exec(ctx,
+			"UPDATE schema_migrations SET sha256=$2 WHERE version=$1",
+			1, strings.Repeat("0", 64),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := VerifyMigrations(ctx, pool); err == nil || !strings.Contains(err.Error(), "manifest mismatch") {
+			t.Fatalf("changed digest was not rejected: %v", err)
+		}
+		if err := Migrate(ctx, pool); err == nil || !strings.Contains(err.Error(), "manifest mismatch") {
+			t.Fatalf("migrate accepted changed digest: %v", err)
+		}
+	})
+}
+
+func TestMigrationManifestStatusRejectsDatabaseOnlyVersion(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO schema_migrations(version, name, sha256) VALUES ($1, $2, $3)",
+		9999, "9999_unknown.up.sql", strings.Repeat("a", 64),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyMigrations(ctx, pool); err == nil || !strings.Contains(err.Error(), "absent from the embedded manifest") {
+		t.Fatalf("database-only version was not rejected: %v", err)
 	}
 }
 
