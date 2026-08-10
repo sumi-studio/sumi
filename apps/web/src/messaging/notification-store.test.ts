@@ -139,7 +139,12 @@ class StubBackend implements MessagingBackend {
   async editMessage(): Promise<void> {}
   async deleteMessage(): Promise<void> {}
   async markRead(): Promise<void> {}
-  async setStatus(): Promise<void> {}
+  async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
+    return { statuses: [], replyLaterMarkers: [] };
+  }
+  async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
+    throw new Error("not used");
+  }
   async updateProfile(): Promise<MemberProfile> {
     return { participant: SELF, displayName: "yohaku", tagline: "" };
   }
@@ -156,8 +161,12 @@ class StubBackend implements MessagingBackend {
   async setMemberRoles(): Promise<RoleAssignment> {
     return { participant: SELF, roleIds: [] };
   }
-  async createReplyLater(): Promise<void> {}
-  async resolveReplyLater(): Promise<void> {}
+  async createReplyLater(): ReturnType<MessagingBackend["createReplyLater"]> {
+    throw new Error("not used");
+  }
+  async resolveReplyLater(): ReturnType<MessagingBackend["resolveReplyLater"]> {
+    throw new Error("not used");
+  }
   async toggleReaction(): Promise<void> {}
   async setNotificationSetting(
     input: NotificationSettingInput,

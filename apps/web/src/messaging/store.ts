@@ -223,6 +223,25 @@ function unreadContribution(
 }
 
 let initialized = false;
+let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+type PresenceServerEvent = Extract<
+  ServerEvent,
+  {
+    type:
+      | "status_updated"
+      | "status_cleared"
+      | "reply_later_created"
+      | "reply_later_resolved";
+  }
+>;
+let presenceResyncGeneration = 0;
+let pendingPresenceResync: {
+  generation: number;
+  events: PresenceServerEvent[];
+} | null = null;
+
+/** Bound long-lived timers and re-evaluate the nearest deadline periodically. */
+const STATUS_EXPIRY_MAX_DELAY_MS = 60 * 60_000;
 
 type NotificationSettingState = Pick<
   MessagingState,
@@ -305,6 +324,127 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+
+  const withoutExpired = (
+    statuses: Record<ParticipantKey, ParticipantStatus>,
+    now: number,
+  ): Record<ParticipantKey, ParticipantStatus> => {
+    const live: Record<ParticipantKey, ParticipantStatus> = {};
+    let dropped = false;
+    for (const [key, status] of Object.entries(statuses)) {
+      if (status.expiresAt !== null && status.expiresAt <= now) {
+        dropped = true;
+        continue;
+      }
+      live[key] = status;
+    }
+    return dropped ? live : statuses;
+  };
+
+  const scheduleStatusExpiry = () => {
+    if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+    statusExpiryTimer = null;
+    let nearest: number | null = null;
+    for (const status of Object.values(get().statusByKey)) {
+      if (status.expiresAt === null) continue;
+      if (nearest === null || status.expiresAt < nearest) {
+        nearest = status.expiresAt;
+      }
+    }
+    if (nearest === null) return;
+    const delay = Math.min(
+      Math.max(0, nearest - Date.now()),
+      STATUS_EXPIRY_MAX_DELAY_MS,
+    );
+    statusExpiryTimer = setTimeout(() => {
+      statusExpiryTimer = null;
+      set((state) => ({
+        statusByKey: withoutExpired(state.statusByKey, Date.now()),
+      }));
+      scheduleStatusExpiry();
+    }, delay);
+  };
+
+  const statusSnapshot = (statuses: ParticipantStatus[]) => {
+    const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
+    for (const status of statuses) {
+      statusByKey[participantKey(status.participant)] = status;
+    }
+    return withoutExpired(statusByKey, Date.now());
+  };
+
+  const applyStatus = (status: ParticipantStatus) => {
+    set((state) => ({
+      statusByKey: withoutExpired(
+        { ...state.statusByKey, [participantKey(status.participant)]: status },
+        Date.now(),
+      ),
+    }));
+    scheduleStatusExpiry();
+  };
+
+  const clearStatus = (participant: ParticipantRef) => {
+    set((state) => {
+      const key = participantKey(participant);
+      if (!(key in state.statusByKey)) return {};
+      const statusByKey = { ...state.statusByKey };
+      delete statusByKey[key];
+      return { statusByKey };
+    });
+    scheduleStatusExpiry();
+  };
+
+  const applyReplyLater = (marker: ReplyLaterMarker) => {
+    set((state) => {
+      const known = state.replyLaterById[marker.markerId];
+      return {
+        replyLaterById: {
+          ...state.replyLaterById,
+          [marker.markerId]: {
+            ...marker,
+            remindAt: marker.remindAt ?? known?.remindAt ?? null,
+            resolved: marker.resolved || (known?.resolved ?? false),
+          },
+        },
+      };
+    });
+  };
+
+  const resyncPresence = async (
+    sessionBackend: MessagingBackend,
+    sessionIdentity: string | null,
+  ) => {
+    const resync = {
+      generation: ++presenceResyncGeneration,
+      events: [] as PresenceServerEvent[],
+    };
+    pendingPresenceResync = resync;
+    try {
+      const presence = await sessionBackend.fetchPresence();
+      if (
+        backend !== sessionBackend ||
+        messagingSessionIdentity !== sessionIdentity ||
+        pendingPresenceResync !== resync ||
+        presenceResyncGeneration !== resync.generation
+      ) {
+        return;
+      }
+      const replyLaterById: Record<string, ReplyLaterMarker> = {};
+      for (const marker of presence.replyLaterMarkers) {
+        replyLaterById[marker.markerId] = marker;
+      }
+      // Stop buffering before replay, otherwise replay would append to itself.
+      // Events were already shown live; replay restores anything an older
+      // wholesale snapshot would otherwise overwrite.
+      pendingPresenceResync = null;
+      set({ statusByKey: statusSnapshot(presence.statuses), replyLaterById });
+      scheduleStatusExpiry();
+      for (const event of resync.events) applyEvent(event);
+    } finally {
+      if (pendingPresenceResync === resync) pendingPresenceResync = null;
+    }
+  };
+
   /**
    * 呼ばれたことの提示。「呼ぶかどうか」はサーバーが送信時に判定済みで、
    * ここに来る `notify` はその答えそのもの。クライアントは提示の仕方だけを
@@ -593,35 +733,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "status_updated") {
-      set((state) => ({
-        statusByKey: {
-          ...state.statusByKey,
-          [participantKey(event.status.participant)]: event.status,
-        },
-      }));
+      pendingPresenceResync?.events.push(event);
+      applyStatus(event.status);
       return;
     }
     if (event.type === "status_cleared") {
-      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
-      set((state) => {
-        const key = participantKey(event.participant);
-        if (!(key in state.statusByKey)) return {};
-        const statusByKey = { ...state.statusByKey };
-        delete statusByKey[key];
-        return { statusByKey };
-      });
+      pendingPresenceResync?.events.push(event);
+      clearStatus(event.participant);
       return;
     }
     if (event.type === "reply_later_created") {
-      set((state) => ({
-        replyLaterById: {
-          ...state.replyLaterById,
-          [event.marker.markerId]: event.marker,
-        },
-      }));
+      pendingPresenceResync?.events.push(event);
+      applyReplyLater(event.marker);
       return;
     }
     if (event.type === "reply_later_resolved") {
+      pendingPresenceResync?.events.push(event);
       set((state) => {
         const marker = state.replyLaterById[event.markerId];
         if (!marker) return {};
@@ -1095,10 +1222,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
           }
-          const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
-          for (const status of snapshot.statuses) {
-            statusByKey[participantKey(status.participant)] = status;
-          }
+          const statusByKey = statusSnapshot(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
           for (const marker of snapshot.readMarkers) {
             lastReadByPlace[placeKey(marker.place)] = marker.lastReadSeq;
@@ -1144,6 +1268,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             roleAssignments: snapshot.roleAssignments,
             permissions: snapshot.permissions,
           });
+          scheduleStatusExpiry();
           (currentBackend as CatchUpAwareMessagingBackend).subscribeCatchUp?.(
             (place) => reconcileLoadedPolls(currentBackend, place),
           );
@@ -1156,6 +1281,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
               // Invalidate a REST snapshot that belongs to the connection we
               // just lost, even before the next socket reaches hello_ack.
               placeReconcileGeneration += 1;
+              presenceResyncGeneration += 1;
+              pendingPresenceResync = null;
             }
             // call_stateはreplayされない。初回接続と再接続のどちらでも、WSが
             // live配送可能になった時点の全量を読み、取得中のeventはcall storeで
@@ -1169,6 +1296,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
                   currentSessionIdentity,
                   participantKey(snapshot.self),
                   generation,
+                ).catch(() => undefined);
+                void resyncPresence(
+                  currentBackend,
+                  currentSessionIdentity,
                 ).catch(() => undefined);
               } else {
                 connectedOnce = true;
@@ -1458,7 +1589,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     setStatus(status, note, expiresAt = null) {
-      void backend.setStatus(status, note, expiresAt).catch(() => undefined);
+      void backend
+        .setStatus(status, note, expiresAt)
+        .then(applyStatus, () => undefined);
     },
 
     async refreshRoles() {
@@ -1550,7 +1683,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           message.messageId,
           Date.now() + delayMs,
         )
-        .catch(() => undefined);
+        .then(applyReplyLater, () => undefined);
     },
 
     votePoll(message, optionIds) {
@@ -1597,7 +1730,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     resolveReplyLater(markerId) {
-      void backend.resolveReplyLater(markerId).catch(() => undefined);
+      void backend
+        .resolveReplyLater(markerId)
+        .then(applyReplyLater, () => undefined);
     },
 
     sendTyping() {
@@ -1677,6 +1812,10 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   notificationWriteChain = Promise.resolve();
   notificationWriteGeneration = 0;
   confirmedNotificationSetting = null;
+  presenceResyncGeneration += 1;
+  pendingPresenceResync = null;
+  if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+  statusExpiryTimer = null;
   useMessaging.setState({
     capabilities: backend.capabilities,
     ready: false,

@@ -859,11 +859,26 @@ export class MockMessagingServer implements MessagingBackend {
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
+  async fetchPresence(): Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }> {
+    const now = Date.now();
+    return {
+      statuses: [...this.statuses.values()].filter(
+        (status) => status.expiresAt === null || status.expiresAt > now,
+      ),
+      replyLaterMarkers: [...this.replyLaterMarkers.values()].filter(
+        (marker) => !marker.resolved,
+      ),
+    };
+  }
+
   async setStatus(
     status: StatusKind,
     note: string,
     expiresAt: number | null = null,
-  ): Promise<void> {
+  ): Promise<ParticipantStatus> {
     const key = participantKey(SELF);
     const current = this.statuses.get(key);
     // 一時ステータスは「その前に言っていたこと」を覚えて、期限で戻る。
@@ -888,7 +903,7 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.statuses.set(key, next);
     this.emit({ type: "status_updated", status: next });
-    if (expiresAt === null) return;
+    if (expiresAt === null) return next;
     window.setTimeout(
       () => {
         // 期限が来ても、途中で置き換えられていたら何もしない。
@@ -911,6 +926,7 @@ export class MockMessagingServer implements MessagingBackend {
       },
       Math.max(0, expiresAt - Date.now()),
     );
+    return next;
   }
 
   /**
@@ -950,14 +966,14 @@ export class MockMessagingServer implements MessagingBackend {
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void> {
+  ): Promise<ReplyLaterMarker> {
     const existing = [...this.replyLaterMarkers.values()].find(
       (marker) =>
         !marker.resolved &&
         marker.messageId === messageId &&
         sameParticipant(marker.participant, SELF),
     );
-    if (existing) return;
+    if (existing) return existing;
     const marker: ReplyLaterMarker = {
       markerId: secureRandomUUID(),
       participant: SELF,
@@ -969,13 +985,16 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.replyLaterMarkers.set(marker.markerId, marker);
     this.emit({ type: "reply_later_created", marker });
+    return marker;
   }
 
-  async resolveReplyLater(markerId: string): Promise<void> {
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
     const marker = this.replyLaterMarkers.get(markerId);
-    if (!marker || marker.resolved) return;
+    if (!marker) throw new Error("unknown reply-later marker");
+    if (marker.resolved) return marker;
     marker.resolved = true;
     this.emit({ type: "reply_later_resolved", markerId });
+    return marker;
   }
 
   async toggleReaction(

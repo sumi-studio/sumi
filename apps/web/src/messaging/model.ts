@@ -616,7 +616,15 @@ export interface MessagingBackend {
     status: StatusKind,
     note: string,
     expiresAt: number | null,
-  ): Promise<void>;
+  ): Promise<ParticipantStatus>;
+  /**
+   * Volatile presence is not recovered by the per-place durable cursor.
+   * Re-read the authoritative current values after a connection gap.
+   */
+  fetchPresence(): Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }>;
   /**
    * 自分の名乗りを丸ごと置き換える。人間はこれを個人設定画面から、agentは
    * 同じ契約をtool経由で使う（AX: UIだけにある操作を作らない）。
@@ -645,8 +653,8 @@ export interface MessagingBackend {
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void>;
-  resolveReplyLater(markerId: string): Promise<void>;
+  ): Promise<ReplyLaterMarker>;
+  resolveReplyLater(markerId: string): Promise<ReplyLaterMarker>;
   toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
   /**
    * 投票の回答を丸ごと置き換える。空配列は取り消し——気が変わることと

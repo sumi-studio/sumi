@@ -126,12 +126,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
     // status_updated は replay されないvolatile eventなので、現在値はここでしか
     // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
-    const statuses: ParticipantStatus[] = asArray(body.statuses).map(
-      parseStatus,
-    );
-    const replyLaterMarkers: ReplyLaterMarker[] = asArray(
-      body.reply_later_markers,
-    ).map(parseReplyLater);
+    const presence = parsePresence(body);
     return {
       self: parseParticipant(body.self),
       workspaces,
@@ -139,10 +134,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       dms,
       threads,
       members,
-      statuses,
+      statuses: presence.statuses,
       readMarkers,
       unreadSummaries,
-      replyLaterMarkers,
+      replyLaterMarkers: presence.replyLaterMarkers,
       notificationSetting: parseNotificationSetting(body.notification_setting),
       roles: asArray(body.roles ?? []).map(parseRole),
       roleAssignments: asArray(body.role_assignments ?? []).map(
@@ -151,6 +146,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       permissions: parsePermissions(body.permissions),
       employedAgents: [],
     };
+  }
+
+  async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
+    return parsePresence(asRecord(await this.request("/messaging/bootstrap")));
   }
 
   async fetchMessages(
@@ -373,16 +372,18 @@ export class ApiMessagingBackend implements MessagingBackend {
     status: StatusKind,
     note: string,
     expiresAt: number | null,
-  ): Promise<void> {
-    await this.request("/messaging/status", {
-      method: "PUT",
-      body: {
-        status,
-        note,
-        expires_at:
-          expiresAt === null ? null : new Date(expiresAt).toISOString(),
-      },
-    });
+  ): Promise<ParticipantStatus> {
+    return parseStatus(
+      await this.request("/messaging/status", {
+        method: "PUT",
+        body: {
+          status,
+          note,
+          expires_at:
+            expiresAt === null ? null : new Date(expiresAt).toISOString(),
+        },
+      }),
+    );
   }
 
   /** PUTは全置換。誰の名乗りかはsessionが決め、bodyには載せない。 */
@@ -467,18 +468,27 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
-      { method: "POST", body: { remind_at: new Date(remindAt).toISOString() } },
+  ): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
+        {
+          method: "POST",
+          body: { remind_at: new Date(remindAt).toISOString() },
+        },
+      ),
     );
+    return parseReplyLater(body.marker);
   }
 
-  async resolveReplyLater(markerId: string): Promise<void> {
-    await this.request(
-      `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
-      { method: "POST", body: {} },
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
+        { method: "POST", body: {} },
+      ),
     );
+    return parseReplyLater(body.marker);
   }
 
   async toggleReaction(
@@ -1049,6 +1059,16 @@ function parseAssignment(value: unknown): RoleAssignment {
   return {
     participant: parseParticipant(wire.participant),
     roleIds: asArray(wire.role_ids).map(asString),
+  };
+}
+
+function parsePresence(body: Record<string, unknown>): {
+  statuses: ParticipantStatus[];
+  replyLaterMarkers: ReplyLaterMarker[];
+} {
+  return {
+    statuses: asArray(body.statuses).map(parseStatus),
+    replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
   };
 }
 

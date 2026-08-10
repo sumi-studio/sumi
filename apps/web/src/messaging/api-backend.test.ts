@@ -1006,7 +1006,10 @@ describe("ApiMessagingBackend", () => {
         }
         if (path.endsWith("/resolve") && init?.method === "POST") {
           return json({
-            marker: replyLaterWire("marker-3", "human-1"),
+            marker: {
+              ...replyLaterWire("marker-3", "human-1"),
+              resolved: true,
+            },
           });
         }
         throw new Error(`unexpected request ${path}`);
@@ -1035,7 +1038,21 @@ describe("ApiMessagingBackend", () => {
       Date.parse("2026-08-01T11:00:00Z"),
     ]);
 
-    await backend.setStatus("busy", "取り込み中", null);
+    await expect(backend.fetchPresence()).resolves.toEqual({
+      statuses: snapshot.statuses,
+      replyLaterMarkers: snapshot.replyLaterMarkers,
+    });
+
+    await expect(
+      backend.setStatus("busy", "取り込み中", null),
+    ).resolves.toEqual({
+      participant: { kind: "human", humanId: "human-1" },
+      status: "busy",
+      note: "取り込み中",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/status",
       expect.objectContaining({
@@ -1067,7 +1084,13 @@ describe("ApiMessagingBackend", () => {
     );
 
     const remindAt = Date.parse("2026-08-01T11:00:00Z");
-    await backend.createReplyLater(channel, "message-1", remindAt);
+    await expect(
+      backend.createReplyLater(channel, "message-1", remindAt),
+    ).resolves.toMatchObject({
+      markerId: "marker-3",
+      remindAt,
+      resolved: false,
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reply-later",
       expect.objectContaining({
@@ -1075,7 +1098,10 @@ describe("ApiMessagingBackend", () => {
         body: JSON.stringify({ remind_at: "2026-08-01T11:00:00.000Z" }),
       }),
     );
-    await backend.resolveReplyLater("marker-3");
+    await expect(backend.resolveReplyLater("marker-3")).resolves.toMatchObject({
+      markerId: "marker-3",
+      resolved: true,
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/reply-later/marker-3/resolve",
       expect.objectContaining({ method: "POST" }),
