@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-10
+- Amended: 2026-08-10（provider-neutral route encodingを確定）
 - Amends:
   - [ADR 0008](0008-personality-agent-identity-and-execution-fabric.md)
   - [エージェント実装計画](../agent/implementation-plan.md)
@@ -49,9 +50,24 @@ routeはpolicy評価、review、Human approval、実行開始、audit、recovery
 各tool callごとにrouteを選ぶ。deploymentや人格agent全体へ設定するproduct-wide
 `ReviewerMode`は置かない。
 
-routeを各providerのtool-call表現へどう載せるかは本ADRでは確定しない。ただしrouteを欠いた
-実行可能callを暗黙にNormalと解釈しない。provider-neutral encodingを凍結する実装まで、
-route欠落はfail-closedにする。
+providerへ公開する全tool input schemaは、app固有のschemaを次の共通envelopeで包む。
+
+```json
+{
+  "route": "normal | elevated",
+  "input": { "...": "app固有の元引数" }
+}
+```
+
+`route`と`input`は必須で、envelopeの未知field、route欠落、未知routeをstrictに拒否する。
+provider adapter / strict assemblerはenvelopeを一度だけ解き、immutableな
+`ToolInvocationRoute`とapp固有argumentsを持つ内部`ToolCall`へ変換する。app adapterへ渡すのは
+`input`だけであり、routeをappのaction語彙や引数へ混ぜない。provider transcript、wire、durable
+event、recoveryは内部`ToolCall`のrouteを保持し、再構築時にも暗黙のNormalを作らない。
+
+tool名を`*_elevated`のように複製する案、provider固有metadataへ依存する案、全appのschemaへ
+予約fieldを直挿しする案は採らない。このenvelopeはagent foundationのinvocation contractであり、
+app-owned domain operationを増やすものではない。
 
 ### 2. NormalはHumanへpromptしない経路である
 
@@ -245,12 +261,10 @@ compatibility branchを作らない。
    既存のNormal callを途中変換・replayしたり、Deny / BlockをHuman promptへ
    fallbackしたりせず、別のexplicit Elevated ToolCall proposalとして型付ける。
 2. Normalのexplicit `Deny`を観測した後、同じactionをElevatedで提案できる条件。
-3. Normal/Elevatedおよび要求authority provenanceを各providerのtool-call表現へ載せる
-   provider-neutral encoding。
-4. reviewerのretry回数、timeout、circuit breakerの具体値。
-5. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
-6. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
-7. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
+3. reviewerのretry回数、timeout、circuit breakerの具体値。
+4. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
+5. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
+6. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
 
 これらが未決でも、non-positive reviewをHumanへfallbackしないこと、routeとauthority sourceを
 同一視しないこと、Human-account one-shotをstanding policyへ変換しないこと、hard deny・
@@ -280,3 +294,5 @@ sandbox・app authorizationを迂回しないことは確定事項である。
 8. 二つのreviewerのprompt/schema/cache/metricが型で分離されているか。
 9. route、authority provenance、version、Human event-time contextがeffect前にdurableか。
 10. productionの固定prompt本文が用途ごとの`.md`を正本とし、Rustへinlineされていないか。
+11. provider-visible schemaが必須の`route + input` envelopeを使い、appへrouteを漏らしたり
+    route欠落をNormalへdefaultしたりしていないか。
