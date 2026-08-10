@@ -238,19 +238,19 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 ### T22: approval/ action + policy 【要T16】
 
-- 読む: §9.1〜§9.4 **全体**(Codex/Claude Code 調査結果含む)、#20、pi: `agent-loop.ts` の beforeToolCall 部
+- 読む: ADR 0012、§9.1〜§9.4 **全体**(Codex/Claude Code 調査結果含む)、#54/#77/#134、pi: `agent-loop.ts` の beforeToolCall 部
 - 作る: `src/approval/mod.rs`(ApprovalBroker 骨格)、`action.rs`、`policy.rs`
-- やること: `CanonicalAction`(runtime 内部正本。**wire にも DB にも書かない**)、shell 複合 command の segment 分解(`&&`/`||`/`;`/pipe/newline/subshell。heredoc・動的 eval・解析不能は NeedsApproval)、`Forbidden > NeedsApproval > Allow` で全 segment の最も厳しい結果。永続 rule は literal token prefix+制約(広域 prefix 拒否、ApproveAlways は仮適用→全 segment 再評価→競合なしのみ保存、**secret 検出時は永続化 fail-closed→ApproveOnce 降格**)。`SecretAwareActionProjector`(secret→kind+keyed digest の `SecretRef`、判定材料不足は `InsufficientEvidence`)。既定 fast path は D3(workspace read/write/edit=Allow、bash/network/domain mutation=NeedsApproval)
-- 受け入れ: M5 ゲート1・2(shell fixture、広域 rule 拒否)、§9.4 の Authorization header 付き curl の ApproveAlways 拒否 fixture
+- やること: strict検証済み`ToolCall`にimmutable `Normal | Elevated` routeとrequested authority provenanceを持たせる(provider-neutral encodingはADR 0012の未決事項として先に決定)。`CanonicalAction`はruntime内部正本でwire/DBへraw保存しない。Normal policyはexplicit `Allow | Deny | Unmatched`だけを返す。shell複合commandをsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外(heredoc・動的eval・解析不能を含む)はUnmatched。managed hard deny/sandbox/app commit時認可は別の非override境界にする。`SecretAwareActionProjector`はsecretをkind+keyed digestへ置換し、判定材料不足を`InsufficientEvidence`にする。standing policyはcurrent-call approvalと別contractであり、旧`ApproveAlways`/`NeedsApproval`をNormal latticeへ残さない
+- 受け入れ: route欠落/変更をfail-closed、NormalのAllow/Deny/Unmatchedをshell fixtureで固定、explicit Denyでreviewer/Human prompt 0件、raw action/secretがwire・DB・reviewerへ出ないこと。policy missing/staleの挙動とstanding ruleのscope/precedence/expiryは未決を解消してからfixture化する
 - コミット: `agent: CanonicalActionと決定論的policy (M5 1/3)`
 
 ### T23: approval/ reviewer + broker 統合 【要T22】
 
-- 読む: §9.2(状態機械)、§9.5〜§9.8 **全体**、D4/D6/D9
-- 作る: `src/approval/reviewer.rs`、`prompt.rs`、ApprovalBroker 完成+Session 結線(T15 の fixture driver を置換。T12 で凍結した `approval_log` transaction 契約へ接続)
-- やること: §9.2 状態機械(Pending=oneshot・タイムアウトなし、abort/soft steer で Cancelled、**soft steer 確定時は同一バッチの未開始ツールも Cancelled 確定** — D4)。ReviewerMode(User/AutoReview/StrictAutoReview)、reviewer trust-domain 制約(未許可は call せず manual/headless block)、bounded transcript(§9.6 の順序と上限。tool result 本文・Thinking・raw CanonicalAction を渡さない)、§9.7 プロンプト+strict JSON schema、3attempt/90s、fail-closed synthetic High/Unknown/Deny、circuit breaker、allow cache と invalidation。terminal/unknown request の no-op Applied(§9.8 末尾)
-- 受け入れ: M5 ゲート3〜7(User/AutoReview E2E、secret 置換、fail-closed 各系、承認待ち中 steer、sandbox 非拡大)+ M2 fixture ゲートの実 broker 再実行(ゲート6)
-- コミット: `agent: Audit reviewerと承認フロー統合 (M5 2/3)`
+- 読む: ADR 0012、§9.2(状態機械)、§9.5〜§9.8 **全体**、D4/D6/D9
+- 作る: `src/approval/reviewer.rs`、`prompt.rs`、`prompts/approval/execution-review.md`、`prompts/approval/escalation-review.md`、ApprovalBroker 完成+Session 結線(T15 の fixture driver を置換。T12 で凍結した `approval_log` transaction 契約へ接続)
+- やること: §9.2の二経路を型で実装する。Normal/UnmatchedはExecution AutoReview(`Allow | Block`)へ進み、non-AllowはblockしてHuman prompt 0件。Elevatedは別prompt/schemaのEscalation AutoReview(`AskHuman | Block`)へ進み、AskHumanだけがPendingを作る。Human current-call decisionは`ApproveOnce | DenyOnce`で、approval後のprovenanceを`AgentOwnWithHumanConsent | HumanAccountOneShot`として別に確定する。後者はGateway認証済みHuman actor・event-time authorization context・exact action digest・one-shot消費へ束縛する。route/authority/digest/policy/reviewer/prompt/schema versionを`ToolExecutionStart`前にdurable化する。productionの固定prompt本文は人格system/Compact/reviewerを含め用途ごとの`.md`を正本とし、Rustへinlineしない。二reviewerの型/prompt `.md`/schema/cache/metricを共有しない。soft steer/abort/recoveryはPendingをCancelledに閉じ、同一batchの未開始toolもCancelled確定する。retry/timeout/circuit breaker、Strictのshadow扱いはADR未決を先に解消する
+- 受け入れ: Normal explicit AllowとExecution-review Allowだけがagent-own実行、Normal Deny/Execution non-AllowでHuman prompt 0件、Escalation AskHumanは実行0件でpendingだけ、Escalation non-AskHumanはprompt/実行0件。Human consent付きagent実行とHuman-account one-shotを別provenanceでE2Eし、wrong actor/action/scope、replay、二重消費を拒否する。current-call decisionにopaque`ApproveAlways`がなく、standing policy mutationが別command/auditであること、productionの固定prompt本文が用途ごとの`.md`だけに存在してRust inline promptがないこと、secret置換、承認待ちsteer、sandbox/app認可非拡大、M2 durability fixtureを固定する
+- コミット: `agent: 二種類のAutoReviewと承認フロー統合 (M5 2/3)`
 
 ### T24: production Gateway/ws.rs + ConnectionSupervisor 【要T13B,T17,T18】
 
@@ -294,7 +294,7 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 - 読む: §11全体、§13 M5ゲート8〜10/Cloud track 5
 - 変更対象: `apps/api`、`apps/web`、`apps/agent`、`contracts/agent-events.yaml`、Go/Rust/TS生成物とintegration harness
 - やること: short-lived tokenでglobal canonical `PersonalityAgentId`、event-time authorization context、`ProcessGeneration`を検証し、personality-agent/current-generation fence、hello cursor、command/ACK/event両方向catch-upをproduction境界で結線する。browser上では`PersonalityAgentId`を人間向けの名前やglobal public addressとして表示しない。current verticalは認証済みAPI/control planeがhuman actorのauthorityを検証した後、canonical IDを認証済みGateway内のinternal target、session claim、event envelope、durable log keyとして直接transportしてよい。将来のmembership／異動／scope-local address解決はこのverticalの要件に含めず、後から導入できる公開アドレス非依存の境界だけを保つ。browserで認証したhuman actorをcommand provenanceへ残す。APIはoversized/attachmentsをseq採番前に拒否。contractsから3言語型を生成しround-trip CIを固定する。各hello後はedge通知を待たず、その`ProcessGeneration`のcurrent hydration stateを観測し、NotReadyならcommandをbounded hold/backpressure、Readyなら束縛されたstable hydration receipt identityを検証して公開する。上限超過時は接続をfail-closedに閉じる
-- 受け入れ: token無し/期限切れ/別`PersonalityAgentId`/旧`ProcessGeneration`、reader EOF、writer timeout、API再起動、command重複/欠番、ACK前後killを個別発火。T28所有のproduction ready-after-reconnect fixtureとして、同generationのNotReady中に接続を失い、再接続・helloした新epochもcurrent NotReadyを観測してholdを維持し、その後同generationのReadyがlatchされた時だけ順序どおり配送を再開することを固定する。ready前のACK/provider/executorは0件とする。T24のready-before/hello-before fixtureやT26のgeneration rollover fixtureは複製しない。chat UIが一つのcontinuous agent sessionへのdirect-address surfaceとしてstream/tool/steer/approvalを含む代表journeyを完走する
+- 受け入れ: token無し/期限切れ/別`PersonalityAgentId`/旧`ProcessGeneration`、reader EOF、writer timeout、API再起動、command重複/欠番、ACK前後killを個別発火。T28所有のproduction ready-after-reconnect fixtureとして、同generationのNotReady中に接続を失い、再接続・helloした新epochもcurrent NotReadyを観測してholdを維持し、その後同generationのReadyがlatchされた時だけ順序どおり配送を再開することを固定する。ready前のACK/provider/executorは0件とする。T24のready-before/hello-before fixtureやT26のgeneration rollover fixtureは複製しない。chat UIが同じ一人の人格agent・single thread・canonical life logへのdirect-address surfaceとしてstream/tool/steer/approvalを含む代表journeyを完走する
 - コミット: `feat(agent): production WS and cross-language E2E`
 
 ### T29: data lifecycle + KMS移行 【owner: store/api/platform、要T17,T21,T26】
