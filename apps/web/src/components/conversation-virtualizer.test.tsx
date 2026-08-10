@@ -183,6 +183,7 @@ describe("ConversationVirtualizer", () => {
     });
     await settleProgrammaticScroll();
 
+    fireEvent.wheel(viewport, { deltaY: -300 });
     viewport.scrollTop = 300;
     fireEvent.scroll(viewport);
     await waitFor(() => {
@@ -294,6 +295,7 @@ describe("ConversationVirtualizer", () => {
     );
     const viewport = screen.getByRole("region");
     await settleProgrammaticScroll();
+    fireEvent.wheel(viewport, { deltaY: -300 });
     viewport.scrollTop = 120;
     fireEvent.scroll(viewport);
     messages = [...messages, { id: "message-100", text: "Message 100" }];
@@ -305,7 +307,46 @@ describe("ConversationVirtualizer", () => {
       />,
     );
     await settleProgrammaticScroll();
-    expect(viewport.scrollTop).toBe(120);
+    // The reading position may shift by a few pixels as rows above it
+    // re-measure, but it must never be pulled back toward the end.
+    expect(Math.abs(viewport.scrollTop - 120)).toBeLessThan(60);
+  });
+
+  it("keeps follow mode armed for non-scrolling controls inside rows", async () => {
+    const handle = createRef<ConversationVirtualizerHandle>();
+    const messages = makeMessages(100);
+    render(
+      <ConversationVirtualizer
+        ref={handle}
+        items={messages}
+        estimateSize={() => 60}
+        renderItem={(message) => <button type="button">{message.text}</button>}
+      />,
+    );
+    const viewport = screen.getByRole("region");
+
+    await waitFor(() => {
+      expect(handle.current?.isAtEnd()).toBe(true);
+    });
+    await settleProgrammaticScroll();
+
+    const control = screen.getByRole("button", { name: "Message 99" });
+    fireEvent.pointerDown(control);
+    fireEvent.touchStart(control);
+    fireEvent.keyDown(control, { key: " " });
+
+    viewport.scrollTop = 120;
+    fireEvent.scroll(viewport);
+    await waitFor(() => {
+      expect(handle.current?.isAtEnd()).toBe(true);
+    });
+
+    fireEvent.keyDown(viewport, { key: "PageUp" });
+    viewport.scrollTop = 120;
+    fireEvent.scroll(viewport);
+    await waitFor(() => {
+      expect(handle.current?.isAtEnd()).toBe(false);
+    });
   });
 });
 

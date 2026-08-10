@@ -8,7 +8,7 @@ import { ChatItemView } from "./chat-item";
 afterEach(cleanup);
 
 describe("ChatItemView", () => {
-  it("uses a dedicated semantic control to reveal message actions", () => {
+  it("keeps message actions in the tree without a reveal toggle", () => {
     render(
       <ChatItemView
         item={{
@@ -16,27 +16,19 @@ describe("ChatItemView", () => {
           id: "user-1",
           text: "こんにちは",
           attachments: [],
-          timestamp: null,
+          timestamp: "2026-08-01T09:00:00+09:00",
           delivery: "durable",
         }}
       />,
     );
 
-    const showActions = screen.getByRole("button", {
-      name: "メッセージの操作を表示",
-    });
-    expect(showActions).toHaveAttribute("aria-expanded", "false");
-    const controls = showActions.getAttribute("aria-controls");
-    expect(controls).not.toBeNull();
-    expect(document.getElementById(controls ?? "")).toHaveAttribute("hidden");
-    expect(showActions.querySelector("button")).toBeNull();
-
-    fireEvent.click(showActions);
-    expect(showActions).toHaveAttribute("aria-expanded", "true");
-    expect(document.getElementById(controls ?? "")).not.toHaveAttribute(
-      "hidden",
-    );
+    // Hover/focus reveal replaces the old toggle: the actions are always in
+    // the accessibility tree and reachable by keyboard.
+    expect(
+      screen.queryByRole("button", { name: "メッセージの操作を表示" }),
+    ).toBeNull();
     expect(screen.getByRole("button", { name: "コピー" })).toBeEnabled();
+    expect(screen.getByText("09:00")).toBeInTheDocument();
   });
 
   it("disables both approval choices while the store has a submission latch", () => {

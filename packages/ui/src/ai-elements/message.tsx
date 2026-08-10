@@ -294,7 +294,7 @@ export function MessageMetadata({
 }: MessageMetadataProps) {
   const [copied, setCopied] = useState(false);
   const hoverVisibility =
-    "opacity-0 transition-opacity duration-150 group-focus-within/message:opacity-100 group-hover/message:opacity-100";
+    "opacity-0 transition-opacity duration-150 group-focus-within/message:opacity-100 group-hover/message:opacity-100 pointer-coarse:opacity-100";
 
   const copy = async () => {
     try {
