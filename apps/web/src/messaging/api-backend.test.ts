@@ -18,6 +18,8 @@ const bootstrap = {
     },
   ],
   dms: [],
+  statuses: [],
+  reply_later_markers: [],
   members: [
     {
       participant: { kind: "human", human_id: "human-1" },
@@ -512,10 +514,9 @@ describe("ApiMessagingBackend", () => {
         expiresAt: null,
       },
     ]);
-    expect(snapshot.replyLaterMarkers.map((marker) => marker.remindAt)).toEqual([
-      null,
-      Date.parse("2026-08-01T11:00:00Z"),
-    ]);
+    expect(snapshot.replyLaterMarkers.map((marker) => marker.remindAt)).toEqual(
+      [null, Date.parse("2026-08-01T11:00:00Z")],
+    );
 
     // 再接続後の再同期は、bootstrapと同じ現在値をもう一度読み直す。
     await expect(backend.fetchPresence()).resolves.toEqual({

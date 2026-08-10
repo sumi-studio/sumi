@@ -128,6 +128,20 @@ class FakePresenceBackend implements MessagingBackend {
   async fetchMessages(): Promise<Message[]> {
     return [];
   }
+  async createChannel(): ReturnType<MessagingBackend["createChannel"]> {
+    throw new Error("unused");
+  }
+  async ensureDM(): ReturnType<MessagingBackend["ensureDM"]> {
+    throw new Error("unused");
+  }
+  async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
+    throw new Error("unused");
+  }
+  async updateChannelTopic(): ReturnType<
+    MessagingBackend["updateChannelTopic"]
+  > {
+    throw new Error("unused");
+  }
   async sendMessage(): Promise<SendReceipt> {
     throw new Error("unused");
   }
