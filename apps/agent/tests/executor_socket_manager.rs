@@ -72,6 +72,12 @@ impl Drop for Fixture {
 }
 
 fn spawn_executor(workspace: &Path, executor_socket: &Path, nonce: &str) -> Child {
+    let client_uid = unsafe { libc::geteuid() };
+    assert_ne!(
+        client_uid, 0,
+        "executor socket tests require a non-root uid"
+    );
+    assert_ne!(client_uid, u32::MAX, "test uid must not be the sentinel");
     Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
         .arg("--tool-executor-socket")
         .env_clear()
@@ -80,6 +86,7 @@ fn spawn_executor(workspace: &Path, executor_socket: &Path, nonce: &str) -> Chil
         .env("SUMI_RPC_NONCE", nonce)
         .env("SUMI_WORKSPACE", workspace)
         .env("SUMI_EXECUTOR_SOCKET", executor_socket)
+        .env("SUMI_EXECUTOR_CLIENT_UID", client_uid.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -469,6 +476,7 @@ async fn completed_primary_reads_close_and_release_connection_ownership() {
         let mut bytes = serde_json::to_vec(&request).unwrap();
         bytes.push(b'\n');
         stream.write_all(&bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
         let mut line = String::new();
         timeout(
             Duration::from_secs(5),

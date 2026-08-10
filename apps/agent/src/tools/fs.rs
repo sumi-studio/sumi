@@ -8,6 +8,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    collections::{HashMap, VecDeque},
     ffi::{CStr, CString, OsStr},
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -19,6 +20,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
 
 use regex::Regex;
@@ -48,7 +50,18 @@ pub const MAX_EDIT_FILE_BYTES: u64 = MAX_SCAN_BYTES;
 pub const MAX_RAW_FILE_CHUNK_BYTES: usize = 64 * 1024;
 /// The executor's private raw-read contract is intentionally limited to the
 /// same one-file envelope accepted by Messaging attachments.
-pub const MAX_RAW_FILE_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_WORKSPACE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_RAW_FILE_TOTAL_BYTES: u64 = MAX_WORKSPACE_DOWNLOAD_BYTES;
+/// Keeps a streamed workspace write comfortably inside the 1 MiB JSON-line
+/// executor envelope even when `Vec<u8>` is encoded as a JSON array.
+pub const MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_ACTIVE_WORKSPACE_DOWNLOADS: usize = 16;
+const RETAINED_WORKSPACE_DOWNLOAD_TERMINALS: usize = 256;
+
+pub(crate) const WORKSPACE_DOWNLOAD_COLLISION: &str =
+    "workspace download destination already exists";
+pub(crate) const WORKSPACE_DOWNLOAD_MISMATCH: &str = "workspace download size or digest mismatch";
+pub(crate) const WORKSPACE_DOWNLOAD_STATE_MISMATCH: &str = "workspace download state mismatch";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditTemporaryOwnership {
@@ -107,6 +120,71 @@ enum WorkspaceGrepEnvelope<'a> {
 pub struct WorkspaceFs {
     root: File,
     display_root: PathBuf,
+    downloads: Mutex<WorkspaceDownloadRegistry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceDownloadReceipt {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceDownloadAbort {
+    Aborted,
+    TooLate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceDownloadTerminal {
+    Aborted,
+    Committed,
+}
+
+#[derive(Default)]
+struct WorkspaceDownloadRegistry {
+    active: HashMap<String, WorkspaceDownload>,
+    terminals: HashMap<String, WorkspaceDownloadTerminal>,
+    terminal_order: VecDeque<String>,
+}
+
+impl WorkspaceDownloadRegistry {
+    fn remember_terminal(&mut self, download_id: &str, terminal: WorkspaceDownloadTerminal) {
+        if self
+            .terminals
+            .insert(download_id.to_owned(), terminal)
+            .is_some()
+        {
+            self.terminal_order.retain(|known| known != download_id);
+        }
+        self.terminal_order.push_back(download_id.to_owned());
+        while self.terminal_order.len() > RETAINED_WORKSPACE_DOWNLOAD_TERMINALS {
+            if let Some(expired) = self.terminal_order.pop_front() {
+                self.terminals.remove(&expired);
+            }
+        }
+    }
+}
+
+/// One incomplete application attachment. The destination stays absent until
+/// `finish_workspace_download` verifies the exact byte commitment and installs
+/// the held anonymous `O_TMPFILE` inode with a no-replace `linkat(2)` publish.
+struct WorkspaceDownload {
+    parent: File,
+    destination_name: CString,
+    relative_path: String,
+    file: File,
+    expected_size: u64,
+    expected_sha256: String,
+    received: u64,
+    digest: Sha256,
+    published: bool,
+}
+
+struct WorkspaceDownloadFinish {
+    result: Result<WorkspaceDownloadReceipt, ToolError>,
+    committed: bool,
 }
 
 impl WorkspaceFs {
@@ -149,6 +227,7 @@ impl WorkspaceFs {
         Ok(Self {
             root: file,
             display_root: root.to_owned(),
+            downloads: Mutex::new(WorkspaceDownloadRegistry::default()),
         })
     }
 
@@ -343,6 +422,218 @@ impl WorkspaceFs {
             content_digest,
             content,
             eof: next_offset == total_bytes,
+        })
+    }
+
+    pub fn begin_workspace_download(
+        &self,
+        download_id: &str,
+        path: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), ToolError> {
+        if expected_size == 0 || expected_size > MAX_WORKSPACE_DOWNLOAD_BYTES {
+            return Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_MISMATCH.to_owned()));
+        }
+        if expected_sha256.len() != 64
+            || !expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_MISMATCH.to_owned()));
+        }
+        let relative = self.relative(path)?;
+        if path.is_absolute()
+            || path.as_os_str() != relative.as_os_str()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(ToolError::InvalidPath(
+                "workspace download destination must be a normal relative path".to_owned(),
+            ));
+        }
+
+        let mut downloads = self.downloads.lock().map_err(|_| {
+            ToolError::Protocol("workspace download registry lock poisoned".to_owned())
+        })?;
+        if downloads.active.contains_key(download_id)
+            || downloads.terminals.contains_key(download_id)
+        {
+            return Err(ToolError::Protocol(
+                WORKSPACE_DOWNLOAD_STATE_MISMATCH.to_owned(),
+            ));
+        }
+        if downloads.active.len() >= MAX_ACTIVE_WORKSPACE_DOWNLOADS {
+            return Err(ToolError::ResourceLimit(ResourceLimit::Concurrency));
+        }
+        let download =
+            self.prepare_workspace_download(&relative, expected_size, expected_sha256.to_owned())?;
+        downloads.active.insert(download_id.to_owned(), download);
+        Ok(())
+    }
+
+    pub fn append_workspace_download(
+        &self,
+        download_id: &str,
+        offset: u64,
+        content: &[u8],
+    ) -> Result<u64, ToolError> {
+        if content.is_empty() || content.len() > MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES {
+            return Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_MISMATCH.to_owned()));
+        }
+        let mut downloads = self.downloads.lock().map_err(|_| {
+            ToolError::Protocol("workspace download registry lock poisoned".to_owned())
+        })?;
+        let mut download = downloads
+            .active
+            .remove(download_id)
+            .ok_or_else(|| ToolError::Protocol(WORKSPACE_DOWNLOAD_STATE_MISMATCH.to_owned()))?;
+        match download.append(offset, content) {
+            Ok(next_offset) => {
+                downloads.active.insert(download_id.to_owned(), download);
+                Ok(next_offset)
+            }
+            Err(operation_error) => {
+                // The incomplete inode has never had a workspace name. Dropping
+                // its last fd removes it, so cleanup cannot leave a partial file
+                // or fail independently of this process.
+                drop(download);
+                downloads.remember_terminal(download_id, WorkspaceDownloadTerminal::Aborted);
+                Err(operation_error)
+            }
+        }
+    }
+
+    pub fn finish_workspace_download(
+        &self,
+        download_id: &str,
+    ) -> Result<WorkspaceDownloadReceipt, ToolError> {
+        self.finish_workspace_download_with_hooks(download_id, || {}, || {}, || Ok(()))
+    }
+
+    fn finish_workspace_download_with_hook(
+        &self,
+        download_id: &str,
+        before_finish: impl FnOnce(),
+    ) -> Result<WorkspaceDownloadReceipt, ToolError> {
+        self.finish_workspace_download_with_hooks(download_id, before_finish, || {}, || Ok(()))
+    }
+
+    fn finish_workspace_download_with_hooks(
+        &self,
+        download_id: &str,
+        before_finish: impl FnOnce(),
+        before_publish: impl FnOnce(),
+        post_publish: impl FnOnce() -> Result<(), ToolError>,
+    ) -> Result<WorkspaceDownloadReceipt, ToolError> {
+        let mut downloads = self.downloads.lock().map_err(|_| {
+            ToolError::Protocol("workspace download registry lock poisoned".to_owned())
+        })?;
+        let mut download = downloads
+            .active
+            .remove(download_id)
+            .ok_or_else(|| ToolError::Protocol(WORKSPACE_DOWNLOAD_STATE_MISMATCH.to_owned()))?;
+        // Keep this registry lock through the final fsync and no-replace publish.
+        // An abort that acquired it first dropped the anonymous inode, so
+        // this path cannot commit. An abort that arrives now waits and observes
+        // the committed tombstone instead of falsely claiming cleanup.
+        before_finish();
+        let finish = download.finish_with_publish_hooks(before_publish, post_publish);
+        if finish.committed {
+            downloads.remember_terminal(download_id, WorkspaceDownloadTerminal::Committed);
+            return finish.result;
+        }
+        drop(download);
+        downloads.remember_terminal(download_id, WorkspaceDownloadTerminal::Aborted);
+        finish.result
+    }
+
+    /// Cleanup is deliberately idempotent. A fresh cleanup RPC must be able to
+    /// close a begun download after cancellation has settled the operation that
+    /// was relaying its current chunk.
+    pub fn abort_workspace_download(
+        &self,
+        download_id: &str,
+    ) -> Result<WorkspaceDownloadAbort, ToolError> {
+        self.abort_workspace_download_with_hook(download_id, || {})
+    }
+
+    fn abort_workspace_download_with_hook(
+        &self,
+        download_id: &str,
+        before_abort: impl FnOnce(),
+    ) -> Result<WorkspaceDownloadAbort, ToolError> {
+        let mut downloads = self.downloads.lock().map_err(|_| {
+            ToolError::Protocol("workspace download registry lock poisoned".to_owned())
+        })?;
+        if let Some(download) = downloads.active.remove(download_id) {
+            before_abort();
+            drop(download);
+            downloads.remember_terminal(download_id, WorkspaceDownloadTerminal::Aborted);
+            return Ok(WorkspaceDownloadAbort::Aborted);
+        }
+        Ok(match downloads.terminals.get(download_id) {
+            Some(WorkspaceDownloadTerminal::Committed) => WorkspaceDownloadAbort::TooLate,
+            Some(WorkspaceDownloadTerminal::Aborted) | None => WorkspaceDownloadAbort::Aborted,
+        })
+    }
+
+    fn prepare_workspace_download(
+        &self,
+        relative: &Path,
+        expected_size: u64,
+        expected_sha256: String,
+    ) -> Result<WorkspaceDownload, ToolError> {
+        let relative_path = text_path(relative)?;
+        let (parent, name) = split_parent_name(relative)?;
+        let parent = File::from(self.open_beneath(
+            &parent,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?);
+        match openat2(
+            parent.as_raw_fd(),
+            Path::new(name),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+            RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        ) {
+            Ok(_) => {
+                return Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_COLLISION.to_owned()));
+            }
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+
+        let destination_name = os_str_cstring(name)?;
+        let current_directory = CString::new(".")
+            .map_err(|_| ToolError::InvalidPath("temporary directory was invalid".to_owned()))?;
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                current_directory.as_ptr(),
+                libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(ToolError::Io(std::io::Error::last_os_error()));
+        }
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(ToolError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(WorkspaceDownload {
+            parent,
+            destination_name,
+            relative_path,
+            file,
+            expected_size,
+            expected_sha256,
+            received: 0,
+            digest: Sha256::new(),
+            published: false,
         })
     }
 
@@ -995,6 +1286,82 @@ impl WorkspaceFs {
     }
 }
 
+impl WorkspaceDownload {
+    fn append(&mut self, offset: u64, content: &[u8]) -> Result<u64, ToolError> {
+        if offset != self.received {
+            return Err(ToolError::Protocol(
+                WORKSPACE_DOWNLOAD_STATE_MISMATCH.to_owned(),
+            ));
+        }
+        let next = self
+            .received
+            .checked_add(u64::try_from(content.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| ToolError::Protocol(WORKSPACE_DOWNLOAD_MISMATCH.to_owned()))?;
+        if next > self.expected_size {
+            return Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_MISMATCH.to_owned()));
+        }
+        self.file.write_all(content)?;
+        self.digest.update(content);
+        self.received = next;
+        Ok(next)
+    }
+
+    fn finish_with_publish_hooks(
+        &mut self,
+        before_publish: impl FnOnce(),
+        post_publish: impl FnOnce() -> Result<(), ToolError>,
+    ) -> WorkspaceDownloadFinish {
+        let result = (|| {
+            let actual_sha256 = format!("{:x}", self.digest.clone().finalize());
+            if self.received != self.expected_size || actual_sha256 != self.expected_sha256 {
+                return Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_MISMATCH.to_owned()));
+            }
+            self.file.sync_all()?;
+            before_publish();
+            // `AT_EMPTY_PATH` requires CAP_DAC_READ_SEARCH, while the executor
+            // deliberately runs with every capability dropped. The documented
+            // unprivileged O_TMPFILE publication form resolves this process's
+            // held fd through procfs and follows only that exact fd symlink.
+            let held_fd = CString::new(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+                .map_err(|_| {
+                    ToolError::InvalidPath("workspace download fd was invalid".to_owned())
+                })?;
+            let linked = unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    held_fd.as_ptr(),
+                    self.parent.as_raw_fd(),
+                    self.destination_name.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            };
+            if linked != 0 {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(libc::EEXIST) {
+                    Err(ToolError::Protocol(WORKSPACE_DOWNLOAD_COLLISION.to_owned()))
+                } else {
+                    Err(ToolError::Io(error))
+                };
+            }
+            self.published = true;
+            post_publish()
+                .map_err(|error| post_commit_error("workspace download publish", error))?;
+            self.parent.sync_all().map_err(|error| {
+                post_commit_error("workspace download publish", ToolError::Io(error))
+            })?;
+            Ok(WorkspaceDownloadReceipt {
+                path: self.relative_path.clone(),
+                size: self.received,
+                sha256: actual_sha256,
+            })
+        })();
+        WorkspaceDownloadFinish {
+            committed: self.published,
+            result,
+        }
+    }
+}
+
 fn post_commit_error(boundary: &str, error: ToolError) -> ToolError {
     ToolError::RpcIndeterminate(format!("{boundary} committed before failure: {error}"))
 }
@@ -1381,6 +1748,8 @@ mod tests {
             ffi::OsStringExt,
             fs::{PermissionsExt, symlink},
         },
+        sync::{Arc, Barrier},
+        thread,
     };
 
     use super::*;
@@ -1401,6 +1770,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn install_workspace_download(
+        fs: &WorkspaceFs,
+        download_id: &str,
+        path: &str,
+        bytes: &[u8],
+    ) -> WorkspaceDownloadReceipt {
+        let digest = sha256(bytes);
+        fs.begin_workspace_download(download_id, Path::new(path), bytes.len() as u64, &digest)
+            .expect("begin workspace download");
+        let mut offset = 0u64;
+        for chunk in bytes.chunks(MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES) {
+            offset = fs
+                .append_workspace_download(download_id, offset, chunk)
+                .expect("append workspace download");
+        }
+        fs.finish_workspace_download(download_id)
+            .expect("finish workspace download")
+    }
+
+    fn download_temporary_paths(root: &Path) -> Vec<PathBuf> {
+        fn collect(directory: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("read workspace directory") {
+                let entry = entry.expect("workspace entry");
+                let file_type = entry.file_type().expect("workspace entry type");
+                if file_type.is_dir() {
+                    collect(&entry.path(), found);
+                } else if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sumi-download-")
+                {
+                    found.push(entry.path());
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        collect(root, &mut found);
+        found
     }
 
     #[test]
@@ -2416,5 +2830,372 @@ mod tests {
             ),
             Err(ToolError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn workspace_download_installs_binary_files_above_inline_limit_through_exact_maximum() {
+        let root = TempWorkspace::new();
+        std::fs::create_dir(root.path.join("downloads")).expect("create download directory");
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+
+        for (download_id, filename, size) in [
+            ("over-inline", "over-inline.bin", 2 * 1024 * 1024 + 1),
+            (
+                "exact-maximum",
+                "exact-maximum.bin",
+                MAX_WORKSPACE_DOWNLOAD_BYTES as usize,
+            ),
+        ] {
+            let bytes = (0..size)
+                .map(|index| ((index * 31 + 17) % 251) as u8)
+                .collect::<Vec<_>>();
+            let path = format!("downloads/{filename}");
+            let receipt = install_workspace_download(&fs, download_id, &path, &bytes);
+
+            assert_eq!(receipt.path, path);
+            assert_eq!(receipt.size, size as u64);
+            assert_eq!(receipt.sha256, sha256(&bytes));
+            assert_eq!(
+                std::fs::read(root.path.join(&receipt.path)).expect("read installed download"),
+                bytes
+            );
+            assert!(download_temporary_paths(&root.path).is_empty());
+        }
+    }
+
+    #[test]
+    fn workspace_download_rejects_path_and_symlink_escapes_without_external_mutation() {
+        let root = TempWorkspace::new();
+        let outside = TempWorkspace::new();
+        let outside_target = outside.path.join("outside.bin");
+        std::fs::write(&outside_target, b"outside").expect("write outside fixture");
+        std::fs::create_dir(root.path.join("dir")).expect("create ordinary parent");
+        symlink(&outside.path, root.path.join("escape")).expect("create parent escape symlink");
+        symlink(&outside_target, root.path.join("linked.bin"))
+            .expect("create final escape symlink");
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let digest = sha256(b"x");
+
+        for destination in [
+            "../outside.bin",
+            "escape/leak.bin",
+            "linked.bin",
+            "dir//file.bin",
+            "dir/./file.bin",
+            "file.bin/",
+        ] {
+            assert!(
+                fs.begin_workspace_download("escape-attempt", Path::new(destination), 1, &digest)
+                    .is_err(),
+                "accepted escaped destination {destination}"
+            );
+        }
+
+        assert!(!outside.path.join("leak.bin").exists());
+        assert_eq!(std::fs::read(outside_target).unwrap(), b"outside");
+        assert!(download_temporary_paths(&root.path).is_empty());
+    }
+
+    #[test]
+    fn workspace_download_collision_preserves_destination_and_cleans_temporary() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let destination = root.path.join("collision.bin");
+        std::fs::write(&destination, b"original").expect("write original destination");
+        let bytes = b"download";
+        let digest = sha256(bytes);
+
+        assert!(matches!(
+            fs.begin_workspace_download(
+                "initial-collision",
+                Path::new("collision.bin"),
+                bytes.len() as u64,
+                &digest,
+            ),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_COLLISION
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+
+        std::fs::remove_file(&destination).expect("remove initial destination");
+        fs.begin_workspace_download(
+            "finish-collision",
+            Path::new("collision.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .expect("begin colliding download");
+        fs.append_workspace_download("finish-collision", 0, bytes)
+            .expect("append colliding download");
+        std::fs::write(&destination, b"competitor").expect("install competing destination");
+        assert!(matches!(
+            fs.finish_workspace_download("finish-collision"),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_COLLISION
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"competitor");
+        assert!(download_temporary_paths(&root.path).is_empty());
+    }
+
+    #[test]
+    fn workspace_download_publishes_held_inode_despite_named_temp_substitution_attempt() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let expected = b"verified attachment bytes";
+        let forged = b"attacker replacement";
+        let digest = sha256(expected);
+        fs.begin_workspace_download(
+            "inode-bound",
+            Path::new("inode-bound.bin"),
+            expected.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        fs.append_workspace_download("inode-bound", 0, expected)
+            .unwrap();
+        assert!(
+            std::fs::read_dir(&root.path).unwrap().next().is_none(),
+            "streaming must not expose a replaceable named temporary"
+        );
+
+        let forged_path = root.path.join(".sumi-download-attacker.tmp");
+        let receipt = fs
+            .finish_workspace_download_with_hooks(
+                "inode-bound",
+                || {},
+                || {
+                    // This is the exact old digest/fsync-to-rename race window.
+                    // A same-workspace writer can create or replace any public
+                    // temporary name, but the publisher links only its held fd.
+                    std::fs::write(&forged_path, forged).unwrap();
+                },
+                || Ok(()),
+            )
+            .expect("publish held O_TMPFILE inode");
+
+        assert_eq!(receipt.sha256, digest);
+        assert_eq!(
+            std::fs::read(root.path.join("inode-bound.bin")).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read(forged_path).unwrap(), forged);
+    }
+
+    #[test]
+    fn workspace_download_abort_and_digest_mismatch_remove_partial_files() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let bytes = b"complete attachment bytes";
+        let digest = sha256(bytes);
+
+        fs.begin_workspace_download(
+            "cancelled",
+            Path::new("cancelled.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .expect("begin cancelled download");
+        fs.append_workspace_download("cancelled", 0, &bytes[..8])
+            .expect("append partial download");
+        assert_eq!(
+            fs.abort_workspace_download("cancelled").unwrap(),
+            WorkspaceDownloadAbort::Aborted
+        );
+        assert_eq!(
+            fs.abort_workspace_download("cancelled").unwrap(),
+            WorkspaceDownloadAbort::Aborted,
+            "abort must be idempotent"
+        );
+        assert!(!root.path.join("cancelled.bin").exists());
+
+        fs.begin_workspace_download(
+            "digest-mismatch",
+            Path::new("mismatch.bin"),
+            bytes.len() as u64,
+            &"0".repeat(64),
+        )
+        .expect("begin digest mismatch");
+        fs.append_workspace_download("digest-mismatch", 0, bytes)
+            .expect("append digest mismatch");
+        assert!(matches!(
+            fs.finish_workspace_download("digest-mismatch"),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_MISMATCH
+        ));
+        assert!(!root.path.join("mismatch.bin").exists());
+
+        fs.begin_workspace_download(
+            "append-error",
+            Path::new("append-error.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .expect("begin append error");
+        fs.append_workspace_download("append-error", 0, &bytes[..8])
+            .expect("append before offset error");
+        assert!(matches!(
+            fs.append_workspace_download("append-error", 3, &bytes[8..]),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_STATE_MISMATCH
+        ));
+        assert!(!root.path.join("append-error.bin").exists());
+        assert!(download_temporary_paths(&root.path).is_empty());
+    }
+
+    #[test]
+    fn workspace_download_abort_drops_anonymous_partial_without_a_workspace_name() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let bytes = b"partial attachment";
+        let digest = sha256(bytes);
+        fs.begin_workspace_download(
+            "anonymous-abort",
+            Path::new("anonymous-abort.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        fs.append_workspace_download("anonymous-abort", 0, &bytes[..7])
+            .unwrap();
+        assert!(
+            std::fs::read_dir(&root.path).unwrap().next().is_none(),
+            "an incomplete O_TMPFILE download must have no workspace directory entry"
+        );
+        assert_eq!(
+            fs.abort_workspace_download("anonymous-abort").unwrap(),
+            WorkspaceDownloadAbort::Aborted
+        );
+        assert!(!root.path.join("anonymous-abort.bin").exists());
+        assert!(download_temporary_paths(&root.path).is_empty());
+    }
+
+    #[test]
+    fn workspace_download_rejects_duplicate_and_replayed_begin_ids() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let digest = sha256(b"x");
+        fs.begin_workspace_download("stable-id", Path::new("one.bin"), 1, &digest)
+            .expect("first begin");
+        assert!(matches!(
+            fs.begin_workspace_download("stable-id", Path::new("two.bin"), 1, &digest),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_STATE_MISMATCH
+        ));
+        fs.abort_workspace_download("stable-id").unwrap();
+        assert!(matches!(
+            fs.begin_workspace_download("stable-id", Path::new("two.bin"), 1, &digest),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_STATE_MISMATCH
+        ));
+        assert!(download_temporary_paths(&root.path).is_empty());
+    }
+
+    #[test]
+    fn workspace_download_finish_and_abort_have_one_serialized_winner() {
+        let root = TempWorkspace::new();
+        let fs = Arc::new(WorkspaceFs::open(&root.path).expect("workspace fs"));
+        let bytes = b"race";
+        let digest = sha256(bytes);
+
+        fs.begin_workspace_download(
+            "finish-wins",
+            Path::new("finish-wins.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        fs.append_workspace_download("finish-wins", 0, bytes)
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let finish_fs = fs.clone();
+        let finish_entered = entered.clone();
+        let finish_release = release.clone();
+        let finish = thread::spawn(move || {
+            finish_fs.finish_workspace_download_with_hook("finish-wins", || {
+                finish_entered.wait();
+                finish_release.wait();
+            })
+        });
+        entered.wait();
+        let abort_fs = fs.clone();
+        let abort = thread::spawn(move || abort_fs.abort_workspace_download("finish-wins"));
+        release.wait();
+        assert_eq!(finish.join().unwrap().unwrap().path, "finish-wins.bin");
+        assert_eq!(
+            abort.join().unwrap().unwrap(),
+            WorkspaceDownloadAbort::TooLate
+        );
+        assert_eq!(
+            std::fs::read(root.path.join("finish-wins.bin")).unwrap(),
+            bytes
+        );
+
+        fs.begin_workspace_download(
+            "abort-wins",
+            Path::new("abort-wins.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        fs.append_workspace_download("abort-wins", 0, bytes)
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let abort_fs = fs.clone();
+        let abort_entered = entered.clone();
+        let abort_release = release.clone();
+        let abort = thread::spawn(move || {
+            abort_fs.abort_workspace_download_with_hook("abort-wins", || {
+                abort_entered.wait();
+                abort_release.wait();
+            })
+        });
+        entered.wait();
+        let finish_fs = fs.clone();
+        let finish = thread::spawn(move || finish_fs.finish_workspace_download("abort-wins"));
+        release.wait();
+        assert_eq!(
+            abort.join().unwrap().unwrap(),
+            WorkspaceDownloadAbort::Aborted
+        );
+        assert!(matches!(
+            finish.join().unwrap(),
+            Err(ToolError::Protocol(message)) if message == WORKSPACE_DOWNLOAD_STATE_MISMATCH
+        ));
+        assert!(!root.path.join("abort-wins.bin").exists());
+        assert!(download_temporary_paths(&root.path).is_empty());
+    }
+
+    #[test]
+    fn workspace_download_post_publish_failure_is_indeterminate_and_too_late_to_abort() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let bytes = b"committed";
+        let digest = sha256(bytes);
+        fs.begin_workspace_download(
+            "post-rename",
+            Path::new("post-rename.bin"),
+            bytes.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        fs.append_workspace_download("post-rename", 0, bytes)
+            .unwrap();
+
+        let result = fs.finish_workspace_download_with_hooks(
+            "post-rename",
+            || {},
+            || {},
+            || {
+                Err(ToolError::Io(std::io::Error::other(
+                    "injected sync failure",
+                )))
+            },
+        );
+        assert!(matches!(result, Err(ToolError::RpcIndeterminate(_))));
+        assert_eq!(
+            std::fs::read(root.path.join("post-rename.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs.abort_workspace_download("post-rename").unwrap(),
+            WorkspaceDownloadAbort::TooLate
+        );
+        assert!(download_temporary_paths(&root.path).is_empty());
     }
 }

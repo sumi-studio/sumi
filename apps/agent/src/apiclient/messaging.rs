@@ -4,8 +4,11 @@
 //! generation-fenced local-control credential.  None of these requests carry
 //! a Human session or a caller-supplied actor identity.
 
+use std::pin::Pin;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,6 +57,18 @@ pub(crate) struct UploadMessagingAttachmentResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenMessagingAttachmentRequest<'a> {
     pub attachment_id: &'a str,
+}
+
+pub(crate) type MessagingAttachmentByteStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<Vec<u8>, String>> + Send>>;
+
+/// Raw attachment transport for the distinct download operation. The stream
+/// is never serialized into a model-visible result; the foundation relays it
+/// to the executor and exposes only the verified workspace receipt.
+pub(crate) struct DownloadMessagingAttachmentResponse {
+    pub size: u64,
+    pub sha256: String,
+    pub body: MessagingAttachmentByteStream,
 }
 
 #[derive(Debug, Serialize)]
@@ -363,6 +378,11 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value>;
 
     async fn open_attachment(&self, request: OpenMessagingAttachmentRequest<'_>) -> Result<Value>;
+
+    async fn download_attachment(
+        &self,
+        request: OpenMessagingAttachmentRequest<'_>,
+    ) -> Result<DownloadMessagingAttachmentResponse>;
 
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value>;
 

@@ -54,8 +54,10 @@ impl ExecutorInvoker for ExecutorClient {
 }
 
 /// Builds the production executor registry from one immutable,
-/// supervisor-issued client. The critical Unix endpoint exposes only bounded,
-/// workspace-confined read and discovery operations.
+/// supervisor-issued client. Model-visible tools remain bounded,
+/// workspace-confined reads and discovery. The same critical Unix endpoint
+/// separately admits a foundation-only streamed workspace-install protocol;
+/// it is not registered as a model filesystem mutation tool.
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
     remote_executor_registry_with_tools(client, std::iter::empty())
 }

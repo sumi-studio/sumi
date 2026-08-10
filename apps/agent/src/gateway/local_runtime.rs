@@ -38,13 +38,14 @@ use super::supervisor::{
 use crate::apiclient::messaging::{
     CreateMessagingChannelRequest, CreateMessagingPollRequest, CreateMessagingReplyLaterRequest,
     CreateMessagingRoleRequest, CreateMessagingThreadRequest, DeleteMessagingRoleRequest,
-    DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, ListMessagingRolesRequest,
-    ListMessagingThreadsRequest, MessagingApi, MessagingNotificationSettingsRequest,
-    OpenMessagingAttachmentRequest, OpenMessagingPlaceRequest, PollMessagingAttentionRequest,
-    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
-    SearchMessagingRequest, SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest,
-    SetMessagingProfileRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
-    UpdateMessagingChannelRequest, UpdateMessagingRoleRequest, UploadMessagingAttachmentRequest,
+    DownloadMessagingAttachmentResponse, DuplicateMessagingChannelRequest,
+    GetMessagingCallStateRequest, ListMessagingRolesRequest, ListMessagingThreadsRequest,
+    MessagingApi, MessagingNotificationSettingsRequest, OpenMessagingAttachmentRequest,
+    OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
+    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+    SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest, SetMessagingProfileRequest,
+    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+    UpdateMessagingRoleRequest, UploadMessagingAttachmentRequest,
     UploadMessagingAttachmentResponse, VoteMessagingPollRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
@@ -59,6 +60,10 @@ const MAX_LOCAL_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_MESSAGING_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MESSAGING_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
 const MESSAGING_ATTACHMENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_MESSAGING_ATTACHMENT_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+const MESSAGING_ATTACHMENT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MESSAGING_ATTACHMENT_DOWNLOAD_PATH: &str = "/local-control/v1/messaging:attachment-download";
+const CONTENT_SHA256_HEADER: &str = "x-sumi-content-sha256";
 const MAX_LOCAL_CONTROL_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
@@ -422,6 +427,103 @@ impl LocalControlHttpClient {
         serde_json::from_slice(body.as_slice()).context("decode strict local control response")
     }
 
+    async fn post_attachment_stream<Request>(
+        &self,
+        path: &str,
+        body: &Request,
+    ) -> Result<DownloadMessagingAttachmentResponse>
+    where
+        Request: Serialize + Sync,
+    {
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let url = self
+            .base_url
+            .join(path)
+            .context("join local attachment download URL")?;
+        let mut request = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .timeout(MESSAGING_ATTACHMENT_DOWNLOAD_TIMEOUT)
+            .json(body);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request
+            .build()
+            .context("build local attachment download request")?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint.revalidate()?;
+        }
+        let response = http
+            .execute(request)
+            .await
+            .context("local attachment download request failed")?;
+        if response.status() != reqwest::StatusCode::OK {
+            bail!(
+                "local attachment download was rejected with status {}",
+                response.status()
+            );
+        }
+        let headers = response.headers();
+        let content_type = headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("local attachment download omitted Content-Type"))?;
+        if !content_type.eq_ignore_ascii_case("application/octet-stream") {
+            bail!("local attachment download returned an invalid Content-Type");
+        }
+        if let Some(encoding) = headers.get(reqwest::header::CONTENT_ENCODING) {
+            let encoding = encoding
+                .to_str()
+                .context("local attachment download Content-Encoding was not text")?;
+            if !encoding.eq_ignore_ascii_case("identity") {
+                bail!("local attachment download returned transformed content");
+            }
+        }
+        if headers.contains_key(reqwest::header::CONTENT_RANGE) {
+            bail!("local attachment download returned a partial response");
+        }
+        let size = headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("local attachment download omitted Content-Length"))?;
+        if !(1..=MAX_MESSAGING_ATTACHMENT_DOWNLOAD_BYTES).contains(&size) {
+            bail!("local attachment download Content-Length is outside the bounded size");
+        }
+        let sha256 = headers
+            .get(CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("local attachment download omitted SHA-256"))?;
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("local attachment download returned an invalid SHA-256");
+        }
+        let sha256 = sha256.to_owned();
+        let body = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| error.to_string())
+        });
+        Ok(DownloadMessagingAttachmentResponse {
+            size,
+            sha256,
+            body: Box::pin(body),
+        })
+    }
+
     async fn post_runtime_state(
         &self,
         publication: &LocalRuntimeStatePublication,
@@ -601,6 +703,14 @@ impl MessagingApi for LocalControlHttpClient {
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
+    }
+
+    async fn download_attachment(
+        &self,
+        request: OpenMessagingAttachmentRequest<'_>,
+    ) -> Result<DownloadMessagingAttachmentResponse> {
+        self.post_attachment_stream(MESSAGING_ATTACHMENT_DOWNLOAD_PATH, &request)
+            .await
     }
 
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<serde_json::Value> {
@@ -1625,8 +1735,10 @@ mod tests {
     use axum::Router;
     use axum::body::Bytes;
     use axum::extract::State;
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
 
@@ -3010,6 +3122,180 @@ mod tests {
             "private workspace path crossed the application boundary"
         );
         server.abort();
+    }
+
+    #[derive(Clone)]
+    struct MessagingDownloadFixtureState {
+        mode: &'static str,
+        request_body: Arc<StdMutex<Option<Vec<u8>>>>,
+    }
+
+    async fn messaging_download_fixture(
+        State(state): State<MessagingDownloadFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer control-secret")
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("identity")
+        );
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request, serde_json::json!({"attachment_id": "att-1"}));
+        *state.request_body.lock().unwrap() = Some(body.to_vec());
+
+        let bytes = Bytes::from_static(&[0, 0xff, 0x80, b's', b'u', b'm', b'i']);
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let mut response = bytes.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("7"));
+        response.headers_mut().insert(
+            CONTENT_SHA256_HEADER,
+            HeaderValue::from_str(&digest).unwrap(),
+        );
+        match state.mode {
+            "valid" => {}
+            "transformed" => {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            }
+            "partial" => {
+                response.headers_mut().insert(
+                    header::CONTENT_RANGE,
+                    HeaderValue::from_static("bytes 0-6/7"),
+                );
+            }
+            "malformed-length" => {
+                response.headers_mut().insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_static("not-a-number"),
+                );
+            }
+            "malformed-sha" => {
+                response.headers_mut().insert(
+                    CONTENT_SHA256_HEADER,
+                    HeaderValue::from_static(
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    ),
+                );
+            }
+            mode => panic!("unknown download fixture mode {mode}"),
+        }
+        response
+    }
+
+    async fn messaging_download_fixture_client(
+        mode: &'static str,
+    ) -> (
+        LocalControlHttpClient,
+        Arc<StdMutex<Option<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let request_body = Arc::new(StdMutex::new(None));
+        let state = MessagingDownloadFixtureState {
+            mode,
+            request_body: request_body.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                MESSAGING_ATTACHMENT_DOWNLOAD_PATH,
+                post(messaging_download_fixture),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        (client, request_body, server)
+    }
+
+    #[tokio::test]
+    async fn messaging_download_streams_authenticated_identity_bytes_with_exact_metadata() {
+        let (client, request_body, server) = messaging_download_fixture_client("valid").await;
+        let response = client
+            .download_attachment(OpenMessagingAttachmentRequest {
+                attachment_id: "att-1",
+            })
+            .await
+            .expect("download attachment response");
+        assert_eq!(response.size, 7);
+        let expected = format!(
+            "{:x}",
+            Sha256::digest([0, 0xff, 0x80, b's', b'u', b'm', b'i'])
+        );
+        assert_eq!(response.sha256, expected);
+        let chunks = response.body.collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].as_ref().unwrap(),
+            &[0, 0xff, 0x80, b's', b'u', b'm', b'i']
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                request_body.lock().unwrap().as_ref().unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"attachment_id": "att-1"})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_download_rejects_transformed_partial_and_malformed_metadata() {
+        for mode in [
+            "transformed",
+            "partial",
+            "malformed-length",
+            "malformed-sha",
+        ] {
+            let (client, request_body, server) = messaging_download_fixture_client(mode).await;
+            let error = client
+                .download_attachment(OpenMessagingAttachmentRequest {
+                    attachment_id: "att-1",
+                })
+                .await
+                .err()
+                .expect("invalid attachment transport metadata");
+            assert!(
+                !error.to_string().is_empty(),
+                "{mode} returned an empty error"
+            );
+            assert!(request_body.lock().unwrap().is_some());
+            server.abort();
+        }
     }
 
     async fn response_limit_fixture(

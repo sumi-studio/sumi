@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -21,7 +22,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::manager::RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE;
-use super::protocol::{RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, parse_artifact_handle};
+use super::protocol::{
+    RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, WORKSPACE_DOWNLOAD_COLLISION_CODE,
+    WORKSPACE_DOWNLOAD_MISMATCH_CODE, WORKSPACE_DOWNLOAD_STATE_MISMATCH_CODE,
+    parse_artifact_handle,
+};
 use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, ExecutorServiceRole, MAX_RPC_LINE_BYTES,
     RpcError, RpcFrame, RpcOperationValidation, RpcRequest, decode_rpc_frame,
@@ -31,7 +36,7 @@ use crate::tools::{
     ResourceLimit, ToolError,
     fs::{
         GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_RAW_FILE_CHUNK_BYTES,
-        MAX_SCAN_ENTRIES, WorkspaceFileChunk,
+        MAX_SCAN_ENTRIES, MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES, WorkspaceFileChunk,
     },
     truncate::{DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, GREP_TRUNCATION_SUFFIX, RetainedOutput},
 };
@@ -62,6 +67,13 @@ pub fn classify_executor_error(error: &ToolError) -> Option<ExecutorErrorClassif
 pub struct WorkspaceFile {
     pub filename: String,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceFileInstallReceipt {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 #[derive(Clone, Copy)]
@@ -223,6 +235,185 @@ impl ExecutorClient {
             offset = offset
                 .checked_add(u64::try_from(chunk.content.len()).unwrap_or(u64::MAX))
                 .ok_or_else(|| ToolError::Protocol("raw workspace offset overflowed".to_owned()))?;
+        }
+    }
+
+    /// Relay one already-authorized byte stream into the private workspace.
+    /// The runtime never resolves a host path: the executor confines the
+    /// relative destination and keeps it absent until an exact size/digest
+    /// commitment is atomically installed without replacement.
+    pub async fn install_workspace_file_stream<S>(
+        &self,
+        destination_path: &str,
+        total_bytes: u64,
+        content_sha256: &str,
+        download_id: &str,
+        mut source: S,
+        cancel: CancellationToken,
+    ) -> Result<WorkspaceFileInstallReceipt, ToolError>
+    where
+        S: Stream<Item = Result<Vec<u8>, String>> + Send + Unpin,
+    {
+        let begun = self
+            .execute(
+                ExecutorOperation::BeginWorkspaceDownload {
+                    download_id: download_id.to_owned(),
+                    path: destination_path.to_owned(),
+                    total_bytes,
+                    content_sha256: content_sha256.to_owned(),
+                    execution_id: format!("{download_id}-begin"),
+                },
+                cancel.clone(),
+                Arc::new(|_| {}),
+            )
+            .await;
+        match begun {
+            Ok(ExecutorResponse::WorkspaceDownloadBegun {}) => {}
+            Ok(_) => {
+                return Err(ToolError::Protocol(
+                    "workspace download begin returned the wrong response".to_owned(),
+                ));
+            }
+            Err(error @ ToolError::RpcIndeterminate(_)) => {
+                return Err(self.cleanup_workspace_download(download_id, error).await);
+            }
+            Err(error) => return Err(error),
+        }
+
+        let transfer = async {
+            let mut offset = 0u64;
+            let mut chunk_index = 0u64;
+            let mut digest = Sha256::new();
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
+                    next = source.next() => next,
+                };
+                let Some(chunk) = next else {
+                    break;
+                };
+                let chunk = chunk.map_err(|message| {
+                    ToolError::Rpc(format!("attachment download stream failed: {message}"))
+                })?;
+                for content in chunk.chunks(MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES) {
+                    if content.is_empty() {
+                        continue;
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(ToolError::Cancelled);
+                    }
+                    let next_offset = offset
+                        .checked_add(u64::try_from(content.len()).unwrap_or(u64::MAX))
+                        .ok_or_else(|| {
+                            ToolError::Protocol("attachment download size overflowed".to_owned())
+                        })?;
+                    if next_offset > total_bytes {
+                        return Err(ToolError::Protocol(
+                            "attachment download exceeded its committed size".to_owned(),
+                        ));
+                    }
+                    let response = self
+                        .execute(
+                            ExecutorOperation::AppendWorkspaceDownload {
+                                download_id: download_id.to_owned(),
+                                offset,
+                                content: content.to_vec(),
+                                execution_id: format!("{download_id}-chunk-{chunk_index:08x}"),
+                            },
+                            cancel.clone(),
+                            Arc::new(|_| {}),
+                        )
+                        .await?;
+                    match response {
+                        ExecutorResponse::WorkspaceDownloadAppended {
+                            offset: acknowledged,
+                        } if acknowledged == next_offset => {}
+                        _ => {
+                            return Err(ToolError::Protocol(
+                                "workspace download append returned the wrong offset".to_owned(),
+                            ));
+                        }
+                    }
+                    digest.update(content);
+                    offset = next_offset;
+                    chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                        ToolError::Protocol("attachment chunk index overflowed".to_owned())
+                    })?;
+                }
+            }
+
+            let actual_sha256 = format!("{:x}", digest.finalize());
+            if offset != total_bytes || actual_sha256 != content_sha256 {
+                return Err(ToolError::Protocol(
+                    "attachment download did not match its size and SHA-256 commitment".to_owned(),
+                ));
+            }
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            match self
+                .execute(
+                    ExecutorOperation::FinishWorkspaceDownload {
+                        download_id: download_id.to_owned(),
+                        execution_id: format!("{download_id}-finish"),
+                    },
+                    cancel,
+                    Arc::new(|_| {}),
+                )
+                .await?
+            {
+                ExecutorResponse::WorkspaceFileInstalled {
+                    path: installed_path,
+                    size,
+                    sha256,
+                } if installed_path == destination_path
+                    && size == total_bytes
+                    && sha256 == content_sha256 =>
+                {
+                    Ok(WorkspaceFileInstallReceipt {
+                        path: installed_path,
+                        size,
+                        sha256,
+                    })
+                }
+                _ => Err(ToolError::Protocol(
+                    "workspace download finish returned invalid metadata".to_owned(),
+                )),
+            }
+        }
+        .await;
+
+        match transfer {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => Err(self.cleanup_workspace_download(download_id, error).await),
+        }
+    }
+
+    async fn cleanup_workspace_download(
+        &self,
+        download_id: &str,
+        original: ToolError,
+    ) -> ToolError {
+        let abort_id = format!("{download_id}-abort");
+        match self
+            .execute(
+                ExecutorOperation::AbortWorkspaceDownload {
+                    download_id: download_id.to_owned(),
+                    execution_id: abort_id,
+                },
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+        {
+            Ok(ExecutorResponse::WorkspaceDownloadAborted {}) => original,
+            Ok(_) => ToolError::RpcIndeterminate(format!(
+                "workspace download cleanup returned the wrong response after: {original}"
+            )),
+            Err(cleanup) => ToolError::RpcIndeterminate(format!(
+                "workspace download cleanup failed ({cleanup}) after: {original}"
+            )),
         }
     }
 
@@ -544,6 +735,10 @@ fn cancellation_mode(operation: &ExecutorOperation) -> CancellationMode {
         ExecutorOperation::Bash { .. } => CancellationMode::ActiveBash,
         ExecutorOperation::ReadFile { .. }
         | ExecutorOperation::ReadRawFile { .. }
+        | ExecutorOperation::BeginWorkspaceDownload { .. }
+        | ExecutorOperation::AppendWorkspaceDownload { .. }
+        | ExecutorOperation::FinishWorkspaceDownload { .. }
+        | ExecutorOperation::AbortWorkspaceDownload { .. }
         | ExecutorOperation::WriteFile { .. }
         | ExecutorOperation::EditFile { .. }
         | ExecutorOperation::RemoveFile { .. }
@@ -655,6 +850,10 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
         ExecutorOperation::Health { .. } => "",
         ExecutorOperation::ReadFile { execution_id, .. }
         | ExecutorOperation::ReadRawFile { execution_id, .. }
+        | ExecutorOperation::BeginWorkspaceDownload { execution_id, .. }
+        | ExecutorOperation::AppendWorkspaceDownload { execution_id, .. }
+        | ExecutorOperation::FinishWorkspaceDownload { execution_id, .. }
+        | ExecutorOperation::AbortWorkspaceDownload { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
         | ExecutorOperation::RemoveFile { execution_id, .. }
@@ -711,6 +910,37 @@ fn validate_response_for_personality_agent(
             expected_version.as_deref(),
             expected_content_digest.as_deref(),
         ),
+        (
+            ExecutorOperation::BeginWorkspaceDownload { .. },
+            ExecutorResponse::WorkspaceDownloadBegun {},
+        ) => true,
+        (
+            ExecutorOperation::AppendWorkspaceDownload {
+                offset, content, ..
+            },
+            ExecutorResponse::WorkspaceDownloadAppended {
+                offset: acknowledged,
+            },
+        ) => {
+            offset.checked_add(u64::try_from(content.len()).unwrap_or(u64::MAX))
+                == Some(*acknowledged)
+        }
+        (
+            ExecutorOperation::FinishWorkspaceDownload { .. },
+            ExecutorResponse::WorkspaceFileInstalled { path, size, sha256 },
+        ) => {
+            *size > 0
+                && sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && valid_relative_path(path)
+        }
+        (
+            ExecutorOperation::AbortWorkspaceDownload { .. },
+            ExecutorResponse::WorkspaceDownloadAborted {}
+            | ExecutorResponse::WorkspaceDownloadAbortTooLate {},
+        ) => true,
         (ExecutorOperation::Grep { path, .. }, ExecutorResponse::Grepped { matches }) => {
             !path.starts_with("artifact://") && workspace_grep_matches_are_bounded(matches)
         }
@@ -899,7 +1129,11 @@ fn artifact_grep_matches_are_bounded(
 fn map_rpc_error(operation: &ExecutorOperation, error: RpcError) -> ToolError {
     let mutating = matches!(
         operation,
-        ExecutorOperation::WriteFile { .. }
+        ExecutorOperation::BeginWorkspaceDownload { .. }
+            | ExecutorOperation::AppendWorkspaceDownload { .. }
+            | ExecutorOperation::FinishWorkspaceDownload { .. }
+            | ExecutorOperation::AbortWorkspaceDownload { .. }
+            | ExecutorOperation::WriteFile { .. }
             | ExecutorOperation::EditFile { .. }
             | ExecutorOperation::RemoveFile { .. }
     );
@@ -909,6 +1143,15 @@ fn map_rpc_error(operation: &ExecutorOperation, error: RpcError) -> ToolError {
         }
         (RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE, None) => {
             ToolError::Rpc(REPLAY_OUTCOME_UNAVAILABLE_MESSAGE.to_owned())
+        }
+        (WORKSPACE_DOWNLOAD_COLLISION_CODE, None) => {
+            ToolError::Protocol("workspace download destination already exists".to_owned())
+        }
+        (WORKSPACE_DOWNLOAD_MISMATCH_CODE, None) => {
+            ToolError::Protocol("workspace download size or digest mismatch".to_owned())
+        }
+        (WORKSPACE_DOWNLOAD_STATE_MISMATCH_CODE, None) => {
+            ToolError::Protocol("workspace download state mismatch".to_owned())
         }
         ("resource_limit", Some(limit)) => ToolError::ResourceLimit(limit),
         ("cancelled", None) if !mutating => ToolError::Cancelled,
@@ -946,7 +1189,9 @@ mod tests {
         executor::{
             ArtifactBrokerClient,
             service::{
-                ExecutorTestControls, run_executor_service, run_executor_service_with_cancel_delay,
+                CriticalExecutorTestState, ExecutorTestControls,
+                run_critical_executor_test_connection, run_executor_service,
+                run_executor_service_with_cancel_delay,
             },
         },
         fs::WorkspaceFs,
@@ -1017,6 +1262,83 @@ mod tests {
             for session in sessions {
                 session.await.unwrap();
             }
+        });
+        (socket, task)
+    }
+
+    fn spawn_real_critical_service(root: &Path, connections: usize) -> (PathBuf, JoinHandle<()>) {
+        let socket = root.join("e.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let state = CriticalExecutorTestState::new(&workspace).unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, write) = stream.into_split();
+                run_critical_executor_test_connection(read, write, identity(), state.clone())
+                    .await
+                    .unwrap();
+            }
+        });
+        (socket, task)
+    }
+
+    fn spawn_critical_finish_response_loss_service(root: &Path) -> (PathBuf, JoinHandle<()>) {
+        let socket = root.join("l.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let state = CriticalExecutorTestState::new(&workspace).unwrap();
+        let task = tokio::spawn(async move {
+            // Begin and one append use the real production-boundary exchange.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, write) = stream.into_split();
+                run_critical_executor_test_connection(read, write, identity(), state.clone())
+                    .await
+                    .unwrap();
+            }
+
+            // Finish reaches and commits in the real service, but its terminal
+            // frame is consumed by this loss proxy instead of reaching the
+            // client. Only after observing that frame do we close the client.
+            let (mut client_stream, _) = listener.accept().await.unwrap();
+            let (proxy_stream, executor_stream) = tokio::io::duplex(2 * MAX_RPC_LINE_BYTES);
+            let (executor_read, executor_write) = tokio::io::split(executor_stream);
+            let service = tokio::spawn(run_critical_executor_test_connection(
+                executor_read,
+                executor_write,
+                identity(),
+                state.clone(),
+            ));
+            let (proxy_read, mut proxy_write) = tokio::io::split(proxy_stream);
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                client_stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            proxy_write.write_all(&request).await.unwrap();
+            proxy_write.shutdown().await.unwrap();
+            let mut terminal = String::new();
+            BufReader::new(proxy_read)
+                .read_line(&mut terminal)
+                .await
+                .unwrap();
+            assert!(terminal.contains("workspace_file_installed"));
+            drop(client_stream);
+            service.await.unwrap().unwrap();
+
+            // The client's fresh cleanup RPC must observe AbortTooLate.
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, write) = stream.into_split();
+            run_critical_executor_test_connection(read, write, identity(), state)
+                .await
+                .unwrap();
         });
         (socket, task)
     }
@@ -1134,6 +1456,118 @@ mod tests {
 
         assert_eq!(file.filename, "image.bin");
         assert_eq!(file.bytes, bytes);
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn installs_streamed_workspace_file_through_real_critical_service() {
+        let root = temp_root("workspace-install-success");
+        let bytes = (0..MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let (socket, service) = spawn_real_critical_service(&root, 4);
+
+        let receipt = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .install_workspace_file_stream(
+                "download.bin",
+                bytes.len() as u64,
+                &digest,
+                "download-success",
+                futures_util::stream::iter(vec![Ok::<_, String>(bytes.clone())]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("stream workspace download");
+
+        assert_eq!(receipt.path, "download.bin");
+        assert_eq!(receipt.size, bytes.len() as u64);
+        assert_eq!(receipt.sha256, digest);
+        assert_eq!(
+            std::fs::read(root.join("workspace/download.bin")).unwrap(),
+            bytes
+        );
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_aborts_real_service_without_a_partial_workspace_name() {
+        let root = temp_root("workspace-install-cancel");
+        let bytes = b"partial then cancelled attachment".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let cancel = CancellationToken::new();
+        let source_cancel = cancel.clone();
+        let first = bytes[..8].to_vec();
+        let remaining = bytes[8..].to_vec();
+        let mut phase = 0u8;
+        let source = futures_util::stream::poll_fn(move |_| {
+            let item = match phase {
+                0 => Some(Ok::<_, String>(first.clone())),
+                1 => {
+                    source_cancel.cancel();
+                    Some(Ok::<_, String>(remaining.clone()))
+                }
+                _ => None,
+            };
+            phase = phase.saturating_add(1);
+            std::task::Poll::Ready(item)
+        });
+        let (socket, service) = spawn_real_critical_service(&root, 3);
+
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .install_workspace_file_stream(
+                "cancelled.bin",
+                bytes.len() as u64,
+                &digest,
+                "download-cancel",
+                source,
+                cancel,
+            )
+            .await
+            .expect_err("cancel streamed download");
+
+        assert!(matches!(error, ToolError::Cancelled));
+        assert!(!root.join("workspace/cancelled.bin").exists());
+        assert!(
+            std::fs::read_dir(root.join("workspace"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "cancelled O_TMPFILE relay left a workspace entry"
+        );
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_finish_response_then_abort_too_late_stays_indeterminate() {
+        let root = temp_root("workspace-install-finish-loss");
+        let bytes = b"committed before response loss".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let (socket, service) = spawn_critical_finish_response_loss_service(&root);
+
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .install_workspace_file_stream(
+                "committed.bin",
+                bytes.len() as u64,
+                &digest,
+                "download-finish-loss",
+                futures_util::stream::iter(vec![Ok::<_, String>(bytes.clone())]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("lost finish response must remain indeterminate");
+
+        assert!(matches!(error, ToolError::RpcIndeterminate(_)));
+        assert_eq!(
+            std::fs::read(root.join("workspace/committed.bin")).unwrap(),
+            bytes
+        );
         service.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

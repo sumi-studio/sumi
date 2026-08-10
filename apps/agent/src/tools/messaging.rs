@@ -5,7 +5,12 @@
 //! The view is a tool owned by the continuing person; it is not another agent
 //! or another life-log Session.
 
-use std::{fmt::Write as _, str, sync::Arc};
+use std::{
+    fmt::Write as _,
+    path::{Component, Path},
+    str,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -20,17 +25,19 @@ use crate::{
         CreateMessagingReplyLaterRequest, CreateMessagingRoleRequest, CreateMessagingThreadRequest,
         DeleteMessagingRoleRequest, DuplicateMessagingChannelRequest, GetMessagingCallStateRequest,
         ListMessagingRolesRequest, ListMessagingThreadsRequest, MessagingApi,
-        MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
-        OpenMessagingAttachmentRequest, OpenMessagingPlaceRequest, PollMessagingAttentionRequest,
-        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingChannelTopicRequest,
-        SetMessagingMemberRolesRequest, SetMessagingProfileRequest, SetMessagingStatusRequest,
-        StartMessagingDMRequest, UpdateMessagingChannelRequest, UpdateMessagingRoleRequest,
+        MessagingAttachmentByteStream, MessagingNotificationPlace,
+        MessagingNotificationSettingsRequest, MessagingParticipant, OpenMessagingAttachmentRequest,
+        OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
+        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+        SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest,
+        SetMessagingProfileRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
+        UpdateMessagingChannelRequest, UpdateMessagingRoleRequest,
         UploadMessagingAttachmentRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{
-        Tool, ToolCtx, ToolError, ToolOutput, ToolRisk, executor::ExecutorClient,
+        Tool, ToolCtx, ToolError, ToolOutput, ToolRisk,
+        executor::{ExecutorClient, WorkspaceFileInstallReceipt},
         fs::MAX_RAW_FILE_TOTAL_BYTES,
     },
 };
@@ -121,6 +128,13 @@ enum MessagingAction {
     },
     /// Read one attachment carried by a message this participant can see.
     OpenAttachment { attachment_id: String },
+    /// Stream one visible attachment into this PersonalityAgent's private
+    /// workspace. The model chooses only a relative private path; no host path
+    /// or byte encoding crosses the tool result.
+    DownloadAttachment {
+        attachment_id: String,
+        destination_path: String,
+    },
     /// Write in the place currently open in this view.
     Write {
         #[serde(default)]
@@ -436,6 +450,16 @@ pub(crate) trait WorkspaceFileSource: Send + Sync + 'static {
         execution_id_prefix: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<WorkspaceFileInput, ToolError>;
+
+    async fn install_file_stream(
+        &self,
+        path: &str,
+        size: u64,
+        sha256: &str,
+        body: MessagingAttachmentByteStream,
+        download_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkspaceFileInstallReceipt, ToolError>;
 }
 
 #[async_trait]
@@ -455,6 +479,19 @@ impl WorkspaceFileSource for ExecutorClient {
             bytes: file.bytes,
         })
     }
+
+    async fn install_file_stream(
+        &self,
+        path: &str,
+        size: u64,
+        sha256: &str,
+        body: MessagingAttachmentByteStream,
+        download_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkspaceFileInstallReceipt, ToolError> {
+        self.install_workspace_file_stream(path, size, sha256, download_id, body, cancel)
+            .await
+    }
 }
 
 struct UnavailableWorkspaceFiles;
@@ -470,6 +507,20 @@ impl WorkspaceFileSource for UnavailableWorkspaceFiles {
     ) -> Result<WorkspaceFileInput, ToolError> {
         Err(ToolError::Protocol(
             "workspace file source is not installed for messaging".to_owned(),
+        ))
+    }
+
+    async fn install_file_stream(
+        &self,
+        _path: &str,
+        _size: u64,
+        _sha256: &str,
+        _body: MessagingAttachmentByteStream,
+        _download_id: &str,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkspaceFileInstallReceipt, ToolError> {
+        Err(ToolError::Protocol(
+            "workspace file destination is not installed for messaging".to_owned(),
         ))
     }
 }
@@ -518,7 +569,8 @@ fn messaging_parameters_schema() -> Value {
         "description": concat!(
             "Choose one messaging action and include only the fields used by that action. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
-            "or limit; open_attachment requires attachment_id; write requires content, ",
+            "or limit; open_attachment requires attachment_id; download_attachment requires ",
+            "attachment_id and destination_path; write requires content, ",
             "attachments, or both and may include urgency or reply_to; react ",
             "requires emoji, reacted, and exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
@@ -545,7 +597,7 @@ fn messaging_parameters_schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": [
-                    "overview", "open", "open_attachment", "write", "react",
+                    "overview", "open", "open_attachment", "download_attachment", "write", "react",
                     "status", "profile", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
                     "search", "notification_settings", "attention", "get_call_state",
@@ -555,7 +607,9 @@ fn messaging_parameters_schema() -> Value {
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
                     "shows one place and focuses it for later writes; open_attachment reads a ",
-                    "file carried by a visible message; write sends a message to ",
+                    "small file carried by a visible message; download_attachment streams a ",
+                    "visible file into a new relative path in this agent's private workspace; ",
+                    "write sends a message to ",
                     "the currently open place; react states whether your emoji reaction is ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
@@ -636,7 +690,17 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "description": concat!(
                     "Required for open_attachment and omitted for other actions. Copy the ",
-                    "attachment_id shown on a message this participant can see."
+                    "attachment_id shown on a message this participant can see. Also required ",
+                    "for download_attachment."
+                )
+            },
+            "destination_path": {
+                "type": "string",
+                "description": concat!(
+                    "Required for download_attachment and omitted for other actions. A normal ",
+                    "relative path inside this agent's private workspace. The destination must ",
+                    "not already exist and its parent directory must already exist; no absolute ",
+                    "or host path is accepted."
                 )
             },
             "content": {
@@ -977,7 +1041,8 @@ impl Tool for MessagingTool {
             description: concat!(
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, read a carried ",
-                "file with open_attachment, then write text and/or workspace files in ",
+                "small file with open_attachment, stream a larger visible file into a new ",
+                "private-workspace path with download_attachment, then write text and/or workspace files in ",
                 "that currently open place, or react or promise a later reply to a ",
                 "message visible in it. When a tangent deserves its own room, list or ",
                 "open a thread under the place. Declare your own availability with status, ",
@@ -1090,6 +1155,45 @@ impl Tool for MessagingTool {
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
                 return attachment_output(&response);
+            }
+            MessagingAction::DownloadAttachment {
+                attachment_id,
+                destination_path,
+            } => {
+                if !state.visible_messages.iter().any(|message| {
+                    message
+                        .attachment_ids
+                        .iter()
+                        .any(|visible_id| visible_id == &attachment_id)
+                }) {
+                    return Err(ToolError::Protocol(
+                        "that attachment is not visible in the currently open place; open the place (paging with before_seq if needed) so its message is on screen, then download the attachment"
+                            .to_owned(),
+                    ));
+                }
+                let download = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.download_attachment(OpenMessagingAttachmentRequest {
+                        attachment_id: &attachment_id,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let download_id = format!("{}-download", client_nonce(ctx.flow_id, ctx.call_id));
+                // Do not race this future against cancellation here. The
+                // executor relay observes the token itself and must finish its
+                // fresh abort/critical-settlement path before the tool returns.
+                let receipt = self
+                    .workspace_files
+                    .install_file_stream(
+                        &destination_path,
+                        download.size,
+                        &download.sha256,
+                        download.body,
+                        &download_id,
+                        ctx.cancel.clone(),
+                    )
+                    .await?;
+                return workspace_download_output(receipt);
             }
             MessagingAction::Write {
                 content,
@@ -1676,6 +1780,23 @@ fn attachment_output(response: &Value) -> Result<ToolOutput, ToolError> {
     })
 }
 
+fn workspace_download_output(
+    receipt: WorkspaceFileInstallReceipt,
+) -> Result<ToolOutput, ToolError> {
+    let details = serde_json::json!({
+        "path": receipt.path,
+        "size": receipt.size,
+        "sha256": receipt.sha256,
+    });
+    let rendered = serde_json::to_string_pretty(&details)
+        .map_err(|error| ToolError::Protocol(error.to_string()))?;
+    Ok(ToolOutput {
+        content: vec![UserContent::Text { text: rendered }],
+        details,
+        is_error: false,
+    })
+}
+
 /// A channel that was just created becomes the place in view, the way a human
 /// lands in the channel they made. Nothing has been seen there, so the screen
 /// starts empty (ADR 0011 §3: 見えていないものは操作できない).
@@ -1706,6 +1827,28 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         }
         MessagingAction::OpenAttachment { attachment_id } => {
             validate_bounded_nonempty(attachment_id, MAX_ATTACHMENT_ID_BYTES)
+        }
+        MessagingAction::DownloadAttachment {
+            attachment_id,
+            destination_path,
+        } => {
+            validate_bounded_nonempty(attachment_id, MAX_ATTACHMENT_ID_BYTES)?;
+            validate_bounded_nonempty(destination_path, MAX_ATTACHMENT_PATH_BYTES)?;
+            let path = Path::new(destination_path);
+            if path.is_absolute()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                || path
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+                    != destination_path.as_str()
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
         }
         MessagingAction::Write {
             content,
@@ -2256,6 +2399,7 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
 
     use anyhow::{Result, anyhow};
+    use futures_util::{StreamExt, stream};
     use serde_json::json;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio_util::sync::CancellationToken;
@@ -2277,6 +2421,7 @@ mod tests {
         upload_failures: AsyncMutex<VecDeque<&'static str>>,
         cancel_after_upload: AsyncMutex<Option<CancellationToken>>,
         attachments: AsyncMutex<BTreeMap<String, Value>>,
+        downloads: AsyncMutex<BTreeMap<String, (Vec<u8>, String)>>,
         reacts: AsyncMutex<Vec<(String, String, String, bool)>>,
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
         profiles: AsyncMutex<Vec<(Option<String>, Option<String>)>>,
@@ -2390,6 +2535,30 @@ mod tests {
                 .get(request.attachment_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("attachment not found"))
+        }
+
+        async fn download_attachment(
+            &self,
+            request: OpenMessagingAttachmentRequest<'_>,
+        ) -> Result<crate::apiclient::messaging::DownloadMessagingAttachmentResponse> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("attachment-download:{}", request.attachment_id));
+            let (bytes, sha256) = self
+                .downloads
+                .lock()
+                .await
+                .get(request.attachment_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("attachment not found"))?;
+            Ok(
+                crate::apiclient::messaging::DownloadMessagingAttachmentResponse {
+                    size: bytes.len() as u64,
+                    sha256,
+                    body: Box::pin(stream::once(async move { Ok(bytes) })),
+                },
+            )
         }
 
         async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {
@@ -2759,6 +2928,7 @@ mod tests {
     #[derive(Default)]
     struct FakeWorkspaceFileSource {
         reads: AsyncMutex<Vec<String>>,
+        installs: AsyncMutex<Vec<(String, Vec<u8>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -2782,6 +2952,38 @@ mod tests {
                 } else {
                     vec![0, 255, 1]
                 },
+            })
+        }
+
+        async fn install_file_stream(
+            &self,
+            path: &str,
+            size: u64,
+            sha256: &str,
+            mut body: MessagingAttachmentByteStream,
+            _download_id: &str,
+            cancel: CancellationToken,
+        ) -> std::result::Result<WorkspaceFileInstallReceipt, ToolError> {
+            let mut bytes = Vec::new();
+            loop {
+                let next = tokio::select! {
+                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
+                    next = body.next() => next,
+                };
+                let Some(chunk) = next else { break };
+                bytes.extend_from_slice(
+                    &chunk.map_err(|message| ToolError::Rpc(message.to_owned()))?,
+                );
+            }
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            if bytes.len() as u64 != size || actual != sha256 {
+                return Err(ToolError::Protocol("download mismatch".to_owned()));
+            }
+            self.installs.lock().await.push((path.to_owned(), bytes));
+            Ok(WorkspaceFileInstallReceipt {
+                path: path.to_owned(),
+                size,
+                sha256: sha256.to_owned(),
             })
         }
     }
@@ -2871,6 +3073,7 @@ mod tests {
                 "overview",
                 "open",
                 "open_attachment",
+                "download_attachment",
                 "write",
                 "react",
                 "status",
@@ -2969,7 +3172,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            42
+            43
         );
     }
 
@@ -3003,6 +3206,20 @@ mod tests {
         assert!(matches!(
             attachment,
             MessagingAction::OpenAttachment { attachment_id } if attachment_id == "att-1"
+        ));
+
+        let download: MessagingAction = serde_json::from_value(json!({
+            "action": "download_attachment",
+            "attachment_id": "att-1",
+            "destination_path": "inbox/note.bin"
+        }))
+        .unwrap();
+        assert!(matches!(
+            download,
+            MessagingAction::DownloadAttachment {
+                attachment_id,
+                destination_path,
+            } if attachment_id == "att-1" && destination_path == "inbox/note.bin"
         ));
 
         let write: MessagingAction = serde_json::from_value(json!({
@@ -4655,6 +4872,117 @@ mod tests {
         .await
         .expect_err("visible attachment became unavailable");
         assert!(matches!(refused, ToolError::Rpc(_)));
+    }
+
+    #[tokio::test]
+    async fn download_attachment_enforces_visibility_then_relays_only_private_metadata() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let files = Arc::new(FakeWorkspaceFileSource::default());
+        let tool = messaging_tool_with_files(api.clone(), files.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-download-place",
+        )
+        .await
+        .unwrap();
+
+        for destination_path in ["dir//file.bin", "dir/./file.bin", "file.bin/"] {
+            let error = execute(
+                &tool,
+                json!({
+                    "action": "download_attachment",
+                    "attachment_id": "a6",
+                    "destination_path": destination_path
+                }),
+                "download-noncanonical",
+            )
+            .await
+            .expect_err("noncanonical destination spelling");
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert!(
+            api.calls
+                .lock()
+                .await
+                .iter()
+                .all(|call| !call.starts_with("attachment-download:"))
+        );
+        assert!(files.installs.lock().await.is_empty());
+
+        let invisible = execute(
+            &tool,
+            json!({
+                "action": "download_attachment",
+                "attachment_id": "not-on-screen",
+                "destination_path": "invisible.bin"
+            }),
+            "download-invisible",
+        )
+        .await
+        .expect_err("attachment outside the current screen");
+        assert!(matches!(invisible, ToolError::Protocol(_)));
+        assert!(
+            !api.calls
+                .lock()
+                .await
+                .contains(&"attachment-download:not-on-screen".to_owned())
+        );
+        assert!(files.installs.lock().await.is_empty());
+
+        let refused = execute(
+            &tool,
+            json!({
+                "action": "download_attachment",
+                "attachment_id": "a6",
+                "destination_path": "refused.bin"
+            }),
+            "download-refused",
+        )
+        .await
+        .expect_err("application refused the visible attachment");
+        assert!(matches!(refused, ToolError::Rpc(_)));
+        assert!(
+            api.calls
+                .lock()
+                .await
+                .contains(&"attachment-download:a6".to_owned())
+        );
+        assert!(files.installs.lock().await.is_empty());
+
+        let bytes = vec![0, 0xff, 0x80, b's', b'u', b'm', b'i'];
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        api.downloads
+            .lock()
+            .await
+            .insert("a6".to_owned(), (bytes.clone(), digest.clone()));
+        let output = execute(
+            &tool,
+            json!({
+                "action": "download_attachment",
+                "attachment_id": "a6",
+                "destination_path": "visible.bin"
+            }),
+            "download-visible",
+        )
+        .await
+        .expect("download visible attachment");
+
+        assert_eq!(
+            files.installs.lock().await.as_slice(),
+            &[("visible.bin".to_owned(), bytes)]
+        );
+        assert_eq!(
+            output.details,
+            json!({"path": "visible.bin", "size": 7, "sha256": digest})
+        );
+        let UserContent::Text { text } = &output.content[0] else {
+            panic!("download result must be text metadata");
+        };
+        assert!(text.contains("visible.bin"));
+        assert!(!text.contains("/workspace"));
+        assert!(!text.contains("data"));
+        assert!(!text.contains("base64"));
     }
 
     /// AX/UX 同型性: 送り手が添付に付けた「ネタバレ」と概要は、人間の画面と

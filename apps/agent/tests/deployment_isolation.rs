@@ -1,8 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
-    io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixListener,
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, PermissionsExt},
@@ -604,6 +603,7 @@ struct OwnedExecutorDockerSmoke {
     root: PathBuf,
     image: String,
     container: String,
+    workspace_volume: String,
 }
 
 impl OwnedExecutorDockerSmoke {
@@ -612,13 +612,15 @@ impl OwnedExecutorDockerSmoke {
         let root = std::env::temp_dir().join(format!("sumi-executor-smoke-{unique}"));
         let image = format!("sumi-executor-smoke-{unique}:latest");
         let container = format!("sumi-executor-smoke-{unique}");
-        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        let workspace_volume = format!("sumi-executor-workspace-{unique}");
         std::fs::create_dir_all(root.join("identity")).unwrap();
         std::fs::create_dir_all(root.join("executor")).unwrap();
+        std::fs::create_dir_all(root.join("client")).unwrap();
         Self {
             root,
             image,
             container,
+            workspace_volume,
         }
     }
 
@@ -679,6 +681,40 @@ impl OwnedExecutorDockerSmoke {
                     Ok(remove) if !remove.status.success() => errors.push(format!(
                         "cannot remove exact owned container {}: {}",
                         self.container,
+                        String::from_utf8_lossy(&remove.stderr)
+                    )),
+                    Ok(_) => {}
+                }
+            }
+            Ok(_) => {}
+        }
+
+        let volume = self.try_docker(
+            20,
+            vec![
+                "volume".into(),
+                "inspect".into(),
+                self.workspace_volume.clone(),
+            ],
+        );
+        match volume {
+            Err(error) => errors.push(format!(
+                "cannot inspect exact owned volume {}: {error}",
+                self.workspace_volume
+            )),
+            Ok(volume) if volume.status.success() => {
+                let remove = self.try_docker(
+                    20,
+                    vec!["volume".into(), "rm".into(), self.workspace_volume.clone()],
+                );
+                match remove {
+                    Err(error) => errors.push(format!(
+                        "cannot remove exact owned volume {}: {error}",
+                        self.workspace_volume
+                    )),
+                    Ok(remove) if !remove.status.success() => errors.push(format!(
+                        "cannot remove exact owned volume {}: {}",
+                        self.workspace_volume,
                         String::from_utf8_lossy(&remove.stderr)
                     )),
                     Ok(_) => {}
@@ -824,6 +860,22 @@ impl OwnedExecutorDockerSmoke {
                 self.root.display()
             ));
         }
+        if self
+            .try_docker(
+                20,
+                vec![
+                    "volume".into(),
+                    "inspect".into(),
+                    self.workspace_volume.clone(),
+                ],
+            )
+            .is_ok_and(|inspect| inspect.status.success())
+        {
+            errors.push(format!(
+                "exact owned volume survived cleanup: {}",
+                self.workspace_volume
+            ));
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -841,23 +893,97 @@ impl Drop for OwnedExecutorDockerSmoke {
     }
 }
 
-fn exchange_executor_socket(socket: &std::path::Path, request: JsonValue) -> JsonValue {
-    let mut stream = UnixStream::connect(socket).expect("connect owned executor socket");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut request = serde_json::to_vec(&request).unwrap();
-    request.push(b'\n');
-    stream.write_all(&request).expect("write executor request");
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("read executor response");
-    serde_json::from_str(response.trim()).expect("decode executor response")
+const EXECUTOR_PEER_HELPER_SOURCE: &str = r#"
+use std::{fs, io::{Read, Write}, net::Shutdown, os::unix::net::UnixStream, time::Duration};
+
+fn main() {
+    let request = fs::read("/client/request.json").expect("read helper request");
+    let exchange = (|| -> std::io::Result<String> {
+        let mut stream = UnixStream::connect("/run/sumi/executor/executor.sock")?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(&request)?;
+        stream.write_all(b"\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    })();
+    if std::env::var("SUMI_TEST_EXPECT_PEER_REJECTION").as_deref() == Ok("1") {
+        match exchange {
+            Err(_) => return,
+            Ok(response) if response.trim().is_empty() => return,
+            Ok(response) => panic!("wrong-uid peer received executor response: {response}"),
+        }
+    }
+    let response = exchange.expect("runtime-uid helper exchange");
+    assert!(!response.trim().is_empty(), "executor closed without a response");
+    fs::write("/client/response.json", response).expect("write helper response");
+}
+"#;
+
+fn run_executor_peer_helper(
+    smoke: &OwnedExecutorDockerSmoke,
+    uid: u32,
+    request: &JsonValue,
+    expect_rejected: bool,
+) -> Output {
+    let client_dir = smoke.root.join("client");
+    let request_path = client_dir.join("request.json");
+    let response_path = client_dir.join("response.json");
+    let _ = std::fs::remove_file(&response_path);
+    std::fs::write(&request_path, serde_json::to_vec(request).unwrap()).unwrap();
+    std::fs::set_permissions(&request_path, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let host_gid = unsafe { libc::getegid() };
+    let mut args = vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        "none".into(),
+        "--read-only".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges:true".into(),
+        "--user".into(),
+        format!("{uid}:{host_gid}"),
+        "--group-add".into(),
+        "10020".into(),
+        "--entrypoint".into(),
+        "/client/executor-peer-test".into(),
+        "--env".into(),
+        "SUMI_TEST_EXECUTOR_PEER_HELPER=1".into(),
+    ];
+    if expect_rejected {
+        args.extend(["--env".into(), "SUMI_TEST_EXPECT_PEER_REJECTION=1".into()]);
+    }
+    args.extend([
+        "-v".into(),
+        format!("{}:/client", client_dir.display()),
+        "-v".into(),
+        format!(
+            "{}:/run/sumi/executor",
+            smoke.root.join("executor").display()
+        ),
+        smoke.image.clone(),
+    ]);
+    smoke.docker(30, args)
+}
+
+fn exchange_executor_socket_as_runtime(
+    smoke: &OwnedExecutorDockerSmoke,
+    request: JsonValue,
+) -> JsonValue {
+    let output = run_executor_peer_helper(smoke, 10_001, &request, false);
+    assert!(
+        output.status.success(),
+        "runtime-uid executor peer helper failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = std::fs::read_to_string(smoke.root.join("client/response.json"))
+        .expect("runtime peer response file");
+    serde_json::from_str(response.trim()).expect("decode runtime peer response")
 }
 
 #[test]
@@ -1325,7 +1451,7 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     );
     assert_has_mount(runtime, "executor-ipc:/run/sumi/executor:ro");
     assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
-    assert_has_mount(executor, "workspace:/workspace:ro");
+    assert_has_mount(executor, "workspace:/workspace");
     assert_has_mount(broker, "broker-ipc:/run/sumi/broker");
     assert!(!volume_sources(runtime).contains("workspace"));
     assert!(!volume_sources(runtime).contains("broker-ipc"));
@@ -1710,14 +1836,18 @@ exit 99
 }
 
 #[test]
-fn executor_deployment_is_broker_blind_and_read_only() {
+fn executor_deployment_is_broker_blind_and_owns_workspace_writes() {
     let compose = compose();
     let executor = service(&compose, "executor");
     let defaults = &compose["x-long-lived-hardening"];
 
     assert_eq!(executor["user"].as_str(), Some("10002:10002"));
     assert_eq!(executor["network_mode"].as_str(), Some("none"));
-    assert_has_mount(executor, "workspace:/workspace:ro");
+    assert_eq!(
+        executor["environment"]["SUMI_EXECUTOR_CLIENT_UID"].as_str(),
+        Some("10001")
+    );
+    assert_has_mount(executor, "workspace:/workspace");
     assert_has_mount(executor, "executor-identity:/run/sumi/identity:ro");
     assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
     assert!(!volume_sources(executor).contains("broker-ipc"));
@@ -1728,7 +1858,7 @@ fn executor_deployment_is_broker_blind_and_read_only() {
     assert!(depends_on.contains_key("prepare"));
     assert!(
         !depends_on.contains_key("broker"),
-        "the read-only executor must not receive a broker startup dependency"
+        "the workspace-owning executor must not receive a broker startup dependency"
     );
     assert!(executor.get("group_add").is_none());
     assert!(executor.get("cap_add").is_none());
@@ -1738,6 +1868,10 @@ fn executor_deployment_is_broker_blind_and_read_only() {
         defaults["cap_drop"],
         Value::Sequence(vec![Value::String("ALL".to_owned())])
     );
+    let entrypoint = read_deploy("container-entrypoint");
+    assert!(entrypoint.contains("require_env SUMI_EXECUTOR_CLIENT_UID"));
+    assert!(entrypoint.contains("SUMI_EXECUTOR_CLIENT_UID must be the fixed runtime uid 10001"));
+    assert!(entrypoint.contains("SUMI_EXECUTOR_CLIENT_UID=\"${SUMI_EXECUTOR_CLIENT_UID}\""));
     assert_eq!(
         defaults["security_opt"],
         Value::Sequence(vec![
@@ -1818,10 +1952,16 @@ fn every_long_lived_role_is_non_root_read_only_and_restricted() {
     assert!(seccomp.is_object());
     let syscalls = seccomp["syscalls"].as_array().unwrap();
     let ordinary = syscalls[0]["names"].as_array().unwrap();
-    for syscall in ["openat2", "close_range", "prctl", "rt_sigtimedwait"] {
+    for syscall in [
+        "openat2",
+        "linkat",
+        "close_range",
+        "prctl",
+        "rt_sigtimedwait",
+    ] {
         assert!(ordinary.iter().any(|name| name.as_str() == Some(syscall)));
     }
-    for dormant in ["mount", "umount2", "unshare"] {
+    for dormant in ["link", "mount", "umount2", "unshare"] {
         assert!(
             !syscalls.iter().any(|rule| {
                 rule["names"]
@@ -1857,25 +1997,25 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
     if std::env::var_os("SUMI_EXECUTOR_DOCKER_SMOKE").is_none() {
         eprintln!(
             "NOT_RUN: set SUMI_EXECUTOR_DOCKER_SMOKE=1 to build and exercise the exact \
-             read-only executor image without providers"
+             hardened executor image without providers"
         );
         return;
     }
-    if !timeout_available() {
-        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound exact executor smoke");
-        return;
-    }
-    if !bounded_docker_output(
+    assert!(
+        timeout_available(),
+        "SUMI_EXECUTOR_DOCKER_SMOKE was explicitly enabled, but GNU timeout is unavailable"
+    );
+    let docker_info = try_bounded_docker_output(
         deploy_dir().parent().unwrap().parent().unwrap(),
         10,
         &["info".into()],
     )
-    .status
-    .success()
-    {
-        eprintln!("HOST_UNAVAILABLE: Docker daemon cannot run exact executor smoke");
-        return;
-    }
+    .expect("SUMI_EXECUTOR_DOCKER_SMOKE was explicitly enabled, but Docker could not be invoked");
+    assert!(
+        docker_info.status.success(),
+        "SUMI_EXECUTOR_DOCKER_SMOKE was explicitly enabled, but the Docker daemon cannot run the exact executor smoke: {}",
+        String::from_utf8_lossy(&docker_info.stderr)
+    );
     let _guard = HOST_FIXTURE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1900,6 +2040,42 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             "exact executor image build failed or exceeded its bound: {}",
             String::from_utf8_lossy(&build.stderr)
         );
+        let create_workspace = smoke.docker(
+            30,
+            vec![
+                "volume".into(),
+                "create".into(),
+                smoke.workspace_volume.clone(),
+            ],
+        );
+        assert!(
+            create_workspace.status.success(),
+            "owned executor workspace volume creation failed: {}",
+            String::from_utf8_lossy(&create_workspace.stderr)
+        );
+        let initialize_workspace = smoke.docker(
+            30,
+            vec![
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "--entrypoint".into(),
+                "/bin/sh".into(),
+                "--user".into(),
+                "0:0".into(),
+                "-v".into(),
+                format!("{}:/workspace", smoke.workspace_volume),
+                smoke.image.clone(),
+                "-ec".into(),
+                "printf 'read-file-content\\n' > /workspace/note.txt; chown 10002:10002 /workspace /workspace/note.txt; chmod 0700 /workspace; chmod 0600 /workspace/note.txt".into(),
+            ],
+        );
+        assert!(
+            initialize_workspace.status.success(),
+            "owned executor workspace volume initialization failed: {}",
+            String::from_utf8_lossy(&initialize_workspace.stderr)
+        );
 
         std::fs::write(
             smoke.root.join("identity/identity.env"),
@@ -1908,7 +2084,37 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             ),
         )
         .unwrap();
-        std::fs::write(smoke.root.join("workspace/note.txt"), "read-file-content\n").unwrap();
+        std::fs::write(
+            smoke.root.join("client/executor-peer-test.rs"),
+            EXECUTOR_PEER_HELPER_SOURCE,
+        )
+        .expect("write runtime peer helper source");
+        let compile_helper = smoke.docker(
+            120,
+            vec![
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "-v".into(),
+                format!("{}:/client", smoke.root.join("client").display()),
+                "rust:1.88-bookworm".into(),
+                "rustc".into(),
+                "--edition=2021".into(),
+                "-O".into(),
+                "/client/executor-peer-test.rs".into(),
+                "-o".into(),
+                "/client/executor-peer-test".into(),
+            ],
+        );
+        assert!(
+            compile_helper.status.success(),
+            "bookworm executor peer helper compile failed; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&compile_helper.stdout),
+            String::from_utf8_lossy(&compile_helper.stderr)
+        );
+        assert!(smoke.root.join("client/executor-peer-test").is_file());
+        let host_gid = unsafe { libc::getegid() };
         let fixture_path = format!("{}:/fixture", smoke.root.display());
         let setup = smoke.docker(
         30,
@@ -1925,7 +2131,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             fixture_path.clone(),
             smoke.image.clone(),
             "-ec".into(),
-            "chown 10002:10002 /fixture/workspace /fixture/workspace/note.txt /fixture/identity /fixture/identity/identity.env; chmod 0700 /fixture/workspace; chmod 0600 /fixture/workspace/note.txt; chmod 0550 /fixture/identity; chmod 0440 /fixture/identity/identity.env; chown 10002:10020 /fixture/executor; chmod 2710 /fixture/executor".into(),
+            format!("chown 10002:10002 /fixture/identity /fixture/identity/identity.env; chmod 0550 /fixture/identity; chmod 0440 /fixture/identity/identity.env; chown 10002:10020 /fixture/executor; chmod 2710 /fixture/executor; chown 10001:{host_gid} /fixture/client /fixture/client/executor-peer-test /fixture/client/executor-peer-test.rs; chmod 0770 /fixture/client; chmod 0550 /fixture/client/executor-peer-test; chmod 0440 /fixture/client/executor-peer-test.rs"),
         ],
     );
         assert!(
@@ -1959,8 +2165,10 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
                 "/tmp:rw,noexec,nosuid,nodev,size=32m".into(),
                 "--user".into(),
                 "10002:10002".into(),
+                "--env".into(),
+                "SUMI_EXECUTOR_CLIENT_UID=10001".into(),
                 "-v".into(),
-                format!("{}:/workspace:ro", smoke.root.join("workspace").display()),
+                format!("{}:/workspace:rw", smoke.workspace_volume),
                 "-v".into(),
                 format!(
                     "{}:/run/sumi/identity:ro",
@@ -1981,7 +2189,6 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             String::from_utf8_lossy(&start.stderr)
         );
 
-        let socket = smoke.root.join("executor/executor.sock");
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut socket_ready = false;
         while Instant::now() < deadline {
@@ -2018,32 +2225,24 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             );
         }
 
-        // The service socket is intentionally runtime-group-only. This fixture is
-        // UUID-owned, so changing just its socket directory to the test gid grants
-        // the host test client traversal without weakening the deployed Compose
-        // contract asserted above.
-        let host_gid = unsafe { libc::getegid() };
-        let client_access = smoke.docker(
-        30,
-        vec![
-            "run".into(),
-            "--rm".into(),
-            "--network".into(),
-            "none".into(),
-            "--entrypoint".into(),
-            "/bin/sh".into(),
-            "--user".into(),
-            "0:0".into(),
-            "-v".into(),
-            fixture_path.clone(),
-            smoke.image.clone(),
-            "-ec".into(),
-            format!(
-                "chgrp {host_gid} /fixture/executor /fixture/executor/executor.sock; chmod 0710 /fixture/executor; chmod 0660 /fixture/executor/executor.sock"
-            ),
-        ],
-    );
-        assert!(client_access.status.success());
+        let rejected_owner = run_executor_peer_helper(
+            &smoke,
+            10_002,
+            &serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "wrong-peer-health",
+                "operation": {"type": "health", "service_role": "tool_executor"},
+            }),
+            true,
+        );
+        assert!(
+            rejected_owner.status.success(),
+            "executor-owner peer was not cleanly rejected before frame parsing; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&rejected_owner.stdout),
+            String::from_utf8_lossy(&rejected_owner.stderr)
+        );
 
         let inspect = smoke.docker(30, vec!["inspect".into(), smoke.container.clone()]);
         assert!(inspect.status.success());
@@ -2052,7 +2251,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         assert_eq!(
             container["State"]["Running"].as_bool(),
             Some(true),
-            "executor container stopped before the read-only mount probe: {container}"
+            "executor container stopped before the workspace mount probe: {container}"
         );
         let environment = container["Config"]["Env"].as_array().unwrap();
         assert!(environment.iter().all(|entry| {
@@ -2063,15 +2262,15 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         let mounts = container["Mounts"].as_array().unwrap();
         assert!(mounts.iter().any(|mount| {
             mount["Destination"].as_str() == Some("/workspace")
-                && mount["RW"].as_bool() == Some(false)
+                && mount["RW"].as_bool() == Some(true)
         }));
         assert!(mounts.iter().all(|mount| {
             mount["Destination"].as_str() != Some("/run/sumi/broker")
                 && mount["Destination"].as_str() != Some("/var/lib/sumi-artifacts")
         }));
 
-        let health = exchange_executor_socket(
-            &socket,
+        let health = exchange_executor_socket_as_runtime(
+            &smoke,
             serde_json::json!({
                 "personality_agent_id": paid,
                 "generation": 1,
@@ -2088,8 +2287,8 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             health["result"]["Ok"]["service_role"].as_str(),
             Some("tool_executor")
         );
-        let read_file = exchange_executor_socket(
-            &socket,
+        let read_file = exchange_executor_socket_as_runtime(
+            &smoke,
             serde_json::json!({
                 "personality_agent_id": paid,
                 "generation": 1,
@@ -2107,48 +2306,81 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             "unexpected read_file response: {read_file}"
         );
 
-        let before_write = smoke.docker(10, vec!["inspect".into(), smoke.container.clone()]);
-        assert!(before_write.status.success());
-        let before_write: JsonValue = serde_json::from_slice(&before_write.stdout).unwrap();
+        let download_id = "exact-container-download";
+        let begin = exchange_executor_socket_as_runtime(
+            &smoke,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "download-begin",
+                "operation": {
+                    "type": "begin_workspace_download",
+                    "download_id": download_id,
+                    "path": "executor-owned-write",
+                    "total_bytes": 8,
+                    "content_sha256": "68ff63fb82e0e5dfec2a8496bf9afef608ad639ed552e740268eb537fa52067f",
+                    "execution_id": "download-begin"
+                },
+            }),
+        );
         assert_eq!(
-            before_write[0]["State"]["Running"].as_bool(),
-            Some(true),
-            "executor container stopped before write denial probe: {}",
-            before_write[0]
+            begin["result"]["Ok"]["type"].as_str(),
+            Some("workspace_download_begun"),
+            "exact container rejected O_TMPFILE begin: {begin}"
         );
-        let write = smoke.docker(
-            10,
-            vec![
-                "exec".into(),
-                "--user".into(),
-                "10002:10002".into(),
-                "--env".into(),
-                "LC_ALL=C".into(),
-                smoke.container.clone(),
-                "/usr/bin/touch".into(),
-                "/workspace/must-not-write".into(),
-            ],
+        let append = exchange_executor_socket_as_runtime(
+            &smoke,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "download-append",
+                "operation": {
+                    "type": "append_workspace_download",
+                    "download_id": download_id,
+                    "offset": 0,
+                    "content": [100, 111, 119, 110, 108, 111, 97, 100],
+                    "execution_id": "download-append"
+                },
+            }),
         );
-        let write_output = format!(
-            "stdout: {}; stderr: {}",
-            String::from_utf8_lossy(&write.stdout),
-            String::from_utf8_lossy(&write.stderr)
+        assert_eq!(
+            append["result"]["Ok"]["offset"].as_u64(),
+            Some(8),
+            "exact container rejected download chunk: {append}"
         );
-        assert!(
-            !write.status.success(),
-            "executor container wrote through its read-only workspace mount: {write_output}"
+        let finish = exchange_executor_socket_as_runtime(
+            &smoke,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "download-finish",
+                "operation": {
+                    "type": "finish_workspace_download",
+                    "download_id": download_id,
+                    "execution_id": "download-finish"
+                },
+            }),
         );
-        assert!(
-            write_output.contains("Read-only file system"),
-            "write denial was not the expected read-only-filesystem failure: {write_output}"
+        assert_eq!(
+            finish["result"]["Ok"]["type"].as_str(),
+            Some("workspace_file_installed"),
+            "cap-drop/seccomp executor could not link its held O_TMPFILE inode: {finish}"
         );
+        assert_eq!(
+            finish["result"]["Ok"]["path"].as_str(),
+            Some("executor-owned-write")
+        );
+        assert_eq!(finish["result"]["Ok"]["size"].as_u64(), Some(8));
         let after_write = smoke.docker(10, vec!["inspect".into(), smoke.container.clone()]);
         assert!(after_write.status.success());
         let after_write: JsonValue = serde_json::from_slice(&after_write.stdout).unwrap();
         assert_eq!(
             after_write[0]["State"]["Running"].as_bool(),
             Some(true),
-            "executor container stopped during write denial probe: {}",
+            "executor container stopped during workspace write probe: {}",
             after_write[0]
         );
         let host_write_check = smoke.docker(
@@ -2163,46 +2395,50 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
                 "--user".into(),
                 "0:0".into(),
                 "-v".into(),
-                fixture_path,
+                format!("{}:/workspace:ro", smoke.workspace_volume),
                 smoke.image.clone(),
                 "-ec".into(),
-                "test ! -e /fixture/workspace/must-not-write".into(),
+                "test \"$(cat /workspace/executor-owned-write)\" = download".into(),
             ],
         );
-        assert!(host_write_check.status.success());
+        assert!(
+            host_write_check.status.success(),
+            "executor write was not visible through the owned workspace volume: {}",
+            String::from_utf8_lossy(&host_write_check.stderr)
+        );
 
-        let health_after = exchange_executor_socket(
-            &socket,
+        let health_after = exchange_executor_socket_as_runtime(
+            &smoke,
             serde_json::json!({
                 "personality_agent_id": paid,
                 "generation": 1,
                 "nonce": nonce,
-                "request_id": "health-after-write-denial",
+                "request_id": "health-after-workspace-write",
                 "operation": {"type": "health", "service_role": "tool_executor"},
             }),
         );
         assert_eq!(
             health_after["result"]["Ok"]["type"].as_str(),
             Some("healthy"),
-            "executor Health failed after write denial: {health_after}"
+            "executor Health failed after workspace write: {health_after}"
         );
-        let read_after = exchange_executor_socket(
-            &socket,
+        let read_after = exchange_executor_socket_as_runtime(
+            &smoke,
             serde_json::json!({
                 "personality_agent_id": paid,
                 "generation": 1,
                 "nonce": nonce,
-                "request_id": "read-after-write-denial",
+                "request_id": "read-after-workspace-write",
                 "operation": {
                     "type": "read_file", "path": "note.txt", "offset": 0,
-                    "limit": 1024, "execution_id": "read-after-write-denial"
+                    "limit": 1024, "execution_id": "read-after-workspace-write"
                 },
             }),
         );
         assert_eq!(
             read_after["result"]["Ok"]["result"]["content"].as_str(),
             Some("read-file-content\n"),
-            "executor read_file failed after write denial: {read_after}"
+            "executor read_file failed after workspace write: {read_after}"
         );
     }));
     let cleanup = smoke.cleanup();

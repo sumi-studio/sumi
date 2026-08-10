@@ -16,7 +16,8 @@ pub use artifact_broker::{ArtifactBroker, ArtifactGrepMatch, ArtifactResponse};
 pub use client::ArtifactBrokerClient;
 #[allow(unused_imports)]
 pub use executor_client::{
-    ExecutorClient, ExecutorErrorClassification, WorkspaceFile, classify_executor_error,
+    ExecutorClient, ExecutorErrorClassification, WorkspaceFile, WorkspaceFileInstallReceipt,
+    classify_executor_error,
 };
 #[allow(unused_imports)]
 pub use protocol::{

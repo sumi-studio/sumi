@@ -190,6 +190,8 @@ services:
     user: "10002:10002"
     command: [executor]
     network_mode: none
+    environment:
+      SUMI_EXECUTOR_CLIENT_UID: "10001"
     depends_on:
       allocator:
         condition: service_completed_successfully
@@ -199,7 +201,6 @@ services:
       - type: volume
         source: workspace
         target: /workspace
-        read_only: true
         volume:
           nocopy: true
       - type: volume

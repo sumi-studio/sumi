@@ -23,7 +23,7 @@
         "futex", "getcwd", "getdents64", "getegid", "geteuid", "getgid",
         "getgroups", "getpgrp", "getpeername", "getpid", "getppid", "getrandom",
         "getrlimit", "getsockname", "getsockopt", "gettid", "getuid",
-        "ioctl", "kill", "listen", "lseek", "lstat", "madvise",
+        "ioctl", "kill", "linkat", "listen", "lseek", "lstat", "madvise",
         "memfd_create", "mkdir", "mkdirat", "mmap", "mprotect", "mremap",
         "msync", "munmap", "newfstatat", "open", "openat",
         "openat2", "pipe", "pipe2", "poll", "ppoll", "prctl", "pread64",

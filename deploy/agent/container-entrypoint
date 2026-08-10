@@ -267,6 +267,9 @@ case "${role}" in
 
   executor)
     load_identity executor "${IDENTITY_FILE}"
+    require_env SUMI_EXECUTOR_CLIENT_UID
+    [[ "${SUMI_EXECUTOR_CLIENT_UID}" == 10001 ]] ||
+      fail "SUMI_EXECUTOR_CLIENT_UID must be the fixed runtime uid 10001"
     umask 0007
     close_unlisted_fds
     exec env -i \
@@ -276,6 +279,7 @@ case "${role}" in
       SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
       SUMI_WORKSPACE=/workspace \
       SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
+      SUMI_EXECUTOR_CLIENT_UID="${SUMI_EXECUTOR_CLIENT_UID}" \
       /usr/local/bin/sumi-agent --tool-executor-socket
     ;;
 

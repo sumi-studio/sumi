@@ -9,7 +9,10 @@ use super::ArtifactResponse;
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{
     bash::BashExecutionResult,
-    fs::{GrepMatch, MAX_RAW_FILE_CHUNK_BYTES, MAX_RAW_FILE_TOTAL_BYTES, WorkspaceFileChunk},
+    fs::{
+        GrepMatch, MAX_RAW_FILE_CHUNK_BYTES, MAX_RAW_FILE_TOTAL_BYTES,
+        MAX_WORKSPACE_DOWNLOAD_BYTES, MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES, WorkspaceFileChunk,
+    },
     truncate::TruncationResult,
 };
 
@@ -30,6 +33,9 @@ const RPC_BOOT_UNIQUENESS_CAPACITY: usize = 1_000_000;
 // already active must still be able to consume its one cancellation identity.
 const RPC_CANCEL_UNIQUENESS_RESERVE: usize = RPC_ACTIVE_REQUEST_CAPACITY;
 pub(super) const RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE: &str = "rpc_boot_uniqueness_exhausted";
+pub(super) const WORKSPACE_DOWNLOAD_COLLISION_CODE: &str = "workspace_download_destination_exists";
+pub(super) const WORKSPACE_DOWNLOAD_MISMATCH_CODE: &str = "workspace_download_mismatch";
+pub(super) const WORKSPACE_DOWNLOAD_STATE_MISMATCH_CODE: &str = "workspace_download_state_mismatch";
 type RpcIdDigest = [u8; 32];
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +141,31 @@ pub enum ExecutorOperation {
         expected_content_digest: Option<String>,
         execution_id: String,
     },
+    /// Foundation-only streamed installation into the PersonalityAgent's
+    /// private workspace. These operations are not exposed as model file
+    /// tools; the authenticated runtime uses them to relay an authorized
+    /// application attachment without ever mounting the workspace itself.
+    BeginWorkspaceDownload {
+        download_id: String,
+        path: String,
+        total_bytes: u64,
+        content_sha256: String,
+        execution_id: String,
+    },
+    AppendWorkspaceDownload {
+        download_id: String,
+        offset: u64,
+        content: Vec<u8>,
+        execution_id: String,
+    },
+    FinishWorkspaceDownload {
+        download_id: String,
+        execution_id: String,
+    },
+    AbortWorkspaceDownload {
+        download_id: String,
+        execution_id: String,
+    },
     WriteFile {
         path: String,
         content: String,
@@ -175,17 +206,44 @@ pub enum ExecutorOperation {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorResponse {
-    Healthy { service_role: ExecutorServiceRole },
-    ReadFile { result: TruncationResult },
-    RawFile { chunk: WorkspaceFileChunk },
+    Healthy {
+        service_role: ExecutorServiceRole,
+    },
+    ReadFile {
+        result: TruncationResult,
+    },
+    RawFile {
+        chunk: WorkspaceFileChunk,
+    },
+    WorkspaceDownloadBegun {},
+    WorkspaceDownloadAppended {
+        offset: u64,
+    },
+    WorkspaceFileInstalled {
+        path: String,
+        size: u64,
+        sha256: String,
+    },
+    WorkspaceDownloadAborted {},
+    WorkspaceDownloadAbortTooLate {},
     Written {},
     Edited {},
     Removed {},
-    Listed { entries: Vec<String> },
-    Globbed { paths: Vec<String> },
-    Grepped { matches: Vec<GrepMatch> },
-    Artifact { response: ArtifactResponse },
-    Bash { result: BashExecutionResult },
+    Listed {
+        entries: Vec<String>,
+    },
+    Globbed {
+        paths: Vec<String>,
+    },
+    Grepped {
+        matches: Vec<GrepMatch>,
+    },
+    Artifact {
+        response: ArtifactResponse,
+    },
+    Bash {
+        result: BashExecutionResult,
+    },
     CancelAccepted {},
     CancelTooLate {},
 }
@@ -291,6 +349,48 @@ impl RpcOperationValidation for ExecutorOperation {
                             .to_owned(),
                     ));
                 }
+                validate_executor_execution_id(execution_id)
+            }
+            Self::BeginWorkspaceDownload {
+                download_id,
+                path,
+                total_bytes,
+                content_sha256,
+                execution_id,
+            } => {
+                validate_executor_execution_id(download_id)?;
+                validate_private_workspace_destination(path)?;
+                if !(1..=MAX_WORKSPACE_DOWNLOAD_BYTES).contains(total_bytes) {
+                    return Err(ToolError::Protocol(format!(
+                        "workspace download must contain 1..={MAX_WORKSPACE_DOWNLOAD_BYTES} bytes"
+                    )));
+                }
+                validate_sha256(content_sha256, "workspace download content_sha256")?;
+                validate_executor_execution_id(execution_id)
+            }
+            Self::AppendWorkspaceDownload {
+                download_id,
+                content,
+                execution_id,
+                ..
+            } => {
+                validate_executor_execution_id(download_id)?;
+                if content.is_empty() || content.len() > MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES {
+                    return Err(ToolError::Protocol(format!(
+                        "workspace download chunk must contain 1..={MAX_WORKSPACE_DOWNLOAD_CHUNK_BYTES} bytes"
+                    )));
+                }
+                validate_executor_execution_id(execution_id)
+            }
+            Self::FinishWorkspaceDownload {
+                download_id,
+                execution_id,
+            }
+            | Self::AbortWorkspaceDownload {
+                download_id,
+                execution_id,
+            } => {
+                validate_executor_execution_id(download_id)?;
                 validate_executor_execution_id(execution_id)
             }
             Self::WriteFile {
@@ -788,6 +888,44 @@ fn validate_workspace_input(value: &str, field: &str) -> Result<(), ToolError> {
     if value.starts_with("artifact://") {
         return Err(ToolError::InvalidPath(format!(
             "executor workspace {field} cannot be an artifact handle"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_private_workspace_destination(value: &str) -> Result<(), ToolError> {
+    if value.is_empty() || value.len() > 4 * 1024 || value.contains('\0') {
+        return Err(ToolError::InvalidPath(
+            "workspace download destination is empty or too long".to_owned(),
+        ));
+    }
+    let path = std::path::Path::new(value);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        || path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+            != value
+    {
+        return Err(ToolError::InvalidPath(
+            "workspace download destination must be a normal relative path".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, field: &str) -> Result<(), ToolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ToolError::Protocol(format!(
+            "{field} must be lowercase hexadecimal SHA-256"
         )));
     }
     Ok(())
@@ -1878,6 +2016,29 @@ mod tests {
             operation("image.bin", 1, 1, 1024, Some("a".repeat(64)), None),
         ] {
             assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_download_destination_requires_one_canonical_relative_spelling() {
+        let operation = |path: &str| ExecutorOperation::BeginWorkspaceDownload {
+            download_id: "download-path".to_owned(),
+            path: path.to_owned(),
+            total_bytes: 1,
+            content_sha256: "a".repeat(64),
+            execution_id: "download-path-begin".to_owned(),
+        };
+
+        operation("dir/file.bin").validate().unwrap();
+        for invalid in [
+            "dir//file.bin",
+            "dir/./file.bin",
+            "file.bin/",
+            "./file.bin",
+            "../file.bin",
+            "/workspace/file.bin",
+        ] {
+            assert!(operation(invalid).validate().is_err(), "accepted {invalid}");
         }
     }
 

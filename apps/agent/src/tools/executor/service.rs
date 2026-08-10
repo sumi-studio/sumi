@@ -38,14 +38,20 @@ use super::{
         CancelDecision, ExecutionLease, ExecutionRegistration, ExecutorManager, PendingExecution,
         RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE,
     },
-    protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE,
+    protocol::{
+        RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, WORKSPACE_DOWNLOAD_COLLISION_CODE,
+        WORKSPACE_DOWNLOAD_MISMATCH_CODE, WORKSPACE_DOWNLOAD_STATE_MISMATCH_CODE,
+    },
     resolve_input,
 };
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{
     ResourceLimit, ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
-    fs::WorkspaceFs,
+    fs::{
+        WORKSPACE_DOWNLOAD_COLLISION, WORKSPACE_DOWNLOAD_MISMATCH,
+        WORKSPACE_DOWNLOAD_STATE_MISMATCH, WorkspaceDownloadAbort, WorkspaceFs,
+    },
     truncate::{TruncationOptions, truncate_tail},
 };
 
@@ -1140,6 +1146,52 @@ impl BlockingFsRegistry {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct CriticalExecutorTestState {
+    fs: Arc<WorkspaceFs>,
+    manager: Arc<ExecutorManager>,
+    blocking_fs: BlockingFsRegistry,
+}
+
+#[cfg(test)]
+impl CriticalExecutorTestState {
+    pub(super) fn new(workspace: &Path) -> Result<Self> {
+        Ok(Self {
+            fs: Arc::new(WorkspaceFs::open(workspace)?),
+            manager: ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
+            blocking_fs: BlockingFsRegistry::new(4, 8),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn run_critical_executor_test_connection<R, W>(
+    read: R,
+    write: W,
+    identity: RpcIdentity,
+    state: CriticalExecutorTestState,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut read = BufReader::new(read);
+    let first_line = read_frame(&mut read)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("critical executor test peer closed before a request"))?;
+    run_critical_executor_service(
+        first_line,
+        read,
+        ExecutorWriter::start(write),
+        identity,
+        state.fs,
+        state.manager,
+        state.blocking_fs,
+    )
+    .await
+}
+
 impl BlockingWorkRegistry {
     fn new(capacity: usize) -> Self {
         Self {
@@ -1202,6 +1254,8 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
     let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
+    let expected_client_uid =
+        executor_client_uid_from_value(Some(&required_text("SUMI_EXECUTOR_CLIENT_UID")?))?;
     let blocking_fs = BlockingFsRegistry::production();
     let fs = blocking_fs
         .open_workspace(workspace.clone())
@@ -1223,6 +1277,13 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             .await
             .context("executor initial-frame admission is closed")?;
         let (stream, _) = listener.accept_verified("executor").await?;
+        if let Err(error) = verify_executor_client_uid(&stream, expected_client_uid) {
+            // Linux SO_PEERCRED is checked before reading even the first byte,
+            // so an executor-owner self-connection never reaches identity or
+            // operation parsing. Credential lookup failure is also rejection.
+            tracing::warn!(%error, "executor rejected unauthorised Unix peer");
+            continue;
+        }
         let identity = identity.clone();
         let fs = fs.clone();
         let manager = manager.clone();
@@ -1303,10 +1364,11 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
 
 /// Serve the production Unix endpoint's deliberately narrow contract.
 ///
-/// This path has no artifact-broker capability and admits only exact-identity
-/// Health plus workspace-dirfd read and discovery operations. The broader
-/// stdio fixture service remains separate and cannot be reached through
-/// production bootstrap.
+/// This path has no artifact-broker capability. It admits exact-identity
+/// Health, workspace-dirfd reads/discovery, and the foundation-only streamed
+/// workspace-install protocol. Ordinary model file mutations remain rejected;
+/// the broader stdio fixture service cannot be reached through production
+/// bootstrap.
 async fn run_critical_executor_service<R>(
     first_line: Vec<u8>,
     mut read: R,
@@ -1374,6 +1436,10 @@ where
         }
         operation @ (ExecutorOperation::ReadFile { .. }
         | ExecutorOperation::ReadRawFile { .. }
+        | ExecutorOperation::BeginWorkspaceDownload { .. }
+        | ExecutorOperation::AppendWorkspaceDownload { .. }
+        | ExecutorOperation::FinishWorkspaceDownload { .. }
+        | ExecutorOperation::AbortWorkspaceDownload { .. }
         | ExecutorOperation::ListDir { .. }
         | ExecutorOperation::Glob { .. }
         | ExecutorOperation::Grep { .. }) => {
@@ -1397,8 +1463,14 @@ where
                     writer
                         .terminal(&identity, request.request_id, result)
                         .await?;
-                    settle_critical_read_cancel(read, writer, &identity, &manager, &execution_id)
-                        .await?;
+                    settle_critical_workspace_cancel(
+                        read,
+                        writer,
+                        &identity,
+                        &manager,
+                        &execution_id,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 ExecutionRegistration::Pending(mut pending) => {
@@ -1410,17 +1482,17 @@ where
                     pending.promote(permit)?
                 }
             };
-            let result =
-                start_critical_read_discovery_execution(execution, fs, blocking_fs, operation)
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::error!(%error, "critical read/discovery ownership task stopped");
-                        Err(bounded_error("rpc_indeterminate"))
-                    });
+            let result = start_critical_workspace_execution(execution, fs, blocking_fs, operation)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "critical workspace operation ownership task stopped");
+                    Err(bounded_error("rpc_indeterminate"))
+                });
             writer
                 .terminal(&identity, request.request_id, result)
                 .await?;
-            settle_critical_read_cancel(read, writer, &identity, &manager, &execution_id).await?;
+            settle_critical_workspace_cancel(read, writer, &identity, &manager, &execution_id)
+                .await?;
         }
         _ => {
             let result = match manager.reject_request(&request.request_id) {
@@ -1436,7 +1508,7 @@ where
     Ok(())
 }
 
-async fn settle_critical_read_cancel<R>(
+async fn settle_critical_workspace_cancel<R>(
     read: &mut R,
     writer: &ExecutorWriter,
     identity: &RpcIdentity,
@@ -1452,7 +1524,8 @@ where
         Ok(Err(error)) => return Err(error.into()),
         Err(_) => {
             return Err(ToolError::Protocol(
-                "critical executor timed out waiting for cancellation settlement or EOF".to_owned(),
+                "critical workspace executor timed out waiting for cancellation settlement or EOF"
+                    .to_owned(),
             )
             .into());
         }
@@ -1504,7 +1577,7 @@ where
     }
 }
 
-fn start_critical_read_discovery_execution(
+fn start_critical_workspace_execution(
     mut execution: ExecutionLease,
     fs: Arc<WorkspaceFs>,
     blocking_fs: BlockingFsRegistry,
@@ -1562,6 +1635,65 @@ fn start_critical_read_discovery_execution(
                 )),
                 Err(error) => Err(error),
             },
+            ExecutorOperation::BeginWorkspaceDownload {
+                download_id,
+                path,
+                total_bytes,
+                content_sha256,
+                ..
+            } => {
+                blocking_fs
+                    .execute(move || {
+                        fs.begin_workspace_download(
+                            &download_id,
+                            Path::new(&path),
+                            total_bytes,
+                            &content_sha256,
+                        )?;
+                        Ok(ExecutorResponse::WorkspaceDownloadBegun {})
+                    })
+                    .await
+            }
+            ExecutorOperation::AppendWorkspaceDownload {
+                download_id,
+                offset,
+                content,
+                ..
+            } => {
+                blocking_fs
+                    .execute(move || {
+                        let offset =
+                            fs.append_workspace_download(&download_id, offset, &content)?;
+                        Ok(ExecutorResponse::WorkspaceDownloadAppended { offset })
+                    })
+                    .await
+            }
+            ExecutorOperation::FinishWorkspaceDownload { download_id, .. } => {
+                blocking_fs
+                    .execute(move || {
+                        let receipt = fs.finish_workspace_download(&download_id)?;
+                        Ok(ExecutorResponse::WorkspaceFileInstalled {
+                            path: receipt.path,
+                            size: receipt.size,
+                            sha256: receipt.sha256,
+                        })
+                    })
+                    .await
+            }
+            ExecutorOperation::AbortWorkspaceDownload { download_id, .. } => {
+                blocking_fs
+                    .execute(move || {
+                        Ok(match fs.abort_workspace_download(&download_id)? {
+                            WorkspaceDownloadAbort::Aborted => {
+                                ExecutorResponse::WorkspaceDownloadAborted {}
+                            }
+                            WorkspaceDownloadAbort::TooLate => {
+                                ExecutorResponse::WorkspaceDownloadAbortTooLate {}
+                            }
+                        })
+                    })
+                    .await
+            }
             ExecutorOperation::ListDir { path, .. } => match resolve_input("list_dir", &path) {
                 Ok(InputRoute::Workspace) => {
                     blocking_fs
@@ -1616,7 +1748,7 @@ fn start_critical_read_discovery_execution(
         }
         .map_err(rpc_error);
         if let Err(error) = execution.complete(result.clone()) {
-            tracing::error!(%error, "failed to settle critical read/discovery ownership");
+            tracing::error!(%error, "failed to settle critical workspace operation ownership");
             return Err(bounded_error("rpc_indeterminate"));
         }
         result
@@ -2661,6 +2793,64 @@ async fn execute_non_bash(
                 response: broker.read_artifact(&path, offset, limit).await?,
             }),
         },
+        ExecutorOperation::BeginWorkspaceDownload {
+            download_id,
+            path,
+            total_bytes,
+            content_sha256,
+            ..
+        } => {
+            blocking_fs
+                .execute(move || {
+                    fs.begin_workspace_download(
+                        &download_id,
+                        Path::new(&path),
+                        total_bytes,
+                        &content_sha256,
+                    )?;
+                    Ok(ExecutorResponse::WorkspaceDownloadBegun {})
+                })
+                .await
+        }
+        ExecutorOperation::AppendWorkspaceDownload {
+            download_id,
+            offset,
+            content,
+            ..
+        } => {
+            blocking_fs
+                .execute(move || {
+                    let offset = fs.append_workspace_download(&download_id, offset, &content)?;
+                    Ok(ExecutorResponse::WorkspaceDownloadAppended { offset })
+                })
+                .await
+        }
+        ExecutorOperation::FinishWorkspaceDownload { download_id, .. } => {
+            blocking_fs
+                .execute(move || {
+                    let receipt = fs.finish_workspace_download(&download_id)?;
+                    Ok(ExecutorResponse::WorkspaceFileInstalled {
+                        path: receipt.path,
+                        size: receipt.size,
+                        sha256: receipt.sha256,
+                    })
+                })
+                .await
+        }
+        ExecutorOperation::AbortWorkspaceDownload { download_id, .. } => {
+            blocking_fs
+                .execute(move || {
+                    Ok(match fs.abort_workspace_download(&download_id)? {
+                        WorkspaceDownloadAbort::Aborted => {
+                            ExecutorResponse::WorkspaceDownloadAborted {}
+                        }
+                        WorkspaceDownloadAbort::TooLate => {
+                            ExecutorResponse::WorkspaceDownloadAbortTooLate {}
+                        }
+                    })
+                })
+                .await
+        }
         ExecutorOperation::WriteFile { path, content, .. } => {
             resolve_input("write_file", &path)?;
             blocking_fs
@@ -2742,6 +2932,10 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     match operation {
         ExecutorOperation::ReadFile { execution_id, .. }
         | ExecutorOperation::ReadRawFile { execution_id, .. }
+        | ExecutorOperation::BeginWorkspaceDownload { execution_id, .. }
+        | ExecutorOperation::AppendWorkspaceDownload { execution_id, .. }
+        | ExecutorOperation::FinishWorkspaceDownload { execution_id, .. }
+        | ExecutorOperation::AbortWorkspaceDownload { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
         | ExecutorOperation::RemoveFile { execution_id, .. }
@@ -2884,6 +3078,15 @@ fn rpc_error(error: ToolError) -> RpcError {
         ToolError::Protocol(message) if message == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE => {
             bounded_error(RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE)
         }
+        ToolError::Protocol(message) if message == WORKSPACE_DOWNLOAD_COLLISION => {
+            bounded_error(WORKSPACE_DOWNLOAD_COLLISION_CODE)
+        }
+        ToolError::Protocol(message) if message == WORKSPACE_DOWNLOAD_MISMATCH => {
+            bounded_error(WORKSPACE_DOWNLOAD_MISMATCH_CODE)
+        }
+        ToolError::Protocol(message) if message == WORKSPACE_DOWNLOAD_STATE_MISMATCH => {
+            bounded_error(WORKSPACE_DOWNLOAD_STATE_MISMATCH_CODE)
+        }
         ToolError::Protocol(_) => bounded_error("protocol"),
     }
 }
@@ -2982,6 +3185,30 @@ fn required_path(name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn executor_client_uid_from_value(value: Option<&str>) -> Result<u32> {
+    let value = value.context("SUMI_EXECUTOR_CLIENT_UID is required for executor socket mode")?;
+    let uid = value.parse::<u32>().ok();
+    if uid.is_none_or(|uid| uid == 0 || uid == u32::MAX || uid.to_string() != value) {
+        bail!("SUMI_EXECUTOR_CLIENT_UID must be a canonical base-10 non-root, non-sentinel u32");
+    }
+    Ok(uid.expect("validated executor client uid"))
+}
+
+/// Linux-only peer binding. Production deployment pins this value to runtime
+/// uid 10001; direct test fixtures supply their own non-root process uid.
+fn verify_executor_client_uid(stream: &UnixStream, expected_uid: u32) -> Result<()> {
+    let credential = stream
+        .peer_cred()
+        .context("failed to read executor Unix peer credentials")?;
+    if credential.uid() != expected_uid {
+        bail!(
+            "executor Unix peer uid {} did not match required uid {expected_uid}",
+            credential.uid()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2995,6 +3222,53 @@ mod tests {
     struct BlockingFsGate {
         state: Mutex<BlockingFsGateState>,
         released: Condvar,
+    }
+
+    #[test]
+    fn executor_client_uid_configuration_is_canonical_non_root_u32() {
+        assert!(executor_client_uid_from_value(None).is_err());
+        for rejected in [
+            "",
+            "runtime",
+            "0",
+            "00",
+            "+10001",
+            "-10001",
+            "010001",
+            " 10001",
+            "10001 ",
+            "10001\n",
+            "4294967295",
+            "4294967296",
+        ] {
+            assert!(
+                executor_client_uid_from_value(Some(rejected)).is_err(),
+                "accepted invalid executor client uid {rejected:?}"
+            );
+        }
+        assert_eq!(
+            executor_client_uid_from_value(Some("10001")).unwrap(),
+            10_001
+        );
+        assert_eq!(executor_client_uid_from_value(Some("1")).unwrap(), 1);
+        assert_eq!(
+            executor_client_uid_from_value(Some("4294967294")).unwrap(),
+            u32::MAX - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_peer_uid_is_checked_without_reading_a_frame() {
+        let (client, server) = UnixStream::pair().expect("Unix peer fixture");
+        let current_uid = unsafe { libc::geteuid() };
+        verify_executor_client_uid(&server, current_uid).expect("exact peer uid");
+        let wrong_uid = if current_uid == u32::MAX {
+            current_uid - 1
+        } else {
+            current_uid + 1
+        };
+        assert!(verify_executor_client_uid(&server, wrong_uid).is_err());
+        drop((client, server));
     }
 
     #[derive(Default)]
@@ -3118,7 +3392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn critical_endpoint_exposes_only_workspace_read_discovery_operations() {
+    async fn critical_endpoint_admits_reads_and_foundation_download_but_rejects_model_mutation() {
         let root = std::env::temp_dir().join(format!(
             "sumi-critical-read-discovery-{}",
             uuid::Uuid::now_v7()
@@ -3219,6 +3493,71 @@ mod tests {
             .expect("join critical endpoint")
             .expect("critical endpoint result");
 
+        let download_id = "critical-foundation-download";
+        for (request_id, operation, expected_type) in [
+            (
+                "critical-download-begin",
+                ExecutorOperation::BeginWorkspaceDownload {
+                    download_id: download_id.to_owned(),
+                    path: "downloaded.bin".to_owned(),
+                    total_bytes: 8,
+                    content_sha256:
+                        "68ff63fb82e0e5dfec2a8496bf9afef608ad639ed552e740268eb537fa52067f"
+                            .to_owned(),
+                    execution_id: "critical-download-begin".to_owned(),
+                },
+                "workspace_download_begun",
+            ),
+            (
+                "critical-download-append",
+                ExecutorOperation::AppendWorkspaceDownload {
+                    download_id: download_id.to_owned(),
+                    offset: 0,
+                    content: b"download".to_vec(),
+                    execution_id: "critical-download-append".to_owned(),
+                },
+                "workspace_download_appended",
+            ),
+            (
+                "critical-download-finish",
+                ExecutorOperation::FinishWorkspaceDownload {
+                    download_id: download_id.to_owned(),
+                    execution_id: "critical-download-finish".to_owned(),
+                },
+                "workspace_file_installed",
+            ),
+            (
+                "critical-download-abort-too-late",
+                ExecutorOperation::AbortWorkspaceDownload {
+                    download_id: download_id.to_owned(),
+                    execution_id: "critical-download-abort-too-late".to_owned(),
+                },
+                "workspace_download_abort_too_late",
+            ),
+        ] {
+            let (mut client, task) = start_critical_test_session(
+                identity.clone(),
+                fs.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                request_id,
+                operation,
+            );
+            let terminal = read_test_terminal(&mut client).await;
+            assert_eq!(
+                terminal["result"]["Ok"]["type"], expected_type,
+                "unexpected foundation download response: {terminal}"
+            );
+            client.shutdown().await.expect("close foundation request");
+            task.await
+                .expect("join critical endpoint")
+                .expect("critical endpoint result");
+        }
+        assert_eq!(
+            std::fs::read(workspace.join("downloaded.bin")).unwrap(),
+            b"download"
+        );
+
         for (request_id, operation) in [
             (
                 "critical-artifact-grep",
@@ -3257,7 +3596,7 @@ mod tests {
         }
         assert!(
             !workspace.join("must-not-write.txt").exists(),
-            "critical endpoint accepted a mutation"
+            "critical endpoint accepted an ordinary model file mutation"
         );
         std::fs::remove_dir_all(root).expect("remove critical endpoint fixture");
     }
