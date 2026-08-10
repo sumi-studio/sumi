@@ -97,6 +97,9 @@ class FakeBackend implements MessagingBackend {
   async fetchMessages() {
     return [];
   }
+  async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
+    return { statuses: [], replyLaterMarkers: [] };
+  }
   async createChannel(): Promise<ChannelSummary> {
     throw new Error("unused");
   }
@@ -115,9 +118,15 @@ class FakeBackend implements MessagingBackend {
   async editMessage() {}
   async deleteMessage() {}
   async markRead() {}
-  async setStatus() {}
-  async createReplyLater() {}
-  async resolveReplyLater() {}
+  async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
+    throw new Error("unused");
+  }
+  async createReplyLater(): ReturnType<MessagingBackend["createReplyLater"]> {
+    throw new Error("unused");
+  }
+  async resolveReplyLater(): ReturnType<MessagingBackend["resolveReplyLater"]> {
+    throw new Error("unused");
+  }
   async toggleReaction() {
     return { messageId: "unused", reactions: [] };
   }

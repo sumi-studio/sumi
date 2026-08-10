@@ -6,14 +6,17 @@ import type {
   Message,
   MessagingBackend,
   ParticipantRef,
+  ParticipantStatus,
   Place,
   PlaceKey,
   ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
+  ReplyLaterMarker,
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusKind,
   UnreadSummary,
 } from "./model";
 import { MAX_SEQ, parsePlaceKey } from "./model";
@@ -35,8 +38,8 @@ export class MessagingAPIError extends Error {
 /** Same-origin browser-session client for the shared messaging surface. */
 export class ApiMessagingBackend implements MessagingBackend {
   readonly capabilities = {
-    status: false,
-    replyLater: false,
+    status: true,
+    replyLater: true,
     reactions: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
@@ -93,18 +96,29 @@ export class ApiMessagingBackend implements MessagingBackend {
         };
       },
     );
+    // status_updated は replay されないvolatile eventなので、現在値はここでしか
+    // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
+    const presence = parsePresence(body);
     return {
       self: parseParticipant(body.self),
       workspaces,
       channels,
       dms,
       members,
-      statuses: [],
+      statuses: presence.statuses,
       readMarkers,
       unreadSummaries,
-      replyLaterMarkers: [],
+      replyLaterMarkers: presence.replyLaterMarkers,
       employedAgents: [],
     };
+  }
+
+  /**
+   * 再接続後の再同期。cursorが戻せるのはplaceのdurableな並びだけなので、
+   * statusと開いているmarkerはserverの現在値で置き換えるほかない。
+   */
+  async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
+    return parsePresence(asRecord(await this.request("/messaging/bootstrap")));
   }
 
   async fetchMessages(
@@ -207,14 +221,44 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
-  setStatus(): Promise<void> {
-    return unsupported();
+  /** 自分のstatusだけを置き換える。参加者はsessionが決め、bodyには載せない。 */
+  async setStatus(
+    status: StatusKind,
+    note: string,
+  ): Promise<ParticipantStatus> {
+    return parseStatus(
+      await this.request("/messaging/status", {
+        method: "PUT",
+        body: { status, note },
+      }),
+    );
   }
-  createReplyLater(): Promise<void> {
-    return unsupported();
+
+  async createReplyLater(
+    place: Place,
+    messageId: string,
+    remindAt: number,
+  ): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
+        {
+          method: "POST",
+          body: { remind_at: new Date(remindAt).toISOString() },
+        },
+      ),
+    );
+    return parseReplyLater(body.marker);
   }
-  resolveReplyLater(): Promise<void> {
-    return unsupported();
+
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
+        { method: "POST", body: {} },
+      ),
+    );
+    return parseReplyLater(body.marker);
   }
 
   async toggleReaction(
@@ -362,6 +406,13 @@ export class ApiMessagingBackend implements MessagingBackend {
         messageId: asString(update.message_id),
         reactions: asArray(update.reactions).map(parseReaction),
       };
+    } else if (eventType === "status_updated") {
+      // 自己申告のattention。placeを持たず、seqも進めない。
+      parsed = { type: eventType, status: parseStatus(wire.status) };
+    } else if (eventType === "reply_later_created") {
+      parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
+    } else if (eventType === "reply_later_resolved") {
+      parsed = { type: eventType, markerId: asString(wire.marker_id) };
     } else if (eventType === "typing") {
       const id = asString(wire.place_id);
       const place = this.places.get(id);
@@ -473,10 +524,6 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 }
 
-function unsupported(): Promise<void> {
-  return Promise.reject(new MessagingAPIError("not_implemented", 501));
-}
-
 function placeID(place: Place): string {
   return place.kind === "channel" ? place.channelId : place.dmId;
 }
@@ -508,6 +555,41 @@ function parseReaction(value: unknown): ReactionSummary {
   return {
     emoji: asString(wire.emoji),
     participants: asArray(wire.participants).map(parseParticipant),
+  };
+}
+
+function parsePresence(body: Record<string, unknown>): {
+  statuses: ParticipantStatus[];
+  replyLaterMarkers: ReplyLaterMarker[];
+} {
+  return {
+    statuses: asArray(body.statuses).map(parseStatus),
+    replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
+  };
+}
+
+function parseStatus(value: unknown): ParticipantStatus {
+  const wire = asRecord(value);
+  return {
+    participant: parseParticipant(wire.participant),
+    status: asStatusKind(wire.status),
+    note: asString(wire.note),
+    expiresAt: wire.expires_at == null ? null : asTimestamp(wire.expires_at),
+  };
+}
+
+function parseReplyLater(value: unknown): ReplyLaterMarker {
+  const wire = asRecord(value);
+  return {
+    markerId: asString(wire.marker_id),
+    participant: parseParticipant(wire.participant),
+    place: parsePlace(wire.place),
+    messageId: asString(wire.message_id),
+    note: asString(wire.note),
+    // remind_atは本人のwireにしか載らない。無いことは欠損ではなく、
+    // 「自分の約束ではない」という正しい答え。
+    remindAt: wire.remind_at == null ? null : asTimestamp(wire.remind_at),
+    resolved: asBoolean(wire.resolved),
   };
 }
 
@@ -579,6 +661,12 @@ function asTimestamp(value: unknown): number {
 function asVisibility(value: unknown): "public" | "private" {
   if (value === "public" || value === "private") return value;
   throw new Error("invalid channel visibility");
+}
+function asStatusKind(value: unknown): StatusKind {
+  if (value === "available" || value === "busy" || value === "away") {
+    return value;
+  }
+  throw new Error("invalid participant status");
 }
 function asDMKind(value: unknown): "dm" | "group_dm" {
   if (value === "dm" || value === "group_dm") return value;

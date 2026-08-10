@@ -530,7 +530,22 @@ export class MockMessagingServer implements MessagingBackend {
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
-  async setStatus(status: StatusKind, note: string): Promise<void> {
+  async fetchPresence(): Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }> {
+    return {
+      statuses: [...this.statuses.values()],
+      replyLaterMarkers: [...this.replyLaterMarkers.values()].filter(
+        (marker) => !marker.resolved,
+      ),
+    };
+  }
+
+  async setStatus(
+    status: StatusKind,
+    note: string,
+  ): Promise<ParticipantStatus> {
     const next: ParticipantStatus = {
       participant: SELF,
       status,
@@ -539,20 +554,21 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.statuses.set(participantKey(SELF), next);
     this.emit({ type: "status_updated", status: next });
+    return next;
   }
 
   async createReplyLater(
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void> {
+  ): Promise<ReplyLaterMarker> {
     const existing = [...this.replyLaterMarkers.values()].find(
       (marker) =>
         !marker.resolved &&
         marker.messageId === messageId &&
         sameParticipant(marker.participant, SELF),
     );
-    if (existing) return;
+    if (existing) return existing;
     const marker: ReplyLaterMarker = {
       markerId: secureRandomUUID(),
       participant: SELF,
@@ -564,13 +580,16 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.replyLaterMarkers.set(marker.markerId, marker);
     this.emit({ type: "reply_later_created", marker });
+    return marker;
   }
 
-  async resolveReplyLater(markerId: string): Promise<void> {
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
     const marker = this.replyLaterMarkers.get(markerId);
-    if (!marker || marker.resolved) return;
+    if (!marker) throw new Error("unknown reply-later marker");
+    if (marker.resolved) return marker;
     marker.resolved = true;
     this.emit({ type: "reply_later_resolved", markerId });
+    return marker;
   }
 
   async toggleReaction(

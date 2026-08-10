@@ -38,6 +38,40 @@ pub(crate) struct ReactMessagingReactionRequest<'a> {
     pub client_nonce: &'a str,
 }
 
+/// Declaring one's own attention state.  There is no field for whose status it
+/// is: the transport's credential decides, the same way the human UI can only
+/// set the signed-in person's status.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetMessagingStatusRequest<'a> {
+    pub status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'a str>,
+    /// Relative, so the server's clock fixes the instant.  None holds the
+    /// status until it is replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingReplyLaterRequest<'a> {
+    pub place_id: &'a str,
+    pub message_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'a str>,
+    /// Relative for the same reason as the status expiry above.  None takes
+    /// the server's default reminder delay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remind_in_minutes: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResolveMessagingReplyLaterRequest<'a> {
+    pub marker_id: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadMessagingThroughRequest<'a> {
@@ -54,6 +88,15 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value>;
 
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value>;
+
+    async fn set_status(&self, request: SetMessagingStatusRequest<'_>) -> Result<Value>;
+
+    async fn reply_later(&self, request: CreateMessagingReplyLaterRequest<'_>) -> Result<Value>;
+
+    async fn resolve_reply_later(
+        &self,
+        request: ResolveMessagingReplyLaterRequest<'_>,
+    ) -> Result<Value>;
 
     async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value>;
 }
