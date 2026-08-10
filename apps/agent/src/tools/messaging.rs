@@ -5,9 +5,10 @@
 //! The view is a tool owned by the continuing person; it is not another agent
 //! or another life-log Session.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{fmt::Write as _, str, sync::Arc};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,15 +21,18 @@ use crate::{
         DeleteMessagingRoleRequest, DuplicateMessagingChannelRequest, GetMessagingCallStateRequest,
         ListMessagingRolesRequest, ListMessagingThreadsRequest, MessagingApi,
         MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
-        OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
-        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
-        SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest,
-        SetMessagingProfileRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
-        UpdateMessagingChannelRequest, UpdateMessagingRoleRequest, VoteMessagingPollRequest,
-        WriteMessagingMessageRequest,
+        OpenMessagingAttachmentRequest, OpenMessagingPlaceRequest, PollMessagingAttentionRequest,
+        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingChannelTopicRequest,
+        SetMessagingMemberRolesRequest, SetMessagingProfileRequest, SetMessagingStatusRequest,
+        StartMessagingDMRequest, UpdateMessagingChannelRequest, UpdateMessagingRoleRequest,
+        UploadMessagingAttachmentRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
-    tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
+    tools::{
+        Tool, ToolCtx, ToolError, ToolOutput, ToolRisk, executor::ExecutorClient,
+        fs::MAX_RAW_FILE_TOTAL_BYTES,
+    },
 };
 
 const TOOL_NAME: &str = "messaging";
@@ -36,6 +40,14 @@ const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
+const MAX_ATTACHMENT_ID_BYTES: usize = 256;
+const MAX_ATTACHMENT_FILENAME_BYTES: usize = 1024;
+const MAX_ATTACHMENT_MIME_BYTES: usize = 256;
+const MAX_ATTACHMENT_PATH_BYTES: usize = 4 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
+const MAX_ATTACHMENT_UPLOAD_BYTES: usize = MAX_RAW_FILE_TOTAL_BYTES as usize;
+const MAX_ATTACHMENT_TEXT_BYTES: usize = 64 * 1024;
+const INLINE_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const MAX_MESSAGE_ID_BYTES: usize = 256;
 const MAX_MARKER_ID_BYTES: usize = 256;
 const MAX_PARTICIPANT_ID_BYTES: usize = 256;
@@ -107,13 +119,19 @@ enum MessagingAction {
         #[serde(default)]
         limit: Option<u16>,
     },
+    /// Read one attachment carried by a message this participant can see.
+    OpenAttachment { attachment_id: String },
     /// Write in the place currently open in this view.
     Write {
+        #[serde(default)]
         content: String,
         #[serde(default)]
         urgency: MessagingUrgency,
         #[serde(default)]
         reply_to: Option<String>,
+        /// Ordered paths selected from this agent's private workspace.
+        #[serde(default)]
+        attachments: Vec<String>,
     },
     /// State the desired emoji reaction on a message visible in the open place.
     React {
@@ -385,6 +403,7 @@ fn member_kind_text(kind: MessagingMemberKind) -> &'static str {
 struct VisibleMessage {
     message_id: String,
     seq: Option<u64>,
+    attachment_ids: Vec<String>,
 }
 
 #[derive(Default)]
@@ -397,13 +416,76 @@ struct MessagingViewState {
 
 pub(crate) struct MessagingTool {
     api: Arc<dyn MessagingApi>,
+    workspace_files: Arc<dyn WorkspaceFileSource>,
     view: Mutex<MessagingViewState>,
+}
+
+pub(crate) struct WorkspaceFileInput {
+    pub(crate) filename: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Resolves an agent-selected path through the foundation-owned filesystem
+/// boundary. Messaging never gets authority to resolve private VM paths.
+#[async_trait]
+pub(crate) trait WorkspaceFileSource: Send + Sync + 'static {
+    async fn read_file_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        execution_id_prefix: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkspaceFileInput, ToolError>;
+}
+
+#[async_trait]
+impl WorkspaceFileSource for ExecutorClient {
+    async fn read_file_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        execution_id_prefix: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkspaceFileInput, ToolError> {
+        let file = self
+            .read_workspace_file_bounded(path, max_bytes, execution_id_prefix, cancel)
+            .await?;
+        Ok(WorkspaceFileInput {
+            filename: file.filename,
+            bytes: file.bytes,
+        })
+    }
+}
+
+struct UnavailableWorkspaceFiles;
+
+#[async_trait]
+impl WorkspaceFileSource for UnavailableWorkspaceFiles {
+    async fn read_file_bounded(
+        &self,
+        _path: &str,
+        _max_bytes: usize,
+        _execution_id_prefix: &str,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkspaceFileInput, ToolError> {
+        Err(ToolError::Protocol(
+            "workspace file source is not installed for messaging".to_owned(),
+        ))
+    }
 }
 
 impl MessagingTool {
     pub(crate) fn new(api: Arc<dyn MessagingApi>) -> Self {
+        Self::with_workspace_files(api, Arc::new(UnavailableWorkspaceFiles))
+    }
+
+    pub(crate) fn with_workspace_files(
+        api: Arc<dyn MessagingApi>,
+        workspace_files: Arc<dyn WorkspaceFileSource>,
+    ) -> Self {
         Self {
             api,
+            workspace_files,
             view: Mutex::new(MessagingViewState::default()),
         }
     }
@@ -436,7 +518,8 @@ fn messaging_parameters_schema() -> Value {
         "description": concat!(
             "Choose one messaging action and include only the fields used by that action. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
-            "or limit; write requires content and may include urgency or reply_to; react ",
+            "or limit; open_attachment requires attachment_id; write requires content, ",
+            "attachments, or both and may include urgency or reply_to; react ",
             "requires emoji, reacted, and exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; profile may include display_name ",
@@ -462,7 +545,7 @@ fn messaging_parameters_schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": [
-                    "overview", "open", "write", "react",
+                    "overview", "open", "open_attachment", "write", "react",
                     "status", "profile", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
                     "search", "notification_settings", "attention", "get_call_state",
@@ -471,7 +554,8 @@ fn messaging_parameters_schema() -> Value {
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
-                    "shows one place and focuses it for later writes; write sends a message to ",
+                    "shows one place and focuses it for later writes; open_attachment reads a ",
+                    "file carried by a visible message; write sends a message to ",
                     "the currently open place; react states whether your emoji reaction is ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
@@ -548,12 +632,30 @@ fn messaging_parameters_schema() -> Value {
                     "Maximum number of messages, search hits or candidates to return."
                 )
             },
+            "attachment_id": {
+                "type": "string",
+                "description": concat!(
+                    "Required for open_attachment and omitted for other actions. Copy the ",
+                    "attachment_id shown on a message this participant can see."
+                )
+            },
             "content": {
                 "type": "string",
                 "description": concat!(
-                    "Required for write, optional for create_poll, and omitted for other ",
-                    "actions. For write, the message text sent to the currently open place; ",
+                    "Optional for write and create_poll, and omitted for other actions. For ",
+                    "write, the message text sent to the currently open place; a write must ",
+                    "carry content, attachments, or both. ",
                     "for create_poll, a line of your own text shown above the question."
+                )
+            },
+            "attachments": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {"type": "string"},
+                "description": concat!(
+                    "Optional for write and omitted for other actions. Ordered paths selected ",
+                    "from this agent's private workspace. The foundation opens these paths; ",
+                    "Messaging receives their bytes and display names, not private paths."
                 )
             },
             "urgency": {
@@ -874,7 +976,8 @@ impl Tool for MessagingTool {
             name: TOOL_NAME.to_owned(),
             description: concat!(
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
-                "open a place to see its timeline/members/unread state, then write in ",
+                "open a place to see its timeline/members/unread state, read a carried ",
+                "file with open_attachment, then write text and/or workspace files in ",
                 "that currently open place, or react or promise a later reply to a ",
                 "message visible in it. When a tangent deserves its own room, list or ",
                 "open a thread under the place. Declare your own availability with status, ",
@@ -967,10 +1070,32 @@ impl Tool for MessagingTool {
                 state.visible_messages = visible_messages_from(&response);
                 response
             }
+            MessagingAction::OpenAttachment { attachment_id } => {
+                if !state.visible_messages.iter().any(|message| {
+                    message
+                        .attachment_ids
+                        .iter()
+                        .any(|visible_id| visible_id == &attachment_id)
+                }) {
+                    return Err(ToolError::Protocol(
+                        "that attachment is not visible in the currently open place; open the place (paging with before_seq if needed) so its message is on screen, then open the attachment"
+                            .to_owned(),
+                    ));
+                }
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.open_attachment(OpenMessagingAttachmentRequest {
+                        attachment_id: &attachment_id,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                return attachment_output(&response);
+            }
             MessagingAction::Write {
                 content,
                 urgency,
                 reply_to,
+                attachments,
             } => {
                 let place_id = state.focused_place_id.clone().ok_or_else(|| {
                     ToolError::Protocol(
@@ -979,6 +1104,67 @@ impl Tool for MessagingTool {
                     )
                 })?;
                 let nonce = client_nonce(ctx.flow_id, ctx.call_id);
+                let mut attachment_ids = Vec::with_capacity(attachments.len());
+                for (index, path) in attachments.iter().enumerate() {
+                    if ctx.cancel.is_cancelled() {
+                        return Err(ToolError::Cancelled);
+                    }
+                    let execution_id = format!("{nonce}-attachment-{index}");
+                    let file = tokio::select! {
+                        _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                        result = self.workspace_files.read_file_bounded(
+                            path,
+                            MAX_ATTACHMENT_UPLOAD_BYTES,
+                            &execution_id,
+                            ctx.cancel.clone(),
+                        ) => result,
+                    }?;
+                    if file.bytes.is_empty()
+                        || file.bytes.len() > MAX_ATTACHMENT_UPLOAD_BYTES
+                        || file.filename.is_empty()
+                    {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                    // A browser File carries an OS-derived MIME candidate. A
+                    // path picker has the same filename hint; the application
+                    // remains authoritative by sniffing the bytes server-side.
+                    let content_type = mime_guess::from_path(&file.filename)
+                        .first_raw()
+                        .filter(|mime| mime.len() <= MAX_ATTACHMENT_MIME_BYTES)
+                        .map(str::to_owned);
+                    let sent_size = file.bytes.len() as u64;
+                    let uploaded = tokio::select! {
+                        _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                        result = self.api.upload_attachment(UploadMessagingAttachmentRequest {
+                            filename: file.filename,
+                            bytes: file.bytes,
+                            content_type,
+                        }) => result,
+                    }
+                    .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                    if uploaded.size != sent_size
+                        || validate_bounded_nonempty(
+                            &uploaded.attachment_id,
+                            MAX_ATTACHMENT_ID_BYTES,
+                        )
+                        .is_err()
+                        || validate_bounded_nonempty(
+                            &uploaded.filename,
+                            MAX_ATTACHMENT_FILENAME_BYTES,
+                        )
+                        .is_err()
+                        || validate_bounded_nonempty(&uploaded.mime, MAX_ATTACHMENT_MIME_BYTES)
+                            .is_err()
+                    {
+                        return Err(ToolError::Protocol(
+                            "messaging upload returned invalid attachment metadata".to_owned(),
+                        ));
+                    }
+                    attachment_ids.push(uploaded.attachment_id);
+                }
+                if ctx.cancel.is_cancelled() {
+                    return Err(ToolError::Cancelled);
+                }
                 let response = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.write(WriteMessagingMessageRequest {
@@ -987,6 +1173,7 @@ impl Tool for MessagingTool {
                         urgency: urgency_text(urgency),
                         reply_to: reply_to.as_deref(),
                         client_nonce: &nonce,
+                        attachments: &attachment_ids,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
@@ -997,6 +1184,7 @@ impl Tool for MessagingTool {
                     state.visible_messages.push(VisibleMessage {
                         message_id: message_id.to_owned(),
                         seq: response.get("seq").and_then(Value::as_u64),
+                        attachment_ids: attachment_ids.clone(),
                     });
                 }
                 response
@@ -1372,6 +1560,7 @@ impl Tool for MessagingTool {
                     state.visible_messages.push(VisibleMessage {
                         message_id: message_id.to_owned(),
                         seq: response.get("seq").and_then(Value::as_u64),
+                        attachment_ids: Vec::new(),
                     });
                 }
                 response
@@ -1428,6 +1617,65 @@ impl Tool for MessagingTool {
     }
 }
 
+/// Convert an application-authorized attachment into model-visible content.
+/// The persisted tool details retain metadata only, not a duplicate base64
+/// payload. Images stay images; small UTF-8 files become text; other bytes are
+/// described without pretending they are readable.
+fn attachment_output(response: &Value) -> Result<ToolOutput, ToolError> {
+    let data = response
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Protocol("attachment response carries no data".to_owned()))?;
+    let mime = response
+        .get("mime")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
+    let filename = response
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("file");
+    let mut details = response.clone();
+    if let Some(object) = details.as_object_mut() {
+        object.remove("data");
+    }
+    let lowered = mime.to_ascii_lowercase();
+    let mut content = vec![UserContent::Text {
+        text: format!("attachment {filename} ({mime})"),
+    }];
+    if INLINE_IMAGE_MIMES.contains(&lowered.as_str()) {
+        content.push(UserContent::Image {
+            data: data.to_owned(),
+            mime_type: lowered,
+        });
+        return Ok(ToolOutput {
+            content,
+            details,
+            is_error: false,
+        });
+    }
+    let bytes = BASE64
+        .decode(data)
+        .map_err(|error| ToolError::Protocol(error.to_string()))?;
+    match str::from_utf8(&bytes) {
+        Ok(text) if bytes.len() <= MAX_ATTACHMENT_TEXT_BYTES => {
+            content.push(UserContent::Text {
+                text: text.to_owned(),
+            });
+        }
+        _ => content.push(UserContent::Text {
+            text: format!(
+                "{} bytes: not an inline image and not readable as text, so the bytes are not shown here.",
+                bytes.len()
+            ),
+        }),
+    }
+    Ok(ToolOutput {
+        content,
+        details,
+        is_error: false,
+    })
+}
+
 /// A channel that was just created becomes the place in view, the way a human
 /// lands in the channel they made. Nothing has been seen there, so the screen
 /// starts empty (ADR 0011 §3: 見えていないものは操作できない).
@@ -1456,11 +1704,23 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::OpenAttachment { attachment_id } => {
+            validate_bounded_nonempty(attachment_id, MAX_ATTACHMENT_ID_BYTES)
+        }
         MessagingAction::Write {
-            content, reply_to, ..
+            content,
+            reply_to,
+            attachments,
+            ..
         } => {
-            if content.is_empty() || content.len() > MAX_CONTENT_BYTES {
+            if content.len() > MAX_CONTENT_BYTES
+                || (content.is_empty() && attachments.is_empty())
+                || attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE
+            {
                 return Err(ToolError::InvalidArguments);
+            }
+            for path in attachments {
+                validate_bounded_nonempty(path, MAX_ATTACHMENT_PATH_BYTES)?;
             }
             if reply_to
                 .as_deref()
@@ -1918,7 +2178,26 @@ fn visible_messages_from(response: &Value) -> Vec<VisibleMessage> {
                 .filter_map(|message| {
                     let message_id = message.get("message_id")?.as_str()?.to_owned();
                     let seq = message.get("seq").and_then(Value::as_u64);
-                    Some(VisibleMessage { message_id, seq })
+                    let attachment_ids = message
+                        .get("attachments")
+                        .and_then(Value::as_array)
+                        .map(|attachments| {
+                            attachments
+                                .iter()
+                                .filter_map(|attachment| {
+                                    attachment
+                                        .get("attachment_id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(VisibleMessage {
+                        message_id,
+                        seq,
+                        attachment_ids,
+                    })
                 })
                 .collect()
         })
@@ -1974,7 +2253,7 @@ fn client_nonce(flow_id: &str, call_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
 
     use anyhow::{Result, anyhow};
     use serde_json::json;
@@ -1983,13 +2262,21 @@ mod tests {
 
     use super::*;
 
-    use crate::{provider::types::ValidatedToolArguments, tools::WorkspacePaths};
+    use crate::{
+        apiclient::messaging::UploadMessagingAttachmentResponse,
+        provider::types::ValidatedToolArguments, tools::WorkspacePaths,
+    };
 
     #[derive(Default)]
     struct FakeMessagingApi {
         calls: AsyncMutex<Vec<String>>,
         reads: AsyncMutex<Vec<(String, u64)>>,
-        writes: AsyncMutex<Vec<(String, String, String)>>,
+        writes: AsyncMutex<Vec<(String, String, String, Vec<String>)>>,
+        uploads: AsyncMutex<Vec<(String, Vec<u8>)>>,
+        upload_content_types: AsyncMutex<Vec<Option<String>>>,
+        upload_failures: AsyncMutex<VecDeque<&'static str>>,
+        cancel_after_upload: AsyncMutex<Option<CancellationToken>>,
+        attachments: AsyncMutex<BTreeMap<String, Value>>,
         reacts: AsyncMutex<Vec<(String, String, String, bool)>>,
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
         profiles: AsyncMutex<Vec<(Option<String>, Option<String>)>>,
@@ -2040,6 +2327,36 @@ mod tests {
             }))
         }
 
+        async fn upload_attachment(
+            &self,
+            request: UploadMessagingAttachmentRequest,
+        ) -> Result<UploadMessagingAttachmentResponse> {
+            if self.upload_failures.lock().await.pop_front() == Some("upload") {
+                return Err(anyhow!("upload failed"));
+            }
+            self.calls
+                .lock()
+                .await
+                .push(format!("upload:{}", request.filename));
+            let mut uploads = self.uploads.lock().await;
+            let attachment_id = format!("att-{}", uploads.len() + 1);
+            let size = request.bytes.len() as u64;
+            self.upload_content_types
+                .lock()
+                .await
+                .push(request.content_type.clone());
+            uploads.push((request.filename.clone(), request.bytes));
+            if let Some(cancel) = self.cancel_after_upload.lock().await.take() {
+                cancel.cancel();
+            }
+            Ok(UploadMessagingAttachmentResponse {
+                attachment_id,
+                filename: request.filename,
+                mime: "application/octet-stream".to_owned(),
+                size,
+            })
+        }
+
         async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value> {
             self.calls
                 .lock()
@@ -2049,6 +2366,7 @@ mod tests {
                 request.place_id.to_owned(),
                 request.content.to_owned(),
                 request.client_nonce.to_owned(),
+                request.attachments.to_vec(),
             ));
             Ok(json!({
                 "client_nonce": request.client_nonce,
@@ -2056,6 +2374,22 @@ mod tests {
                 "seq": 8,
                 "created": true
             }))
+        }
+
+        async fn open_attachment(
+            &self,
+            request: OpenMessagingAttachmentRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("attachment:{}", request.attachment_id));
+            self.attachments
+                .lock()
+                .await
+                .get(request.attachment_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("attachment not found"))
         }
 
         async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {
@@ -2422,10 +2756,56 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeWorkspaceFileSource {
+        reads: AsyncMutex<Vec<String>>,
+        failures: AsyncMutex<VecDeque<&'static str>>,
+    }
+
+    #[async_trait]
+    impl WorkspaceFileSource for FakeWorkspaceFileSource {
+        async fn read_file_bounded(
+            &self,
+            path: &str,
+            _max_bytes: usize,
+            _execution_id_prefix: &str,
+            _cancel: CancellationToken,
+        ) -> std::result::Result<WorkspaceFileInput, ToolError> {
+            if self.failures.lock().await.pop_front() == Some("read") {
+                return Err(ToolError::Rpc("workspace read failed".to_owned()));
+            }
+            self.reads.lock().await.push(path.to_owned());
+            Ok(WorkspaceFileInput {
+                filename: path.rsplit('/').next().unwrap_or(path).to_owned(),
+                bytes: if path.ends_with("empty.bin") {
+                    Vec::new()
+                } else {
+                    vec![0, 255, 1]
+                },
+            })
+        }
+    }
+
+    fn messaging_tool_with_files(
+        api: Arc<FakeMessagingApi>,
+        files: Arc<FakeWorkspaceFileSource>,
+    ) -> MessagingTool {
+        MessagingTool::with_workspace_files(api, files)
+    }
+
     async fn execute(
         tool: &MessagingTool,
         action: Value,
         call_id: &str,
+    ) -> Result<ToolOutput, ToolError> {
+        execute_with_cancel(tool, action, call_id, CancellationToken::new()).await
+    }
+
+    async fn execute_with_cancel(
+        tool: &MessagingTool,
+        action: Value,
+        call_id: &str,
+        cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: ValidatedToolArguments = serde_json::from_value(action).unwrap();
         let workspace = WorkspacePaths::new("/workspace").unwrap();
@@ -2433,7 +2813,7 @@ mod tests {
             flow_id: "flow",
             call_id,
             args: &args,
-            cancel: CancellationToken::new(),
+            cancel,
             on_update: Arc::new(|_| {}),
             workspace: &workspace,
         })
@@ -2490,6 +2870,7 @@ mod tests {
             json!([
                 "overview",
                 "open",
+                "open_attachment",
                 "write",
                 "react",
                 "status",
@@ -2577,6 +2958,7 @@ mod tests {
         assert_eq!(schema["properties"]["options"]["maxItems"], 10);
         assert_eq!(schema["properties"]["allow_multi"]["type"], "boolean");
         assert_eq!(schema["properties"]["option_ids"]["type"], "array");
+        assert_eq!(schema["properties"]["attachments"]["maxItems"], 10);
         assert_eq!(schema["properties"]["closes_in_minutes"]["minimum"], 1);
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
@@ -2587,7 +2969,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            40
+            42
         );
     }
 
@@ -2613,6 +2995,16 @@ mod tests {
             } if place_id == "general"
         ));
 
+        let attachment: MessagingAction = serde_json::from_value(json!({
+            "action": "open_attachment",
+            "attachment_id": "att-1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            attachment,
+            MessagingAction::OpenAttachment { attachment_id } if attachment_id == "att-1"
+        ));
+
         let write: MessagingAction = serde_json::from_value(json!({
             "action": "write",
             "content": "hello",
@@ -2625,8 +3017,10 @@ mod tests {
             MessagingAction::Write {
                 content,
                 urgency: MessagingUrgency::Fyi,
-                reply_to: Some(reply_to)
+                reply_to: Some(reply_to),
+                attachments
             } if content == "hello" && reply_to == "message-1"
+                && attachments.is_empty()
         ));
 
         let react: MessagingAction = serde_json::from_value(json!({
@@ -2974,6 +3368,240 @@ mod tests {
         assert_eq!(writes[0].0, "general");
         assert_eq!(writes[0].1, "hi");
         assert_eq!(writes[0].2, client_nonce("flow", "write"));
+    }
+
+    #[tokio::test]
+    async fn write_reads_workspace_paths_uploads_bytes_then_sends_attachment_ids_once() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let source = Arc::new(FakeWorkspaceFileSource::default());
+        let tool = messaging_tool_with_files(api.clone(), source.clone());
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({
+                "action": "write",
+                "content": "",
+                "attachments": ["docs/note.bin"]
+            }),
+            "write-with-attachment",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            source.reads.lock().await.as_slice(),
+            &["docs/note.bin".to_owned()]
+        );
+        assert_eq!(
+            api.uploads.lock().await.as_slice(),
+            &[("note.bin".to_owned(), vec![0, 255, 1])]
+        );
+        let writes = api.writes.lock().await;
+        assert_eq!(writes.len(), 1, "attachments and text are one message send");
+        assert_eq!(writes[0].0, "general");
+        assert_eq!(writes[0].1, "");
+        assert_eq!(writes[0].3, vec!["att-1".to_owned()]);
+        drop(writes);
+
+        seed_attachment(
+            &api,
+            "att-1",
+            json!({
+                "attachment_id": "att-1",
+                "filename": "note.bin",
+                "mime": "application/octet-stream",
+                "size": 3,
+                "message_id": "m8",
+                "data": "AP8B"
+            }),
+        )
+        .await;
+        execute(
+            &tool,
+            json!({"action": "open_attachment", "attachment_id": "att-1"}),
+            "open-own-attachment",
+        )
+        .await
+        .expect("a sender sees the attachment in the message that just landed");
+    }
+
+    #[tokio::test]
+    async fn write_preserves_attachment_selection_order_and_mime_hint() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let source = Arc::new(FakeWorkspaceFileSource::default());
+        let tool = messaging_tool_with_files(api.clone(), source.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        execute(
+            &tool,
+            json!({
+                "action": "write",
+                "content": "see both",
+                "attachments": ["docs/one.txt", "reports/two.bin"]
+            }),
+            "write-two",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            source.reads.lock().await.as_slice(),
+            &["docs/one.txt".to_owned(), "reports/two.bin".to_owned()]
+        );
+        let uploads = api.uploads.lock().await;
+        assert_eq!(uploads[0].0, "one.txt");
+        assert_eq!(uploads[1].0, "two.bin");
+        drop(uploads);
+        assert_eq!(
+            api.upload_content_types.lock().await.as_slice(),
+            &[
+                Some("text/plain".to_owned()),
+                Some("application/octet-stream".to_owned())
+            ]
+        );
+        assert_eq!(
+            api.writes.lock().await[0].3,
+            vec!["att-1".to_owned(), "att-2".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_read_or_upload_failure_never_sends_a_message() {
+        let read_api = Arc::new(FakeMessagingApi::default());
+        let read_source = Arc::new(FakeWorkspaceFileSource::default());
+        let read_tool = messaging_tool_with_files(read_api.clone(), read_source.clone());
+        execute(
+            &read_tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-read-failure",
+        )
+        .await
+        .unwrap();
+        read_source.failures.lock().await.push_back("read");
+        assert!(
+            execute(
+                &read_tool,
+                json!({"action": "write", "attachments": ["docs/note.bin"]}),
+                "read-failure",
+            )
+            .await
+            .is_err()
+        );
+        assert!(read_api.uploads.lock().await.is_empty());
+        assert!(read_api.writes.lock().await.is_empty());
+
+        let upload_api = Arc::new(FakeMessagingApi::default());
+        let upload_source = Arc::new(FakeWorkspaceFileSource::default());
+        let upload_tool = messaging_tool_with_files(upload_api.clone(), upload_source);
+        execute(
+            &upload_tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-upload-failure",
+        )
+        .await
+        .unwrap();
+        upload_api.upload_failures.lock().await.push_back("upload");
+        assert!(
+            execute(
+                &upload_tool,
+                json!({"action": "write", "attachments": ["docs/note.bin"]}),
+                "upload-failure",
+            )
+            .await
+            .is_err()
+        );
+        assert!(upload_api.writes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_file_is_rejected_before_upload_or_send() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let source = Arc::new(FakeWorkspaceFileSource::default());
+        let tool = messaging_tool_with_files(api.clone(), source);
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        let error = execute(
+            &tool,
+            json!({"action": "write", "attachments": ["docs/empty.bin"]}),
+            "empty-file",
+        )
+        .await
+        .expect_err("empty attachment must fail locally");
+
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert!(api.uploads.lock().await.is_empty());
+        assert!(api.writes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_an_upload_stops_before_the_next_file_or_message() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let source = Arc::new(FakeWorkspaceFileSource::default());
+        let tool = messaging_tool_with_files(api.clone(), source.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        *api.cancel_after_upload.lock().await = Some(cancel.clone());
+
+        let error = execute_with_cancel(
+            &tool,
+            json!({
+                "action": "write",
+                "attachments": ["docs/one.bin", "docs/two.bin"]
+            }),
+            "cancel-between-files",
+            cancel,
+        )
+        .await
+        .expect_err("cancelled write");
+
+        assert!(matches!(error, ToolError::Cancelled));
+        assert_eq!(source.reads.lock().await.as_slice(), &["docs/one.bin"]);
+        assert_eq!(api.uploads.lock().await.len(), 1);
+        assert!(api.writes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_requires_text_or_one_to_ten_nonempty_attachment_paths() {
+        let tool = MessagingTool::new(Arc::new(FakeMessagingApi::default()));
+
+        for invalid in [
+            json!({"action": "write"}),
+            json!({"action": "write", "attachments": [""]}),
+            json!({
+                "action": "write",
+                "attachments": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
+            }),
+        ] {
+            let error = execute(&tool, invalid, "invalid-write")
+                .await
+                .expect_err("invalid composer input");
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
     }
 
     #[tokio::test]
@@ -3884,6 +4512,149 @@ mod tests {
             api.reacts.lock().await.as_slice(),
             &[("general".to_owned(), "m8".to_owned(), "✅".to_owned(), true)]
         );
+    }
+
+    async fn seed_attachment(api: &FakeMessagingApi, id: &str, response: Value) {
+        api.attachments.lock().await.insert(id.to_owned(), response);
+    }
+
+    #[tokio::test]
+    async fn open_attachment_shows_images_and_text_without_repeating_bytes_in_details() {
+        let image_api = Arc::new(FakeMessagingApi::default());
+        seed_attachment(
+            &image_api,
+            "a6",
+            json!({
+                "attachment_id": "a6",
+                "filename": "shot.png",
+                "mime": "image/png",
+                "size": 5,
+                "message_id": "m1",
+                "data": "cGl4ZWw="
+            }),
+        )
+        .await;
+        let image_tool = MessagingTool::new(image_api.clone());
+        execute(
+            &image_tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-image-place",
+        )
+        .await
+        .unwrap();
+        let image_output = execute(
+            &image_tool,
+            json!({"action": "open_attachment", "attachment_id": "a6"}),
+            "open-image",
+        )
+        .await
+        .expect("open image attachment");
+        assert!(matches!(
+            image_output.content.last(),
+            Some(UserContent::Image { data, mime_type })
+                if data == "cGl4ZWw=" && mime_type == "image/png"
+        ));
+        assert_eq!(image_output.details["filename"], "shot.png");
+        assert!(image_output.details.get("data").is_none());
+
+        let text_api = Arc::new(FakeMessagingApi::default());
+        seed_attachment(
+            &text_api,
+            "a6",
+            json!({
+                "attachment_id": "a6",
+                "filename": "notes.md",
+                "mime": "text/markdown",
+                "size": 5,
+                "message_id": "m2",
+                "data": "aGVsbG8="
+            }),
+        )
+        .await;
+        let text_tool = MessagingTool::new(text_api);
+        execute(
+            &text_tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-text-place",
+        )
+        .await
+        .unwrap();
+        let text_output = execute(
+            &text_tool,
+            json!({"action": "open_attachment", "attachment_id": "a6"}),
+            "open-text",
+        )
+        .await
+        .expect("open text attachment");
+        assert!(matches!(
+            text_output.content.last(),
+            Some(UserContent::Text { text }) if text == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_attachment_summarizes_binary_and_surfaces_refusal() {
+        let api = Arc::new(FakeMessagingApi::default());
+        seed_attachment(
+            &api,
+            "a6",
+            json!({
+                "attachment_id": "a6",
+                "filename": "dump.bin",
+                "mime": "application/octet-stream",
+                "size": 4,
+                "message_id": "m3",
+                "data": "//79/A=="
+            }),
+        )
+        .await;
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-binary-place",
+        )
+        .await
+        .unwrap();
+
+        let output = execute(
+            &tool,
+            json!({"action": "open_attachment", "attachment_id": "a6"}),
+            "open-binary",
+        )
+        .await
+        .expect("open binary attachment");
+        assert!(matches!(
+            output.content.last(),
+            Some(UserContent::Text { text }) if text.starts_with("4 bytes:")
+        ));
+
+        let invisible = execute(
+            &tool,
+            json!({"action": "open_attachment", "attachment_id": "att-missing"}),
+            "open-invisible",
+        )
+        .await
+        .expect_err("attachment outside the current screen");
+        assert!(matches!(invisible, ToolError::Protocol(_)));
+        assert!(
+            !api.calls
+                .lock()
+                .await
+                .contains(&"attachment:att-missing".to_owned())
+        );
+
+        // Even a visible identifier can be refused by the application after a
+        // tombstone or concurrent authorization change.
+        api.attachments.lock().await.remove("a6");
+        let refused = execute(
+            &tool,
+            json!({"action": "open_attachment", "attachment_id": "a6"}),
+            "open-refused",
+        )
+        .await
+        .expect_err("visible attachment became unavailable");
+        assert!(matches!(refused, ToolError::Rpc(_)));
     }
 
     /// AX/UX 同型性: 送り手が添付に付けた「ネタバレ」と概要は、人間の画面と

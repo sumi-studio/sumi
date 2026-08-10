@@ -27,6 +27,33 @@ pub(crate) struct WriteMessagingMessageRequest<'a> {
     pub urgency: &'a str,
     pub reply_to: Option<&'a str>,
     pub client_nonce: &'a str,
+    pub attachments: &'a [String],
+}
+
+/// One file already opened from the private workspace by the agent
+/// foundation. Messaging receives bytes and a display name, never the private
+/// workspace path that selected them.
+#[derive(Debug)]
+pub(crate) struct UploadMessagingAttachmentRequest {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UploadMessagingAttachmentResponse {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// Fetch bytes for an attachment the authenticated participant can see.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenMessagingAttachmentRequest<'a> {
+    pub attachment_id: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -328,7 +355,14 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
 
     async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<Value>;
 
+    async fn upload_attachment(
+        &self,
+        request: UploadMessagingAttachmentRequest,
+    ) -> Result<UploadMessagingAttachmentResponse>;
+
     async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value>;
+
+    async fn open_attachment(&self, request: OpenMessagingAttachmentRequest<'_>) -> Result<Value>;
 
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value>;
 

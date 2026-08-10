@@ -40,11 +40,12 @@ use crate::apiclient::messaging::{
     CreateMessagingRoleRequest, CreateMessagingThreadRequest, DeleteMessagingRoleRequest,
     DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, ListMessagingRolesRequest,
     ListMessagingThreadsRequest, MessagingApi, MessagingNotificationSettingsRequest,
-    OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
-    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
-    SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest, SetMessagingProfileRequest,
-    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
-    UpdateMessagingRoleRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
+    OpenMessagingAttachmentRequest, OpenMessagingPlaceRequest, PollMessagingAttentionRequest,
+    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
+    SearchMessagingRequest, SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest,
+    SetMessagingProfileRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
+    UpdateMessagingChannelRequest, UpdateMessagingRoleRequest, UploadMessagingAttachmentRequest,
+    UploadMessagingAttachmentResponse, VoteMessagingPollRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -56,6 +57,8 @@ const MAX_LOCAL_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
 // list. Keep that cohesive response bounded independently without widening the
 // credential and runtime-state control-plane boundary above.
 const MAX_MESSAGING_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MESSAGING_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
+const MESSAGING_ATTACHMENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_LOCAL_CONTROL_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
@@ -357,6 +360,68 @@ impl LocalControlHttpClient {
         serde_json::from_slice(body.as_slice()).context("decode strict local control response")
     }
 
+    async fn post_multipart_bounded<Response>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+        max_response_bytes: usize,
+        request_timeout: Duration,
+    ) -> Result<Response>
+    where
+        Response: for<'de> Deserialize<'de>,
+    {
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let url = self
+            .base_url
+            .join(path)
+            .context("join local control endpoint URL")?;
+        let mut request = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .timeout(request_timeout)
+            .multipart(form);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request.build().context("build local control request")?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint.revalidate()?;
+        }
+        let response = http
+            .execute(request)
+            .await
+            .context("local control request failed")?;
+        if !response.status().is_success() {
+            bail!(
+                "local control request was rejected with status {}",
+                response.status()
+            );
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_response_bytes as u64)
+        {
+            bail!("local control response exceeds bounded size");
+        }
+        let mut body = Zeroizing::new(Vec::new());
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read local control response")?;
+            if body.len().saturating_add(chunk.len()) > max_response_bytes {
+                bail!("local control response exceeds bounded size");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(body.as_slice()).context("decode strict local control response")
+    }
+
     async fn post_runtime_state(
         &self,
         publication: &LocalRuntimeStatePublication,
@@ -502,9 +567,40 @@ impl MessagingApi for LocalControlHttpClient {
         .await
     }
 
+    async fn upload_attachment(
+        &self,
+        request: UploadMessagingAttachmentRequest,
+    ) -> Result<UploadMessagingAttachmentResponse> {
+        let mut part = reqwest::multipart::Part::bytes(request.bytes).file_name(request.filename);
+        if let Some(content_type) = request.content_type {
+            part = part
+                .mime_str(&content_type)
+                .context("attachment content type is invalid")?;
+        }
+        self.post_multipart_bounded(
+            "/local-control/v1/messaging:upload",
+            reqwest::multipart::Form::new().part("file", part),
+            MAX_MESSAGING_UPLOAD_RESPONSE_BYTES,
+            MESSAGING_ATTACHMENT_UPLOAD_TIMEOUT,
+        )
+        .await
+    }
+
     async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:write", &request)
             .await
+    }
+
+    async fn open_attachment(
+        &self,
+        request: OpenMessagingAttachmentRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:attachment",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
     }
 
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<serde_json::Value> {
@@ -2811,6 +2907,7 @@ mod tests {
                 urgency: "normal",
                 reply_to: None,
                 client_nonce: "nonce-max-escaped",
+                attachments: &[],
             })
             .await
             .expect("a legal maximum write must be observed as success");
@@ -2825,6 +2922,92 @@ mod tests {
         assert_eq!(
             request["content"].as_str().unwrap().as_bytes().len(),
             64 * 1024
+        );
+        server.abort();
+    }
+
+    async fn messaging_upload_fixture(
+        State(captured): State<Arc<StdMutex<Option<(String, Vec<u8>)>>>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<serde_json::Value> {
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer control-secret")
+        );
+        let content_type = headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .expect("multipart content type")
+            .to_owned();
+        *captured.lock().unwrap() = Some((content_type, body.to_vec()));
+        Json(serde_json::json!({
+            "attachment_id": "att-1",
+            "filename": "note.txt",
+            "mime": "application/octet-stream",
+            "size": 3
+        }))
+    }
+
+    #[tokio::test]
+    async fn messaging_upload_sends_authenticated_multipart_bytes_without_workspace_path() {
+        let captured = Arc::new(StdMutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:upload",
+                post(messaging_upload_fixture),
+            )
+            .with_state(captured.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+
+        let response = client
+            .upload_attachment(UploadMessagingAttachmentRequest {
+                filename: "note.txt".to_owned(),
+                bytes: vec![0, 255, 1],
+                content_type: Some("text/plain".to_owned()),
+            })
+            .await
+            .expect("upload attachment");
+
+        assert_eq!(response.attachment_id, "att-1");
+        let (content_type, body) = captured.lock().unwrap().take().unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        assert!(body.windows(3).any(|window| window == [0, 255, 1]));
+        let filename = b"filename=\"note.txt\"";
+        assert!(
+            body.windows(filename.len())
+                .any(|window| window == filename)
+        );
+        let part_content_type = b"Content-Type: text/plain";
+        assert!(
+            body.windows(part_content_type.len())
+                .any(|window| window == part_content_type)
+        );
+        let private_path = b"docs/note.txt";
+        assert!(
+            !body
+                .windows(private_path.len())
+                .any(|window| window == private_path),
+            "private workspace path crossed the application boundary"
         );
         server.abort();
     }

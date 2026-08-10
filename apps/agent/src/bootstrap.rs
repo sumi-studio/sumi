@@ -1042,7 +1042,10 @@ async fn run_after_not_ready(
             ExecutorHealthPolicy::PRODUCTION,
         )
         .await?;
-        let messaging_tool: Arc<dyn Tool> = Arc::new(MessagingTool::new(messaging_api));
+        let messaging_tool: Arc<dyn Tool> = Arc::new(MessagingTool::with_workspace_files(
+            messaging_api,
+            executor_client.clone(),
+        ));
         let registry = remote_executor_registry_with_tools(
             executor_client.clone(),
             std::iter::once(messaging_tool),
