@@ -52,8 +52,10 @@ type Server struct {
 	// failing closed (503): a subscription nothing can send to is worse than
 	// an honest "この deployment に push はまだ無い".
 	Push *PushDispatcher
-	// Calls, when set, is the RTC surface (ADR 0012). Nil means the deployment
-	// configured no media transport, and the call routes are not mounted.
+	// Calls, when set, exposes RTC state to the agent's local-control lane
+	// (ADR 0012). Public call routes are registered independently so
+	// GET /messaging/calls remains mounted without a configured media transport;
+	// nil keeps only the local-control call-state capability unavailable.
 	Calls *CallService
 
 	// profileMu keeps this process's unversioned profile events in the same

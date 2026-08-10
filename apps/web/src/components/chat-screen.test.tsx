@@ -3,7 +3,12 @@
 import "@testing-library/jest-dom/vitest";
 import { SduiView } from "@sumi/sdui";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { forwardRef, type ReactNode, useImperativeHandle } from "react";
+import {
+  forwardRef,
+  type ReactNode,
+  StrictMode,
+  useImperativeHandle,
+} from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatScreen } from "./chat-screen";
 
@@ -16,6 +21,8 @@ const state = vi.hoisted(() => ({
     reason: string;
   }>,
   restoreDraft: vi.fn<(key: string) => string | undefined>(),
+  connect: vi.fn(),
+  disconnect: vi.fn(),
 }));
 
 vi.mock("../agent/store", () => ({
@@ -49,8 +56,8 @@ vi.mock("../agent/store", () => ({
     ready: "ready",
     lastError: null,
     recoverableDrafts: state.recoverableDrafts,
-    connect: vi.fn(),
-    disconnect: vi.fn(),
+    connect: state.connect,
+    disconnect: state.disconnect,
     sendMessage: state.sendMessage,
     restoreDraft: state.restoreDraft,
     discardDraft: vi.fn(),
@@ -127,9 +134,31 @@ afterEach(() => {
   state.scrollToEnd.mockClear();
   state.recoverableDrafts = [];
   state.restoreDraft.mockReset();
+  state.connect.mockClear();
+  state.disconnect.mockClear();
 });
 
 describe("SDUI action boundary", () => {
+  it("StrictModeの検査マウントでは接続前WebSocketを作らない", async () => {
+    vi.useFakeTimers();
+    try {
+      const view = render(
+        <StrictMode>
+          <ChatScreen />
+        </StrictMode>,
+      );
+      expect(state.connect).not.toHaveBeenCalled();
+
+      await vi.runOnlyPendingTimersAsync();
+      expect(state.connect).toHaveBeenCalledTimes(1);
+
+      view.unmount();
+      expect(state.disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("renders conversation items through the virtualized log", () => {
     render(<ChatScreen />);
 
