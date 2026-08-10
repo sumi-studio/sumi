@@ -37,6 +37,12 @@ ADR 0015がAcceptedになった時点で、global Messaging placeを前提にし
   installation enabled、place visibilityをcommit時に再認可する。
 - Agent tool snapshotは同じWorkspace / installation contextから作り、appへ見せる前のadvertisementと
   effect直前のauthorizationを別に保つ。
+- `dm` / `group_dm`はscopeとして`WorkspaceId`を持つが、Workspace roleからplaceのread / append /
+  invite / admin authorityを導出しない。place tenureはadmission時のexact `WorkspaceMemberId` tenureへ
+  束縛し、両方がcurrentかつactiveであることを要求する。Workspace membershipのcloseは同じtransactionで
+  束縛されたcurrent place tenureも閉じ、再加入だけでは復元しない。
+- group DMのread / unread / search / notification / AttentionCandidate seq範囲は、current tenureの
+  `visible_from_seq`を下限とする。
 - Direct ChatはParticipant-owned境界のままであり、上記fieldを架空のWorkspaceから補わない。
 - v1とのdual-read、current UI Workspaceからのscope推測、global DMのcompatibility branchは作らない。
 

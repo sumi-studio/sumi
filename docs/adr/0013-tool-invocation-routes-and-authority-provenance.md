@@ -83,6 +83,10 @@ RequestedExecutionAuthority = AgentOwn | HumanAccountOneShot
 | Elevated | `AgentOwn` | `null` |
 | Elevated | `HumanAccountOneShot` | non-null |
 
+`requested_authority`はbindingのnull性から安全側に導出できる場合でも省略しない。providerが
+どのauthority sourceを要求したかを明示し、route / bindingとの不一致をhard blockするための
+意図的な冗長性である。
+
 `AuthorityBindingRef`はfoundationが事前発行したopaque handleであり、それ自体はgrantでもsecretでもない。
 server側で具体的なHuman actor、account / credential binding、audienceへ解決できる。providerが自由記述した
 Human ID、account名、最新sender、current user、app input中の自己申告actorからbindingを合成しない。
@@ -90,6 +94,13 @@ Human ID、account名、最新sender、current user、app input中の自己申�
 Escalation AutoReviewと`ApprovalRequested`より前に検証し、appのtarget resolverからtarget / scopeも
 確定する。unknown、stale、revoked、mismatchedなbindingはHumanへpromptせずblockする。bindingの存在は
 Human approvalやeffect直前のaccount再認可を置き換えない。
+
+current provider requestで利用可能なfoundation-owned binding issuer / registryが存在しない、または
+対象tool / app / audienceに適合するcurrent bindingが一件もない場合、そのtool schemaは
+`human_account_one_shot`を選択肢としてadvertiseしない。非advertise値やnon-null refを受け取った場合も
+Execution / Escalation AutoReviewやHuman promptへ進めない。durableな`RejectedToolCall`と
+`AuthorityBindingUnavailable`のtyped error、引数をechoしないsynthetic `is_error` resultを同じ
+確定経路へ残し、`approval_log` / `tool_executions`は作らずblockする。
 
 canonical action digestはversion付きかつdomain-separatedなcanonical executable action――少なくとも
 tool名、immutable route、requested authority、binding identityと解決済みHuman / account / audience、
@@ -174,8 +185,9 @@ ExecutionAuthorityProvenance =
   Computer Useのいずれでも同じ意味を持つ。
 
 したがって`Elevated == HumanAccountOneShot`ではない。Elevatedのcurrent-call approvalを
-解決するとき、要求されたcapability sourceとapp側の認可contractに従って後二者のどちらかを
-durableに確定する。client payloadのactor名、agent credentialへのHuman名の付与、reviewer
+解決するとき、requested `AgentOwn`は`AgentOwnWithHumanConsent`にだけ、requested
+`HumanAccountOneShot`は`HumanAccountOneShot`にだけdurableに確定する。cross-mapping、推測、
+fallbackはblockする。client payloadのactor名、agent credentialへのHuman名の付与、reviewer
 allowをHuman-account authorityとして扱うことは禁止する。
 
 `HumanAccountOneShot`は次をすべて満たす場合だけ成立する。
@@ -300,6 +312,9 @@ compatibility branchを作らない。
 7. providerが所有しSumi側でinput schemaを包めないnative toolを将来使う場合のroute表現と、
    foundation-owned toolとの同一audit / approval contract。別途決定するまでnative toolを
    envelope済みの実行可能callとして扱わない。
+8. foundation-owned `AuthorityBindingRef` issuer / registryの永続化単位、source accountごとの
+   lifetime、revoke propagation、provider-visible binding選択肢の安全な表示方法。これらが実装される
+   までは`human_account_one_shot`をproviderへadvertiseしない。
 
 これらが未決でも、non-positive reviewをHumanへfallbackしないこと、routeとauthority sourceを
 同一視しないこと、Human-account one-shotをstanding policyへ変換しないこと、hard deny・

@@ -45,22 +45,33 @@ current Workspaceから推測するとdomain identityがUI stateに依存する�
 3. `dm`作成時には2名、`group_dm`作成時には全参加者が、そのWorkspaceのactive memberで
    あることをcommit時に検証する。active Workspace membershipは必要条件であり、DM本文の
    閲覧にはactive place membershipも必要とする。Workspace owner / adminであることだけでは
-   DM本文を閲覧できない。
+   DM本文を閲覧できない。`dm` / `group_dm`がscopeとして`WorkspaceId`を持っていても、Workspace
+   roleからDMのread / append / invite / admin authorityを導出しない。各place-membership tenureは
+   admission時のexact `WorkspaceMemberId` tenureへ束縛し、両tenureがcurrentかつactiveな間だけ
+   「active place member」とみなす。
 
 4. Workspace membershipがinactiveになった参加者には、そのWorkspace内のMessaging placeへの
    新規read、write、deliveryを許可しない。message、authorship、membership履歴は削除しない。
-   Workspaceへの再加入だけで旧DMへのaccessを暗黙復元せず、明示的なplace admissionを必要とする。
+   membership removal / leaveは同じtransactionで、そのexact `WorkspaceMemberId`へ束縛された全
+   current place tenureも閉じる。Workspaceへの再加入は新しい`WorkspaceMemberId` tenureを作るだけで、
+   旧DMへのaccessを暗黙復元せず、明示的なplace admissionを必要とする。
 
    一対一DMでは、canonical pairのどちらかが、双方ともactive Workspace memberである状態で
    `ensure_dm`を明示実行したときだけ、欠けているcurrent place-membership tenureを同じtransactionで
    作る。Workspace再加入、一覧取得、DM画面を開くだけでは作らない。双方のWorkspace membershipと
    place membershipがactiveでない間は、そのDMへ新しいmessageをappendできない。pairが変わらないため、
-   明示再admission後は同じDMの全履歴を再び閲覧できる。
+   明示再admission後は同じDMの全履歴を再び閲覧できる。このoperationはpair-levelの再admissionであり、
+   どちらか一方の明示実行をもって欠けているcurrent tenureを双方について原子的に作る。pairが不変である
+   ため相手の新しいconsentは要求しない、という意図的なproduct decisionである。
 
    group DMへの再admissionは、activeなplace memberがactive Workspace memberを明示的に招待する
    app-owned operationとする。Workspace owner / adminであるだけでは実行できない。新しいtenureは
    admission時点の`visible_from_seq`を持ち、それ以前のgroup履歴を既定では読めない。過去履歴の共有は
-   現参加者の同意と範囲を示す別operationが定義されるまで行わない。
+   現参加者の同意と範囲を示す別operationが定義されるまで行わない。read、unread count、search、
+   notification / AttentionCandidateの候補seq範囲はすべてcurrent tenureの`visible_from_seq`を下限とする。
+   message appendはactive Workspace membershipとactive place tenureの両方をcommit時に要求する。
+   activeなplace memberが一人もいないgroup DMはfrozenとし、Workspace owner / adminや過去memberの
+   自己申告だけでは再開しない。復旧を必要とするなら、別の明示operationとauthorityを先に定義する。
 
 5. 一対一DMの同一性は
    `(WorkspaceId, canonical unordered participant pair)`で定める。同じ2名がWorkspace Aと
@@ -105,8 +116,12 @@ invite linkとする。
 - 認証済み参加者の明示`POST`が、自分自身の`ParticipantRef`をtransport認証から導出する。
 - redemptionはtoken lock、未使用・未期限切れ・未失効、発行者の同じtenureがactiveかつ現在も
   `manage_members`を持つこと、base membership insert、token consumptionを一transactionで行う。
-  inviteはroleを運ばず、role付与は別の`manage_roles` commandを必要とする。同じactorのretryだけは
-  保存済みmembership tenureを返してidempotentにし、別actorへの再利用は拒否する。
+  inviteはroleを運ばず、role付与は別の`SetMembershipRoles` operationを必要とする。このoperationは
+  `manage_members` authorityに加え、追加・削除する各roleのeffective permissionがactor自身の
+  effective authority以内であることと、変更後もeffective administratorが一人以上残ることを
+  同じtransactionで要求する。`manage_roles`はrole definitionのCRUDに限る。同じactorのretryだけは
+  保存済みmembership tenureとそのcurrent stateを返してidempotentにし、閉じたtenureを再開しない。
+  再加入には新しいinviteを必要とし、別actorへの再利用は拒否する。
 - Secretary / Employment relationからmembershipを導出しない。Human UIとPersonalityAgent toolは
   同じredemption commandを使う。
 

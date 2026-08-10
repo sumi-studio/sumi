@@ -446,6 +446,9 @@ pub enum ToolArgumentError {
     SchemaViolation,
     IncompleteResponse,
     TooLarge,
+    /// envelopeは構造的に正しいが、requested Human account bindingを
+    /// foundationがcurrentかつexactに解決できなかった。raw refはechoしない。
+    AuthorityBindingUnavailable,
 }
 
 // ValidatedToolArgumentsは公開constructorを持たない。live streamではassembler内の
@@ -1379,6 +1382,10 @@ pi の `beforeToolCall` フック(block 可能)**[事実]**(`pi:agent/src/types.
 globalなreviewer/approval modeで一括切替しない。
 genericな別`request_permission` toolは置かない。authority requestは実際のtarget ToolCallを
 Elevatedとして提案すること自体であり、NormalのDeny/Blockから自動生成・replayしない。
+`HumanAccountOneShot`のbindingをcurrent provider snapshotでadvertiseできない、または受信refを
+currentかつexactに解決できない場合は、`AuthorityBindingUnavailable`のdurable
+`RejectedToolCall`とsynthetic `is_error` resultで閉じる。approval / execution row、reviewer、
+Human promptは作らず、raw binding refや解決候補をresultへechoしない。
 
 ### 9.2 状態機械
 
@@ -1919,6 +1926,8 @@ CREATE TABLE approval_log (
   invocation_route TEXT NOT NULL CHECK (invocation_route = 'elevated'),
   requested_authority_provenance TEXT NOT NULL,
   resolved_authority_provenance TEXT,
+  authority_binding_ref TEXT,
+  resolved_authority_binding_identity TEXT, -- secretでないfoundation正規identity。HumanAccountだけpre-reviewで必須
   action_digest TEXT NOT NULL,
   policy_version TEXT NOT NULL,
   reviewer_version TEXT NOT NULL,
@@ -1933,19 +1942,32 @@ CREATE TABLE approval_log (
   created_at TEXT NOT NULL,
   decided_at TEXT,
   CHECK (requested_authority_provenance IN (
-    'agent_own_with_human_consent', 'human_account_one_shot'
+    'agent_own', 'human_account_one_shot'
   )),
   CHECK (resolved_authority_provenance IS NULL OR resolved_authority_provenance IN (
     'agent_own_with_human_consent', 'human_account_one_shot'
   )),
   CHECK (state IN ('pending', 'approved_once', 'denied', 'cancelled')),
   CHECK ((
+    (requested_authority_provenance = 'agent_own'
+      AND authority_binding_ref IS NULL AND resolved_authority_binding_identity IS NULL)
+    OR
+    (requested_authority_provenance = 'human_account_one_shot'
+      AND authority_binding_ref IS NOT NULL AND resolved_authority_binding_identity IS NOT NULL)
+  ) IS TRUE),
+  CHECK ((
     (state = 'pending' AND resolved_authority_provenance IS NULL
       AND decision_command_id IS NULL AND human_authorization_context IS NULL
       AND current_call_grant_id IS NULL AND decided_at IS NULL)
     OR
     (state = 'approved_once'
-      AND resolved_authority_provenance = requested_authority_provenance
+      AND (
+        (requested_authority_provenance = 'agent_own'
+          AND resolved_authority_provenance = 'agent_own_with_human_consent')
+        OR
+        (requested_authority_provenance = 'human_account_one_shot'
+          AND resolved_authority_provenance = 'human_account_one_shot')
+      )
       AND decision_command_id IS NOT NULL AND human_authorization_context IS NOT NULL
       AND current_call_grant_id IS NOT NULL AND decided_at IS NOT NULL)
     OR
@@ -1958,6 +1980,7 @@ CREATE TABLE approval_log (
       AND current_call_grant_id IS NULL AND decided_at IS NOT NULL)
   ) IS TRUE),
   UNIQUE(id, tool_call_id, action_digest, requested_authority_provenance),
+  UNIQUE(id, authority_binding_ref, resolved_authority_binding_identity),
   UNIQUE(id, current_call_grant_id, resolved_authority_provenance, human_authorization_context)
 );
 
@@ -2084,6 +2107,8 @@ CREATE TABLE tool_executions (
   invocation_route TEXT NOT NULL,
   requested_authority_provenance TEXT NOT NULL,
   resolved_authority_provenance TEXT, -- effect前に確定。Elevated pending/全routeのpre-effect blockだけNULLを許す
+  authority_binding_ref TEXT,
+  resolved_authority_binding_identity TEXT, -- secretでないfoundation正規identity。HumanAccountだけpre-reviewで必須
   action_digest TEXT NOT NULL,
   policy_version TEXT,               -- length_guard等policy前skipだけNULL
   policy_decision TEXT NOT NULL,     -- allow|deny|unmatched|not_evaluated
@@ -2105,7 +2130,7 @@ CREATE TABLE tool_executions (
   )),                           -- 自由文・executor stderrは禁止。表示文は暗号化raw event + redacted projectionに置く
   CHECK (invocation_route IN ('normal', 'elevated')),
   CHECK (requested_authority_provenance IN (
-    'agent_own', 'agent_own_with_human_consent', 'human_account_one_shot'
+    'agent_own', 'human_account_one_shot'
   )),
   CHECK (resolved_authority_provenance IS NULL OR resolved_authority_provenance IN (
     'agent_own', 'agent_own_with_human_consent', 'human_account_one_shot'
@@ -2113,6 +2138,13 @@ CREATE TABLE tool_executions (
   CHECK (policy_decision IN ('allow', 'deny', 'unmatched', 'not_evaluated')),
   CHECK (reviewer_kind IS NULL OR reviewer_kind IN ('execution', 'escalation')),
   CHECK (review_outcome IS NULL OR review_outcome IN ('allow', 'block', 'ask_human')),
+  CHECK ((
+    (requested_authority_provenance = 'agent_own'
+      AND authority_binding_ref IS NULL AND resolved_authority_binding_identity IS NULL)
+    OR
+    (requested_authority_provenance = 'human_account_one_shot'
+      AND authority_binding_ref IS NOT NULL AND resolved_authority_binding_identity IS NOT NULL)
+  ) IS TRUE),
   CHECK ((
     (policy_version IS NULL AND policy_decision = 'not_evaluated'
       AND state = 'not_started' AND error_code = 'length_guard')
@@ -2132,10 +2164,14 @@ CREATE TABLE tool_executions (
     OR
     (invocation_route = 'elevated'
       AND requested_authority_provenance IN (
-        'agent_own_with_human_consent', 'human_account_one_shot'
+        'agent_own', 'human_account_one_shot'
       )
       AND (
-        (resolved_authority_provenance = requested_authority_provenance
+        (((requested_authority_provenance = 'agent_own'
+            AND resolved_authority_provenance = 'agent_own_with_human_consent')
+          OR
+          (requested_authority_provenance = 'human_account_one_shot'
+            AND resolved_authority_provenance = 'human_account_one_shot'))
           AND state IN ('prepared', 'running', 'succeeded', 'failed', 'cancelled', 'indeterminate'))
         OR
         (resolved_authority_provenance IS NULL
@@ -2171,7 +2207,11 @@ CREATE TABLE tool_executions (
       (resolved_authority_provenance IS NULL
         AND current_call_grant_id IS NULL AND human_authorization_context IS NULL)
       OR
-      (resolved_authority_provenance = requested_authority_provenance
+      (((requested_authority_provenance = 'agent_own'
+          AND resolved_authority_provenance = 'agent_own_with_human_consent')
+        OR
+        (requested_authority_provenance = 'human_account_one_shot'
+          AND resolved_authority_provenance = 'human_account_one_shot'))
         AND approval_request_id IS NOT NULL AND current_call_grant_id IS NOT NULL
         AND human_authorization_context IS NOT NULL)
     ))
@@ -2231,7 +2271,13 @@ CREATE TABLE tool_executions (
     -- Elevated ApproveOnce後。matching approval/grant/contextのtupleなしにはeffectへ進めない。
     (invocation_route = 'elevated' AND policy_decision = 'not_evaluated'
       AND reviewer_kind = 'escalation' AND review_outcome = 'ask_human'
-      AND resolved_authority_provenance = requested_authority_provenance
+      AND (
+        (requested_authority_provenance = 'agent_own'
+          AND resolved_authority_provenance = 'agent_own_with_human_consent')
+        OR
+        (requested_authority_provenance = 'human_account_one_shot'
+          AND resolved_authority_provenance = 'human_account_one_shot')
+      )
       AND approval_request_id IS NOT NULL AND current_call_grant_id IS NOT NULL
       AND human_authorization_context IS NOT NULL
       AND state IN ('running', 'succeeded', 'failed', 'cancelled', 'indeterminate'))
@@ -2258,6 +2304,10 @@ CREATE TABLE tool_executions (
   ),
   FOREIGN KEY (approval_request_id, tool_call_id, action_digest, requested_authority_provenance)
     REFERENCES approval_log(id, tool_call_id, action_digest, requested_authority_provenance),
+  -- AgentOwnのnullable binding列はSQLite FKを発火しないため、上のbase FKも必ず残す。
+  -- HumanAccountではこのFKがapprovalとexecutionのexact binding equalityをDBでも強制する。
+  FOREIGN KEY (approval_request_id, authority_binding_ref, resolved_authority_binding_identity)
+    REFERENCES approval_log(id, authority_binding_ref, resolved_authority_binding_identity),
   FOREIGN KEY (approval_request_id, current_call_grant_id, resolved_authority_provenance,
     human_authorization_context)
     REFERENCES approval_log(id, current_call_grant_id, resolved_authority_provenance,
@@ -2270,9 +2320,11 @@ CREATE UNIQUE INDEX tool_execution_recovery_attestation
 ON tool_executions(tool_call_id, command_id, run_id, executor_generation);
 ```
 
-上のcomposite FKはElevated行を同じrequest/action/requested provenanceへ束縛し、effectへ進む
-行ではさらに同じapprovalのgrant/resolved provenance/Human authorization contextへ束縛する。
-EventWriterは同じtransaction内で`approval_log.state`との対応も検査し、`prepared + unresolved`
+上のcomposite FKはElevated行を同じrequest/action/requested provenanceへ束縛し、HumanAccountでは
+同じbinding ref / resolved binding identity、effectへ進む行ではさらに同じapprovalのgrant /
+resolved provenance / Human authorization contextへ束縛する。EventWriterはnullable FKへ依存せず、
+全Elevated行でapproval / executionのbinding field exact equalityも検査する。同じtransaction内で
+`approval_log.state`との対応も検査し、`prepared + unresolved`
 は`pending`、`not_started + human_denied`は`denied`、unresolved `cancelled`は`cancelled`、
 resolved executionは`approved_once`以外を拒否する。FKを満たす別時点のapproval snapshotを
 executionへ流用してはならない。
@@ -2993,7 +3045,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   2. Normalのshell fixture (`&&`, pipe, newline, subshell, heredoc, interpreter wrapper)をsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外はUnmatchedにする。Denyはreviewer/Human promptとも0件
   3. Normal/UnmatchedだけがExecution AutoReviewへ進み、`Allow`だけがagent-own exact callを一回実行する。`Block`、timeout、invalid JSON、transport error、未許可trust domain、InsufficientEvidenceは実行0件かつHuman prompt 0件
   4. Elevatedだけが別prompt/schemaのEscalation AutoReviewへ進み、`AskHuman`だけが`ApprovalRequested + pending`を作り、実行は0件。`Block`と全failureはHuman prompt/実行とも0件。二reviewerのrequest/result型、prompt/schema version、cache、metricを交差利用しない
-  5. Gateway認証済みcurrent-call decisionのApproveOnceだけがexact callを一回進め、DenyOnce、wrong actor/action/scope、stale/replay、二重消費はblockする。approval後のprovenanceを`AgentOwnWithHumanConsent | HumanAccountOneShot`で区別し、後者だけが本当のHuman accountとevent-time auth contextを使う
+  5. Gateway認証済みcurrent-call decisionのApproveOnceだけがexact callを一回進め、DenyOnce、wrong actor/action/scope、stale/replay、二重消費はblockする。requested `AgentOwn`は`AgentOwnWithHumanConsent`にだけ、requested `HumanAccountOneShot`は`HumanAccountOneShot`にだけ解決し、cross-mappingを拒否する。後者だけが本当のHuman accountとevent-time auth contextを使い、binding issuer / registryが無いprovider snapshotでは選択肢としてadvertiseしない
   6. current-call UIは「今回だけ承認」「今回だけ拒否」を扱う。別のstanding policy UIは「常に許可」「明示expiryまで許可」「永続拒否」とrule一覧・編集・削除を扱う。current-call decisionとpolicy mutationを別payload/audit/transactionにし、Human-account one-shotをstanding grantへ変換しない。rule scope/precedence/expiry上限は実装前にADR 0013の未決を解消する
   7. 承認待ち中のuser_messageがsoft steerとして機能し、current-call decisionとAbortも即時処理される。`ApprovalRequested + pending`直後をkillし、再起動後にpendingをCancelledで閉じて保存済みsoft steerへ一度だけ継続する。route、authority provenance、action digest、policy/reviewer/prompt/schema version、Human event-time contextを`ToolExecutionStart`前にdurable化する
   8. review Allow、Human consent、standing Allowの後もexecutor sandboxとapp-owned commit-time authorizationを維持し、内部状態・追加network・別principalの権限を暗黙に得ない。web→api→agent E2Eでstream/tool/steer/current-call approvalと別のpolicy管理操作を確認する
