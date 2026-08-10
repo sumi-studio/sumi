@@ -281,7 +281,7 @@ func (s *Server) localCreateRole(w http.ResponseWriter, r *http.Request, authori
 	}
 	role, err := s.Store.CreateRoleWithPosition(r.Context(), request.WorkspaceID,
 		localActor(authorization), request.Name, request.Color,
-		permissionMap(*request.Permissions), request.Position)
+		permissionMap(*request.Permissions), request.Position.pointer())
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -304,7 +304,7 @@ func (s *Server) localUpdateRole(w http.ResponseWriter, r *http.Request, authori
 	}
 	role, err := s.Store.UpdateRoleWithPosition(r.Context(), request.WorkspaceID, request.RoleID,
 		localActor(authorization), request.Name, request.Color,
-		permissionMap(*request.Permissions), request.Position)
+		permissionMap(*request.Permissions), request.Position.pointer())
 	if err != nil {
 		writeDomainError(w, err)
 		return

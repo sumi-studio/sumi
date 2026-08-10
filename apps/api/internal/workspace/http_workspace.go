@@ -1,6 +1,9 @@
 package workspace
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -262,10 +265,39 @@ func (s *Server) serveRoles(w http.ResponseWriter, r *http.Request) {
 }
 
 type roleMutationRequest struct {
-	Name        string    `json:"name"`
-	Color       string    `json:"color,omitempty"`
-	Position    *int      `json:"position,omitempty"`
-	Permissions *[]string `json:"permissions"`
+	Name        string       `json:"name"`
+	Color       string       `json:"color,omitempty"`
+	Position    rolePosition `json:"position,omitempty"`
+	Permissions *[]string    `json:"permissions"`
+}
+
+// rolePosition keeps the omitted request value distinct from an explicit JSON
+// null. The API permits omission (create defaults to zero; update preserves),
+// but position is not nullable when supplied.
+type rolePosition struct {
+	value   *int
+	present bool
+}
+
+func (p *rolePosition) UnmarshalJSON(data []byte) error {
+	p.present = true
+	p.value = nil
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("role position cannot be null")
+	}
+	var value int
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	p.value = &value
+	return nil
+}
+
+func (p rolePosition) pointer() *int {
+	if !p.present {
+		return nil
+	}
+	return p.value
 }
 
 func permissionMap(keys []string) map[string]bool {
@@ -285,7 +317,7 @@ func (s *Server) serveCreateRole(w http.ResponseWriter, r *http.Request) {
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var roleErr error
 		role, roleErr = s.Store.CreateRoleWithPosition(r.Context(), r.PathValue("workspace_id"),
-			actor, request.Name, request.Color, permissionMap(*request.Permissions), request.Position)
+			actor, request.Name, request.Color, permissionMap(*request.Permissions), request.Position.pointer())
 		return roleErr
 	})
 	if !done {
@@ -308,7 +340,7 @@ func (s *Server) serveUpdateRole(w http.ResponseWriter, r *http.Request) {
 		var roleErr error
 		role, roleErr = s.Store.UpdateRoleWithPosition(r.Context(), r.PathValue("workspace_id"),
 			r.PathValue("role_id"), actor, request.Name, request.Color,
-			permissionMap(*request.Permissions), request.Position)
+			permissionMap(*request.Permissions), request.Position.pointer())
 		return roleErr
 	})
 	if !done {

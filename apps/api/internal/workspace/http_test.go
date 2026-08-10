@@ -158,6 +158,16 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 	if humanRole.Position != 10 {
 		t.Fatalf("Human-updated role position = %d", humanRole.Position)
 	}
+	if invalid := browserCall(mux, http.MethodPost,
+		"/workspaces/"+humanWorkspace.WorkspaceID+"/roles",
+		`{"name":"invalid null create","position":null,"permissions":[]}`); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("null browser role position create = %d: %s", invalid.Code, invalid.Body.String())
+	}
+	if invalid := browserCall(mux, http.MethodPatch,
+		"/workspaces/"+humanWorkspace.WorkspaceID+"/roles/"+humanRole.RoleID,
+		`{"name":"invalid null update","position":null,"permissions":[]}`); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("null browser role position update = %d: %s", invalid.Code, invalid.Body.String())
+	}
 	preservedRole := invokeLocal(server.localUpdateRole, fmt.Sprintf(
 		`{"workspace_id":%q,"role_id":%q,"name":"Inviter preserved","permissions":["manage_members"]}`,
 		agentWorkspace.WorkspaceID, role.RoleID), w.agentA.ID)
@@ -177,6 +187,16 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 	decodeRecorder(t, positionedRole, &role)
 	if role.Position != 5 {
 		t.Fatalf("Agent-updated role position = %d", role.Position)
+	}
+	if invalid := invokeLocal(server.localCreateRole, fmt.Sprintf(
+		`{"workspace_id":%q,"name":"invalid null create","position":null,"permissions":[]}`,
+		agentWorkspace.WorkspaceID), w.agentA.ID); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("null Agent role position create = %d: %s", invalid.Code, invalid.Body.String())
+	}
+	if invalid := invokeLocal(server.localUpdateRole, fmt.Sprintf(
+		`{"workspace_id":%q,"role_id":%q,"name":"invalid null update","position":null,"permissions":[]}`,
+		agentWorkspace.WorkspaceID, role.RoleID), w.agentA.ID); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("null Agent role position update = %d: %s", invalid.Code, invalid.Body.String())
 	}
 	if invalid := browserCall(mux, http.MethodPatch,
 		"/workspaces/"+humanWorkspace.WorkspaceID+"/roles/"+humanRole.RoleID,
@@ -321,6 +341,22 @@ func TestInvitePreviewAndRequiredRequestPresenceAcrossTransports(t *testing.T) {
 	if emptyRole.Code != http.StatusCreated {
 		t.Fatalf("explicit empty permissions = %d: %s", emptyRole.Code, emptyRole.Body.String())
 	}
+	var omittedPositionRole roleWire
+	decodeRecorder(t, emptyRole, &omittedPositionRole)
+	if omittedPositionRole.Position != 0 {
+		t.Fatalf("omitted browser role position = %d, want 0", omittedPositionRole.Position)
+	}
+	explicitZeroRole := browserCall(mux, http.MethodPost,
+		"/workspaces/"+created.WorkspaceID+"/roles",
+		`{"name":"Zero","position":0,"permissions":[]}`)
+	if explicitZeroRole.Code != http.StatusCreated {
+		t.Fatalf("explicit zero browser role position = %d: %s", explicitZeroRole.Code, explicitZeroRole.Body.String())
+	}
+	var zeroPositionRole roleWire
+	decodeRecorder(t, explicitZeroRole, &zeroPositionRole)
+	if zeroPositionRole.Position != 0 {
+		t.Fatalf("explicit zero browser role position response = %d, want 0", zeroPositionRole.Position)
+	}
 	emptyAssignments := browserCall(mux, http.MethodPut,
 		"/workspaces/"+created.WorkspaceID+"/members/"+created.OwnerWorkspaceMemberID+"/roles",
 		`{"role_ids":[]}`)
@@ -425,6 +461,40 @@ func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *t
 	var created workspaceWire
 	decodeRecorder(t, createdResponse, &created)
 	assertOwnerParticipant(t, w, created, w.agentA)
+	roleCreateOmitted := call(LocalRoleCreatePath, authorization.BearerToken, fmt.Sprintf(
+		`{"workspace_id":%q,"name":"Registered omitted position","permissions":[]}`,
+		created.WorkspaceID))
+	if roleCreateOmitted.Code != http.StatusCreated {
+		t.Fatalf("registered role create with omitted position = %d: %s",
+			roleCreateOmitted.Code, roleCreateOmitted.Body.String())
+	}
+	var registeredRole roleWire
+	decodeRecorder(t, roleCreateOmitted, &registeredRole)
+	if registeredRole.Position != 0 {
+		t.Fatalf("registered omitted role position = %d, want 0", registeredRole.Position)
+	}
+	roleCreateZero := call(LocalRoleCreatePath, authorization.BearerToken, fmt.Sprintf(
+		`{"workspace_id":%q,"name":"Registered zero position","position":0,"permissions":[]}`,
+		created.WorkspaceID))
+	if roleCreateZero.Code != http.StatusCreated {
+		t.Fatalf("registered role create with explicit zero = %d: %s",
+			roleCreateZero.Code, roleCreateZero.Body.String())
+	}
+	var registeredZeroRole roleWire
+	decodeRecorder(t, roleCreateZero, &registeredZeroRole)
+	if registeredZeroRole.Position != 0 {
+		t.Fatalf("registered explicit zero role position = %d, want 0", registeredZeroRole.Position)
+	}
+	if invalid := call(LocalRoleCreatePath, authorization.BearerToken, fmt.Sprintf(
+		`{"workspace_id":%q,"name":"Registered null create","position":null,"permissions":[]}`,
+		created.WorkspaceID)); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("registered null role position create = %d: %s", invalid.Code, invalid.Body.String())
+	}
+	if invalid := call(LocalRoleUpdatePath, authorization.BearerToken, fmt.Sprintf(
+		`{"workspace_id":%q,"role_id":%q,"name":"Registered null update","position":null,"permissions":[]}`,
+		created.WorkspaceID, registeredRole.RoleID)); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("registered null role position update = %d: %s", invalid.Code, invalid.Body.String())
+	}
 	inviteResponse := call(LocalInviteCreatePath, authorization.BearerToken,
 		fmt.Sprintf(`{"workspace_id":%q}`, created.WorkspaceID))
 	if inviteResponse.Code != http.StatusCreated {
