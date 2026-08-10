@@ -177,15 +177,23 @@ class FakePresenceBackend implements MessagingBackend {
   }
 }
 
-async function startMessaging(
+async function initializeMessaging(
   backend: FakePresenceBackend,
 ): Promise<FakePresenceBackend> {
   bindMessagingSessionIdentity("human-1");
   installMessagingBackend(backend);
   useMessaging.getState().init();
   await vi.waitFor(() => expect(useMessaging.getState().ready).toBe(true));
-  // 最初のconnectedはbootstrapで受け取った現在値そのもの。
+  return backend;
+}
+
+async function startMessaging(
+  backend: FakePresenceBackend,
+): Promise<FakePresenceBackend> {
+  await initializeMessaging(backend);
   backend.emitConnection("connected");
+  await vi.waitFor(() => expect(backend.presenceFetches).toBe(1));
+  backend.presenceFetches = 0;
   return backend;
 }
 
@@ -193,6 +201,33 @@ describe("messaging presence convergence", () => {
   afterEach(() => {
     vi.useRealTimers();
     bindMessagingSessionIdentity(null);
+  });
+
+  it("closes the bootstrap-to-first-socket presence gap", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [status(OTHER, "busy", "bootstrap")],
+      replyLaterMarkers: [marker("marker-at-bootstrap", OTHER)],
+    };
+    await initializeMessaging(backend);
+
+    // The HTTP snapshot is captured before the socket subscribes. A mutation
+    // in this interval has no replayable seq, so the first connected boundary
+    // must re-read the authoritative presence projection.
+    backend.presence = {
+      statuses: [status(OTHER, "available", "after bootstrap")],
+      replyLaterMarkers: [],
+    };
+    backend.emitConnection("connected");
+
+    await vi.waitFor(() => {
+      const state = useMessaging.getState();
+      expect(state.statusByKey["human:human-2"]).toEqual(
+        status(OTHER, "available", "after bootstrap"),
+      );
+      expect(state.replyLaterById["marker-at-bootstrap"]).toBeUndefined();
+    });
+    expect(backend.presenceFetches).toBe(1);
   });
 
   it("re-syncs statuses and open markers after a reconnect", async () => {

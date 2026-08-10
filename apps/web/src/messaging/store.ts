@@ -926,16 +926,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
           scheduleStatusExpiry();
           backend.subscribe(applyEvent, { sinceByPlace });
           // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
-          // 再接続なので、replayされないplace lifecycleとpresenceを読み直す。
+          // 再接続なので、replayされないplace lifecycleを読み直す。presenceは
+          // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
           let connectedOnce = false;
           backend.subscribeConnection((connection) => {
             set({ connection });
             if (connection !== "connected") return;
-            if (!connectedOnce) {
+            if (connectedOnce) {
+              void reconcilePlaces().catch(() => undefined);
+            } else {
               connectedOnce = true;
-              return;
             }
-            void reconcilePlaces().catch(() => undefined);
             void resyncPresence().catch(() => undefined);
           });
         })
