@@ -215,6 +215,83 @@ async fn production_manager_runs_concurrent_read_file_and_fences_identity() {
 }
 
 #[tokio::test]
+async fn production_socket_accepts_workspace_list_glob_and_grep() {
+    let mut fixture = Fixture::new().await;
+    std::fs::create_dir(fixture.workspace.join("nested")).unwrap();
+    std::fs::write(fixture.workspace.join("root.txt"), "needle at root\n").unwrap();
+    std::fs::write(
+        fixture.workspace.join("nested/second.txt"),
+        "another needle\n",
+    )
+    .unwrap();
+    fixture.start(NONCE).await;
+
+    let listed = exchange(
+        &fixture.executor_socket,
+        &request(
+            NONCE,
+            "request-list",
+            json!({"type":"list_dir","path":".","execution_id":"execution-list"}),
+        ),
+    )
+    .await;
+    let listed_terminal = listed
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .expect("list_dir terminal");
+    assert_eq!(listed_terminal["result"]["Ok"]["type"], "listed");
+    let entries = listed_terminal["result"]["Ok"]["entries"]
+        .as_array()
+        .expect("list_dir entries");
+    assert!(entries.iter().any(|entry| entry == "root.txt"));
+    assert!(entries.iter().any(|entry| entry == "nested"));
+
+    let globbed = exchange(
+        &fixture.executor_socket,
+        &request(
+            NONCE,
+            "request-glob",
+            json!({"type":"glob","pattern":"**/*.txt","execution_id":"execution-glob"}),
+        ),
+    )
+    .await;
+    let globbed_terminal = globbed
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .expect("glob terminal");
+    assert_eq!(globbed_terminal["result"]["Ok"]["type"], "globbed");
+    let paths = globbed_terminal["result"]["Ok"]["paths"]
+        .as_array()
+        .expect("glob paths");
+    assert!(paths.iter().any(|path| path == "root.txt"));
+    assert!(paths.iter().any(|path| path == "nested/second.txt"));
+
+    let grepped = exchange(
+        &fixture.executor_socket,
+        &request(
+            NONCE,
+            "request-grep",
+            json!({"type":"grep","path":".","pattern":"needle","execution_id":"execution-grep"}),
+        ),
+    )
+    .await;
+    let grepped_terminal = grepped
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .expect("grep terminal");
+    assert_eq!(grepped_terminal["result"]["Ok"]["type"], "grepped");
+    let matches = grepped_terminal["result"]["Ok"]["matches"]
+        .as_array()
+        .expect("grep matches");
+    assert_eq!(matches.len(), 2);
+    assert!(
+        matches
+            .iter()
+            .all(|entry| entry["line"] == "needle at root" || entry["line"] == "another needle")
+    );
+}
+
+#[tokio::test]
 async fn manager_restart_rotates_nonce_and_rebinds_stale_socket() {
     let mut fixture = Fixture::new().await;
     std::fs::write(fixture.workspace.join("source.txt"), "source").unwrap();
