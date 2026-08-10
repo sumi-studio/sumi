@@ -2,15 +2,9 @@ name: API Postgres contracts
 
 on:
   pull_request:
-    paths:
-      - "apps/api/**"
-      - ".github/workflows/api-postgres-contracts.yml"
   push:
     branches:
       - main
-    paths:
-      - "apps/api/**"
-      - ".github/workflows/api-postgres-contracts.yml"
 
 permissions:
   contents: read
@@ -24,13 +18,13 @@ jobs:
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_USER: sumi_test_creator
-          POSTGRES_PASSWORD: sumi_test_password
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_admin
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U sumi_test_creator -d postgres"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -51,6 +45,12 @@ jobs:
         with:
           go-version-file: apps/api/go.mod
           cache-dependency-path: apps/api/go.sum
+
+      - name: Create constrained database test role
+        run: |
+          docker exec "${{ job.services.postgres.id }}" \
+            psql --username postgres --dbname postgres --set ON_ERROR_STOP=1 \
+            --command "CREATE ROLE sumi_test_creator WITH LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOREPLICATION PASSWORD 'sumi_test_password'"
 
       - name: Run API contract tests
         run: go test -count=1 ./...
