@@ -1,5 +1,6 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { participantKey } from "../model";
+import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 
@@ -11,6 +12,10 @@ export function MemberList() {
   const membersByKey = useMessaging((state) => state.membersByKey);
   const statusByKey = useMessaging((state) => state.statusByKey);
   const selfKey = useMessaging((state) => state.selfKey);
+  const startDM = useMessaging((state) => state.startDM);
+  const placeNavigate = usePlaceNavigate();
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [failedKey, setFailedKey] = useState<string | null>(null);
 
   const members = useMemo(
     () =>
@@ -29,11 +34,8 @@ export function MemberList() {
         {members.map((member) => {
           const key = participantKey(member.participant);
           const status = statusByKey[key];
-          return (
-            <div
-              key={key}
-              className="flex items-center gap-2.5 rounded-md px-2 py-1.5"
-            >
+          const content = (
+            <>
               <ParticipantAvatar
                 participantKey={key}
                 name={member.displayName}
@@ -49,11 +51,54 @@ export function MemberList() {
                     </span>
                   ) : null}
                 </span>
-                <span className="block truncate text-[11px] text-muted-foreground">
-                  {status?.note ? status.note : member.tagline}
+                <span
+                  className={`block truncate text-[11px] ${
+                    failedKey === key
+                      ? "text-rose-500"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {failedKey === key
+                    ? "DMを開始できませんでした。もう一度押してください"
+                    : status?.note
+                      ? status.note
+                      : member.tagline}
                 </span>
               </span>
-            </div>
+            </>
+          );
+          if (key === selfKey) {
+            return (
+              <div
+                key={key}
+                className="flex items-center gap-2.5 rounded-md px-2 py-1.5"
+              >
+                {content}
+              </div>
+            );
+          }
+          return (
+            <button
+              key={key}
+              type="button"
+              title={`${member.displayName}にDMを送る`}
+              disabled={pendingKey !== null}
+              onClick={async () => {
+                setPendingKey(key);
+                setFailedKey(null);
+                try {
+                  const place = await startDM([member.participant]);
+                  placeNavigate(place);
+                } catch {
+                  setFailedKey(key);
+                } finally {
+                  setPendingKey(null);
+                }
+              }}
+              className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-accent/60 disabled:opacity-60"
+            >
+              {content}
+            </button>
           );
         })}
       </div>
