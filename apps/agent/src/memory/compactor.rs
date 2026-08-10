@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::prompts::CompactPrompt;
 use crate::provider::{
     canonical_request::CanonicalRequestBody,
     model::{MaxTokensField, ModelSpec},
@@ -39,23 +40,6 @@ use crate::store::{
 };
 
 use super::{BatchId, CompactResult, DecryptedMemorySummary, L1Entry};
-
-const COMPACT_SYSTEM_PROMPT: &str = "あなたは記憶の圧縮係。会話を続けるな。要約だけ出力せよ。";
-
-const COMPACT_FORMAT_INSTRUCTIONS: &str = r"指定フォーマット:
-## 出来事
-（何が起き、何を話したか。時刻付き）
-
-## ユーザーについて分かったこと
-（好み・事実・関係性）
-
-## 約束・宿題
-（やると言ったこと、期限）
-
-## 参照
-（ワークスペースに書いたメモのパス、調べれば分かること）
-
-目標圧縮率: 入力の 1/8〜1/15、上限 800 トークン程度";
 
 const MAX_COMPACT_OUTPUT_TOKENS: u64 = 800;
 
@@ -243,6 +227,7 @@ impl CompactError {
 /// ```
 #[derive(Clone, PartialEq)]
 pub struct CompactionInput {
+    prompt: CompactPrompt,
     conversation: Vec<PublicMessage>,
     recent_memory: Option<String>,
     summaries: Vec<DecryptedSummary>,
@@ -269,6 +254,7 @@ impl CompactionInput {
             });
         }
         Self {
+            prompt: CompactPrompt::L0ToL1,
             conversation,
             recent_memory: recent.map(|projection| projection.0.clone()),
             summaries: Vec::new(),
@@ -278,6 +264,14 @@ impl CompactionInput {
     /// Build a compaction input from decrypted L1 summaries, keeping each
     /// summary as read-only history that is framed separately when serialized.
     pub fn from_decrypted_summaries(entries: &[L1Entry]) -> Self {
+        Self::from_summaries(entries, CompactPrompt::L1ToL2)
+    }
+
+    fn from_consolidated_summaries(entries: &[L1Entry]) -> Self {
+        Self::from_summaries(entries, CompactPrompt::ConsolidateL2)
+    }
+
+    fn from_summaries(entries: &[L1Entry], prompt: CompactPrompt) -> Self {
         let summaries = entries
             .iter()
             .map(|entry| DecryptedSummary {
@@ -287,6 +281,7 @@ impl CompactionInput {
             })
             .collect();
         Self {
+            prompt,
             conversation: Vec::new(),
             recent_memory: None,
             summaries,
@@ -375,6 +370,7 @@ pub(crate) fn build_compact_request(
     }
 
     let user_content = build_user_content(input);
+    let system_prompt = input.prompt.as_str();
     let mut request = Map::new();
     request.insert("model".to_owned(), json!(spec.model.id));
     request.insert("stream".to_owned(), json!(false));
@@ -392,7 +388,7 @@ pub(crate) fn build_compact_request(
             request.insert(
                 "messages".to_owned(),
                 json!([
-                    json!({"role": "system", "content": COMPACT_SYSTEM_PROMPT}),
+                    json!({"role": "system", "content": system_prompt}),
                     json!({"role": "user", "content": user_content}),
                 ]),
             );
@@ -406,11 +402,11 @@ pub(crate) fn build_compact_request(
             let system = if compat.supports_prompt_cache {
                 json!([{
                     "type": "text",
-                    "text": COMPACT_SYSTEM_PROMPT,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }])
             } else {
-                json!(COMPACT_SYSTEM_PROMPT)
+                json!(system_prompt)
             };
             request.insert("system".to_owned(), system);
             request.insert(
@@ -424,7 +420,7 @@ pub(crate) fn build_compact_request(
                 .model
                 .responses_compat()
                 .ok_or(CompactError::UnsupportedProtocol)?;
-            request.insert("instructions".to_owned(), json!(COMPACT_SYSTEM_PROMPT));
+            request.insert("instructions".to_owned(), json!(system_prompt));
             request.insert(
                 "input".to_owned(),
                 json!([{"role": "user", "content": user_content}]),
@@ -715,13 +711,18 @@ fn compaction_time_range(input: &CompactionInput) -> (DateTime<Utc>, DateTime<Ut
 
 fn build_user_content(input: &CompactionInput) -> String {
     let mut content = String::new();
+    let summary_layer = match input.prompt {
+        CompactPrompt::L1ToL2 => "l1",
+        CompactPrompt::ConsolidateL2 => "l2",
+        CompactPrompt::L0ToL1 => "l0",
+    };
 
     for summary in &input.summaries {
         let from = summary.from.to_rfc3339_opts(SecondsFormat::Secs, true);
         let to = summary.to.to_rfc3339_opts(SecondsFormat::Secs, true);
         let escaped_summary = escape_framing_text(summary.text.as_str());
         content.push_str(&format!(
-            "<memory layer=\"l1\" from=\"{from}\" to=\"{to}\">{escaped_summary}</memory>\n"
+            "<memory layer=\"{summary_layer}\" from=\"{from}\" to=\"{to}\">{escaped_summary}</memory>\n"
         ));
     }
 
@@ -744,7 +745,6 @@ fn build_user_content(input: &CompactionInput) -> String {
         ));
     }
 
-    content.push_str(COMPACT_FORMAT_INSTRUCTIONS);
     content
 }
 
@@ -1069,9 +1069,13 @@ async fn build_compaction_input(store: &Store, job: &Job) -> Result<CompactionIn
             let messages = load_batch_messages(store, batch_id).await?;
             Ok(CompactionInput::from_public_batch(&messages, None))
         }
-        MemoryJobKind::CompactL1 | MemoryJobKind::ConsolidateL2 => {
+        MemoryJobKind::CompactL1 => {
             let entries = load_batch_summaries(store, &job.source_ids).await?;
             Ok(CompactionInput::from_decrypted_summaries(&entries))
+        }
+        MemoryJobKind::ConsolidateL2 => {
+            let entries = load_batch_summaries(store, &job.source_ids).await?;
+            Ok(CompactionInput::from_consolidated_summaries(&entries))
         }
     }
 }
@@ -2673,6 +2677,7 @@ mod tests {
             &[user("hello"), assistant_with_thinking(), tool_result()],
             None,
         );
+        assert_eq!(input.prompt, CompactPrompt::L0ToL1);
 
         let PublicMessage::Assistant(assistant) = &input.conversation[1] else {
             panic!("expected assistant");
@@ -2688,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_contains_framing_and_format_instructions() {
+    fn build_request_contains_framing_and_combined_prompt() {
         let input = CompactionInput::from_public_batch(
             &[user("hello"), assistant_with_thinking(), tool_result()],
             Some(&RedactedMemoryProjection::new("prior summary".to_owned())),
@@ -2701,21 +2706,74 @@ mod tests {
         let messages = request["messages"].as_array().expect("messages");
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
+        let system_prompt = messages[0]["content"].as_str().expect("system prompt");
         let user_content = messages[1]["content"].as_str().expect("content");
 
+        assert!(system_prompt.contains("L0の会話履歴をL1の要約へ"));
+        assert!(system_prompt.contains("## 出来事"));
+        assert!(system_prompt.contains("目標圧縮率: 入力の 1/8〜1/15"));
+        assert!(system_prompt.contains("上限 800 トークン程度"));
         assert!(user_content.contains("<conversation>"));
         assert!(user_content.contains("</conversation>"));
         assert!(user_content.contains("<recent-memory>"));
         assert!(user_content.contains("</recent-memory>"));
-        assert!(user_content.contains("## 出来事"));
-        assert!(user_content.contains("目標圧縮率: 入力の 1/8〜1/15"));
-        assert!(user_content.contains("上限 800 トークン程度"));
+        assert!(!user_content.contains("指定フォーマット:"));
 
         let max_tokens = request["max_completion_tokens"]
             .as_u64()
             .or_else(|| request["max_tokens"].as_u64())
             .expect("max tokens");
         assert_eq!(max_tokens, 800);
+    }
+
+    #[test]
+    fn compact_request_shape_uses_file_prompts_for_all_protocols() {
+        let input = CompactionInput::from_public_batch(&[user("hello")], None);
+        let expected_user_content = format!(
+            "<conversation>\n[USER] [{}] hello\n</conversation>\n",
+            timestamp().to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
+        let expected_prompt = CompactPrompt::L0ToL1.as_str();
+
+        for preset in ["kimi-k3", "anthropic", "openai-responses"] {
+            let conversation = ModelSpec::preset(preset).expect("protocol preset");
+            let compact = select_compact_model(&conversation, None, &[]).expect("supported");
+            let body = build_compact_request(&compact, &input).expect("protocol request");
+            let request: Value = serde_json::from_str(&request_text(&body)).expect("json");
+
+            let expected = match conversation.protocol {
+                ApiProtocol::OpenAiChatCompletions => json!({
+                    "model": conversation.id,
+                    "stream": false,
+                    "messages": [
+                        {"role": "system", "content": expected_prompt},
+                        {"role": "user", "content": expected_user_content},
+                    ],
+                    "max_completion_tokens": 800,
+                }),
+                ApiProtocol::AnthropicMessages => json!({
+                    "model": conversation.id,
+                    "stream": false,
+                    "system": [{
+                        "type": "text",
+                        "text": expected_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                    "messages": [{"role": "user", "content": expected_user_content}],
+                    "max_tokens": 800,
+                }),
+                ApiProtocol::OpenAiResponses => json!({
+                    "model": conversation.id,
+                    "stream": false,
+                    "instructions": expected_prompt,
+                    "input": [{"role": "user", "content": expected_user_content}],
+                    "max_output_tokens": 800,
+                    "store": false,
+                }),
+            };
+
+            assert_eq!(request, expected, "request shape changed for {preset}");
+        }
     }
 
     #[test]
@@ -2797,7 +2855,11 @@ mod tests {
             est_tokens: 12,
             time_range: (timestamp(), timestamp()),
         };
-        let input = CompactionInput::from_decrypted_summaries(&[entry]);
+        let entries = [entry];
+        let input = CompactionInput::from_decrypted_summaries(&entries);
+        let consolidated = CompactionInput::from_consolidated_summaries(&entries);
+        assert_eq!(input.prompt, CompactPrompt::L1ToL2);
+        assert_eq!(consolidated.prompt, CompactPrompt::ConsolidateL2);
         assert!(input.conversation.is_empty());
         assert_eq!(input.summaries.len(), 1);
         assert_eq!(
@@ -2808,12 +2870,26 @@ mod tests {
         let compact = select_compact_model(&chat_model(), None, &[]).expect("same model");
         let body = build_compact_request(&compact, &input).expect("build request");
         let request: Value = serde_json::from_str(&request_text(&body)).expect("json");
+        assert_eq!(
+            request["messages"][0]["content"],
+            CompactPrompt::L1ToL2.as_str()
+        );
         let content = request["messages"][1]["content"].as_str().expect("content");
 
         // Trusted <memory> framing is emitted by the serializer, not the summary text.
         assert!(content.contains("<memory layer=\"l1\""));
         assert!(!content.contains("&lt;memory layer=\"l1\""));
         assert!(content.contains("concise replies"));
+
+        let body = build_compact_request(&compact, &consolidated).expect("build request");
+        let request: Value = serde_json::from_str(&request_text(&body)).expect("json");
+        assert_eq!(
+            request["messages"][0]["content"],
+            CompactPrompt::ConsolidateL2.as_str()
+        );
+        let content = request["messages"][1]["content"].as_str().expect("content");
+        assert!(content.contains("<memory layer=\"l2\""));
+        assert!(!content.contains("<memory layer=\"l1\""));
     }
 
     #[test]
