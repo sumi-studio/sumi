@@ -1270,21 +1270,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const existingLoad = placeLoads.get(key);
     if (existingLoad) return existingLoad;
     const currentBackend = backend;
-    const load = currentBackend
-      .fetchMessages(place, { limit: PAGE_SIZE })
-      .then((messages) => {
-        if (backend !== currentBackend) return;
-        set((state) => ({
-          messagesByPlace: {
-            ...state.messagesByPlace,
-            [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
-          },
-          hasMoreByPlace: {
-            ...state.hasMoreByPlace,
-            [key]: messages.length >= PAGE_SIZE,
-          },
-        }));
-      });
+    const load = enqueueReactionProjection(
+      reactionPlaceQueueKey(place),
+      async (loadBackend, isCurrent) => {
+        const messages = await loadBackend.fetchMessages(place, {
+          limit: PAGE_SIZE,
+        });
+        if (!isCurrent()) return () => undefined;
+        return () => {
+          set((state) => ({
+            messagesByPlace: {
+              ...state.messagesByPlace,
+              [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+            },
+            hasMoreByPlace: {
+              ...state.hasMoreByPlace,
+              [key]: messages.length >= PAGE_SIZE,
+            },
+          }));
+        };
+      },
+      currentBackend,
+    );
     placeLoads.set(key, load);
     try {
       await load;
@@ -1298,7 +1305,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const dispatchSend = (key: PlaceKey, pending: PendingMessage) => {
     const place = parsePlaceKey(key);
     if (!place) return;
-    backend
+    const currentBackend = backend;
+    currentBackend
       .sendMessage({
         place,
         content: pending.content,
@@ -1311,6 +1319,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         poll: pending.poll ?? null,
       })
       .then(async (receipt) => {
+        if (backend !== currentBackend) return;
         let confirmed = (get().messagesByPlace[key] ?? []).some(
           (message) =>
             message.messageId === receipt.messageId ||
@@ -1318,25 +1327,37 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         if (!confirmed) {
           // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
-          const messages = await backend.fetchMessages(place, {
-            beforeSeq: receipt.seq + 1,
-            limit: 1,
-          });
-          const committed = messages.find(
-            (message) => message.messageId === receipt.messageId,
+          let committed: Message | undefined;
+          await enqueueReactionProjection(
+            reactionPlaceQueueKey(place),
+            async (historyBackend, isCurrent) => {
+              const messages = await historyBackend.fetchMessages(place, {
+                beforeSeq:
+                  receipt.seq === MAX_SEQ ? undefined : receipt.seq + 1,
+                limit: 1,
+              });
+              if (!isCurrent()) return () => undefined;
+              const foundMessage = messages.find(
+                (message) => message.messageId === receipt.messageId,
+              );
+              committed = foundMessage;
+              return () => {
+                if (!foundMessage) return;
+                set((state) => ({
+                  messagesByPlace: {
+                    ...state.messagesByPlace,
+                    [key]: upsertMessage(
+                      state.messagesByPlace[key] ?? [],
+                      foundMessage,
+                    ),
+                  },
+                }));
+              };
+            },
+            currentBackend,
           );
-          if (committed) {
-            set((state) => ({
-              messagesByPlace: {
-                ...state.messagesByPlace,
-                [key]: upsertMessage(
-                  state.messagesByPlace[key] ?? [],
-                  committed,
-                ),
-              },
-            }));
-            confirmed = true;
-          }
+          if (backend !== currentBackend) return;
+          confirmed = committed !== undefined;
         }
         if (!confirmed) throw new Error("Committed message was not found");
         set((state) => ({
@@ -1349,6 +1370,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }));
       })
       .catch(() => {
+        if (backend !== currentBackend) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -1710,17 +1732,32 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return true;
       }
-      const messages = await backend.fetchMessages(place, {
-        beforeSeq: seq + 1,
-        limit: 50,
-      });
-      set((state) => ({
-        messagesByPlace: {
-          ...state.messagesByPlace,
-          [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+      const currentBackend = backend;
+      let found = false;
+      await enqueueReactionProjection(
+        reactionPlaceQueueKey(place),
+        async (historyBackend, isCurrent) => {
+          const messages = await historyBackend.fetchMessages(place, {
+            beforeSeq: seq === MAX_SEQ ? undefined : seq + 1,
+            limit: 50,
+          });
+          if (!isCurrent()) return () => undefined;
+          found = messages.some((message) => message.seq === seq);
+          return () => {
+            set((state) => ({
+              messagesByPlace: {
+                ...state.messagesByPlace,
+                [key]: mergeMessages(
+                  state.messagesByPlace[key] ?? [],
+                  messages,
+                ),
+              },
+            }));
+          };
         },
-      }));
-      return messages.some((message) => message.seq === seq);
+        currentBackend,
+      );
+      return found;
     },
 
     searchMessages(query) {
@@ -2011,26 +2048,46 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((entry) => ({
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
-      const older = await backend.fetchMessages(place, {
-        beforeSeq: current[0].seq,
-        limit: PAGE_SIZE,
-      });
-      set((entry) => {
-        const existing = entry.messagesByPlace[key] ?? [];
-        const known = new Set(existing.map((m) => m.messageId));
-        const fresh = older.filter((m) => !known.has(m.messageId));
-        return {
-          messagesByPlace: {
-            ...entry.messagesByPlace,
-            [key]: [...fresh, ...existing],
+      const currentBackend = backend;
+      try {
+        await enqueueReactionProjection(
+          reactionPlaceQueueKey(place),
+          async (historyBackend, isCurrent) => {
+            const older = await historyBackend.fetchMessages(place, {
+              beforeSeq: current[0].seq,
+              limit: PAGE_SIZE,
+            });
+            if (!isCurrent()) return () => undefined;
+            return () => {
+              set((entry) => {
+                const existing = entry.messagesByPlace[key] ?? [];
+                const known = new Set(existing.map((m) => m.messageId));
+                const fresh = older.filter((m) => !known.has(m.messageId));
+                return {
+                  messagesByPlace: {
+                    ...entry.messagesByPlace,
+                    [key]: [...fresh, ...existing],
+                  },
+                  hasMoreByPlace: {
+                    ...entry.hasMoreByPlace,
+                    [key]: older.length >= PAGE_SIZE,
+                  },
+                };
+              });
+            };
           },
-          hasMoreByPlace: {
-            ...entry.hasMoreByPlace,
-            [key]: older.length >= PAGE_SIZE,
-          },
-          loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: false },
-        };
-      });
+          currentBackend,
+        );
+      } finally {
+        if (backend === currentBackend) {
+          set((entry) => ({
+            loadingOlderByPlace: {
+              ...entry.loadingOlderByPlace,
+              [key]: false,
+            },
+          }));
+        }
+      }
     },
 
     resolveReplyLater(markerId) {

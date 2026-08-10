@@ -214,6 +214,59 @@ describe("reaction projection convergence", () => {
     ).toEqual(fresh.reactions);
   });
 
+  it("replays an unknown live reaction after the initial history snapshot", async () => {
+    const backend = new ControlledReactionBackend();
+    await start(backend);
+    const stale = message("m1", 1);
+    const live = [{ emoji: "👍", participants: [OTHER] }];
+    backend.holdFetch = true;
+
+    useMessaging.getState().selectPlace(PLACE_KEY);
+    await vi.waitFor(() => expect(backend.fetches).toHaveLength(1));
+    backend.pushEvent({
+      type: "reaction_updated",
+      place: PLACE,
+      messageId: "m1",
+      reactions: live,
+    });
+    backend.resolveFetch([stale]);
+
+    await vi.waitFor(() =>
+      expect(
+        useMessaging.getState().messagesByPlace[PLACE_KEY]?.[0]?.reactions,
+      ).toEqual(live),
+    );
+  });
+
+  it("replays an unknown live reaction after an older-page snapshot", async () => {
+    const backend = new ControlledReactionBackend();
+    await start(backend);
+    const current = message("m51", 51);
+    const older = message("m1", 1);
+    const live = [{ emoji: "🎉", participants: [OTHER] }];
+    backend.holdFetch = true;
+    useMessaging.setState({
+      messagesByPlace: { [PLACE_KEY]: [current] },
+      hasMoreByPlace: { [PLACE_KEY]: true },
+    });
+
+    const load = useMessaging.getState().loadOlder(PLACE_KEY);
+    await vi.waitFor(() => expect(backend.fetches).toHaveLength(1));
+    backend.pushEvent({
+      type: "reaction_updated",
+      place: PLACE,
+      messageId: "m1",
+      reactions: live,
+    });
+    backend.resolveFetch([older]);
+    await load;
+
+    expect(
+      useMessaging.getState().messagesByPlace[PLACE_KEY]?.[0]?.reactions,
+    ).toEqual(live);
+    expect(useMessaging.getState().loadingOlderByPlace[PLACE_KEY]).toBe(false);
+  });
+
   it("covers paginated and maximum-sequence loaded windows", async () => {
     const backend = new ControlledReactionBackend();
     await start(backend);
