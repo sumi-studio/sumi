@@ -20,6 +20,549 @@ paths:
                   status:
                     type: string
                     enum: [ok]
+  /workspaces:
+    get:
+      operationId: listWorkspaces
+      summary: List the authenticated Human's active Workspace memberships
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Side-effect-free Workspace projection; an empty list is valid
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspaces]
+                additionalProperties: false
+                properties:
+                  workspaces:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Workspace"
+        "401":
+          description: Missing or invalid browser session
+    post:
+      operationId: createWorkspace
+      summary: Atomically create a Workspace and its immutable owner membership
+      description: Actor identity comes only from the signed browser session. Origin is checked before the body is processed.
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceCreateRequest"
+      responses:
+        "201":
+          description: Workspace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          description: Origin not allowed or authenticated actor cannot create the resource
+  /workspaces/{workspace_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getWorkspace
+      summary: Read one visible Workspace
+      description: A nonexistent Workspace and one outside the caller's active memberships have the same response.
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Workspace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "401":
+          description: Missing or invalid browser session
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateWorkspace
+      summary: Update Workspace presentation under manage_workspace
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceUpdateRequest"
+      responses:
+        "200":
+          description: Updated Workspace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/members:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listWorkspaceMembers
+      summary: List active Workspace membership tenures
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Active memberships
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                additionalProperties: false
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WorkspaceMembership"
+        "401":
+          description: Missing or invalid browser session
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/membership:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    delete:
+      operationId: leaveWorkspace
+      summary: Close the authenticated Human's current non-owner membership tenure
+      security:
+        - sumiSession: []
+      responses:
+        "204":
+          description: Membership tenure closed
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/members/{workspace_member_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/WorkspaceMemberId"
+    delete:
+      operationId: removeWorkspaceMember
+      summary: Close another active membership tenure under manage_members
+      security:
+        - sumiSession: []
+      responses:
+        "204":
+          description: Membership tenure closed
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/invites:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: createWorkspaceInvite
+      summary: Create a single-use 24-hour opaque Workspace invite
+      description: The plaintext code is returned once. Its issuing membership tenure and manage_members authority are rechecked at redemption.
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "201":
+          description: Invite created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceInvite"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/invites/{invite_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - name: invite_id
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/UUIDv7"
+    delete:
+      operationId: revokeWorkspaceInvite
+      summary: Revoke an invite under manage_members
+      security:
+        - sumiSession: []
+      responses:
+        "204":
+          description: Invite revoked
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspace-invites/redeem:
+    post:
+      operationId: redeemWorkspaceInvite
+      summary: Redeem an opaque invite as the authenticated Human
+      description: A successful exact same-actor retry returns the original membership. Redemption never assigns roles.
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              additionalProperties: false
+              properties:
+                code:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+      responses:
+        "200":
+          description: New membership or the exact prior redemption result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceMembership"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /workspaces/{workspace_id}/roles:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: listWorkspaceRoles
+      summary: List custom Workspace roles
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Custom roles
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roles]
+                additionalProperties: false
+                properties:
+                  roles:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WorkspaceRole"
+        "401":
+          description: Missing or invalid browser session
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      operationId: createWorkspaceRole
+      summary: Create a role under manage_roles and the caller's privilege ceiling
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceRoleMutation"
+      responses:
+        "201":
+          description: Role created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceRole"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /workspaces/{workspace_id}/roles/{role_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/RoleId"
+    patch:
+      operationId: updateWorkspaceRole
+      summary: Update a role under manage_roles and the caller's privilege ceiling
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceRoleMutation"
+      responses:
+        "200":
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceRole"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      operationId: deleteWorkspaceRole
+      summary: Delete a role under manage_roles and the caller's privilege ceiling
+      security:
+        - sumiSession: []
+      responses:
+        "204":
+          description: Role deleted
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/members/{workspace_member_id}/roles:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/WorkspaceMemberId"
+    put:
+      operationId: setWorkspaceMemberRoles
+      summary: Replace the roles attached to one exact membership tenure
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_ids]
+              additionalProperties: false
+              properties:
+                role_ids:
+                  type: array
+                  uniqueItems: true
+                  items:
+                    $ref: "#/components/schemas/UUIDv7"
+      responses:
+        "200":
+          description: Stored role IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [role_ids]
+                additionalProperties: false
+                properties:
+                  role_ids:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UUIDv7"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /apps/catalog:
+    get:
+      operationId: listAppCatalog
+      summary: List server-canonical app descriptors
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Available app descriptors
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [apps]
+                additionalProperties: false
+                properties:
+                  apps:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AppDescriptor"
+        "401":
+          description: Missing or invalid browser session
+  /app-installations:
+    get:
+      operationId: listAppInstallations
+      summary: List app lifecycle state for one owner
+      security:
+        - sumiSession: []
+      parameters:
+        - $ref: "#/components/parameters/AppOwnerKind"
+        - name: owner_id
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/UUIDv7"
+        - name: participant_kind
+          in: query
+          required: false
+          description: Required exactly when owner_kind is participant
+          schema:
+            type: string
+            enum: [human, personality_agent]
+      responses:
+        "200":
+          description: App installations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [installations]
+                additionalProperties: false
+                properties:
+                  installations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AppInstallation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing or invalid browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      operationId: installApp
+      summary: Install and enable an app for one owner
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner, app_id]
+              additionalProperties: false
+              properties:
+                owner:
+                  $ref: "#/components/schemas/AppOwnerRef"
+                app_id:
+                  $ref: "#/components/schemas/AppId"
+      responses:
+        "201":
+          description: Installed app
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppInstallation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /app-installations/{installation_id}/state:
+    parameters:
+      - name: installation_id
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/UUIDv7"
+    put:
+      operationId: setAppInstallationState
+      summary: Enable or disable an installed app without deleting app-owned data
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state]
+              additionalProperties: false
+              properties:
+                state:
+                  $ref: "#/components/schemas/AppInstallationState"
+      responses:
+        "200":
+          description: Updated installation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppInstallation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /app-installations/{installation_id}:
+    parameters:
+      - name: installation_id
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/UUIDv7"
+    delete:
+      operationId: uninstallApp
+      summary: Remove only the app-owner binding; app-owned data is not cascaded
+      security:
+        - sumiSession: []
+      responses:
+        "204":
+          description: Installation removed
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /direct-chat/commands:
     post:
       operationId: createDirectChatCommand
@@ -137,7 +680,266 @@ components:
       in: cookie
       name: sumi_session
       description: Signed HttpOnly browser session cookie.
+  parameters:
+    WorkspaceId:
+      name: workspace_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUIDv7"
+    WorkspaceMemberId:
+      name: workspace_member_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUIDv7"
+    RoleId:
+      name: role_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUIDv7"
+    AppOwnerKind:
+      name: owner_kind
+      in: query
+      required: true
+      schema:
+        $ref: "#/components/schemas/AppOwnerKind"
+  responses:
+    InvalidRequest:
+      description: Strict JSON or domain validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIError"
+    Forbidden:
+      description: Authenticated actor lacks current domain authority
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIError"
+    NotFound:
+      description: Resource is absent, unavailable, or intentionally hidden from this actor
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIError"
+    Conflict:
+      description: Requested state conflicts with current canonical state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIError"
   schemas:
+    UUIDv7:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    APIError:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, invalid_session, missing_session, duplicate_session_cookies, origin_not_allowed, forbidden, not_found, conflict, internal_error]
+    Workspace:
+      type: object
+      required: [workspace_id, name, owner_workspace_member_id, created_at]
+      additionalProperties: false
+      properties:
+        workspace_id:
+          $ref: "#/components/schemas/UUIDv7"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        owner_workspace_member_id:
+          $ref: "#/components/schemas/UUIDv7"
+        created_at:
+          type: string
+          format: date-time
+    WorkspaceCreateRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    WorkspaceUpdateRequest:
+      $ref: "#/components/schemas/WorkspaceCreateRequest"
+    ParticipantRef:
+      oneOf:
+        - type: object
+          required: [kind, human_id]
+          additionalProperties: false
+          properties:
+            kind:
+              const: human
+            human_id:
+              $ref: "#/components/schemas/UUIDv7"
+        - type: object
+          required: [kind, personality_agent_id]
+          additionalProperties: false
+          properties:
+            kind:
+              const: personality_agent
+            personality_agent_id:
+              $ref: "#/components/schemas/PersonalityAgentId"
+      discriminator:
+        propertyName: kind
+    WorkspaceMembership:
+      type: object
+      required: [workspace_member_id, workspace_id, participant, owner, role_ids, joined_at]
+      additionalProperties: false
+      properties:
+        workspace_member_id:
+          $ref: "#/components/schemas/UUIDv7"
+        workspace_id:
+          $ref: "#/components/schemas/UUIDv7"
+        participant:
+          $ref: "#/components/schemas/ParticipantRef"
+        owner:
+          type: boolean
+        role_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UUIDv7"
+        joined_at:
+          type: string
+          format: date-time
+    WorkspaceInvite:
+      type: object
+      required: [invite_id, workspace_id, code, expires_at, created_at]
+      additionalProperties: false
+      properties:
+        invite_id:
+          $ref: "#/components/schemas/UUIDv7"
+        workspace_id:
+          $ref: "#/components/schemas/UUIDv7"
+        code:
+          type: string
+          minLength: 43
+          maxLength: 43
+          description: Opaque single-use secret returned only at creation
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    WorkspacePermission:
+      type: string
+      enum: [manage_workspace, manage_members, manage_roles, manage_apps, manage_channels, mention_all]
+    WorkspaceRoleMutation:
+      type: object
+      required: [name, permissions]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 60
+        color:
+          type: string
+          pattern: '^#[0-9a-f]{6}$'
+        permissions:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/WorkspacePermission"
+    WorkspaceRole:
+      type: object
+      required: [role_id, workspace_id, name, position, permissions, created_at]
+      additionalProperties: false
+      properties:
+        role_id:
+          $ref: "#/components/schemas/UUIDv7"
+        workspace_id:
+          $ref: "#/components/schemas/UUIDv7"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 60
+        color:
+          type: string
+          pattern: '^#[0-9a-f]{6}$'
+        position:
+          type: integer
+        permissions:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/WorkspacePermission"
+        created_at:
+          type: string
+          format: date-time
+    AppId:
+      type: string
+      pattern: '^[a-z][a-z0-9-]{0,63}$'
+    AppOwnerKind:
+      type: string
+      enum: [workspace, participant]
+    AppOwnerRef:
+      oneOf:
+        - type: object
+          required: [kind, workspace_id]
+          additionalProperties: false
+          properties:
+            kind:
+              const: workspace
+            workspace_id:
+              $ref: "#/components/schemas/UUIDv7"
+        - type: object
+          required: [kind, participant]
+          additionalProperties: false
+          properties:
+            kind:
+              const: participant
+            participant:
+              $ref: "#/components/schemas/ParticipantRef"
+      discriminator:
+        propertyName: kind
+    AppDescriptor:
+      type: object
+      required: [app_id, display_name, workspace_owner_allowed, participant_owner_allowed]
+      additionalProperties: false
+      properties:
+        app_id:
+          $ref: "#/components/schemas/AppId"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        workspace_owner_allowed:
+          type: boolean
+        participant_owner_allowed:
+          type: boolean
+    AppInstallationState:
+      type: string
+      enum: [enabled, disabled]
+    AppInstallation:
+      type: object
+      required: [installation_id, owner, app_id, state, installed_at, updated_at]
+      additionalProperties: false
+      properties:
+        installation_id:
+          $ref: "#/components/schemas/UUIDv7"
+        owner:
+          $ref: "#/components/schemas/AppOwnerRef"
+        app_id:
+          $ref: "#/components/schemas/AppId"
+        state:
+          $ref: "#/components/schemas/AppInstallationState"
+        installed_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
     JsonSafeInteger:
       type: integer
       minimum: 0

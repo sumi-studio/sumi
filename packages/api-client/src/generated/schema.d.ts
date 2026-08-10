@@ -21,6 +21,304 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the authenticated Human's active Workspace memberships */
+        get: operations["listWorkspaces"];
+        put?: never;
+        /**
+         * Atomically create a Workspace and its immutable owner membership
+         * @description Actor identity comes only from the signed browser session. Origin is checked before the body is processed.
+         */
+        post: operations["createWorkspace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one visible Workspace
+         * @description A nonexistent Workspace and one outside the caller's active memberships have the same response.
+         */
+        get: operations["getWorkspace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Workspace presentation under manage_workspace */
+        patch: operations["updateWorkspace"];
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /** List active Workspace membership tenures */
+        get: operations["listWorkspaceMembers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/membership": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Close the authenticated Human's current non-owner membership tenure */
+        delete: operations["leaveWorkspace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/members/{workspace_member_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                workspace_member_id: components["parameters"]["WorkspaceMemberId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Close another active membership tenure under manage_members */
+        delete: operations["removeWorkspaceMember"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a single-use 24-hour opaque Workspace invite
+         * @description The plaintext code is returned once. Its issuing membership tenure and manage_members authority are rechecked at redemption.
+         */
+        post: operations["createWorkspaceInvite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/invites/{invite_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                invite_id: components["schemas"]["UUIDv7"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke an invite under manage_members */
+        delete: operations["revokeWorkspaceInvite"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspace-invites/redeem": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Redeem an opaque invite as the authenticated Human
+         * @description A successful exact same-actor retry returns the original membership. Redemption never assigns roles.
+         */
+        post: operations["redeemWorkspaceInvite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /** List custom Workspace roles */
+        get: operations["listWorkspaceRoles"];
+        put?: never;
+        /** Create a role under manage_roles and the caller's privilege ceiling */
+        post: operations["createWorkspaceRole"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/roles/{role_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                role_id: components["parameters"]["RoleId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete a role under manage_roles and the caller's privilege ceiling */
+        delete: operations["deleteWorkspaceRole"];
+        options?: never;
+        head?: never;
+        /** Update a role under manage_roles and the caller's privilege ceiling */
+        patch: operations["updateWorkspaceRole"];
+        trace?: never;
+    };
+    "/workspaces/{workspace_id}/members/{workspace_member_id}/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                workspace_member_id: components["parameters"]["WorkspaceMemberId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Replace the roles attached to one exact membership tenure */
+        put: operations["setWorkspaceMemberRoles"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/apps/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List server-canonical app descriptors */
+        get: operations["listAppCatalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/app-installations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List app lifecycle state for one owner */
+        get: operations["listAppInstallations"];
+        put?: never;
+        /** Install and enable an app for one owner */
+        post: operations["installApp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/app-installations/{installation_id}/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                installation_id: components["schemas"]["UUIDv7"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Enable or disable an installed app without deleting app-owned data */
+        put: operations["setAppInstallationState"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/app-installations/{installation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                installation_id: components["schemas"]["UUIDv7"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove only the app-owner binding; app-owned data is not cascaded */
+        delete: operations["uninstallApp"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/direct-chat/commands": {
         parameters: {
             query?: never;
@@ -96,6 +394,98 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** Format: uuid */
+        UUIDv7: string;
+        APIError: {
+            /** @enum {string} */
+            error: "invalid_request" | "invalid_session" | "missing_session" | "duplicate_session_cookies" | "origin_not_allowed" | "forbidden" | "not_found" | "conflict" | "internal_error";
+        };
+        Workspace: {
+            workspace_id: components["schemas"]["UUIDv7"];
+            name: string;
+            owner_workspace_member_id: components["schemas"]["UUIDv7"];
+            /** Format: date-time */
+            created_at: string;
+        };
+        WorkspaceCreateRequest: {
+            name: string;
+        };
+        WorkspaceUpdateRequest: components["schemas"]["WorkspaceCreateRequest"];
+        ParticipantRef: {
+            /** @constant */
+            kind: "human";
+            human_id: components["schemas"]["UUIDv7"];
+        } | {
+            /** @constant */
+            kind: "personality_agent";
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+        };
+        WorkspaceMembership: {
+            workspace_member_id: components["schemas"]["UUIDv7"];
+            workspace_id: components["schemas"]["UUIDv7"];
+            participant: components["schemas"]["ParticipantRef"];
+            owner: boolean;
+            role_ids: components["schemas"]["UUIDv7"][];
+            /** Format: date-time */
+            joined_at: string;
+        };
+        WorkspaceInvite: {
+            invite_id: components["schemas"]["UUIDv7"];
+            workspace_id: components["schemas"]["UUIDv7"];
+            /** @description Opaque single-use secret returned only at creation */
+            code: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: date-time */
+            created_at: string;
+        };
+        /** @enum {string} */
+        WorkspacePermission: "manage_workspace" | "manage_members" | "manage_roles" | "manage_apps" | "manage_channels" | "mention_all";
+        WorkspaceRoleMutation: {
+            name: string;
+            color?: string;
+            permissions: components["schemas"]["WorkspacePermission"][];
+        };
+        WorkspaceRole: {
+            role_id: components["schemas"]["UUIDv7"];
+            workspace_id: components["schemas"]["UUIDv7"];
+            name: string;
+            color?: string;
+            position: number;
+            permissions: components["schemas"]["WorkspacePermission"][];
+            /** Format: date-time */
+            created_at: string;
+        };
+        AppId: string;
+        /** @enum {string} */
+        AppOwnerKind: "workspace" | "participant";
+        AppOwnerRef: {
+            /** @constant */
+            kind: "workspace";
+            workspace_id: components["schemas"]["UUIDv7"];
+        } | {
+            /** @constant */
+            kind: "participant";
+            participant: components["schemas"]["ParticipantRef"];
+        };
+        AppDescriptor: {
+            app_id: components["schemas"]["AppId"];
+            display_name: string;
+            workspace_owner_allowed: boolean;
+            participant_owner_allowed: boolean;
+        };
+        /** @enum {string} */
+        AppInstallationState: "enabled" | "disabled";
+        AppInstallation: {
+            installation_id: components["schemas"]["UUIDv7"];
+            owner: components["schemas"]["AppOwnerRef"];
+            app_id: components["schemas"]["AppId"];
+            state: components["schemas"]["AppInstallationState"];
+            /** Format: date-time */
+            installed_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
         /** @description non-negative integer representable exactly by JavaScript number clients */
         JsonSafeInteger: number;
         /**
@@ -638,8 +1028,50 @@ export interface components {
             reject_reason?: components["schemas"]["CommandRejectReason"];
         };
     };
-    responses: never;
-    parameters: never;
+    responses: {
+        /** @description Strict JSON or domain validation failed */
+        InvalidRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["APIError"];
+            };
+        };
+        /** @description Authenticated actor lacks current domain authority */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["APIError"];
+            };
+        };
+        /** @description Resource is absent, unavailable, or intentionally hidden from this actor */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["APIError"];
+            };
+        };
+        /** @description Requested state conflicts with current canonical state */
+        Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["APIError"];
+            };
+        };
+    };
+    parameters: {
+        WorkspaceId: components["schemas"]["UUIDv7"];
+        WorkspaceMemberId: components["schemas"]["UUIDv7"];
+        RoleId: components["schemas"]["UUIDv7"];
+        AppOwnerKind: components["schemas"]["AppOwnerKind"];
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
@@ -667,6 +1099,681 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    listWorkspaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Side-effect-free Workspace projection; an empty list is valid */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        workspaces: components["schemas"]["Workspace"][];
+                    };
+                };
+            };
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Workspace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workspace"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Origin not allowed or authenticated actor cannot create the resource */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workspace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workspace"];
+                };
+            };
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated Workspace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workspace"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listWorkspaceMembers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active memberships */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        members: components["schemas"]["WorkspaceMembership"][];
+                    };
+                };
+            };
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    leaveWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Membership tenure closed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    removeWorkspaceMember: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                workspace_member_id: components["parameters"]["WorkspaceMemberId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Membership tenure closed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createWorkspaceInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Invite created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceInvite"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    revokeWorkspaceInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                invite_id: components["schemas"]["UUIDv7"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invite revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    redeemWorkspaceInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    code: string;
+                };
+            };
+        };
+        responses: {
+            /** @description New membership or the exact prior redemption result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceMembership"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    listWorkspaceRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Custom roles */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        roles: components["schemas"]["WorkspaceRole"][];
+                    };
+                };
+            };
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createWorkspaceRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceRoleMutation"];
+            };
+        };
+        responses: {
+            /** @description Role created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceRole"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    deleteWorkspaceRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                role_id: components["parameters"]["RoleId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Role deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateWorkspaceRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                role_id: components["parameters"]["RoleId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceRoleMutation"];
+            };
+        };
+        responses: {
+            /** @description Role updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceRole"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    setWorkspaceMemberRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+                workspace_member_id: components["parameters"]["WorkspaceMemberId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    role_ids: components["schemas"]["UUIDv7"][];
+                };
+            };
+        };
+        responses: {
+            /** @description Stored role IDs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        role_ids: components["schemas"]["UUIDv7"][];
+                    };
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listAppCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Available app descriptors */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        apps: components["schemas"]["AppDescriptor"][];
+                    };
+                };
+            };
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listAppInstallations: {
+        parameters: {
+            query: {
+                owner_kind: components["parameters"]["AppOwnerKind"];
+                owner_id: components["schemas"]["UUIDv7"];
+                /** @description Required exactly when owner_kind is participant */
+                participant_kind?: "human" | "personality_agent";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description App installations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        installations: components["schemas"]["AppInstallation"][];
+                    };
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    installApp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    owner: components["schemas"]["AppOwnerRef"];
+                    app_id: components["schemas"]["AppId"];
+                };
+            };
+        };
+        responses: {
+            /** @description Installed app */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppInstallation"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    setAppInstallationState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                installation_id: components["schemas"]["UUIDv7"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    state: components["schemas"]["AppInstallationState"];
+                };
+            };
+        };
+        responses: {
+            /** @description Updated installation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppInstallation"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    uninstallApp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                installation_id: components["schemas"]["UUIDv7"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installation removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     createDirectChatCommand: {
