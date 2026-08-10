@@ -167,14 +167,13 @@ func TestAttachmentUploadBindAndVisibility(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("send with attachment = %d %v, want 201", resp.StatusCode, body)
 	}
-	message, _ := body["message"].(map[string]any)
-	attachments, _ := message["attachments"].([]any)
-	if len(attachments) != 1 {
-		t.Fatalf("message carries %d attachments, want 1 (%v)", len(attachments), message)
+	history, err := w.store.History(ctx, privateChannel.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil || len(history) != 1 || len(history[0].Attachments) != 1 {
+		t.Fatalf("stored attachment message = %#v, err %v", history, err)
 	}
-	first, _ := attachments[0].(map[string]any)
-	if first["attachment_id"] != id || first["mime"] != "image/png" {
-		t.Fatalf("attachment wire = %v", first)
+	first := history[0].Attachments[0]
+	if first.AttachmentID != id || first.MIME != "image/png" {
+		t.Fatalf("stored attachment = %#v", first)
 	}
 
 	// Bound: readable by the place's members only.
@@ -379,14 +378,13 @@ func TestAttachmentDraftSpoilerAndAlt(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("send = %d %v, want 201", resp.StatusCode, body)
 	}
-	message, _ := body["message"].(map[string]any)
-	attachments, _ := message["attachments"].([]any)
-	if len(attachments) != 1 {
-		t.Fatalf("message carries %d attachments, want 1 (%v)", len(attachments), message)
+	history, err := w.store.History(ctx, channel.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil || len(history) != 1 || len(history[0].Attachments) != 1 {
+		t.Fatalf("stored declaration message = %#v, err %v", history, err)
 	}
-	sent, _ := attachments[0].(map[string]any)
-	if sent["spoiler"] != true || sent["alt"] != "結末の一枚" || sent["filename"] != "ending.png" {
-		t.Fatalf("sent attachment wire = %v", sent)
+	sent := history[0].Attachments[0]
+	if !sent.Spoiler || sent.Alt != "結末の一枚" || sent.Filename != "ending.png" {
+		t.Fatalf("stored attachment declarations = %#v", sent)
 	}
 
 	// The recipient's own read of the timeline carries them too.

@@ -21,9 +21,11 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
-// maxRequestBytes bounds any /messaging request body: the largest legal
-// message content plus envelope headroom.
-const maxRequestBytes = MaxContentBytes + 64*1024
+// maxRequestBytes bounds any /messaging JSON request body. A legal content
+// byte can occupy six wire bytes when JSON escapes a control character
+// ("\\u0001"), so the cap covers that worst case plus the surrounding poll,
+// attachment and identity envelope.
+const maxRequestBytes = 6*MaxContentBytes + 64*1024
 
 // maxTopicBytes bounds a channel topic: one header line, not a document.
 const maxTopicBytes = 1000
@@ -393,6 +395,27 @@ func reactionUpdateToWire(messageID string, reactions []ReactionSummary) reactio
 	return reactionUpdateWire{
 		MessageID: messageID,
 		Reactions: reactionsToWire(reactions),
+	}
+}
+
+// messageReceiptWire is the shared mutation ACK for browser REST and the
+// agent's local-control route. It intentionally excludes message content: a
+// successful maximum-size write must remain observable under the bounded
+// control-plane response, and the durable message arrives through the normal
+// timeline/event projection.
+type messageReceiptWire struct {
+	ClientNonce string `json:"client_nonce"`
+	MessageID   string `json:"message_id"`
+	Seq         int64  `json:"seq"`
+	Created     bool   `json:"created"`
+}
+
+func messageReceiptToWire(message Message, created bool) messageReceiptWire {
+	return messageReceiptWire{
+		ClientNonce: message.ClientNonce,
+		MessageID:   message.MessageID,
+		Seq:         message.Seq,
+		Created:     created,
 	}
 }
 
@@ -1353,7 +1376,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	// Attachment-only and poll-only messages are legitimate; empty with
 	// nothing attached is not.
 	if (req.Content == "" && len(req.Attachments) == 0 && req.Poll == nil) ||
-		len(req.Content) > MaxContentBytes {
+		!messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
@@ -1398,11 +1421,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	if created {
 		publishMessageCreated(r.Context(), s.Store, s.Hub, place, msg)
 	}
-	writeJSON(w, status, struct {
-		MessageID string      `json:"message_id"`
-		Seq       int64       `json:"seq"`
-		Message   messageWire `json:"message"`
-	}{MessageID: msg.MessageID, Seq: msg.Seq, Message: messageToWire(place, msg)})
+	writeJSON(w, status, messageReceiptToWire(msg, created))
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
@@ -1417,7 +1436,7 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Content == "" || len(req.Content) > MaxContentBytes {
+	if req.Content == "" || !messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}

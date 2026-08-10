@@ -1527,6 +1527,7 @@ mod tests {
 
     use axum::Json;
     use axum::Router;
+    use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
@@ -2737,6 +2738,95 @@ mod tests {
         Json(serde_json::json!({
             "messages": [{"content": "x".repeat(payload_bytes)}]
         }))
+    }
+
+    #[derive(Clone, Default)]
+    struct CompactWriteFixtureState {
+        request_body: Arc<StdMutex<Option<Vec<u8>>>>,
+    }
+
+    async fn compact_write_fixture(
+        State(state): State<CompactWriteFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> std::result::Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer control-secret")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let client_nonce = request
+            .get("client_nonce")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        *state.request_body.lock().unwrap() = Some(body.to_vec());
+        Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "client_nonce": client_nonce,
+                "message_id": "0198f0f4-9b72-7000-8000-000000000099",
+                "seq": 7,
+                "created": true
+            })),
+        ))
+    }
+
+    #[tokio::test]
+    async fn messaging_write_observes_a_compact_receipt_for_max_escaped_content() {
+        let state = CompactWriteFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:write",
+                post(compact_write_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let content = "\u{1}".repeat(64 * 1024);
+
+        let receipt = client
+            .write(WriteMessagingMessageRequest {
+                place_id: "01900000-0000-7000-8000-000000000002",
+                content: &content,
+                urgency: "normal",
+                reply_to: None,
+                client_nonce: "nonce-max-escaped",
+            })
+            .await
+            .expect("a legal maximum write must be observed as success");
+
+        assert_eq!(receipt["client_nonce"], "nonce-max-escaped");
+        assert_eq!(receipt["seq"], 7);
+        assert_eq!(receipt["created"], true);
+        assert!(receipt.get("message").is_none());
+        let raw = state.request_body.lock().unwrap().take().unwrap();
+        assert!(raw.len() > 2 * 64 * 1024);
+        let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            request["content"].as_str().unwrap().as_bytes().len(),
+            64 * 1024
+        );
+        server.abort();
     }
 
     async fn response_limit_fixture(

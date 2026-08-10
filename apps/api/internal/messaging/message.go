@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,14 @@ const (
 
 // MaxContentBytes matches the schema CHECK on messages.content.
 const MaxContentBytes = 65536
+
+// messageContentFitsStorage names the complete byte-level invariant shared by
+// transport admission and PostgreSQL. PostgreSQL text cannot contain NUL; an
+// explicit 400 is preferable to discovering that only after membership or
+// sequence state has already been touched.
+func messageContentFitsStorage(content string) bool {
+	return len(content) <= MaxContentBytes && !strings.ContainsRune(content, '\x00')
+}
 
 // MaxHistoryLimit bounds one History page.
 const MaxHistoryLimit = 200
@@ -91,8 +100,8 @@ func (s *Store) AppendMessage(ctx context.Context, in AppendInput) (Message, boo
 			return Message{}, false, err
 		}
 	}
-	if len(in.Content) > MaxContentBytes {
-		return Message{}, false, fmt.Errorf("content exceeds %d bytes", MaxContentBytes)
+	if !messageContentFitsStorage(in.Content) {
+		return Message{}, false, fmt.Errorf("content is not storable or exceeds %d bytes", MaxContentBytes)
 	}
 	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
 		return Message{}, false, ErrTooManyAttachments
@@ -329,8 +338,8 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 	if content == "" {
 		return Message{}, fmt.Errorf("content must not be empty")
 	}
-	if len(content) > MaxContentBytes {
-		return Message{}, fmt.Errorf("content exceeds %d bytes", MaxContentBytes)
+	if !messageContentFitsStorage(content) {
+		return Message{}, fmt.Errorf("content is not storable or exceeds %d bytes", MaxContentBytes)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

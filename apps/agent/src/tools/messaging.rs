@@ -2050,7 +2050,12 @@ mod tests {
                 request.content.to_owned(),
                 request.client_nonce.to_owned(),
             ));
-            Ok(json!({"message_id": "m8", "seq": 8}))
+            Ok(json!({
+                "client_nonce": request.client_nonce,
+                "message_id": "m8",
+                "seq": 8,
+                "created": true
+            }))
         }
 
         async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {

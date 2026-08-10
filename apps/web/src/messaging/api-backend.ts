@@ -295,7 +295,12 @@ export class ApiMessagingBackend implements MessagingBackend {
         },
       ),
     );
-    return { messageId: asString(body.message_id), seq: asSeq(body.seq) };
+    return {
+      clientNonce: asString(body.client_nonce),
+      messageId: asString(body.message_id),
+      seq: asSeq(body.seq),
+      created: asBoolean(body.created),
+    };
   }
 
   /**

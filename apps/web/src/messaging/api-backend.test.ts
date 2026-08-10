@@ -70,7 +70,15 @@ describe("ApiMessagingBackend", () => {
           return json({ messages: [messageWire(1, "hello")] });
         }
         if (path.endsWith("/messages") && init?.method === "POST") {
-          return json({ message_id: "message-2", seq: 2 }, 201);
+          return json(
+            {
+              client_nonce: "nonce-1",
+              message_id: "message-2",
+              seq: 2,
+              created: true,
+            },
+            201,
+          );
         }
         if (path.endsWith("/read-through") && init?.method === "PUT") {
           return new Response(null, { status: 204 });
@@ -94,7 +102,12 @@ describe("ApiMessagingBackend", () => {
         clientNonce: "nonce-1",
         attachments: [],
       }),
-    ).resolves.toEqual({ messageId: "message-2", seq: 2 });
+    ).resolves.toEqual({
+      clientNonce: "nonce-1",
+      messageId: "message-2",
+      seq: 2,
+      created: true,
+    });
     await backend.markRead(channel, 2);
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -174,7 +187,15 @@ describe("ApiMessagingBackend", () => {
           );
         }
         if (path.endsWith("/messages") && init?.method === "POST") {
-          return json({ message_id: "message-2", seq: 2 }, 201);
+          return json(
+            {
+              client_nonce: "nonce-1",
+              message_id: "message-2",
+              seq: 2,
+              created: true,
+            },
+            201,
+          );
         }
         throw new Error(`unexpected request ${path}`);
       },

@@ -1,8 +1,10 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,181 @@ import (
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
+
+func TestLocalWriteBoundaryThroughAuthenticatedControlRoute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	world := newWorld(t, ctx)
+	messagingServer := NewServer(world.store, nil)
+
+	commandStore, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open command store: %v", err)
+	}
+	t.Cleanup(func() { _ = commandStore.Close() })
+	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), commandStore)
+	if err != nil {
+		t.Fatalf("open durable gateway: %v", err)
+	}
+	const bearer = "messaging-write-boundary-bearer-token"
+	control, err := agentevents.NewLocalControlServer(
+		gateway,
+		[]byte("messaging-write-signing-secret-32-bytes"),
+		[]agentevents.LocalRuntimeAuthorization{{
+			BearerToken:           bearer,
+			TenantID:              "tenant-local",
+			PersonalityAgentID:    world.agent.ID,
+			Generation:            1,
+			RPCBootNonce:          "boot-write-boundary",
+			Audience:              "sumi:agent:events",
+			DeliveryAuthorization: agentevents.LocalDeliveryRaw,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("new local control: %v", err)
+	}
+	if err := messagingServer.RegisterLocalControlRoutes(control); err != nil {
+		t.Fatalf("register messaging routes: %v", err)
+	}
+	handler, err := control.HandlerForLocalRuntime(world.agent.ID)
+	if err != nil {
+		t.Fatalf("bind local runtime handler: %v", err)
+	}
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+
+	type durableState struct {
+		workspaces  int64
+		places      int64
+		memberships int64
+		messages    int64
+		lastSeq     int64
+	}
+	snapshot := func() durableState {
+		t.Helper()
+		var state durableState
+		queries := []struct {
+			query string
+			dest  *int64
+			args  []any
+		}{
+			{`SELECT count(*) FROM workspaces WHERE workspace_id = $1`, &state.workspaces, []any{DefaultWorkspaceID}},
+			{`SELECT count(*) FROM places WHERE place_id = $1`, &state.places, []any{DefaultGeneralChannelID}},
+			{`SELECT count(*) FROM workspace_members WHERE member_kind = $1 AND member_id = $2`, &state.memberships, []any{world.agent.Kind, world.agent.ID}},
+			{`SELECT count(*) FROM messages WHERE author_kind = $1 AND author_id = $2`, &state.messages, []any{world.agent.Kind, world.agent.ID}},
+			{`SELECT COALESCE((SELECT last_seq FROM places WHERE place_id = $1), -1)`, &state.lastSeq, []any{DefaultGeneralChannelID}},
+		}
+		for _, query := range queries {
+			if err := world.store.pool.QueryRow(ctx, query.query, query.args...).Scan(query.dest); err != nil {
+				t.Fatalf("snapshot durable write state: %v", err)
+			}
+		}
+		return state
+	}
+
+	type postResult struct {
+		status int
+		body   map[string]any
+		raw    []byte
+	}
+	post := func(content, nonce, authorization string) postResult {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{
+			"place_id": DefaultGeneralChannelID,
+			"content":  content, "urgency": "normal", "client_nonce": nonce,
+		})
+		if err != nil {
+			t.Fatalf("marshal local write: %v", err)
+		}
+		request, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, httpServer.URL+LocalWritePath, bytes.NewReader(payload),
+		)
+		if err != nil {
+			t.Fatalf("new local write request: %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if authorization != "" {
+			request.Header.Set("Authorization", "Bearer "+authorization)
+		}
+		response, err := httpServer.Client().Do(request)
+		if err != nil {
+			t.Fatalf("post local write: %v", err)
+		}
+		defer response.Body.Close()
+		raw, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read local write response: %v", err)
+		}
+		body := map[string]any{}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("decode local write response %q: %v", raw, err)
+			}
+		}
+		return postResult{status: response.StatusCode, body: body, raw: raw}
+	}
+
+	initial := snapshot()
+	if result := post("not authorized", "nonce-unauthorized", "wrong-bearer-token-with-32-bytes-minimum"); result.status != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer status = %d, body %v", result.status, result.body)
+	}
+	if got := snapshot(); got != initial {
+		t.Fatalf("unauthorized write mutated durable state: before %#v after %#v", initial, got)
+	}
+
+	for name, content := range map[string]string{
+		"over-limit": strings.Repeat("x", MaxContentBytes+1),
+		"nul":        strings.Repeat("\x00", MaxContentBytes),
+	} {
+		result := post(content, "nonce-invalid-"+name, bearer)
+		if result.status != http.StatusBadRequest || result.body["error"] != "invalid_content" {
+			t.Fatalf("%s write = %d %v, want 400 invalid_content", name, result.status, result.body)
+		}
+		if got := snapshot(); got != initial {
+			t.Fatalf("%s write mutated durable state: before %#v after %#v", name, initial, got)
+		}
+	}
+	nulPayload, err := json.Marshal(map[string]any{"content": strings.Repeat("\x00", MaxContentBytes)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nulPayload) <= MaxContentBytes+64*1024 || len(nulPayload) > maxRequestBytes {
+		t.Fatalf("escaped boundary request size = %d, cap %d", len(nulPayload), maxRequestBytes)
+	}
+
+	// U+0001 is storable but has the same six-byte JSON escape expansion as
+	// NUL. It proves the widened request cap admits the largest legal escaped
+	// payload through the real bearer-authenticated route.
+	escaped := post(strings.Repeat("\x01", MaxContentBytes), "nonce-control", bearer)
+	if escaped.status != http.StatusCreated || escaped.body["created"] != true ||
+		escaped.body["client_nonce"] != "nonce-control" || len(escaped.raw) >= 1024 {
+		t.Fatalf("escaped max write = %d %v (%d response bytes)", escaped.status, escaped.body, len(escaped.raw))
+	}
+
+	const escapedNonce = "nonce-\"quoted\"-\\slash"
+	created := post(strings.Repeat("a", MaxContentBytes), escapedNonce, bearer)
+	if created.status != http.StatusCreated || created.body["created"] != true ||
+		created.body["client_nonce"] != escapedNonce || len(created.body) != 4 {
+		t.Fatalf("max write receipt = %d %v", created.status, created.body)
+	}
+	messageID, _ := created.body["message_id"].(string)
+	seq, _ := created.body["seq"].(float64)
+	if messageID == "" || seq != 2 || !bytes.Contains(created.raw, []byte(`\"quoted\"-\\slash`)) {
+		t.Fatalf("max write identity/escaping = %v raw %q", created.body, created.raw)
+	}
+
+	replayed := post(strings.Repeat("a", MaxContentBytes), escapedNonce, bearer)
+	if replayed.status != http.StatusOK || replayed.body["created"] != false ||
+		replayed.body["message_id"] != messageID || replayed.body["seq"] != seq ||
+		replayed.body["client_nonce"] != escapedNonce {
+		t.Fatalf("same-nonce replay = %d %v, first %v", replayed.status, replayed.body, created.body)
+	}
+	final := snapshot()
+	if final.workspaces != 1 || final.places != 1 || final.memberships != 1 ||
+		final.messages != 2 || final.lastSeq != 2 {
+		t.Fatalf("final durable state = %#v, want two committed messages", final)
+	}
+}
 
 func TestLocalOpenAdmitsAgentWithoutOverviewFirst(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

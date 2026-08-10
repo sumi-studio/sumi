@@ -305,6 +305,24 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	if !decodeJSON(w, r, &request) {
 		return
 	}
+	switch request.Urgency {
+	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_urgency")
+		return
+	}
+	// Validate the entire mutation shape before default-workspace admission.
+	// An oversized or otherwise unstorable write must not create membership,
+	// allocate a place, or advance its sequence as a side effect of rejection.
+	if request.PlaceID == "" || request.Content == "" ||
+		!messageContentFitsStorage(request.Content) {
+		writeError(w, http.StatusBadRequest, "invalid_content")
+		return
+	}
+	if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	viewer := localViewer(authorization)
 	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
 		writeStoreError(w, err)
@@ -334,11 +352,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	if !created {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, struct {
-		MessageID string      `json:"message_id"`
-		Seq       int64       `json:"seq"`
-		Message   messageWire `json:"message"`
-	}{message.MessageID, message.Seq, messageToWire(place, message)})
+	writeJSON(w, status, messageReceiptToWire(message, created))
 }
 
 // localReact states the agent's desired emoji state through the identical
