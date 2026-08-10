@@ -108,6 +108,9 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err != nil {
 		return Message{}, false, err
 	}
+	if err := lockPlaceMembershipScope(ctx, tx, place); err != nil {
+		return Message{}, false, err
+	}
 	canPost, err := s.canAccess(ctx, tx, place, in.Author)
 	if err != nil {
 		return Message{}, false, err

@@ -53,12 +53,11 @@ const (
 	EventPlaceUpdated       = "place_updated"
 )
 
-// subscriber is one live WebSocket connection's delivery state. visible is a
-// positive cache of place visibility: places the subscriber was allowed to see
-// at first contact. Unknown places are re-checked against the store (so places
-// created mid-connection are delivered); revocations take effect on reconnect,
-// like most live-session permission models. The messaging surface's authority
-// for what exists is always the store — the hub only decides who is told now.
+// subscriber is one live WebSocket connection's delivery state. visible keeps
+// the most recent observation for catch-up bookkeeping and the store-less
+// session-revocation harness, but a live store-backed publish never trusts it:
+// membership is re-authorized for every event so revocation fences content
+// without requiring reconnect.
 type subscriber struct {
 	viewer ParticipantRef
 	send   chan []byte
@@ -181,11 +180,11 @@ func excluded(refs []ParticipantRef, viewer ParticipantRef) bool {
 	return false
 }
 
-// visibleTo answers "may this subscriber be told about this event now",
-// caching verdicts per scope key. Place events use place visibility;
-// participant-scoped events use ParticipantVisible under a prefixed key so the
-// two namespaces cannot collide. An event with neither scope is delivered to
-// no one (fail-closed).
+// visibleTo answers "may this subscriber be told about this event now". Place
+// events use place visibility; participant-scoped events use ParticipantVisible
+// under a prefixed key so the two namespaces cannot collide. Store-backed live
+// delivery always rechecks current authority; the cached observation is never
+// an authorization input. An event with neither scope is delivered to no one.
 func (h *Hub) visibleTo(ctx context.Context, sub *subscriber, event Event) bool {
 	scope := event.PlaceID
 	if scope == "" {
@@ -194,10 +193,13 @@ func (h *Hub) visibleTo(ctx context.Context, sub *subscriber, event Event) bool 
 		}
 		scope = "participant|" + event.Subject.Key()
 	}
-	ok, known := sub.visibility(scope)
-	if known {
-		return ok
+	// A nil store exists only in the isolated session-revocation test harness.
+	// Its cached scope is still fenced by writePump's session authorization.
+	if h.store == nil {
+		ok, known := sub.visibility(scope)
+		return known && ok
 	}
+	var ok bool
 	if event.PlaceID != "" {
 		_, err := h.store.PlaceFor(ctx, event.PlaceID, sub.viewer)
 		ok = err == nil

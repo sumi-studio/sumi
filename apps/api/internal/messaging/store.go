@@ -87,6 +87,9 @@ func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participan
 		 ON CONFLICT (workspace_id) DO NOTHING`, DefaultWorkspaceID); err != nil {
 		return fmt.Errorf("ensure default workspace: %w", err)
 	}
+	if err := lockWorkspaceMembershipScope(ctx, tx, DefaultWorkspaceID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO places (place_id, kind, workspace_id, name, topic)
 		 VALUES ($1, 'channel', $2, 'general', 'みんなの場所')
@@ -228,7 +231,15 @@ func (s *Store) AddWorkspaceMember(ctx context.Context, workspaceID string, memb
 	if err := s.participantExists(ctx, member); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin add workspace member: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMembershipScope(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx,
 		`INSERT INTO workspace_members (workspace_id, member_kind, member_id, role)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (workspace_id, member_kind, member_id) WHERE left_at IS NULL
@@ -236,6 +247,9 @@ func (s *Store) AddWorkspaceMember(ctx context.Context, workspaceID string, memb
 		workspaceID, member.Kind, member.ID, role)
 	if err != nil {
 		return fmt.Errorf("add workspace member: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit add workspace member: %w", err)
 	}
 	return nil
 }
@@ -246,12 +260,23 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, workspaceID string, m
 	if err := member.Validate(); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin remove workspace member: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMembershipScope(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx,
 		`UPDATE workspace_members SET left_at = now()
 		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
 		workspaceID, member.Kind, member.ID)
 	if err != nil {
 		return fmt.Errorf("remove workspace member: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit remove workspace member: %w", err)
 	}
 	return nil
 }
@@ -462,6 +487,40 @@ type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Membership admission and mutation serialize on one transaction-scoped key
+// per authority scope. For a channel the workspace membership row is the
+// authority; for dm/group_dm it is the place membership row. Acquiring this
+// before authorization and holding it through commit gives send vs add/remove
+// a defined commit order without relying on statement snapshots.
+func lockWorkspaceMembershipScope(ctx context.Context, q querier, workspaceID string) error {
+	if _, err := q.Exec(ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+		workspaceMembershipScopeKey(workspaceID)); err != nil {
+		return fmt.Errorf("lock workspace membership scope: %w", err)
+	}
+	return nil
+}
+
+func workspaceMembershipScopeKey(workspaceID string) string {
+	return "messaging:workspace-membership:" + workspaceID
+}
+
+func lockPlaceMembershipScope(ctx context.Context, q querier, place Place) error {
+	if place.Kind == PlaceChannel {
+		return lockWorkspaceMembershipScope(ctx, q, place.WorkspaceID)
+	}
+	if _, err := q.Exec(ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+		placeMembershipScopeKey(place.PlaceID)); err != nil {
+		return fmt.Errorf("lock place membership scope: %w", err)
+	}
+	return nil
+}
+
+func placeMembershipScopeKey(placeID string) string {
+	return "messaging:place-membership:" + placeID
 }
 
 func (s *Store) workspaceExists(ctx context.Context, workspaceID string) error {

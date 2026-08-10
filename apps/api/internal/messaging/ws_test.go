@@ -352,6 +352,50 @@ func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 	}
 }
 
+func TestHubReauthorizesWarmedVisibilityAfterMembershipRemoval(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		participant func(world) ParticipantRef
+	}{
+		{name: "human", participant: func(w world) ParticipantRef { return w.humanB }},
+		{name: "personality_agent", participant: func(w world) ParticipantRef { return w.agent }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			ws, ch := w.workspaceWithChannel(t, ctx)
+			participant := test.participant(w)
+			hub := NewHub(w.store)
+			sub := hub.subscribe(participant)
+			defer hub.unsubscribe(sub)
+
+			probe := Event{Type: EventTyping, PlaceID: ch.PlaceID}
+			if !hub.visibleTo(ctx, sub, probe) {
+				t.Fatal("member was not initially visible")
+			}
+			if cached, known := sub.visibility(ch.PlaceID); !known || !cached {
+				t.Fatal("positive visibility observation was not warmed")
+			}
+
+			msg := w.send(t, ctx, ch.PlaceID, w.humanA, "revocation後に漏らしてはいけない")
+			wire := messageToWire(ch, msg)
+			if err := w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, participant); err != nil {
+				t.Fatalf("remove member: %v", err)
+			}
+			// This is the broad fallback frame (no OnlyFor). Even though the
+			// subscriber once had a positive cache entry, current membership must
+			// fence the full message body after the removal commit.
+			hub.Publish(ctx, Event{
+				Type: EventMessageCreated, PlaceID: ch.PlaceID, Message: &wire,
+			})
+			if got := len(sub.send); got != 0 {
+				t.Fatalf("removed %s received %d queued content frames", participant.Key(), got)
+			}
+		})
+	}
+}
+
 func TestRESTSendReachesWSSubscribers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
