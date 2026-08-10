@@ -21,7 +21,6 @@ test("mobile Human can open and resolve an exact request", async ({
       ],
       allowFreeText: true,
       expiresAt,
-      callback: { correlationId: "mobile-smoke" },
     },
   });
   expect(created.status()).toBe(201);

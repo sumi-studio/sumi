@@ -3,6 +3,8 @@ PUBLISHER_TOKEN=local-publisher-token-change-me
 HUMAN_BOOTSTRAP_SECRET=local-human-bootstrap-change-me
 SESSION_SIGNING_SECRET=local-session-signing-secret-change-me-32-bytes
 CALLBACK_SIGNING_SECRET=local-callback-signing-secret-change-me
+# Optional. Leave empty to disable callbacks; requests asking for one will fail closed.
+CALLBACK_URL=
 VAPID_PUBLIC_KEY=BDummyPublicKeyReplaceWithNpxWebPushGenerateVapidKeys
 VAPID_PRIVATE_KEY=DummyPrivateKeyReplaceWithNpxWebPushGenerateVapidKeys
 VAPID_SUBJECT=mailto:local@example.invalid

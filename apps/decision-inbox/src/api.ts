@@ -16,7 +16,6 @@ export interface HumanSessionPayload {
   expiresAt: string;
   vapidPublicKey: string;
   pushSubscriptionCount: number;
-  registeredEndpointHashes: string[];
 }
 
 async function decode<T>(response: Response): Promise<T> {

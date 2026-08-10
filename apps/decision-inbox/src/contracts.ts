@@ -13,7 +13,7 @@ export const choiceSchema = z.object({
   tone: choiceToneSchema,
 });
 
-const callbackUrlSchema = z
+export const callbackUrlSchema = z
   .string()
   .trim()
   .max(512)

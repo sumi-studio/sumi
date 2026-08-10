@@ -9,8 +9,10 @@ import {
   setSessionCookie,
   signedSessionCookie,
 } from "./auth";
+import { type CallbackDelivery, deliverDecisionCallback } from "./callback";
 import {
   bootstrapSchema,
+  callbackUrlSchema,
   createDecisionSchema,
   type DecisionRequest,
   mintBootstrapSchema,
@@ -25,12 +27,18 @@ import {
   expireRequests,
   getDecision,
 } from "./db";
-import { type PushEnv, sendDecisionPush } from "./push";
+import {
+  type PushEnv,
+  prunePushSubscriptions,
+  sendDecisionPush,
+  storePushSubscription,
+} from "./push";
 
 export interface Env extends AuthEnv, PushEnv {
   ASSETS: Fetcher;
   HUMAN_BOOTSTRAP_SECRET: string;
   CALLBACK_SIGNING_SECRET: string;
+  CALLBACK_URL?: string;
 }
 
 class ApiFault extends Error {
@@ -195,38 +203,50 @@ function requestEnvelope(request: Request, decision: DecisionRequest) {
   };
 }
 
-async function callbackDelivery(
+function configuredCallbackUrl(
   env: Env,
-  decision: DecisionRequest,
-  callbackUrl: string,
-): Promise<void> {
-  const payload = JSON.stringify({
-    type: `decision.${decision.status}`,
-    occurredAt: new Date().toISOString(),
-    request: decision,
-  });
-  const signature = await hmac(env.CALLBACK_SIGNING_SECRET, payload);
-  let status = 0;
-  try {
-    const response = await fetch(callbackUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Sumi-Decision-Signature": `sha256=${signature}`,
-      },
-      body: payload,
-      redirect: "manual",
-      signal: AbortSignal.timeout(10_000),
-    });
-    status = response.status;
-  } catch {
-    status = 0;
+  callback: { url?: string } | undefined,
+): string | null {
+  if (!callback) return null;
+  const configured = callbackUrlSchema.safeParse(env.CALLBACK_URL ?? "");
+  if (!configured.success) {
+    throw new ApiFault(
+      503,
+      "callback_unavailable",
+      "Callback delivery is not configured for this deployment",
+    );
   }
-  await env.DB.prepare(
-    "UPDATE decision_requests SET callback_attempted_at = ?, callback_status = ? WHERE id = ?",
-  )
-    .bind(Date.now(), status, decision.id)
-    .run();
+  if (callback.url && callback.url !== configured.data) {
+    throw new ApiFault(
+      422,
+      "callback_url_mismatch",
+      "Callback URL must exactly match this deployment's configured destination",
+    );
+  }
+  return configured.data;
+}
+
+function callbackDeliveryFromRow(
+  env: Env,
+  row: DecisionRow,
+  decision: DecisionRequest,
+): CallbackDelivery | null {
+  const configured = callbackUrlSchema.safeParse(env.CALLBACK_URL ?? "");
+  if (
+    !configured.success ||
+    !row.callback_url ||
+    row.callback_url !== configured.data ||
+    !row.callback_delivery_id ||
+    !row.callback_delivery_created_at
+  ) {
+    return null;
+  }
+  return {
+    callbackUrl: configured.data,
+    deliveryId: row.callback_delivery_id,
+    deliveryCreatedAt: row.callback_delivery_created_at,
+    decision,
+  };
 }
 
 async function handlePublisherCreate(
@@ -258,6 +278,7 @@ async function handlePublisherCreate(
   if (!parsed.success) throw validationFault(parsed.error);
   const input = parsed.data;
   const now = Date.now();
+  const callbackUrl = configuredCallbackUrl(env, input.callback);
   const expiresAt = Date.parse(input.expiresAt);
   if (expiresAt <= now + 30_000 || expiresAt > now + 7 * 86_400_000) {
     throw new ApiFault(
@@ -286,7 +307,7 @@ async function handlePublisherCreate(
       input.source,
       JSON.stringify(input.choices),
       input.allowFreeText ? 1 : 0,
-      input.callback?.url ?? null,
+      callbackUrl,
       input.callback?.correlationId ?? null,
       expiresAt,
       now,
@@ -396,10 +417,15 @@ async function handlePublisherCancel(
   let cancelled = false;
   if (row.status === "pending") {
     const now = Date.now();
+    const callbackDeliveryId = row.callback_url ? randomToken() : null;
     const cancellation = await env.DB.prepare(
-      "UPDATE decision_requests SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+      `UPDATE decision_requests
+       SET status = 'cancelled', cancelled_at = ?, updated_at = ?,
+           callback_delivery_id = CASE WHEN callback_url IS NULL THEN NULL ELSE ? END,
+           callback_delivery_created_at = CASE WHEN callback_url IS NULL THEN NULL ELSE ? END
+       WHERE id = ? AND status = 'pending'`,
     )
-      .bind(now, now, id)
+      .bind(now, now, callbackDeliveryId, now, id)
       .run();
     cancelled = (cancellation.meta.changes ?? 0) > 0;
   }
@@ -414,8 +440,9 @@ async function handlePublisherCancel(
     );
   }
   const decision = decisionFromRow(updated);
-  if (cancelled && updated.callback_url) {
-    ctx.waitUntil(callbackDelivery(env, decision, updated.callback_url));
+  const callbackDelivery = callbackDeliveryFromRow(env, updated, decision);
+  if (cancelled && callbackDelivery) {
+    ctx.waitUntil(deliverDecisionCallback(env, callbackDelivery));
   }
   return json(requestEnvelope(request, decision));
 }
@@ -521,8 +548,9 @@ async function handleSession(request: Request, env: Env): Promise<Response> {
       "human_auth_required",
       "Open the private sign-in link again",
     );
+  await prunePushSubscriptions(env.DB);
   const pushSubscriptions = await env.DB.prepare(
-    "SELECT endpoint_hash FROM push_subscriptions ORDER BY created_at DESC",
+    "SELECT endpoint_hash FROM push_subscriptions ORDER BY last_seen_at DESC, created_at DESC",
   ).all<{ endpoint_hash: string }>();
   return json({
     authenticated: true,
@@ -530,9 +558,6 @@ async function handleSession(request: Request, env: Env): Promise<Response> {
     expiresAt: new Date(session.expiresAt).toISOString(),
     vapidPublicKey: env.VAPID_PUBLIC_KEY,
     pushSubscriptionCount: pushSubscriptions.results.length,
-    registeredEndpointHashes: pushSubscriptions.results.map(
-      (subscription) => subscription.endpoint_hash,
-    ),
   });
 }
 
@@ -639,12 +664,15 @@ async function handleHumanRespond(
   }
 
   const responseId = randomToken();
+  const callbackDeliveryId = existing.callback_url ? randomToken() : null;
   const operations = await env.DB.batch([
     env.DB.prepare(
       `UPDATE decision_requests
-       SET status = 'resolved', resolved_at = ?, updated_at = ?, resolution_key = ?
+       SET status = 'resolved', resolved_at = ?, updated_at = ?, resolution_key = ?,
+           callback_delivery_id = CASE WHEN callback_url IS NULL THEN NULL ELSE ? END,
+           callback_delivery_created_at = CASE WHEN callback_url IS NULL THEN NULL ELSE ? END
        WHERE id = ? AND status = 'pending' AND expires_at > ?`,
-    ).bind(now, now, resolutionKey, id, now),
+    ).bind(now, now, resolutionKey, callbackDeliveryId, now, id, now),
     env.DB.prepare(
       `INSERT OR IGNORE INTO decision_responses (
         id, request_id, choice_id, reply, idempotency_key_hash, created_at
@@ -674,8 +702,9 @@ async function handleHumanRespond(
     );
   }
   const decision = decisionFromRow(updated);
-  if ((operations[0].meta.changes ?? 0) > 0 && updated.callback_url) {
-    ctx.waitUntil(callbackDelivery(env, decision, updated.callback_url));
+  const callbackDelivery = callbackDeliveryFromRow(env, updated, decision);
+  if ((operations[0].meta.changes ?? 0) > 0 && callbackDelivery) {
+    ctx.waitUntil(deliverDecisionCallback(env, callbackDelivery));
   }
   return json({ request: decision });
 }
@@ -691,28 +720,25 @@ async function handlePushSubscribe(
   );
   if (!parsed.success) throw validationFault(parsed.error);
   const now = Date.now();
+  if (parsed.data.expirationTime && parsed.data.expirationTime <= now) {
+    throw new ApiFault(
+      422,
+      "expired_subscription",
+      "The push subscription has already expired",
+    );
+  }
   const endpointHash = await sha256(`push:${parsed.data.endpoint}`);
-  await env.DB.prepare(
-    `INSERT INTO push_subscriptions (
-      endpoint_hash, endpoint, expiration_time, p256dh, auth, created_at, last_seen_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT (endpoint_hash) DO UPDATE SET
-      endpoint = excluded.endpoint,
-      expiration_time = excluded.expiration_time,
-      p256dh = excluded.p256dh,
-      auth = excluded.auth,
-      last_seen_at = excluded.last_seen_at`,
-  )
-    .bind(
-      endpointHash,
-      parsed.data.endpoint,
-      parsed.data.expirationTime ?? null,
-      parsed.data.keys.p256dh,
-      parsed.data.keys.auth,
-      now,
-      now,
-    )
-    .run();
+  await storePushSubscription(
+    env.DB,
+    endpointHash,
+    {
+      endpoint: parsed.data.endpoint,
+      expirationTime: parsed.data.expirationTime ?? null,
+      p256dh: parsed.data.keys.p256dh,
+      auth: parsed.data.keys.auth,
+    },
+    now,
+  );
   return json({ subscribed: true }, 201);
 }
 
@@ -836,23 +862,23 @@ async function scheduledHandler(
 ): Promise<void> {
   const now = Date.now();
   ctx.waitUntil(
-    env.DB.batch([
-      env.DB.prepare(
-        "UPDATE decision_requests SET status = 'expired', updated_at = ? WHERE status = 'pending' AND expires_at <= ?",
-      ).bind(now, now),
-      env.DB.prepare("DELETE FROM human_sessions WHERE expires_at <= ?").bind(
-        now,
-      ),
-      env.DB.prepare(
-        "DELETE FROM bootstrap_tokens WHERE expires_at <= ? OR consumed_at < ?",
-      ).bind(now, now - 7 * 86_400_000),
-      env.DB.prepare("DELETE FROM rate_limits WHERE updated_at < ?").bind(
-        now - 2 * 86_400_000,
-      ),
-      env.DB.prepare(
-        "DELETE FROM push_subscriptions WHERE expiration_time IS NOT NULL AND expiration_time <= ?",
-      ).bind(now),
-    ]).then(() => undefined),
+    (async () => {
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE decision_requests SET status = 'expired', updated_at = ? WHERE status = 'pending' AND expires_at <= ?",
+        ).bind(now, now),
+        env.DB.prepare("DELETE FROM human_sessions WHERE expires_at <= ?").bind(
+          now,
+        ),
+        env.DB.prepare(
+          "DELETE FROM bootstrap_tokens WHERE expires_at <= ? OR consumed_at < ?",
+        ).bind(now, now - 7 * 86_400_000),
+        env.DB.prepare("DELETE FROM rate_limits WHERE updated_at < ?").bind(
+          now - 2 * 86_400_000,
+        ),
+      ]);
+      await prunePushSubscriptions(env.DB, now);
+    })(),
   );
 }
 

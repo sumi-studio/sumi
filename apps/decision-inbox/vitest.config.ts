@@ -19,6 +19,7 @@ export default defineConfig({
             "test-session-signing-secret-at-least-32-bytes",
           CALLBACK_SIGNING_SECRET:
             "test-callback-signing-secret-at-least-32-bytes",
+          CALLBACK_URL: "https://publisher.example.test/hooks/decision-inbox",
           VAPID_PUBLIC_KEY:
             "BES0_AyhYwO2hhcb0_4LeFvUQfZr-IVANqMZbIQ0aNls3vEhJGUUoKAVNYQQVvdx4gXF4K0wdym7G8UsJC-7t0s",
           VAPID_PRIVATE_KEY: "hJ680txcQOzb6A2ymLhaLsMYODeJkjV_doERndhvq_4",

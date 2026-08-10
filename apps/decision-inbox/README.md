@@ -9,12 +9,12 @@ This is deliberately a separate product boundary. It does not import Sumi runtim
 - Publisher API: bearer-authenticated create, poll, unresolved list, cancel, and one-time Human link minting.
 - Human PWA: one-time bootstrap exchange, HttpOnly session, pending/history/detail views, two-tap choice flow, optional short reply, contextual push setup, and clear terminal states.
 - Durable state: D1 is authoritative. A cached shell and last successful reads remain visible offline, but writes are disabled and never queued or reported as successful.
-- Delivery: standard Web Push with VAPID. Push opens `/requests/:id`; 404/410 subscriptions are deleted. Optional callbacks are one-shot, signed hints. Publisher polling remains authoritative.
+- Delivery: standard Web Push with VAPID. Push opens `/requests/:id`; 404/410 subscriptions are deleted. At most four recently confirmed phone/browser subscriptions are retained and contacted per decision. Optional callbacks are one-shot, signed hints. Publisher polling remains authoritative.
 - Scope: one Human, one publisher credential, multiple phone/browser subscriptions. No org, Workspace, role, or multi-user model.
 
 ## Architecture
 
-`src/worker.ts` serves the native Worker API and built Vite assets. D1 stores request state, exactly one response per request, one-time bootstrap hashes, session hashes, subscriptions, and small fixed-window rate counters. The browser never receives the publisher token or VAPID private key.
+`src/worker.ts` serves the native Worker API and built Vite assets. D1 stores request state, exactly one response per request, one-time bootstrap hashes, session hashes, bounded subscriptions, immutable callback delivery identity, and small fixed-window rate counters. The browser never receives the publisher token or VAPID private key.
 
 The important state transitions are:
 
@@ -71,8 +71,7 @@ curl --request POST http://localhost:8787/api/publisher/requests \
       {"id":"stop","label":"Stop the change","tone":"destructive"}
     ],
     "allowFreeText": true,
-    "expiresAt": "2026-08-10T23:30:00+09:00",
-    "callback": {"correlationId":"cutover-42"}
+    "expiresAt": "2026-08-10T23:30:00+09:00"
   }'
 ```
 
@@ -105,7 +104,11 @@ curl --request POST http://localhost:8787/api/publisher/bootstrap-tokens \
   --data '{"expiresInSeconds":3600}'
 ```
 
-If a request includes `callback.url`, the Worker sends one best-effort `POST` when it resolves or is cancelled. The JSON body is signed as `X-Sumi-Decision-Signature: sha256=<base64url HMAC-SHA256>` with `CALLBACK_SIGNING_SECRET`. There is no retry queue in this temporary app; poll D1 state to determine the result.
+Callback routing is deployment-owned. Set one exact public HTTPS `CALLBACK_URL`; a request can then opt into delivery with `"callback":{"correlationId":"cutover-42"}`. A request may include `callback.url` only as an assertion, and it must exactly match `CALLBACK_URL`. It never selects an arbitrary destination. If callback is requested while the deployment has no valid destination, creation fails closed.
+
+When the request resolves or is cancelled, the terminal D1 transition also mints and stores one immutable delivery ID and creation time. The Worker sends one best-effort `POST` whose exact JSON body contains `schema`, `delivery.id`, `delivery.createdAt`, `type`, and the request. The exact bytes are signed as `X-Sumi-Decision-Signature: sha256=<base64url HMAC-SHA256>` with `CALLBACK_SIGNING_SECRET`; the ID is also copied to `X-Sumi-Decision-Delivery-Id`.
+
+**Receiver contract:** verify the signature over the raw body, then atomically claim/deduplicate `delivery.id` in the receiver's durable store **before** performing any effect. If the claim already exists, return success without repeating effects. The same delivery may be replayed with byte-identical body and signature even though this temporary sender has no retry queue. Publisher polling remains authoritative.
 
 ## Validation
 
@@ -132,13 +135,14 @@ pnpm test:e2e
    pnpm exec web-push generate-vapid-keys
    ```
 
-3. Set every live secret. Use independent random values; do not reuse Sumi credentials:
+3. Set every live deployment value through Worker secret bindings. Use independent random credentials and do not reuse Sumi credentials. `CALLBACK_URL` and the VAPID public metadata are not confidential, but keeping every deployment-specific value out of source makes this temporary app easier to replace:
 
    ```bash
    pnpm exec wrangler secret put PUBLISHER_TOKEN
    pnpm exec wrangler secret put HUMAN_BOOTSTRAP_SECRET
    pnpm exec wrangler secret put SESSION_SIGNING_SECRET
    pnpm exec wrangler secret put CALLBACK_SIGNING_SECRET
+   pnpm exec wrangler secret put CALLBACK_URL
    pnpm exec wrangler secret put VAPID_PUBLIC_KEY
    pnpm exec wrangler secret put VAPID_PRIVATE_KEY
    pnpm exec wrangler secret put VAPID_SUBJECT
@@ -159,7 +163,8 @@ Keep `COOKIE_SECURE=true` in production. The live Worker should use a custom HTT
 - Human writes require the Strict same-site session cookie, exact same-origin `Origin`, and a derived CSRF token.
 - Raw bootstrap and session tokens are never stored. Publisher auth is a Worker secret; rows carry only a hash of the stable, non-secret `PUBLISHER_ID`, so the bearer secret can rotate without orphaning requests. Push endpoints must remain reversible because they are delivery addresses.
 - Request title/body/reply are bounded plain text. The PWA renders React text nodes and has no Markdown or HTML renderer.
-- Callback URLs must be public HTTPS hostnames. Callback delivery follows no redirects.
+- Callback requests can target only the deployment's exact public HTTPS `CALLBACK_URL`. Callback delivery follows no redirects, and receivers must atomically deduplicate the signed immutable delivery ID before effects.
+- Push retention is deliberately small: at most four active subscriptions, idle entries are removed after 45 days, and records are renewed or removed after an absolute 180 days. The browser refreshes `last_seen_at` by re-registering its existing subscription when the app opens. Stale/aged pruning, upsert, and cap enforcement share one atomic D1 batch; delivery independently limits fan-out to four.
 - Rate counters bound bootstrap, publish, read, response, and subscription routes for personal use. They are not an abuse-prevention product.
 - Later authentication should be Cloudflare Access or Sumi Human auth. Later delivery should be Sumi notification intent/outbox. Do not grow this bootstrap/session scheme into shared product infrastructure.
 
@@ -167,6 +172,7 @@ Keep `COOKIE_SECURE=true` in production. The live Worker should use a custom HTT
 
 - Web Push delivery depends on the phone/browser push service and is not an execution guarantee.
 - Callback delivery is a single best-effort attempt; polling is the source of truth.
+- Only four recently confirmed push subscriptions are retained; opening an older device lets its existing authorized subscription reclaim an active slot.
 - Lists are capped at 100 rows with no pagination.
 - There is no admin UI, credential rotation UI, multi-Human isolation, or data export.
 - iOS requires installing the PWA to the Home Screen before standards-based Web Push is available.

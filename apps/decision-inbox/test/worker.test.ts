@@ -3,7 +3,12 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deliverDecisionCallback } from "../src/callback";
+import type { DecisionRequest } from "../src/contracts";
+import { hmac, sha256 } from "../src/crypto";
+import type { DecisionRow } from "../src/db";
+import { MAX_ACTIVE_PUSH_SUBSCRIPTIONS } from "../src/push";
 import worker from "../src/worker";
 
 const origin = "https://decision.test";
@@ -36,7 +41,6 @@ function decisionInput(overrides: Record<string, unknown> = {}) {
     ],
     allowFreeText: true,
     expiresAt: defaultExpiresAt,
-    callback: { correlationId: "cutover-42" },
     ...overrides,
   };
 }
@@ -72,6 +76,10 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM push_subscriptions"),
     env.DB.prepare("DELETE FROM rate_limits"),
   ]);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe("publisher contract", () => {
@@ -160,6 +168,34 @@ describe("publisher contract", () => {
     expect(login.response.status).toBe(200);
     const replay = await signIn(payload.bootstrapToken);
     expect(replay.response.status).toBe(401);
+  });
+
+  it("uses only the deployment callback URL and rejects a mismatch", async () => {
+    const mismatch = await createDecision("request-key-callback-mismatch", {
+      callback: {
+        url: "https://other.example.test/hooks/decision-inbox",
+        correlationId: "cutover-42",
+      },
+    });
+    expect(mismatch.status).toBe(422);
+    expect((await mismatch.json()) as object).toMatchObject({
+      error: { code: "callback_url_mismatch" },
+    });
+
+    const accepted = await createDecision("request-key-callback-configured", {
+      callback: { correlationId: "cutover-42" },
+    });
+    expect(accepted.status).toBe(201);
+    const requestId = ((await accepted.json()) as { request: { id: string } })
+      .request.id;
+    const stored = await env.DB.prepare(
+      "SELECT callback_url FROM decision_requests WHERE id = ?",
+    )
+      .bind(requestId)
+      .first<{ callback_url: string }>();
+    expect(stored?.callback_url).toBe(
+      "https://publisher.example.test/hooks/decision-inbox",
+    );
   });
 });
 
@@ -297,5 +333,209 @@ describe("Human decision flow", () => {
       },
     );
     expect(response.status).toBe(409);
+  });
+
+  it("persists one stable signed callback delivery across a replay", async () => {
+    const sent = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", sent);
+    const created = (await (
+      await createDecision("request-key-callback-replay", {
+        callback: { correlationId: "cutover-42" },
+      })
+    ).json()) as { request: { id: string } };
+    const { cookie, body } = await signIn();
+    const headers = {
+      "Content-Type": "application/json",
+      Cookie: cookie,
+      Origin: origin,
+      "X-CSRF-Token": body.csrfToken,
+    };
+    const answer = {
+      choiceId: "now",
+      reply: "Use the checked release head.",
+      idempotencyKey: "response-key-callback",
+    };
+    const resolved = await call(
+      `/api/human/requests/${created.request.id}/respond`,
+      { method: "POST", headers, body: JSON.stringify(answer) },
+    );
+    expect(resolved.status).toBe(200);
+    const decision = ((await resolved.json()) as { request: DecisionRequest })
+      .request;
+    const storedBeforeReplay = await env.DB.prepare(
+      "SELECT * FROM decision_requests WHERE id = ?",
+    )
+      .bind(created.request.id)
+      .first<DecisionRow>();
+    expect(storedBeforeReplay?.callback_delivery_id).toBeTruthy();
+    expect(storedBeforeReplay?.callback_delivery_created_at).toBeTruthy();
+    expect(sent).toHaveBeenCalledOnce();
+
+    const firstInit = sent.mock.calls[0]?.[1] as RequestInit;
+    const firstBody = String(firstInit.body);
+    const firstHeaders = new Headers(firstInit.headers);
+    const parsedBody = JSON.parse(firstBody) as {
+      schema: string;
+      delivery: { id: string; createdAt: string };
+    };
+    expect(parsedBody).toMatchObject({
+      schema: "sumi.decision.callback.v1",
+      delivery: {
+        id: storedBeforeReplay?.callback_delivery_id,
+        createdAt: new Date(
+          storedBeforeReplay?.callback_delivery_created_at ?? 0,
+        ).toISOString(),
+      },
+    });
+    expect(firstHeaders.get("X-Sumi-Decision-Delivery-Id")).toBe(
+      storedBeforeReplay?.callback_delivery_id,
+    );
+    expect(firstHeaders.get("X-Sumi-Decision-Signature")).toBe(
+      `sha256=${await hmac(env.CALLBACK_SIGNING_SECRET, firstBody)}`,
+    );
+
+    await deliverDecisionCallback(
+      env,
+      {
+        callbackUrl: storedBeforeReplay?.callback_url ?? "",
+        deliveryId: storedBeforeReplay?.callback_delivery_id ?? "",
+        deliveryCreatedAt:
+          storedBeforeReplay?.callback_delivery_created_at ?? 0,
+        decision,
+      },
+      sent,
+    );
+    expect(sent).toHaveBeenCalledTimes(2);
+    const replayInit = sent.mock.calls[1]?.[1] as RequestInit;
+    expect(replayInit.body).toBe(firstBody);
+    expect(
+      new Headers(replayInit.headers).get("X-Sumi-Decision-Signature"),
+    ).toBe(firstHeaders.get("X-Sumi-Decision-Signature"));
+
+    const apiReplay = await call(
+      `/api/human/requests/${created.request.id}/respond`,
+      { method: "POST", headers, body: JSON.stringify(answer) },
+    );
+    expect(apiReplay.status).toBe(200);
+    expect(sent).toHaveBeenCalledTimes(2);
+    const storedAfterReplay = await env.DB.prepare(
+      "SELECT callback_delivery_id, callback_delivery_created_at FROM decision_requests WHERE id = ?",
+    )
+      .bind(created.request.id)
+      .first<{
+        callback_delivery_id: string;
+        callback_delivery_created_at: number;
+      }>();
+    expect(storedAfterReplay).toEqual({
+      callback_delivery_id: storedBeforeReplay?.callback_delivery_id,
+      callback_delivery_created_at:
+        storedBeforeReplay?.callback_delivery_created_at,
+    });
+  });
+});
+
+describe("Web Push subscription API", () => {
+  function subscription(index: number) {
+    return {
+      endpoint: `https://push.example.invalid/subscription-${index}`,
+      expirationTime: null,
+      keys: {
+        p256dh: `test-p256dh-key-material-${index}`,
+        auth: `test-auth-key-${index}`,
+      },
+    };
+  }
+
+  it("refreshes last-seen and evicts the least-recent endpoint at the cap", async () => {
+    const { cookie, body } = await signIn();
+    const now = Date.now();
+    for (let index = 0; index < MAX_ACTIVE_PUSH_SUBSCRIPTIONS; index += 1) {
+      const value = subscription(index);
+      await env.DB.prepare(
+        `INSERT INTO push_subscriptions (
+          endpoint_hash, endpoint, expiration_time, p256dh, auth, created_at, last_seen_at
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?)`,
+      )
+        .bind(
+          await sha256(`push:${value.endpoint}`),
+          value.endpoint,
+          value.keys.p256dh,
+          value.keys.auth,
+          now - 20_000 + index,
+          now - 20_000 + index,
+        )
+        .run();
+    }
+
+    const newest = subscription(99);
+    const response = await call("/api/human/push-subscriptions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: cookie,
+        Origin: origin,
+        "X-CSRF-Token": body.csrfToken,
+      },
+      body: JSON.stringify(newest),
+    });
+    expect(response.status).toBe(201);
+    const rows = await env.DB.prepare(
+      "SELECT endpoint_hash, last_seen_at FROM push_subscriptions ORDER BY last_seen_at DESC",
+    ).all<{ endpoint_hash: string; last_seen_at: number }>();
+    expect(rows.results).toHaveLength(MAX_ACTIVE_PUSH_SUBSCRIPTIONS);
+    expect(rows.results.map((row) => row.endpoint_hash)).toContain(
+      await sha256(`push:${newest.endpoint}`),
+    );
+    expect(rows.results.map((row) => row.endpoint_hash)).not.toContain(
+      await sha256(`push:${subscription(0).endpoint}`),
+    );
+
+    const newestHash = await sha256(`push:${newest.endpoint}`);
+    const beforeRefresh = Date.now() - 10_000;
+    await env.DB.prepare(
+      "UPDATE push_subscriptions SET last_seen_at = ? WHERE endpoint_hash = ?",
+    )
+      .bind(beforeRefresh, newestHash)
+      .run();
+    const refresh = await call("/api/human/push-subscriptions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: cookie,
+        Origin: origin,
+        "X-CSRF-Token": body.csrfToken,
+      },
+      body: JSON.stringify(newest),
+    });
+    expect(refresh.status).toBe(201);
+    const refreshed = await env.DB.prepare(
+      "SELECT last_seen_at FROM push_subscriptions WHERE endpoint_hash = ?",
+    )
+      .bind(newestHash)
+      .first<{ last_seen_at: number }>();
+    expect(refreshed?.last_seen_at).toBeGreaterThan(beforeRefresh);
+  });
+
+  it("keeps the active cap under concurrent subscribe requests", async () => {
+    const { cookie, body } = await signIn();
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, (_, index) =>
+        call("/api/human/push-subscriptions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: cookie,
+            Origin: origin,
+            "X-CSRF-Token": body.csrfToken,
+          },
+          body: JSON.stringify(subscription(index)),
+        }),
+      ),
+    );
+    expect(responses.every((response) => response.status === 201)).toBe(true);
+    const stored = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM push_subscriptions",
+    ).first<{ count: number }>();
+    expect(stored?.count).toBe(MAX_ACTIVE_PUSH_SUBSCRIPTIONS);
   });
 });

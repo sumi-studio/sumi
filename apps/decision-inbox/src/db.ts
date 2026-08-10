@@ -26,6 +26,8 @@ export interface DecisionRow {
   resolution_key: string | null;
   callback_attempted_at: number | null;
   callback_status: number | null;
+  callback_delivery_id: string | null;
+  callback_delivery_created_at: number | null;
   response_id: string | null;
   response_choice_id: string | null;
   response_reply: string | null;

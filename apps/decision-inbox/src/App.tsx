@@ -92,22 +92,6 @@ function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/u, "");
-}
-
-async function pushEndpointHash(endpoint: string): Promise<string> {
-  const bytes = new TextEncoder().encode(`push:${endpoint}`);
-  return bytesToBase64Url(
-    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
-  );
-}
-
 function Icon({
   name,
   size = 18,
@@ -768,13 +752,8 @@ export function App() {
       .then((registration) => registration.pushManager.getSubscription())
       .then(async (subscription) => {
         if (subscription) {
-          const endpointHash = await pushEndpointHash(subscription.endpoint);
-          if (session.registeredEndpointHashes.includes(endpointHash)) {
-            setPushState("on");
-          } else {
-            await subscription.unsubscribe();
-            setPushState("expired");
-          }
+          await api.subscribe(subscription.toJSON());
+          setPushState("on");
         } else if (
           Notification.permission === "granted" ||
           session.pushSubscriptionCount > 0
