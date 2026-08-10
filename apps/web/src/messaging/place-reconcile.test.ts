@@ -118,7 +118,9 @@ class FakeBackend implements MessagingBackend {
   async setStatus() {}
   async createReplyLater() {}
   async resolveReplyLater() {}
-  async toggleReaction() {}
+  async toggleReaction() {
+    return { messageId: "unused", reactions: [] };
+  }
   sendTyping() {}
 
   subscribe(
