@@ -21,6 +21,8 @@ import { useMessaging } from "../store";
 import { useOverlayPanel } from "./overlay";
 
 const SEARCH_DEBOUNCE_MS = 300;
+const MAX_SEARCH_QUERY_BYTES = 200;
+const UTF8_ENCODER = new TextEncoder();
 
 const RESULT_TIME_FORMAT = new Intl.DateTimeFormat("ja-JP", {
   month: "numeric",
@@ -28,6 +30,19 @@ const RESULT_TIME_FORMAT = new Intl.DateTimeFormat("ja-JP", {
   hour: "2-digit",
   minute: "2-digit",
 });
+
+function limitSearchQuery(raw: string): string {
+  if (UTF8_ENCODER.encode(raw).length <= MAX_SEARCH_QUERY_BYTES) return raw;
+  let byteLength = 0;
+  let limited = "";
+  for (const character of raw) {
+    const characterBytes = UTF8_ENCODER.encode(character).length;
+    if (byteLength + characterBytes > MAX_SEARCH_QUERY_BYTES) break;
+    limited += character;
+    byteLength += characterBytes;
+  }
+  return limited;
+}
 
 /** 検索結果のplace表示名。usePlaceDisplayと同じ解決規則（DMは相手の名前）。 */
 function placeLabel(
@@ -103,6 +118,7 @@ export function MessageSearch({
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [failed, setFailed] = useState(false);
   const [results, setResults] = useState<MessageSearchResult[] | null>(null);
   const timerRef = useRef<number | null>(null);
   const requestIdRef = useRef(0);
@@ -114,14 +130,22 @@ export function MessageSearch({
       if (!trimmed) {
         setResults(null);
         setSearching(false);
+        setFailed(false);
         return;
       }
       setSearching(true);
+      setFailed(false);
       try {
         const found = await searchMessages(trimmed);
-        if (requestIdRef.current === requestId) setResults(found);
+        if (requestIdRef.current === requestId) {
+          setResults(found);
+          setFailed(false);
+        }
       } catch {
-        if (requestIdRef.current === requestId) setResults([]);
+        if (requestIdRef.current === requestId) {
+          setResults(null);
+          setFailed(true);
+        }
       } finally {
         if (requestIdRef.current === requestId) setSearching(false);
       }
@@ -132,6 +156,11 @@ export function MessageSearch({
   const scheduleSearch = useCallback(
     (raw: string) => {
       if (timerRef.current) window.clearTimeout(timerRef.current);
+      // Invalidate the in-flight request when input changes, not after the
+      // debounce delay. Otherwise an old response can appear under a new query.
+      requestIdRef.current += 1;
+      setResults(null);
+      setFailed(false);
       timerRef.current = window.setTimeout(() => {
         void runSearch(raw);
       }, SEARCH_DEBOUNCE_MS);
@@ -171,11 +200,11 @@ export function MessageSearch({
           ref={overlay.triggerProps.ref}
           value={query}
           placeholder="検索"
-          maxLength={100}
           onChange={(event) => {
-            setQuery(event.target.value);
+            const nextQuery = limitSearchQuery(event.target.value);
+            setQuery(nextQuery);
             setOpen(true);
-            scheduleSearch(event.target.value);
+            scheduleSearch(nextQuery);
           }}
           onFocus={() => {
             if (query.trim()) setOpen(true);
@@ -210,7 +239,11 @@ export function MessageSearch({
               <Loader2 className="size-3 animate-spin text-muted-foreground" />
             ) : null}
           </p>
-          {results === null ? null : results.length === 0 && !searching ? (
+          {failed && !searching ? (
+            <p className="px-2 pb-2 text-[12px] text-rose-500">
+              検索に失敗しました
+            </p>
+          ) : results === null ? null : results.length === 0 && !searching ? (
             <p className="px-2 pb-2 text-[12px] text-muted-foreground/70">
               一致するメッセージはありません
             </p>
