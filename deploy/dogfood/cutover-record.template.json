@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "status": "not_cut_over",
+  "canonical_host": "<lowercase-hostname>",
+  "cutover_at": null,
+  "app_sha": null,
+  "migration_manifest_sha256": null,
+  "origin_images": {
+    "api": null,
+    "runtime_provisioner": null,
+    "postgres": null,
+    "cloudflared": null,
+    "agent_tag": null
+  },
+  "edge": {
+    "worker_version_id": null,
+    "deployment_id": null,
+    "named_tunnel_id": null
+  },
+  "backup_rehearsal": {
+    "snapshot_id": null,
+    "handoff_manifest_sha256": null,
+    "restored_at": null,
+    "restored_agent_volume_map_sha256": null
+  },
+  "restart_smoke": {
+    "ran_at": null,
+    "browser": null,
+    "result": null
+  },
+  "protected_data": [
+    "postgres_control_plane",
+    "messaging_metadata",
+    "messaging_read_state",
+    "messaging_attachments",
+    "api_command_log",
+    "api_runtime_state",
+    "personality_agent_private_volumes"
+  ],
+  "policy": "After cutover_at, applied migration files are immutable and schema changes are forward-only."
+}

@@ -216,7 +216,7 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux     *http.ServeMux
+	publicMux     http.Handler
 	localMux      *http.ServeMux
 	localListener *localControlListenerConfig
 	store         *agentevents.CommandStore
@@ -267,7 +267,7 @@ func (a *application) Close() error {
 	return a.closeErr
 }
 
-func newRouter() (*http.ServeMux, error) {
+func newRouter() (http.Handler, error) {
 	app, err := newApplicationFromEnv()
 	if err != nil {
 		return nil, err
@@ -471,8 +471,11 @@ func newApplicationFromEnv() (*application, error) {
 		browser.SetSpawner(spawnManager)
 	}
 	mux.HandleFunc("GET /health", handler.Health)
+	mux.Handle("GET /ready", handler.Readiness{
+		Checks: readinessChecks(databasePool),
+	})
 	return &application{
-		publicMux:     mux,
+		publicMux:     noStoreAPIResponses(mux),
 		localMux:      localMux,
 		localListener: localListener,
 		store:         store,
@@ -482,6 +485,75 @@ func newApplicationFromEnv() (*application, error) {
 		localRuntimes: localRuntimes,
 		messaging:     messagingServer,
 	}, nil
+}
+
+// noStoreAPIResponses leaves response bodies, Set-Cookie multiplicity, and
+// WebSocket upgrades untouched while making the API listener an explicit
+// no-cache origin. The edge Worker can therefore stream the origin response
+// directly instead of reconstructing it merely to add cache policy.
+func noStoreAPIResponses(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(response, request)
+	})
+}
+
+func readinessChecks(databasePool *pgxpool.Pool) []handler.ReadinessCheck {
+	checks := make([]handler.ReadinessCheck, 0, 7)
+	if databasePool != nil {
+		checks = append(checks,
+			handler.ReadinessCheck{Name: "database", Check: databasePool.Ping},
+			handler.ReadinessCheck{Name: "migration_manifest", Check: func(ctx context.Context) error {
+				return db.VerifyMigrations(ctx, databasePool)
+			}},
+		)
+	}
+	for _, directory := range []struct {
+		name string
+		path string
+	}{
+		{name: "command_log", path: strings.TrimSpace(os.Getenv("SUMI_COMMAND_LOG_DIR"))},
+		{name: "runtime_state", path: strings.TrimSpace(os.Getenv("SUMI_AGENT_RUNTIME_STATE_DIR"))},
+		{name: "attachments", path: strings.TrimSpace(os.Getenv("SUMI_MESSAGING_ATTACHMENT_ROOT"))},
+		{name: "local_control", path: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_ROOT"))},
+	} {
+		if directory.path == "" {
+			continue
+		}
+		name, path := directory.name, directory.path
+		checks = append(checks, handler.ReadinessCheck{Name: name, Check: func(context.Context) error {
+			return checkWritableDirectory(path)
+		}})
+	}
+	if socket := strings.TrimSpace(os.Getenv("SUMI_RUNTIME_PROVISIONER_SOCKET")); socket != "" {
+		checks = append(checks, handler.ReadinessCheck{Name: "runtime_provisioner", Check: func(ctx context.Context) error {
+			var dialer net.Dialer
+			connection, err := dialer.DialContext(ctx, "unix", socket)
+			if err != nil {
+				return err
+			}
+			return connection.Close()
+		}})
+	}
+	return checks
+}
+
+func checkWritableDirectory(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+	probe, err := os.CreateTemp(path, ".sumi-readiness-*")
+	if err != nil {
+		return err
+	}
+	name := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(name)
+	return errors.Join(closeErr, removeErr)
 }
 
 // registerMessagingCallRoutes keeps the browser's read-only current-state

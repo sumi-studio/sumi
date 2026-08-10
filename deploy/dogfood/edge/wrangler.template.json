@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "sumi-dogfood-edge",
+  "main": "./worker.mjs",
+  "compatibility_date": "2026-08-10",
+  "compatibility_flags": ["global_fetch_private_origin"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "__SUMI_CANONICAL_HOST__/*",
+      "zone_name": "__SUMI_ZONE_NAME__"
+    }
+  ],
+  "vars": {
+    "SUMI_APP_SHA": "__SUMI_APP_SHA__"
+  },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/auth",
+      "/auth/*",
+      "/direct-chat",
+      "/direct-chat/*",
+      "/messaging",
+      "/messaging/*",
+      "/health",
+      "/health/*",
+      "/ready",
+      "/ready/*",
+      "/agent",
+      "/agent/*",
+      "/local-control",
+      "/local-control/*",
+      "/mcp-app-sandbox.html"
+    ]
+  }
+}

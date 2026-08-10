@@ -6,31 +6,75 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 )
 
 func main() {
-	databaseURL := os.Getenv("SUMI_DB_URL")
-	if databaseURL == "" {
-		log.Fatal("SUMI_DB_URL is required")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context, args []string, output io.Writer) error {
+	mode := "apply"
+	if len(args) > 1 {
+		return errors.New("usage: sumi-migrate [apply|verify|status|manifest]")
+	}
+	if len(args) == 1 {
+		mode = strings.TrimSpace(args[0])
+	}
+	if mode == "manifest" {
+		entries, digest, err := db.EmbeddedMigrationManifest()
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(output).Encode(struct {
+			ManifestSHA256 string                      `json:"manifest_sha256"`
+			Migrations     []db.MigrationManifestEntry `json:"migrations"`
+		}{ManifestSHA256: digest, Migrations: entries})
+	}
+	if mode != "apply" && mode != "verify" && mode != "status" {
+		return fmt.Errorf("unknown mode %q; usage: sumi-migrate [apply|verify|status|manifest]", mode)
+	}
+
+	databaseURL := strings.TrimSpace(os.Getenv("SUMI_DB_URL"))
+	if databaseURL == "" {
+		return errors.New("SUMI_DB_URL is required")
+	}
 	pool, err := db.Open(ctx, databaseURL)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		return fmt.Errorf("open database: %w", err)
 	}
 	defer pool.Close()
-	if err := db.Migrate(ctx, pool.Pool); err != nil {
-		log.Fatalf("migrate: %v", err)
+	if mode == "apply" {
+		if err := db.Migrate(ctx, pool.Pool); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+	}
+	status, verifyErr := db.MigrationManifestStatus(ctx, pool.Pool)
+	if mode == "status" || mode == "apply" {
+		if err := json.NewEncoder(output).Encode(status); err != nil {
+			return fmt.Errorf("write migration status: %w", err)
+		}
+	}
+	if verifyErr != nil {
+		return fmt.Errorf("verify migrations: %w", verifyErr)
 	}
 	version, err := db.LatestAppliedVersion(ctx, pool.Pool)
 	if err != nil {
-		log.Fatalf("read latest version: %v", err)
+		return fmt.Errorf("read latest version: %w", err)
 	}
-	log.Printf("migrations applied; latest version %d", version)
+	log.Printf("migration manifest %s; latest version %d", mode, version)
+	return nil
 }

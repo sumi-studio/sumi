@@ -1,0 +1,223 @@
+name: sumi-dogfood
+
+x-service-hardening: &service-hardening
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+
+services:
+  postgres:
+    image: ${SUMI_POSTGRES_IMAGE:?set an image@sha256 digest}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sumi
+      POSTGRES_DB: sumi
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U sumi -d sumi"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    networks: [data]
+    stop_grace_period: 60s
+
+  host-state-init:
+    image: ${SUMI_API_IMAGE:?set an image@sha256 digest}
+    user: "0:0"
+    entrypoint: [/busybox/sh]
+    command:
+      - -ceu
+      - |
+        install -d -o 65532 -g 65532 -m 0700 \
+          /var/lib/sumi/command-log \
+          /var/lib/sumi/runtime-state \
+          /var/lib/sumi/attachments
+        install -d -o 65532 -g 20000 -m 0750 /run/sumi/local-control
+        install -d -o 0 -g 0 -m 0700 /run/sumi/runtime-secrets
+        install -d -o 0 -g 20000 -m 0750 /run/sumi/runtime-provisioner
+        install -d -o 0 -g 0 -m 0700 /run/sumi/supervisor-locks
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    volumes:
+      - type: bind
+        source: ${SUMI_DOGFOOD_STATE_ROOT:?set an absolute persistent state root}
+        target: /var/lib/sumi
+        bind: { create_host_path: false }
+      - type: bind
+        source: /run/sumi/local-control
+        target: /run/sumi/local-control
+        bind: { create_host_path: false }
+      - type: bind
+        source: /run/sumi/runtime-secrets
+        target: /run/sumi/runtime-secrets
+        bind: { create_host_path: false }
+      - type: bind
+        source: /run/sumi/runtime-provisioner
+        target: /run/sumi/runtime-provisioner
+        bind: { create_host_path: false }
+      - type: bind
+        source: /run/sumi/supervisor-locks
+        target: /run/sumi/supervisor-locks
+        bind: { create_host_path: false }
+    restart: "no"
+
+  migrate:
+    image: ${SUMI_API_IMAGE:?set an image@sha256 digest}
+    entrypoint: [/usr/local/bin/sumi-migrate]
+    command: [apply]
+    environment:
+      SUMI_DB_URL: ${SUMI_DB_URL:?set the dogfood database URL}
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [data]
+    restart: "no"
+
+  # Maintenance SQL never runs from the host. This digest-pinned client has
+  # only the internal data network and no database volume or published port.
+  # `compose-database.sh` supplies one fixed operation through /bin/sh.
+  database-client:
+    image: ${SUMI_POSTGRES_IMAGE:?set an image@sha256 digest}
+    profiles: [maintenance]
+    entrypoint: [/bin/sh]
+    command: [-ceu, "exit 2"]
+    environment:
+      SUMI_DB_URL: ${SUMI_DB_URL:?set the dogfood database URL}
+      SUMI_RESTORE_DB_URL: ${SUMI_RESTORE_DB_URL:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    networks: [data]
+    restart: "no"
+
+  runtime-provisioner:
+    image: ${SUMI_PROVISIONER_IMAGE:?set an image@sha256 digest}
+    user: "0:0"
+    environment:
+      DOCKER_CONFIG: /run/sumi/docker-config
+      SUMI_AGENT_IMAGE_TAG: ${SUMI_APP_SHA:?set the exact source commit}
+      SUMI_CONTROL_PLANE_NETWORK: sumi-control-plane
+      SUMI_RUNTIME_SECRET_HOST_ROOT: /run/sumi/runtime-secrets
+    command:
+      - -socket
+      - /run/sumi/runtime-provisioner/control.sock
+      - -socket-gid
+      - "20000"
+      - -supervisor
+      - /opt/sumi/deploy/agent/supervisor
+    depends_on:
+      host-state-init: { condition: service_completed_successfully }
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/sumi/local-control:/run/sumi/local-control
+      - /run/sumi/runtime-secrets:/run/sumi/runtime-secrets
+      - /run/sumi/runtime-provisioner:/run/sumi/runtime-provisioner
+      - /run/sumi/supervisor-locks:/run/sumi/supervisor-locks
+      - type: bind
+        source: ${SUMI_DOCKER_CONFIG_FILE:?set a protected Docker config.json}
+        target: /run/sumi/docker-config/config.json
+        read_only: true
+        bind: { create_host_path: false }
+    networks: [control-plane]
+    restart: unless-stopped
+    stop_grace_period: 120s
+
+  api:
+    <<: *service-hardening
+    image: ${SUMI_API_IMAGE:?set an image@sha256 digest}
+    user: "65532:65532"
+    group_add: ["20000"]
+    environment:
+      PORT: "8080"
+      SUMI_APP_SHA: ${SUMI_APP_SHA:?set the exact source commit}
+      SUMI_DB_URL: ${SUMI_DB_URL:?set the dogfood database URL}
+      SUMI_COMMAND_LOG_DIR: /var/lib/sumi/command-log
+      SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi/runtime-state
+      SUMI_MESSAGING_ATTACHMENT_ROOT: /var/lib/sumi/attachments
+      SUMI_RUNTIME_PROVISIONER_SOCKET: /run/sumi/runtime-provisioner/control.sock
+      SUMI_LOCAL_CONTROL_ENABLED: "1"
+      SUMI_LOCAL_CONTROL_ROOT: /run/sumi/local-control
+      SUMI_LOCAL_CONTROL_SOCKET_GID: "20000"
+      SUMI_LOCAL_CONTROL_TENANT_ID: ${SUMI_LOCAL_CONTROL_TENANT_ID:?set the dogfood tenant id}
+      SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION: ${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}
+      SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:?set a base64 signing secret}
+      SUMI_AGENT_TOKEN_AUDIENCE: ${SUMI_AGENT_TOKEN_AUDIENCE:-sumi:agent:events}
+      SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?set a base64 session secret}
+      SUMI_BROWSER_SESSION_AUDIENCE: ${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}
+      SUMI_BROWSER_WS_ALLOWED_ORIGINS: https://${SUMI_CANONICAL_HOST:?set the canonical hostname}
+      SUMI_AUTH_FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:?set the Firebase project}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase_adc
+      SUMI_APPROVAL_SECRET_DIGEST_KEY: ${SUMI_APPROVAL_SECRET_DIGEST_KEY:?set 64 hex characters}
+      SUMI_PROVIDER_API_KEY: ${SUMI_PROVIDER_API_KEY:?set the provider credential}
+      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      SUMI_MODEL_ID: ${SUMI_MODEL_ID:-}
+      SUMI_AGENT_GATEWAY_URL: ws://api:8080/agent/ws
+      SUMI_MESSAGING_PUSH_SUBJECT: ${SUMI_MESSAGING_PUSH_SUBJECT:-}
+      SUMI_LIVEKIT_URL: ${SUMI_LIVEKIT_URL:-}
+      SUMI_LIVEKIT_API_KEY: ${SUMI_LIVEKIT_API_KEY:-}
+      SUMI_LIVEKIT_API_SECRET: ${SUMI_LIVEKIT_API_SECRET:-}
+    secrets: [firebase_adc]
+    depends_on:
+      postgres: { condition: service_healthy }
+      host-state-init: { condition: service_completed_successfully }
+      runtime-provisioner: { condition: service_started }
+    volumes:
+      - ${SUMI_DOGFOOD_STATE_ROOT:?set an absolute persistent state root}:/var/lib/sumi
+      - /run/sumi/local-control:/run/sumi/local-control
+      - /run/sumi/runtime-provisioner:/run/sumi/runtime-provisioner
+    expose: ["8080"]
+    networks:
+      control-plane: { aliases: [api] }
+      data: {}
+      edge: {}
+    healthcheck:
+      test: [CMD, /busybox/wget, -q, -O, /dev/null, http://127.0.0.1:8080/ready]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+    stop_grace_period: 30s
+    deploy:
+      replicas: 1
+      update_config:
+        order: stop-first
+        parallelism: 1
+
+  cloudflared:
+    <<: *service-hardening
+    image: ${SUMI_CLOUDFLARED_IMAGE:?set an image@sha256 digest}
+    command: [tunnel, --no-autoupdate, run, --token-file, /run/secrets/cloudflare_tunnel_token]
+    secrets: [cloudflare_tunnel_token]
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [edge]
+
+secrets:
+  postgres_password:
+    file: ${SUMI_POSTGRES_PASSWORD_FILE:?set a 0600 password file}
+  firebase_adc:
+    file: ${SUMI_FIREBASE_ADC_FILE:?set a service-account ADC file}
+  cloudflare_tunnel_token:
+    file: ${SUMI_CLOUDFLARE_TUNNEL_TOKEN_FILE:?set a 0600 named Tunnel token file}
+
+volumes:
+  postgres-data: {}
+
+networks:
+  control-plane:
+    name: sumi-control-plane
+  data:
+    internal: true
+  edge: {}
