@@ -47,6 +47,7 @@ var (
 	ErrNotAuthor           = errors.New("only the author may do this")
 	ErrForbidden           = errors.New("participant lacks the required role")
 	ErrMessageDeleted      = errors.New("message is deleted")
+	ErrIdempotencyConflict = errors.New("idempotency key was already used for another reaction mutation")
 	ErrSeqBeyondLatest     = errors.New("seq is beyond the place's latest seq")
 )
 

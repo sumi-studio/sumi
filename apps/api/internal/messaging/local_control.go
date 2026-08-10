@@ -10,6 +10,7 @@ const (
 	LocalOverviewPath    = "/local-control/v1/messaging:overview"
 	LocalOpenPath        = "/local-control/v1/messaging:open"
 	LocalWritePath       = "/local-control/v1/messaging:write"
+	LocalReactPath       = "/local-control/v1/messaging:react"
 	LocalReadThroughPath = "/local-control/v1/messaging:read-through"
 )
 
@@ -24,6 +25,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalOverviewPath, s.localOverview},
 		{"POST " + LocalOpenPath, s.localOpen},
 		{"POST " + LocalWritePath, s.localWrite},
+		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
 	}
 	for _, route := range routes {
@@ -163,6 +165,46 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		Seq       int64       `json:"seq"`
 		Message   messageWire `json:"message"`
 	}{message.MessageID, message.Seq, messageToWire(place, message)})
+}
+
+// localReact toggles the agent's emoji on a message through the identical
+// store path the human UI uses. The tool layer scopes it to messages visible
+// in the currently open view (ADR 0011 §3: 見えていないものは操作できない);
+// the server enforces the shared permission model.
+func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID     string `json:"place_id"`
+		MessageID   string `json:"message_id"`
+		Emoji       string `json:"emoji"`
+		ClientNonce string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.MessageID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || validateReactionEmoji(request.Emoji) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	message, reacted, err := s.toggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji, request.ClientNonce)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, message)
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+		Reacted bool        `json:"reacted"`
+	}{wire, reacted})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

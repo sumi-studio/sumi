@@ -15,7 +15,9 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ReactionSummary,
   ReplyLaterMarker,
+  ServerEvent,
   StatusKind,
   Urgency,
   WorkspaceSummary,
@@ -26,6 +28,18 @@ import { mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
+/** reaction再同期の1ページ上限（serverの上限と同じ）。 */
+const REACTION_RESYNC_LIMIT = 200;
+
+/** reactionの同一判定用。無変化ならmessageの参照を保って再描画を避ける。 */
+function reactionsFingerprint(reactions: readonly ReactionSummary[]): string {
+  return reactions
+    .map(
+      (entry) =>
+        `${entry.emoji}:${entry.participants.map(participantKey).join(",")}`,
+    )
+    .join("|");
+}
 
 let backend: MessagingBackend = new ApiMessagingBackend();
 
@@ -122,20 +136,242 @@ function unreadContribution(
 }
 
 let initialized = false;
+let messagingSessionGeneration = 0;
+
+type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
+
+interface ReactionProjectionOperation {
+  epoch: number;
+  journal: ReactionUpdatedEvent[];
+}
+
+interface ReactionProjectionCoordinator {
+  active: ReactionProjectionOperation | null;
+  backend: MessagingBackend;
+  epoch: number;
+  pending: number;
+  sessionGeneration: number;
+  tail: Promise<void>;
+}
+
+const reactionProjectionByPlace = new Map<
+  PlaceKey,
+  ReactionProjectionCoordinator
+>();
 
 export const useMessaging = create<MessagingState>((set, get) => {
   if (import.meta.env.DEV) {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+  const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
+    const key = placeKey(event.place);
+    // reactionだけを差し替える。message全体を置き換えると、同時に届いた
+    // 編集をこのeventが巻き戻す。未ロードのmessageは無視でよい（後で読めば
+    // 現在のreactionが付いてくる）。
+    set((state) => {
+      const current = state.messagesByPlace[key];
+      if (!current) return {};
+      let changed = false;
+      const next = current.map((message) => {
+        if (message.messageId !== event.messageId) return message;
+        // tombstoneはreactionを持たない。削除より前に始まったtoggleの遅い
+        // ACK/echoをreplayしても、削除済みmessageを復活させない。
+        if (message.deleted) return message;
+        if (
+          reactionsFingerprint(message.reactions) ===
+          reactionsFingerprint(event.reactions)
+        ) {
+          return message;
+        }
+        changed = true;
+        return { ...message, reactions: event.reactions };
+      });
+      if (!changed) return {};
+      return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+    });
+  };
+
+  /**
+   * Absolute reaction snapshotを作る処理はplaceごとのFIFOに置く。resyncと
+   * local toggle ACKが独立に完了すると、遅い古いsnapshotが新しいstateを
+   * 巻き戻せるため。active operation中のWSは即時反映しつつjournalへ一度だけ
+   * 記録し、snapshot適用後に受信順でreplayする。wire revisionがないため
+   * cross-transportの瞬時線形化は主張しない。request前にpublish済みのframeが
+   * request中に届いても、serverがown echoを同じWS FIFOへenqueueしてからHTTPを
+   * 返すことで収束し、切断・overflow時は後続のcaught_up resyncで収束する。
+   */
+  const enqueueReactionProjection = (
+    place: Place,
+    produce: (
+      operationBackend: MessagingBackend,
+      isCurrent: () => boolean,
+    ) => Promise<() => void>,
+  ): Promise<void> => {
+    const key = placeKey(place);
+    const operationBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    let coordinator = reactionProjectionByPlace.get(key);
+    if (
+      !coordinator ||
+      coordinator.backend !== operationBackend ||
+      coordinator.sessionGeneration !== sessionGeneration
+    ) {
+      coordinator = {
+        active: null,
+        backend: operationBackend,
+        epoch: 0,
+        pending: 0,
+        sessionGeneration,
+        tail: Promise.resolve(),
+      };
+      reactionProjectionByPlace.set(key, coordinator);
+    }
+    const target = coordinator;
+    target.pending += 1;
+    const task = target.tail.then(async () => {
+      const isCurrent = () =>
+        backend === operationBackend &&
+        messagingSessionGeneration === sessionGeneration &&
+        reactionProjectionByPlace.get(key) === target;
+      if (!isCurrent()) return;
+      const operation: ReactionProjectionOperation = {
+        epoch: ++target.epoch,
+        journal: [],
+      };
+      target.active = operation;
+      try {
+        const applySnapshot = await produce(operationBackend, isCurrent);
+        if (
+          !isCurrent() ||
+          target.active !== operation ||
+          target.epoch !== operation.epoch
+        ) {
+          return;
+        }
+        applySnapshot();
+        for (const event of operation.journal) {
+          applyReactionUpdateRaw(event);
+        }
+      } finally {
+        if (target.active === operation) target.active = null;
+      }
+    });
+    const settled = task
+      .catch(() => undefined)
+      .finally(() => {
+        target.pending -= 1;
+        if (
+          target.pending === 0 &&
+          target.active === null &&
+          reactionProjectionByPlace.get(key) === target
+        ) {
+          reactionProjectionByPlace.delete(key);
+        }
+      });
+    target.tail = settled;
+    return task;
+  };
+
+  /**
+   * ロード済み範囲のreactionを読み直して収束させる。catch-upはcursorより後の
+   * messageしかreplayしないので、切断中やHub overflowで落ちたreaction eventは
+   * 二度と届かない。再接続のたびにロード済みwindow全体を
+   * serverの上限ごとに遡って読み直す。
+   */
+  const resyncReactions = (place: Place): Promise<void> =>
+    enqueueReactionProjection(place, async (resyncBackend, isCurrent) => {
+      const key = placeKey(place);
+      const loaded = get().messagesByPlace[key];
+      if (!loaded || loaded.length === 0) return () => undefined;
+      const reactionsById = new Map<string, ReactionSummary[]>();
+      const ranges: { oldestSeq: number; newestSeq: number }[] = [];
+      for (const message of [...loaded].sort(
+        (left, right) => left.seq - right.seq,
+      )) {
+        const current = ranges[ranges.length - 1];
+        if (current && message.seq <= current.newestSeq + 1) {
+          current.newestSeq = Math.max(current.newestSeq, message.seq);
+        } else {
+          ranges.push({ oldestSeq: message.seq, newestSeq: message.seq });
+        }
+      }
+
+      // loadPlaceAroundで離れたwindowが併存し得るため、件数ではなく連続seq範囲
+      // ごとに取得する。gapをページ送りで横断せず、各windowを確実に覆う。
+      for (const range of ranges.reverse()) {
+        let beforeSeq = range.newestSeq + 1;
+        while (beforeSeq > range.oldestSeq) {
+          const limit = Math.min(
+            beforeSeq - range.oldestSeq,
+            REACTION_RESYNC_LIMIT,
+          );
+          const fresh = await resyncBackend.fetchMessages(place, {
+            beforeSeq,
+            limit,
+          });
+          if (!isCurrent()) return () => undefined;
+          if (fresh.length === 0) break;
+          for (const message of fresh) {
+            reactionsById.set(message.messageId, message.reactions);
+          }
+          const nextBeforeSeq = Math.min(
+            ...fresh.map((message) => message.seq),
+          );
+          if (nextBeforeSeq >= beforeSeq) break;
+          beforeSeq = nextBeforeSeq;
+        }
+      }
+
+      return () => {
+        set((state) => {
+          const current = state.messagesByPlace[key];
+          if (!current) return {};
+          let changed = false;
+          const next = current.map((message) => {
+            const reactions = reactionsById.get(message.messageId);
+            if (
+              message.deleted ||
+              !reactions ||
+              reactionsFingerprint(reactions) ===
+                reactionsFingerprint(message.reactions)
+            ) {
+              return message;
+            }
+            changed = true;
+            return { ...message, reactions };
+          });
+          if (!changed) return {};
+          return {
+            messagesByPlace: { ...state.messagesByPlace, [key]: next },
+          };
+        });
+      };
+    });
+
+  const applyReactionUpdate = (event: ReactionUpdatedEvent) => {
+    const coordinator = reactionProjectionByPlace.get(placeKey(event.place));
+    if (
+      coordinator?.backend === backend &&
+      coordinator.sessionGeneration === messagingSessionGeneration
+    ) {
+      coordinator.active?.journal.push(event);
+    }
+    applyReactionUpdateRaw(event);
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
-    if (
-      event.type === "message_created" ||
-      event.type === "message_edited" ||
-      event.type === "reaction_updated"
-    ) {
+    if (event.type === "reaction_updated") {
+      applyReactionUpdate(event);
+      return;
+    }
+    if (event.type === "caught_up") {
+      void resyncReactions(event.place).catch(() => undefined);
+      return;
+    }
+    if (event.type === "message_created" || event.type === "message_edited") {
       const key = placeKey(event.message.place);
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
@@ -616,9 +852,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     toggleReaction(message, emoji) {
-      void backend
-        .toggleReaction(message.place, message.messageId, emoji)
-        .catch(() => undefined);
+      const clientNonce = secureRandomUUID();
+      void enqueueReactionProjection(
+        message.place,
+        async (operationBackend, isCurrent) => {
+          const canonical = await operationBackend.toggleReaction(
+            message.place,
+            message.messageId,
+            emoji,
+            clientNonce,
+          );
+          if (!isCurrent()) return () => undefined;
+          if (canonical.messageId !== message.messageId) {
+            throw new Error("Reaction acknowledgement target mismatch");
+          }
+          const acknowledgement: ReactionUpdatedEvent = {
+            type: "reaction_updated",
+            place: message.place,
+            messageId: canonical.messageId,
+            reactions: canonical.reactions,
+          };
+          return () => applyReactionUpdateRaw(acknowledgement);
+        },
+      ).catch(() => undefined);
     },
 
     async loadOlder(key) {
@@ -702,6 +958,8 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  messagingSessionGeneration += 1;
+  reactionProjectionByPlace.clear();
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;

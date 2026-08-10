@@ -15,8 +15,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     apiclient::messaging::{
-        MessagingApi, OpenMessagingPlaceRequest, ReadMessagingThroughRequest,
-        WriteMessagingMessageRequest,
+        MessagingApi, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
+        ReadMessagingThroughRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -27,6 +27,9 @@ const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
+const MAX_MESSAGE_ID_BYTES: usize = 256;
+// The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
+const MAX_EMOJI_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -49,6 +52,14 @@ enum MessagingAction {
         #[serde(default)]
         reply_to: Option<String>,
     },
+    /// Toggle an emoji reaction on a message visible in the open place.
+    React {
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        emoji: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -60,11 +71,21 @@ enum MessagingUrgency {
     Fyi,
 }
 
+/// One message currently on this view's screen. Reactions may only target
+/// these (ADR 0011 §3: 見えていないものは操作できない — like a human, the
+/// agent reacts to what the open place shows, never to an unseen permalink).
+#[derive(Clone)]
+struct VisibleMessage {
+    message_id: String,
+    seq: Option<u64>,
+}
+
 #[derive(Default)]
 struct MessagingViewState {
     initialized: bool,
     focused_place_id: Option<String>,
     pending_read_through: Option<(String, u64)>,
+    visible_messages: Vec<VisibleMessage>,
 }
 
 pub(crate) struct MessagingTool {
@@ -108,17 +129,19 @@ fn messaging_parameters_schema() -> Value {
         "description": concat!(
             "Choose one messaging action and include only the fields used by that action. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
-            "or limit; write requires content and may include urgency or reply_to. Write acts on ",
+            "or limit; write requires content and may include urgency or reply_to; react ",
+            "requires emoji plus exactly one of message_id or seq. Write and react act on ",
             "the place most recently opened in this tool view."
         ),
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["overview", "open", "write"],
+                "enum": ["overview", "open", "write", "react"],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
                     "shows one place and focuses it for later writes; write sends a message to ",
-                    "the currently open place."
+                    "the currently open place; react toggles an emoji reaction on a message ",
+                    "visible in the currently open place."
                 )
             },
             "place_id": {
@@ -148,6 +171,29 @@ fn messaging_parameters_schema() -> Value {
             "reply_to": {
                 "type": "string",
                 "description": "Optional for write and omitted for other actions. Message identifier to reply to."
+            },
+            "message_id": {
+                "type": "string",
+                "description": concat!(
+                    "For react and omitted for other actions. The message to react to, by ",
+                    "message_id. Provide exactly one of message_id or seq; the message must be ",
+                    "visible in the currently open place."
+                )
+            },
+            "seq": {
+                "type": "integer",
+                "minimum": 1,
+                "description": concat!(
+                    "For react and omitted for other actions. The message to react to, by its ",
+                    "seq in the currently open place. Provide exactly one of message_id or seq."
+                )
+            },
+            "emoji": {
+                "type": "string",
+                "description": concat!(
+                    "Required for react and omitted for other actions. Emoji to toggle on the ",
+                    "target message; reacting again with the same emoji removes your reaction."
+                )
             }
         },
         "required": ["action"],
@@ -163,7 +209,8 @@ impl Tool for MessagingTool {
             description: concat!(
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, then write in ",
-                "that currently open place. Opening never publishes presence."
+                "that currently open place or react to a message visible in it. ",
+                "Opening never publishes presence."
             )
             .to_owned(),
             parameters: messaging_parameters_schema(),
@@ -231,6 +278,9 @@ impl Tool for MessagingTool {
                     .and_then(Value::as_u64);
                 state.focused_place_id = Some(place_id.clone());
                 state.pending_read_through = last_visible_seq.map(|seq| (place_id, seq));
+                // The opened screen defines what can be reacted to; a new open
+                // (including paging with before_seq) replaces the screen.
+                state.visible_messages = visible_messages_from(&response);
                 response
             }
             MessagingAction::Write {
@@ -245,13 +295,61 @@ impl Tool for MessagingTool {
                     )
                 })?;
                 let nonce = client_nonce(ctx.flow_id, ctx.call_id);
-                tokio::select! {
+                let response = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.write(WriteMessagingMessageRequest {
                         place_id: &place_id,
                         content: &content,
                         urgency: urgency_text(urgency),
                         reply_to: reply_to.as_deref(),
+                        client_nonce: &nonce,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // The freshly sent message appears on the sender's own screen,
+                // exactly like a human seeing their message land — so it is
+                // immediately reactable.
+                if let Some(message_id) = response.get("message_id").and_then(Value::as_str) {
+                    state.visible_messages.push(VisibleMessage {
+                        message_id: message_id.to_owned(),
+                        seq: response.get("seq").and_then(Value::as_u64),
+                    });
+                }
+                response
+            }
+            MessagingAction::React {
+                message_id,
+                seq,
+                emoji,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before reacting; reactions attach to messages visible in the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                let target = state
+                    .visible_messages
+                    .iter()
+                    .find(|message| match (&message_id, seq) {
+                        (Some(id), _) => &message.message_id == id,
+                        (None, Some(seq)) => message.seq == Some(seq),
+                        (None, None) => false,
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        ToolError::Protocol(
+                            "that message is not visible in the currently open place; open the place (paging with before_seq if needed) so the message is on screen, then react"
+                                .to_owned(),
+                        )
+                })?;
+                let nonce = client_nonce(ctx.flow_id, ctx.call_id);
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.react(ReactMessagingReactionRequest {
+                        place_id: &place_id,
+                        message_id: &target.message_id,
+                        emoji: &emoji,
                         client_nonce: &nonce,
                     }) => result,
                 }
@@ -295,7 +393,54 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::React {
+            message_id,
+            seq,
+            emoji,
+        } => {
+            // Exactly one selector: a reaction lands on one visible message.
+            if message_id.is_some() == seq.is_some() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if message_id
+                .as_deref()
+                .is_some_and(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            if seq == &Some(0) {
+                return Err(ToolError::InvalidArguments);
+            }
+            if emoji.is_empty()
+                || emoji.len() > MAX_EMOJI_BYTES
+                || emoji
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
+}
+
+/// Extracts the reactable screen contents from an open response. Entries
+/// without a message_id (unexpected wire shapes) are skipped fail-closed.
+fn visible_messages_from(response: &Value) -> Vec<VisibleMessage> {
+    response
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| {
+                    let message_id = message.get("message_id")?.as_str()?.to_owned();
+                    let seq = message.get("seq").and_then(Value::as_u64);
+                    Some(VisibleMessage { message_id, seq })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_bounded_nonempty(value: &str, max_bytes: usize) -> Result<(), ToolError> {
@@ -347,6 +492,7 @@ mod tests {
         calls: AsyncMutex<Vec<String>>,
         reads: AsyncMutex<Vec<(String, u64)>>,
         writes: AsyncMutex<Vec<(String, String, String)>>,
+        reacts: AsyncMutex<Vec<(String, String, String)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -367,7 +513,11 @@ mod tests {
                 "latest_seq": 7,
                 "last_read_seq": 3,
                 "members": [],
-                "messages": [{"seq": 7, "content": "hello"}]
+                "messages": [
+                    {"message_id": "m6", "seq": 6, "content": "earlier", "reactions": []},
+                    {"message_id": "m7", "seq": 7, "content": "hello",
+                     "reactions": [{"emoji": "👍", "participants": []}]}
+                ]
             }))
         }
 
@@ -381,7 +531,24 @@ mod tests {
                 request.content.to_owned(),
                 request.client_nonce.to_owned(),
             ));
-            Ok(json!({"message_id": "m1", "seq": 8}))
+            Ok(json!({"message_id": "m8", "seq": 8}))
+        }
+
+        async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("react:{}:{}", request.place_id, request.message_id));
+            self.reacts.lock().await.push((
+                request.place_id.to_owned(),
+                request.message_id.to_owned(),
+                format!("{}:{}", request.emoji, request.client_nonce),
+            ));
+            Ok(json!({
+                "message": {"message_id": request.message_id,
+                            "reactions": [{"emoji": request.emoji, "participants": []}]},
+                "reacted": true
+            }))
         }
 
         async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
@@ -465,7 +632,7 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["properties"]["action"]["enum"],
-            json!(["overview", "open", "write"])
+            json!(["overview", "open", "write", "react"])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
@@ -474,12 +641,15 @@ mod tests {
             schema["properties"]["urgency"]["enum"],
             json!(["urgent", "normal", "fyi"])
         );
+        assert_eq!(schema["properties"]["seq"]["minimum"], 1);
+        assert_eq!(schema["properties"]["emoji"]["type"], "string");
+        assert_eq!(schema["properties"]["message_id"]["type"], "string");
         assert_eq!(
             schema["properties"]
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            7
+            10
         );
     }
 
@@ -519,6 +689,21 @@ mod tests {
                 urgency: MessagingUrgency::Fyi,
                 reply_to: Some(reply_to)
             } if content == "hello" && reply_to == "message-1"
+        ));
+
+        let react: MessagingAction = serde_json::from_value(json!({
+            "action": "react",
+            "seq": 7,
+            "emoji": "👍"
+        }))
+        .unwrap();
+        assert!(matches!(
+            react,
+            MessagingAction::React {
+                message_id: None,
+                seq: Some(7),
+                emoji
+            } if emoji == "👍"
         ));
     }
 
@@ -595,5 +780,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api.reads.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn react_requires_an_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert!(api.reacts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn react_targets_only_messages_visible_on_the_open_screen() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        // By seq and by message_id, both against the visible screen.
+        execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "r1",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "react", "message_id": "m6", "emoji": "🎉"}),
+            "r2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.reacts.lock().await.as_slice(),
+            &[
+                (
+                    "general".to_owned(),
+                    "m7".to_owned(),
+                    format!("👍:{}", client_nonce("flow", "r1"))
+                ),
+                (
+                    "general".to_owned(),
+                    "m6".to_owned(),
+                    format!("🎉:{}", client_nonce("flow", "r2"))
+                ),
+            ]
+        );
+
+        // A message that is not on the screen cannot be reacted to, whether
+        // addressed by id or by seq (ADR 0011 §3).
+        let error = execute(
+            &tool,
+            json!({"action": "react", "message_id": "m404", "emoji": "👍"}),
+            "r3",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 99, "emoji": "👍"}),
+            "r4",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert_eq!(api.reacts.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn react_rejects_ambiguous_or_malformed_selectors() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        for arguments in [
+            json!({"action": "react", "emoji": "👍"}),
+            json!({"action": "react", "message_id": "m7", "seq": 7, "emoji": "👍"}),
+            json!({"action": "react", "seq": 0, "emoji": "👍"}),
+            json!({"action": "react", "seq": 7, "emoji": ""}),
+            json!({"action": "react", "seq": 7, "emoji": "a b"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert!(api.reacts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn own_written_message_is_immediately_reactable() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "追記"}),
+            "write",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "react", "seq": 8, "emoji": "✅"}),
+            "react",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.reacts.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "m8".to_owned(),
+                format!("✅:{}", client_nonce("flow", "react"))
+            )]
+        );
     }
 }

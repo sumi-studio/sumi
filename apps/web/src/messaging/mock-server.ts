@@ -11,6 +11,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -520,8 +521,9 @@ export class MockMessagingServer implements MessagingBackend {
     place: Place,
     messageId: string,
     emoji: string,
-  ): Promise<void> {
-    this.applyReaction(place, messageId, SELF, emoji);
+    _clientNonce: string,
+  ): Promise<ReactionMutationResult> {
+    return this.applyReaction(place, messageId, SELF, emoji);
   }
 
   /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
@@ -530,10 +532,10 @@ export class MockMessagingServer implements MessagingBackend {
     messageId: string,
     participant: ParticipantRef,
     emoji: string,
-  ): void {
+  ): ReactionMutationResult {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted) return;
+    if (!message || message.deleted) throw new Error("Message not found");
     const summary = message.reactions.find((entry) => entry.emoji === emoji);
     if (!summary) {
       message.reactions.push({ emoji, participants: [participant] });
@@ -551,7 +553,21 @@ export class MockMessagingServer implements MessagingBackend {
     } else {
       summary.participants.push(participant);
     }
-    this.emit({ type: "reaction_updated", message: { ...message } });
+    // reactionだけを配る部分更新。実backendと同じ形にしておかないと、mockでは
+    // 通るのに実接続で編集を巻き戻す、という差が出る。
+    const reaction: ReactionMutationResult = {
+      messageId: message.messageId,
+      reactions: message.reactions.map((entry) => ({
+        emoji: entry.emoji,
+        participants: [...entry.participants],
+      })),
+    };
+    this.emit({
+      type: "reaction_updated",
+      place: message.place,
+      ...reaction,
+    });
+    return reaction;
   }
 
   sendTyping(_place: Place): void {

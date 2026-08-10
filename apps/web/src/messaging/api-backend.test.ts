@@ -119,6 +119,141 @@ describe("ApiMessagingBackend", () => {
       message: { seq: 5, content: "live", place: channel },
     });
   });
+
+  it("returns the canonical REST reaction result and projects WS updates", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path.endsWith("/reactions") && init?.method === "POST") {
+          return json({
+            message: messageWire(1, "hello", [
+              {
+                emoji: "👍",
+                participants: [{ kind: "human", human_id: "human-1" }],
+              },
+            ]),
+            reacted: true,
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    expect(backend.capabilities.reactions).toBe(true);
+    await backend.bootstrap();
+
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+
+    const canonical = await backend.toggleReaction(
+      channel,
+      "message-1",
+      "👍",
+      "reaction-nonce-1",
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/places/channel-1/messages/message-1/reactions",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ emoji: "👍", client_nonce: "reaction-nonce-1" }),
+      }),
+    );
+    expect(canonical).toEqual({
+      messageId: "message-1",
+      reactions: [
+        {
+          emoji: "👍",
+          participants: [{ kind: "human", humanId: "human-1" }],
+        },
+      ],
+    });
+    // REST and WS have different ordering semantics. The store coordinates
+    // the canonical ACK with live events, so the backend must not disguise
+    // the ACK as another live event.
+    expect(events).toEqual([]);
+
+    vi.useFakeTimers();
+    try {
+      const socket = FakeWebSocket.instances[0];
+      socket?.open();
+      socket?.message({
+        type: "event",
+        event: {
+          type: "reaction_updated",
+          place_id: "channel-1",
+          reaction: {
+            message_id: "message-1",
+            reactions: [
+              {
+                emoji: "👍",
+                participants: [{ kind: "human", human_id: "human-1" }],
+              },
+            ],
+          },
+        },
+      });
+      // The event is a reaction-only patch: it carries no content, so it can
+      // never roll back an edit that raced it.
+      expect(events).toEqual([
+        {
+          type: "reaction_updated",
+          place: channel,
+          messageId: "message-1",
+          reactions: [
+            {
+              emoji: "👍",
+              participants: [{ kind: "human", humanId: "human-1" }],
+            },
+          ],
+        },
+      ]);
+      events.length = 0;
+      // Clearing the last reaction arrives as an empty set, not an omission.
+      socket?.message({
+        type: "event",
+        event: {
+          type: "reaction_updated",
+          place_id: "channel-1",
+          reaction: { message_id: "message-1", reactions: [] },
+        },
+      });
+      expect(events).toEqual([
+        {
+          type: "reaction_updated",
+          place: channel,
+          messageId: "message-1",
+          reactions: [],
+        },
+      ]);
+      events.length = 0;
+      // A reaction to an old message must not rewind the replay cursor: the
+      // reconnect hello still asks for everything after seq 4.
+      socket?.close();
+      vi.advanceTimersByTime(300);
+      const reconnected = FakeWebSocket.instances[0];
+      expect(reconnected).not.toBe(socket);
+      reconnected?.open();
+      expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+        type: "hello",
+        cursors: { "channel-1": 4 },
+      });
+      // caught_up is surfaced so the subscriber can re-read its loaded window:
+      // reactions below the cursor are never replayed by catch-up.
+      reconnected?.message({
+        type: "caught_up",
+        place_id: "channel-1",
+        latest_seq: 9,
+      });
+      expect(events).toEqual([{ type: "caught_up", place: channel }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 class FakeWebSocket extends EventTarget {
@@ -161,7 +296,11 @@ function channelWire() {
   return { kind: "channel", channel_id: "channel-1" };
 }
 
-function messageWire(seq: number, content: string) {
+function messageWire(
+  seq: number,
+  content: string,
+  reactions: { emoji: string; participants: unknown[] }[] = [],
+) {
   return {
     message_id: `message-${seq}`,
     place: channelWire(),
@@ -170,6 +309,7 @@ function messageWire(seq: number, content: string) {
     content,
     mentions: [],
     urgency: "normal",
+    reactions,
     reply_to: null,
     client_nonce: `nonce-${seq}`,
     created_at: "2026-08-01T10:00:00Z",

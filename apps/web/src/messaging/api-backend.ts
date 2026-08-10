@@ -7,6 +7,8 @@ import type {
   ParticipantRef,
   Place,
   PlaceKey,
+  ReactionMutationResult,
+  ReactionSummary,
   ReadMarker,
   SendMessageInput,
   SendReceipt,
@@ -34,7 +36,7 @@ export class ApiMessagingBackend implements MessagingBackend {
   readonly capabilities = {
     status: false,
     replyLater: false,
-    reactions: false,
+    reactions: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -193,8 +195,24 @@ export class ApiMessagingBackend implements MessagingBackend {
   resolveReplyLater(): Promise<void> {
     return unsupported();
   }
-  toggleReaction(): Promise<void> {
-    return unsupported();
+
+  async toggleReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+    clientNonce: string,
+  ): Promise<ReactionMutationResult> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
+        { method: "POST", body: { emoji, client_nonce: clientNonce } },
+      ),
+    );
+    const message = asRecord(body.message);
+    return {
+      messageId: asString(message.message_id),
+      reactions: asArray(message.reactions).map(parseReaction),
+    };
   }
 
   sendTyping(place: Place): void {
@@ -287,7 +305,15 @@ export class ApiMessagingBackend implements MessagingBackend {
       this.emitConnection("connected");
       return;
     }
-    if (type === "caught_up" || type === "receipt") return;
+    if (type === "caught_up") {
+      // Catch-up replays only messages after the cursor, so reactions that
+      // landed on already-read messages while the socket was down are not in
+      // it. Surface the boundary so the subscriber can re-read what it holds.
+      const place = this.places.get(asString(frame.place_id));
+      if (place) this.emit({ type: "caught_up", place });
+      return;
+    }
+    if (type === "receipt") return;
     if (type === "error") throw new Error("messaging socket error");
     if (type !== "event") throw new Error("unknown messaging frame");
     const wire = asRecord(frame.event);
@@ -301,6 +327,20 @@ export class ApiMessagingBackend implements MessagingBackend {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
+    } else if (eventType === "reaction_updated") {
+      // A reaction can target a message older than the replay cursor, so it
+      // must never move the cursor (backwards or at all). It is also a partial
+      // update: applying it as a whole message would roll back an edit that
+      // committed while this event was in flight.
+      const place = this.places.get(asString(wire.place_id));
+      if (!place) return;
+      const update = asRecord(wire.reaction);
+      parsed = {
+        type: eventType,
+        place,
+        messageId: asString(update.message_id),
+        reactions: asArray(update.reactions).map(parseReaction),
+      };
     } else if (eventType === "typing") {
       const id = asString(wire.place_id);
       const place = this.places.get(id);
@@ -313,7 +353,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     } else {
       return;
     }
-    for (const listener of this.listeners) listener(parsed);
+    this.emit(parsed);
+  }
+
+  private emit(event: ServerEvent): void {
+    for (const listener of this.listeners) listener(event);
   }
 
   private stopSocket(): void {
@@ -383,6 +427,14 @@ function parseParticipant(value: unknown): ParticipantRef {
   throw new Error("invalid participant");
 }
 
+function parseReaction(value: unknown): ReactionSummary {
+  const wire = asRecord(value);
+  return {
+    emoji: asString(wire.emoji),
+    participants: asArray(wire.participants).map(parseParticipant),
+  };
+}
+
 function parsePlace(value: unknown): Place {
   const wire = asRecord(value);
   const kind = asString(wire.kind);
@@ -405,7 +457,7 @@ function parseMessage(value: unknown): Message {
     content: asString(wire.content),
     mentions: asArray(wire.mentions).map(parseParticipant),
     urgency: asUrgency(wire.urgency),
-    reactions: [],
+    reactions: asArray(wire.reactions).map(parseReaction),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,

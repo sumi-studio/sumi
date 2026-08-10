@@ -31,6 +31,15 @@ pub(crate) struct WriteMessagingMessageRequest<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ReactMessagingReactionRequest<'a> {
+    pub place_id: &'a str,
+    pub message_id: &'a str,
+    pub emoji: &'a str,
+    pub client_nonce: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadMessagingThroughRequest<'a> {
     pub place_id: &'a str,
     pub seq: u64,
@@ -43,6 +52,8 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<Value>;
 
     async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value>;
+
+    async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value>;
 
     async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value>;
 }
