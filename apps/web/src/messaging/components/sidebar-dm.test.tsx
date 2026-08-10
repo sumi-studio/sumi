@@ -81,6 +81,7 @@ beforeEach(() => {
       threads: true,
       polls: true,
     },
+    permissions: { manage_channels: true },
   });
 });
 
@@ -183,6 +184,31 @@ describe("チャンネルのコンテキストメニュー", () => {
     expect(menu.getByRole("menuitem", { name: "複製" })).toBeInTheDocument();
     expect(
       menu.getByRole("menuitem", { name: "チャンネルを作成" }),
+    ).toBeInTheDocument();
+  });
+
+  it("右クリックの作成からチャンネル作成ダイアログを開く", () => {
+    const menu = openChannelMenu();
+    fireEvent.click(menu.getByRole("menuitem", { name: "チャンネルを作成" }));
+
+    expect(
+      screen.getByRole("dialog", { name: "チャンネルを作成" }),
+    ).toBeInTheDocument();
+  });
+
+  it("管理権限が無ければチャンネル管理項目を出さない", () => {
+    useMessaging.setState({ permissions: {} });
+    const menu = openChannelMenu();
+
+    expect(
+      menu.queryByRole("menuitem", { name: "チャンネルを編集" }),
+    ).toBeNull();
+    expect(menu.queryByRole("menuitem", { name: "複製" })).toBeNull();
+    expect(
+      menu.queryByRole("menuitem", { name: "チャンネルを作成" }),
+    ).toBeNull();
+    expect(
+      menu.getByRole("menuitem", { name: /通知設定/ }),
     ).toBeInTheDocument();
   });
 
