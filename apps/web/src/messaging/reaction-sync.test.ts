@@ -678,13 +678,24 @@ class StubBackend implements MessagingBackend {
   ensureDM = vi.fn();
   createGroupDM = vi.fn();
   updateChannelTopic = vi.fn();
+  fetchPresence = vi.fn(async () => ({
+    statuses: [],
+    replyLaterMarkers: [],
+  }));
+
   sendMessage = vi.fn();
   editMessage = vi.fn(async () => undefined);
   deleteMessage = vi.fn(async () => undefined);
   markRead = vi.fn(async () => undefined);
-  setStatus = vi.fn(async () => undefined);
-  createReplyLater = vi.fn(async () => undefined);
-  resolveReplyLater = vi.fn(async () => undefined);
+  setStatus = vi.fn(async () => {
+    throw new Error("unused");
+  });
+  createReplyLater = vi.fn(async () => {
+    throw new Error("unused");
+  });
+  resolveReplyLater = vi.fn(async () => {
+    throw new Error("unused");
+  });
   toggleReaction = vi.fn(
     async (
       _place: Place,
