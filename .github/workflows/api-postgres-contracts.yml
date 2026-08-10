@@ -1,0 +1,56 @@
+name: API Postgres contracts
+
+on:
+  pull_request:
+    paths:
+      - "apps/api/**"
+      - ".github/workflows/api-postgres-contracts.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/api/**"
+      - ".github/workflows/api-postgres-contracts.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  api-postgres-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sumi_test_creator
+          POSTGRES_PASSWORD: sumi_test_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sumi_test_creator -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SUMI_TEST_DB_URL: postgres://sumi_test_creator:sumi_test_password@localhost:5432/postgres?sslmode=disable
+
+    defaults:
+      run:
+        working-directory: apps/api
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+
+      - name: Run API contract tests
+        run: go test -count=1 ./...
