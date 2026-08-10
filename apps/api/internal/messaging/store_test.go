@@ -197,7 +197,9 @@ func TestAppendIsIdempotentOnClientNonce(t *testing.T) {
 	}
 }
 
-func waitForAdvisoryWaiters(t *testing.T, ctx context.Context, store *Store, key string, want int) {
+func waitForAdvisoryLocks(
+	t *testing.T, ctx context.Context, store *Store, key string, granted bool, want int,
+) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -206,9 +208,9 @@ func waitForAdvisoryWaiters(t *testing.T, ctx context.Context, store *Store, key
 			`WITH key AS (SELECT hashtextextended($1, 0) AS value)
 			 SELECT count(*)
 			 FROM pg_locks, key
-			 WHERE locktype = 'advisory' AND NOT granted
+			 WHERE locktype = 'advisory' AND granted = $2
 			   AND classid::bigint = ((value >> 32) & 4294967295)
-			   AND objid::bigint = (value & 4294967295)`, key).Scan(&count)
+			   AND objid::bigint = (value & 4294967295)`, key, granted).Scan(&count)
 		if err != nil {
 			t.Fatalf("inspect advisory waiters: %v", err)
 		}
@@ -217,7 +219,7 @@ func waitForAdvisoryWaiters(t *testing.T, ctx context.Context, store *Store, key
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("advisory waiters for %q did not reach %d", key, want)
+	t.Fatalf("advisory locks for %q (granted=%v) did not reach %d", key, granted, want)
 }
 
 func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
@@ -239,7 +241,7 @@ func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
 		removeDone := make(chan error, 1)
 		go func() { removeDone <- w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.humanA) }()
 		key := workspaceMembershipScopeKey(ws.WorkspaceID)
-		waitForAdvisoryWaiters(t, ctx, w.store, key, 1)
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
 
 		type appendResult struct {
 			created bool
@@ -253,7 +255,7 @@ func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
 			})
 			appendDone <- appendResult{created: created, err: appendErr}
 		}()
-		waitForAdvisoryWaiters(t, ctx, w.store, key, 2)
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 2)
 		if err := blocker.Commit(ctx); err != nil {
 			t.Fatalf("release blocker: %v", err)
 		}
@@ -303,11 +305,11 @@ func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
 			appendDone <- appendResult{message: message, created: created, err: appendErr}
 		}()
 		key := workspaceMembershipScopeKey(ws.WorkspaceID)
-		waitForAdvisoryWaiters(t, ctx, w.store, key, 1)
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
 
 		removeDone := make(chan error, 1)
 		go func() { removeDone <- w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.humanA) }()
-		waitForAdvisoryWaiters(t, ctx, w.store, key, 2)
+		waitForAdvisoryLocks(t, ctx, w.store, key, false, 2)
 		if err := blocker.Commit(ctx); err != nil {
 			t.Fatalf("release blocker: %v", err)
 		}
@@ -326,6 +328,75 @@ func TestAppendAndMembershipRemovalCommitInLockOrder(t *testing.T) {
 			t.Fatalf("admission intents = %+v, want the two pre-removal recipients", intents)
 		}
 	})
+}
+
+func TestChannelAdmissionsShareScopeWhileRemovalWaits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	ws, first := w.workspaceWithChannel(t, ctx)
+	second, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "second", "", w.humanA)
+	if err != nil {
+		t.Fatalf("create second channel: %v", err)
+	}
+
+	// Hold each append at its per-place seq update, after it has acquired the
+	// shared workspace admission lock. Different channel rows let both sends
+	// reach that point concurrently.
+	firstBlocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin first place blocker: %v", err)
+	}
+	defer func() { _ = firstBlocker.Rollback(ctx) }()
+	if _, err := firstBlocker.Exec(ctx,
+		"UPDATE places SET last_seq = last_seq WHERE place_id = $1", first.PlaceID); err != nil {
+		t.Fatalf("block first place: %v", err)
+	}
+	secondBlocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin second place blocker: %v", err)
+	}
+	defer func() { _ = secondBlocker.Rollback(ctx) }()
+	if _, err := secondBlocker.Exec(ctx,
+		"UPDATE places SET last_seq = last_seq WHERE place_id = $1", second.PlaceID); err != nil {
+		t.Fatalf("block second place: %v", err)
+	}
+
+	type appendResult struct {
+		created bool
+		err     error
+	}
+	appendDone := make(chan appendResult, 2)
+	for i, placeID := range []string{first.PlaceID, second.PlaceID} {
+		go func(index int, target string) {
+			_, created, appendErr := w.store.AppendMessage(ctx, AppendInput{
+				PlaceID: target, Author: w.humanA, Content: "parallel admission",
+				ClientNonce: fmt.Sprintf("parallel-%d", index),
+			})
+			appendDone <- appendResult{created: created, err: appendErr}
+		}(i, placeID)
+	}
+	key := workspaceMembershipScopeKey(ws.WorkspaceID)
+	waitForAdvisoryLocks(t, ctx, w.store, key, true, 2)
+
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.humanA) }()
+	waitForAdvisoryLocks(t, ctx, w.store, key, false, 1)
+	if err := firstBlocker.Commit(ctx); err != nil {
+		t.Fatalf("release first place: %v", err)
+	}
+	if err := secondBlocker.Commit(ctx); err != nil {
+		t.Fatalf("release second place: %v", err)
+	}
+	for range 2 {
+		result := <-appendDone
+		if result.err != nil || !result.created {
+			t.Fatalf("parallel append = created %v err %v", result.created, result.err)
+		}
+	}
+	if err := <-removeDone; err != nil {
+		t.Fatalf("remove after shared admissions: %v", err)
+	}
 }
 
 func TestMentionsBindAtAdmissionFromActiveMembership(t *testing.T) {

@@ -300,15 +300,16 @@ func (s *Server) publishReplyLaterCreated(ctx context.Context, marker ReplyLater
 	}
 	owner := marker.Participant
 	ownerWire := replyLaterToWire(marker, owner)
-	s.Hub.Publish(ctx, Event{
+	ownerEvent := Event{
 		Type: EventReplyLaterCreated, PlaceID: marker.PlaceID,
 		Marker: &ownerWire, OnlyFor: &owner,
-	})
+	}
 	publicWire := replyLaterToWire(marker, ParticipantRef{})
-	s.Hub.Publish(ctx, Event{
+	publicEvent := Event{
 		Type: EventReplyLaterCreated, PlaceID: marker.PlaceID,
 		Marker: &publicWire, ExceptFor: []ParticipantRef{owner},
-	})
+	}
+	s.Hub.PublishVariants(ctx, []Event{ownerEvent, publicEvent})
 }
 
 // publishReplyLaterResolved announces a kept promise. Only the identifier
@@ -389,19 +390,21 @@ func publishMessageCreated(ctx context.Context, store *Store, hub *Hub, place Pl
 		decisions = nil
 	}
 	notified := make([]ParticipantRef, 0, len(decisions))
+	events := make([]Event, 0, len(decisions)+1)
 	for _, decision := range decisions {
 		recipient := decision.Participant
 		notify := notifyWire{Reason: decision.Reason}
-		hub.Publish(ctx, Event{
+		events = append(events, Event{
 			Type: EventMessageCreated, PlaceID: place.PlaceID,
 			Message: &wire, Notify: &notify, OnlyFor: &recipient,
 		})
 		notified = append(notified, recipient)
 	}
-	hub.Publish(ctx, Event{
+	events = append(events, Event{
 		Type: EventMessageCreated, PlaceID: place.PlaceID,
 		Message: &wire, ExceptFor: notified,
 	})
+	hub.PublishVariants(ctx, events)
 }
 
 // publishStatus fans a self-declared status out to everyone who may see the

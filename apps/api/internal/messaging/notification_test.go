@@ -407,6 +407,35 @@ func TestMessageCreatedCarriesNotifyOnlyOnTheCalledRecipientsWire(t *testing.T) 
 	}
 }
 
+func TestPublishMessageCreatedAuthorizesAllIntentVariantsOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "全員に一度ずつ")
+	authorizer := &countingHubAuthorizer{store: w.store}
+	hub := newHub(authorizer)
+	subs := []*subscriber{
+		hub.subscribe(w.humanA),
+		hub.subscribe(w.humanB),
+		hub.subscribe(w.agent),
+	}
+	for _, sub := range subs {
+		defer hub.unsubscribe(sub)
+	}
+
+	publishMessageCreated(ctx, w.store, hub, ch, msg)
+
+	if authorizer.placeCalls != 1 {
+		t.Fatalf("message variant authorization queries = %d, want one", authorizer.placeCalls)
+	}
+	for _, sub := range subs {
+		if got := len(sub.send); got != 1 {
+			t.Fatalf("subscriber %s received %d message variants, want one", sub.viewer.Key(), got)
+		}
+	}
+}
+
 func TestLocalNotificationSettingsUseTheSharedStore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

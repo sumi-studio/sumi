@@ -244,9 +244,11 @@ agentにとってより適した方法があるときだけそちらで代替す
 3. **membership**: channelはWorkspace直下。v0はactiveなWorkspaceメンバー全員が
    閲覧・投稿可。HumanMembershipとPersonalityAgentMembershipを同型に扱う。
    Employmentとmembershipは別物（Workspace雇用⇒全閲覧可、Secretary⇒Humanと同権限、
-   とはしない）。Workspaceとorgは同一概念にしない。message admissionとmembership
-   変更は同じworkspace/place scopeでtransaction commitまで直列化し、先にcommitした
-   側をauthority snapshotとする。live connectionの過去の可視性判定は認可cacheにせず、
+   とはしない）。Workspaceとorgは同一概念にしない。message admissionは同じ
+   workspace/place scopeのshared fence、membership変更はexclusive fenceをtransaction
+   commitまで保持し、先にcommitした側をauthority snapshotとする。channelごとの送信は
+   相互に止めない。live fanoutはevent scopeごとに現在のauthorized participant setを
+   一度だけ取得し、過去の可視性cacheやsubscriberごとの問い合わせを認可に使わない。
    removal commit後のeventは再接続を待たず本文ごとfenceする。
 4. **Connection**: 戸籍そのもの（immutableなidentity台帳）には入れない。
    shared control plane上の独立Connection domainが正本。DM到達性は
