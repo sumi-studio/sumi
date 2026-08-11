@@ -78,6 +78,14 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if err != nil || projected.InstallationID != installed.InstallationID {
 		t.Fatalf("exact enabled projection = %#v, %v", projected, err)
 	}
+	resolved, err := w.apps.ResolveEnabledInstallation(ctx, workspaceOwner, w.owner, "messaging")
+	if err != nil || resolved.InstallationID != installed.InstallationID {
+		t.Fatalf("authenticated owner/app resolution = %#v, %v", resolved, err)
+	}
+	if _, err := w.apps.ResolveEnabledInstallation(ctx, workspaceOwner, w.member,
+		"messaging"); !errors.Is(err, workspace.ErrNotFound) {
+		t.Fatalf("non-member resolution error = %v", err)
+	}
 	if _, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, false); err != nil {
 		t.Fatalf("disable Messaging: %v", err)
 	}
@@ -95,6 +103,10 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 		t.Fatalf("disabled commit admission = %v", err)
 	}
 	_ = tx.Rollback(ctx)
+	if _, err := w.apps.ResolveEnabledInstallation(ctx, workspaceOwner, w.owner,
+		"messaging"); !errors.Is(err, applicationapps.ErrAppDisabled) {
+		t.Fatalf("disabled bind-time resolution = %v", err)
+	}
 	if _, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, true); err != nil {
 		t.Fatalf("re-enable Messaging: %v", err)
 	}
