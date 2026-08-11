@@ -11,8 +11,12 @@ func (s *Store) ReadMarker(ctx context.Context, placeID string, participant Part
 	if _, err := s.PlaceFor(ctx, placeID, participant); err != nil {
 		return 0, err
 	}
+	return s.readMarker(ctx, s.pool, placeID, participant)
+}
+
+func (s *Store) readMarker(ctx context.Context, q querier, placeID string, participant ParticipantRef) (int64, error) {
 	var seq int64
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`SELECT COALESCE((SELECT last_read_seq FROM read_markers
 		 WHERE place_id = $1 AND member_kind = $2 AND member_id = $3), 0)`,
 		placeID, participant.Kind, participant.ID).Scan(&seq)

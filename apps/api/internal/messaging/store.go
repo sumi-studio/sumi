@@ -140,7 +140,7 @@ func (s *Store) AddWorkspaceMember(ctx context.Context, workspaceID string, memb
 	default:
 		return fmt.Errorf("unknown workspace role %q", role)
 	}
-	if err := s.workspaceExists(ctx, workspaceID); err != nil {
+	if err := s.workspaceExists(ctx, s.pool, workspaceID); err != nil {
 		return err
 	}
 	if err := s.participantExists(ctx, member); err != nil {
@@ -367,14 +367,18 @@ func (s *Store) CreateGroupDM(ctx context.Context, creator ParticipantRef, other
 // reported as ErrPlaceNotFound — existence is not revealed across the
 // membership boundary.
 func (s *Store) PlaceFor(ctx context.Context, placeID string, viewer ParticipantRef) (Place, error) {
+	return s.placeFor(ctx, s.pool, placeID, viewer)
+}
+
+func (s *Store) placeFor(ctx context.Context, q querier, placeID string, viewer ParticipantRef) (Place, error) {
 	if err := viewer.Validate(); err != nil {
 		return Place{}, err
 	}
-	place, err := s.loadPlace(ctx, s.pool, placeID)
+	place, err := s.loadPlace(ctx, q, placeID)
 	if err != nil {
 		return Place{}, err
 	}
-	canRead, err := s.canAccess(ctx, s.pool, place, viewer)
+	canRead, err := s.canAccess(ctx, q, place, viewer)
 	if err != nil {
 		return Place{}, err
 	}
@@ -481,9 +485,9 @@ func placeMembershipScopeKey(placeID string) string {
 	return "messaging:place-membership:" + placeID
 }
 
-func (s *Store) workspaceExists(ctx context.Context, workspaceID string) error {
+func (s *Store) workspaceExists(ctx context.Context, q querier, workspaceID string) error {
 	var exists bool
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		"SELECT EXISTS (SELECT 1 FROM workspaces WHERE workspace_id = $1)", workspaceID).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("check workspace exists: %w", err)
@@ -525,7 +529,7 @@ func (s *Store) workspaceMembership(ctx context.Context, q querier, workspaceID 
 		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
 		workspaceID, p.Kind, p.ID).Scan(&role)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if err := s.workspaceExists(ctx, workspaceID); err != nil {
+		if err := s.workspaceExists(ctx, q, workspaceID); err != nil {
 			return false, "", err
 		}
 		return false, "", nil
