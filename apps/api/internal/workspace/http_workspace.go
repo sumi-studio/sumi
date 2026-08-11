@@ -98,6 +98,34 @@ func (s *Server) serveUpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, workspaceToWire(updated))
 }
 
+func (s *Server) serveTransferWorkspaceOwnership(w http.ResponseWriter, r *http.Request) {
+	actor, claims, ok := s.browserActor(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		WorkspaceMemberID string `json:"workspace_member_id"`
+	}
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	var updated Workspace
+	done, err := s.browserMutation(w, r, claims, func() error {
+		var transferErr error
+		updated, transferErr = s.Store.TransferOwnership(r.Context(),
+			r.PathValue("workspace_id"), request.WorkspaceMemberID, actor)
+		return transferErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, workspaceToWire(updated))
+}
+
 func (s *Server) serveMembers(w http.ResponseWriter, r *http.Request) {
 	actor, _, ok := s.browserActor(w, r)
 	if !ok {

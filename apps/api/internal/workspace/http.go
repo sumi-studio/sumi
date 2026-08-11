@@ -33,6 +33,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /workspaces", s.serveCreateWorkspace)
 	mux.HandleFunc("GET /workspaces/{workspace_id}", s.serveWorkspace)
 	mux.HandleFunc("PATCH /workspaces/{workspace_id}", s.serveUpdateWorkspace)
+	mux.HandleFunc("PUT /workspaces/{workspace_id}/owner", s.serveTransferWorkspaceOwnership)
 	mux.HandleFunc("GET /workspaces/{workspace_id}/members", s.serveMembers)
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/membership", s.serveLeaveWorkspace)
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/members/{workspace_member_id}", s.serveRemoveMember)

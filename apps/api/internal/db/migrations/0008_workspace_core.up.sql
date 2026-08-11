@@ -41,21 +41,32 @@ ALTER TABLE workspaces
     REFERENCES workspace_members (workspace_id, workspace_member_id)
     DEFERRABLE INITIALLY DEFERRED;
 
-CREATE OR REPLACE FUNCTION prevent_workspace_owner_change()
+-- Ownership may move only to an active membership tenure in the same
+-- Workspace. The application operation adds the current-owner authorization;
+-- this trigger keeps direct SQL and future callers inside the structural
+-- invariant as well.
+CREATE OR REPLACE FUNCTION validate_workspace_owner_change()
 RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF NEW.owner_workspace_member_id IS DISTINCT FROM OLD.owner_workspace_member_id THEN
-        RAISE EXCEPTION 'workspace owner transfer is not implemented';
+    IF NEW.owner_workspace_member_id IS DISTINCT FROM OLD.owner_workspace_member_id
+       AND NOT EXISTS (
+           SELECT 1
+           FROM workspace_members wm
+           WHERE wm.workspace_id = NEW.workspace_id
+             AND wm.workspace_member_id = NEW.owner_workspace_member_id
+             AND wm.left_at IS NULL
+       ) THEN
+        RAISE EXCEPTION 'workspace owner must be an active membership tenure';
     END IF;
     RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER workspace_owner_immutable
+CREATE TRIGGER workspace_owner_valid
     BEFORE UPDATE OF owner_workspace_member_id ON workspaces
     FOR EACH ROW
-    EXECUTE FUNCTION prevent_workspace_owner_change();
+    EXECUTE FUNCTION validate_workspace_owner_change();
 
 CREATE UNIQUE INDEX workspace_members_one_active_tenure
     ON workspace_members (workspace_id, member_kind, member_id)
@@ -90,8 +101,10 @@ CREATE TRIGGER workspace_member_participant_exists
     FOR EACH ROW
     EXECUTE FUNCTION validate_workspace_member_participant();
 
--- Until owner transfer has a dedicated audited operation, the distinguished
--- owner membership and the participant it names are immutable.
+-- The distinguished owner membership and the participant it names are
+-- immutable while that exact tenure owns the Workspace. After a transfer the
+-- former owner becomes an ordinary active membership and may leave or be
+-- removed through the normal operations.
 CREATE OR REPLACE FUNCTION prevent_workspace_owner_membership_mutation()
 RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -100,7 +113,7 @@ BEGIN
         SELECT 1 FROM workspaces w
         WHERE w.owner_workspace_member_id = OLD.workspace_member_id
     ) THEN
-        RAISE EXCEPTION 'workspace owner membership is immutable until owner transfer is defined';
+        RAISE EXCEPTION 'workspace owner membership is immutable';
     END IF;
     IF TG_OP = 'UPDATE' AND EXISTS (
         SELECT 1 FROM workspaces w
@@ -111,7 +124,7 @@ BEGIN
         OR NEW.member_id IS DISTINCT FROM OLD.member_id
         OR NEW.left_at IS DISTINCT FROM OLD.left_at
     ) THEN
-        RAISE EXCEPTION 'workspace owner membership is immutable until owner transfer is defined';
+        RAISE EXCEPTION 'workspace owner membership is immutable';
     END IF;
     IF TG_OP = 'DELETE' THEN
         RETURN OLD;

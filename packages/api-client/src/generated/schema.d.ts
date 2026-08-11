@@ -84,6 +84,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/{workspace_id}/owner": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Transfer ownership to one exact active membership tenure
+         * @description Only the current owner may perform this operation. Ownership is distinct from role permissions.
+         */
+        put: operations["transferWorkspaceOwnership"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/workspaces/{workspace_id}/membership": {
         parameters: {
             query?: never;
@@ -435,6 +457,9 @@ export interface components {
             name: string;
         };
         WorkspaceUpdateRequest: components["schemas"]["WorkspaceCreateRequest"];
+        WorkspaceOwnerTransferRequest: {
+            workspace_member_id: components["schemas"]["UUIDv7"];
+        };
         ParticipantRef: {
             /** @constant */
             kind: "human";
@@ -1325,6 +1350,42 @@ export interface operations {
                 };
                 content?: never;
             };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    transferWorkspaceOwnership: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceOwnerTransferRequest"];
+            };
+        };
+        responses: {
+            /** @description Workspace with the new distinguished owner membership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Workspace"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
         };
     };

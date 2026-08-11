@@ -139,6 +139,36 @@ paths:
           description: Missing or invalid browser session
         "404":
           $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/owner:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    put:
+      operationId: transferWorkspaceOwnership
+      summary: Transfer ownership to one exact active membership tenure
+      description: Only the current owner may perform this operation. Ownership is distinct from role permissions.
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceOwnerTransferRequest"
+      responses:
+        "200":
+          description: Workspace with the new distinguished owner membership
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /workspaces/{workspace_id}/membership:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -824,6 +854,13 @@ components:
           maxLength: 200
     WorkspaceUpdateRequest:
       $ref: "#/components/schemas/WorkspaceCreateRequest"
+    WorkspaceOwnerTransferRequest:
+      type: object
+      required: [workspace_member_id]
+      additionalProperties: false
+      properties:
+        workspace_member_id:
+          $ref: "#/components/schemas/UUIDv7"
     ParticipantRef:
       oneOf:
         - type: object

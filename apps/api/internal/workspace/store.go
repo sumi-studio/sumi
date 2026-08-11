@@ -250,6 +250,55 @@ func (s *Store) UpdateName(ctx context.Context, workspaceID string, actor partic
 	return item, nil
 }
 
+// TransferOwnership moves the distinguished Workspace ownership to an exact,
+// active membership tenure. Ownership is not a role and cannot be delegated by
+// a manage permission: only the current owner may choose their successor.
+func (s *Store) TransferOwnership(
+	ctx context.Context,
+	workspaceID string,
+	targetWorkspaceMemberID string,
+	actor participant.Ref,
+) (Workspace, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("begin transfer workspace ownership: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockWorkspace(ctx, tx, workspaceID); err != nil {
+		return Workspace{}, err
+	}
+	currentOwner, err := activeMembershipForUpdate(ctx, tx, workspaceID, actor)
+	if err != nil {
+		return Workspace{}, err
+	}
+	if !currentOwner.Owner {
+		return Workspace{}, ErrForbidden
+	}
+	target, err := membershipByIDForUpdate(ctx, tx, workspaceID, targetWorkspaceMemberID, true)
+	if err != nil {
+		return Workspace{}, err
+	}
+
+	var item Workspace
+	err = tx.QueryRow(ctx, `
+		UPDATE workspaces
+		SET owner_workspace_member_id = $2
+		WHERE workspace_id = $1
+		RETURNING workspace_id, name, owner_workspace_member_id, created_at`,
+		workspaceID, target.WorkspaceMemberID,
+	).Scan(&item.WorkspaceID, &item.Name, &item.OwnerWorkspaceMemberID, &item.CreatedAt)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("transfer workspace ownership: %w", err)
+	}
+	if err := ensureEffectiveAdministrator(ctx, tx, workspaceID); err != nil {
+		return Workspace{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Workspace{}, fmt.Errorf("commit workspace ownership transfer: %w", err)
+	}
+	return item, nil
+}
+
 func (s *Store) CreateInvite(ctx context.Context, workspaceID string, actor participant.Ref) (Invite, error) {
 	raw := make([]byte, inviteEntropyBytes)
 	if _, err := io.ReadFull(s.random, raw); err != nil {

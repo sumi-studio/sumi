@@ -12,6 +12,7 @@ const (
 	LocalWorkspaceCreatePath  = "/local-control/v1/workspace:create"
 	LocalWorkspaceGetPath     = "/local-control/v1/workspace:get"
 	LocalWorkspaceUpdatePath  = "/local-control/v1/workspace:update"
+	LocalWorkspaceOwnerPath   = "/local-control/v1/workspace:transfer-owner"
 	LocalMembersPath          = "/local-control/v1/workspace:members"
 	LocalLeavePath            = "/local-control/v1/workspace:leave"
 	LocalRemoveMemberPath     = "/local-control/v1/workspace:remove-member"
@@ -44,6 +45,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalWorkspaceCreatePath, s.localCreateWorkspace},
 		{"POST " + LocalWorkspaceGetPath, s.localWorkspace},
 		{"POST " + LocalWorkspaceUpdatePath, s.localUpdateWorkspace},
+		{"POST " + LocalWorkspaceOwnerPath, s.localTransferWorkspaceOwnership},
 		{"POST " + LocalMembersPath, s.localMembers},
 		{"POST " + LocalLeavePath, s.localLeave},
 		{"POST " + LocalRemoveMemberPath, s.localRemoveMember},
@@ -132,6 +134,20 @@ func (s *Server) localUpdateWorkspace(w http.ResponseWriter, r *http.Request, au
 	}
 	item, err := s.Store.UpdateName(r.Context(), request.WorkspaceID,
 		localActor(authorization), request.Name)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, workspaceToWire(item))
+}
+
+func (s *Server) localTransferWorkspaceOwnership(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request membershipIDRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	item, err := s.Store.TransferOwnership(r.Context(), request.WorkspaceID,
+		request.WorkspaceMemberID, localActor(authorization))
 	if err != nil {
 		writeDomainError(w, err)
 		return

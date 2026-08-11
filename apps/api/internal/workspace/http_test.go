@@ -160,7 +160,36 @@ func TestHumanAndAgentTransportsConvergeOnWorkspaceOperations(t *testing.T) {
 		t.Fatalf("Human redeemed membership = %#v", humanMembership)
 	}
 
-	if sessions.authorizeCalls != 3 { // create, invite creation, redemption
+	// Ownership is the same exact-tenure operation through both transports.
+	// The browser Human can hand its Workspace to a PersonalityAgent member;
+	// the local PersonalityAgent can hand its Workspace to a Human member.
+	humanTransfer := browserCall(mux, http.MethodPut,
+		"/workspaces/"+humanCreated.WorkspaceID+"/owner",
+		fmt.Sprintf(`{"workspace_member_id":%q}`, agentMembership.WorkspaceMemberID))
+	if humanTransfer.Code != http.StatusOK {
+		t.Fatalf("Human owner transfer status = %d, body=%s",
+			humanTransfer.Code, humanTransfer.Body.String())
+	}
+	var humanTransferred workspaceWire
+	decodeRecorder(t, humanTransfer, &humanTransferred)
+	if humanTransferred.OwnerWorkspaceMemberID != agentMembership.WorkspaceMemberID {
+		t.Fatalf("Human owner transfer = %#v", humanTransferred)
+	}
+
+	agentTransfer := invokeLocal(server.localTransferWorkspaceOwnership,
+		fmt.Sprintf(`{"workspace_id":%q,"workspace_member_id":%q}`,
+			agentCreated.WorkspaceID, humanMembership.WorkspaceMemberID), w.agentA.ID)
+	if agentTransfer.Code != http.StatusOK {
+		t.Fatalf("Agent owner transfer status = %d, body=%s",
+			agentTransfer.Code, agentTransfer.Body.String())
+	}
+	var agentTransferred workspaceWire
+	decodeRecorder(t, agentTransfer, &agentTransferred)
+	if agentTransferred.OwnerWorkspaceMemberID != humanMembership.WorkspaceMemberID {
+		t.Fatalf("Agent owner transfer = %#v", agentTransferred)
+	}
+
+	if sessions.authorizeCalls != 4 { // create, invite creation, redemption, owner transfer
 		t.Fatalf("browser mutation admission calls = %d", sessions.authorizeCalls)
 	}
 }
