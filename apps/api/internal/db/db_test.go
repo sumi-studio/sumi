@@ -2,10 +2,12 @@ package db
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -122,6 +124,137 @@ func TestKosekiSchemaConstraints(t *testing.T) {
 	}
 	if activeCount != 1 {
 		t.Fatalf("expected exactly 1 active employment after transfer, got %d", activeCount)
+	}
+}
+
+func TestKosekiIdentityColumnsAreImmutableWithoutFreezingMutableState(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 15)
+
+	const human1 = "0198f0f4-9b72-7000-8000-000000000031"
+	const human2 = "0198f0f4-9b72-7000-8000-000000000032"
+	const replacementHumanID = "0198f0f4-9b72-7000-8000-000000000033"
+	const agentID = "0198f0f4-9b72-7000-8000-000000000034"
+	const replacementAgentID = "0198f0f4-9b72-7000-8000-000000000035"
+	for _, humanID := range []string{human1, human2} {
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO humans (human_id, display_name) VALUES ($1, 'Initial')",
+			humanID); err != nil {
+			t.Fatalf("insert human %s: %v", humanID, err)
+		}
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)",
+		agentID, human1); err != nil {
+		t.Fatalf("insert agent: %v", err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("apply identity-immutability migration over existing identities: %v", err)
+	}
+
+	assertIdentityUpdateRejected(t, pool, ctx,
+		"UPDATE humans SET human_id=$2 WHERE human_id=$1", human1, replacementHumanID)
+	assertIdentityUpdateRejected(t, pool, ctx,
+		"UPDATE humans SET created_at=created_at + interval '1 second' WHERE human_id=$1", human1)
+	assertIdentityUpdateRejected(t, pool, ctx,
+		"UPDATE agents SET personality_agent_id=$2 WHERE personality_agent_id=$1", agentID, replacementAgentID)
+	assertIdentityUpdateRejected(t, pool, ctx,
+		"UPDATE agents SET created_at=created_at + interval '1 second' WHERE personality_agent_id=$1", agentID)
+
+	if _, err := pool.Exec(ctx, `UPDATE humans
+		SET display_name='Chosen', display_name_customized=true, display_name_initialized=true
+		WHERE human_id=$1`, human1); err != nil {
+		t.Fatalf("update mutable Human attributes: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agents
+		SET display_name='Kuro', warmth='warm', human_id=$2
+		WHERE personality_agent_id=$1`, agentID, human2); err != nil {
+		t.Fatalf("update mutable PersonalityAgent attributes and current relation: %v", err)
+	}
+
+	var humanName string
+	var customized, initialized bool
+	if err := pool.QueryRow(ctx, `SELECT display_name, display_name_customized, display_name_initialized
+		FROM humans WHERE human_id=$1`, human1).Scan(&humanName, &customized, &initialized); err != nil {
+		t.Fatalf("read mutable Human attributes: %v", err)
+	}
+	if humanName != "Chosen" || !customized || !initialized {
+		t.Fatalf("mutable Human attributes were not persisted: name=%q customized=%t initialized=%t",
+			humanName, customized, initialized)
+	}
+	var agentName, warmth, ownerID string
+	if err := pool.QueryRow(ctx, `SELECT display_name, warmth, human_id
+		FROM agents WHERE personality_agent_id=$1`, agentID).Scan(&agentName, &warmth, &ownerID); err != nil {
+		t.Fatalf("read mutable PersonalityAgent attributes: %v", err)
+	}
+	if agentName != "Kuro" || warmth != "warm" || ownerID != human2 {
+		t.Fatalf("mutable PersonalityAgent state was not persisted: name=%q warmth=%q human_id=%q",
+			agentName, warmth, ownerID)
+	}
+
+	// The identity guard deliberately does not decide the still-separate public
+	// identity-row retention question. Rows without dependents remain deletable.
+	if _, err := pool.Exec(ctx, "DELETE FROM agents WHERE personality_agent_id=$1", agentID); err != nil {
+		t.Fatalf("delete agent identity row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM humans WHERE human_id = ANY($1)", []string{human1, human2}); err != nil {
+		t.Fatalf("delete Human identity rows: %v", err)
+	}
+}
+
+func TestKosekiIdentityImmutabilityDownMigrationRemovesOnlyItsGuards(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	down, err := migrationFS.ReadFile("migrations/0016_koseki_identity_immutability.down.sql")
+	if err != nil {
+		t.Fatalf("read down migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("apply down migration: %v", err)
+	}
+
+	const human1 = "0198f0f4-9b72-7000-8000-000000000041"
+	const human2 = "0198f0f4-9b72-7000-8000-000000000042"
+	const agentID = "0198f0f4-9b72-7000-8000-000000000043"
+	for _, humanID := range []string{human1, human2} {
+		if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+			t.Fatalf("insert human %s after down migration: %v", humanID, err)
+		}
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)", agentID, human2); err != nil {
+		t.Fatalf("insert agent after down migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE humans SET human_id='0198f0f4-9b72-7000-8000-000000000044', created_at=created_at + interval '1 second' WHERE human_id=$1",
+		human1); err != nil {
+		t.Fatalf("Human identity guard remained after down migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE agents SET personality_agent_id='0198f0f4-9b72-7000-8000-000000000045', created_at=created_at + interval '1 second' WHERE personality_agent_id=$1",
+		agentID); err != nil {
+		t.Fatalf("PersonalityAgent identity guard remained after down migration: %v", err)
+	}
+}
+
+func assertIdentityUpdateRejected(t *testing.T, pool *pgxpool.Pool, ctx context.Context, query string, args ...any) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, query, args...); err == nil {
+		t.Fatal("identity-column update unexpectedly succeeded")
+	} else {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("identity-column update returned a non-Postgres error: %v", err)
+		}
+		if pgErr.Code != "23000" {
+			t.Fatalf("identity-column update failed outside the identity guard: code=%s error=%v", pgErr.Code, err)
+		}
 	}
 }
 
