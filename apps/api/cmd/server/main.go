@@ -23,12 +23,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
+	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 	"golang.org/x/sys/unix"
 )
 
@@ -343,7 +345,9 @@ func newApplicationFromEnv() (*application, error) {
 		if sv != nil {
 			messagingSessions = sv
 		}
-		messagingStore := messaging.New(database.Pool)
+		workspaceStore := workspacecontrol.New(database.Pool)
+		appStore := applicationapps.New(database.Pool, workspaceStore)
+		messagingStore := messaging.New(database.Pool, workspaceStore, appStore)
 		messagingHub := messaging.NewHub(messagingStore)
 		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins

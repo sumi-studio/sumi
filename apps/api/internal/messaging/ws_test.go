@@ -25,11 +25,20 @@ func (unusedFirebaseVerifier) VerifyIDToken(context.Context, string) (agentevent
 func newWSWorld(t *testing.T, ctx context.Context) (world, *httptest.Server) {
 	t.Helper()
 	w := newWorld(t, ctx)
-	hub := NewHub(w.store)
-	rest := NewServer(w.store, stubSessions{})
+	if err := w.store.seedDefaultWorkspaceFixture(ctx, w.humanA); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.seedDefaultWorkspaceFixture(ctx, w.humanB); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.seedDefaultWorkspaceFixture(ctx, w.agent); err != nil {
+		t.Fatal(err)
+	}
+	hub := NewHub(w.store.core)
+	rest := NewServer(w.store.core, stubSessions{})
 	rest.AllowedOrigins = []string{testOrigin}
 	rest.Hub = hub
-	ws := NewWSServer(w.store, stubSessions{}, hub)
+	ws := NewWSServer(w.store.core, stubSessions{}, hub)
 	ws.AllowedOrigins = []string{testOrigin}
 	mux := http.NewServeMux()
 	rest.RegisterRoutes(mux)
@@ -42,6 +51,17 @@ func newWSWorld(t *testing.T, ctx context.Context) (world, *httptest.Server) {
 func dialWS(t *testing.T, ts *httptest.Server, cookie string, cursors map[string]int64) *websocket.Conn {
 	t.Helper()
 	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/messaging/ws"
+	if store, ok := testStoreForParticipant(cookie); ok {
+		if scoped, err := store.scopeForActor(context.Background(), Human(cookie)); err == nil {
+			url += "?workspace_id=" + scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID
+		}
+	} else if store, ok := testStoreForServer(ts.URL); ok {
+		if actor, actorOK := testActorForServer(ts.URL); actorOK {
+			if scoped, err := store.scopeForActor(context.Background(), actor); err == nil {
+				url += "?workspace_id=" + scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID
+			}
+		}
+	}
 	header := http.Header{}
 	header.Set("Origin", testOrigin)
 	header.Set("Cookie", agentevents.BrowserSessionCookie+"="+cookie)
@@ -101,11 +121,9 @@ func TestWSRejectsBadOriginAndSession(t *testing.T) {
 func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	const (
-		humanID = "01913f5e-7b8a-7abc-8def-0123456789ab"
-		agentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
-		placeID = "cached-place"
-	)
+	w := newWorld(t, ctx)
+	_, place := w.workspaceWithChannel(t, ctx)
+	humanID, agentID, placeID := w.humanA.ID, w.agent.ID, place.PlaceID
 
 	commandStore, err := agentevents.OpenCommandStore(t.TempDir())
 	if err != nil {
@@ -140,8 +158,8 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 		t.Fatal(err)
 	}
 
-	hub := NewHub(nil)
-	ws := NewWSServer(nil, sessions, hub)
+	hub := NewHub(w.store.core)
+	ws := NewWSServer(w.store.core, sessions, hub)
 	ws.AllowedOrigins = []string{testOrigin}
 	auth.Connections = ws
 	mux := http.NewServeMux()
@@ -149,6 +167,8 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 	mux.Handle("GET /messaging/ws", ws)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
+	testStoresByServer.Store(ts.URL, w.store)
+	testActorsByServer.Store(ts.URL, w.humanA)
 
 	issueAndPrime := func(t *testing.T) (string, *websocket.Conn) {
 		t.Helper()
@@ -310,7 +330,7 @@ func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w, ts := newWSWorld(t, ctx)
-	w.workspaceWithChannel(t, ctx)
+	_, channel := w.workspaceWithChannel(t, ctx)
 	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
@@ -335,9 +355,8 @@ func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 
 	// The outsider must not receive the dm event. Prove the socket is still
 	// live and ordered by sending something the outsider can see afterwards.
-	_, ch2 := w.workspaceWithChannel(t, ctx)
 	if err := insider.WriteJSON(map[string]any{
-		"type": "send", "place_id": ch2.PlaceID,
+		"type": "send", "place_id": channel.PlaceID,
 		"content": "全員向け", "client_nonce": "ch-nonce-1",
 	}); err != nil {
 		t.Fatalf("write channel send: %v", err)
@@ -347,7 +366,7 @@ func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 		t.Fatalf("outsider frame = %v", frame)
 	}
 	event := frame["event"].(map[string]any)
-	if event["place_id"] != ch2.PlaceID {
+	if event["place_id"] != channel.PlaceID {
 		t.Fatalf("outsider must only see the channel event, got %v", event)
 	}
 }
@@ -366,8 +385,8 @@ func TestHubReauthorizesWarmedVisibilityAfterMembershipRemoval(t *testing.T) {
 			w := newWorld(t, ctx)
 			ws, ch := w.workspaceWithChannel(t, ctx)
 			participant := test.participant(w)
-			hub := NewHub(w.store)
-			sub := hub.subscribe(participant)
+			hub := NewHub(w.store.core)
+			sub := hub.subscribe(w.store.mustScopeForPlace(t, ctx, ch.PlaceID, participant))
 			defer hub.unsubscribe(sub)
 
 			audience, err := w.store.ActiveParticipantsForPlace(ctx, ch.PlaceID)
@@ -404,7 +423,7 @@ type countingHubAuthorizer struct {
 	placeCalls       int
 	participantCalls int
 	audience         map[ParticipantRef]struct{}
-	store            *Store
+	store            hubAuthorizer
 }
 
 func (a *countingHubAuthorizer) ActiveParticipantsForPlace(

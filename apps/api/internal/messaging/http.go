@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 )
 
 // maxRequestBytes bounds any /messaging JSON request body. One legal content
@@ -401,7 +402,7 @@ func notificationSettingToWire(setting NotificationSetting) notificationSettingW
 // skipped the receiver's own rules. Delivery is best-effort on top of that
 // durable truth, so a delivery read failure still fans out the message without
 // claiming that anyone was called.
-func publishMessageCreated(ctx context.Context, store *Store, hub *Hub, place Place, msg Message) {
+func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, place Place, msg Message) {
 	if hub == nil {
 		return
 	}
@@ -449,7 +450,23 @@ type unreadSummaryWire struct {
 
 // --- authentication ---
 
-// viewer authenticates the request and returns the acting participant. The
+type requestScopeContextKey struct{}
+
+func scopedStoreForRequest(r *http.Request) *ScopedStore {
+	store, _ := r.Context().Value(requestScopeContextKey{}).(*ScopedStore)
+	return store
+}
+
+func exactQueryValue(r *http.Request, key string) (string, bool) {
+	values, present := r.URL.Query()[key]
+	returnValue := ""
+	if present && len(values) == 1 {
+		returnValue = values[0]
+	}
+	return returnValue, present && len(values) == 1 && returnValue != ""
+}
+
+// viewer authenticates the request and binds its exact app scope. The
 // browser session lane acts as the session's Human; the agent lane (bearer
 // token, acting as the PersonalityAgent) is added alongside when the agent
 // tools land — both resolve to a ParticipantRef here and nothing below this
@@ -482,6 +499,20 @@ func (s *Server) viewer(w http.ResponseWriter, r *http.Request) (ParticipantRef,
 		writeError(w, http.StatusUnauthorized, "invalid_session")
 		return ParticipantRef{}, none, false
 	}
+	workspaceID, workspaceOK := exactQueryValue(r, "workspace_id")
+	installationID, installationOK := exactQueryValue(r, "installation_id")
+	if !workspaceOK || !installationOK || s.Store == nil {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return ParticipantRef{}, none, false
+	}
+	scoped, err := s.Store.Scoped(Scope{
+		WorkspaceID: workspaceID, InstallationID: installationID, Actor: viewer,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return ParticipantRef{}, none, false
+	}
+	*r = *r.WithContext(context.WithValue(r.Context(), requestScopeContextKey{}, scoped))
 	return viewer, claims, true
 }
 
@@ -510,12 +541,13 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	summaries, err := s.Store.UnreadSummaries(ctx, viewer)
+	store := scopedStoreForRequest(r)
+	summaries, err := store.UnreadSummaries(ctx)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	workspaces, err := s.Store.WorkspacesFor(ctx, viewer)
+	workspace, err := store.Workspace(ctx)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -537,16 +569,13 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	workspaceWires := make([]workspaceWire, len(workspaces))
-	for i, ws := range workspaces {
-		workspaceWires[i] = workspaceWire{WorkspaceID: ws.WorkspaceID, Name: ws.Name}
-		profiles, err := s.Store.WorkspaceMemberProfiles(ctx, ws.WorkspaceID, viewer)
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		addMembers(profiles)
+	workspaceWires := []workspaceWire{{WorkspaceID: workspace.WorkspaceID, Name: workspace.Name}}
+	profiles, err := store.WorkspaceMembers(ctx)
+	if err != nil {
+		writeStoreError(w, err)
+		return
 	}
+	addMembers(profiles)
 
 	channels := []channelWire{}
 	dms := []dmWire{}
@@ -563,7 +592,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			channels = append(channels, channelToWire(sum.Place))
 			continue
 		}
-		profiles, err := s.Store.ActiveMembers(ctx, sum.Place.PlaceID, viewer)
+		profiles, err := store.ActiveMembers(ctx, sum.Place.PlaceID)
 		if err != nil {
 			writeStoreError(w, err)
 			return
@@ -586,7 +615,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	// promises of every visible place. Statuses change over the volatile
 	// status_updated event, which never replays — bootstrap is where a fresh
 	// client learns the current value.
-	statuses, err := s.Store.StatusesVisibleTo(ctx, viewer)
+	statuses, err := store.StatusesVisibleTo(ctx)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -595,7 +624,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	for i, status := range statuses {
 		statusWires[i] = statusToWire(status)
 	}
-	markers, err := s.Store.ReplyLaterMarkersFor(ctx, viewer)
+	markers, err := store.ReplyLaterMarkersFor(ctx)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -606,7 +635,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	// The viewer's own notification setting: the sidebar dims muted places from
 	// the first paint, without a second round trip that could disagree.
-	setting, err := s.Store.NotificationSettingFor(ctx, viewer)
+	setting, err := store.NotificationSettingFor(ctx)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -638,7 +667,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -661,7 +690,10 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.CreateChannel(r.Context(), req.WorkspaceID, req.Name, req.Topic, viewer)
+		if req.WorkspaceID != "" && req.WorkspaceID != scopedStoreForRequest(r).Scope.WorkspaceID {
+			return ErrInvalidScope
+		}
+		place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic)
 		return opErr
 	})
 	if !done {
@@ -678,7 +710,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 
 // serveUpdatePlace edits a channel's mutable fields (v0: topic only).
 func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -695,7 +727,7 @@ func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.UpdateChannelTopic(r.Context(), r.PathValue("place_id"), req.Topic, viewer)
+		place, opErr = scopedStoreForRequest(r).UpdateChannelTopic(r.Context(), r.PathValue("place_id"), req.Topic)
 		return opErr
 	})
 	if !done {
@@ -732,7 +764,7 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, created, opErr = s.Store.EnsureDM(r.Context(), viewer, other)
+		place, created, opErr = scopedStoreForRequest(r).EnsureDM(r.Context(), other)
 		return opErr
 	})
 	if !done {
@@ -775,7 +807,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.CreateGroupDM(r.Context(), viewer, others)
+		place, opErr = scopedStoreForRequest(r).CreateGroupDM(r.Context(), others)
 		return opErr
 	})
 	if !done {
@@ -794,16 +826,17 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
-	viewer, _, ok := s.viewer(w, r)
+	_, _, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), r.PathValue("place_id"), viewer)
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), r.PathValue("place_id"))
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	profiles, err := s.Store.ActiveMembers(r.Context(), place.PlaceID, viewer)
+	profiles, err := store.ActiveMembers(r.Context(), place.PlaceID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -820,7 +853,7 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveHistory(w http.ResponseWriter, r *http.Request) {
-	viewer, _, ok := s.viewer(w, r)
+	_, _, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -842,12 +875,13 @@ func (s *Server) serveHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		opt.Limit = limit
 	}
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), placeID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	messages, err := s.Store.History(r.Context(), placeID, viewer, opt)
+	messages, err := store.History(r.Context(), placeID, opt)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -890,7 +924,8 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), placeID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -901,7 +936,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, created, opErr = s.Store.AppendMessage(r.Context(), AppendInput{
+		msg, created, opErr = store.AppendMessage(r.Context(), AppendInput{
 			PlaceID: placeID, Author: viewer, Content: req.Content,
 			Urgency: req.Urgency, ReplyTo: req.ReplyTo, ClientNonce: req.ClientNonce,
 		})
@@ -920,13 +955,13 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	if created {
-		publishMessageCreated(r.Context(), s.Store, s.Hub, place, msg)
+		publishMessageCreated(r.Context(), store, s.Hub, place, msg)
 	}
 	writeJSON(w, status, messageReceiptToWire(msg, created))
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -941,7 +976,8 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), placeID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -949,7 +985,7 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	var msg Message
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, opErr = s.Store.EditMessage(r.Context(), placeID, r.PathValue("message_id"), viewer, req.Content)
+		msg, opErr = store.EditMessage(r.Context(), placeID, r.PathValue("message_id"), req.Content)
 		return opErr
 	})
 	if !done {
@@ -967,12 +1003,13 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
 	placeID := r.PathValue("place_id")
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), placeID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -980,7 +1017,7 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	var msg Message
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, opErr = s.Store.DeleteMessage(r.Context(), placeID, r.PathValue("message_id"), viewer)
+		msg, opErr = store.DeleteMessage(r.Context(), placeID, r.PathValue("message_id"))
 		return opErr
 	})
 	if !done {
@@ -998,7 +1035,7 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 // serveToggleReaction toggles the viewer's emoji on a message. The same store
 // toggle backs the agent tool path (AX: UIだけにある操作を作らない).
 func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -1018,7 +1055,8 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), placeID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -1029,8 +1067,8 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, reacted, opErr = s.toggleReaction(
-			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji, req.ClientNonce)
+		msg, reacted, opErr = s.toggleScopedReaction(
+			r.Context(), store, placeID, r.PathValue("message_id"), req.Emoji, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -1051,7 +1089,7 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 // request field (自己申告のattention — the platform does not observe or
 // announce attention on a person's behalf).
 func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -1077,7 +1115,7 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 	var status ParticipantStatus
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		status, opErr = s.Store.SetStatus(r.Context(), viewer, req.Status, req.Note, req.ExpiresAt)
+		status, opErr = scopedStoreForRequest(r).SetStatus(r.Context(), req.Status, req.Note, req.ExpiresAt)
 		return opErr
 	})
 	if !done {
@@ -1095,11 +1133,11 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 // There is no route for reading anyone else's: what interrupts a person is
 // theirs to know (契約ドラフト: owner が本人、変更も本人のみ).
 func (s *Server) serveNotificationSetting(w http.ResponseWriter, r *http.Request) {
-	viewer, _, ok := s.viewer(w, r)
+	_, _, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
-	setting, err := s.Store.NotificationSettingFor(r.Context(), viewer)
+	setting, err := scopedStoreForRequest(r).NotificationSettingFor(r.Context())
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -1112,7 +1150,7 @@ func (s *Server) serveNotificationSetting(w http.ResponseWriter, r *http.Request
 // (bootstrap gives it), so a partial merge would only add a way for two tabs to
 // disagree about what was removed.
 func (s *Server) serveSetNotificationSetting(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -1150,8 +1188,8 @@ func (s *Server) serveSetNotificationSetting(w http.ResponseWriter, r *http.Requ
 	var setting NotificationSetting
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		setting, opErr = s.Store.SetNotificationSetting(
-			r.Context(), viewer, req.Defaults.Level, perPlace, req.Keywords)
+		setting, opErr = scopedStoreForRequest(r).SetNotificationSetting(
+			r.Context(), req.Defaults.Level, perPlace, req.Keywords)
 		return opErr
 	})
 	if !done {
@@ -1195,8 +1233,8 @@ func (s *Server) serveCreateReplyLater(w http.ResponseWriter, r *http.Request) {
 	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		marker, created, opErr = s.Store.CreateReplyLater(
-			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Note, *req.RemindAt)
+		marker, created, opErr = scopedStoreForRequest(r).CreateReplyLater(
+			r.Context(), placeID, r.PathValue("message_id"), req.Note, *req.RemindAt)
 		return opErr
 	})
 	if !done {
@@ -1230,7 +1268,7 @@ func (s *Server) serveResolveReplyLater(w http.ResponseWriter, r *http.Request) 
 	var marker ReplyLaterMarker
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		marker, opErr = s.Store.ResolveReplyLater(r.Context(), r.PathValue("marker_id"), viewer)
+		marker, opErr = scopedStoreForRequest(r).ResolveReplyLater(r.Context(), r.PathValue("marker_id"))
 		return opErr
 	})
 	if !done {
@@ -1247,7 +1285,7 @@ func (s *Server) serveResolveReplyLater(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) serveReadThrough(w http.ResponseWriter, r *http.Request) {
-	viewer, claims, ok := s.viewer(w, r)
+	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -1258,7 +1296,7 @@ func (s *Server) serveReadThrough(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	done, err := s.mutate(w, r, claims, func() error {
-		return s.Store.ReadThrough(r.Context(), r.PathValue("place_id"), viewer, req.Seq)
+		return scopedStoreForRequest(r).ReadThrough(r.Context(), r.PathValue("place_id"), req.Seq)
 	})
 	if !done {
 		return
@@ -1331,6 +1369,12 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+	case errors.Is(err, ErrInvalidScope):
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+	case errors.Is(err, applicationapps.ErrInstallationNotFound):
+		writeError(w, http.StatusNotFound, "installation_not_found")
+	case errors.Is(err, applicationapps.ErrAppDisabled):
+		writeError(w, http.StatusForbidden, "app_disabled")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

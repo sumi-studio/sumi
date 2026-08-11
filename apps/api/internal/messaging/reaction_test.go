@@ -24,6 +24,12 @@ func callLocal(
 	authorization agentevents.LocalRuntimeAuthorization,
 ) (int, map[string]any) {
 	t.Helper()
+	if store, ok := testStoreForParticipant(authorization.PersonalityAgentID); ok {
+		if scoped, err := store.fixtureScopeForRequest(ctx, PersonalityAgent(authorization.PersonalityAgentID), path, body); err == nil {
+			body["workspace_id"] = scoped.Scope.WorkspaceID
+			body["installation_id"] = scoped.Scope.InstallationID
+		}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal local request: %v", err)
@@ -254,8 +260,8 @@ func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
 	w := newWorld(t, ctx)
 	_, ch := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "concurrent reactions")
-	hub := NewHub(w.store)
-	server := NewServer(w.store, nil)
+	hub := NewHub(w.store.core)
+	server := NewServer(w.store.core, nil)
 	server.Hub = hub
 	sub := hub.subscribe(w.humanA)
 	sub.markVisible(ch.PlaceID, true)
@@ -265,9 +271,10 @@ func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
 	errs := make(chan error, 2)
 	for _, actor := range []ParticipantRef{w.humanA, w.humanB} {
 		actor := actor
+		scoped := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, actor)
 		go func() {
 			<-start
-			_, _, err := server.toggleReaction(ctx, ch.PlaceID, msg.MessageID, actor, "👍", "concurrent-"+actor.Key())
+			_, _, err := server.toggleScopedReaction(ctx, scoped, ch.PlaceID, msg.MessageID, "👍", "concurrent-"+actor.Key())
 			errs <- err
 		}()
 	}
@@ -305,7 +312,7 @@ func TestLocalReactTogglesForTheAgent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	server := NewServer(w.store, nil)
+	server := NewServer(w.store.core, nil)
 	_, channel := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, channel.PlaceID, w.humanA, "generalの発言")
 
@@ -474,7 +481,7 @@ func TestReactionNonceConflictMapsToRESTAndLocalControl409(t *testing.T) {
 		t.Fatalf("REST nonce conflict: status=%d body=%v", response.StatusCode, body)
 	}
 
-	server := NewServer(w.store, nil)
+	server := NewServer(w.store.core, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 	localRequest := func(messageID string) (int, map[string]any) {
 		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{

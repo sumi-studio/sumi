@@ -24,7 +24,9 @@ func (w world) mintHuman(t *testing.T, ctx context.Context, name string) Partici
 		"UPDATE humans SET display_name = $1 WHERE human_id = $2", name, id); err != nil {
 		t.Fatalf("name human %s: %v", name, err)
 	}
-	return Human(id)
+	participant := Human(id)
+	registerTestStore(w.store, participant)
+	return participant
 }
 
 func reasonFor(t *testing.T, decisions []NotificationDecision, participant ParticipantRef) string {
@@ -413,7 +415,7 @@ func TestPublishMessageCreatedAuthorizesAllIntentVariantsOnce(t *testing.T) {
 		defer hub.unsubscribe(sub)
 	}
 
-	publishMessageCreated(ctx, w.store, hub, ch, msg)
+	publishMessageCreated(ctx, w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanA), hub, ch, msg)
 
 	if authorizer.placeCalls != 1 {
 		t.Fatalf("message variant authorization queries = %d, want one", authorizer.placeCalls)
@@ -429,7 +431,8 @@ func TestLocalNotificationSettingsUseTheSharedStore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	server := NewServer(w.store, nil)
+	_, general := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 
 	// An empty request is a read: the agent's default, same as a Human's.
@@ -475,7 +478,6 @@ func TestLocalNotificationSettingsUseTheSharedStore(t *testing.T) {
 	if stored.Default() != NotifyLevelMentions || len(stored.Keywords) != 1 {
 		t.Fatalf("agent stored setting = %+v", stored)
 	}
-	_, general := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, general.PlaceID, w.humanA, "今夜のリリースについて")
 	decisions, err := w.store.NotificationDecisionsFor(ctx, general, msg)
 	if err != nil {

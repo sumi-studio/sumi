@@ -60,6 +60,7 @@ const (
 // without requiring reconnect.
 type subscriber struct {
 	viewer ParticipantRef
+	store  *ScopedStore
 	send   chan []byte
 	// done is closed exactly once on unsubscribe. send is never closed, so
 	// concurrent publishers can always select against done without racing a
@@ -106,19 +107,27 @@ type hubAuthorizer interface {
 // NewHub returns a hub that obtains current authorized participant sets from
 // the messaging store before in-memory fanout.
 func NewHub(store *Store) *Hub {
-	if store == nil {
-		return newHub(nil)
-	}
-	return newHub(store)
+	return newHub(nil)
 }
 
 func newHub(authorizer hubAuthorizer) *Hub {
 	return &Hub{authorizer: authorizer, subscribers: map[*subscriber]struct{}{}}
 }
 
-func (h *Hub) subscribe(viewer ParticipantRef) *subscriber {
+func (h *Hub) subscribe(scope any) *subscriber {
+	var viewer ParticipantRef
+	var store *ScopedStore
+	switch value := scope.(type) {
+	case ParticipantRef:
+		viewer = value // test-only store-less subscriber
+	case *ScopedStore:
+		store, viewer = value, value.Scope.Actor
+	default:
+		panic("messaging subscriber requires ParticipantRef or ScopedStore")
+	}
 	sub := &subscriber{
 		viewer: viewer,
+		store:  store,
 		// Enough headroom for a busy place; overflow means the reader is not
 		// keeping up and replay-on-reconnect is the correct recovery.
 		send:    make(chan []byte, 256),
@@ -218,7 +227,16 @@ func (h *Hub) PublishVariants(ctx context.Context, events []Event) {
 	var drop []*subscriber
 	for _, sub := range subs {
 		visible := false
-		if h.authorizer == nil {
+		if sub.store != nil {
+			if events[0].PlaceID != "" {
+				_, err := sub.store.PlaceFor(ctx, events[0].PlaceID)
+				visible = err == nil
+			} else {
+				var err error
+				visible, err = sub.store.ParticipantVisible(ctx, *events[0].Subject)
+				visible = err == nil && visible
+			}
+		} else if h.authorizer == nil {
 			visible, _ = sub.visibility(scope)
 		} else {
 			_, visible = authorized[sub.viewer]

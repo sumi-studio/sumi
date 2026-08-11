@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -35,11 +36,17 @@ func (stubSessions) AuthorizeSession(ctx context.Context, claims agentevents.Use
 func newTestServer(t *testing.T, ctx context.Context) (world, *httptest.Server) {
 	t.Helper()
 	w := newWorld(t, ctx)
-	server := NewServer(w.store, stubSessions{})
+	for _, participant := range []ParticipantRef{w.humanA, w.humanB, w.agent} {
+		if err := w.store.seedDefaultWorkspaceFixture(ctx, participant); err != nil {
+			t.Fatalf("prepare default test Workspace: %v", err)
+		}
+	}
+	server := NewServer(w.store.core, stubSessions{})
 	server.AllowedOrigins = []string{testOrigin}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	ts := httptest.NewServer(mux)
+	testStoresByServer.Store(ts.URL, w.store)
 	t.Cleanup(ts.Close)
 	return w, ts
 }
@@ -47,9 +54,34 @@ func newTestServer(t *testing.T, ctx context.Context) (world, *httptest.Server) 
 // call issues a request as the given participant (via the stub cookie).
 func call(t *testing.T, ts *httptest.Server, method, path, cookie string, body any) (*http.Response, map[string]any) {
 	t.Helper()
+	requestBody := map[string]any{}
+	if supplied, ok := body.(map[string]any); ok {
+		for key, value := range supplied {
+			requestBody[key] = value
+		}
+	}
+	if cookie != "" && !strings.HasPrefix(cookie, "revoked:") {
+		store, ok := testStoreForParticipant(cookie)
+		if !ok {
+			store, ok = testStoreForServer(ts.URL)
+		}
+		if ok {
+			if scoped, err := store.fixtureScopeForRequest(context.Background(), Human(cookie), path, requestBody); err == nil {
+				parsed, parseErr := url.Parse(path)
+				if parseErr != nil {
+					t.Fatalf("parse request path: %v", parseErr)
+				}
+				query := parsed.Query()
+				query.Set("workspace_id", scoped.Scope.WorkspaceID)
+				query.Set("installation_id", scoped.Scope.InstallationID)
+				parsed.RawQuery = query.Encode()
+				path = parsed.String()
+			}
+		}
+	}
 	var reader *bytes.Reader
 	if body != nil {
-		raw, err := json.Marshal(body)
+		raw, err := json.Marshal(requestBody)
 		if err != nil {
 			t.Fatalf("marshal body: %v", err)
 		}
@@ -88,8 +120,8 @@ func TestMessagingRoutesFailClosedOnOriginAndSession(t *testing.T) {
 		t.Fatalf("request: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET without origin: status %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("GET without exact scope: status %d, want 400", resp.StatusCode)
 	}
 
 	// Unsafe methods still fail closed before request-body or resource checks.
@@ -151,7 +183,7 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	for _, m := range members {
 		names[m.(map[string]any)["display_name"].(string)] = true
 	}
-	if !names["Yohaku"] || !names["Haru"] || !names["Kuro（Yohaku）"] {
+	if !names["Yohaku"] || !names["Haru"] || !names["Kuro"] {
 		t.Fatalf("members missing display names: %v", members)
 	}
 	// The channel has one unread mention for the viewer.
@@ -307,7 +339,7 @@ func TestDMEndpointsUseReachability(t *testing.T) {
 	stranger := "018f3f8d-7b2c-7a10-8f9e-00000000ab99"
 	resp, body = call(t, ts, http.MethodPost, "/messaging/dms", stranger,
 		map[string]any{"participant": map[string]any{"kind": "human", "human_id": w.humanA.ID}})
-	if resp.StatusCode != http.StatusForbidden || body["error"] != "not_reachable" {
+	if resp.StatusCode != http.StatusNotFound || body["error"] != "not_found" {
 		t.Fatalf("unreachable dm: status %d body %v", resp.StatusCode, body)
 	}
 }
@@ -325,11 +357,16 @@ func TestChannelTopicPatchOverHTTP(t *testing.T) {
 	}
 	channelID := body["channel_id"].(string)
 
-	// Any active workspace member may edit the topic (v0: CreateChannelと同じ基準).
+	// Channel management requires the Workspace-owned app capability.
 	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanB.ID,
 		map[string]any{"topic": "レビュー予約はこちら"})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("member patch topic: status %d body %v", resp.StatusCode, body)
+	}
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanA.ID,
+		map[string]any{"topic": "レビュー予約はこちら"})
 	if resp.StatusCode != http.StatusOK || body["topic"] != "レビュー予約はこちら" {
-		t.Fatalf("patch topic: status %d body %v", resp.StatusCode, body)
+		t.Fatalf("owner patch topic: status %d body %v", resp.StatusCode, body)
 	}
 
 	// The change is durable and projected by bootstrap.

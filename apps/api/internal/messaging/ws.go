@@ -113,11 +113,31 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_session")
 		return
 	}
+	workspaceID, workspaceOK := exactQueryValue(r, "workspace_id")
+	installationID, installationOK := exactQueryValue(r, "installation_id")
+	if !workspaceOK || !installationOK || s.Store == nil {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return
+	}
+	store, err := s.Store.Scoped(Scope{
+		WorkspaceID: workspaceID, InstallationID: installationID, Actor: viewer,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return
+	}
+	if err := store.authorize(r.Context()); err != nil {
+		writeStoreError(w, err)
+		return
+	}
 
 	var conn *websocket.Conn
 	upgradeAttempted := false
 	upgradeCtx, cancelUpgrade := context.WithTimeout(r.Context(), s.WriteTimeout)
 	err = s.Sessions.AuthorizeSession(upgradeCtx, claims, func() error {
+		if err := store.authorize(upgradeCtx); err != nil {
+			return err
+		}
 		upgrader := s.upgrader
 		upgrader.HandshakeTimeout = s.WriteTimeout
 		upgradeAttempted = true
@@ -150,7 +170,7 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub := s.Hub.subscribe(viewer)
+	sub := s.Hub.subscribe(store)
 	defer s.Hub.unsubscribe(sub)
 
 	// The writer owns the socket's write side: hub frames, receipts, pings.
@@ -176,7 +196,7 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // with caught_up{latest_seq} so the client can detect a replay gap.
 func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[string]int64) bool {
 	for placeID, since := range cursors {
-		place, err := s.Store.PlaceFor(ctx, placeID, sub.viewer)
+		place, err := sub.store.PlaceFor(ctx, placeID)
 		if err != nil {
 			// Not visible (or gone): the cursor is silently dropped. The
 			// place's existence is not revealed on this path either.
@@ -184,7 +204,7 @@ func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[str
 			continue
 		}
 		sub.markVisible(placeID, true)
-		messages, err := s.Store.MessagesSince(ctx, placeID, sub.viewer, since, catchUpLimit)
+		messages, err := sub.store.MessagesSince(ctx, placeID, since, catchUpLimit)
 		if err != nil {
 			return false
 		}
@@ -251,7 +271,7 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 		s.enqueueError(sub, "invalid_client_nonce", frame.ClientNonce)
 		return
 	}
-	place, err := s.Store.PlaceFor(ctx, frame.PlaceID, sub.viewer)
+	place, err := sub.store.PlaceFor(ctx, frame.PlaceID)
 	if err != nil {
 		s.enqueueError(sub, storeErrorCode(err), frame.ClientNonce)
 		return
@@ -264,7 +284,7 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 	err = s.Sessions.AuthorizeSession(ctx, claims, func() error {
 		called = true
 		var opErr error
-		msg, created, opErr = s.Store.AppendMessage(ctx, AppendInput{
+		msg, created, opErr = sub.store.AppendMessage(ctx, AppendInput{
 			PlaceID: frame.PlaceID, Author: sub.viewer, Content: frame.Content,
 			Urgency: frame.Urgency, ReplyTo: frame.ReplyTo, ClientNonce: frame.ClientNonce,
 		})
@@ -288,14 +308,14 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 		Created     bool   `json:"created"`
 	}{Type: "receipt", ClientNonce: frame.ClientNonce, MessageID: msg.MessageID, Seq: msg.Seq, Created: created})
 	if created {
-		publishMessageCreated(ctx, s.Store, s.Hub, place, msg)
+		publishMessageCreated(ctx, sub.store, s.Hub, place, msg)
 	}
 }
 
 func (s *WSServer) handleTyping(ctx context.Context, sub *subscriber, frame wsClientFrame) {
 	// Volatile and best-effort: no receipt, no replay. Visibility is still
 	// checked so typing cannot probe places.
-	if _, err := s.Store.PlaceFor(ctx, frame.PlaceID, sub.viewer); err != nil {
+	if _, err := sub.store.PlaceFor(ctx, frame.PlaceID); err != nil {
 		return
 	}
 	actor := participantToWire(sub.viewer)
@@ -320,12 +340,12 @@ func (s *WSServer) writePump(
 			_ = conn.Close()
 			return
 		case frame := <-sub.send:
-			if err := s.authorizeWrite(ctx, conn, claims, websocket.TextMessage, frame); err != nil {
+			if err := s.authorizeWrite(ctx, conn, sub, claims, websocket.TextMessage, frame); err != nil {
 				_ = conn.Close()
 				return
 			}
 		case <-ticker.C:
-			if err := s.authorizeWrite(ctx, conn, claims, websocket.PingMessage, nil); err != nil {
+			if err := s.authorizeWrite(ctx, conn, sub, claims, websocket.PingMessage, nil); err != nil {
 				_ = conn.Close()
 				return
 			}
@@ -336,6 +356,7 @@ func (s *WSServer) writePump(
 func (s *WSServer) authorizeWrite(
 	ctx context.Context,
 	conn *websocket.Conn,
+	sub *subscriber,
 	claims agentevents.UserSessionClaims,
 	messageType int,
 	payload []byte,
@@ -343,6 +364,12 @@ func (s *WSServer) authorizeWrite(
 	writeCtx, cancel := context.WithTimeout(ctx, s.WriteTimeout)
 	defer cancel()
 	return s.Sessions.AuthorizeSession(writeCtx, claims, func() error {
+		if sub == nil || sub.store == nil {
+			return ErrInvalidScope
+		}
+		if err := sub.store.authorize(writeCtx); err != nil {
+			return err
+		}
 		_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 		return conn.WriteMessage(messageType, payload)
 	})

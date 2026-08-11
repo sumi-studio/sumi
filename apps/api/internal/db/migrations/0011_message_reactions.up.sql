@@ -24,12 +24,15 @@ CREATE TABLE message_reactions (
 -- participant and client operation so Human and PersonalityAgent transports
 -- can both retry an indeterminate request without changing the result again.
 CREATE TABLE message_reaction_mutations (
+    workspace_id uuidv7  NOT NULL,
     member_kind  text    NOT NULL
         CHECK (member_kind IN ('human', 'personality_agent')),
     member_id    uuidv7  NOT NULL,
     client_nonce text    NOT NULL CHECK (length(client_nonce) BETWEEN 1 AND 128),
-    message_id   uuidv7  NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    message_id   uuidv7  NOT NULL,
     emoji        text    NOT NULL CHECK (length(emoji) BETWEEN 1 AND 32),
     reacted      boolean NOT NULL,
-    PRIMARY KEY (member_kind, member_id, client_nonce)
+    PRIMARY KEY (workspace_id, member_kind, member_id, client_nonce),
+    FOREIGN KEY (workspace_id, message_id)
+        REFERENCES messages (workspace_id, message_id) ON DELETE CASCADE
 );

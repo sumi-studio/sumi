@@ -13,12 +13,13 @@ type overviewWire struct {
 	ReplyLaterMarkers []replyLaterWire    `json:"reply_later_markers"`
 }
 
-func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (overviewWire, error) {
-	summaries, err := s.Store.UnreadSummaries(ctx, viewer)
+func (s *Server) buildOverview(ctx context.Context, store *ScopedStore) (overviewWire, error) {
+	viewer := store.Scope.Actor
+	summaries, err := store.UnreadSummaries(ctx)
 	if err != nil {
 		return overviewWire{}, err
 	}
-	workspaces, err := s.Store.WorkspacesFor(ctx, viewer)
+	workspace, err := store.Workspace(ctx)
 	if err != nil {
 		return overviewWire{}, err
 	}
@@ -34,15 +35,12 @@ func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (over
 			memberOrder = append(memberOrder, key)
 		}
 	}
-	workspaceWires := make([]workspaceWire, len(workspaces))
-	for i, workspace := range workspaces {
-		workspaceWires[i] = workspaceWire{WorkspaceID: workspace.WorkspaceID, Name: workspace.Name}
-		profiles, err := s.Store.WorkspaceMemberProfiles(ctx, workspace.WorkspaceID, viewer)
-		if err != nil {
-			return overviewWire{}, err
-		}
-		addMembers(profiles)
+	workspaceWires := []workspaceWire{{WorkspaceID: workspace.WorkspaceID, Name: workspace.Name}}
+	profiles, err := store.WorkspaceMembers(ctx)
+	if err != nil {
+		return overviewWire{}, err
 	}
+	addMembers(profiles)
 	channels, dms := []channelWire{}, []dmWire{}
 	readMarkers := []readMarkerWire{}
 	unread := []unreadSummaryWire{}
@@ -54,7 +52,7 @@ func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (over
 			channels = append(channels, channelToWire(summary.Place))
 			continue
 		}
-		profiles, err := s.Store.ActiveMembers(ctx, summary.Place.PlaceID, viewer)
+		profiles, err := store.ActiveMembers(ctx, summary.Place.PlaceID)
 		if err != nil {
 			return overviewWire{}, err
 		}
@@ -69,7 +67,7 @@ func (s *Server) buildOverview(ctx context.Context, viewer ParticipantRef) (over
 	for i, key := range memberOrder {
 		members[i] = memberSet[key]
 	}
-	markers, err := s.Store.ReplyLaterMarkersFor(ctx, viewer)
+	markers, err := store.ReplyLaterMarkersFor(ctx)
 	if err != nil {
 		return overviewWire{}, err
 	}
