@@ -12,6 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { registerUserScrollTarget } from "../lib/user-scroll-intent";
 
 export interface ConversationVirtualizerItem {
   id: string;
@@ -45,6 +46,8 @@ export interface ConversationVirtualizerProps<
   renderItem: (item: TItem, index: number) => ReactNode;
   /** Rendered only while the user has explicitly opened the full transcript. */
   renderTranscriptItem?: (item: TItem, index: number) => ReactNode;
+  /** Floating controls kept inside the scroll viewport so wheel input reaches it. */
+  footerOverlay?: ReactNode;
   estimateSize?: (item: TItem, index: number) => number;
   overscan?: number;
   scrollEndThreshold?: number;
@@ -84,6 +87,7 @@ export function ConversationVirtualizer<
   items,
   renderItem,
   renderTranscriptItem,
+  footerOverlay,
   estimateSize,
   overscan = DEFAULT_OVERSCAN,
   scrollEndThreshold = DEFAULT_SCROLL_END_THRESHOLD,
@@ -170,6 +174,16 @@ export function ConversationVirtualizer<
     // documented-by-source reconcile target and clearing it ends the flight.
     (virtualizer as unknown as { scrollState: unknown }).scrollState = null;
   }, [virtualizer]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    return registerUserScrollTarget(viewport, ({ left, top }) => {
+      interruptProgrammaticScroll();
+      viewport.scrollTop += top;
+      viewport.scrollLeft += left;
+    });
+  }, [interruptProgrammaticScroll]);
 
   useImperativeHandle(
     ref,
@@ -378,6 +392,19 @@ export function ConversationVirtualizer<
             );
           })}
         </div>
+        {footerOverlay ? (
+          <div
+            data-slot="conversation-viewport-footer"
+            style={{
+              bottom: 0,
+              height: 0,
+              position: "sticky",
+              zIndex: 1,
+            }}
+          >
+            {footerOverlay}
+          </div>
+        ) : null}
       </section>
       {transcriptOpen && (
         <div

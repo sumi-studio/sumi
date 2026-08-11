@@ -30,6 +30,18 @@ function renderInput(
 }
 
 describe("ChatPromptInput", () => {
+  it("does not send while IME composition is active", () => {
+    const { onSend } = renderInput({ value: "変換中" });
+    const input = screen.getByRole("textbox");
+
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+
+    expect(onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledOnce();
+  });
+
   it("does not send an empty message", () => {
     const { onSend } = renderInput();
     const send = screen.getByRole("button", { name: "送信" });

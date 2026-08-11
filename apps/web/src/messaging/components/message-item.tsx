@@ -26,6 +26,7 @@ import { memo, type ReactNode, useMemo } from "react";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { MessageContent } from "./message-content";
+import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const TIME_FORMAT = new Intl.DateTimeFormat("ja-JP", {
@@ -182,6 +183,7 @@ export const MessageItem = memo(function MessageItem({
   onJumpTo,
   onRetry,
 }: MessageItemProps) {
+  const passthroughRef = useWheelPassthrough<HTMLDivElement>();
   const authorKey = participantKey(message.author);
   const author = membersByKey[authorKey];
   const own = authorKey === selfKey;
@@ -306,7 +308,11 @@ export const MessageItem = memo(function MessageItem({
               >
                 <SmilePlus className="size-3.5" />
               </PopoverTrigger>
-              <PopoverContent side="top" className="flex gap-0.5 p-1">
+              <PopoverContent
+                ref={passthroughRef}
+                side="top"
+                className="flex gap-0.5 p-1"
+              >
                 {REACTION_PALETTE.map((emoji) => (
                   <button
                     key={emoji}
@@ -337,7 +343,11 @@ export const MessageItem = memo(function MessageItem({
               >
                 <Clock className="size-3.5" />
               </PopoverTrigger>
-              <PopoverContent side="top" className="w-40 p-1">
+              <PopoverContent
+                ref={passthroughRef}
+                side="top"
+                className="w-40 p-1"
+              >
                 <p className="px-2 pt-1 pb-0.5 text-[11px] text-muted-foreground">
                   後で返信 — いつ知らせる？
                 </p>

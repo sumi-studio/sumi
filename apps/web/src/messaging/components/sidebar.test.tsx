@@ -216,3 +216,79 @@ describe("Sidebar route authority", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
+
+describe("Sidebar overlay and IME behavior", () => {
+  const setPlaceNotificationLevel = vi.fn();
+  const setStatus = vi.fn();
+  const createChannel = vi.fn(async (): Promise<PlaceKey> => "channel:created");
+
+  beforeEach(() => {
+    navigation.navigate.mockReset();
+    setTwoWorkspaceState(createChannel);
+    useMessaging.setState({
+      statusByKey: {
+        "human:human-a": {
+          participant: SELF,
+          status: "available",
+          note: "",
+          expiresAt: null,
+        },
+      },
+      unreadCountByPlace: {},
+      mentionCountByPlace: {},
+      notificationLevelByPlace: {},
+      notificationDefaultLevel: "all",
+      capabilities: {
+        status: true,
+        replyLater: true,
+        reactions: true,
+        notifications: true,
+      },
+      setPlaceNotificationLevel,
+      setStatus,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    useMessaging.setState({ createChannel: realCreateChannel });
+  });
+
+  it("shows the selected place notification level as a radio and closes after selection", () => {
+    render(<Sidebar selectedPlaceKey="channel:channel-a" />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "通知設定" })[0]);
+    expect(screen.getByRole("radio", { name: /すべて通知/ })).toBeChecked();
+    fireEvent.click(screen.getByRole("radio", { name: /ミュート/ }));
+
+    expect(setPlaceNotificationLevel).toHaveBeenCalledWith(
+      "channel:channel-a",
+      "mute",
+    );
+    expect(screen.queryByRole("radio", { name: /ミュート/ })).toBeNull();
+  });
+
+  it("closes the status menu on an outside pointerdown", () => {
+    render(<Sidebar selectedPlaceKey="channel:channel-a" />);
+    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    expect(screen.getByRole("radio", { name: "取り込み中" })).toBeVisible();
+
+    fireEvent.pointerDown(screen.getByRole("navigation"));
+
+    expect(screen.queryByRole("radio", { name: "取り込み中" })).toBeNull();
+  });
+
+  it("does not implicitly submit channel creation on an IME Enter", () => {
+    render(<Sidebar selectedPlaceKey="channel:channel-a" />);
+    fireEvent.click(screen.getByTitle("チャンネルを作成"));
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
+    const name = within(dialog).getByRole("textbox", { name: "名前" });
+    fireEvent.change(name, { target: { value: "設計" } });
+
+    fireEvent.keyDown(name, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(name, { key: "Enter", keyCode: 229 });
+
+    expect(createChannel).not.toHaveBeenCalled();
+  });
+});

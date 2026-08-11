@@ -1,10 +1,12 @@
 import { CornerUpLeft, Pencil, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { MemberProfile, Message, Urgency } from "../model";
 import { participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
+import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const MAX_HEIGHT_PX = 220;
@@ -64,6 +66,7 @@ export function Composer() {
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const lastTypingAt = useRef(0);
+  const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
 
   const editingMessage = editingMessageId
     ? messages.find((entry) => entry.messageId === editingMessageId)
@@ -159,7 +162,7 @@ export function Composer() {
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (event.nativeEvent.isComposing) return;
+      if (isImeComposing(event)) return;
       if (mention && candidates.length > 0) {
         if (event.key === "ArrowDown") {
           event.preventDefault();
@@ -239,7 +242,10 @@ export function Composer() {
   return (
     <div className="relative shrink-0 px-4 pb-4 sm:px-6">
       {mention && candidates.length > 0 ? (
-        <div className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6">
+        <div
+          ref={mentionPassthroughRef}
+          className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6"
+        >
           {candidates.map((member, index) => {
             const key = participantKey(member.participant);
             return (
