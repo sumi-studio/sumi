@@ -5,7 +5,11 @@
 //! The view is a tool owned by the continuing person; it is not another agent
 //! or another life-log Session.
 
-use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -36,6 +40,7 @@ const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
 const MAX_MESSAGE_ID_BYTES: usize = 256;
+const MAX_CLIENT_NONCE_BYTES: usize = 128;
 const MAX_MARKER_ID_BYTES: usize = 256;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
@@ -43,6 +48,7 @@ const MAX_EMOJI_BYTES: usize = 128;
 // character ASCII note is well under any byte budget and still a 400.
 const MAX_STATUS_NOTE_CHARS: usize = 200;
 const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
+const DEFAULT_OPEN_LIMIT: usize = 20;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
 
@@ -181,10 +187,68 @@ enum MessagingStatus {
 /// One message currently on this view's screen. Reactions may only target
 /// these (ADR 0011 §3: 見えていないものは操作できない — like a human, the
 /// agent reacts to what the open place shows, never to an unseen permalink).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VisibleMessage {
     message_id: String,
     seq: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct OpenPlaceWire {
+    kind: String,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    dm_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenParticipantWire {
+    kind: String,
+    #[serde(default)]
+    human_id: Option<String>,
+    #[serde(default)]
+    personality_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenReactionWire {
+    emoji: String,
+    participants: Vec<OpenParticipantWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenMessageWire {
+    message_id: String,
+    place: OpenPlaceWire,
+    seq: u64,
+    author: OpenParticipantWire,
+    content: String,
+    mentions: Vec<OpenParticipantWire>,
+    urgency: String,
+    reactions: Vec<OpenReactionWire>,
+    // Value keeps null distinct from an omitted required field without
+    // recreating the server's nullable-field machinery in this adapter.
+    reply_to: Value,
+    client_nonce: String,
+    created_at: String,
+    edited_at: Value,
+    deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenResponseWire {
+    place: OpenPlaceWire,
+    latest_seq: u64,
+    last_read_seq: u64,
+    #[serde(rename = "members")]
+    _members: Vec<Value>,
+    messages: Vec<OpenMessageWire>,
+}
+
+struct ValidatedOpenAdmission {
+    visible_messages: Vec<VisibleMessage>,
+    read_through_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,7 +269,7 @@ struct VisibleReplyLaterMarker {
     note: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct MessagingViewState {
     focused_place_id: Option<String>,
     pending_read_through: BTreeMap<String, u64>,
@@ -751,10 +815,10 @@ impl MessagingTool {
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
-                let admitted_read_through_seq = contiguous_page_read_through_seq(&response);
+                let admission = validate_open_response(&response, &place_id, before_seq, limit)?;
                 state.focused_place_id = Some(place_id.clone());
-                state.visible_messages = visible_messages_from(&response);
-                if let Some(seq) = admitted_read_through_seq {
+                state.visible_messages = admission.visible_messages;
+                if let Some(seq) = admission.read_through_seq {
                     record_pending_read_through(state, &place_id, seq);
                     if matches!(post_commit_mode, PostCommitMode::ReturnLiveHook) {
                         live_post_commit = Some(read_through_post_commit(
@@ -1386,55 +1450,207 @@ fn upsert_visible_reply_later_marker(
     state.visible_reply_later_markers.push(marker);
 }
 
-/// Extracts the reactable screen contents from an open response. Entries
-/// without a message_id (unexpected wire shapes) are skipped fail-closed.
-fn visible_messages_from(response: &Value) -> Vec<VisibleMessage> {
-    response
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|messages| {
-            messages
-                .iter()
-                .filter_map(|message| {
-                    let message_id = message.get("message_id")?.as_str()?.to_owned();
-                    let seq = message.get("seq").and_then(Value::as_u64);
-                    Some(VisibleMessage { message_id, seq })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
+/// Authenticate one complete Messaging screen before any of it becomes local
+/// view state or read evidence. The API returns dense per-place history in
+/// ascending order even though it pages backwards; accepting a looser shape
+/// would let an incomplete or cross-place response manufacture both visible
+/// mutation targets and a read cursor.
+fn validate_open_response(
+    response: &Value,
+    requested_place_id: &str,
+    before_seq: Option<u64>,
+    requested_limit: Option<u16>,
+) -> Result<ValidatedOpenAdmission, ToolError> {
+    let page: OpenResponseWire = serde_json::from_value(response.clone()).map_err(|error| {
+        ToolError::Protocol(format!("invalid Messaging open response: {error}"))
+    })?;
+    validate_open_place(&page.place, requested_place_id)?;
+    if page.last_read_seq > page.latest_seq {
+        return Err(ToolError::Protocol(
+            "Messaging open last_read_seq exceeds latest_seq".to_owned(),
+        ));
+    }
+    let limit = requested_limit
+        .map(usize::from)
+        .unwrap_or(DEFAULT_OPEN_LIMIT);
+    if page.messages.len() > limit {
+        return Err(ToolError::Protocol(
+            "Messaging open returned more messages than requested".to_owned(),
+        ));
+    }
+    let bounded_before = before_seq.filter(|seq| *seq > 0);
+    let expected_page_end = bounded_before
+        .map(|seq| page.latest_seq.min(seq - 1))
+        .unwrap_or(page.latest_seq);
+    if page.messages.last().map(|message| message.seq).unwrap_or(0) != expected_page_end {
+        return Err(ToolError::Protocol(
+            "Messaging open page end is inconsistent with latest_seq or before_seq".to_owned(),
+        ));
+    }
 
-/// Highest cursor this exact open page may acknowledge after its ToolResult is
-/// durably admitted. A read cursor is contiguous, so a latest-page snapshot may
-/// not jump over older messages the Agent never received. Tombstones still
-/// count because their sequence and the fact of deletion are part of the page.
-fn contiguous_page_read_through_seq(response: &Value) -> Option<u64> {
-    let last_read_seq = response.get("last_read_seq")?.as_u64()?;
-    let mut page_seqs = response
-        .get("messages")?
-        .as_array()?
-        .iter()
-        .map(|message| message.get("seq")?.as_u64())
-        .collect::<Option<Vec<_>>>()?;
-    page_seqs.sort_unstable();
-    page_seqs.dedup();
+    let mut message_ids = BTreeSet::new();
+    let mut visible_messages = Vec::with_capacity(page.messages.len());
+    let mut previous_seq: Option<u64> = None;
+    for message in &page.messages {
+        if message.seq == 0
+            || message.seq > page.latest_seq
+            || previous_seq.is_some_and(|previous| previous.checked_add(1) != Some(message.seq))
+        {
+            return Err(ToolError::Protocol(
+                "Messaging open messages are not a positive contiguous ascending page".to_owned(),
+            ));
+        }
+        if bounded_before.is_some_and(|before| message.seq >= before) {
+            return Err(ToolError::Protocol(
+                "Messaging open returned a sequence at or beyond before_seq".to_owned(),
+            ));
+        }
+        if message.place != page.place {
+            return Err(ToolError::Protocol(
+                "Messaging open message belongs to a different place".to_owned(),
+            ));
+        }
+        validate_open_message(message)?;
+        if !message_ids.insert(message.message_id.as_str()) {
+            return Err(ToolError::Protocol(
+                "Messaging open contains a duplicate message_id".to_owned(),
+            ));
+        }
+        visible_messages.push(VisibleMessage {
+            message_id: message.message_id.clone(),
+            seq: Some(message.seq),
+        });
+        previous_seq = Some(message.seq);
+    }
 
-    let mut admitted_seq = last_read_seq;
-    for seq in page_seqs {
-        if seq <= admitted_seq {
+    let mut read_through_seq = page.last_read_seq;
+    for message in &page.messages {
+        if message.seq <= read_through_seq {
             continue;
         }
-        if admitted_seq.checked_add(1) != Some(seq) {
+        if read_through_seq.checked_add(1) != Some(message.seq) {
             break;
         }
-        admitted_seq = seq;
+        read_through_seq = message.seq;
     }
-    (admitted_seq > last_read_seq).then_some(admitted_seq)
+
+    Ok(ValidatedOpenAdmission {
+        visible_messages,
+        read_through_seq: (read_through_seq > page.last_read_seq).then_some(read_through_seq),
+    })
+}
+
+fn validate_open_place(place: &OpenPlaceWire, requested_place_id: &str) -> Result<(), ToolError> {
+    let place_id = match place.kind.as_str() {
+        "channel" if place.dm_id.is_none() => place.channel_id.as_deref(),
+        "dm" | "group_dm" if place.channel_id.is_none() => place.dm_id.as_deref(),
+        _ => None,
+    }
+    .filter(|id| is_bounded_nonempty(id, MAX_PLACE_ID_BYTES))
+    .ok_or_else(|| ToolError::Protocol("Messaging open returned an invalid place".to_owned()))?;
+    if place_id != requested_place_id {
+        return Err(ToolError::Protocol(
+            "Messaging open response place does not match the requested place".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_open_message(message: &OpenMessageWire) -> Result<(), ToolError> {
+    if !is_bounded_nonempty(&message.message_id, MAX_MESSAGE_ID_BYTES) {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid message_id".to_owned(),
+        ));
+    }
+    validate_open_participant(&message.author, "author")?;
+    for mention in &message.mentions {
+        validate_open_participant(mention, "mention")?;
+    }
+    if !matches!(message.urgency.as_str(), "urgent" | "normal" | "fyi") {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid urgency".to_owned(),
+        ));
+    }
+    if message.client_nonce.is_empty() || message.client_nonce.len() > MAX_CLIENT_NONCE_BYTES {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid client_nonce".to_owned(),
+        ));
+    }
+    if !valid_nullable_string(&message.reply_to, MAX_REPLY_ID_BYTES) {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid reply_to".to_owned(),
+        ));
+    }
+    if message.created_at.is_empty() || !valid_nullable_string(&message.edited_at, usize::MAX) {
+        return Err(ToolError::Protocol(
+            "Messaging open message has invalid time provenance".to_owned(),
+        ));
+    }
+
+    for reaction in &message.reactions {
+        if reaction.emoji.is_empty() {
+            return Err(ToolError::Protocol(
+                "Messaging open message has an invalid reaction".to_owned(),
+            ));
+        }
+        for participant in &reaction.participants {
+            validate_open_participant(participant, "reaction participant")?;
+        }
+    }
+
+    if message.deleted {
+        if !message.content.is_empty()
+            || !message.mentions.is_empty()
+            || !message.reactions.is_empty()
+        {
+            return Err(ToolError::Protocol(
+                "Messaging open tombstone still carries removed experience data".to_owned(),
+            ));
+        }
+    } else if message.content.is_empty() || message.content.len() > MAX_CONTENT_BYTES {
+        return Err(ToolError::Protocol(
+            "Messaging open live message has invalid content".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_nullable_string(value: &Value, max_bytes: usize) -> bool {
+    value.is_null()
+        || value
+            .as_str()
+            .is_some_and(|value| is_bounded_nonempty(value, max_bytes))
+}
+
+fn validate_open_participant(
+    participant: &OpenParticipantWire,
+    role: &str,
+) -> Result<(), ToolError> {
+    let valid = match participant.kind.as_str() {
+        "human" if participant.personality_agent_id.is_none() => participant
+            .human_id
+            .as_deref()
+            .is_some_and(|id| is_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES)),
+        "personality_agent" if participant.human_id.is_none() => participant
+            .personality_agent_id
+            .as_deref()
+            .is_some_and(|id| is_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES)),
+        _ => false,
+    };
+    if !valid {
+        return Err(ToolError::Protocol(format!(
+            "Messaging open contains an invalid {role} participant"
+        )));
+    }
+    Ok(())
+}
+
+fn is_bounded_nonempty(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
 fn validate_bounded_nonempty(value: &str, max_bytes: usize) -> Result<(), ToolError> {
-    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+    if !is_bounded_nonempty(value, max_bytes) {
         return Err(ToolError::InvalidArguments);
     }
     Ok(())
@@ -1491,6 +1707,64 @@ mod tests {
         },
     };
 
+    fn test_participant() -> Value {
+        json!({"kind": "human", "human_id": "human-fixture"})
+    }
+
+    fn test_open_message(place_id: &str, seq: u64, deleted: bool) -> Value {
+        json!({
+            "message_id": format!("m{seq}"),
+            "place": {"kind": "channel", "channel_id": place_id},
+            "seq": seq,
+            "author": test_participant(),
+            "content": if deleted { "" } else { "visible" },
+            "mentions": [],
+            "urgency": "normal",
+            "reactions": [],
+            "reply_to": null,
+            "client_nonce": format!("nonce-{seq}"),
+            "created_at": "2026-08-12T00:00:00Z",
+            "edited_at": null,
+            "deleted": deleted
+        })
+    }
+
+    fn test_open_response(
+        place_id: &str,
+        latest_seq: u64,
+        last_read_seq: u64,
+        first_seq: u64,
+        last_seq: u64,
+        tombstone_seq: Option<u64>,
+    ) -> Value {
+        let messages = if first_seq > last_seq {
+            Vec::new()
+        } else {
+            (first_seq..=last_seq)
+                .map(|seq| test_open_message(place_id, seq, tombstone_seq == Some(seq)))
+                .collect::<Vec<_>>()
+        };
+        json!({
+            "place": {"kind": "channel", "channel_id": place_id},
+            "latest_seq": latest_seq,
+            "last_read_seq": last_read_seq,
+            "members": [],
+            "messages": messages
+        })
+    }
+
+    fn default_test_open_response(request: &OpenMessagingPlaceRequest<'_>) -> Value {
+        let latest_seq = 7;
+        let last_seq = request
+            .before_seq
+            .filter(|seq| *seq > 0)
+            .map(|seq| latest_seq.min(seq - 1))
+            .unwrap_or(latest_seq);
+        let limit = u64::from(request.limit.unwrap_or(DEFAULT_OPEN_LIMIT as u16));
+        let first_seq = last_seq.saturating_sub(limit.saturating_sub(1)).max(1);
+        test_open_response(request.place_id, latest_seq, 5, first_seq, last_seq, None)
+    }
+
     #[derive(Default)]
     struct FakeMessagingApi {
         calls: AsyncMutex<Vec<String>>,
@@ -1528,17 +1802,7 @@ mod tests {
             if let Some(response) = self.open_responses.lock().await.pop_front() {
                 return Ok(response);
             }
-            Ok(json!({
-                "place": {"kind": "channel", "channel_id": request.place_id},
-                "latest_seq": 7,
-                "last_read_seq": 5,
-                "members": [],
-                "messages": [
-                    {"message_id": "m6", "seq": 6, "content": "earlier", "reactions": []},
-                    {"message_id": "m7", "seq": 7, "content": "hello",
-                     "reactions": [{"emoji": "👍", "participants": []}]}
-                ]
-            }))
+            Ok(default_test_open_response(&request))
         }
 
         async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value> {
@@ -2402,34 +2666,13 @@ mod tests {
 
     #[tokio::test]
     async fn bound_open_admits_only_contiguous_pages_after_result_commit() {
-        fn page(last_read_seq: u64, first: u64, last: u64) -> Value {
-            let messages = (first..=last)
-                .map(|seq| {
-                    json!({
-                        "message_id": format!("m{seq}"),
-                        "seq": seq,
-                        "content": if seq == 3 { "" } else { "visible" },
-                        "deleted": seq == 3,
-                        "reactions": []
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "place": {"kind": "channel", "channel_id": "general"},
-                "latest_seq": 25,
-                "last_read_seq": last_read_seq,
-                "members": [],
-                "messages": messages
-            })
-        }
-
         let api = Arc::new(FakeMessagingApi::default());
         api.open_responses.lock().await.extend([
-            page(0, 16, 25),
-            page(0, 6, 15),
-            page(0, 1, 5),
-            page(5, 6, 15),
-            page(15, 16, 25),
+            test_open_response("general", 25, 0, 16, 25, None),
+            test_open_response("general", 25, 0, 6, 15, None),
+            test_open_response("general", 25, 0, 1, 5, Some(3)),
+            test_open_response("general", 25, 5, 6, 15, None),
+            test_open_response("general", 25, 15, 16, 25, None),
         ]);
         let tool = Arc::new(MessagingTool::new(api.clone()));
         let mut builder = ToolRegistryBuilder::default();
@@ -2535,6 +2778,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strict_open_wire_rejects_malformed_pages() {
+        let valid = || test_open_response("general", 2, 0, 1, 2, None);
+        let mut wrong_inner_place = valid();
+        wrong_inner_place["messages"][0]["place"]["channel_id"] = json!("other");
+        let mut incomplete_row = valid();
+        incomplete_row["messages"][0] = json!({"message_id": "m1", "seq": 1});
+        let mut missing_nullable_field = valid();
+        missing_nullable_field["messages"][0]
+            .as_object_mut()
+            .expect("message object")
+            .remove("reply_to");
+        let mut missing_provenance = valid();
+        missing_provenance["messages"][0]
+            .as_object_mut()
+            .expect("message object")
+            .remove("client_nonce");
+        let mut invalid_author = valid();
+        invalid_author["messages"][0]["author"]["human_id"] = json!("");
+        let mut duplicate_seq = valid();
+        duplicate_seq["messages"][1]["seq"] = json!(1);
+        let mut duplicate_message_id = valid();
+        duplicate_message_id["messages"][1]["message_id"] = json!("m1");
+        let mut reversed = valid();
+        reversed["messages"]
+            .as_array_mut()
+            .expect("messages array")
+            .swap(0, 1);
+        let mut seq_zero = valid();
+        seq_zero["messages"][0]["seq"] = json!(0);
+        let mut invalid_tombstone = valid();
+        invalid_tombstone["messages"][0]["deleted"] = json!(true);
+        let mut gap = test_open_response("general", 3, 0, 1, 3, None);
+        gap["messages"].as_array_mut().expect("messages").remove(1);
+        let mut last_read_beyond_latest = valid();
+        last_read_beyond_latest["last_read_seq"] = json!(3);
+        let mut latest_behind_page = valid();
+        latest_behind_page["latest_seq"] = json!(1);
+
+        let cases = [
+            (
+                "wrong-outer-place",
+                test_open_response("other", 2, 0, 1, 2, None),
+                None,
+                None,
+            ),
+            ("wrong-inner-place", wrong_inner_place, None, None),
+            ("incomplete-row", incomplete_row, None, None),
+            ("missing-nullable-field", missing_nullable_field, None, None),
+            ("missing-provenance", missing_provenance, None, None),
+            ("invalid-author", invalid_author, None, None),
+            ("duplicate-seq", duplicate_seq, None, None),
+            ("duplicate-message-id", duplicate_message_id, None, None),
+            ("reverse-order", reversed, None, None),
+            ("seq-zero", seq_zero, None, None),
+            ("at-before-seq", valid(), Some(2), Some(10)),
+            ("too-many-for-limit", valid(), None, Some(1)),
+            ("gap", gap, None, None),
+            ("invalid-tombstone", invalid_tombstone, None, None),
+            (
+                "last-read-beyond-latest",
+                last_read_beyond_latest,
+                None,
+                None,
+            ),
+            ("latest-behind-page", latest_behind_page, None, None),
+        ];
+
+        for (id, response, before_seq, limit) in cases {
+            assert!(
+                matches!(
+                    validate_open_response(&response, "general", before_seq, limit),
+                    Err(ToolError::Protocol(_))
+                ),
+                "case {id}: malformed open wire must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_open_wire_cannot_change_view_or_manufacture_read_evidence() {
+        let api = Arc::new(FakeMessagingApi::default());
+        api.open_responses
+            .lock()
+            .await
+            .push_back(test_open_response("other", 2, 0, 1, 2, None));
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        {
+            let mut state = tool.view.lock().await;
+            state.focused_place_id = Some("old-place".to_owned());
+            state.visible_messages = vec![VisibleMessage {
+                message_id: "old-message".to_owned(),
+                seq: Some(9),
+            }];
+            state.pending_read_through.insert("old-place".to_owned(), 9);
+        }
+        let expected_state = tool.view.lock().await.clone();
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).expect("register Messaging");
+        let registry = builder.build();
+
+        let error = match execute_bound_action(
+            &registry,
+            "invalid-open",
+            json!({"action": "open", "place_id": "general"}),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("wrong-place open wire must fail before admission"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Protocol(_))
+        ));
+        assert_eq!(*tool.view.lock().await, expected_state);
+        assert!(api.reads.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn valid_older_page_admits_overlap_and_complete_tombstone() {
+        let api = Arc::new(FakeMessagingApi::default());
+        api.open_responses
+            .lock()
+            .await
+            .push_back(test_open_response("general", 10, 2, 1, 5, Some(3)));
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).expect("register Messaging");
+        let registry = builder.build();
+
+        let outcome = execute_bound_action(
+            &registry,
+            "valid-overlap",
+            json!({
+                "action": "open", "place_id": "general", "before_seq": 6, "limit": 10
+            }),
+        )
+        .await
+        .expect("complete dense page is valid");
+        assert_eq!(outcome.output.details["last_read_seq"], 2);
+        assert_eq!(outcome.output.details["messages"][2]["seq"], 3);
+        assert_eq!(outcome.output.details["messages"][2]["deleted"], true);
+        assert_eq!(outcome.output.details["messages"][2]["content"], "");
+        assert!(api.reads.lock().await.is_empty());
+        {
+            let state = tool.view.lock().await;
+            assert_eq!(state.focused_place_id.as_deref(), Some("general"));
+            assert_eq!(
+                state
+                    .visible_messages
+                    .iter()
+                    .map(|message| message.seq.expect("validated seq"))
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5]
+            );
+            assert_eq!(state.pending_read_through.get("general"), Some(&5));
+        }
+        assert!(matches!(
+            outcome
+                .live_post_commit
+                .expect("2-overlap then 3..5 is contiguous")
+                .invoke_after_result_commit(CancellationToken::new())
+                .await,
+            LiveAppPostCommitOutcome::Applied
+        ));
+        assert_eq!(
+            api.reads.lock().await.as_slice(),
+            &[("general".to_owned(), 5)]
+        );
+    }
+
     #[tokio::test]
     async fn failed_live_read_is_deferred_without_rewriting_the_tool_result() {
         let api = Arc::new(FakeMessagingApi::default());
@@ -2609,53 +3024,6 @@ mod tests {
         clear_pending_read_through(&mut state, "place-a", 7);
         assert!(!state.pending_read_through.contains_key("place-a"));
         assert_eq!(state.pending_read_through.get("place-b"), Some(&4));
-    }
-
-    #[test]
-    fn read_through_candidate_stops_at_the_first_unadmitted_gap() {
-        assert_eq!(
-            contiguous_page_read_through_seq(&json!({
-                "last_read_seq": 5,
-                "messages": [
-                    {"message_id": "m6", "seq": 6},
-                    {"message_id": "m7", "seq": 7}
-                ]
-            })),
-            Some(7)
-        );
-        assert_eq!(
-            contiguous_page_read_through_seq(&json!({
-                "last_read_seq": 0,
-                "messages": [
-                    {"message_id": "m16", "seq": 16},
-                    {"message_id": "m17", "seq": 17}
-                ]
-            })),
-            None
-        );
-        assert_eq!(
-            contiguous_page_read_through_seq(&json!({
-                "last_read_seq": 0,
-                "messages": [
-                    {"message_id": "m1", "seq": 1},
-                    {"message_id": "m2", "seq": 2, "deleted": true},
-                    {"message_id": "m4", "seq": 4}
-                ]
-            })),
-            Some(2)
-        );
-        assert_eq!(
-            contiguous_page_read_through_seq(&json!({
-                "last_read_seq": 0,
-                "messages": [
-                    {"message_id": "m1", "seq": 1},
-                    {"message_id": "malformed"},
-                    {"message_id": "m2", "seq": 2}
-                ]
-            })),
-            None,
-            "an unsequenced row cannot be treated as admitted read evidence"
-        );
     }
 
     #[tokio::test]
