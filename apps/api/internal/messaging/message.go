@@ -213,6 +213,10 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	if _, err := s.PlaceFor(ctx, placeID, viewer); err != nil {
 		return nil, err
 	}
+	return s.history(ctx, s.pool, placeID, opt)
+}
+
+func (s *Store) history(ctx context.Context, q querier, placeID string, opt HistoryOptions) ([]Message, error) {
 	limit := opt.Limit
 	if limit <= 0 {
 		limit = defaultHistoryLimit
@@ -226,7 +230,7 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 		before = "AND seq < $3"
 		args = append(args, opt.BeforeSeq)
 	}
-	rows, err := s.pool.Query(ctx, fmt.Sprintf(
+	rows, err := q.Query(ctx, fmt.Sprintf(
 		`SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
 		        reply_to, client_nonce, created_at, edited_at, deleted_at
 		 FROM messages WHERE place_id = $1 %s
@@ -242,10 +246,10 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
-	if err := s.attachMentions(ctx, messages); err != nil {
+	if err := s.attachMentionsWith(ctx, q, messages); err != nil {
 		return nil, err
 	}
-	if err := s.attachReactions(ctx, messages); err != nil {
+	if err := s.attachReactionsWith(ctx, q, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -614,6 +618,10 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 
 // attachMentions loads mention rows for the given messages in one query.
 func (s *Store) attachMentions(ctx context.Context, messages []Message) error {
+	return s.attachMentionsWith(ctx, s.pool, messages)
+}
+
+func (s *Store) attachMentionsWith(ctx context.Context, q querier, messages []Message) error {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -623,7 +631,7 @@ func (s *Store) attachMentions(ctx context.Context, messages []Message) error {
 		ids[i] = m.MessageID
 		index[m.MessageID] = i
 	}
-	rows, err := s.pool.Query(ctx,
+	rows, err := q.Query(ctx,
 		`SELECT mm.message_id, mm.member_kind, mm.member_id
 		 FROM message_mentions mm
 		 JOIN messages m ON m.message_id = mm.message_id

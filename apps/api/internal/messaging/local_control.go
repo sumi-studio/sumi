@@ -94,32 +94,18 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 		request.Limit = 50
 	}
 	viewer := localViewer(authorization)
-	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	snapshot, err := s.Store.OpenSnapshot(r.Context(), request.PlaceID, viewer,
+		HistoryOptions{BeforeSeq: request.BeforeSeq, Limit: request.Limit})
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	messages, err := s.Store.History(r.Context(), request.PlaceID, viewer, HistoryOptions{BeforeSeq: request.BeforeSeq, Limit: request.Limit})
-	if err != nil {
-		writeStoreError(w, err)
-		return
+	wires := make([]messageWire, len(snapshot.Messages))
+	for i, message := range snapshot.Messages {
+		wires[i] = messageToWire(snapshot.Place, message)
 	}
-	profiles, err := s.Store.ActiveMembers(r.Context(), request.PlaceID, viewer)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	lastRead, err := s.Store.ReadMarker(r.Context(), request.PlaceID, viewer)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	wires := make([]messageWire, len(messages))
-	for i, message := range messages {
-		wires[i] = messageToWire(place, message)
-	}
-	members := make([]memberWire, len(profiles))
-	for i, profile := range profiles {
+	members := make([]memberWire, len(snapshot.Members))
+	for i, profile := range snapshot.Members {
 		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
 	}
 	writeJSON(w, http.StatusOK, struct {
@@ -128,7 +114,7 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 		LastReadSeq int64         `json:"last_read_seq"`
 		Members     []memberWire  `json:"members"`
 		Messages    []messageWire `json:"messages"`
-	}{placeToWire(place), place.LastSeq, lastRead, members, wires})
+	}{placeToWire(snapshot.Place), snapshot.Place.LastSeq, snapshot.LastReadSeq, members, wires})
 }
 
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

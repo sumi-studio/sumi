@@ -200,6 +200,10 @@ func validateReactionEmoji(emoji string) error {
 // attachReactions loads reaction rows for the given messages in one query and
 // aggregates them into per-emoji summaries, mirroring attachMentions.
 func (s *Store) attachReactions(ctx context.Context, messages []Message) error {
+	return s.attachReactionsWith(ctx, s.pool, messages)
+}
+
+func (s *Store) attachReactionsWith(ctx context.Context, q querier, messages []Message) error {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -209,7 +213,7 @@ func (s *Store) attachReactions(ctx context.Context, messages []Message) error {
 		ids[i] = m.MessageID
 		index[m.MessageID] = i
 	}
-	rows, err := s.pool.Query(ctx,
+	rows, err := q.Query(ctx,
 		`SELECT message_id, emoji, member_kind, member_id
 		 FROM message_reactions
 		 WHERE message_id = ANY($1)
