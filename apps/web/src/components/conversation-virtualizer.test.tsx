@@ -86,6 +86,28 @@ afterEach(() => {
 });
 
 describe("ConversationVirtualizer", () => {
+  it("keeps a footer overlay inside the scroll viewport", () => {
+    render(
+      <ConversationVirtualizer
+        items={[]}
+        estimateSize={() => 64}
+        ariaLabel="Test conversation"
+        renderItem={() => null}
+        footerOverlay={<button type="button">jump to latest</button>}
+      />,
+    );
+
+    const viewport = document.querySelector(
+      '[data-slot="conversation-viewport"]',
+    );
+    const jump = screen.getByRole("button", { name: "jump to latest" });
+    expect(viewport?.contains(jump)).toBe(true);
+    expect(
+      jump.closest<HTMLElement>('[data-slot="conversation-viewport-footer"]')
+        ?.style.position,
+    ).toBe("sticky");
+  });
+
   it("renders a bounded variable-height window for a large conversation", async () => {
     const messages = makeMessages(1_000);
 

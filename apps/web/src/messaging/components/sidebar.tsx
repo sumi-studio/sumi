@@ -1,5 +1,6 @@
 import { BellOff, Check, Hash, MoreVertical, Plus, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { isImeComposing } from "../../lib/ime";
 import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
 import { parsePlaceKey, participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -8,7 +9,10 @@ import {
   notificationLevelFor,
   useMessaging,
 } from "../store";
+import { useOverlayPanel } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
+
+const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
@@ -72,35 +76,23 @@ function PlaceNotificationMenu({
   const setPlaceNotificationLevel = useMessaging(
     (state) => state.setPlaceNotificationLevel,
   );
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) {
-        onOpenChange(false);
-      }
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onOpenChange(false);
-    };
-    window.addEventListener("mousedown", closeOnOutsideClick);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("mousedown", closeOnOutsideClick);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open, onOpenChange]);
+  const overlay = useOverlayPanel<HTMLButtonElement>({
+    open,
+    onOpenChange,
+    // このパネルはサイドバーのスクロール領域内にある。
+    scrollPassthrough: () => null,
+  });
 
   return (
-    <div ref={containerRef} className="relative">
+    <div className="relative">
       <button
         type="button"
         aria-label="通知設定"
-        aria-expanded={open}
+        aria-haspopup="dialog"
+        {...overlay.triggerProps}
         onClick={(event) => {
           event.stopPropagation();
-          onOpenChange(!open);
+          overlay.toggle();
         }}
         className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
           open ? "opacity-100" : "opacity-0 group-hover:opacity-100"
@@ -109,36 +101,59 @@ function PlaceNotificationMenu({
         <MoreVertical className="size-3.5" />
       </button>
       {open ? (
-        <div className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md">
-          <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
+        <div
+          {...overlay.panelProps}
+          role="dialog"
+          aria-label="この場所の通知設定"
+          className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
+        >
+          <p
+            id={`place-notification-${key}`}
+            className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground"
+          >
             通知
           </p>
-          {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
-            (candidate) => (
-              <button
-                key={candidate}
-                type="button"
-                onClick={() => {
-                  setPlaceNotificationLevel(key, candidate);
-                  onOpenChange(false);
-                }}
-                className={`block w-full rounded-md px-2 py-1.5 text-left hover:bg-accent ${
-                  level === candidate ? "bg-accent/60" : ""
-                }`}
-              >
-                <span
-                  className={`block text-[13px] ${
-                    level === candidate ? "font-medium" : ""
+          <div role="radiogroup" aria-labelledby={`place-notification-${key}`}>
+            {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
+              (candidate) => (
+                <label
+                  key={candidate}
+                  className={`flex w-full cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
+                    level === candidate ? "bg-accent/60" : ""
                   }`}
                 >
-                  {NOTIFICATION_LEVEL_LABEL[candidate]}
-                </span>
-                <span className="block text-[11px] text-muted-foreground">
-                  {NOTIFICATION_LEVEL_HINT[candidate]}
-                </span>
-              </button>
-            ),
-          )}
+                  <input
+                    type="radio"
+                    name={`place-notification-choice-${key}`}
+                    checked={level === candidate}
+                    onChange={() => {
+                      setPlaceNotificationLevel(key, candidate);
+                      onOpenChange(false);
+                    }}
+                    className="sr-only"
+                  />
+                  <Check
+                    aria-hidden
+                    className={`mt-0.5 size-3.5 shrink-0 transition-opacity ${
+                      level === candidate ? "opacity-100" : "opacity-0"
+                    }`}
+                  />
+                  <span className="min-w-0">
+                    <span
+                      className={`block text-[13px] ${
+                        level === candidate ? "font-medium" : ""
+                      }`}
+                    >
+                      {NOTIFICATION_LEVEL_LABEL[candidate]}
+                    </span>
+                    <span className="block text-[11px] text-muted-foreground">
+                      {NOTIFICATION_LEVEL_HINT[candidate]}
+                    </span>
+                  </span>
+                </label>
+              ),
+            )}
+          </div>
         </div>
       ) : null}
     </div>
@@ -308,7 +323,15 @@ function CreateChannelDialog({
 
   return (
     <DialogShell title="チャンネルを作成" onClose={onClose}>
-      <form onSubmit={submit} className="mt-3 space-y-3">
+      <form
+        onSubmit={submit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && isImeComposing(event)) {
+            event.preventDefault();
+          }
+        }}
+        className="mt-3 space-y-3"
+      >
         <label className="block">
           <span className="mb-1 block text-[11px] text-muted-foreground">
             名前
@@ -540,6 +563,12 @@ export function Sidebar({
   const [openDialog, setOpenDialog] = useState<
     { kind: "channel"; workspaceId: string } | { kind: "dm" } | null
   >(null);
+  const statusOverlay = useOverlayPanel<HTMLButtonElement>({
+    open: statusMenuOpen,
+    onOpenChange: setStatusMenuOpen,
+    scrollPassthrough: () =>
+      document.querySelector<HTMLElement>(SIDEBAR_PLACES),
+  });
 
   const activePlace = selectedPlaceKey ? parsePlaceKey(selectedPlaceKey) : null;
   const activeChannel =
@@ -575,7 +604,10 @@ export function Sidebar({
             (workspaces.length === 0 ? "ワークスペースなし" : "場所を選択")}
         </span>
       </div>
-      <nav className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2">
+      <nav
+        data-slot="sidebar-places"
+        className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2"
+      >
         <div className="pt-2">
           <SectionHeader
             label="チャンネル"
@@ -649,19 +681,29 @@ export function Sidebar({
       </nav>
       <div className="relative shrink-0 border-border/70 border-t p-2">
         {statusMenuOpen && canSetStatus ? (
-          <div className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md">
+          <div
+            {...statusOverlay.panelProps}
+            role="dialog"
+            aria-label="ステータス"
+            className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
+          >
             {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => (
-              <button
+              <label
                 key={kind}
-                type="button"
-                onClick={() => {
-                  setStatus(kind, kind === "busy" ? "取り込み中" : "");
-                  setStatusMenuOpen(false);
-                }}
-                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent ${
+                className={`flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
                   selfStatus?.status === kind ? "font-medium" : ""
                 }`}
               >
+                <input
+                  type="radio"
+                  name="self-status-choice"
+                  checked={selfStatus?.status === kind}
+                  onChange={() => {
+                    setStatus(kind, kind === "busy" ? "取り込み中" : "");
+                    setStatusMenuOpen(false);
+                  }}
+                  className="sr-only"
+                />
                 <span
                   className={`size-2 rounded-full ${
                     kind === "available"
@@ -672,7 +714,13 @@ export function Sidebar({
                   }`}
                 />
                 {STATUS_LABEL[kind]}
-              </button>
+                <Check
+                  aria-hidden
+                  className={`ml-auto size-3.5 shrink-0 ${
+                    selfStatus?.status === kind ? "opacity-100" : "opacity-0"
+                  }`}
+                />
+              </label>
             ))}
             <p className="px-2 pt-1 pb-0.5 text-[10px] text-muted-foreground/70">
               ステータスは自己申告。誰かが勝手に晒すことはありません
@@ -682,8 +730,10 @@ export function Sidebar({
         <button
           type="button"
           disabled={!canSetStatus}
+          aria-haspopup="dialog"
+          {...statusOverlay.triggerProps}
           onClick={() => {
-            if (canSetStatus) setStatusMenuOpen((open) => !open);
+            if (canSetStatus) statusOverlay.toggle();
           }}
           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
         >
