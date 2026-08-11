@@ -431,6 +431,7 @@ func (a *countingHubAuthorizer) withLiveAudience(
 	ctx context.Context,
 	scope Scope,
 	boundary liveBoundary,
+	requireActor bool,
 	deliver func(map[ParticipantRef]struct{}) error,
 ) error {
 	if boundary.placeID != "" {
@@ -439,7 +440,7 @@ func (a *countingHubAuthorizer) withLiveAudience(
 		a.participantCalls++
 	}
 	if a.store != nil {
-		return a.store.core.withLiveAudience(ctx, scope, boundary, deliver)
+		return a.store.core.withLiveAudience(ctx, scope, boundary, requireActor, deliver)
 	}
 	return deliver(a.audience)
 }

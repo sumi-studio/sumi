@@ -719,3 +719,93 @@ func TestTypingHoldsSessionAndWorkspaceAuthorityThroughPublish(t *testing.T) {
 		}
 	})
 }
+
+func TestTypingUsesOneDatabaseConnectionForAuthorityAndAudience(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	w := newWorldWithMaxConns(t, ctx, 1)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	actorStore := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	hub := NewHub(w.store.core)
+	receiver := hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB))
+	defer hub.unsubscribe(receiver)
+	server := NewWSServer(w.store.core, &controlledSessionAdmission{}, hub)
+	server.WriteTimeout = 2 * time.Second
+
+	done := make(chan struct{})
+	go func() {
+		server.handleTyping(ctx, &subscriber{viewer: w.agent, store: actorStore},
+			agentevents.UserSessionClaims{}, wsClientFrame{PlaceID: channel.PlaceID})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("typing exhausted the one-connection pool")
+	}
+	if got := len(receiver.send); got != 1 {
+		t.Fatalf("single-connection typing delivered %d frames, want one", got)
+	}
+
+	// The live operation must return its sole connection and every authority
+	// lease; a lifecycle mutation cannot remain starved behind a completed
+	// volatile publish.
+	membershipID := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+	removeCtx, removeCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer removeCancel()
+	if err := w.workspaces.RemoveMember(
+		removeCtx, workspace.WorkspaceID, membershipID, w.humanA,
+	); err != nil {
+		t.Fatalf("membership lifecycle after one-connection typing: %v", err)
+	}
+}
+
+func TestProductionCapacityConcurrentTypingCompletesAndReleasesLifecycleFence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const productionMaxConns = int32(10)
+	const concurrentTyping = int(productionMaxConns)
+	w := newWorldWithMaxConns(t, ctx, productionMaxConns)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	actorStore := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	hub := NewHub(w.store.core)
+	receiver := hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB))
+	defer hub.unsubscribe(receiver)
+	server := NewWSServer(w.store.core, &controlledSessionAdmission{}, hub)
+
+	ready := make(chan struct{}, concurrentTyping)
+	start := make(chan struct{})
+	done := make(chan struct{}, concurrentTyping)
+	for range concurrentTyping {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			server.handleTyping(ctx, &subscriber{viewer: w.agent, store: actorStore},
+				agentevents.UserSessionClaims{}, wsClientFrame{PlaceID: channel.PlaceID})
+			done <- struct{}{}
+		}()
+	}
+	for range concurrentTyping {
+		<-ready
+	}
+	close(start)
+	for range concurrentTyping {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("production-capacity concurrent typing exhausted the pool")
+		}
+	}
+	if got := len(receiver.send); got != concurrentTyping {
+		t.Fatalf("concurrent typing delivered %d frames, want %d", got, concurrentTyping)
+	}
+
+	membershipID := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+	removeCtx, removeCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer removeCancel()
+	if err := w.workspaces.RemoveMember(
+		removeCtx, workspace.WorkspaceID, membershipID, w.humanA,
+	); err != nil {
+		t.Fatalf("membership lifecycle after concurrent typing: %v", err)
+	}
+}

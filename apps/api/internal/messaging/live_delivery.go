@@ -22,6 +22,7 @@ func (s *Store) withLiveAudience(
 	ctx context.Context,
 	scope Scope,
 	boundary liveBoundary,
+	requireActor bool,
 	deliver func(map[ParticipantRef]struct{}) error,
 ) error {
 	if s == nil || s.workspaces == nil || s.apps == nil || deliver == nil {
@@ -38,28 +39,41 @@ func (s *Store) withLiveAudience(
 		return fmt.Errorf("begin live audience snapshot: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if err := s.workspaces.LockSharedInTx(ctx, tx, scope.WorkspaceID); err != nil {
-		if errors.Is(err, workspacecontrol.ErrNotFound) {
-			return ErrPlaceNotFound
+	scoped := &ScopedStore{Store: s, Scope: scope}
+	if requireActor {
+		if _, err := scoped.authorizeMutationInTx(ctx, tx); err != nil {
+			return err
 		}
-		return err
-	}
-	if _, err := s.apps.RequireEnabledInstallationInTx(
-		ctx,
-		tx,
-		scope.InstallationID,
-		applicationapps.WorkspaceOwner(scope.WorkspaceID),
-		MessagingAppID,
-	); err != nil {
-		return err
+	} else {
+		if err := s.workspaces.LockSharedInTx(ctx, tx, scope.WorkspaceID); err != nil {
+			if errors.Is(err, workspacecontrol.ErrNotFound) {
+				return ErrPlaceNotFound
+			}
+			return err
+		}
+		if _, err := s.apps.RequireEnabledInstallationInTx(
+			ctx,
+			tx,
+			scope.InstallationID,
+			applicationapps.WorkspaceOwner(scope.WorkspaceID),
+			MessagingAppID,
+		); err != nil {
+			return err
+		}
 	}
 
-	scoped := &ScopedStore{Store: s, Scope: scope}
 	audience := map[ParticipantRef]struct{}{}
 	if boundary.placeID != "" {
 		place, err := scoped.lockScopedPlace(ctx, tx, boundary.placeID)
 		if err != nil {
 			return err
+		}
+		if requireActor {
+			if _, err := scoped.placeAccessAfterAuthorization(
+				ctx, tx, place, scope.Actor,
+			); err != nil {
+				return err
+			}
 		}
 		members, err := scoped.activeMembersScoped(ctx, tx, place)
 		if err != nil {
