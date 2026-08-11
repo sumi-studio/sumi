@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/canonicalid"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
@@ -698,8 +699,7 @@ func newUUIDv7() string {
 }
 
 func isCanonicalUUIDv7(value string) bool {
-	id, err := uuid.Parse(value)
-	return err == nil && id.String() == value && id.Version() == 7 && id.Variant() == uuid.RFC4122
+	return canonicalid.IsUUIDv7(value)
 }
 
 func isUniqueViolation(err error) bool {

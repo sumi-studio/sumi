@@ -416,6 +416,9 @@ func TestBrowserWebSocketRequiresExactInstallationScopeAndBoundAuthorizer(t *tes
 	}{
 		{name: "missing", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
 		{name: "empty installation", query: "?installation_id=&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "malformed installation", query: "?installation_id=not-a-uuid&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "wrong-version installation", query: "?installation_id=018f47a2-9b3c-4def-8abc-0123456789ab&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "wrong-variant installation", query: "?installation_id=018f47a2-9b3c-7def-0abc-0123456789ab&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
 		{name: "duplicate installation", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID + "&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
 		{name: "missing epoch", query: "?installation_id=" + testDirectChatInstallationID, authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
 		{name: "duplicate epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},

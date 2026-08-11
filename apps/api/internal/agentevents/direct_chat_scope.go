@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/canonicalid"
 )
 
 var errDirectChatInvalidScope = errors.New("invalid direct-chat transport scope")
@@ -21,7 +23,8 @@ func directChatScopeFromRequest(r *http.Request) (directChatScope, error) {
 	query := r.URL.Query()
 	installationValues, installationOK := query["installation_id"]
 	epochValues, epochOK := query["authority_epoch"]
-	if !installationOK || len(installationValues) != 1 || installationValues[0] == "" ||
+	if !installationOK || len(installationValues) != 1 ||
+		!canonicalid.IsUUIDv7(installationValues[0]) ||
 		!epochOK || len(epochValues) != 1 || !isCanonicalPositiveInt64(epochValues[0]) {
 		return directChatScope{}, errDirectChatInvalidScope
 	}
