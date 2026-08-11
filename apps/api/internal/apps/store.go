@@ -145,6 +145,50 @@ func (s *Store) RequireEnabledInstallation(
 	return installation, nil
 }
 
+// ResolveEnabledInstallation turns an authenticated, model-selected app owner
+// address into the exact current installation identity used at bind time. It
+// never supplies a default Workspace and never accepts an installation id from
+// the model. Callers must still seal the returned id into the invocation and
+// use RequireEnabledInstallationInTx again at commit.
+func (s *Store) ResolveEnabledInstallation(
+	ctx context.Context,
+	owner OwnerRef,
+	actor participant.Ref,
+	appID string,
+) (Installation, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return Installation{}, fmt.Errorf("begin app-installation resolution: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := s.authorizeRead(ctx, tx, owner, actor); err != nil {
+		return Installation{}, err
+	}
+	storageKind, storageID := ownerStorageKey(owner)
+	row := tx.QueryRow(ctx, `
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		       installed_at, updated_at
+		FROM app_installations
+		WHERE owner_kind = $1 AND owner_id = $2 AND app_id = $3`,
+		storageKind, storageID, appID)
+	installation, err := scanInstallation(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Installation{}, ErrInstallationNotFound
+	}
+	if err != nil {
+		return Installation{}, fmt.Errorf("resolve app installation: %w", err)
+	}
+	if installation.State != StateEnabled {
+		return Installation{}, ErrAppDisabled
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Installation{}, fmt.Errorf("commit app-installation resolution: %w", err)
+	}
+	return installation, nil
+}
+
 func (s *Store) Installations(ctx context.Context, owner OwnerRef, actor participant.Ref) ([]Installation, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
