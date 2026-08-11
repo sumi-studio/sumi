@@ -269,3 +269,53 @@ func TestLocalReplyLaterAndResolveUseTheSharedStore(t *testing.T) {
 		t.Fatalf("agent resolving the human's marker: status %d, want 404", status)
 	}
 }
+
+func TestLocalOverviewRestoresReplyLaterMarkerAfterServerReconstruction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	_, channel := w.workspaceWithChannel(t, ctx)
+	message := w.send(t, ctx, channel.PlaceID, w.humanA, "再起動後に対応してください")
+
+	beforeRestart := NewServer(w.store, nil)
+	status, body := callLocal(t, ctx, beforeRestart.localReplyLater, LocalReplyLaterPath, map[string]any{
+		"place_id": channel.PlaceID, "message_id": message.MessageID,
+		"note": "再起動後も覚えておく", "remind_in_minutes": 30,
+	}, authorization)
+	if status != http.StatusCreated {
+		t.Fatalf("create marker before reconstruction: status %d body %v", status, body)
+	}
+	markerID := body["marker"].(map[string]any)["marker_id"].(string)
+
+	// The overview is the reconstruction boundary for the agent adapter. A new
+	// server instance sharing only the durable Store must return the marker with
+	// the same owner-private schedule that the Human bootstrap returns.
+	afterRestart := NewServer(w.store, nil)
+	status, body = callLocal(t, ctx, afterRestart.localOverview, LocalOverviewPath,
+		map[string]any{}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("overview after reconstruction: status %d body %v", status, body)
+	}
+	markers, ok := body["reply_later_markers"].([]any)
+	if !ok || len(markers) != 1 {
+		t.Fatalf("overview markers = %#v, want the durable marker", body["reply_later_markers"])
+	}
+	marker := markers[0].(map[string]any)
+	if marker["marker_id"] != markerID || marker["note"] != "再起動後も覚えておく" || marker["remind_at"] == nil {
+		t.Fatalf("overview marker = %v, want the agent's complete own marker", marker)
+	}
+
+	status, body = callLocal(t, ctx, afterRestart.localReplyLaterResolve,
+		LocalReplyLaterResolvePath, map[string]any{"marker_id": markerID}, authorization)
+	if status != http.StatusOK || body["marker"].(map[string]any)["resolved"] != true {
+		t.Fatalf("resolve reconstructed marker: status %d body %v", status, body)
+	}
+	open, err := w.store.ReplyLaterMarkersFor(ctx, w.agent)
+	if err != nil {
+		t.Fatalf("list markers after resolve: %v", err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("resolved marker remained open: %+v", open)
+	}
+}

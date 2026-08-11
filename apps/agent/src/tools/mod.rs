@@ -14,6 +14,7 @@ pub mod bash;
 #[allow(dead_code)]
 #[path = "bash_non_linux.rs"]
 mod bash_non_linux_compile_check;
+pub(crate) mod bound;
 #[cfg(target_os = "linux")]
 pub mod executor;
 #[cfg(target_os = "linux")]
@@ -26,8 +27,10 @@ mod unix_pipe;
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     marker::PhantomData,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -38,9 +41,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::types::{ToolDefinition, UserContent, ValidatedToolArguments};
+use crate::provider::types::{ToolCall, ToolDefinition, UserContent, ValidatedToolArguments};
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 
+pub(crate) use bound::{
+    AdapterIdentity, AppActionDescriptor, AppPrecondition, BoundExecutionArguments,
+    BoundExecutionIdentity, BoundToolInvocation, CapabilityClass, DescribeError, ResourceScope,
+    ReviewProjection, ToolBinding,
+};
+
+/// Provider-facing scheduling metadata for the legacy raw tool path.
+///
+/// This is not an authorization decision and does not determine the trusted
+/// app adapter's [`CapabilityClass`] mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolRisk {
     ReadOnly,
@@ -84,6 +97,14 @@ pub enum ToolError {
     Protocol(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BoundExecutionError {
+    #[error("bound invocation was rejected: {0}")]
+    InvalidInvocation(#[from] DescribeError),
+    #[error("bound app operation failed: {0}")]
+    Tool(#[from] ToolError),
+}
+
 impl From<crate::runtime::contracts::RuntimeContractError> for ToolError {
     fn from(error: crate::runtime::contracts::RuntimeContractError) -> Self {
         Self::Protocol(error.to_string())
@@ -95,6 +116,64 @@ pub struct ToolOutput {
     pub content: Vec<UserContent>,
     pub details: Value,
     pub is_error: bool,
+}
+
+/// Observable result of best-effort app maintenance after a committed result.
+/// A deferred hook is not a tool failure and must not rewrite the already
+/// admitted tool result or fail an unrelated later action.
+#[derive(Debug)]
+pub(crate) enum LiveAppPostCommitOutcome {
+    Applied,
+    Deferred(ToolError),
+}
+
+type LiveAppPostCommitFuture =
+    Pin<Box<dyn Future<Output = LiveAppPostCommitOutcome> + Send + 'static>>;
+
+/// Non-serializable, non-authoritative process-local maintenance hook.
+///
+/// It is intentionally non-`Clone` and consumed once. The route may invoke it
+/// only after receiving the durable commit receipt for the exact
+/// `ToolExecutionEnd`/tool result. The hook emits no durable event, grants no
+/// invocation authority, may be lost on crash, and is never recovered from
+/// serialized evidence.
+pub(crate) struct LiveAppPostCommit {
+    callback: Box<dyn FnOnce(CancellationToken) -> LiveAppPostCommitFuture + Send + 'static>,
+}
+
+impl LiveAppPostCommit {
+    pub(crate) fn new<F, Fut>(callback: F) -> Self
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = LiveAppPostCommitOutcome> + Send + 'static,
+    {
+        Self {
+            callback: Box::new(move |cancel| Box::pin(callback(cancel))),
+        }
+    }
+
+    pub(crate) async fn invoke_after_result_commit(
+        self,
+        cancel: CancellationToken,
+    ) -> LiveAppPostCommitOutcome {
+        (self.callback)(cancel).await
+    }
+}
+
+/// Exact tool output plus optional process-local app maintenance that becomes
+/// eligible only after the route durably commits that output.
+pub(crate) struct BoundToolExecutionOutcome {
+    pub output: ToolOutput,
+    pub live_post_commit: Option<LiveAppPostCommit>,
+}
+
+impl BoundToolExecutionOutcome {
+    pub(crate) fn without_live_post_commit(output: ToolOutput) -> Self {
+        Self {
+            output,
+            live_post_commit: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,10 +212,43 @@ pub struct ToolCtx<'a> {
     pub workspace: &'a WorkspacePaths,
 }
 
+pub(crate) struct ToolBindCtx<'a> {
+    pub args: &'a ValidatedToolArguments,
+    pub workspace: &'a WorkspacePaths,
+}
+
+pub(crate) struct BoundToolCtx<'a> {
+    pub flow_id: &'a str,
+    pub call_id: &'a str,
+    pub args: &'a BoundExecutionArguments,
+    pub cancel: CancellationToken,
+    pub on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    pub workspace: &'a WorkspacePaths,
+}
+
+/// One complete app-owned binding/execution package.
+///
+/// Implementors must provide identity, proposal binding, and exact bound
+/// execution together. A registry therefore cannot review through one
+/// independently optional surface and discover a missing executor later.
+/// The adapter maps its complete action vocabulary to coarse
+/// [`CapabilityClass`] values and retains commit-time authorization.
+#[async_trait]
+pub(crate) trait BoundToolAdapter: Send + Sync {
+    fn identity(&self) -> AdapterIdentity;
+    async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError>;
+    async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError>;
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDefinition;
     fn risk(&self) -> ToolRisk;
+    /// Return the tool's complete app-owned bound adapter, if it has one.
+    /// This single package is extracted and frozen during registration.
+    fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+        None
+    }
     async fn execute(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError>;
 }
 
@@ -174,6 +286,40 @@ impl Tool for GuardedTool {
     }
 }
 
+struct GuardedBoundToolAdapter {
+    inner: Arc<dyn BoundToolAdapter>,
+}
+
+#[async_trait]
+impl BoundToolAdapter for GuardedBoundToolAdapter {
+    fn identity(&self) -> AdapterIdentity {
+        self.inner.identity()
+    }
+
+    async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+        self.inner.bind(ctx).await
+    }
+
+    async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError> {
+        let update = ToolUpdate {
+            callback: ctx.on_update,
+            settled: Arc::new(Mutex::new(false)),
+        };
+        let _settlement = ToolSettlementGuard::new(update.clone());
+        let guarded_update = update.clone();
+        self.inner
+            .execute(BoundToolCtx {
+                flow_id: ctx.flow_id,
+                call_id: ctx.call_id,
+                args: ctx.args,
+                cancel: ctx.cancel,
+                on_update: Arc::new(move |value| guarded_update.emit(value)),
+                workspace: ctx.workspace,
+            })
+            .await
+    }
+}
+
 #[derive(Default)]
 pub struct ToolRegistryBuilder {
     tools: BTreeMap<String, RegisteredTool>,
@@ -188,11 +334,30 @@ impl ToolRegistryBuilder {
                 "duplicate frozen tool definition: {name}"
             )));
         }
+        let bound_adapter = tool
+            .clone()
+            .bound_adapter()
+            .map(|adapter| {
+                let identity = adapter.identity();
+                identity
+                    .validate()
+                    .map_err(|error| ToolError::Protocol(error.to_string()))?;
+                Ok::<_, ToolError>(RegisteredBoundToolAdapter {
+                    identity,
+                    adapter: Arc::new(GuardedBoundToolAdapter { inner: adapter }),
+                    // This pointer token binds a live invocation to this exact
+                    // frozen registration. It is defense-in-depth registry
+                    // identity only: not Approval, policy, or one-shot authority.
+                    registration_seal: Arc::new(()),
+                })
+            })
+            .transpose()?;
         self.tools.insert(
             name,
             RegisteredTool {
                 definition,
                 tool: Arc::new(GuardedTool { inner: tool }),
+                bound_adapter,
             },
         );
         Ok(())
@@ -202,6 +367,7 @@ impl ToolRegistryBuilder {
         ToolRegistry {
             tools: self.tools,
             executor_identity: None,
+            registry_seal: Arc::new(()),
         }
     }
 
@@ -209,6 +375,7 @@ impl ToolRegistryBuilder {
         ToolRegistry {
             tools: self.tools,
             executor_identity: Some(identity),
+            registry_seal: Arc::new(()),
         }
     }
 }
@@ -220,12 +387,46 @@ pub struct ToolRegistry {
     // Production remote registries bind the immutable client's complete RPC
     // identity so neither PAID nor boot nonce can be erased at composition.
     executor_identity: Option<RpcIdentity>,
+    registry_seal: Arc<()>,
 }
 
 #[derive(Clone)]
 struct RegisteredTool {
     definition: ToolDefinition,
     tool: Arc<dyn Tool>,
+    bound_adapter: Option<RegisteredBoundToolAdapter>,
+}
+
+#[derive(Clone)]
+struct RegisteredBoundToolAdapter {
+    identity: AdapterIdentity,
+    adapter: Arc<dyn BoundToolAdapter>,
+    registration_seal: Arc<()>,
+}
+
+/// Opaque same-process execution handle paired with durable invocation
+/// evidence.
+///
+/// The serializable invocation is evidence. The registry and registration
+/// pointer tokens, sealed flow id, and concrete `WorkspacePaths` are live
+/// execution binding only. They are not Approval, policy, or one-shot
+/// authority. This wrapper is deliberately non-`Clone` and is consumed by
+/// execution as defense in depth against accidental in-process reuse.
+/// ADR 0013's durable start barrier still owns exactly one committed
+/// start/effect across crash, cancellation, and retry boundaries.
+pub(crate) struct SealedBoundToolInvocation {
+    invocation: BoundToolInvocation,
+    sealed_evidence_digest: bound::InvocationDigest,
+    flow_id: String,
+    workspace: WorkspacePaths,
+    registry_seal: Arc<()>,
+    registration_seal: Arc<()>,
+}
+
+impl SealedBoundToolInvocation {
+    pub(crate) fn invocation(&self) -> &BoundToolInvocation {
+        &self.invocation
+    }
 }
 
 impl ToolRegistry {
@@ -269,6 +470,143 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).map(|entry| entry.tool.clone())
+    }
+
+    /// Ask the exact frozen app adapter to bind a model-facing proposal to a
+    /// serializable operation. The production runner does not call this path
+    /// yet; it is a neutral predecessor for later policy and route wiring.
+    pub(crate) async fn bind(
+        &self,
+        call: &ToolCall,
+        flow_id: &str,
+        workspace: &WorkspacePaths,
+    ) -> Result<SealedBoundToolInvocation, DescribeError> {
+        if call.id.is_empty() || call.name.is_empty() {
+            return Err(DescribeError::InvalidProposalIdentity {
+                reason: "tool call id and name must be non-empty".to_owned(),
+            });
+        }
+        let registered = self
+            .tools
+            .get(&call.name)
+            .ok_or_else(|| DescribeError::UnknownTool {
+                tool: call.name.clone(),
+            })?;
+        let execution_identity = BoundExecutionIdentity::seal(flow_id, workspace.root())?;
+        let bound_adapter = registered.bound_adapter.as_ref().ok_or_else(|| {
+            DescribeError::MissingBoundAdapter {
+                tool: call.name.clone(),
+            }
+        })?;
+        let binding = bound_adapter
+            .adapter
+            .bind(ToolBindCtx {
+                args: &call.arguments,
+                workspace,
+            })
+            .await?;
+        let invocation = BoundToolInvocation::seal(
+            &call.id,
+            &call.name,
+            call.arguments.as_object(),
+            bound_adapter.identity.clone(),
+            execution_identity,
+            binding,
+        )?;
+        let sealed_evidence_digest = invocation.evidence_digest()?;
+        Ok(SealedBoundToolInvocation {
+            invocation,
+            sealed_evidence_digest,
+            flow_id: flow_id.to_owned(),
+            workspace: workspace.clone(),
+            registry_seal: self.registry_seal.clone(),
+            registration_seal: bound_adapter.registration_seal.clone(),
+        })
+    }
+
+    /// Re-establish that serialized evidence is still paired with the exact
+    /// registry and registration that produced it.
+    ///
+    /// The pointer seals are registry-binding defense in depth. Validation is
+    /// intentionally repeatable and confers neither Approval, policy, nor a
+    /// one-shot right to execute. A deserialized invocation alone is
+    /// deliberately not executable authority.
+    pub(crate) fn validate_bound<'a>(
+        &'a self,
+        sealed: &'a SealedBoundToolInvocation,
+    ) -> Result<&'a BoundToolInvocation, DescribeError> {
+        if !Arc::ptr_eq(&self.registry_seal, &sealed.registry_seal) {
+            return Err(DescribeError::RegistryIdentityMismatch);
+        }
+        let registered = self
+            .tools
+            .get(&sealed.invocation.tool_name)
+            .ok_or(DescribeError::RegistryIdentityMismatch)?;
+        let bound_adapter = registered
+            .bound_adapter
+            .as_ref()
+            .ok_or(DescribeError::RegistryIdentityMismatch)?;
+        if !Arc::ptr_eq(&bound_adapter.registration_seal, &sealed.registration_seal)
+            || bound_adapter.identity != sealed.invocation.adapter
+        {
+            return Err(DescribeError::RegistryIdentityMismatch);
+        }
+        let sealed_execution_identity =
+            BoundExecutionIdentity::seal(&sealed.flow_id, sealed.workspace.root())
+                .map_err(|_| DescribeError::SealedEvidenceMismatch)?;
+        let recomputed_descriptor_digest = sealed
+            .invocation
+            .recompute_descriptor_digest()
+            .map_err(|_| DescribeError::SealedEvidenceMismatch)?;
+        let recomputed_evidence_digest = sealed
+            .invocation
+            .evidence_digest()
+            .map_err(|_| DescribeError::SealedEvidenceMismatch)?;
+        if sealed.invocation.execution_identity != sealed_execution_identity
+            || recomputed_descriptor_digest != sealed.invocation.descriptor_digest
+            || recomputed_evidence_digest != sealed.sealed_evidence_digest
+        {
+            return Err(DescribeError::SealedEvidenceMismatch);
+        }
+        Ok(&sealed.invocation)
+    }
+
+    /// Consume and execute only the operation already sealed by this exact
+    /// registry, durable flow, and concrete workspace.
+    ///
+    /// This path neither invokes `bind` again nor consults current app view
+    /// state to reinterpret the model proposal. It accepts no caller-supplied
+    /// flow or workspace substitution. A deserialized invocation has no live
+    /// seal and therefore cannot enter this method after restart. Consuming the
+    /// handle prevents accidental local reuse; the durable ADR 0013 route must
+    /// still enforce the exactly-one committed start/effect barrier.
+    pub(crate) async fn execute_bound(
+        &self,
+        sealed: SealedBoundToolInvocation,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<BoundToolExecutionOutcome, BoundExecutionError> {
+        let invocation = self.validate_bound(&sealed)?;
+        let registered = self
+            .tools
+            .get(&invocation.tool_name)
+            .ok_or(DescribeError::RegistryIdentityMismatch)?;
+        let bound_adapter = registered
+            .bound_adapter
+            .as_ref()
+            .ok_or(DescribeError::RegistryIdentityMismatch)?;
+        bound_adapter
+            .adapter
+            .execute(BoundToolCtx {
+                flow_id: &sealed.flow_id,
+                call_id: &invocation.tool_call_id,
+                args: &invocation.execution_arguments,
+                cancel,
+                on_update,
+                workspace: &sealed.workspace,
+            })
+            .await
+            .map_err(BoundExecutionError::from)
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -450,6 +788,12 @@ mod tests {
         pending: bool,
     }
 
+    struct BindingTool {
+        name: &'static str,
+        bind_count: Arc<AtomicUsize>,
+        bound_executions: Arc<Mutex<Vec<Value>>>,
+    }
+
     #[async_trait]
     impl Tool for RawRetainingTool {
         fn def(&self) -> ToolDefinition {
@@ -476,6 +820,67 @@ mod tests {
     }
 
     #[async_trait]
+    impl Tool for BindingTool {
+        fn def(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.to_owned(),
+                description: "binding test tool".to_owned(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        fn risk(&self) -> ToolRisk {
+            ToolRisk::ReadOnly
+        }
+
+        fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+            Some(self)
+        }
+
+        async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+            unreachable!("binding contract tests never activate raw execution")
+        }
+    }
+
+    #[async_trait]
+    impl BoundToolAdapter for BindingTool {
+        fn identity(&self) -> AdapterIdentity {
+            AdapterIdentity::new("test.binding", 1).expect("valid test adapter")
+        }
+
+        async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+            self.bind_count.fetch_add(1, Ordering::Relaxed);
+            Ok(ToolBinding::new(
+                AppActionDescriptor::new(
+                    "inspect",
+                    CapabilityClass::Read,
+                    vec![ResourceScope::collection("test", "item")],
+                )?,
+                ReviewProjection::from_value(json!({"operation": "inspect"}))?,
+                BoundExecutionArguments::from_value(Value::Object(ctx.args.as_object().clone()))?,
+            ))
+        }
+
+        async fn execute(
+            &self,
+            ctx: BoundToolCtx<'_>,
+        ) -> Result<BoundToolExecutionOutcome, ToolError> {
+            let arguments = Value::Object(ctx.args.as_object().clone());
+            self.bound_executions
+                .lock()
+                .expect("bound executions lock")
+                .push(json!({
+                    "arguments": arguments.clone(),
+                    "flow_id": ctx.flow_id,
+                    "workspace": ctx.workspace.root(),
+                }));
+            Ok(BoundToolExecutionOutcome::without_live_post_commit(
+                text_output("bound", arguments),
+            ))
+        }
+    }
+
+    #[async_trait]
     impl TypedToolHandler<Params> for Handler {
         async fn execute(
             &self,
@@ -490,6 +895,14 @@ mod tests {
 
     fn validated(value: Value) -> ValidatedToolArguments {
         serde_json::from_value(value).expect("object-shaped arguments")
+    }
+
+    fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: validated(arguments),
+        }
     }
 
     #[tokio::test]
@@ -748,5 +1161,294 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(registry.get("one").is_some());
         assert_eq!(registry.definitions()[0].description, "one");
+    }
+
+    #[tokio::test]
+    async fn registry_binding_fails_closed_without_a_complete_adapter_package() {
+        struct Never;
+        #[async_trait]
+        impl TypedToolHandler<Params> for Never {
+            async fn execute(
+                &self,
+                _params: Params,
+                _ctx: TypedToolCtx<'_>,
+            ) -> Result<ToolOutput, ToolError> {
+                unreachable!("missing-adapter test never executes")
+            }
+        }
+
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(TypedTool::<Params, _>::new(
+                "unbound",
+                "unbound",
+                ToolRisk::ReadOnly,
+                Never,
+            )))
+            .expect("register unbound tool");
+        let registry = builder.build();
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+
+        let result = registry
+            .bind(
+                &call("call-1", "unbound", json!({"value": "x"})),
+                "flow-1",
+                &workspace,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(DescribeError::MissingBoundAdapter { tool }) if tool == "unbound"
+        ));
+    }
+
+    #[tokio::test]
+    async fn registration_seal_is_repeatable_binding_not_approval_or_mutable_identity() {
+        fn registry() -> ToolRegistry {
+            let mut builder = ToolRegistryBuilder::default();
+            builder
+                .register(Arc::new(BindingTool {
+                    name: "inspect",
+                    bind_count: Arc::new(AtomicUsize::new(0)),
+                    bound_executions: Arc::new(Mutex::new(Vec::new())),
+                }))
+                .expect("register binding tool");
+            builder.build()
+        }
+
+        let origin = registry();
+        let other = registry();
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = origin
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind invocation");
+
+        assert_eq!(
+            origin
+                .validate_bound(&sealed)
+                .expect("origin registry accepts its seal")
+                .tool_call_id,
+            "call-1"
+        );
+        assert!(origin.clone().validate_bound(&sealed).is_ok());
+        assert!(matches!(
+            other.validate_bound(&sealed),
+            Err(DescribeError::RegistryIdentityMismatch)
+        ));
+
+        let mut altered_call = origin
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind call mutation fixture");
+        altered_call.invocation.tool_call_id = "call-2".to_owned();
+        assert!(matches!(
+            origin.validate_bound(&altered_call),
+            Err(DescribeError::SealedEvidenceMismatch)
+        ));
+
+        let mut altered_projection = origin
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind projection mutation fixture");
+        altered_projection.invocation.review_projection =
+            ReviewProjection::from_value(json!({"operation": "replace"}))
+                .expect("valid replacement projection");
+        assert!(matches!(
+            origin.validate_bound(&altered_projection),
+            Err(DescribeError::SealedEvidenceMismatch)
+        ));
+
+        let mut altered_arguments = origin
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind argument mutation fixture");
+        altered_arguments.invocation.execution_arguments =
+            BoundExecutionArguments::from_value(json!({"path": "beta"}))
+                .expect("valid replacement arguments");
+        assert!(matches!(
+            origin.validate_bound(&altered_arguments),
+            Err(DescribeError::SealedEvidenceMismatch)
+        ));
+
+        let mut altered_flow = origin
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind flow mutation fixture");
+        altered_flow.flow_id = "flow-2".to_owned();
+        assert!(matches!(
+            origin.validate_bound(&altered_flow),
+            Err(DescribeError::SealedEvidenceMismatch)
+        ));
+
+        let mut altered_workspace = origin
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind workspace mutation fixture");
+        altered_workspace.workspace =
+            WorkspacePaths::new("/other-workspace").expect("replacement workspace");
+        assert!(matches!(
+            origin.validate_bound(&altered_workspace),
+            Err(DescribeError::SealedEvidenceMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_bound_consumes_sealed_arguments_flow_and_workspace_without_rebinding() {
+        let bind_count = Arc::new(AtomicUsize::new(0));
+        let bound_executions = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(BindingTool {
+                name: "inspect",
+                bind_count: bind_count.clone(),
+                bound_executions: bound_executions.clone(),
+            }))
+            .expect("register binding tool");
+        let registry = builder.build();
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind invocation");
+        assert_eq!(bind_count.load(Ordering::Relaxed), 1);
+
+        let output = registry
+            .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+            .await
+            .expect("execute sealed invocation");
+        assert_eq!(output.output.details, json!({"path": "alpha"}));
+        assert!(output.live_post_commit.is_none());
+        assert_eq!(bind_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            bound_executions
+                .lock()
+                .expect("bound executions lock")
+                .as_slice(),
+            &[json!({
+                "arguments": {"path": "alpha"},
+                "flow_id": "flow-1",
+                "workspace": "/workspace"
+            })]
+        );
+
+        let mut altered = registry
+            .bind(
+                &call("call-2", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind altered invocation");
+        altered.invocation.descriptor.operation = "replace".to_owned();
+        let rejected = registry
+            .execute_bound(altered, CancellationToken::new(), Arc::new(|_| {}))
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(BoundExecutionError::InvalidInvocation(
+                DescribeError::SealedEvidenceMismatch
+            ))
+        ));
+        assert_eq!(
+            bound_executions
+                .lock()
+                .expect("bound executions lock")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deserialized_evidence_cannot_mint_a_restart_execution_seal() {
+        fn registry(
+            bind_count: Arc<AtomicUsize>,
+            bound_executions: Arc<Mutex<Vec<Value>>>,
+        ) -> ToolRegistry {
+            let mut builder = ToolRegistryBuilder::default();
+            builder
+                .register(Arc::new(BindingTool {
+                    name: "inspect",
+                    bind_count,
+                    bound_executions,
+                }))
+                .expect("register binding tool");
+            builder.build()
+        }
+
+        let original = registry(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = original
+            .bind(
+                &call("call-1", "inspect", json!({"path": "alpha"})),
+                "flow-1",
+                &workspace,
+            )
+            .await
+            .expect("bind invocation");
+        let encoded = serde_json::to_vec(sealed.invocation()).expect("serialize evidence");
+        drop(sealed);
+        drop(original);
+
+        let execution_count = Arc::new(Mutex::new(Vec::new()));
+        let restarted = registry(Arc::new(AtomicUsize::new(0)), execution_count.clone());
+        let invocation: BoundToolInvocation =
+            serde_json::from_slice(&encoded).expect("deserialize durable evidence");
+        let sealed_evidence_digest = invocation.evidence_digest().expect("valid evidence digest");
+        let fabricated = SealedBoundToolInvocation {
+            invocation,
+            sealed_evidence_digest,
+            flow_id: "flow-1".to_owned(),
+            workspace: workspace.clone(),
+            registry_seal: Arc::new(()),
+            registration_seal: Arc::new(()),
+        };
+
+        let result = restarted
+            .execute_bound(fabricated, CancellationToken::new(), Arc::new(|_| {}))
+            .await;
+        assert!(matches!(
+            result,
+            Err(BoundExecutionError::InvalidInvocation(
+                DescribeError::RegistryIdentityMismatch
+            ))
+        ));
+        assert!(
+            execution_count
+                .lock()
+                .expect("execution count lock")
+                .is_empty()
+        );
     }
 }
