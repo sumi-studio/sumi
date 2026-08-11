@@ -180,6 +180,88 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 	}
 }
 
+func TestMigrateRejectsLegacyVersionEightWithResetRequiredError(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 7)
+
+	// This is the identifying shape of the replaced 0008 migration: it owns
+	// places, but its workspaces table has no distinguished owner membership.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE workspaces (
+			workspace_id uuidv7 PRIMARY KEY,
+			name text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE TABLE places (
+			place_id uuidv7 PRIMARY KEY,
+			workspace_id uuidv7 REFERENCES workspaces(workspace_id)
+		);
+		INSERT INTO schema_migrations (version) VALUES (8)
+	`); err != nil {
+		t.Fatalf("create legacy version-eight shape: %v", err)
+	}
+
+	err := Migrate(ctx, pool)
+	if !errors.Is(err, ErrPreCutoverResetRequired) {
+		t.Fatalf("legacy migration error = %v, want reset-required", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "reset this pre-cutover database") {
+		t.Fatalf("legacy migration error is not actionable: %v", err)
+	}
+	var versionNine bool
+	if err := pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 9)",
+	).Scan(&versionNine); err != nil {
+		t.Fatal(err)
+	}
+	if versionNine {
+		t.Fatal("legacy database advanced past the fail-fast boundary")
+	}
+}
+
+func TestWorkspaceCoreDownDropsAppCapabilitySeamInDependencyOrder(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 8)
+
+	down, err := migrationFS.ReadFile("migrations/0008_workspace_core.down.sql")
+	if err != nil {
+		t.Fatalf("read Workspace down migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("apply Workspace down migration: %v", err)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.tables
+		WHERE table_schema = current_schema()
+		  AND table_name IN (
+			'app_workspace_role_capabilities',
+			'workspace_role_app_capability_grants',
+			'app_catalog',
+			'workspace_roles'
+		  )`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("Workspace down migration left %d capability/role tables", remaining)
+	}
+	var functionRemains bool
+	if err := pool.QueryRow(ctx, `
+		SELECT to_regprocedure(
+			'prevent_app_workspace_role_capability_identity_mutation()'
+		) IS NOT NULL`).Scan(&functionRemains); err != nil {
+		t.Fatal(err)
+	}
+	if functionRemains {
+		t.Fatal("Workspace down migration left capability identity trigger function")
+	}
+}
+
 // TestKosekiSchemaConstraints verifies the 戸籍 invariants from issue #119
 // against a migrated database: a credential cannot be rebound to a different
 // Human, and an agent has at most one active Employer at a time.

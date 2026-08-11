@@ -26,6 +26,11 @@ const migrationAdvisoryLockID = int64(0x534d4944) // "SMID"
 
 var upMigrationRe = regexp.MustCompile(`^(\d+)_[^/]+\.up\.sql$`)
 
+// ErrPreCutoverResetRequired marks the one intentional destructive migration
+// boundary. Version 0008 was replaced before dogfooding data became durable;
+// an old database must be reset instead of guessed at or partially adopted.
+var ErrPreCutoverResetRequired = errors.New("pre-cutover Workspace schema replacement requires a database reset")
+
 // migrationBookkeepingSchema is the durable record of applied migrations. The
 // runner owns this table; individual migration files must not create it.
 const migrationBookkeepingSchema = `
@@ -54,6 +59,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {
 		return fmt.Errorf("ensure schema_migrations table: %w", err)
 	}
+	if err := rejectLegacyWorkspaceMigration(ctx, pool); err != nil {
+		return err
+	}
 
 	pending, err := pendingMigrations(ctx, pool)
 	if err != nil {
@@ -63,6 +71,36 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err := applyMigration(ctx, pool, m); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// rejectLegacyWorkspaceMigration distinguishes every pre-cutover 0008 shape
+// from the current 0008_workspace_core. Migration versions are the durable
+// identity, so a database that recorded either the legacy Messaging schema or
+// an earlier draft of Workspace core would otherwise skip the replacement.
+// This is deliberately a reset guard, not a compatibility/backfill path.
+func rejectLegacyWorkspaceMigration(ctx context.Context, pool *pgxpool.Pool) error {
+	var versionApplied, currentFingerprint bool
+	err := pool.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM schema_migrations WHERE version = 8),
+			EXISTS (
+				SELECT 1
+				FROM information_schema.columns
+				WHERE table_schema = current_schema()
+				  AND table_name = 'workspaces'
+				  AND column_name = 'owner_workspace_member_id'
+			)
+			AND to_regclass(current_schema() || '.app_catalog') IS NOT NULL
+			AND to_regclass(current_schema() || '.app_workspace_role_capabilities') IS NOT NULL
+			AND to_regclass(current_schema() || '.workspace_role_app_capability_grants') IS NOT NULL
+	`).Scan(&versionApplied, &currentFingerprint)
+	if err != nil {
+		return fmt.Errorf("inspect pre-cutover Workspace migration boundary: %w", err)
+	}
+	if versionApplied && !currentFingerprint {
+		return fmt.Errorf("%w: recorded migration 0008 does not match the current Workspace foundation; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired)
 	}
 	return nil
 }
