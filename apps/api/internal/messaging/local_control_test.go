@@ -35,7 +35,7 @@ func workspaceMembershipEpisodes(
 
 func assertEmptyOverview(t *testing.T, body map[string]any) {
 	t.Helper()
-	for _, field := range []string{"workspaces", "channels", "dms", "members", "read_markers", "unread_summaries"} {
+	for _, field := range []string{"workspaces", "channels", "dms", "members", "read_markers", "unread_summaries", "reply_later_markers"} {
 		values, ok := body[field].([]any)
 		if !ok || len(values) != 0 {
 			t.Fatalf("%s = %#v, want an empty array", field, body[field])

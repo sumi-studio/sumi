@@ -1478,6 +1478,7 @@ mod tests {
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
+        reply_later_markers: AsyncMutex<Vec<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -1485,13 +1486,14 @@ mod tests {
     impl MessagingApi for FakeMessagingApi {
         async fn overview(&self) -> Result<Value> {
             self.calls.lock().await.push("overview".to_owned());
+            let reply_later_markers = self.reply_later_markers.lock().await.clone();
             Ok(json!({
                 "self": {
                     "kind": "personality_agent",
                     "personality_agent_id": "agent-1"
                 },
                 "channels": [{"channel_id": "general"}],
-                "reply_later_markers": []
+                "reply_later_markers": reply_later_markers
             }))
         }
 
@@ -1570,21 +1572,22 @@ mod tests {
                 request.note.map(str::to_owned),
                 request.remind_in_minutes,
             ));
-            Ok(json!({
-                "marker": {
-                    "marker_id": "marker-1",
-                    "participant": {
-                        "kind": "personality_agent",
-                        "personality_agent_id": "agent-1"
-                    },
-                    "place": {"kind": "channel", "channel_id": request.place_id},
-                    "message_id": request.message_id,
-                    "note": request.note.unwrap_or(""),
-                    "remind_at": "2026-08-04T12:00:00Z",
-                    "resolved": false
+            let marker = json!({
+                "marker_id": "marker-1",
+                "participant": {
+                    "kind": "personality_agent",
+                    "personality_agent_id": "agent-1"
                 },
-                "created": true
-            }))
+                "place": {"kind": "channel", "channel_id": request.place_id},
+                "message_id": request.message_id,
+                "note": request.note.unwrap_or(""),
+                "remind_at": "2026-08-04T12:00:00Z",
+                "resolved": false
+            });
+            let mut markers = self.reply_later_markers.lock().await;
+            markers.retain(|known| known["marker_id"] != marker["marker_id"]);
+            markers.push(marker.clone());
+            Ok(json!({"marker": marker, "created": true}))
         }
 
         async fn resolve_reply_later(
@@ -1599,6 +1602,10 @@ mod tests {
                 .lock()
                 .await
                 .push(request.marker_id.to_owned());
+            self.reply_later_markers
+                .lock()
+                .await
+                .retain(|marker| marker["marker_id"].as_str() != Some(request.marker_id));
             Ok(json!({"marker": {"marker_id": request.marker_id, "resolved": true}}))
         }
 
@@ -2955,6 +2962,106 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.resolutions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overview_preserves_a_reply_later_marker_for_bound_resolve() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool).expect("register Messaging");
+        let registry = builder.build();
+
+        execute_bound_action(
+            &registry,
+            "open",
+            json!({"action": "open", "place_id": "general"}),
+        )
+        .await
+        .expect("open the target message");
+        execute_bound_action(
+            &registry,
+            "promise",
+            json!({"action": "reply_later", "seq": 7, "note": "later"}),
+        )
+        .await
+        .expect("create reply-later marker");
+        execute_bound_action(&registry, "overview", json!({"action": "overview"}))
+            .await
+            .expect("refresh overview without losing the marker");
+        execute_bound_action(
+            &registry,
+            "resolve",
+            json!({"action": "resolve_reply_later", "marker_id": "marker-1"}),
+        )
+        .await
+        .expect("bind and resolve the marker admitted by overview");
+
+        assert_eq!(
+            api.calls.lock().await.as_slice(),
+            &[
+                "open:general",
+                "reply_later:m7",
+                "overview",
+                "resolve:marker-1"
+            ]
+        );
+        assert!(api.reply_later_markers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recreated_adapter_recovers_a_reply_later_marker_from_overview() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let old_tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut old_builder = ToolRegistryBuilder::default();
+        old_builder
+            .register(old_tool.clone())
+            .expect("register old Messaging adapter");
+        let old_registry = old_builder.build();
+
+        execute_bound_action(
+            &old_registry,
+            "old-open",
+            json!({"action": "open", "place_id": "general"}),
+        )
+        .await
+        .expect("old adapter opens the target message");
+        execute_bound_action(
+            &old_registry,
+            "old-promise",
+            json!({"action": "reply_later", "seq": 7, "note": "after restart"}),
+        )
+        .await
+        .expect("old adapter creates the durable marker");
+        drop(old_registry);
+        drop(old_tool);
+
+        let recreated = Arc::new(MessagingTool::new(api.clone()));
+        let mut recreated_builder = ToolRegistryBuilder::default();
+        recreated_builder
+            .register(recreated)
+            .expect("register recreated Messaging adapter");
+        let recreated_registry = recreated_builder.build();
+        execute_bound_action(
+            &recreated_registry,
+            "recreated-overview",
+            json!({"action": "overview"}),
+        )
+        .await
+        .expect("overview reconstructs durable reply-later state");
+        execute_bound_action(
+            &recreated_registry,
+            "recreated-resolve",
+            json!({"action": "resolve_reply_later", "marker_id": "marker-1"}),
+        )
+        .await
+        .expect("recreated adapter binds and resolves the recovered marker");
+
+        assert_eq!(
+            api.resolutions.lock().await.as_slice(),
+            &["marker-1".to_owned()]
+        );
+        assert!(api.reply_later_markers.lock().await.is_empty());
     }
 
     #[tokio::test]
