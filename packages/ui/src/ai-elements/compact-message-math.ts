@@ -7,6 +7,7 @@ interface MdNode {
   children?: MdNode[];
   data?: {
     hName?: string;
+    hProperties?: Record<string, unknown>;
     hChildren?: HastNode[];
   };
   position?: {
@@ -23,6 +24,17 @@ interface HastNode {
   children?: HastNode[];
 }
 
+interface MathScope {
+  display: boolean;
+  source: string;
+}
+
+const MAX_TEX_SOURCE_LENGTH = 4_096;
+const MAX_TEX_NESTING_DEPTH = 64;
+const MAX_TEX_TOKENS = 2_048;
+
+export const REMARK_MATH_OPTIONS = { singleDollarTextMath: false } as const;
+
 function dollarRun(raw: string): number {
   let count = 0;
   while (count < raw.length && raw[count] === "$") count += 1;
@@ -35,19 +47,6 @@ function rawSource(source: string, node: MdNode): string | null {
   if (typeof start !== "number" || typeof end !== "number") return null;
   const raw = source.slice(start, end);
   return raw.startsWith("$") && raw.endsWith("$") ? raw : null;
-}
-
-/**
- * Keep single-dollar inline math without turning ordinary prices into math.
- * These are the same delimiter constraints Pandoc applies: non-blank content,
- * no whitespace just inside the delimiters, and no digit immediately after
- * the closing delimiter.
- */
-function isCurrencyLikeMath(raw: string, source: string, end: number): boolean {
-  const inner = raw.slice(1, -1);
-  if (inner.trim() === "") return true;
-  if (/^\s|\s$/.test(inner)) return true;
-  return /\d/.test(source.charAt(end));
 }
 
 function displayMathNode(value: string): MdNode {
@@ -108,36 +107,11 @@ function splitDisplayMathLines(
   return promoted ? output : null;
 }
 
-/** Correct remark-math's chat-specific delimiter ambiguities before mentions. */
+/** Promote standalone one-line double-dollar math to display layout. */
 export function remarkCompactMath() {
   return (tree: MdNode, file: { value?: unknown }) => {
     const source = typeof file.value === "string" ? file.value : "";
     if (source === "") return;
-
-    const demoteCurrency = (node: MdNode) => {
-      if (!node.children) return;
-      const next: MdNode[] = [];
-      let changed = false;
-      for (const child of node.children) {
-        if (child.type === "inlineMath") {
-          const raw = rawSource(source, child);
-          const end = child.position?.end?.offset ?? 0;
-          if (
-            raw !== null &&
-            dollarRun(raw) === 1 &&
-            isCurrencyLikeMath(raw, source, end)
-          ) {
-            next.push({ type: "text", value: raw });
-            changed = true;
-            continue;
-          }
-        }
-        demoteCurrency(child);
-        next.push(child);
-      }
-      if (changed) node.children = next;
-    };
-    demoteCurrency(tree);
 
     const promoteDisplays = (node: MdNode) => {
       if (!node.children) return;
@@ -168,7 +142,147 @@ function hastClassNames(node: HastNode): string[] {
   return [];
 }
 
-/** Remove KaTeX's large display margins and contain long formulae locally. */
+function hastText(node: HastNode): string {
+  if (node.type === "text") return node.value ?? "";
+  return (node.children ?? []).map(hastText).join("");
+}
+
+function mathScope(node: HastNode): MathScope | null {
+  if (node.type !== "element") return null;
+  const classes = hastClassNames(node);
+  if (
+    node.tagName === "code" &&
+    (classes.includes("math-inline") || classes.includes("math-display"))
+  ) {
+    return {
+      display: classes.includes("math-display"),
+      source: hastText(node),
+    };
+  }
+  if (node.tagName !== "pre") return null;
+  const code = node.children?.find(
+    (child) =>
+      child.type === "element" &&
+      child.tagName === "code" &&
+      hastClassNames(child).includes("language-math"),
+  );
+  return code ? { display: true, source: hastText(code) } : null;
+}
+
+type MathLimit = "length" | "depth" | "tokens";
+
+function texLimit(source: string): MathLimit | null {
+  if (source.length > MAX_TEX_SOURCE_LENGTH) return "length";
+  let depth = 0;
+  let tokens = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source.charAt(index);
+    if (/\s/.test(character)) continue;
+    tokens += 1;
+    if (tokens > MAX_TEX_TOKENS) return "tokens";
+    if (character === "\\") {
+      while (/[A-Za-z]/.test(source[index + 1] ?? "")) index += 1;
+      continue;
+    }
+    if (character === "{") {
+      depth += 1;
+      if (depth > MAX_TEX_NESTING_DEPTH) return "depth";
+    } else if (character === "}") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  return null;
+}
+
+function mathFallback(
+  source: string,
+  display: boolean,
+  reason: MathLimit | "render",
+): HastNode {
+  const error: HastNode = {
+    type: "element",
+    tagName: "span",
+    properties: {
+      className: ["katex-error"],
+      style: "color:var(--destructive)",
+      title:
+        reason === "render"
+          ? "数式を描画できませんでした"
+          : "数式が表示上限を超えています",
+      "data-math-fallback": reason,
+    },
+    children: [{ type: "text", value: source }],
+  };
+  return {
+    type: "element",
+    tagName: display ? "div" : "span",
+    properties: display
+      ? {
+          className: "my-1 max-w-full overflow-x-auto",
+          "data-math-display": "",
+        }
+      : {
+          className: "inline-block max-w-full overflow-x-auto align-baseline",
+          "data-math-inline": "",
+        },
+    children: [error],
+  };
+}
+
+function replaceMath(
+  tree: HastNode,
+  replacement: (scope: MathScope) => HastNode | null,
+) {
+  const walk = (node: HastNode) => {
+    const children = node.children;
+    if (!children) return;
+    for (const [index, child] of children.entries()) {
+      const scope = mathScope(child);
+      const next = scope ? replacement(scope) : null;
+      if (next) {
+        children[index] = next;
+        continue;
+      }
+      walk(child);
+    }
+  };
+  walk(tree);
+}
+
+const KATEX_OPTIONS = {
+  strict: "ignore" as const,
+  errorColor: "var(--destructive)",
+  trust: false,
+  maxExpand: 1_000,
+  maxSize: 20,
+};
+
+/**
+ * Bound author-controlled TeX before KaTeX allocates layout nodes. KaTeX's
+ * own parser errors stay visible, while unexpected plugin errors replace every
+ * still-unrendered math scope with its exact source.
+ */
+export function rehypeCompactKatex() {
+  const render = rehypeKatex(KATEX_OPTIONS) as unknown as (
+    tree: HastNode,
+    file: unknown,
+  ) => void;
+  return (tree: HastNode, file: unknown) => {
+    replaceMath(tree, (scope) => {
+      const limit = texLimit(scope.source);
+      return limit ? mathFallback(scope.source, scope.display, limit) : null;
+    });
+    try {
+      render(tree, file);
+    } catch {
+      replaceMath(tree, (scope) =>
+        mathFallback(scope.source, scope.display, "render"),
+      );
+    }
+  };
+}
+
+/** Contain both display and long inline formulae inside their message row. */
 export function rehypeCompactMathLayout() {
   return (tree: HastNode) => {
     const walk = (node: HastNode) => {
@@ -194,23 +308,27 @@ export function rehypeCompactMathLayout() {
           };
           continue;
         }
+        if (
+          child.type === "element" &&
+          hastClassNames(child).includes("katex")
+        ) {
+          children[index] = {
+            type: "element",
+            tagName: "span",
+            properties: {
+              className:
+                "inline-block max-w-full overflow-x-auto align-baseline",
+              "data-math-inline": "",
+            },
+            children: [child],
+          };
+          continue;
+        }
         walk(child);
       }
     };
     walk(tree);
   };
-}
-
-const KATEX_OPTIONS = {
-  strict: "ignore" as const,
-  errorColor: "var(--destructive)",
-  trust: false,
-  throwOnError: false,
-};
-
-/** KaTeX failures stay visible as their TeX source instead of aborting chat. */
-export function rehypeCompactKatex() {
-  return rehypeKatex(KATEX_OPTIONS);
 }
 
 export { remarkMath };

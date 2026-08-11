@@ -5,7 +5,7 @@ import {
   CompactMessageResponse,
   type CompactMessageResponseProps,
 } from "@sumi/ui/ai-elements/compact-message-response";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 afterEach(() => {
@@ -132,6 +132,9 @@ describe("@sumi/ui CompactMessageResponse", () => {
 
     expect(container.querySelector(".katex")).not.toBeNull();
     expect(container.querySelector(".katex-display")).toBeNull();
+    expect(container.querySelector("[data-math-inline]")?.className).toContain(
+      "overflow-x-auto",
+    );
     expect(container.querySelector("math")?.getAttribute("aria-hidden")).toBe(
       null,
     );
@@ -203,6 +206,43 @@ describe("@sumi/ui CompactMessageResponse", () => {
     expect(container).toHaveTextContent(source);
   });
 
+  it("keeps later math and native Markdown after a currency opener", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {"価格は $5。**重要** [資料](https://example.com) `code`、式は $x+1$"}
+      </CompactMessageResponse>,
+    );
+
+    expect(container).toHaveTextContent("価格は $5。");
+    expect(container.querySelector("strong")).toHaveTextContent("重要");
+    expect(container.querySelector("a")).toHaveAttribute(
+      "href",
+      "https://example.com",
+    );
+    expect(container.querySelector("code")).toHaveTextContent("code");
+    expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent("x+1");
+  });
+
+  it.each([
+    "価格は $5、式は $x+1$",
+    "$5 **bold** $x+1$",
+    "$5 [link](https://example.com) $x+1$",
+    "$5 `code` $x+1$",
+  ])("does not let a price consume later structure: %s", (source) => {
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container).toHaveTextContent("$5");
+    expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent("x+1");
+  });
+
   it("respects escaped delimiters and leaves unclosed math readable", () => {
     const { container } = render(
       <CompactMessageResponse>
@@ -241,6 +281,56 @@ describe("@sumi/ui CompactMessageResponse", () => {
     expect(container).toHaveTextContent("after");
   });
 
+  it("clamps author-controlled dimensions to KaTeX's finite maxSize", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {String.raw`$\rule{100000em}{100000em}$`}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector(".katex-html")?.innerHTML).not.toContain(
+      "100000em",
+    );
+    expect(container.querySelector(".katex-html")?.innerHTML).toContain("20em");
+  });
+
+  it("rejects deeply nested TeX before KaTeX and preserves exact source", () => {
+    const tex = `${String.raw`\sqrt{`.repeat(65)}x${"}".repeat(65)}`;
+    const { container } = render(
+      <CompactMessageResponse>{`$${tex}$`}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(
+      container.querySelector("[data-math-fallback=depth]"),
+    ).toHaveTextContent(tex);
+  });
+
+  it("rejects overlong TeX before rendering and keeps a scrollable fallback", () => {
+    const tex = "x".repeat(4_097);
+    const { container } = render(
+      <CompactMessageResponse>{`$${tex}$`}</CompactMessageResponse>,
+    );
+
+    const fallback = container.querySelector("[data-math-fallback=length]");
+    expect(fallback).toHaveTextContent(tex);
+    expect(fallback?.parentElement).toHaveAttribute("data-math-inline");
+    expect(fallback?.parentElement?.className).toContain("overflow-x-auto");
+  });
+
+  it("rejects excessive TeX token complexity below the input-size cap", () => {
+    const tex = "x+".repeat(1_025);
+    const { container } = render(
+      <CompactMessageResponse>{`$${tex}$`}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(
+      container.querySelector("[data-math-fallback=tokens]"),
+    ).toHaveTextContent(tex);
+  });
+
   it("keeps KaTeX trust disabled for author-controlled commands", () => {
     const { container } = render(
       <CompactMessageResponse>
@@ -267,5 +357,30 @@ describe("@sumi/ui CompactMessageResponse", () => {
     expect(paragraph?.querySelector("[data-trailer]")).toHaveTextContent(
       "(編集済み)",
     );
+  });
+
+  it.each([
+    ["$E=mc^2$", "E=mc^2"],
+    [String.raw`$$\frac{1}{2}$$`, String.raw`\frac{1}{2}`],
+  ])("copies one TeX source instead of duplicate KaTeX text: %s", (source, tex) => {
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+    const boundary = container.querySelector("[data-compact-message-response]");
+    const math = container.querySelector(
+      "[data-math-inline], [data-math-display]",
+    );
+    const selection = window.getSelection();
+    const range = document.createRange();
+    if (!boundary || !math || !selection)
+      throw new Error("math copy fixture missing");
+    range.selectNodeContents(math);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const setData = vi.fn();
+
+    fireEvent.copy(boundary, { clipboardData: { setData } });
+
+    expect(setData).toHaveBeenCalledWith("text/plain", tex);
   });
 });

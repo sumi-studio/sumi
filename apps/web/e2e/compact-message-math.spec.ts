@@ -1,0 +1,127 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { once } from "node:events";
+import { createServer as createNetServer } from "node:net";
+import { resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { expect, test } from "@playwright/test";
+
+test("math stays locally scrollable and copies one TeX source", async ({
+  context,
+  page,
+}) => {
+  const port = await ephemeralPort();
+  const origin = `http://127.0.0.1:${port}`;
+  const harnessURL = `${origin}/harness/compact-message-math.html`;
+  const vite = startVite(port);
+  try {
+    await waitFor(harnessURL);
+    await context.grantPermissions(["clipboard-read", "clipboard-write"], {
+      origin,
+    });
+    await page.goto(harnessURL);
+    await page.waitForFunction(() => "__compactMathReady" in window);
+
+    const narrow = await page.locator("#narrow-message").evaluate((message) => {
+      const math = message.querySelector<HTMLElement>("[data-math-inline]");
+      if (!math) throw new Error("inline math wrapper missing");
+      const style = getComputedStyle(math);
+      return {
+        messageWidth: message.clientWidth,
+        clientWidth: math.clientWidth,
+        scrollWidth: math.scrollWidth,
+        overflowX: style.overflowX,
+        display: style.display,
+        verticalAlign: style.verticalAlign,
+      };
+    });
+    expect(narrow.clientWidth).toBeLessThanOrEqual(narrow.messageWidth);
+    expect(narrow.scrollWidth).toBeGreaterThan(narrow.clientWidth);
+    expect(narrow.overflowX).toBe("auto");
+    expect(narrow.display).toBe("inline-block");
+    expect(narrow.verticalAlign).toBe("baseline");
+
+    await copyFormula(page, "#copy-energy [data-math-inline]");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe("E=mc^2");
+
+    await copyFormula(page, "#copy-fraction [data-math-display]");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(String.raw`\frac{1}{2}`);
+  } finally {
+    await stop(vite);
+  }
+});
+
+async function copyFormula(
+  page: {
+    locator(selector: string): {
+      evaluate(fn: (node: HTMLElement) => boolean): Promise<boolean>;
+    };
+  },
+  selector: string,
+) {
+  const copied = await page.locator(selector).evaluate((node) => {
+    const selection = window.getSelection();
+    const range = document.createRange();
+    if (!selection) return false;
+    range.selectNodeContents(node);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return document.execCommand("copy");
+  });
+  expect(copied).toBe(true);
+}
+
+function startVite(port: number) {
+  return spawn(
+    process.execPath,
+    [
+      resolve("node_modules/vite/bin/vite.js"),
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--strictPort",
+    ],
+    { cwd: ".", stdio: ["ignore", "pipe", "pipe"] },
+  );
+}
+
+async function ephemeralPort(): Promise<number> {
+  const server = createNetServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("ephemeral port reservation did not expose a TCP address");
+  }
+  const port = address.port;
+  const closed = once(server, "close");
+  server.close();
+  await closed;
+  return port;
+}
+
+async function waitFor(url: string) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      if ((await fetch(url)).ok) return;
+    } catch {}
+    await delay(100);
+  }
+  throw new Error(`timed out waiting for ${url}`);
+}
+
+async function stop(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const gracefulExit = once(child, "exit").then(() => true);
+  child.kill("SIGTERM");
+  if (await Promise.race([gracefulExit, delay(5_000).then(() => false)])) {
+    return;
+  }
+  child.kill("SIGKILL");
+  await once(child, "exit");
+}
