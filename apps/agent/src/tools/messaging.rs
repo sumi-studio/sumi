@@ -751,16 +751,10 @@ impl MessagingTool {
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
-                let last_visible_seq = response
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|message| message.get("seq").and_then(Value::as_u64))
-                    .max();
+                let admitted_read_through_seq = contiguous_page_read_through_seq(&response);
                 state.focused_place_id = Some(place_id.clone());
                 state.visible_messages = visible_messages_from(&response);
-                if let Some(seq) = last_visible_seq {
+                if let Some(seq) = admitted_read_through_seq {
                     record_pending_read_through(state, &place_id, seq);
                     if matches!(post_commit_mode, PostCommitMode::ReturnLiveHook) {
                         live_post_commit = Some(read_through_post_commit(
@@ -1411,6 +1405,34 @@ fn visible_messages_from(response: &Value) -> Vec<VisibleMessage> {
         .unwrap_or_default()
 }
 
+/// Highest cursor this exact open page may acknowledge after its ToolResult is
+/// durably admitted. A read cursor is contiguous, so a latest-page snapshot may
+/// not jump over older messages the Agent never received. Tombstones still
+/// count because their sequence and the fact of deletion are part of the page.
+fn contiguous_page_read_through_seq(response: &Value) -> Option<u64> {
+    let last_read_seq = response.get("last_read_seq")?.as_u64()?;
+    let mut page_seqs = response
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .map(|message| message.get("seq")?.as_u64())
+        .collect::<Option<Vec<_>>>()?;
+    page_seqs.sort_unstable();
+    page_seqs.dedup();
+
+    let mut admitted_seq = last_read_seq;
+    for seq in page_seqs {
+        if seq <= admitted_seq {
+            continue;
+        }
+        if admitted_seq.checked_add(1) != Some(seq) {
+            break;
+        }
+        admitted_seq = seq;
+    }
+    (admitted_seq > last_read_seq).then_some(admitted_seq)
+}
+
 fn validate_bounded_nonempty(value: &str, max_bytes: usize) -> Result<(), ToolError> {
     if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(ToolError::InvalidArguments);
@@ -1479,6 +1501,7 @@ mod tests {
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
+        open_responses: AsyncMutex<VecDeque<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -1502,10 +1525,13 @@ mod tests {
                 .lock()
                 .await
                 .push(format!("open:{}", request.place_id));
+            if let Some(response) = self.open_responses.lock().await.pop_front() {
+                return Ok(response);
+            }
             Ok(json!({
                 "place": {"kind": "channel", "channel_id": request.place_id},
                 "latest_seq": 7,
-                "last_read_seq": 3,
+                "last_read_seq": 5,
                 "members": [],
                 "messages": [
                     {"message_id": "m6", "seq": 6, "content": "earlier", "reactions": []},
@@ -2375,6 +2401,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_open_admits_only_contiguous_pages_after_result_commit() {
+        fn page(last_read_seq: u64, first: u64, last: u64) -> Value {
+            let messages = (first..=last)
+                .map(|seq| {
+                    json!({
+                        "message_id": format!("m{seq}"),
+                        "seq": seq,
+                        "content": if seq == 3 { "" } else { "visible" },
+                        "deleted": seq == 3,
+                        "reactions": []
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "place": {"kind": "channel", "channel_id": "general"},
+                "latest_seq": 25,
+                "last_read_seq": last_read_seq,
+                "members": [],
+                "messages": messages
+            })
+        }
+
+        let api = Arc::new(FakeMessagingApi::default());
+        api.open_responses.lock().await.extend([
+            page(0, 16, 25),
+            page(0, 6, 15),
+            page(0, 1, 5),
+            page(5, 6, 15),
+            page(15, 16, 25),
+        ]);
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).expect("register Messaging");
+        let registry = builder.build();
+
+        let latest_gap = execute_bound_action(
+            &registry,
+            "latest-gap",
+            json!({"action": "open", "place_id": "general", "limit": 10}),
+        )
+        .await
+        .expect("open latest page");
+        assert_eq!(latest_gap.output.details["last_read_seq"], 0);
+        assert_eq!(latest_gap.output.details["latest_seq"], 25);
+        assert_eq!(latest_gap.output.details["messages"][0]["seq"], 16);
+        assert!(latest_gap.live_post_commit.is_none());
+        assert!(api.reads.lock().await.is_empty());
+        assert!(
+            !tool
+                .view
+                .lock()
+                .await
+                .pending_read_through
+                .contains_key("general")
+        );
+
+        let middle_gap = execute_bound_action(
+            &registry,
+            "middle-gap",
+            json!({
+                "action": "open", "place_id": "general", "before_seq": 16, "limit": 10
+            }),
+        )
+        .await
+        .expect("page backward across another gap");
+        assert!(middle_gap.live_post_commit.is_none());
+        assert!(api.reads.lock().await.is_empty());
+
+        let oldest = execute_bound_action(
+            &registry,
+            "oldest",
+            json!({
+                "action": "open", "place_id": "general", "before_seq": 6, "limit": 10
+            }),
+        )
+        .await
+        .expect("open oldest contiguous page");
+        assert!(
+            api.reads.lock().await.is_empty(),
+            "open precedes durable admission"
+        );
+        assert!(matches!(
+            oldest
+                .live_post_commit
+                .expect("1..5 is the first contiguous prefix")
+                .invoke_after_result_commit(CancellationToken::new())
+                .await,
+            LiveAppPostCommitOutcome::Applied
+        ));
+        assert_eq!(
+            api.reads.lock().await.as_slice(),
+            &[("general".to_owned(), 5)]
+        );
+
+        for (call_id, action, want_seq) in [
+            (
+                "middle-contiguous",
+                json!({
+                    "action": "open", "place_id": "general", "before_seq": 16, "limit": 10
+                }),
+                15,
+            ),
+            (
+                "latest-contiguous",
+                json!({"action": "open", "place_id": "general", "limit": 10}),
+                25,
+            ),
+        ] {
+            let outcome = execute_bound_action(&registry, call_id, action)
+                .await
+                .expect("open next contiguous page");
+            assert!(matches!(
+                outcome
+                    .live_post_commit
+                    .expect("contiguous page returns post-result maintenance")
+                    .invoke_after_result_commit(CancellationToken::new())
+                    .await,
+                LiveAppPostCommitOutcome::Applied
+            ));
+            assert_eq!(
+                api.reads.lock().await.last().map(|(_, seq)| *seq),
+                Some(want_seq)
+            );
+        }
+        assert_eq!(
+            api.reads.lock().await.as_slice(),
+            &[
+                ("general".to_owned(), 5),
+                ("general".to_owned(), 15),
+                ("general".to_owned(), 25)
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_live_read_is_deferred_without_rewriting_the_tool_result() {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
@@ -2448,6 +2609,53 @@ mod tests {
         clear_pending_read_through(&mut state, "place-a", 7);
         assert!(!state.pending_read_through.contains_key("place-a"));
         assert_eq!(state.pending_read_through.get("place-b"), Some(&4));
+    }
+
+    #[test]
+    fn read_through_candidate_stops_at_the_first_unadmitted_gap() {
+        assert_eq!(
+            contiguous_page_read_through_seq(&json!({
+                "last_read_seq": 5,
+                "messages": [
+                    {"message_id": "m6", "seq": 6},
+                    {"message_id": "m7", "seq": 7}
+                ]
+            })),
+            Some(7)
+        );
+        assert_eq!(
+            contiguous_page_read_through_seq(&json!({
+                "last_read_seq": 0,
+                "messages": [
+                    {"message_id": "m16", "seq": 16},
+                    {"message_id": "m17", "seq": 17}
+                ]
+            })),
+            None
+        );
+        assert_eq!(
+            contiguous_page_read_through_seq(&json!({
+                "last_read_seq": 0,
+                "messages": [
+                    {"message_id": "m1", "seq": 1},
+                    {"message_id": "m2", "seq": 2, "deleted": true},
+                    {"message_id": "m4", "seq": 4}
+                ]
+            })),
+            Some(2)
+        );
+        assert_eq!(
+            contiguous_page_read_through_seq(&json!({
+                "last_read_seq": 0,
+                "messages": [
+                    {"message_id": "m1", "seq": 1},
+                    {"message_id": "malformed"},
+                    {"message_id": "m2", "seq": 2}
+                ]
+            })),
+            None,
+            "an unsequenced row cannot be treated as admitted read evidence"
+        );
     }
 
     #[tokio::test]
