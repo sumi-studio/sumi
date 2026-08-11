@@ -201,6 +201,7 @@ function installation(
     owner,
     appId: "direct-chat",
     state: "enabled",
+    authorityEpoch: "1",
     installedAt: 1,
     updatedAt: 2,
   };

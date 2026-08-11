@@ -104,6 +104,7 @@ type Installation struct {
 	Owner          OwnerRef
 	AppID          string
 	State          State
+	AuthorityEpoch int64
 	InstalledAt    time.Time
 	UpdatedAt      time.Time
 }

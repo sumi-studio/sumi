@@ -2,6 +2,7 @@ import type { ApprovalDecision, BrowserEventEnvelope } from "@sumi/api-client";
 import { create } from "zustand";
 import {
   type DirectChatConnectionState,
+  type DirectChatInstallationBinding,
   type DirectChatReadyState,
   type DirectChatServerFrame,
   DirectChatSocket,
@@ -23,7 +24,7 @@ import {
 import { userMessageIdFromCommandId } from "./user-message-id";
 
 export interface DirectChatTransport {
-  bindInstallation(installationId: string): void;
+  bindInstallation(binding: DirectChatInstallationBinding): void;
   suspendInstallation(): void;
   connect(): void;
   close(): void;
@@ -47,8 +48,8 @@ export interface ConversationState {
   ready: DirectChatReadyState;
   lastError: string | null;
   recoverableDrafts: RecoverableDraft[];
-  acquireConnection: (installationId: string) => () => void;
-  suspendInstallation: (installationId: string) => boolean;
+  acquireConnection: (binding: DirectChatInstallationBinding) => () => void;
+  suspendInstallation: (binding: DirectChatInstallationBinding) => boolean;
   connect: () => void;
   disconnect: () => void;
   resumeMountedConnection: () => void;
@@ -86,7 +87,7 @@ export function createConversationStore({
   const connectionOwners = new Set<symbol>();
   let connectionGeneration = 0;
   let pendingConnectionGeneration: number | null = null;
-  let boundInstallationId: string | null = null;
+  let boundInstallation: DirectChatInstallationBinding | null = null;
   const approvalSubmissionLatches = new Set<string>();
   const undurableAdmissions = new Map<
     string,
@@ -197,13 +198,15 @@ export function createConversationStore({
       });
     };
 
-    const bindInstallation = (installationId: string): boolean => {
-      const normalized = installationId.trim();
+    const bindInstallation = (
+      binding: DirectChatInstallationBinding,
+    ): boolean => {
+      const normalized = normalizeInstallationBinding(binding);
       if (!normalized) {
         publish("Direct chat installation is unavailable");
         return false;
       }
-      if (boundInstallationId === normalized) return true;
+      if (sameInstallationBinding(boundInstallation, normalized)) return true;
 
       cancelPendingConnection();
       if (started) stopConnection();
@@ -215,7 +218,7 @@ export function createConversationStore({
       )
         return false;
       transport.bindInstallation(normalized);
-      boundInstallationId = normalized;
+      boundInstallation = normalized;
       publish(null);
       return true;
     };
@@ -252,14 +255,20 @@ export function createConversationStore({
       return false;
     };
 
-    const suspendInstallation = (installationId: string): boolean => {
-      const normalized = installationId.trim();
-      if (!normalized || boundInstallationId !== normalized) return true;
+    const suspendInstallation = (
+      binding: DirectChatInstallationBinding,
+    ): boolean => {
+      const normalized = normalizeInstallationBinding(binding);
+      if (
+        !normalized ||
+        !sameInstallationBinding(boundInstallation, normalized)
+      )
+        return true;
 
       cancelPendingConnection();
       if (started) stopConnection();
       transport.suspendInstallation();
-      boundInstallationId = null;
+      boundInstallation = null;
       approvalSubmissionLatches.clear();
       const recovered = recoverPendingCommands(
         "installation_suspended",
@@ -538,8 +547,8 @@ export function createConversationStore({
       ready,
       lastError: null,
       recoverableDrafts: outbox.recoverableDrafts(),
-      acquireConnection(installationId) {
-        if (!bindInstallation(installationId)) return () => undefined;
+      acquireConnection(binding) {
+        if (!bindInstallation(binding)) return () => undefined;
         const owner = Symbol("direct-chat-connection-owner");
         connectionOwners.add(owner);
         scheduleMountedConnection();
@@ -569,7 +578,7 @@ export function createConversationStore({
         stopConnection();
       },
       resumeMountedConnection() {
-        if (boundInstallationId !== null) scheduleMountedConnection();
+        if (boundInstallation !== null) scheduleMountedConnection();
       },
       resetAuthority() {
         cancelPendingConnection();
@@ -579,7 +588,7 @@ export function createConversationStore({
         } else {
           transport.close();
         }
-        boundInstallationId = null;
+        boundInstallation = null;
         const cleared = outbox.clear();
         privateStateQuarantined = !cleared;
         undurableAdmissions.clear();
@@ -687,6 +696,34 @@ export function createConversationStore({
 
 function commandCorrelationKey(commandId: string, commandSeq: number): string {
   return `${commandId}:${commandSeq}`;
+}
+
+const MAX_AUTHORITY_EPOCH = 9_223_372_036_854_775_807n;
+
+function normalizeInstallationBinding(
+  binding: DirectChatInstallationBinding,
+): DirectChatInstallationBinding | null {
+  const installationId = binding.installationId.trim();
+  const authorityEpoch = binding.authorityEpoch.trim();
+  if (
+    !installationId ||
+    !/^[1-9][0-9]*$/.test(authorityEpoch) ||
+    authorityEpoch.length > 19 ||
+    BigInt(authorityEpoch) > MAX_AUTHORITY_EPOCH
+  ) {
+    return null;
+  }
+  return { installationId, authorityEpoch };
+}
+
+function sameInstallationBinding(
+  left: DirectChatInstallationBinding | null,
+  right: DirectChatInstallationBinding,
+): boolean {
+  return (
+    left?.installationId === right.installationId &&
+    left.authorityEpoch === right.authorityEpoch
+  );
 }
 
 function findOptimistic(

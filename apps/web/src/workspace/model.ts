@@ -97,6 +97,7 @@ export interface AppInstallation {
   owner: AppOwnerRef;
   appId: string;
   state: AppInstallationState;
+  authorityEpoch: string;
   installedAt: number;
   updatedAt: number;
 }

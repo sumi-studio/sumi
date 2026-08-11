@@ -106,12 +106,8 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 func (h *UserCommandIngress) authorizeDirectChat(
 	ctx context.Context,
 	claims UserSessionClaims,
-	installationID string,
-	operation func() error,
+	scope directChatScope,
 ) error {
-	if operation == nil {
-		return errors.New("direct-chat authorization operation is required")
-	}
 	if h.Authorizer == nil {
 		return ErrDirectChatAuthorizationUnavailable
 	}
@@ -119,8 +115,8 @@ func (h *UserCommandIngress) authorizeDirectChat(
 		ctx,
 		claims.UserID,
 		claims.PersonalityAgentID,
-		installationID,
-		operation,
+		scope.InstallationID,
+		scope.AuthorityEpoch,
 	)
 }
 
@@ -150,9 +146,9 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
-	installationID, err := directChatInstallationID(r)
+	scope, err := directChatScopeFromRequest(r)
 	if err != nil {
-		http.Error(w, "invalid_scope", http.StatusBadRequest)
+		writeDirectChatInvalidScope(w)
 		return
 	}
 	if h.Authorizer == nil || h.LifecycleFence == nil {
@@ -165,7 +161,7 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseLifecycle()
-	if err := h.authorizeDirectChat(r.Context(), claims, installationID, func() error { return nil }); err != nil {
+	if err := h.authorizeDirectChat(r.Context(), claims, scope); err != nil {
 		if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
 			http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
 			return
@@ -223,12 +219,22 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancelOperation()
 	err = h.Sessions.AuthorizeSession(r.Context(), claims, func() error {
 		sessionLeaseEntered = true
-		return h.authorizeDirectChat(r.Context(), claims, installationID, func() error {
-			appendCalled = true
-			var appendErr error
-			env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
-			return appendErr
-		})
+		// Composite PostgreSQL authorization commits before the durable append.
+		// The surrounding process-lifetime lifecycle permit and session lease
+		// remain held across the effect, so a backend loss after authorization
+		// cannot turn an already-appended command into a failed auth commit.
+		if err := h.authorizeDirectChat(r.Context(), claims, scope); err != nil {
+			return err
+		}
+		appendCalled = true
+		var appendErr error
+		env, appendErr = h.Appender.Append(
+			operationContext,
+			directChatProvenance(claims),
+			idempotencyKey,
+			raw,
+		)
+		return appendErr
 	})
 	if err != nil {
 		if !sessionLeaseEntered ||

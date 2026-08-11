@@ -272,6 +272,7 @@ function startVite(apiURL: string) {
         VITE_SUMI_AUTH_MODE: "preissued",
         VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID:
           "0198f0f4-9b72-7000-8000-000000000051",
+        VITE_SUMI_DIRECT_CHAT_AUTHORITY_EPOCH: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },

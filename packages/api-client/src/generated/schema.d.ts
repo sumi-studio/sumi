@@ -562,11 +562,17 @@ export interface components {
         };
         /** @enum {string} */
         AppInstallationState: "enabled" | "disabled";
+        /**
+         * Format: app-installation-authority-epoch
+         * @description positive canonical decimal lifecycle authority epoch; encoded as a string to preserve it losslessly in JavaScript
+         */
+        AppInstallationAuthorityEpoch: string;
         AppInstallation: {
             installation_id: components["schemas"]["UUIDv7"];
             owner: components["schemas"]["AppOwnerRef"];
             app_id: components["schemas"]["AppId"];
             state: components["schemas"]["AppInstallationState"];
+            authority_epoch: components["schemas"]["AppInstallationAuthorityEpoch"];
             /** Format: date-time */
             installed_at: string;
             /** Format: date-time */
@@ -1959,7 +1965,12 @@ export interface operations {
     };
     createDirectChatCommand: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Exact authenticated Human-owned direct-chat installation bound by the app surface. */
+                installation_id: components["schemas"]["UUIDv7"];
+                /** @description Exact lifecycle authority epoch observed with installation_id at bind time. */
+                authority_epoch: components["schemas"]["AppInstallationAuthorityEpoch"];
+            };
             header: {
                 "Idempotency-Key": string;
             };
@@ -1981,13 +1992,14 @@ export interface operations {
                     "application/json": components["schemas"]["DirectChatCommandReceipt"];
                 };
             };
-            /** @description Command rejected before seq/command_id allocation */
+            /** @description Invalid transport scope or command rejected before seq/command_id allocation */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["DirectChatCommandRejectedResponse"];
+                    "text/plain": "invalid_scope";
                 };
             };
             /** @description Missing or invalid browser session cookie */
@@ -1997,7 +2009,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Origin not allowed */
+            /** @description Origin not allowed or exact app/Employer authority denied */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2013,11 +2025,23 @@ export interface operations {
                     "application/json": components["schemas"]["DirectChatCommandIdempotencyConflictResponse"];
                 };
             };
+            /** @description App or Employer authority store unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     browserWebSocket: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Exact authenticated Human-owned direct-chat installation bound by the app surface. */
+                installation_id: components["schemas"]["UUIDv7"];
+                /** @description Exact lifecycle authority epoch observed with installation_id at bind time. */
+                authority_epoch: components["schemas"]["AppInstallationAuthorityEpoch"];
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2038,6 +2062,15 @@ export interface operations {
                     "application/json": components["schemas"]["BrowserServerFrame"];
                 };
             };
+            /** @description Invalid transport scope before runtime spawn or WebSocket upgrade */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": "invalid_scope";
+                };
+            };
             /** @description Missing or invalid browser session cookie */
             401: {
                 headers: {
@@ -2045,8 +2078,15 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Origin not allowed */
+            /** @description Origin not allowed or exact app/Employer authority denied */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description App or Employer authority store unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

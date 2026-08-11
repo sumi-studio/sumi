@@ -271,6 +271,7 @@ type appInstallationWire struct {
 	Owner          appOwnerWire `json:"owner"`
 	AppID          string       `json:"app_id"`
 	State          string       `json:"state"`
+	AuthorityEpoch string       `json:"authority_epoch"`
 	InstalledAt    time.Time    `json:"installed_at"`
 	UpdatedAt      time.Time    `json:"updated_at"`
 }
@@ -278,7 +279,8 @@ type appInstallationWire struct {
 func installationToWire(item applicationapps.Installation) appInstallationWire {
 	return appInstallationWire{
 		InstallationID: item.InstallationID, Owner: appOwnerToWire(item.Owner),
-		AppID: item.AppID, State: string(item.State), InstalledAt: item.InstalledAt,
+		AppID: item.AppID, State: string(item.State),
+		AuthorityEpoch: strconv.FormatInt(item.AuthorityEpoch, 10), InstalledAt: item.InstalledAt,
 		UpdatedAt: item.UpdatedAt,
 	}
 }

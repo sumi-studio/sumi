@@ -131,20 +131,16 @@ type mutableDirectChatAuthorizer struct {
 	mu             sync.RWMutex
 	allowed        bool
 	installationID string
+	authorityEpoch int64
 }
 
 type coordinatedDirectChatAuthorizer struct {
-	mu           sync.Mutex
-	changed      *sync.Cond
-	current      bool
-	transferring bool
-	active       int
+	mu      sync.Mutex
+	current bool
 }
 
 func newCoordinatedDirectChatAuthorizer() *coordinatedDirectChatAuthorizer {
-	a := &coordinatedDirectChatAuthorizer{current: true}
-	a.changed = sync.NewCond(&a.mu)
-	return a
+	return &coordinatedDirectChatAuthorizer{current: true}
 }
 
 func (a *coordinatedDirectChatAuthorizer) AuthorizeDirectChat(
@@ -152,33 +148,28 @@ func (a *coordinatedDirectChatAuthorizer) AuthorizeDirectChat(
 	_ string,
 	_ string,
 	_ string,
-	operation func() error,
+	_ int64,
 ) error {
 	a.mu.Lock()
-	if !a.current || a.transferring {
-		a.mu.Unlock()
+	defer a.mu.Unlock()
+	if !a.current {
 		return errors.New("human is not the current Employer")
 	}
-	a.active++
-	a.mu.Unlock()
-
-	err := operation()
-	a.mu.Lock()
-	a.active--
-	a.changed.Broadcast()
-	a.mu.Unlock()
-	return err
+	return nil
 }
 
-func (a *coordinatedDirectChatAuthorizer) transfer(started chan<- struct{}) {
-	a.mu.Lock()
-	a.transferring = true
+func (a *coordinatedDirectChatAuthorizer) transfer(
+	fence *directchat.LifecycleFence,
+	started chan<- struct{},
+) {
 	close(started)
-	for a.active != 0 {
-		a.changed.Wait()
+	release, err := fence.AcquireMutation(context.Background())
+	if err != nil {
+		return
 	}
+	defer release()
+	a.mu.Lock()
 	a.current = false
-	a.transferring = false
 	a.mu.Unlock()
 }
 
@@ -222,20 +213,27 @@ func (a *mutableDirectChatAuthorizer) AuthorizeDirectChat(
 	_ string,
 	_ string,
 	installationID string,
-	operation func() error,
+	authorityEpoch int64,
 ) error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if !a.allowed ||
-		(a.installationID != "" && a.installationID != installationID) {
+		(a.installationID != "" && a.installationID != installationID) ||
+		(a.authorityEpoch != 0 && a.authorityEpoch != authorityEpoch) {
 		return ErrDirectChatAuthorizationDenied
 	}
-	return operation()
+	return nil
 }
 
 func (a *mutableDirectChatAuthorizer) setInstallationID(installationID string) {
 	a.mu.Lock()
 	a.installationID = installationID
+	a.mu.Unlock()
+}
+
+func (a *mutableDirectChatAuthorizer) setAuthorityEpoch(authorityEpoch int64) {
+	a.mu.Lock()
+	a.authorityEpoch = authorityEpoch
 	a.mu.Unlock()
 }
 
@@ -417,10 +415,13 @@ func TestBrowserWebSocketRequiresExactInstallationScopeAndBoundAuthorizer(t *tes
 		wantStatus int
 	}{
 		{name: "missing", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
-		{name: "empty", query: "?installation_id=", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
-		{name: "duplicate", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID, authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
-		{name: "wrong", query: "?installation_id=0198f0f4-9b72-7000-8000-000000000099", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusForbidden},
-		{name: "unbound", query: "?installation_id=" + testDirectChatInstallationID, wantStatus: http.StatusServiceUnavailable},
+		{name: "empty installation", query: "?installation_id=&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "duplicate installation", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID + "&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "missing epoch", query: "?installation_id=" + testDirectChatInstallationID, authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "duplicate epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "stale epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=2", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusForbidden},
+		{name: "wrong", query: "?installation_id=0198f0f4-9b72-7000-8000-000000000099&authority_epoch=1", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusForbidden},
+		{name: "unbound", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1", wantStatus: http.StatusServiceUnavailable},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			browser := NewBrowserServer(sessions, gateway, gateway)
@@ -446,6 +447,15 @@ func TestBrowserWebSocketRequiresExactInstallationScopeAndBoundAuthorizer(t *tes
 			defer response.Body.Close()
 			if response.StatusCode != testCase.wantStatus {
 				t.Fatalf("status=%d, want %d", response.StatusCode, testCase.wantStatus)
+			}
+			if testCase.wantStatus == http.StatusBadRequest {
+				body, err := io.ReadAll(response.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(body) != "invalid_scope" {
+					t.Fatalf("invalid scope body = %q", body)
+				}
 			}
 			if stats := browser.ConnectionStats(); stats != (BrowserConnectionStats{}) {
 				t.Fatalf("rejected scope registered connection: %+v", stats)
@@ -874,7 +884,7 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 	for _, test := range []struct {
 		name   string
 		cookie string
@@ -950,7 +960,7 @@ func TestBrowserWebSocketRejectsOriginAndAuthorityBeforeRuntimeActivity(t *testi
 		t.Fatal(err)
 	}
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 	for _, test := range []struct {
 		name       string
 		origin     string
@@ -1055,7 +1065,7 @@ func TestBrowserWebSocketRevocationWinsAdmissionBeforeSpawn(t *testing.T) {
 	}
 	result := make(chan dialResult, 1)
 	go func() {
-		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 		header := http.Header{
 			"Origin": {browserAuthTestOrigin},
 			"Cookie": {BrowserSessionCookie + "=verified-before-race"},
@@ -1136,7 +1146,7 @@ func TestBrowserWebSocketLogoutCompletesWhileSpawnerIsBlocked(t *testing.T) {
 	}
 	dialed := make(chan dialResult, 1)
 	go func() {
-		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 		header := http.Header{
 			"Origin": {browserAuthTestOrigin},
 			"Cookie": {BrowserSessionCookie + "=" + session},
@@ -1224,7 +1234,7 @@ func TestBrowserWebSocketLifecycleMutationWaitsForBoundedProvisioning(t *testing
 		dialed := make(chan dialBrowserResult, 1)
 		go func() {
 			wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) +
-				"/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+				"/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 			header := http.Header{
 				"Origin": {browserAuthTestOrigin},
 				"Cookie": {BrowserSessionCookie + "=" + session},
@@ -1445,6 +1455,101 @@ func TestBrowserWebSocketRevalidatesCurrentEmployerOnLiveBoundaries(t *testing.T
 		assertBrowserConnectionClosedBeforeFrame(t, conn)
 		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
 	})
+
+	t.Run("fast same-ID disable and re-enable cannot revive the old socket epoch", func(t *testing.T) {
+		authorizer := &mutableDirectChatAuthorizer{
+			allowed:        true,
+			installationID: testDirectChatInstallationID,
+			authorityEpoch: testDirectChatAuthorityEpoch,
+		}
+		_, server, conn := openLiveAuthorizedBrowser(
+			t,
+			authorizer,
+			nil,
+			10*time.Millisecond,
+			false,
+		)
+		authorizer.setAuthorityEpoch(testDirectChatAuthorityEpoch + 1)
+		assertBrowserConnectionClosedBeforeFrame(t, conn)
+		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+	})
+}
+
+func TestBrowserWebSocketTwoClientsCannotShareStaleSameIDAuthorityEpoch(t *testing.T) {
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	gateway := openRuntimeGateway(t)
+	sessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer := &mutableDirectChatAuthorizer{
+		allowed:        true,
+		installationID: testDirectChatInstallationID,
+		authorityEpoch: 1,
+	}
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
+	server.Authorizer = authorizer
+	server.AuthorizationPollInterval = 10 * time.Millisecond
+	server.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	})
+
+	first, response, err := dialBrowserWSWithEpoch(httpServer, cookie, 1)
+	if err != nil {
+		t.Fatalf("dial first browser epoch: status=%v err=%v", responseStatus(response), err)
+	}
+	defer first.Close()
+	if err := first.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, first, "unavailable")
+
+	// Another tab commits disable -> enable and observes epoch 2. The first
+	// socket retains epoch 1 and must close; a reconnect carrying that stale
+	// value is denied even though installation_id is unchanged.
+	authorizer.setAuthorityEpoch(2)
+	assertBrowserConnectionClosedBeforeFrame(t, first)
+	stale, response, err := dialBrowserWSWithEpoch(httpServer, cookie, 1)
+	if stale != nil {
+		_ = stale.Close()
+		t.Fatal("stale browser epoch unexpectedly reconnected")
+	}
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if err == nil || responseStatus(response) != http.StatusForbidden {
+		t.Fatalf("stale epoch admission: status=%v err=%v", responseStatus(response), err)
+	}
+
+	current, response, err := dialBrowserWSWithEpoch(httpServer, cookie, 2)
+	if err != nil {
+		t.Fatalf("dial current browser epoch: status=%v err=%v", responseStatus(response), err)
+	}
+	defer current.Close()
+	if err := current.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, current, "unavailable")
+}
+
+func responseStatus(response *http.Response) int {
+	if response == nil {
+		return 0
+	}
+	return response.StatusCode
 }
 
 func TestBrowserWebSocketEmployerTransferSerializesCommandAppend(t *testing.T) {
@@ -1458,11 +1563,13 @@ func TestBrowserWebSocketEmployerTransferSerializesCommandAppend(t *testing.T) {
 		t,
 		authorizer,
 		nil,
-		time.Hour,
+		10*time.Millisecond,
 		true,
 		appender,
 		nil,
 	)
+	fence := directchat.NewLifecycleFence()
+	server.SetLifecycleFence(fence)
 	if err := conn.WriteJSON(browserCommandFrame{
 		Type:           "command",
 		IdempotencyKey: "transfer-vs-append",
@@ -1479,7 +1586,7 @@ func TestBrowserWebSocketEmployerTransferSerializesCommandAppend(t *testing.T) {
 	transferStarted := make(chan struct{})
 	transferDone := make(chan struct{})
 	go func() {
-		authorizer.transfer(transferStarted)
+		authorizer.transfer(fence, transferStarted)
 		close(transferDone)
 	}()
 	<-transferStarted
@@ -1494,6 +1601,15 @@ func TestBrowserWebSocketEmployerTransferSerializesCommandAppend(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("command append did not complete")
 	}
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	var accepted browserCommandAcceptedFrame
+	if err := conn.ReadJSON(&accepted); err != nil {
+		t.Fatalf("read command acceptance before Employer transfer: %v", err)
+	}
+	if accepted.Type != "command_accepted" ||
+		accepted.IdempotencyKey != "transfer-vs-append" {
+		t.Fatalf("unexpected command acceptance: %+v", accepted)
+	}
 	select {
 	case <-transferDone:
 	case <-time.After(time.Second):
@@ -1501,6 +1617,122 @@ func TestBrowserWebSocketEmployerTransferSerializesCommandAppend(t *testing.T) {
 	}
 	assertBrowserConnectionClosedBeforeFrame(t, conn)
 	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+}
+
+func TestBrowserWebSocketQueuedLifecycleMutationDoesNotDeadlockCommandAcceptance(t *testing.T) {
+	appender := &blockingCommandAppender{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	_, server, conn := openLiveAuthorizedBrowserWithOptions(
+		t,
+		allowDirectChatAuthorizer{},
+		nil,
+		time.Hour,
+		true,
+		appender,
+		nil,
+	)
+	fence := directchat.NewLifecycleFence()
+	server.SetLifecycleFence(fence)
+
+	acceptanceWriteStarted := make(chan struct{})
+	releaseAcceptanceWrite := make(chan struct{})
+	var acceptanceWrite sync.Once
+	server.beforeWrite = func() {
+		acceptanceWrite.Do(func() {
+			close(acceptanceWriteStarted)
+			<-releaseAcceptanceWrite
+		})
+	}
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "queued-lifecycle-writer",
+		Command:        json.RawMessage(`{"type":"user_message","text":"one permit only","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-appender.started:
+	case <-time.After(time.Second):
+		t.Fatal("command append did not start under its lifecycle operation permit")
+	}
+
+	mutationAcquired := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		release, err := fence.AcquireMutation(context.Background())
+		if err == nil {
+			close(mutationAcquired)
+			release()
+		}
+		mutationDone <- err
+	}()
+	waitForLifecycleMutationQueue(t, fence)
+	select {
+	case <-mutationAcquired:
+		t.Fatal("lifecycle mutation crossed the blocked command effect")
+	default:
+	}
+
+	close(appender.release)
+	select {
+	case <-acceptanceWriteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("queued lifecycle writer deadlocked command acceptance")
+	}
+	select {
+	case <-mutationAcquired:
+		t.Fatal("lifecycle mutation crossed the command acceptance write")
+	default:
+	}
+	close(releaseAcceptanceWrite)
+
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	var accepted browserCommandAcceptedFrame
+	if err := conn.ReadJSON(&accepted); err != nil {
+		t.Fatalf("read command acceptance: %v", err)
+	}
+	if accepted.Type != "command_accepted" ||
+		accepted.IdempotencyKey != "queued-lifecycle-writer" {
+		t.Fatalf("unexpected command acceptance: %+v", accepted)
+	}
+	select {
+	case err := <-mutationDone:
+		if err != nil {
+			t.Fatalf("lifecycle mutation after command acceptance: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle mutation did not proceed after command acceptance")
+	}
+}
+
+// A full-capacity writer queued behind an active operation makes the weighted
+// semaphore reject following read probes until their contexts expire. This
+// proves the writer is actually between the command's outer permit and its
+// acceptance write instead of relying on scheduler timing.
+func waitForLifecycleMutationQueue(t *testing.T, fence *directchat.LifecycleFence) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		probeContext, cancelProbe := context.WithTimeout(
+			context.Background(),
+			5*time.Millisecond,
+		)
+		releaseProbe, err := fence.AcquireOperation(probeContext)
+		cancelProbe()
+		if errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("probe lifecycle writer queue: %v", err)
+		}
+		releaseProbe()
+		if time.Now().After(deadline) {
+			t.Fatal("lifecycle mutation never queued behind command operation")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestBrowserWebSocketEmployerTransferSerializesPrivateWrite(t *testing.T) {
@@ -1528,6 +1760,8 @@ func TestBrowserWebSocketEmployerTransferSerializesPrivateWrite(t *testing.T) {
 		nil,
 		beforeWrite,
 	)
+	fence := directchat.NewLifecycleFence()
+	server.SetLifecycleFence(fence)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	claims := TokenClaims{
 		TenantID:           "tenant-1",
@@ -1551,7 +1785,7 @@ func TestBrowserWebSocketEmployerTransferSerializesPrivateWrite(t *testing.T) {
 	transferStarted := make(chan struct{})
 	transferDone := make(chan struct{})
 	go func() {
-		authorizer.transfer(transferStarted)
+		authorizer.transfer(fence, transferStarted)
 		close(transferDone)
 	}()
 	<-transferStarted
@@ -1708,7 +1942,7 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 		t.Fatalf("unexpected command result: %+v", accepted)
 	}
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 	header := http.Header{
 		"Origin": {"https://web.example"},
 		"Cookie": {BrowserSessionCookie + "=" + firstSession},
@@ -2043,14 +2277,33 @@ func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want Bro
 
 func dialBrowserWS(t *testing.T, server *httptest.Server, cookie, personalityAgentID string) *websocket.Conn {
 	t.Helper()
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) +
-		"/direct-chat/ws?installation_id=" + testDirectChatInstallationID
-	header := http.Header{"Origin": {"https://web.example"}, "Cookie": {BrowserSessionCookie + "=" + cookie}}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, response, err := dialBrowserWSWithEpoch(
+		server,
+		cookie,
+		testDirectChatAuthorityEpoch,
+	)
 	if err != nil {
-		t.Fatalf("dial browser websocket: %v", err)
+		t.Fatalf("dial browser websocket: status=%v err=%v", responseStatus(response), err)
 	}
 	return conn
+}
+
+func dialBrowserWSWithEpoch(
+	server *httptest.Server,
+	cookie string,
+	authorityEpoch int64,
+) (*websocket.Conn, *http.Response, error) {
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) +
+		fmt.Sprintf(
+			"/direct-chat/ws?installation_id=%s&authority_epoch=%d",
+			testDirectChatInstallationID,
+			authorityEpoch,
+		)
+	header := http.Header{
+		"Origin": {browserAuthTestOrigin},
+		"Cookie": {BrowserSessionCookie + "=" + cookie},
+	}
+	return websocket.DefaultDialer.Dial(wsURL, header)
 }
 
 func assertBrowserEvent(t *testing.T, conn *websocket.Conn, eventType string, durable bool) {
@@ -2363,7 +2616,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
 	header := http.Header{"Origin": {"https://web.example"}, "Cookie": {BrowserSessionCookie + "=" + signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant-1", UserID: "user-1", PersonalityAgentID: personalityAgentID, Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})}}
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {

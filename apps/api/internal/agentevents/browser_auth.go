@@ -64,17 +64,19 @@ var (
 	ErrDirectChatAuthorizationUnavailable = errors.New("direct-chat authorization unavailable")
 )
 
-// DirectChatAuthorizer holds Current-Employer and the authenticated Human's
-// exact enabled participant-owned direct-chat AppInstallation authority across
-// one private operation. The installation identity is control metadata from
-// the entry surface; it never becomes command or provenance data.
+// DirectChatAuthorizer commits one Current-Employer + exact enabled
+// participant-owned direct-chat AppInstallation snapshot before a private
+// operation starts. The caller's process-lifetime lifecycle permit then holds
+// that authority ordering across the effect; PostgreSQL locks do not. The
+// installation identity and epoch are transport control metadata and never
+// become command or provenance data.
 type DirectChatAuthorizer interface {
 	AuthorizeDirectChat(
 		ctx context.Context,
 		humanID,
 		personalityAgentID,
 		installationID string,
-		operation func() error,
+		authorityEpoch int64,
 	) error
 }
 

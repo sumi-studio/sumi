@@ -663,6 +663,7 @@ describe("Workspace control store", () => {
       owner: { kind: "workspace", workspaceId: WORKSPACE_B_ID },
       appId: APP_B.appId,
       state: "disabled",
+      authorityEpoch: "1",
       installedAt: Date.parse("2026-08-10T06:11:12.345Z"),
       updatedAt: Date.parse("2026-08-10T06:12:13.456Z"),
     };
@@ -781,6 +782,7 @@ function installation(
     owner: { kind: "workspace", workspaceId },
     appId: APP_ID,
     state,
+    authorityEpoch: "1",
     installedAt: Date.parse("2026-08-10T06:07:08.901Z"),
     updatedAt: Date.parse(updatedAt),
   };

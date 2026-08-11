@@ -4,6 +4,11 @@ import type {
 } from "@sumi/api-client";
 import { secureRandomUUID } from "./random-uuid";
 
+export interface DirectChatInstallationBinding {
+  installationId: string;
+  authorityEpoch: string;
+}
+
 export type DirectChatCommand =
   | { type: "abort" }
   | { type: "user_message"; text: string; attachments: [] }
@@ -813,16 +818,21 @@ export function resolveDirectChatURL({
   apiBaseURL,
   authMode,
   installationId,
+  authorityEpoch,
   pageOrigin,
 }: {
   apiBaseURL?: string;
   authMode?: string;
   installationId: string;
+  authorityEpoch: string;
   pageOrigin?: string;
 }): URL {
   if (!pageOrigin) throw new Error("direct chat page origin is unavailable");
   if (!installationId.trim()) {
     throw new Error("direct chat installation is unavailable");
+  }
+  if (!/^[1-9][0-9]*$/.test(authorityEpoch)) {
+    throw new Error("direct chat authority epoch is unavailable");
   }
 
   const pageURL = new URL(pageOrigin);
@@ -848,6 +858,7 @@ export function resolveDirectChatURL({
 
   const url = new URL("/direct-chat/ws", apiURL);
   url.searchParams.set("installation_id", installationId);
+  url.searchParams.set("authority_epoch", authorityEpoch);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 }
@@ -861,6 +872,7 @@ export class DirectChatSocket {
   private lastEventSeq = 0;
   private admissionReady = false;
   private installationId?: string;
+  private authorityEpoch?: string;
   private readonly pending = new Map<string, DirectChatCommand>();
   private readonly listeners = new Set<Listener>();
   private readonly connectionListeners = new Set<ConnectionListener>();
@@ -871,12 +883,19 @@ export class DirectChatSocket {
    * authority transition: unaccepted transport retries are fenced, while the
    * durable event cursor remains valid for the same Human's private chat log.
    */
-  bindInstallation(installationId: string) {
-    const normalized = installationId.trim();
-    if (!normalized) throw new Error("direct chat installation is unavailable");
-    if (this.installationId === normalized) return;
+  bindInstallation(binding: DirectChatInstallationBinding) {
+    const installationId = binding.installationId.trim();
+    const authorityEpoch = binding.authorityEpoch.trim();
+    if (!installationId || !/^[1-9][0-9]*$/.test(authorityEpoch))
+      throw new Error("direct chat installation binding is unavailable");
+    if (
+      this.installationId === installationId &&
+      this.authorityEpoch === authorityEpoch
+    )
+      return;
     this.close();
-    this.installationId = normalized;
+    this.installationId = installationId;
+    this.authorityEpoch = authorityEpoch;
     this.reconnectAttempt = 0;
     this.pending.clear();
     this.setConnectionState("closed");
@@ -892,6 +911,7 @@ export class DirectChatSocket {
   suspendInstallation() {
     this.close();
     this.installationId = undefined;
+    this.authorityEpoch = undefined;
     this.reconnectAttempt = 0;
     this.pending.clear();
     this.setConnectionState("closed");
@@ -899,7 +919,7 @@ export class DirectChatSocket {
   }
 
   connect() {
-    if (!this.installationId) {
+    if (!this.installationId || !this.authorityEpoch) {
       this.setConnectionState("closed");
       this.setReadyState("unknown");
       return;
@@ -923,6 +943,7 @@ export class DirectChatSocket {
       apiBaseURL: env?.VITE_API_BASE_URL,
       authMode: env?.VITE_SUMI_AUTH_MODE,
       installationId: this.installationId,
+      authorityEpoch: this.authorityEpoch,
       pageOrigin: globalThis.location?.origin,
     });
     const socket = new WebSocket(url);
@@ -1028,6 +1049,7 @@ export class DirectChatSocket {
     this.lastEventSeq = 0;
     this.pending.clear();
     this.installationId = undefined;
+    this.authorityEpoch = undefined;
     this.setConnectionState("closed");
     this.setReadyState("unknown");
   }

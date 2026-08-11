@@ -30,8 +30,18 @@ vi.mock("../agent/store", () => ({
 }));
 
 vi.mock("../components/chat-screen", () => ({
-  ChatScreen: ({ installationId }: { installationId: string }) => (
-    <div data-testid="direct-chat" data-installation-id={installationId}>
+  ChatScreen: ({
+    installationId,
+    authorityEpoch,
+  }: {
+    installationId: string;
+    authorityEpoch: string;
+  }) => (
+    <div
+      data-testid="direct-chat"
+      data-installation-id={installationId}
+      data-authority-epoch={authorityEpoch}
+    >
       direct chat
     </div>
   ),
@@ -95,6 +105,10 @@ describe("DirectChatGate", () => {
     expect(screen.getByTestId("direct-chat")).toHaveAttribute(
       "data-installation-id",
       INSTALLATION_ID,
+    );
+    expect(screen.getByTestId("direct-chat")).toHaveAttribute(
+      "data-authority-epoch",
+      "1",
     );
     expect(screen.queryByTestId("app-rail")).not.toBeInTheDocument();
   });
@@ -166,6 +180,7 @@ function installation(state: "enabled" | "disabled"): AppInstallation {
     },
     appId: "direct-chat",
     state,
+    authorityEpoch: "1",
     installedAt: 1,
     updatedAt: 2,
   };
