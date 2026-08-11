@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +13,7 @@ import (
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -31,13 +34,26 @@ var upMigrationRe = regexp.MustCompile(`^(\d+)_[^/]+\.up\.sql$`)
 // an old database must be reset instead of guessed at or partially adopted.
 var ErrPreCutoverResetRequired = errors.New("pre-cutover Workspace schema replacement requires a database reset")
 
+var ErrMigrationChecksumMismatch = errors.New("applied migration checksum does not match embedded history")
+
 // migrationBookkeepingSchema is the durable record of applied migrations. The
 // runner owns this table; individual migration files must not create it.
 const migrationBookkeepingSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
 	version   bigint      PRIMARY KEY,
-	applied_at timestamptz NOT NULL DEFAULT now()
+	applied_at timestamptz NOT NULL DEFAULT now(),
+	checksum text        NOT NULL
 );`
+
+// migrationDB is deliberately satisfied by both pgxpool.Pool and a checked-out
+// pgxpool.Conn. Production migration work uses one checked-out connection so
+// the session-level advisory lock protects every read and write below it.
+type migrationDB interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Begin(context.Context) (pgx.Tx, error)
+}
 
 type pendingMigration struct {
 	version int
@@ -49,26 +65,46 @@ type pendingMigration struct {
 // schema_migrations. It is idempotent: re-running against an up-to-date database
 // is a no-op. A session-level advisory lock serializes concurrent runners.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID); err != nil {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
 	defer func() {
-		_, _ = pool.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
+		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
 	}()
 
-	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {
+	if _, err := conn.Exec(ctx, migrationBookkeepingSchema); err != nil {
 		return fmt.Errorf("ensure schema_migrations table: %w", err)
 	}
-	if err := rejectLegacyWorkspaceMigration(ctx, pool); err != nil {
-		return err
+	// Pre-checksum development databases have the table but not the column.
+	// Adding it is safe; the intentionally replaced version 0008 is rejected
+	// below when its checksum is absent instead of being silently adopted.
+	if _, err := conn.Exec(ctx,
+		"ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text"); err != nil {
+		return fmt.Errorf("ensure migration checksum column: %w", err)
 	}
 
-	pending, err := pendingMigrations(ctx, pool)
+	pending, err := pendingMigrations(ctx, conn)
 	if err != nil {
 		return err
 	}
+	// Once the exact embedded prefix has been proven, make the invariant a DB
+	// constraint. A pre-checksum database with any applied row is rejected above
+	// rather than retroactively blessing unverifiable history.
+	if _, err := conn.Exec(ctx,
+		"ALTER TABLE schema_migrations ALTER COLUMN checksum SET NOT NULL"); err != nil {
+		return fmt.Errorf("require migration checksums: %w", err)
+	}
+	if err := rejectLegacyWorkspaceMigration(ctx, conn); err != nil {
+		return err
+	}
 	for _, m := range pending {
-		if err := applyMigration(ctx, pool, m); err != nil {
+		if err := applyMigration(ctx, conn, m); err != nil {
 			return err
 		}
 	}
@@ -80,11 +116,27 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 // identity, so a database that recorded either the legacy Messaging schema or
 // an earlier draft of Workspace core would otherwise skip the replacement.
 // This is deliberately a reset guard, not a compatibility/backfill path.
-func rejectLegacyWorkspaceMigration(ctx context.Context, pool *pgxpool.Pool) error {
+func rejectLegacyWorkspaceMigration(ctx context.Context, db migrationDB) error {
+	migrations, err := embeddedUpMigrations()
+	if err != nil {
+		return err
+	}
+	var expectedChecksum string
+	for _, migration := range migrations {
+		if migration.version == 8 {
+			expectedChecksum = migrationChecksum(migration.content)
+			break
+		}
+	}
+	if expectedChecksum == "" {
+		return errors.New("embedded Workspace migration 0008 is missing")
+	}
 	var versionApplied, currentFingerprint bool
-	err := pool.QueryRow(ctx, `
+	var recordedChecksum *string
+	err = db.QueryRow(ctx, `
 		SELECT
 			EXISTS (SELECT 1 FROM schema_migrations WHERE version = 8),
+			(SELECT checksum FROM schema_migrations WHERE version = 8),
 			EXISTS (
 				SELECT 1
 				FROM information_schema.columns
@@ -95,17 +147,17 @@ func rejectLegacyWorkspaceMigration(ctx context.Context, pool *pgxpool.Pool) err
 			AND to_regclass(current_schema() || '.app_catalog') IS NOT NULL
 			AND to_regclass(current_schema() || '.app_workspace_role_capabilities') IS NOT NULL
 			AND to_regclass(current_schema() || '.workspace_role_app_capability_grants') IS NOT NULL
-	`).Scan(&versionApplied, &currentFingerprint)
+	`).Scan(&versionApplied, &recordedChecksum, &currentFingerprint)
 	if err != nil {
 		return fmt.Errorf("inspect pre-cutover Workspace migration boundary: %w", err)
 	}
-	if versionApplied && !currentFingerprint {
+	if versionApplied && (recordedChecksum == nil || *recordedChecksum != expectedChecksum || !currentFingerprint) {
 		return fmt.Errorf("%w: recorded migration 0008 does not match the current Workspace foundation; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired)
 	}
 	return nil
 }
 
-func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]pendingMigration, error) {
+func pendingMigrations(ctx context.Context, db migrationDB) ([]pendingMigration, error) {
 	embedded, err := embeddedUpMigrations()
 	if err != nil {
 		return nil, err
@@ -113,35 +165,41 @@ func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]pendingMigrat
 	if len(embedded) == 0 {
 		return nil, nil
 	}
-	rows, err := pool.Query(ctx, "SELECT version FROM schema_migrations")
+	rows, err := db.Query(ctx, "SELECT version, checksum FROM schema_migrations ORDER BY version")
 	if err != nil {
 		return nil, fmt.Errorf("read applied migrations: %w", err)
 	}
 	defer rows.Close()
-	applied := make(map[int]bool, len(embedded))
+	appliedCount := 0
 	for rows.Next() {
 		var version int
-		if err := rows.Scan(&version); err != nil {
+		var checksum *string
+		if err := rows.Scan(&version, &checksum); err != nil {
 			return nil, fmt.Errorf("scan applied version: %w", err)
 		}
-		applied[version] = true
+		if appliedCount >= len(embedded) {
+			return nil, fmt.Errorf("%w: applied migration %04d is not present in embedded history; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, version)
+		}
+		expected := embedded[appliedCount]
+		if version != expected.version {
+			return nil, fmt.Errorf("%w: applied history is not the embedded prefix at position %d (found %04d, expected %04d); reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, appliedCount+1, version, expected.version)
+		}
+		if checksum == nil {
+			return nil, fmt.Errorf("%w: migration %04d has no verifiable checksum; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, version)
+		}
+		if *checksum != migrationChecksum(expected.content) {
+			return nil, fmt.Errorf("%w: %w: version %04d; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, ErrMigrationChecksumMismatch, version)
+		}
+		appliedCount++
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate applied migrations: %w", err)
 	}
-	pending := make([]pendingMigration, 0, len(embedded))
-	for _, m := range embedded {
-		if applied[m.version] {
-			continue
-		}
-		pending = append(pending, m)
-	}
-	sort.Slice(pending, func(i, j int) bool { return pending[i].version < pending[j].version })
-	return pending, nil
+	return embedded[appliedCount:], nil
 }
 
-func applyMigration(ctx context.Context, pool *pgxpool.Pool, m pendingMigration) error {
-	tx, err := pool.Begin(ctx)
+func applyMigration(ctx context.Context, db migrationDB, m pendingMigration) error {
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin migration %d: %w", m.version, err)
 	}
@@ -149,13 +207,20 @@ func applyMigration(ctx context.Context, pool *pgxpool.Pool, m pendingMigration)
 	if _, err := tx.Exec(ctx, m.content); err != nil {
 		return fmt.Errorf("apply migration %d (%s): %w", m.version, m.name, err)
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", m.version); err != nil {
+	if _, err := tx.Exec(ctx,
+		"INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)",
+		m.version, migrationChecksum(m.content)); err != nil {
 		return fmt.Errorf("record migration %d: %w", m.version, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit migration %d: %w", m.version, err)
 	}
 	return nil
+}
+
+func migrationChecksum(content string) string {
+	digest := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(digest[:])
 }
 
 // embeddedUpMigrations reads the embedded migrations directory and returns the

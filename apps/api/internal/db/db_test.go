@@ -56,6 +56,28 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 	if first == 0 {
 		t.Fatal("expected non-zero latest version after migrate")
 	}
+	var missingChecksums int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM schema_migrations WHERE checksum IS NULL OR length(checksum) <> 64",
+	).Scan(&missingChecksums); err != nil {
+		t.Fatal(err)
+	}
+	if missingChecksums != 0 {
+		t.Fatalf("fresh migration history has %d missing checksums", missingChecksums)
+	}
+	var checksumNullable string
+	if err := pool.QueryRow(ctx, `
+		SELECT is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = 'schema_migrations'
+		  AND column_name = 'checksum'
+	`).Scan(&checksumNullable); err != nil {
+		t.Fatal(err)
+	}
+	if checksumNullable != "NO" {
+		t.Fatalf("schema_migrations.checksum remains nullable: %s", checksumNullable)
+	}
 	// Second run must be a no-op and not error.
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("second migrate: %v", err)
@@ -196,6 +218,83 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 	}
 }
 
+func TestMigrateRejectsChangedAppliedMigrationChecksum(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE schema_migrations SET checksum = repeat('0', 64) WHERE version = 16"); err != nil {
+		t.Fatal(err)
+	}
+	err := Migrate(ctx, pool)
+	if !errors.Is(err, ErrMigrationChecksumMismatch) {
+		t.Fatalf("changed migration error = %v", err)
+	}
+	if !errors.Is(err, ErrPreCutoverResetRequired) {
+		t.Fatalf("changed migration error is not reset-required: %v", err)
+	}
+}
+
+func TestMigrateRejectsUnverifiableAppliedMigration(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 7)
+	if _, err := pool.Exec(ctx, `
+		ALTER TABLE schema_migrations ALTER COLUMN checksum DROP NOT NULL;
+		UPDATE schema_migrations SET checksum = NULL WHERE version = 7
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Migrate(ctx, pool)
+	if !errors.Is(err, ErrPreCutoverResetRequired) {
+		t.Fatalf("unverifiable history error = %v, want reset-required", err)
+	}
+	var versionEight bool
+	if err := pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 8)",
+	).Scan(&versionEight); err != nil {
+		t.Fatal(err)
+	}
+	if versionEight {
+		t.Fatal("unverifiable database advanced past its applied history")
+	}
+}
+
+func TestMigrateRejectsAppliedHistoryThatIsNotEmbeddedPrefix(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM schema_migrations WHERE version = 8"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Migrate(ctx, pool)
+	if !errors.Is(err, ErrPreCutoverResetRequired) {
+		t.Fatalf("non-prefix history error = %v, want reset-required", err)
+	}
+}
+
+func TestMigrateUsesOneConnectionForSessionLockAndMigrationWork(t *testing.T) {
+	pool := testdb.CreateWithMaxConns(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate with one available connection: %v", err)
+	}
+	if pool.Stat().TotalConns() != 1 {
+		t.Fatalf("migration opened %d connections, want exactly one", pool.Stat().TotalConns())
+	}
+}
+
 func TestMigrateRejectsLegacyVersionEightWithResetRequiredError(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -205,6 +304,7 @@ func TestMigrateRejectsLegacyVersionEightWithResetRequiredError(t *testing.T) {
 	// This is the identifying shape of the replaced 0008 migration: it owns
 	// places, but its workspaces table has no distinguished owner membership.
 	if _, err := pool.Exec(ctx, `
+		ALTER TABLE schema_migrations ALTER COLUMN checksum DROP NOT NULL;
 		CREATE TABLE workspaces (
 			workspace_id uuidv7 PRIMARY KEY,
 			name text NOT NULL,

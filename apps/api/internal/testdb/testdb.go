@@ -22,6 +22,13 @@ import (
 // database. It skips the test when SUMI_TEST_DB_URL is unset. The temporary
 // database is dropped on test cleanup. The caller must apply migrations.
 func Create(t *testing.T) *pgxpool.Pool {
+	return CreateWithMaxConns(t, 10)
+}
+
+// CreateWithMaxConns is Create with an explicit pool size. It exists for
+// integration tests that need to prove behavior at a particular connection
+// boundary, such as session-level advisory locking.
+func CreateWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
 	t.Helper()
 	databaseURL := strings.TrimSpace(os.Getenv("SUMI_TEST_DB_URL"))
 	if databaseURL == "" {
@@ -53,7 +60,7 @@ func Create(t *testing.T) *pgxpool.Pool {
 	// Match db.Open instead of inheriting pgxpool's CPU-dependent default.
 	// Concurrency tests exercise the production pool contract and may
 	// deliberately hold more than four connections at once.
-	config.MaxConns = 10
+	config.MaxConns = maxConns
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		_, _ = maintenance.Exec(context.Background(), fmt.Sprintf(`DROP DATABASE IF EXISTS "%s" WITH (FORCE)`, testDBName))
