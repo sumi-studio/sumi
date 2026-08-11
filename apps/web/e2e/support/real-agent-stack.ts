@@ -28,6 +28,8 @@ export const firstProviderResponse = "real-agent-turn-one";
 export const secondProviderResponse = "real-agent-turn-two-context-ok";
 
 const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001";
+const realAgentHumanID = "0198f0f4-9b72-7000-8000-000000000002";
+const directChatInstallationID = "0198f0f4-9b72-7000-8000-000000000051";
 const workspaceBrowserHumanID = "0198f0f4-9b72-7000-8000-00000000e2e0";
 const generation = "7";
 
@@ -515,13 +517,19 @@ export async function buildRealAgentStack(): Promise<RealAgentBuild> {
       runCommand(
         "build Go API server",
         "go",
-        ["build", "-o", apiServer, "./cmd/server"],
+        ["build", "-buildvcs=false", "-o", apiServer, "./cmd/server"],
         { cwd: apiDirectory, timeoutMilliseconds: 180_000 },
       ),
       runCommand(
         "build Go session issuer",
         "go",
-        ["build", "-o", sessionIssuer, "./cmd/e2e-session-cookie"],
+        [
+          "build",
+          "-buildvcs=false",
+          "-o",
+          sessionIssuer,
+          "./cmd/e2e-session-cookie",
+        ],
         { cwd: apiDirectory, timeoutMilliseconds: 180_000 },
       ),
       runCommand(
@@ -546,11 +554,15 @@ export async function removeRealAgentBuild(
 
 export async function startRealAgentStack(
   build: RealAgentBuild,
+  databaseURL: string,
 ): Promise<RealAgentStack> {
+  if (!databaseURL.trim()) {
+    throw new Error("a disposable empty Postgres database URL is required");
+  }
   const maxAddressBindAttempts = 3;
   for (let attempt = 1; attempt <= maxAddressBindAttempts; attempt++) {
     try {
-      return await startRealAgentStackOnce(build);
+      return await startRealAgentStackOnce(build, databaseURL);
     } catch (error) {
       if (
         error instanceof StartupCleanupError ||
@@ -566,6 +578,7 @@ export async function startRealAgentStack(
 
 async function startRealAgentStackOnce(
   build: RealAgentBuild,
+  databaseURL: string,
 ): Promise<RealAgentStack> {
   const runtimeDirectory = await secureTempDirectory(
     "sumi-real-agent-runtime-",
@@ -588,6 +601,13 @@ async function startRealAgentStackOnce(
     );
     await Promise.all(Object.values(paths).map((path) => chmod(path, 0o700)));
 
+    const executorServerUID = process.getuid?.();
+    if (executorServerUID === undefined || executorServerUID === 0) {
+      throw new Error(
+        "the real-agent fixture requires a non-root Unix UID for its executor",
+      );
+    }
+
     const [publicPort, localControlPort, webPort] = await Promise.all([
       ephemeralPort(),
       ephemeralPort(),
@@ -600,7 +620,7 @@ async function startRealAgentStackOnce(
     const browserSessionSecret = randomBytes(48).toString("base64");
     const localControlBearer = randomToken();
     const tenantID = `real-agent-e2e-${randomIdentifier()}`;
-    const userID = `real-agent-user-${randomIdentifier()}`;
+    const userID = realAgentHumanID;
     const rpcNonce = `rpc-${randomIdentifier()}`;
     const leaseID = `lease-${randomIdentifier()}`;
     const fenceID = `fence-${randomIdentifier()}`;
@@ -614,7 +634,9 @@ async function startRealAgentStackOnce(
       providerApiKey,
       wrappingKey,
       approvalDigestKey,
+      databaseURL,
     ];
+    const baseEnvironment = environmentWithoutSumiConfiguration();
     const commonIdentityEnvironment = {
       SUMI_PERSONALITY_AGENT_ID: personalityAgentID,
       SUMI_RPC_GENERATION: generation,
@@ -623,39 +645,10 @@ async function startRealAgentStackOnce(
 
     await provider.start();
 
-    const sessionCookie = (
-      await runCommand(
-        "issue production browser session",
-        build.sessionIssuer,
-        [],
-        {
-          cwd: apiDirectory,
-          env: {
-            ...process.env,
-            SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
-            SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
-            SUMI_E2E_SESSION_TENANT_ID: tenantID,
-            SUMI_E2E_SESSION_USER_ID: userID,
-            SUMI_E2E_SESSION_PERSONALITY_AGENT_ID: personalityAgentID,
-          },
-          redactions,
-          timeoutMilliseconds: 15_000,
-        },
-      )
-    ).trim();
-    if (
-      sessionCookie.length === 0 ||
-      sessionCookie.length > 4_096 ||
-      /\s/.test(sessionCookie)
-    ) {
-      throw new Error("session issuer returned an invalid opaque cookie");
-    }
-    redactions.push(sessionCookie);
-
     const api = ManagedProcess.start("Go production API", build.apiServer, [], {
       cwd: apiDirectory,
       env: {
-        ...process.env,
+        ...baseEnvironment,
         PORT: String(publicPort),
         SUMI_PUBLIC_LOOPBACK_LISTEN: `127.0.0.1:${publicPort}`,
         SUMI_COMMAND_LOG_DIR: paths.commandLog,
@@ -664,6 +657,7 @@ async function startRealAgentStackOnce(
         SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
         SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
         SUMI_BROWSER_WS_ALLOWED_ORIGINS: webURL,
+        SUMI_DB_URL: databaseURL,
         SUMI_LOCAL_CONTROL_ENABLED: "1",
         SUMI_LOCAL_CONTROL_BEARER: localControlBearer,
         SUMI_LOCAL_CONTROL_TENANT_ID: tenantID,
@@ -681,6 +675,39 @@ async function startRealAgentStackOnce(
     await delay(100);
     api.assertRunning();
 
+    const sessionCookie = (
+      await runCommand(
+        "provision Direct Chat authority and issue production browser session",
+        build.sessionIssuer,
+        [],
+        {
+          cwd: apiDirectory,
+          env: {
+            ...baseEnvironment,
+            SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
+            SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
+            SUMI_E2E_SESSION_TENANT_ID: tenantID,
+            SUMI_E2E_SESSION_USER_ID: userID,
+            SUMI_E2E_SESSION_PERSONALITY_AGENT_ID: personalityAgentID,
+            SUMI_E2E_SESSION_DATABASE_URL: databaseURL,
+            SUMI_E2E_SESSION_DISPLAY_NAME: "Direct Chat E2E Human",
+            SUMI_E2E_SESSION_DIRECT_CHAT_INSTALLATION_ID:
+              directChatInstallationID,
+          },
+          redactions,
+          timeoutMilliseconds: 15_000,
+        },
+      )
+    ).trim();
+    if (
+      sessionCookie.length === 0 ||
+      sessionCookie.length > 4_096 ||
+      /\s/.test(sessionCookie)
+    ) {
+      throw new Error("session issuer returned an invalid opaque cookie");
+    }
+    redactions.push(sessionCookie);
+
     const executor = ManagedProcess.start(
       "Rust tool executor",
       build.agent,
@@ -688,7 +715,7 @@ async function startRealAgentStackOnce(
       {
         cwd: agentDirectory,
         env: {
-          ...process.env,
+          ...baseEnvironment,
           ...commonIdentityEnvironment,
           SUMI_WORKSPACE: paths.workspace,
           SUMI_EXECUTOR_SOCKET: executorSocket,
@@ -707,13 +734,14 @@ async function startRealAgentStackOnce(
       {
         cwd: agentDirectory,
         env: {
-          ...process.env,
+          ...baseEnvironment,
           ...commonIdentityEnvironment,
           SUMI_PROCESS_GENERATION_LEASE_ID: leaseID,
           SUMI_GENERATION_RECOVERY_FENCE_ID: fenceID,
           SUMI_STATE_DIR: paths.agentState,
           SUMI_WORKSPACE: paths.workspace,
           SUMI_EXECUTOR_SOCKET: executorSocket,
+          SUMI_EXECUTOR_SERVER_UID: String(executorServerUID),
           SUMI_GATEWAY_URL: `ws://127.0.0.1:${publicPort}/agent/ws`,
           SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: "true",
           SUMI_LOCAL_CONTROL_URL: localControlURL,
@@ -751,11 +779,11 @@ async function startRealAgentStackOnce(
       {
         cwd: webDirectory,
         env: {
-          ...process.env,
+          ...baseEnvironment,
           VITE_API_BASE_URL: apiURL,
           VITE_SUMI_AUTH_MODE: "preissued",
-          VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID:
-            "0198f0f4-9b72-7000-8000-000000000051",
+          VITE_SUMI_PREISSUED_USER_ID: userID,
+          VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID: directChatInstallationID,
           VITE_SUMI_DIRECT_CHAT_AUTHORITY_EPOCH: "1",
         },
         redactions,
