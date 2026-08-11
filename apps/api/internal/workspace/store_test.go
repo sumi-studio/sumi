@@ -177,14 +177,87 @@ func TestWorkspaceExistenceHidingAndOwnerProtection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	member, err := w.store.RedeemInvite(ctx, invite.Code, w.humanB)
+	_, err = w.store.RedeemInvite(ctx, invite.Code, w.humanB)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Direct SQL still cannot select an inactive or foreign tenure as owner.
 	if _, err := w.pool.Exec(ctx, `
 		UPDATE workspaces SET owner_workspace_member_id = $2
-		WHERE workspace_id = $1`, created.WorkspaceID, member.WorkspaceMemberID); err == nil {
-		t.Fatal("database allowed owner transfer without a defined operation")
+		WHERE workspace_id = $1`, created.WorkspaceID,
+		"0198f0f4-9b72-7000-8000-000000000299"); err == nil {
+		t.Fatal("database allowed an unknown owner membership")
+	}
+}
+
+func TestWorkspaceOwnershipTransferBindsExactActiveTenure(t *testing.T) {
+	w := newTestWorld(t)
+	ctx := context.Background()
+	created, err := w.store.CreateWorkspace(ctx, "handoff", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admit := func(ref participant.Ref) Membership {
+		t.Helper()
+		invite, err := w.store.CreateInvite(ctx, created.WorkspaceID, w.humanA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		membership, err := w.store.RedeemInvite(ctx, invite.Code, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return membership
+	}
+	humanB := admit(w.humanB)
+	agentA := admit(w.agentA)
+
+	if _, err := w.store.TransferOwnership(ctx, created.WorkspaceID,
+		humanB.WorkspaceMemberID, w.humanB); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("non-owner transfer error = %v", err)
+	}
+	transferred, err := w.store.TransferOwnership(ctx, created.WorkspaceID,
+		agentA.WorkspaceMemberID, w.humanA)
+	if err != nil {
+		t.Fatalf("transfer to PersonalityAgent: %v", err)
+	}
+	if transferred.OwnerWorkspaceMemberID != agentA.WorkspaceMemberID {
+		t.Fatalf("transferred Workspace = %#v", transferred)
+	}
+	members, err := w.store.Members(ctx, created.WorkspaceID, w.agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners := 0
+	for _, membership := range members {
+		if membership.Owner {
+			owners++
+			if membership.WorkspaceMemberID != agentA.WorkspaceMemberID {
+				t.Fatalf("owner membership = %#v", membership)
+			}
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("owner count = %d", owners)
+	}
+	if err := w.store.Leave(ctx, created.WorkspaceID, w.agentA); !errors.Is(err, ErrOwnerProtected) {
+		t.Fatalf("new owner Leave error = %v", err)
+	}
+	if err := w.store.Leave(ctx, created.WorkspaceID, w.humanA); err != nil {
+		t.Fatalf("former owner Leave: %v", err)
+	}
+	if _, err := w.store.TransferOwnership(ctx, created.WorkspaceID,
+		created.OwnerWorkspaceMemberID, w.agentA); !errors.Is(err, ErrMemberNotFound) {
+		t.Fatalf("closed former tenure transfer error = %v", err)
+	}
+
+	other, err := w.store.CreateWorkspace(ctx, "other", w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.TransferOwnership(ctx, created.WorkspaceID,
+		other.OwnerWorkspaceMemberID, w.agentA); !errors.Is(err, ErrMemberNotFound) {
+		t.Fatalf("foreign tenure transfer error = %v", err)
 	}
 }
 
