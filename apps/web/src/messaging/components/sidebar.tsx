@@ -543,8 +543,10 @@ function SectionHeader({
 
 export function Sidebar({
   selectedPlaceKey,
+  workspaceId,
 }: {
   selectedPlaceKey: PlaceKey | null;
+  workspaceId: string | null;
 }) {
   const workspaces = useMessaging((state) => state.workspaces);
   const channels = useMessaging((state) => state.channels);
@@ -575,11 +577,17 @@ export function Sidebar({
     activePlace?.kind === "channel"
       ? channels.find((channel) => channel.channelId === activePlace.channelId)
       : undefined;
-  const activeWorkspace = activeChannel
+  const channelWorkspace = activeChannel
     ? workspaces.find(
         (workspace) => workspace.workspaceId === activeChannel.workspaceId,
       )
     : undefined;
+  const activeWorkspace =
+    channelWorkspace?.workspaceId === workspaceId
+      ? channelWorkspace
+      : selectedPlaceKey === null
+        ? workspaces.find((workspace) => workspace.workspaceId === workspaceId)
+        : undefined;
   const selectedWorkspaceId = activeWorkspace?.workspaceId ?? null;
   const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
   selectedWorkspaceIdRef.current = selectedWorkspaceId;

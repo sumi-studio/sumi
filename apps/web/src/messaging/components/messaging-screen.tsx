@@ -560,7 +560,10 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
         activeAppId="messaging"
         workspaceId={getMessagingScope()?.workspaceId}
       />
-      <Sidebar selectedPlaceKey={selectedPlaceKey} />
+      <Sidebar
+        selectedPlaceKey={selectedPlaceKey}
+        workspaceId={getMessagingScope()?.workspaceId ?? null}
+      />
       {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
           開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
       <div className="flex min-w-0 flex-1 flex-col">

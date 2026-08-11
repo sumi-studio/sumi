@@ -9,7 +9,7 @@ import {
   SUMI_DEV_PORT,
 } from "../vite.config.ts";
 
-test("the supported dev origin proxies auth, direct chat, and messaging", () => {
+test("the supported dev origin proxies every same-origin app API surface", () => {
   const server = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
   assert.equal(SUMI_DEV_ORIGIN, "http://127.0.0.1:5173");
   assert.equal(SUMI_DEV_HOST, "127.0.0.1");
@@ -19,13 +19,25 @@ test("the supported dev origin proxies auth, direct chat, and messaging", () => 
   const auth = server.proxy?.["/auth"];
   const directChat = server.proxy?.["/direct-chat"];
   const messaging = server.proxy?.["/messaging"];
+  const workspace = server.proxy?.["/workspaces"];
+  const workspaceInvites = server.proxy?.["/workspace-invites"];
+  const apps = server.proxy?.["/apps"];
+  const appInstallations = server.proxy?.["/app-installations"];
   assert.equal(typeof auth, "object");
   assert.equal(typeof directChat, "object");
   assert.equal(typeof messaging, "object");
+  assert.equal(typeof workspace, "object");
+  assert.equal(typeof workspaceInvites, "object");
+  assert.equal(typeof apps, "object");
+  assert.equal(typeof appInstallations, "object");
   if (
     typeof auth !== "object" ||
     typeof directChat !== "object" ||
-    typeof messaging !== "object"
+    typeof messaging !== "object" ||
+    typeof workspace !== "object" ||
+    typeof workspaceInvites !== "object" ||
+    typeof apps !== "object" ||
+    typeof appInstallations !== "object"
   )
     return;
   assert.deepEqual(auth, {
@@ -42,6 +54,12 @@ test("the supported dev origin proxies auth, direct chat, and messaging", () => 
     changeOrigin: false,
     ws: true,
   });
+  for (const proxy of [workspace, workspaceInvites, apps, appInstallations]) {
+    assert.deepEqual(proxy, {
+      target: SUMI_DEV_API_ORIGIN,
+      changeOrigin: false,
+    });
+  }
 });
 
 test("the proxy target accepts only literal IPv4 or the exact Compose service", () => {

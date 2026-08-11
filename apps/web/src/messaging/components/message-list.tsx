@@ -14,7 +14,7 @@ import {
 } from "../../components/conversation-virtualizer";
 import { type Message, participantKey } from "../model";
 import { placePath } from "../place-route";
-import { useMessaging } from "../store";
+import { getMessagingScope, useMessaging } from "../store";
 import { buildRows, type PendingMessage, type TimelineRow } from "../timeline";
 import { MessageItem } from "./message-item";
 
@@ -267,8 +267,9 @@ export function MessageList({
 
   const copyLink = useCallback(
     (message: Message) => {
-      if (!activePlaceKey) return;
-      const url = `${window.location.origin}${placePath(activePlaceKey)}?m=${message.seq}`;
+      const workspaceId = getMessagingScope()?.workspaceId;
+      if (!activePlaceKey || !workspaceId) return;
+      const url = `${window.location.origin}${placePath(workspaceId, activePlaceKey)}?m=${message.seq}`;
       void navigator.clipboard.writeText(url);
     },
     [activePlaceKey],
