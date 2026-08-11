@@ -1,11 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { AuthGate } from "../auth/auth-gate";
-import { MessagingScreen } from "../messaging/components/messaging-screen";
+import { WorkspaceLanding } from "../workspace/components/workspace-landing";
 
-/**
- * ルートは特定のWorkspaceやplaceを推測しないホーム。現在地があるときは
- * URL（/c/:id、/dm/:id）が正本になり、ここでは明示的な選択を待つ。
- */
+/** Side-effect-free control-plane entry. Messaging is not initialized here. */
 export const Route = createFileRoute("/")({
   component: HomeRoute,
 });
@@ -13,7 +10,7 @@ export const Route = createFileRoute("/")({
 export function HomeRoute() {
   return (
     <AuthGate>
-      <MessagingScreen />
+      <WorkspaceLanding />
     </AuthGate>
   );
 }

@@ -36,6 +36,13 @@ import {
   presentationFor,
   presentDesktopNotification,
 } from "./notifications";
+import {
+  getActiveMessagingScope,
+  type MessagingScope,
+  sameMessagingScope,
+  setActiveMessagingScope,
+  validateMessagingScope,
+} from "./scope";
 import type { PendingMessage } from "./timeline";
 import { mergeMessages, upsertMessage } from "./timeline";
 
@@ -54,11 +61,34 @@ function reactionsFingerprint(reactions: readonly ReactionSummary[]): string {
     .join("|");
 }
 
-let backend: MessagingBackend = new ApiMessagingBackend();
+const UNBOUND_CAPABILITIES: MessagingCapabilities = {
+  status: false,
+  replyLater: false,
+  reactions: false,
+  notifications: false,
+};
+
+function unboundMessagingBackend(): MessagingBackend {
+  const target = {
+    capabilities: UNBOUND_CAPABILITIES,
+    dispose() {},
+  } as Partial<MessagingBackend>;
+  return new Proxy(target as MessagingBackend, {
+    get(value, property, receiver) {
+      if (property in value) return Reflect.get(value, property, receiver);
+      return () => {
+        throw new Error("Messaging scope is not bound");
+      };
+    },
+  });
+}
+
+let backend: MessagingBackend = unboundMessagingBackend();
 
 /** Tests and explicit development harnesses may replace the transport before init. */
 export function installMessagingBackend(override: MessagingBackend): void {
   if (initialized) throw new Error("Messaging backend is already initialized");
+  backend.dispose();
   backend = override;
 }
 
@@ -1571,6 +1601,10 @@ export function getMessagingSessionIdentity(): string | null {
   return messagingSessionIdentity;
 }
 
+export function getMessagingScope(): MessagingScope | null {
+  return getActiveMessagingScope();
+}
+
 /**
  * Re-read authoritative presentation profiles after a canonical Human rename.
  * A rename may also change contextual agent labels (for example `Sumi（たっけ）`),
@@ -1603,10 +1637,32 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  setActiveMessagingScope(null);
+  resetMessagingRuntime(unboundMessagingBackend());
+}
+
+/**
+ * Binds Messaging to one exact Workspace installation. A scope switch replaces
+ * the transport and all private projections synchronously before React can
+ * expose the next Workspace subtree.
+ */
+export function bindMessagingScope(scope: MessagingScope | null): void {
+  if (scope !== null && messagingSessionIdentity === null) {
+    throw new Error("Messaging scope requires an authenticated Human");
+  }
+  const exact = scope === null ? null : validateMessagingScope(scope);
+  if (sameMessagingScope(getActiveMessagingScope(), exact)) return;
+  setActiveMessagingScope(exact);
+  resetMessagingRuntime(
+    exact === null ? unboundMessagingBackend() : new ApiMessagingBackend(exact),
+  );
+}
+
+function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
   reactionProjectionByPlace.clear();
   backend.dispose();
-  backend = new ApiMessagingBackend();
+  backend = nextBackend;
   initialized = false;
   presenceResyncGeneration += 1;
   pendingPresenceResync = null;

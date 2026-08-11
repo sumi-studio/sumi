@@ -4,6 +4,10 @@ import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
 } from "../messaging/store";
+import {
+  bindWorkspaceSessionIdentity,
+  getWorkspaceSessionIdentity,
+} from "../workspace/store";
 import { useAuth } from "./auth-context";
 import { LoginScreen } from "./login-screen";
 
@@ -17,11 +21,14 @@ export function AuthGate({ children }: { children: ReactNode }) {
     user,
   } = useAuth();
   const identity = canUseDirectChat ? (user?.id ?? "preissued") : null;
-  const identityMatches = getMessagingSessionIdentity() === identity;
+  const identityMatches =
+    getMessagingSessionIdentity() === identity &&
+    getWorkspaceSessionIdentity() === identity;
   const [, rerender] = useReducer((value: number) => value + 1, 0);
 
   useLayoutEffect(() => {
     if (identityMatches) return;
+    bindWorkspaceSessionIdentity(identity);
     bindMessagingSessionIdentity(identity);
     rerender();
   }, [identity, identityMatches]);

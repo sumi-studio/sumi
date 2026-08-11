@@ -24,6 +24,12 @@ import type {
   UnreadSummary,
 } from "./model";
 import { MAX_SEQ, parsePlaceKey } from "./model";
+import {
+  bindMessagingScopeToURL,
+  type MessagingScope,
+  scopedMessagingPath,
+  validateMessagingScope,
+} from "./scope";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -57,6 +63,13 @@ export class ApiMessagingBackend implements MessagingBackend {
   private reconnectTimer: number | null = null;
   private reconnectDelay = 250;
   private stopped = false;
+  private readonly abortController = new AbortController();
+
+  readonly scope: MessagingScope;
+
+  constructor(scope: MessagingScope) {
+    this.scope = validateMessagingScope(scope);
+  }
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
     const body = asRecord(await this.request("/messaging/bootstrap"));
@@ -67,6 +80,12 @@ export class ApiMessagingBackend implements MessagingBackend {
         name: asString(value.name),
       };
     });
+    if (
+      workspaces.length !== 1 ||
+      workspaces[0]?.workspaceId !== this.scope.workspaceId
+    ) {
+      throw new Error("Messaging bootstrap crossed Workspace scope");
+    }
     const channels = asArray(body.channels).map((entry) =>
       this.registerChannel(entry),
     );
@@ -344,6 +363,7 @@ export class ApiMessagingBackend implements MessagingBackend {
   dispose(): void {
     this.listeners.clear();
     this.connectionListeners.clear();
+    this.abortController.abort();
     this.stopSocket();
   }
 
@@ -357,7 +377,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       return;
     }
     this.emitConnection("reconnecting");
-    const url = new URL("/messaging/ws", window.location.href);
+    const url = bindMessagingScopeToURL(
+      new URL("/messaging/ws", window.location.href),
+      this.scope,
+    );
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
     this.socket = socket;
@@ -528,7 +551,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     path: string,
     options: { method?: string; body?: unknown } = {},
   ): Promise<unknown> {
-    const response = await fetch(path, {
+    const response = await fetch(scopedMessagingPath(path, this.scope), {
       method: options.method ?? "GET",
       credentials: "include",
       cache: "no-store",
@@ -540,7 +563,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       },
       body:
         options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.any([
+        this.abortController.signal,
+        AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      ]),
     });
     if (!response.ok) {
       let code = "messaging_request_failed";

@@ -2,33 +2,30 @@ import { DoorOpen, MessageCircle } from "lucide-react";
 import type { ComponentType } from "react";
 
 /**
- * アプリレールのlocal provider（Codex合意）。ここは実体ではなく記述の置き場で、
- * 将来は同じdescriptor列をserverから受け取り、rendererを
- * builtin / sdui / mcp_app に分ける。MCP AppのHTML/JSはsandboxed iframe内のみ。
+ * Renderer knowledge only. Availability and lifecycle come from the canonical
+ * catalog + exact enabled installation; this registry cannot make an app
+ * appear by itself.
  */
-export interface AppDescriptor {
-  id: string;
-  label: string;
+export interface WorkspaceAppRenderer {
+  appId: string;
   icon: ComponentType<{ className?: string }>;
-  route: string;
+  route(workspaceId: string): string;
   renderer: "builtin";
 }
 
-export const LOCAL_APP_DESCRIPTORS: AppDescriptor[] = [
-  {
-    id: "home",
-    label: "Sumi",
+export const WORKSPACE_APP_RENDERERS: Record<string, WorkspaceAppRenderer> = {
+  messaging: {
+    appId: "messaging",
     icon: MessageCircle,
-    route: "/",
+    route: (workspaceId) => `/w/${encodeURIComponent(workspaceId)}/messaging`,
     renderer: "builtin",
   },
-  {
-    // 直通 = 自分が雇う人格agent本人への生の回線。既存のトーク画面を使う。
-    id: "direct",
-    label: "直通",
-    icon: DoorOpen,
-    route: "/direct",
-    renderer: "builtin",
-  },
-  // Mail、Calendar、Tasks…は実ルートを持ったときにここへ増える。
-];
+};
+
+/** Direct Chat is Participant-owned and never joins the Workspace app list. */
+export const DIRECT_CHAT_RENDERER = {
+  appId: "direct-chat",
+  label: "直通",
+  icon: DoorOpen,
+  route: "/direct",
+} as const;
