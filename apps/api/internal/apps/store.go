@@ -192,7 +192,7 @@ func (s *Store) RequireEnabledInstallationInSnapshot(
 	}
 	storageKind, storageID := ownerStorageKey(owner)
 	row := tx.QueryRow(ctx, `
-		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		       installed_at, updated_at
 		FROM app_installations
 		WHERE installation_id = $1
