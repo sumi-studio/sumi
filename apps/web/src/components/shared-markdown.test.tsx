@@ -122,4 +122,150 @@ describe("@sumi/ui CompactMessageResponse", () => {
     expect(container.querySelector("p")).toHaveTextContent("本文(新)");
     expect(container).not.toHaveTextContent("(旧)");
   });
+
+  it("renders inline TeX with accessible MathML and keeps surrounding text inline", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {"質量とエネルギーは $E = mc^2$ で結ばれる"}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector(".katex-display")).toBeNull();
+    expect(container.querySelector("math")?.getAttribute("aria-hidden")).toBe(
+      null,
+    );
+    expect(container.querySelector(".katex-html")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent("E = mc^2");
+    expect(container.querySelector("p")).toHaveTextContent(
+      "質量とエネルギーは",
+    );
+    expect(container.querySelector("p")).toHaveTextContent("で結ばれる");
+  });
+
+  it("renders standalone double-dollar lines as contained display math", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {"前の行\n$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n後の行"}
+      </CompactMessageResponse>,
+    );
+
+    const display = container.querySelector(".katex-display");
+    const wrapper = display?.parentElement;
+    expect(display).not.toBeNull();
+    expect(wrapper).toHaveAttribute("data-math-display");
+    expect(wrapper?.className).toContain("max-w-full");
+    expect(wrapper?.className).toContain("overflow-x-auto");
+    expect(container.querySelector("pre")).toBeNull();
+    expect(container).toHaveTextContent("前の行");
+    expect(container).toHaveTextContent("後の行");
+  });
+
+  it("keeps double-dollar math inline when text shares its line", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {"途中に $$x^2 + 1$$ を置く"}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector(".katex-display")).toBeNull();
+  });
+
+  it("renders multiline double-dollar fences as display math", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {"解は\n\n$$\n\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}\n$$"}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex-display")).not.toBeNull();
+    expect(container.querySelector("[data-math-display]")).not.toBeNull();
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it.each([
+    "ランチは $5 と $10 でした",
+    "コストは$5、利益は$3です",
+    "US$ 100 と US$ 200",
+    "$1,200 〜 $1,500",
+  ])("leaves currency-like dollars as text: %s", (source) => {
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container).toHaveTextContent(source);
+  });
+
+  it("respects escaped delimiters and leaves unclosed math readable", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {String.raw`escaped \$x^2\$ and unclosed $y + 1`}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container).toHaveTextContent("escaped $x^2$ and unclosed $y + 1");
+  });
+
+  it("does not parse math delimiters inside code spans or fences", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {"`$x^2$`\n\n```tex\n$$y^2$$\n```"}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.querySelector("code")).toHaveTextContent("$x^2$");
+    expect(container.querySelector("pre")).toHaveTextContent("$$y^2$$");
+  });
+
+  it("shows malformed TeX as source text without aborting the message", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {String.raw`before $\frac{1}$ after`}
+      </CompactMessageResponse>,
+    );
+
+    const fallback = container.querySelector(".katex-error");
+    expect(fallback).toHaveTextContent(String.raw`\frac{1}`);
+    expect(fallback).toHaveAttribute("title");
+    expect(fallback).toHaveStyle({ color: "var(--destructive)" });
+    expect(container).toHaveTextContent("before");
+    expect(container).toHaveTextContent("after");
+  });
+
+  it("keeps KaTeX trust disabled for author-controlled commands", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {String.raw`$\href{https://attacker.example}{click}$ $\htmlClass{owned}{x}$`}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector("a[href], img, script, style")).toBeNull();
+    expect(container.querySelector(".owned")).toBeNull();
+    expect(container.querySelectorAll(".katex")).toHaveLength(2);
+    expect(container).toHaveTextContent(String.raw`\href`);
+    expect(container).toHaveTextContent(String.raw`\htmlClass`);
+  });
+
+  it("keeps an edited trailer attached after inline math", () => {
+    const { container } = render(
+      <CompactMessageResponse trailer={{ text: "(編集済み)" }}>
+        {"答えは $x=1$"}
+      </CompactMessageResponse>,
+    );
+
+    const paragraph = container.querySelector("p");
+    expect(paragraph?.querySelector(".katex")).not.toBeNull();
+    expect(paragraph?.querySelector("[data-trailer]")).toHaveTextContent(
+      "(編集済み)",
+    );
+  });
 });

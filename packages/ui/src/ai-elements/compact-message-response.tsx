@@ -16,6 +16,13 @@ import remarkBreaks from "remark-breaks";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough";
 import remarkGfm from "remark-gfm";
+import {
+  rehypeCompactKatex,
+  rehypeCompactMathLayout,
+  remarkCompactMath,
+  remarkMath,
+} from "./compact-message-math";
+import "katex/dist/katex.min.css";
 
 const LINK_CLASS =
   "break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary";
@@ -226,6 +233,10 @@ const STANDARD_REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [
   remarkCjkFriendly,
   remarkCjkFriendlyGfmStrikethrough,
   remarkBreaks,
+  remarkMath,
+  // Currency demotion must precede consumer transforms such as mentions so
+  // text restored from a false-positive formula still receives decoration.
+  remarkCompactMath,
 ];
 
 export interface CompactMessageResponseProps {
@@ -258,7 +269,11 @@ export function CompactMessageResponse({
     [extraRemarkPlugins],
   );
   const rehypePlugins = useMemo(
-    () => (trailer ? [rehypeTrailer(trailer)] : []),
+    () => [
+      rehypeCompactKatex,
+      rehypeCompactMathLayout,
+      ...(trailer ? [rehypeTrailer(trailer)] : []),
+    ],
     [trailer],
   );
   const rendered = (
