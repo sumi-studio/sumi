@@ -45,9 +45,57 @@ type WorkspaceAuthority interface {
 	Members(context.Context, string, participant.Ref) ([]workspacecontrol.Membership, error)
 	ActiveMembershipInTx(context.Context, pgx.Tx, string, participant.Ref) (workspacecontrol.Membership, error)
 	ActiveMembershipsInTx(context.Context, pgx.Tx, string) ([]workspacecontrol.Membership, error)
+	LockSharedInTx(context.Context, pgx.Tx, string) error
 	LockSharedAndRequireMembership(context.Context, pgx.Tx, string, participant.Ref) (workspacecontrol.Membership, error)
 	LockAndRequireAppCapability(context.Context, pgx.Tx, string, participant.Ref, string) error
 	RequireMembership(context.Context, string, participant.Ref) error
+}
+
+// withLiveAuthorityLease holds the exact Human session's application and
+// place authority through a volatile publish or the actual socket write. The
+// caller supplies the effect so removal, logout, installation disable, or
+// private-place tenure closure can win before it or must wait until it ends.
+func (s *ScopedStore) withLiveAuthorityLease(
+	ctx context.Context,
+	boundary liveBoundary,
+	effect func() error,
+) error {
+	if s == nil || s.Store == nil || effect == nil {
+		return ErrInvalidScope
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin live authority lease: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+		return err
+	}
+	if boundary.placeID != "" {
+		place, err := s.lockScopedPlace(ctx, tx, boundary.placeID)
+		if err != nil {
+			return err
+		}
+		if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
+			return err
+		}
+	} else if boundary.subjectSet {
+		if err := boundary.subject.Validate(); err != nil {
+			return ErrInvalidScope
+		}
+		if _, err := s.workspaces.ActiveMembershipInTx(
+			ctx, tx, s.Scope.WorkspaceID, boundary.subject,
+		); err != nil {
+			return ErrPlaceNotFound
+		}
+	}
+	if err := effect(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit live authority lease: %w", err)
+	}
+	return nil
 }
 
 type AppAuthority interface {

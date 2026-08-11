@@ -846,6 +846,15 @@ func (s *Store) LockSharedAndRequireMembership(
 	return activeMembership(ctx, tx, workspaceID, actor)
 }
 
+// LockSharedInTx acquires the Workspace-wide shared authority/audience fence
+// without attributing the read to a participant. It is intentionally narrower
+// than LockSharedAndRequireMembership: application delivery adapters use it
+// only to project an already-committed durable event to the Workspace's
+// current audience. New participant operations must use the actor-bound form.
+func (s *Store) LockSharedInTx(ctx context.Context, tx pgx.Tx, workspaceID string) error {
+	return lockWorkspaceShared(ctx, tx, workspaceID)
+}
+
 // ActiveMembershipInTx returns the exact active tenure an application binds
 // its own child resource to. Returning only a boolean would force consumers to
 // rediscover workspace_member_id and reopen a race with removal/rejoin.

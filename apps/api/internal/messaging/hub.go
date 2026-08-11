@@ -39,6 +39,30 @@ type Event struct {
 	ExceptFor []ParticipantRef `json:"-"`
 }
 
+// liveBoundary is the non-serialized application address for one live frame.
+// Exactly one of placeID and subjectSet is populated. It is comparable so all
+// variants of one logical event can be proven to share one audience snapshot.
+type liveBoundary struct {
+	placeID    string
+	subject    ParticipantRef
+	subjectSet bool
+}
+
+func (b liveBoundary) key() string {
+	if b.placeID != "" {
+		return b.placeID
+	}
+	if b.subjectSet {
+		return "participant|" + b.subject.Key()
+	}
+	return ""
+}
+
+type outboundFrame struct {
+	payload  []byte
+	boundary liveBoundary
+}
+
 // Durable event types. The wire names match the web model's ServerEvent.
 const (
 	EventMessageCreated     = "message_created"
@@ -61,7 +85,7 @@ const (
 type subscriber struct {
 	viewer ParticipantRef
 	store  *ScopedStore
-	send   chan []byte
+	send   chan outboundFrame
 	// done is closed exactly once on unsubscribe. send is never closed, so
 	// concurrent publishers can always select against done without racing a
 	// channel close.
@@ -97,17 +121,22 @@ type Hub struct {
 }
 
 // hubAuthorizer is the narrow adapter from in-memory fanout to Messaging's
-// authorization model. Hub asks for a current participant set; channel/DM and
-// participant-visibility vocabulary stays in Store.
+// authorization model. The callback runs while one Workspace/install/place
+// shared lease is held, so membership and app lifecycle changes cannot split
+// one logical event into subscriber-by-subscriber authority snapshots.
 type hubAuthorizer interface {
-	ActiveParticipantsForPlace(context.Context, string) (map[ParticipantRef]struct{}, error)
-	ParticipantsVisibleTo(context.Context, ParticipantRef) (map[ParticipantRef]struct{}, error)
+	withLiveAudience(
+		context.Context,
+		Scope,
+		liveBoundary,
+		func(map[ParticipantRef]struct{}) error,
+	) error
 }
 
 // NewHub returns a hub that obtains current authorized participant sets from
 // the messaging store before in-memory fanout.
 func NewHub(store *Store) *Hub {
-	return newHub(nil)
+	return newHub(store)
 }
 
 func newHub(authorizer hubAuthorizer) *Hub {
@@ -130,7 +159,7 @@ func (h *Hub) subscribe(scope any) *subscriber {
 		store:  store,
 		// Enough headroom for a busy place; overflow means the reader is not
 		// keeping up and replay-on-reconnect is the correct recovery.
-		send:    make(chan []byte, 256),
+		send:    make(chan outboundFrame, 256),
 		done:    make(chan struct{}),
 		visible: map[string]bool{},
 	}
@@ -152,24 +181,47 @@ func (h *Hub) unsubscribe(sub *subscriber) {
 // Publish delivers the event to every subscriber in its audience who can see
 // its scope (place, or subject participant for place-less events). Slow
 // subscribers are dropped rather than blocking the publisher.
-func (h *Hub) Publish(ctx context.Context, event Event) {
-	h.PublishVariants(ctx, []Event{event})
+func (h *Hub) Publish(ctx context.Context, event Event) error {
+	return h.publishVariants(ctx, Scope{}, []Event{event})
+}
+
+// PublishScoped projects an event from one exact installed Messaging app.
+// Production hubs require this form; the unscoped form is retained only for
+// store-less fanout harnesses.
+func (h *Hub) PublishScoped(ctx context.Context, store *ScopedStore, event Event) error {
+	if store == nil {
+		return ErrInvalidScope
+	}
+	return h.publishVariants(ctx, store.Scope, []Event{event})
 }
 
 // PublishVariants delivers mutually exclusive recipient variants of one
 // logical event. Current authorization is resolved once for the shared scope,
 // then OnlyFor/ExceptFor partitions the already-authorized subscribers fully
 // in memory. A subscriber receives at most one variant.
-func (h *Hub) PublishVariants(ctx context.Context, events []Event) {
+func (h *Hub) PublishVariants(ctx context.Context, events []Event) error {
+	return h.publishVariants(ctx, Scope{}, events)
+}
+
+// PublishVariantsScoped is PublishScoped for mutually exclusive payload
+// variants. Authorization is still resolved exactly once for the whole set.
+func (h *Hub) PublishVariantsScoped(ctx context.Context, store *ScopedStore, events []Event) error {
+	if store == nil {
+		return ErrInvalidScope
+	}
+	return h.publishVariants(ctx, store.Scope, events)
+}
+
+func (h *Hub) publishVariants(ctx context.Context, scope Scope, events []Event) error {
 	if h == nil {
-		return
+		return nil
 	}
 	if len(events) == 0 {
-		return
+		return nil
 	}
-	scope, ok := eventScope(events[0])
+	boundary, ok := eventScope(events[0])
 	if !ok {
-		return
+		return ErrInvalidScope
 	}
 	frames := make([][]byte, len(events))
 	onlyFor := make(map[ParticipantRef]int, len(events))
@@ -177,20 +229,20 @@ func (h *Hub) PublishVariants(ctx context.Context, events []Event) {
 	excludedByEvent := make([]map[ParticipantRef]struct{}, len(events))
 	for i, event := range events {
 		candidateScope, valid := eventScope(event)
-		if !valid || candidateScope != scope {
-			return
+		if !valid || candidateScope != boundary {
+			return ErrInvalidScope
 		}
 		frame, err := json.Marshal(struct {
 			Type  string `json:"type"`
 			Event Event  `json:"event"`
 		}{Type: "event", Event: event})
 		if err != nil {
-			return
+			return err
 		}
 		frames[i] = frame
 		if event.OnlyFor != nil {
 			if _, duplicate := onlyFor[*event.OnlyFor]; duplicate {
-				return
+				return ErrInvalidScope
 			}
 			onlyFor[*event.OnlyFor] = i
 			continue
@@ -205,77 +257,76 @@ func (h *Hub) PublishVariants(ctx context.Context, events []Event) {
 		}
 	}
 
-	var authorized map[ParticipantRef]struct{}
-	if h.authorizer != nil {
-		var err error
-		if events[0].PlaceID != "" {
-			authorized, err = h.authorizer.ActiveParticipantsForPlace(ctx, events[0].PlaceID)
-		} else {
-			authorized, err = h.authorizer.ParticipantsVisibleTo(ctx, *events[0].Subject)
+	fanout := func(authorized map[ParticipantRef]struct{}) error {
+		h.mu.Lock()
+		subs := make([]*subscriber, 0, len(h.subscribers))
+		for sub := range h.subscribers {
+			subs = append(subs, sub)
 		}
-		if err != nil {
-			return
-		}
-	}
-	h.mu.Lock()
-	subs := make([]*subscriber, 0, len(h.subscribers))
-	for sub := range h.subscribers {
-		subs = append(subs, sub)
-	}
-	h.mu.Unlock()
+		h.mu.Unlock()
 
-	var drop []*subscriber
-	for _, sub := range subs {
-		visible := false
-		if sub.store != nil {
-			if events[0].PlaceID != "" {
-				_, err := sub.store.PlaceFor(ctx, events[0].PlaceID)
-				visible = err == nil
+		var drop []*subscriber
+		for _, sub := range subs {
+			// A Participant may have sockets open in several Workspaces (or an
+			// old socket sealed to a pre-reinstall installation). Audience
+			// membership is meaningful only inside the event's exact app address.
+			// This is an in-memory equality check over sealed server state, not a
+			// subscriber-by-subscriber authorization query.
+			if scope.WorkspaceID != "" && (sub.store == nil ||
+				sub.store.Scope.WorkspaceID != scope.WorkspaceID ||
+				sub.store.Scope.InstallationID != scope.InstallationID) {
+				continue
+			}
+			visible := false
+			if h.authorizer == nil {
+				visible, _ = sub.visibility(boundary.key())
 			} else {
-				var err error
-				visible, err = sub.store.ParticipantVisible(ctx, *events[0].Subject)
-				visible = err == nil && visible
+				_, visible = authorized[sub.viewer]
 			}
-		} else if h.authorizer == nil {
-			visible, _ = sub.visibility(scope)
-		} else {
-			_, visible = authorized[sub.viewer]
-		}
-		sub.markVisible(scope, visible)
-		if !visible {
-			continue
-		}
-		variant, found := onlyFor[sub.viewer]
-		if !found {
-			for _, candidate := range fallbacks {
-				if _, excluded := excludedByEvent[candidate][sub.viewer]; excluded {
-					continue
+			sub.markVisible(boundary.key(), visible)
+			if !visible {
+				continue
+			}
+			variant, found := onlyFor[sub.viewer]
+			if !found {
+				for _, candidate := range fallbacks {
+					if _, excluded := excludedByEvent[candidate][sub.viewer]; excluded {
+						continue
+					}
+					variant, found = candidate, true
+					break
 				}
-				variant, found = candidate, true
-				break
+			}
+			if !found {
+				continue
+			}
+			select {
+			case <-sub.done:
+			case sub.send <- outboundFrame{payload: frames[variant], boundary: boundary}:
+			default:
+				drop = append(drop, sub)
 			}
 		}
-		if !found {
-			continue
+		for _, sub := range drop {
+			h.unsubscribe(sub)
 		}
-		select {
-		case <-sub.done:
-		case sub.send <- frames[variant]:
-		default:
-			drop = append(drop, sub)
-		}
+		return nil
 	}
-	for _, sub := range drop {
-		h.unsubscribe(sub)
+	if h.authorizer != nil {
+		return h.authorizer.withLiveAudience(ctx, scope, boundary, fanout)
 	}
+	return fanout(nil)
 }
 
-func eventScope(event Event) (string, bool) {
+func eventScope(event Event) (liveBoundary, bool) {
 	if event.PlaceID != "" {
-		return event.PlaceID, true
+		if event.Subject != nil {
+			return liveBoundary{}, false
+		}
+		return liveBoundary{placeID: event.PlaceID}, true
 	}
 	if event.Subject != nil {
-		return "participant|" + event.Subject.Key(), true
+		return liveBoundary{subject: *event.Subject, subjectSet: true}, true
 	}
-	return "", false
+	return liveBoundary{}, false
 }
