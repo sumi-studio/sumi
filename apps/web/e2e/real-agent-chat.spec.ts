@@ -28,6 +28,12 @@ test("Chrome direct chat reaches the real production agent for two contextual tu
   page,
 }) => {
   if (!build) throw new Error("real-agent binaries were not built");
+  const databaseURL = process.env.SUMI_DIRECT_CHAT_E2E_DB_URL?.trim();
+  if (!databaseURL) {
+    throw new Error(
+      "SUMI_DIRECT_CHAT_E2E_DB_URL must name a disposable empty Postgres database",
+    );
+  }
 
   const assistantMessageEndSequence = new Map<string, number>();
   let directChatSocketSeen = false;
@@ -105,7 +111,7 @@ test("Chrome direct chat reaches the real production agent for two contextual tu
     });
   });
 
-  const stack = await startRealAgentStack(build);
+  const stack = await startRealAgentStack(build, databaseURL);
   let primaryError: Error | undefined;
   try {
     await stack.installSession(context);
@@ -117,6 +123,7 @@ test("Chrome direct chat reaches the real production agent for two contextual tu
     ).toBe(true);
 
     await page.goto(stack.webURL);
+    await page.getByRole("button", { name: "直通", exact: true }).click();
     await expect(
       page.getByText("エージェント利用可能", { exact: true }),
     ).toBeVisible({ timeout: 45_000 });
