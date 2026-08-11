@@ -12,6 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { registerUserScrollTarget } from "../lib/user-scroll-intent";
 
 export interface ConversationVirtualizerItem {
   id: string;
@@ -173,6 +174,16 @@ export function ConversationVirtualizer<
     // documented-by-source reconcile target and clearing it ends the flight.
     (virtualizer as unknown as { scrollState: unknown }).scrollState = null;
   }, [virtualizer]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    return registerUserScrollTarget(viewport, ({ left, top }) => {
+      interruptProgrammaticScroll();
+      viewport.scrollTop += top;
+      viewport.scrollLeft += left;
+    });
+  }, [interruptProgrammaticScroll]);
 
   useImperativeHandle(
     ref,

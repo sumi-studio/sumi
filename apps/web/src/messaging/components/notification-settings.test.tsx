@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useMessaging } from "../store";
 import { NotificationSettingsMenu } from "./notification-settings";
@@ -13,6 +19,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 beforeEach(() => {
+  mocks.setDefaultLevel.mockResolvedValue("confirmed");
+  mocks.setKeywords.mockResolvedValue("confirmed");
+  mocks.setSoundEnabled.mockResolvedValue("confirmed");
   useMessaging.setState({
     notificationDefaultLevel: "mentions",
     notificationKeywords: [],
@@ -41,19 +50,44 @@ describe("NotificationSettingsMenu", () => {
     expect(screen.getByRole("radio", { name: "すべて通知" })).not.toBeChecked();
   });
 
-  it("レベル変更をstatusで返す", () => {
+  it("レベル変更は確定後にだけstatusで返す", async () => {
+    let confirm!: (result: "confirmed") => void;
+    mocks.setDefaultLevel.mockReturnValueOnce(
+      new Promise((resolve) => {
+        confirm = resolve;
+      }),
+    );
     render(<NotificationSettingsMenu />);
     open();
 
     fireEvent.click(screen.getByRole("radio", { name: "ミュート" }));
 
     expect(mocks.setDefaultLevel).toHaveBeenCalledWith("mute");
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "既定を「ミュート」にしました",
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+
+    confirm("confirmed");
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "既定を「ミュート」にしました",
+      ),
     );
   });
 
-  it("通知音の状態をswitchで示す", () => {
+  it("レベル変更の失敗とロールバックをstatusで返す", async () => {
+    mocks.setDefaultLevel.mockResolvedValueOnce("failed");
+    render(<NotificationSettingsMenu />);
+    open();
+
+    fireEvent.click(screen.getByRole("radio", { name: "ミュート" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "既定の通知を保存できず、元に戻しました",
+      ),
+    );
+  });
+
+  it("通知音の状態をswitchで示す", async () => {
     render(<NotificationSettingsMenu />);
     open();
 
@@ -62,7 +96,11 @@ describe("NotificationSettingsMenu", () => {
     fireEvent.click(toggle);
 
     expect(mocks.setSoundEnabled).toHaveBeenCalledWith(true);
-    expect(screen.getByRole("status")).toHaveTextContent("通知音を鳴らします");
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "通知音を鳴らします",
+      ),
+    );
   });
 
   it("IME変換確定のEnterではキーワードを追加しない", () => {

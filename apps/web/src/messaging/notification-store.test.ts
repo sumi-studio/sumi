@@ -242,7 +242,9 @@ describe("notification settings in the store", () => {
   });
 
   it("writes the whole setting when one place changes", async () => {
-    useMessaging.getState().setPlaceNotificationLevel(CHANNEL_KEY, "mute");
+    const result = useMessaging
+      .getState()
+      .setPlaceNotificationLevel(CHANNEL_KEY, "mute");
 
     expect(notificationLevelFor(useMessaging.getState(), CHANNEL_KEY)).toBe(
       "mute",
@@ -253,11 +255,14 @@ describe("notification settings in the store", () => {
       perPlace: [{ place: CHANNEL, level: "mute" }],
       keywords: ["デプロイ"],
     });
+    await expect(result).resolves.toBe("confirmed");
   });
 
   it("keeps the defaults and keywords editable through the same path", async () => {
-    useMessaging.getState().setNotificationDefaultLevel("all");
-    useMessaging.getState().setNotificationKeywords(["リリース", "Kuro"]);
+    const first = useMessaging.getState().setNotificationDefaultLevel("all");
+    const latest = useMessaging
+      .getState()
+      .setNotificationKeywords(["リリース", "Kuro"]);
 
     // 全置換なので、続けて変えた分は最新のsnapshot1本にまとめて送れば足りる。
     await vi.waitFor(() =>
@@ -273,6 +278,8 @@ describe("notification settings in the store", () => {
       "リリース",
       "Kuro",
     ]);
+    await expect(first).resolves.toBe("superseded");
+    await expect(latest).resolves.toBe("confirmed");
   });
 
   it("並べて送るので、遅れて届いた古いsnapshotがサーバーを巻き戻さない", async () => {
@@ -329,7 +336,9 @@ describe("notification settings in the store", () => {
 
   it("puts a rejected change back, rather than showing a setting that is not in force", async () => {
     backend.rejectSettingWrites = true;
-    useMessaging.getState().setPlaceNotificationLevel(CHANNEL_KEY, "mute");
+    const result = useMessaging
+      .getState()
+      .setPlaceNotificationLevel(CHANNEL_KEY, "mute");
     expect(notificationLevelFor(useMessaging.getState(), CHANNEL_KEY)).toBe(
       "mute",
     );
@@ -338,6 +347,7 @@ describe("notification settings in the store", () => {
         "all",
       ),
     );
+    await expect(result).resolves.toBe("failed");
   });
 
   it("does not let queued writes cross a messaging session boundary", async () => {

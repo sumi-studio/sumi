@@ -62,6 +62,8 @@ export function installMessagingBackend(override: MessagingBackend): void {
   backend = override;
 }
 
+export type NotificationWriteResult = "confirmed" | "superseded" | "failed";
+
 interface MessagingState {
   capabilities: MessagingCapabilities;
   ready: boolean;
@@ -118,10 +120,17 @@ interface MessagingState {
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
   setStatus(status: StatusKind, note: string): void;
-  setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
-  setNotificationDefaultLevel(level: NotificationLevel): void;
-  setNotificationKeywords(keywords: string[]): void;
-  setNotificationSoundEnabled(enabled: boolean): void;
+  setPlaceNotificationLevel(
+    key: PlaceKey,
+    level: NotificationLevel,
+  ): Promise<NotificationWriteResult>;
+  setNotificationDefaultLevel(
+    level: NotificationLevel,
+  ): Promise<NotificationWriteResult>;
+  setNotificationKeywords(keywords: string[]): Promise<NotificationWriteResult>;
+  setNotificationSoundEnabled(
+    enabled: boolean,
+  ): Promise<NotificationWriteResult>;
   createReplyLater(message: Message, delayMs?: number): void;
   toggleReaction(message: Message, emoji: string): void;
   loadOlder(key: PlaceKey): Promise<void>;
@@ -1005,7 +1014,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     defaultLevel: NotificationLevel;
     levelByPlace: Record<PlaceKey, NotificationLevel>;
     keywords: string[];
-  }) => {
+  }): Promise<NotificationWriteResult> => {
     const sessionBackend = backend;
     const state = get();
     const previous: NotificationSettingState = {
@@ -1019,41 +1028,48 @@ export const useMessaging = create<MessagingState>((set, get) => {
       notificationLevelByPlace: next.levelByPlace,
       notificationKeywords: next.keywords,
     });
-    notificationWriteChain = notificationWriteChain.then(async () => {
-      // bindMessagingSessionIdentity resets the public chain, but a callback
-      // already queued on the old promise still exists. Never let it use the
-      // replacement backend or mutate the replacement session's confirmed
-      // rollback point.
-      if (backend !== sessionBackend) return;
-      // 送る番が来るまでにもっと新しい設定になっていたら、この一本は要らない。
-      if (generation !== notificationWriteGeneration) return;
-      const perPlace: { place: Place; level: NotificationLevel }[] = [];
-      for (const [key, level] of Object.entries(next.levelByPlace)) {
-        const place = parsePlaceKey(key);
-        if (place) perPlace.push({ place, level });
-      }
-      try {
-        const confirmed = notificationSettingState(
-          await sessionBackend.setNotificationSetting({
-            defaults: { level: next.defaultLevel },
-            perPlace,
-            keywords: next.keywords,
-          }),
-        );
-        if (backend !== sessionBackend) return;
-        confirmedNotificationSetting = confirmed;
-        // 追い越されていれば後続の書き込みが正。確定値は覚えるが手元は触らない。
-        if (generation === notificationWriteGeneration) set(confirmed);
-      } catch {
-        if (
-          backend !== sessionBackend ||
-          generation !== notificationWriteGeneration
-        ) {
-          return;
+    const result = notificationWriteChain.then(
+      async (): Promise<NotificationWriteResult> => {
+        // bindMessagingSessionIdentity resets the public chain, but a callback
+        // already queued on the old promise still exists. Never let it use the
+        // replacement backend or mutate the replacement session's confirmed
+        // rollback point.
+        if (backend !== sessionBackend) return "superseded";
+        // 送る番が来るまでにもっと新しい設定になっていたら、この一本は要らない。
+        if (generation !== notificationWriteGeneration) return "superseded";
+        const perPlace: { place: Place; level: NotificationLevel }[] = [];
+        for (const [key, level] of Object.entries(next.levelByPlace)) {
+          const place = parsePlaceKey(key);
+          if (place) perPlace.push({ place, level });
         }
-        set(confirmedNotificationSetting ?? previous);
-      }
-    });
+        try {
+          const confirmed = notificationSettingState(
+            await sessionBackend.setNotificationSetting({
+              defaults: { level: next.defaultLevel },
+              perPlace,
+              keywords: next.keywords,
+            }),
+          );
+          if (backend !== sessionBackend) return "superseded";
+          confirmedNotificationSetting = confirmed;
+          // 追い越されていれば後続の書き込みが正。確定値は覚えるが手元は触らない。
+          if (generation !== notificationWriteGeneration) return "superseded";
+          set(confirmed);
+          return "confirmed";
+        } catch {
+          if (
+            backend !== sessionBackend ||
+            generation !== notificationWriteGeneration
+          ) {
+            return "superseded";
+          }
+          set(confirmedNotificationSetting ?? previous);
+          return "failed";
+        }
+      },
+    );
+    notificationWriteChain = result.then(() => undefined);
+    return result;
   };
 
   return {
@@ -1412,7 +1428,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     setPlaceNotificationLevel(key, level) {
       const state = get();
-      pushNotificationSetting({
+      return pushNotificationSetting({
         defaultLevel: state.notificationDefaultLevel,
         levelByPlace: { ...state.notificationLevelByPlace, [key]: level },
         keywords: state.notificationKeywords,
@@ -1421,7 +1437,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     setNotificationDefaultLevel(level) {
       const state = get();
-      pushNotificationSetting({
+      return pushNotificationSetting({
         defaultLevel: level,
         levelByPlace: state.notificationLevelByPlace,
         keywords: state.notificationKeywords,
@@ -1430,7 +1446,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     setNotificationKeywords(keywords) {
       const state = get();
-      pushNotificationSetting({
+      return pushNotificationSetting({
         defaultLevel: state.notificationDefaultLevel,
         levelByPlace: state.notificationLevelByPlace,
         keywords,
@@ -1441,6 +1457,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     setNotificationSoundEnabled(enabled) {
       persistNotificationSound(enabled);
       set({ notificationSoundEnabled: enabled });
+      return Promise.resolve("confirmed");
     },
 
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {

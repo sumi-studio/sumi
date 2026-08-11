@@ -5,6 +5,8 @@ import {
   useEffect,
   useRef,
 } from "react";
+import { isImeComposing } from "../../lib/ime";
+import { applyUserScrollDelta } from "../../lib/user-scroll-intent";
 
 /** 開いているオーバーレイの「閉じる」手続き。排他のために 1 か所へ集める。 */
 const openOverlays = new Set<() => void>();
@@ -53,9 +55,22 @@ function forwardWheel(
   const target = resolveTarget();
   if (!target) return;
   event.preventDefault();
-  const scale = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
-  target.scrollTop += event.deltaY * scale;
-  target.scrollLeft += event.deltaX * scale;
+  const scaleX =
+    event.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? 16
+      : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+        ? target.clientWidth
+        : 1;
+  const scaleY =
+    event.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? 16
+      : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+        ? target.clientHeight
+        : 1;
+  applyUserScrollDelta(target, {
+    left: event.deltaX * scaleX,
+    top: event.deltaY * scaleY,
+  });
 }
 
 /** portal 越しのパネルから下のスクロール領域へホイールを渡す ref。 */
@@ -143,7 +158,7 @@ export function useOverlayPanel<T extends HTMLElement = HTMLButtonElement>({
       requestClose(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.isComposing) return;
+      if (event.key !== "Escape" || isImeComposing(event)) return;
       requestClose(true);
     };
     document.addEventListener("pointerdown", onPointerDown, true);

@@ -66,6 +66,33 @@ function fakeScroller(
   return () => top;
 }
 
+function fakeTwoAxisScroller(
+  element: HTMLElement,
+  { clientHeight, clientWidth }: { clientHeight: number; clientWidth: number },
+) {
+  let top = 0;
+  let left = 0;
+  Object.defineProperties(element, {
+    scrollTop: {
+      configurable: true,
+      get: () => top,
+      set: (value: number) => {
+        top = value;
+      },
+    },
+    scrollLeft: {
+      configurable: true,
+      get: () => left,
+      set: (value: number) => {
+        left = value;
+      },
+    },
+    clientHeight: { configurable: true, get: () => clientHeight },
+    clientWidth: { configurable: true, get: () => clientWidth },
+  });
+  return { readLeft: () => left, readTop: () => top };
+}
+
 afterEach(cleanup);
 
 describe("useOverlayPanel", () => {
@@ -108,6 +135,7 @@ describe("useOverlayPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "通知" }));
 
     fireEvent.keyDown(document, { key: "Escape", isComposing: true });
+    fireEvent.keyDown(document, { key: "Escape", keyCode: 229 });
 
     expect(screen.getByTestId("通知-panel")).toBeInTheDocument();
   });
@@ -156,6 +184,29 @@ describe("useOverlayPanel", () => {
     panel.dispatchEvent(lineWheel);
     expect(lineWheel.defaultPrevented).toBe(true);
     expect(readScrollTop()).toBe(168);
+  });
+
+  it("page単位のホイールを対象viewportの幅と高さで換算する", () => {
+    render(<Harness />);
+    const viewport = screen.getByTestId("viewport");
+    const scroll = fakeTwoAxisScroller(viewport, {
+      clientHeight: 240,
+      clientWidth: 640,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "通知" }));
+
+    const wheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaMode: WheelEvent.DOM_DELTA_PAGE,
+      deltaX: 1,
+      deltaY: -1,
+    });
+    screen.getByTestId("通知-panel").dispatchEvent(wheel);
+
+    expect(wheel.defaultPrevented).toBe(true);
+    expect(scroll.readLeft()).toBe(640);
+    expect(scroll.readTop()).toBe(-240);
   });
 
   it("パネル内がスクロールできるときはそちらを優先する", () => {

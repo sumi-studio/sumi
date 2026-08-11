@@ -11,6 +11,7 @@ import {
 } from "@testing-library/react";
 import { createRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { applyUserScrollDelta } from "../lib/user-scroll-intent";
 import {
   ConversationVirtualizer,
   type ConversationVirtualizerHandle,
@@ -332,6 +333,41 @@ describe("ConversationVirtualizer", () => {
     // The reading position may shift by a few pixels as rows above it
     // re-measure, but it must never be pulled back toward the end.
     expect(Math.abs(viewport.scrollTop - 120)).toBeLessThan(60);
+  });
+
+  it("cancels an active scroll flight before applying forwarded user intent", async () => {
+    const handle = createRef<ConversationVirtualizerHandle>();
+    let messages = makeMessages(100);
+    const view = render(
+      <ConversationVirtualizer
+        ref={handle}
+        items={messages}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    const viewport = screen.getByRole("region");
+    await waitFor(() => expect(handle.current?.isAtEnd()).toBe(true));
+    await settleProgrammaticScroll();
+
+    act(() => handle.current?.scrollToEnd({ behavior: "smooth" }));
+    const intendedOffset = viewport.scrollTop - 300;
+    act(() => applyUserScrollDelta(viewport, { left: 0, top: -300 }));
+    fireEvent.scroll(viewport);
+
+    messages = [...messages, { id: "message-100", text: "Message 100" }];
+    view.rerender(
+      <ConversationVirtualizer
+        ref={handle}
+        items={messages}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    await settleProgrammaticScroll();
+
+    expect(Math.abs(viewport.scrollTop - intendedOffset)).toBeLessThan(60);
+    expect(handle.current?.isAtEnd()).toBe(false);
   });
 
   it("keeps follow mode armed for non-scrolling controls inside rows", async () => {

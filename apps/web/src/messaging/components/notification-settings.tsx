@@ -2,7 +2,7 @@ import { Bell, Check, Volume2, VolumeX, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import type { NotificationLevel } from "../model";
-import { useMessaging } from "../store";
+import { type NotificationWriteResult, useMessaging } from "../store";
 import { useOverlayPanel } from "./overlay";
 import { NOTIFICATION_LEVEL_LABEL } from "./sidebar";
 
@@ -111,6 +111,21 @@ export function NotificationSettingsMenu() {
     );
   }, []);
 
+  const announceWrite = useCallback(
+    async (
+      result: Promise<NotificationWriteResult>,
+      success: string,
+      failure: string,
+    ) => {
+      setFeedback("");
+      if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
+      const outcome = await result;
+      if (outcome === "confirmed") flash(success);
+      if (outcome === "failed") flash(failure);
+    },
+    [flash],
+  );
+
   useEffect(
     () => () => {
       if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
@@ -124,9 +139,13 @@ export function NotificationSettingsMenu() {
       setDraft("");
       return;
     }
-    setKeywords([...keywords, value]);
+    const result = setKeywords([...keywords, value]);
     setDraft("");
-    flash(`「${value}」で呼ばれるようにしました`);
+    void announceWrite(
+      result,
+      `「${value}」で呼ばれるようにしました`,
+      `「${value}」を追加できず、元に戻しました`,
+    );
   };
 
   return (
@@ -163,9 +182,10 @@ export function NotificationSettingsMenu() {
                   level={level}
                   selected={defaultLevel === level}
                   onSelect={() => {
-                    setDefaultLevel(level);
-                    flash(
+                    void announceWrite(
+                      setDefaultLevel(level),
                       `既定を「${NOTIFICATION_LEVEL_LABEL[level]}」にしました`,
+                      "既定の通知を保存できず、元に戻しました",
                     );
                   }}
                 />
@@ -186,8 +206,13 @@ export function NotificationSettingsMenu() {
                   type="button"
                   aria-label={`${keyword} を外す`}
                   onClick={() => {
-                    setKeywords(keywords.filter((entry) => entry !== keyword));
-                    flash(`「${keyword}」を外しました`);
+                    void announceWrite(
+                      setKeywords(
+                        keywords.filter((entry) => entry !== keyword),
+                      ),
+                      `「${keyword}」を外しました`,
+                      `「${keyword}」を外せず、元に戻しました`,
+                    );
                   }}
                   className="text-muted-foreground hover:text-foreground"
                 >
@@ -213,8 +238,11 @@ export function NotificationSettingsMenu() {
           <SoundToggle
             enabled={soundEnabled}
             onToggle={() => {
-              setSoundEnabled(!soundEnabled);
-              flash(soundEnabled ? "通知音を止めました" : "通知音を鳴らします");
+              void announceWrite(
+                setSoundEnabled(!soundEnabled),
+                soundEnabled ? "通知音を止めました" : "通知音を鳴らします",
+                "通知音の設定を変更できませんでした",
+              );
             }}
           />
           <p
