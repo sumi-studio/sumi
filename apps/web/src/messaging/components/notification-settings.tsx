@@ -97,18 +97,20 @@ export function NotificationSettingsMenu() {
   const [draft, setDraft] = useState("");
   const [feedback, setFeedback] = useState("");
   const feedbackTimer = useRef<number | null>(null);
+  const mounted = useRef(false);
+  const announcementGeneration = useRef(0);
   const overlay = useOverlayPanel<HTMLButtonElement>({
     open,
     onOpenChange: setOpen,
   });
 
   const flash = useCallback((message: string) => {
+    if (!mounted.current) return;
     setFeedback(message);
     if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
-    feedbackTimer.current = window.setTimeout(
-      () => setFeedback(""),
-      FEEDBACK_MS,
-    );
+    feedbackTimer.current = window.setTimeout(() => {
+      if (mounted.current) setFeedback("");
+    }, FEEDBACK_MS);
   }, []);
 
   const announceWrite = useCallback(
@@ -117,21 +119,27 @@ export function NotificationSettingsMenu() {
       success: string,
       failure: string,
     ) => {
+      const generation = ++announcementGeneration.current;
       setFeedback("");
       if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
       const outcome = await result;
+      if (!mounted.current || generation !== announcementGeneration.current) {
+        return;
+      }
       if (outcome === "confirmed") flash(success);
       if (outcome === "failed") flash(failure);
     },
     [flash],
   );
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      announcementGeneration.current += 1;
       if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
-    },
-    [],
-  );
+    };
+  }, []);
 
   const addKeyword = () => {
     const value = draft.trim();
