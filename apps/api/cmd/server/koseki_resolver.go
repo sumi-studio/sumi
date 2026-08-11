@@ -73,8 +73,9 @@ func (r *kosekiIdentityBindingResolver) claims(humanID, agentID string) agenteve
 
 // directChatAuthorizer composes the 私信 Surface's two independent authority
 // sources under one transaction: Current Human Employer first, then the exact
-// enabled Human-owned direct-chat AppInstallation. Durable/private operations
-// run while both shared leases are held.
+// enabled Human-owned direct-chat AppInstallation. That snapshot commits before
+// the durable/private effect; the caller's process-lifetime lifecycle permit,
+// rather than PostgreSQL row locks, orders the effect against later mutations.
 type directChatAuthorizer struct {
 	pool   *pgxpool.Pool
 	koseki *koseki.Store

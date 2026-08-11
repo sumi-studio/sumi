@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/canonicalid"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
@@ -77,7 +78,7 @@ var (
 
 // ValidateInstallationID validates an opaque exact installation address.
 func ValidateInstallationID(value string) error {
-	if !isCanonicalUUIDv7(value) {
+	if !canonicalid.IsUUIDv7(value) {
 		return ErrInstallationNotFound
 	}
 	return nil
