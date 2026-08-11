@@ -457,7 +457,9 @@ function appOwnerQuery(owner: AppOwnerRef): URLSearchParams {
   });
 }
 
-function participantToWire(participant: ParticipantRef): Record<string, string> {
+function participantToWire(
+  participant: ParticipantRef,
+): Record<string, string> {
   return participant.kind === "human"
     ? { kind: "human", human_id: participant.humanId }
     : {
@@ -469,7 +471,10 @@ function participantToWire(participant: ParticipantRef): Record<string, string> 
 function appOwnerToWire(owner: AppOwnerRef): Record<string, unknown> {
   return owner.kind === "workspace"
     ? { kind: "workspace", workspace_id: owner.workspaceId }
-    : { kind: "participant", participant: participantToWire(owner.participant) };
+    : {
+        kind: "participant",
+        participant: participantToWire(owner.participant),
+      };
 }
 
 function parseAppOwner(value: unknown): AppOwnerRef {

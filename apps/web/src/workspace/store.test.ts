@@ -554,16 +554,12 @@ describe("Workspace control store", () => {
 
     await store.getState().transferOwnership(MEMBER_C_ID);
 
-    expect(transferOwnership).toHaveBeenCalledWith(
-      WORKSPACE_A_ID,
-      MEMBER_C_ID,
-    );
+    expect(transferOwnership).toHaveBeenCalledWith(WORKSPACE_A_ID, MEMBER_C_ID);
     expect(store.getState().selectedWorkspace).toEqual(transferred);
     expect(
-      store.getState().members.map((member) => [
-        member.workspaceMemberId,
-        member.owner,
-      ]),
+      store
+        .getState()
+        .members.map((member) => [member.workspaceMemberId, member.owner]),
     ).toEqual([
       [MEMBER_A_ID, false],
       [MEMBER_C_ID, true],
@@ -614,7 +610,10 @@ describe("Workspace control store", () => {
     ).toBeNull();
 
     await store.getState().installApp(APP_ID);
-    expect(installApp).toHaveBeenCalledWith(WORKSPACE_A_ID, APP_ID);
+    expect(installApp).toHaveBeenCalledWith(
+      { kind: "workspace", workspaceId: WORKSPACE_A_ID },
+      APP_ID,
+    );
     expect(installationForApp(store.getState().installations, APP_ID)).toBe(
       enabled,
     );
@@ -691,8 +690,8 @@ describe("Workspace control store", () => {
             ? delayedOld([APP])
             : Promise.resolve([APP_B]);
         },
-        listInstallations: (workspaceId) =>
-          workspaceId === WORKSPACE_A_ID
+        listInstallations: (owner) =>
+          owner.kind === "workspace" && owner.workspaceId === WORKSPACE_A_ID
             ? delayedOld([installationA])
             : Promise.resolve([installationB]),
       }),

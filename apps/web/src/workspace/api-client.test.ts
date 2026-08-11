@@ -383,8 +383,18 @@ describe("WorkspaceApiClient", () => {
         ],
       },
     ]);
-    await expect(client.listInstallations(WORKSPACE_A_ID)).resolves.toEqual([]);
-    await expect(client.installApp(WORKSPACE_A_ID, APP_ID)).resolves.toEqual({
+    await expect(
+      client.listInstallations({
+        kind: "workspace",
+        workspaceId: WORKSPACE_A_ID,
+      }),
+    ).resolves.toEqual([]);
+    await expect(
+      client.installApp(
+        { kind: "workspace", workspaceId: WORKSPACE_A_ID },
+        APP_ID,
+      ),
+    ).resolves.toEqual({
       installationId: INSTALLATION_ID,
       owner: { kind: "workspace", workspaceId: WORKSPACE_A_ID },
       appId: APP_ID,
@@ -442,6 +452,61 @@ describe("WorkspaceApiClient", () => {
     expect(fetcher.mock.calls.slice(3).map(([path]) => path)).not.toContain(
       `/app-installations/${APP_ID}`,
     );
+  });
+
+  it("addresses a Participant-owned lifecycle through the same exact owner contract", async () => {
+    const participantInstallation = {
+      installation_id: INSTALLATION_ID,
+      owner: {
+        kind: "participant",
+        participant: { kind: "human", human_id: HUMAN_A_ID },
+      },
+      app_id: "direct-chat",
+      state: "enabled",
+      installed_at: "2026-08-10T05:06:07.890Z",
+      updated_at: "2026-08-10T05:06:07.890Z",
+    };
+    const fetcher = fetchSequence(
+      json({ installations: [participantInstallation] }),
+      json(participantInstallation, 201),
+    );
+    const client = new WorkspaceApiClient(fetcher);
+    const owner = {
+      kind: "participant" as const,
+      participant: { kind: "human" as const, humanId: HUMAN_A_ID },
+    };
+
+    await expect(client.listInstallations(owner)).resolves.toEqual([
+      {
+        installationId: INSTALLATION_ID,
+        owner,
+        appId: "direct-chat",
+        state: "enabled",
+        installedAt: Date.parse("2026-08-10T05:06:07.890Z"),
+        updatedAt: Date.parse("2026-08-10T05:06:07.890Z"),
+      },
+    ]);
+    await expect(
+      client.installApp(owner, "direct-chat"),
+    ).resolves.toMatchObject({
+      installationId: INSTALLATION_ID,
+      owner,
+      appId: "direct-chat",
+    });
+
+    expectRequest(
+      fetcher,
+      0,
+      `/app-installations?owner_kind=participant&owner_id=${HUMAN_A_ID}&participant_kind=human`,
+      "GET",
+    );
+    expectRequest(fetcher, 1, "/app-installations", "POST", {
+      owner: {
+        kind: "participant",
+        participant: { kind: "human", human_id: HUMAN_A_ID },
+      },
+      app_id: "direct-chat",
+    });
   });
 });
 

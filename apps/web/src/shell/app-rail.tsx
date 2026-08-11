@@ -11,7 +11,12 @@ import {
 } from "@sumi/ui/components/tooltip";
 import { useNavigate } from "@tanstack/react-router";
 import { Building2, Check, ChevronsUpDown, LayoutGrid } from "lucide-react";
+import { preissuedSessionMode, useAuth } from "../auth/auth-context";
 import { SettingsPopover } from "../components/app-navigation";
+import {
+  participantInstallation,
+  useParticipantApps,
+} from "../participant/app-store";
 import { useWorkspaceControl } from "../workspace/store";
 import {
   DIRECT_CHAT_RENDERER,
@@ -26,12 +31,17 @@ export function AppRail({
   workspaceId?: string;
 }) {
   const navigate = useNavigate();
+  const { authenticated, user } = useAuth();
   const workspaces = useWorkspaceControl((state) => state.workspaces);
   const selectedWorkspace = useWorkspaceControl(
     (state) => state.selectedWorkspace,
   );
   const catalog = useWorkspaceControl((state) => state.catalog);
   const installations = useWorkspaceControl((state) => state.installations);
+  const participantOwner = useParticipantApps((state) => state.owner);
+  const participantInstallations = useParticipantApps(
+    (state) => state.installations,
+  );
   const enabledApps = catalog.flatMap((descriptor) => {
     if (
       catalog.filter((candidate) => candidate.appId === descriptor.appId)
@@ -48,6 +58,21 @@ export function AppRail({
       ? [{ descriptor, installation, renderer }]
       : [];
   });
+  const directInstallation = participantInstallation(
+    participantInstallations,
+    DIRECT_CHAT_RENDERER.appId,
+  );
+  const exactHumanOwner =
+    authenticated &&
+    user !== null &&
+    participantOwner?.kind === "participant" &&
+    participantOwner.participant.kind === "human" &&
+    participantOwner.participant.humanId === user.id;
+  const directChatEnabled =
+    preissuedSessionMode ||
+    (exactHumanOwner &&
+      directInstallation !== "duplicate" &&
+      directInstallation?.state === "enabled");
   const DirectIcon = DIRECT_CHAT_RENDERER.icon;
 
   return (
@@ -161,13 +186,15 @@ export function AppRail({
             })
           : null}
 
-        <RailButton
-          label={DIRECT_CHAT_RENDERER.label}
-          active={activeAppId === DIRECT_CHAT_RENDERER.appId}
-          onClick={() => void navigate({ to: DIRECT_CHAT_RENDERER.route })}
-        >
-          <DirectIcon className="size-4" />
-        </RailButton>
+        {directChatEnabled ? (
+          <RailButton
+            label={DIRECT_CHAT_RENDERER.label}
+            active={activeAppId === DIRECT_CHAT_RENDERER.appId}
+            onClick={() => void navigate({ to: DIRECT_CHAT_RENDERER.route })}
+          >
+            <DirectIcon className="size-4" />
+          </RailButton>
+        ) : null}
       </nav>
       <div className="mt-auto px-2 pb-3">
         <SettingsPopover />
