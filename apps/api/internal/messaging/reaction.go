@@ -49,7 +49,7 @@ func (s *ScopedStore) ToggleReactionIdempotent(ctx context.Context, placeID, mes
 		return Message{}, false, fmt.Errorf("begin scoped reaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return Message{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)

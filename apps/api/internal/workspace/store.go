@@ -745,6 +745,13 @@ func (s *Store) LockAndRequireAppCapability(ctx context.Context, tx pgx.Tx, work
 	if !appCapabilityRefPattern.MatchString(capabilityRef) {
 		return ErrInvalidPermission
 	}
+	// Workspace is the lock root for every Workspace-owned application
+	// mutation. Resolve the app catalog only after it so role changes,
+	// installation lifecycle, and app-domain writes cannot form a
+	// catalog -> Workspace / Workspace -> catalog lock cycle.
+	if err := lockWorkspace(ctx, tx, workspaceID); err != nil {
+		return err
+	}
 	var capabilityID string
 	err := tx.QueryRow(ctx, `
 		SELECT capability_id
@@ -757,7 +764,7 @@ func (s *Store) LockAndRequireAppCapability(ctx context.Context, tx pgx.Tx, work
 	if err != nil {
 		return fmt.Errorf("validate app Workspace-role capability: %w", err)
 	}
-	_, err = s.lockAndRequireEffectiveCapability(ctx, tx, workspaceID, actor, capabilityRef)
+	_, err = s.requireEffectiveCapabilityAfterWorkspaceLock(ctx, tx, workspaceID, actor, capabilityRef)
 	return err
 }
 
@@ -765,6 +772,10 @@ func (s *Store) lockAndRequireEffectiveCapability(ctx context.Context, tx pgx.Tx
 	if err := lockWorkspace(ctx, tx, workspaceID); err != nil {
 		return "", err
 	}
+	return s.requireEffectiveCapabilityAfterWorkspaceLock(ctx, tx, workspaceID, actor, capabilityRef)
+}
+
+func (s *Store) requireEffectiveCapabilityAfterWorkspaceLock(ctx context.Context, tx pgx.Tx, workspaceID string, actor participant.Ref, capabilityRef string) (string, error) {
 	membership, err := activeMembership(ctx, tx, workspaceID, actor)
 	if err != nil {
 		return "", err
@@ -815,6 +826,24 @@ func (s *Store) RequireMembership(ctx context.Context, workspaceID string, actor
 func (s *Store) RequireMembershipInTx(ctx context.Context, tx pgx.Tx, workspaceID string, actor participant.Ref) error {
 	_, err := activeMembership(ctx, tx, workspaceID, actor)
 	return err
+}
+
+// LockSharedAndRequireMembership acquires the Workspace-wide shared authority
+// fence used by application mutations, then resolves the actor's exact active
+// tenure. Membership joins, closures, role changes, and app lifecycle changes
+// acquire the same Workspace row FOR UPDATE, so whichever transaction commits
+// first defines the authority/audience snapshot. Shared holders do not
+// serialize independent application mutations with each other.
+func (s *Store) LockSharedAndRequireMembership(
+	ctx context.Context,
+	tx pgx.Tx,
+	workspaceID string,
+	actor participant.Ref,
+) (Membership, error) {
+	if err := lockWorkspaceShared(ctx, tx, workspaceID); err != nil {
+		return Membership{}, err
+	}
+	return activeMembership(ctx, tx, workspaceID, actor)
 }
 
 // ActiveMembershipInTx returns the exact active tenure an application binds
@@ -1087,12 +1116,23 @@ func permissionsForMembership(ctx context.Context, q querier, membership Members
 }
 
 func lockWorkspace(ctx context.Context, q querier, workspaceID string) error {
+	return lockWorkspaceWithClause(ctx, q, workspaceID, "FOR UPDATE")
+}
+
+func lockWorkspaceShared(ctx context.Context, q querier, workspaceID string) error {
+	return lockWorkspaceWithClause(ctx, q, workspaceID, "FOR SHARE")
+}
+
+func lockWorkspaceWithClause(ctx context.Context, q querier, workspaceID, clause string) error {
 	if !isCanonicalUUIDv7(workspaceID) {
 		return ErrNotFound
 	}
+	if clause != "FOR UPDATE" && clause != "FOR SHARE" {
+		return errors.New("invalid Workspace lock mode")
+	}
 	var locked string
-	err := q.QueryRow(ctx,
-		"SELECT workspace_id FROM workspaces WHERE workspace_id = $1 FOR UPDATE", workspaceID,
+	err := q.QueryRow(ctx, fmt.Sprintf(
+		"SELECT workspace_id FROM workspaces WHERE workspace_id = $1 %s", clause), workspaceID,
 	).Scan(&locked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound

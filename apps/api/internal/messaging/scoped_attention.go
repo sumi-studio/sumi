@@ -82,7 +82,7 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 		return NotificationSetting{}, fmt.Errorf("begin set scoped notification setting: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return NotificationSetting{}, err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -147,7 +147,7 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 		return ParticipantStatus{}, fmt.Errorf("begin set scoped status: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return ParticipantStatus{}, err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -241,7 +241,7 @@ func (s *ScopedStore) CreateReplyLater(ctx context.Context, placeID, messageID, 
 		return ReplyLaterMarker{}, false, fmt.Errorf("begin scoped reply-later: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return ReplyLaterMarker{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
@@ -290,7 +290,7 @@ func (s *ScopedStore) ResolveReplyLater(ctx context.Context, markerID string) (R
 		return ReplyLaterMarker{}, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return ReplyLaterMarker{}, err
 	}
 	marker := ReplyLaterMarker{MarkerID: markerID, Participant: s.Scope.Actor}
