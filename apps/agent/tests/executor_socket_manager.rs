@@ -290,7 +290,7 @@ async fn health_is_exact_role_bound_and_side_effect_free() {
 }
 
 #[tokio::test]
-async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
+async fn production_socket_exposes_only_workspace_read_discovery_without_side_effects() {
     let mut fixture = Fixture::new().await;
     let sentinel = fixture.workspace.join("sentinel.txt");
     std::fs::write(&sentinel, "original").unwrap();
@@ -321,22 +321,6 @@ async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
             "execution_id": "forbidden-remove",
         }),
         json!({
-            "type": "list_dir",
-            "path": ".",
-            "execution_id": "forbidden-list",
-        }),
-        json!({
-            "type": "glob",
-            "pattern": "*",
-            "execution_id": "forbidden-glob",
-        }),
-        json!({
-            "type": "grep",
-            "path": ".",
-            "pattern": "needle",
-            "execution_id": "forbidden-grep",
-        }),
-        json!({
             "type": "cancel",
             "execution_id": "unknown",
         }),
@@ -360,6 +344,35 @@ async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
         .await;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["result"]["Err"]["code"], "protocol");
+    }
+
+    let allowed = [
+        json!({
+            "type": "list_dir",
+            "path": ".",
+            "execution_id": "allowed-list",
+        }),
+        json!({
+            "type": "glob",
+            "pattern": "*.txt",
+            "execution_id": "allowed-glob",
+        }),
+        json!({
+            "type": "grep",
+            "path": ".",
+            "pattern": "original",
+            "execution_id": "allowed-grep",
+        }),
+    ];
+    let expected = ["listed", "globbed", "grepped"];
+    for (index, (operation, expected_type)) in allowed.into_iter().zip(expected).enumerate() {
+        let frames = exchange(
+            &fixture.executor_socket,
+            &request(NONCE, &format!("allowed-{index}"), operation),
+        )
+        .await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["result"]["Ok"]["type"], expected_type);
     }
     assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "original");
 }

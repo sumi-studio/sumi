@@ -371,12 +371,26 @@ impl ToolRegistryBuilder {
         }
     }
 
-    pub(crate) fn build_for_executor_identity(self, identity: RpcIdentity) -> ToolRegistry {
-        ToolRegistry {
+    pub(crate) fn build_bound_for_executor_identity(
+        self,
+        identity: RpcIdentity,
+    ) -> Result<ToolRegistry, ToolError> {
+        let missing_binders = self
+            .tools
+            .iter()
+            .filter_map(|(name, tool)| tool.bound_adapter.is_none().then_some(name.as_str()))
+            .collect::<Vec<_>>();
+        if !missing_binders.is_empty() {
+            return Err(ToolError::Protocol(format!(
+                "production tool registry contains tools without binding adapters: {}",
+                missing_binders.join(", ")
+            )));
+        }
+        Ok(ToolRegistry {
             tools: self.tools,
             executor_identity: Some(identity),
             registry_seal: Arc::new(()),
-        }
+        })
     }
 }
 
