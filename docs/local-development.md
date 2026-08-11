@@ -128,6 +128,26 @@ not a public OpenAI API-key or production-provider contract.
 
 ## Start and verify
 
+### Pre-cutover Workspace database reset boundary
+
+Migration `0008_workspace_core` intentionally replaces the earlier
+pre-dogfooding `0008_messaging_schema`. A database that has recorded the old
+version is not upgraded, backfilled, or adopted: the migrator stops with an
+explicit reset-required error before applying `0009`.
+
+Before Developer Workspace contains data that must survive, reset that local
+database and migrate from empty:
+
+```sh
+docker compose -f deploy/local/compose.yaml down -v
+make db-up
+make migrate
+```
+
+The `down -v` command deletes the local control-plane volume. Do not run it
+against a database whose contents must be retained; this boundary exists only
+for the current pre-cutover environment.
+
 First validate configuration, then start:
 
 ```sh
