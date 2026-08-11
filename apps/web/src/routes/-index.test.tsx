@@ -13,16 +13,16 @@ vi.mock("../auth/auth-gate", () => ({
   AuthGate: ({ children }: { children: ReactNode }) => children,
 }));
 
-vi.mock("../messaging/components/messaging-screen", () => ({
-  MessagingScreen: () => <main>場所を選択</main>,
+vi.mock("../workspace/components/workspace-landing", () => ({
+  WorkspaceLanding: () => <main>Workspaceを選択</main>,
 }));
 
 import { HomeRoute } from "./index";
 
-describe("messaging home route", () => {
-  it("renders an unselected home instead of guessing the first channel", () => {
+describe("Workspace home route", () => {
+  it("renders the explicit Workspace control-plane entry", () => {
     render(<HomeRoute />);
 
-    expect(screen.getByRole("main")).toHaveTextContent("場所を選択");
+    expect(screen.getByRole("main")).toHaveTextContent("Workspaceを選択");
   });
 });

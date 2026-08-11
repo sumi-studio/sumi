@@ -1,16 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { AuthGate } from "../auth/auth-gate";
-import { MessagingScreen } from "../messaging/components/messaging-screen";
+import { WorkspaceContextRequired } from "../workspace/components/workspace-context-required";
 
 export const Route = createFileRoute("/dm/$dmId")({
-  component: () => (
-    <AuthGate>
-      <DmRoute />
-    </AuthGate>
-  ),
+  component: WorkspaceContextRequired,
 });
-
-function DmRoute() {
-  const { dmId } = Route.useParams();
-  return <MessagingScreen placeKey={`dm:${dmId}`} />;
-}

@@ -1,16 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { AuthGate } from "../auth/auth-gate";
-import { MessagingScreen } from "../messaging/components/messaging-screen";
+import { WorkspaceContextRequired } from "../workspace/components/workspace-context-required";
 
 export const Route = createFileRoute("/c/$channelId")({
-  component: () => (
-    <AuthGate>
-      <ChannelRoute />
-    </AuthGate>
-  ),
+  component: WorkspaceContextRequired,
 });
-
-function ChannelRoute() {
-  const { channelId } = Route.useParams();
-  return <MessagingScreen placeKey={`channel:${channelId}`} />;
-}

@@ -3,6 +3,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiMessagingBackend } from "./api-backend";
 import type { ServerEvent } from "./model";
+import {
+  expectScopedMessagingPath,
+  MESSAGING_SCOPE,
+  scopedMessagingTestPath,
+} from "./scope.test-support";
 
 const channel = { kind: "channel", channelId: "channel-1" } as const;
 const bootstrap = {
@@ -57,7 +62,7 @@ describe("ApiMessagingBackend", () => {
   it("uses the browser session REST surface for bootstrap, history, send, and read", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = expectScopedMessagingPath(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (path.includes("/messages?") && init?.method === "GET") {
           return json({ messages: [messageWire(1, "hello")] });
@@ -80,7 +85,7 @@ describe("ApiMessagingBackend", () => {
       },
     );
     vi.stubGlobal("fetch", fetchMock);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
 
     const snapshot = await backend.bootstrap();
     expect(snapshot.channels[0]?.name).toBe("general");
@@ -103,7 +108,7 @@ describe("ApiMessagingBackend", () => {
     await backend.markRead(channel, 2);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/places/channel-1/read-through",
+      scopedMessagingTestPath("/messaging/places/channel-1/read-through"),
       expect.objectContaining({
         method: "PUT",
         credentials: "include",
@@ -118,7 +123,7 @@ describe("ApiMessagingBackend", () => {
       vi.fn(async () => json(bootstrap)),
     );
     vi.stubGlobal("WebSocket", FakeWebSocket);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     await backend.bootstrap();
     const events: ServerEvent[] = [];
     backend.subscribe((event) => events.push(event), {
@@ -149,7 +154,7 @@ describe("ApiMessagingBackend", () => {
   it("returns the canonical REST reaction result and projects WS updates", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = expectScopedMessagingPath(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (path.endsWith("/reactions") && init?.method === "POST") {
           return json({
@@ -167,7 +172,7 @@ describe("ApiMessagingBackend", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("WebSocket", FakeWebSocket);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     expect(backend.capabilities.reactions).toBe(true);
     await backend.bootstrap();
 
@@ -183,7 +188,9 @@ describe("ApiMessagingBackend", () => {
       "reaction-nonce-1",
     );
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/places/channel-1/messages/message-1/reactions",
+      scopedMessagingTestPath(
+        "/messaging/places/channel-1/messages/message-1/reactions",
+      ),
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ emoji: "👍", client_nonce: "reaction-nonce-1" }),
@@ -284,7 +291,7 @@ describe("ApiMessagingBackend", () => {
   it("creates channels, dms, and group dms and edits topics over REST", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = expectScopedMessagingPath(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (path === "/messaging/channels" && init?.method === "POST") {
           return json(channelSummaryWire("開発の相談"), 201);
@@ -323,7 +330,7 @@ describe("ApiMessagingBackend", () => {
       },
     );
     vi.stubGlobal("fetch", fetchMock);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     await backend.bootstrap();
 
     await expect(
@@ -336,7 +343,7 @@ describe("ApiMessagingBackend", () => {
       visibility: "public",
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/channels",
+      scopedMessagingTestPath("/messaging/channels"),
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
@@ -351,7 +358,7 @@ describe("ApiMessagingBackend", () => {
       backend.ensureDM({ kind: "human", humanId: "human-2" }),
     ).resolves.toMatchObject({ dmId: "dm-1", kind: "dm" });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/dms",
+      scopedMessagingTestPath("/messaging/dms"),
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
@@ -378,7 +385,7 @@ describe("ApiMessagingBackend", () => {
       vi.fn(async () => json(bootstrap)),
     );
     vi.stubGlobal("WebSocket", FakeWebSocket);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     await backend.bootstrap();
     const events: ServerEvent[] = [];
     backend.subscribe((event) => events.push(event));
@@ -429,7 +436,7 @@ describe("ApiMessagingBackend", () => {
       vi.fn(async () => json(bootstrap)),
     );
     vi.stubGlobal("WebSocket", FakeWebSocket);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     await backend.bootstrap();
     backend.subscribe(() => {}, {
       sinceByPlace: { "channel:channel-1": 4 },
@@ -490,7 +497,7 @@ describe("ApiMessagingBackend", () => {
     };
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = expectScopedMessagingPath(input);
         if (path === "/messaging/bootstrap") return json(presenceBootstrap);
         if (path === "/messaging/status" && init?.method === "PUT") {
           return json({
@@ -526,7 +533,7 @@ describe("ApiMessagingBackend", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("WebSocket", FakeWebSocket);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
 
     const snapshot = await backend.bootstrap();
     expect(snapshot.statuses).toEqual([
@@ -555,7 +562,7 @@ describe("ApiMessagingBackend", () => {
       expiresAt: null,
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/status",
+      scopedMessagingTestPath("/messaging/status"),
       expect.objectContaining({
         method: "PUT",
         body: JSON.stringify({ status: "busy", note: "取り込み中" }),
@@ -571,7 +578,9 @@ describe("ApiMessagingBackend", () => {
       resolved: false,
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/places/channel-1/messages/message-1/reply-later",
+      scopedMessagingTestPath(
+        "/messaging/places/channel-1/messages/message-1/reply-later",
+      ),
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ remind_at: "2026-08-01T11:00:00.000Z" }),
@@ -582,7 +591,7 @@ describe("ApiMessagingBackend", () => {
       resolved: true,
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/reply-later/marker-3/resolve",
+      scopedMessagingTestPath("/messaging/reply-later/marker-3/resolve"),
       expect.objectContaining({ method: "POST" }),
     );
 
@@ -628,7 +637,7 @@ describe("ApiMessagingBackend", () => {
   it("carries the receiver's notification setting and the per-recipient notify", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = expectScopedMessagingPath(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (
           path === "/messaging/notification-settings" &&
@@ -646,7 +655,7 @@ describe("ApiMessagingBackend", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("WebSocket", FakeWebSocket);
-    const backend = new ApiMessagingBackend();
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     expect(backend.capabilities.notifications).toBe(true);
 
     const snapshot = await backend.bootstrap();
@@ -663,7 +672,7 @@ describe("ApiMessagingBackend", () => {
       keywords: ["リリース"],
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/messaging/notification-settings",
+      scopedMessagingTestPath("/messaging/notification-settings"),
       expect.objectContaining({
         method: "PUT",
         body: JSON.stringify({

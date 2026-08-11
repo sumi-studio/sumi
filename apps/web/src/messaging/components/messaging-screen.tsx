@@ -19,7 +19,11 @@ import {
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
-import { setNotificationNavigator, useMessaging } from "../store";
+import {
+  getMessagingScope,
+  setNotificationNavigator,
+  useMessaging,
+} from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
@@ -552,7 +556,10 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
 
   return (
     <div className="flex h-dvh bg-background text-foreground">
-      <AppRail activeAppId="home" />
+      <AppRail
+        activeAppId="messaging"
+        workspaceId={getMessagingScope()?.workspaceId}
+      />
       <Sidebar selectedPlaceKey={selectedPlaceKey} />
       {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
           開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
