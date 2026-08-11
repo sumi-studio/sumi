@@ -407,9 +407,9 @@ func TestPublishMessageCreatedAuthorizesAllIntentVariantsOnce(t *testing.T) {
 	authorizer := &countingHubAuthorizer{store: w.store}
 	hub := newHub(authorizer)
 	subs := []*subscriber{
-		hub.subscribe(w.humanA),
-		hub.subscribe(w.humanB),
-		hub.subscribe(w.agent),
+		hub.subscribe(w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanA)),
+		hub.subscribe(w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)),
+		hub.subscribe(w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.agent)),
 	}
 	for _, sub := range subs {
 		defer hub.unsubscribe(sub)

@@ -316,7 +316,7 @@ func replyLaterToWire(marker ReplyLaterMarker, viewer ParticipantRef) replyLater
 
 // publishReplyLaterCreated fans one durable creation out as two per-audience
 // payloads: the owner's copy carries remind_at, everyone else's does not.
-func (s *Server) publishReplyLaterCreated(ctx context.Context, marker ReplyLaterMarker) {
+func (s *Server) publishReplyLaterCreated(ctx context.Context, store *ScopedStore, marker ReplyLaterMarker) {
 	if s.Hub == nil {
 		return
 	}
@@ -331,17 +331,17 @@ func (s *Server) publishReplyLaterCreated(ctx context.Context, marker ReplyLater
 		Type: EventReplyLaterCreated, PlaceID: marker.PlaceID,
 		Marker: &publicWire, ExceptFor: []ParticipantRef{owner},
 	}
-	s.Hub.PublishVariants(ctx, []Event{ownerEvent, publicEvent})
+	_ = s.Hub.PublishVariantsScoped(ctx, store, []Event{ownerEvent, publicEvent})
 }
 
 // publishReplyLaterResolved announces a kept promise. Only the identifier
 // travels: everyone who saw the marker appear can retire it, and nothing
 // private needs re-stating to do so.
-func (s *Server) publishReplyLaterResolved(ctx context.Context, marker ReplyLaterMarker) {
+func (s *Server) publishReplyLaterResolved(ctx context.Context, store *ScopedStore, marker ReplyLaterMarker) {
 	if s.Hub == nil {
 		return
 	}
-	s.Hub.Publish(ctx, Event{
+	_ = s.Hub.PublishScoped(ctx, store, Event{
 		Type: EventReplyLaterResolved, PlaceID: marker.PlaceID, MarkerID: marker.MarkerID,
 	})
 }
@@ -426,19 +426,19 @@ func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, pl
 		Type: EventMessageCreated, PlaceID: place.PlaceID,
 		Message: &wire, ExceptFor: notified,
 	})
-	hub.PublishVariants(ctx, events)
+	_ = hub.PublishVariantsScoped(ctx, store, events)
 }
 
 // publishStatus fans a self-declared status out to everyone who may see the
 // participant. It is volatile like typing: the current value is in bootstrap,
 // so a missed frame costs nothing.
-func (s *Server) publishStatus(ctx context.Context, status ParticipantStatus) {
+func (s *Server) publishStatus(ctx context.Context, store *ScopedStore, status ParticipantStatus) {
 	if s.Hub == nil {
 		return
 	}
 	subject := status.Participant
 	wire := statusToWire(status)
-	s.Hub.Publish(ctx, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
+	_ = s.Hub.PublishScoped(ctx, store, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
 }
 
 type unreadSummaryWire struct {
@@ -704,7 +704,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := channelToWire(place)
-	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
 	writeJSON(w, http.StatusCreated, wire)
 }
 
@@ -738,7 +738,7 @@ func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := channelToWire(place)
-	s.Hub.Publish(r.Context(), Event{Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire})
+	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire})
 	writeJSON(w, http.StatusOK, wire)
 }
 
@@ -779,7 +779,7 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		Participants: []participantWire{participantToWire(viewer), participantToWire(other)},
 	}
 	if created {
-		s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
 	}
 	writeJSON(w, http.StatusOK, wire)
 }
@@ -821,7 +821,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		DMID: place.PlaceID, Kind: place.Kind,
 		Participants: append([]participantWire{participantToWire(viewer)}, req.Participants...),
 	}
-	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
 	writeJSON(w, http.StatusCreated, wire)
 }
 
@@ -996,7 +996,7 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := messageToWire(place, msg)
-	s.Hub.Publish(r.Context(), Event{Type: EventMessageEdited, PlaceID: placeID, Message: &wire})
+	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventMessageEdited, PlaceID: placeID, Message: &wire})
 	writeJSON(w, http.StatusOK, struct {
 		Message messageWire `json:"message"`
 	}{Message: wire})
@@ -1028,7 +1028,7 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := messageToWire(place, msg)
-	s.Hub.Publish(r.Context(), Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
+	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1125,7 +1125,7 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	s.publishStatus(r.Context(), status)
+	s.publishStatus(r.Context(), scopedStoreForRequest(r), status)
 	writeJSON(w, http.StatusOK, statusToWire(status))
 }
 
@@ -1245,7 +1245,7 @@ func (s *Server) serveCreateReplyLater(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if created {
-		s.publishReplyLaterCreated(r.Context(), marker)
+		s.publishReplyLaterCreated(r.Context(), scopedStoreForRequest(r), marker)
 	}
 	status := http.StatusCreated
 	if !created {
@@ -1278,7 +1278,7 @@ func (s *Server) serveResolveReplyLater(w http.ResponseWriter, r *http.Request) 
 		writeStoreError(w, err)
 		return
 	}
-	s.publishReplyLaterResolved(r.Context(), marker)
+	s.publishReplyLaterResolved(r.Context(), scopedStoreForRequest(r), marker)
 	writeJSON(w, http.StatusOK, struct {
 		Marker replyLaterWire `json:"marker"`
 	}{Marker: replyLaterToWire(marker, viewer)})

@@ -212,14 +212,14 @@ func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[str
 			event := Event{Type: EventMessageCreated, PlaceID: placeID}
 			wire := messageToWire(place, m)
 			event.Message = &wire
-			if !s.enqueueJSON(sub, struct {
+			if !s.enqueueJSONAt(sub, liveBoundary{placeID: placeID}, struct {
 				Type  string `json:"type"`
 				Event Event  `json:"event"`
 			}{Type: "event", Event: event}) {
 				return false
 			}
 		}
-		if !s.enqueueJSON(sub, struct {
+		if !s.enqueueJSONAt(sub, liveBoundary{placeID: placeID}, struct {
 			Type      string `json:"type"`
 			PlaceID   string `json:"place_id"`
 			LatestSeq int64  `json:"latest_seq"`
@@ -248,7 +248,7 @@ func (s *WSServer) readPump(ctx context.Context, conn *websocket.Conn, sub *subs
 		case "send":
 			s.handleSend(ctx, sub, claims, frame)
 		case "typing":
-			s.handleTyping(ctx, sub, frame)
+			s.handleTyping(ctx, sub, claims, frame)
 		default:
 			s.enqueueError(sub, "unknown_frame", "")
 			return
@@ -300,7 +300,7 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 	}
 	// Receipt to the sender first, then fan-out (the sender also receives the
 	// event and reconciles by client_nonce).
-	s.enqueueJSON(sub, struct {
+	s.enqueueJSONAt(sub, liveBoundary{placeID: frame.PlaceID}, struct {
 		Type        string `json:"type"`
 		ClientNonce string `json:"client_nonce"`
 		MessageID   string `json:"message_id"`
@@ -312,14 +312,29 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 	}
 }
 
-func (s *WSServer) handleTyping(ctx context.Context, sub *subscriber, frame wsClientFrame) {
+func (s *WSServer) handleTyping(
+	ctx context.Context,
+	sub *subscriber,
+	claims agentevents.UserSessionClaims,
+	frame wsClientFrame,
+) {
 	// Volatile and best-effort: no receipt, no replay. Visibility is still
-	// checked so typing cannot probe places.
-	if _, err := sub.store.PlaceFor(ctx, frame.PlaceID); err != nil {
+	// checked so typing cannot probe places. Unlike a durable post-commit
+	// event, typing is a fresh Human operation: session admission and exact
+	// Workspace/install/place authority remain leased through audience resolve
+	// and enqueue.
+	if sub == nil || sub.store == nil || s.Sessions == nil || s.Hub == nil {
 		return
 	}
-	actor := participantToWire(sub.viewer)
-	s.Hub.Publish(ctx, Event{Type: EventTyping, PlaceID: frame.PlaceID, Actor: &actor})
+	boundary := liveBoundary{placeID: frame.PlaceID}
+	_ = s.Sessions.AuthorizeSession(ctx, claims, func() error {
+		return sub.store.withLiveAuthorityLease(ctx, boundary, func() error {
+			actor := participantToWire(sub.viewer)
+			return s.Hub.PublishScoped(ctx, sub.store, Event{
+				Type: EventTyping, PlaceID: frame.PlaceID, Actor: &actor,
+			})
+		})
+	})
 }
 
 func (s *WSServer) writePump(
@@ -340,12 +355,16 @@ func (s *WSServer) writePump(
 			_ = conn.Close()
 			return
 		case frame := <-sub.send:
-			if err := s.authorizeWrite(ctx, conn, sub, claims, websocket.TextMessage, frame); err != nil {
+			if err := s.authorizeWrite(
+				ctx, conn, sub, claims, websocket.TextMessage, frame.payload, frame.boundary,
+			); err != nil {
 				_ = conn.Close()
 				return
 			}
 		case <-ticker.C:
-			if err := s.authorizeWrite(ctx, conn, sub, claims, websocket.PingMessage, nil); err != nil {
+			if err := s.authorizeWrite(
+				ctx, conn, sub, claims, websocket.PingMessage, nil, liveBoundary{},
+			); err != nil {
 				_ = conn.Close()
 				return
 			}
@@ -360,6 +379,7 @@ func (s *WSServer) authorizeWrite(
 	claims agentevents.UserSessionClaims,
 	messageType int,
 	payload []byte,
+	boundary liveBoundary,
 ) error {
 	writeCtx, cancel := context.WithTimeout(ctx, s.WriteTimeout)
 	defer cancel()
@@ -367,11 +387,10 @@ func (s *WSServer) authorizeWrite(
 		if sub == nil || sub.store == nil {
 			return ErrInvalidScope
 		}
-		if err := sub.store.authorize(writeCtx); err != nil {
-			return err
-		}
-		_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
-		return conn.WriteMessage(messageType, payload)
+		return sub.store.withLiveAuthorityLease(writeCtx, boundary, func() error {
+			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
+			return conn.WriteMessage(messageType, payload)
+		})
 	})
 }
 
@@ -418,6 +437,10 @@ func (s *WSServer) CloseBrowserSession(sessionID string) {
 // enqueueJSON queues a frame for the writer. False means the subscriber is
 // gone (buffer overflow or unsubscribed) and the caller should stop.
 func (s *WSServer) enqueueJSON(sub *subscriber, body any) bool {
+	return s.enqueueJSONAt(sub, liveBoundary{}, body)
+}
+
+func (s *WSServer) enqueueJSONAt(sub *subscriber, boundary liveBoundary, body any) bool {
 	frame, err := json.Marshal(body)
 	if err != nil {
 		return false
@@ -425,7 +448,7 @@ func (s *WSServer) enqueueJSON(sub *subscriber, body any) bool {
 	select {
 	case <-sub.done:
 		return false
-	case sub.send <- frame:
+	case sub.send <- outboundFrame{payload: frame, boundary: boundary}:
 		return true
 	default:
 		s.Hub.unsubscribe(sub)

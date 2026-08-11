@@ -263,7 +263,7 @@ func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
 	hub := NewHub(w.store.core)
 	server := NewServer(w.store.core, nil)
 	server.Hub = hub
-	sub := hub.subscribe(w.humanA)
+	sub := hub.subscribe(w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanA))
 	sub.markVisible(ch.PlaceID, true)
 	t.Cleanup(func() { hub.unsubscribe(sub) })
 
@@ -293,7 +293,7 @@ func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
 			var frame struct {
 				Event Event `json:"event"`
 			}
-			if err := json.Unmarshal(raw, &frame); err != nil {
+			if err := json.Unmarshal(raw.payload, &frame); err != nil {
 				t.Fatalf("decode reaction event: %v", err)
 			}
 			if frame.Event.Reaction == nil || len(frame.Event.Reaction.Reactions) != 1 {

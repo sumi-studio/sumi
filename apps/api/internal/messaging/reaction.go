@@ -32,7 +32,7 @@ func (s *Server) toggleScopedReaction(ctx context.Context, store *ScopedStore, p
 	}
 	if s.Hub != nil {
 		update := reactionUpdateToWire(message)
-		s.Hub.Publish(ctx, Event{Type: EventReactionUpdated, PlaceID: placeID, Reaction: &update})
+		_ = s.Hub.PublishScoped(ctx, store, Event{Type: EventReactionUpdated, PlaceID: placeID, Reaction: &update})
 	}
 	return message, reacted, nil
 }

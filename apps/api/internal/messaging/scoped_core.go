@@ -273,11 +273,31 @@ func (s *ScopedStore) PlaceFor(ctx context.Context, placeID string) (Place, erro
 }
 
 func (s *ScopedStore) loadScopedPlace(ctx context.Context, q querier, placeID string) (Place, error) {
+	return s.loadScopedPlaceWithClause(ctx, q, placeID, "")
+}
+
+// lockScopedPlace is the place-level half of the live authority fence. The
+// Workspace fence is always acquired first. Place admission/closure takes the
+// conflicting row lock, so audience and exact access cannot change during the
+// protected effect.
+func (s *ScopedStore) lockScopedPlace(ctx context.Context, q querier, placeID string) (Place, error) {
+	return s.loadScopedPlaceWithClause(ctx, q, placeID, " FOR SHARE")
+}
+
+func (s *ScopedStore) loadScopedPlaceWithClause(
+	ctx context.Context,
+	q querier,
+	placeID string,
+	lockClause string,
+) (Place, error) {
+	if lockClause != "" && lockClause != " FOR SHARE" {
+		return Place{}, errors.New("invalid place lock mode")
+	}
 	var place Place
 	var name *string
 	err := q.QueryRow(ctx, `
 		SELECT place_id, kind, workspace_id, name, topic, visibility, last_seq
-		FROM places WHERE workspace_id = $1 AND place_id = $2`,
+		FROM places WHERE workspace_id = $1 AND place_id = $2`+lockClause,
 		s.Scope.WorkspaceID, placeID).Scan(&place.PlaceID, &place.Kind, &place.WorkspaceID,
 		&name, &place.Topic, &place.Visibility, &place.LastSeq)
 	if errors.Is(err, pgx.ErrNoRows) {

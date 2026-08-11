@@ -300,7 +300,7 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 		writeStoreError(w, err)
 		return
 	}
-	s.publishStatus(r.Context(), status)
+	s.publishStatus(r.Context(), store, status)
 	writeJSON(w, http.StatusOK, struct {
 		Status statusWire `json:"status"`
 	}{statusToWire(status)})
@@ -345,7 +345,7 @@ func (s *Server) localReplyLater(w http.ResponseWriter, r *http.Request, authori
 		return
 	}
 	if created {
-		s.publishReplyLaterCreated(r.Context(), marker)
+		s.publishReplyLaterCreated(r.Context(), store, marker)
 	}
 	// TODO(#128): the agent's own reminder rides the「予定された出来事」覚醒
 	// トリガ from here once that trigger exists; the marker is already durable.
@@ -383,7 +383,7 @@ func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, 
 		writeStoreError(w, err)
 		return
 	}
-	s.publishReplyLaterResolved(r.Context(), marker)
+	s.publishReplyLaterResolved(r.Context(), store, marker)
 	writeJSON(w, http.StatusOK, struct {
 		Marker replyLaterWire `json:"marker"`
 	}{replyLaterToWire(marker, viewer)})

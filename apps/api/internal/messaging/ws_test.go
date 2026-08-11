@@ -233,7 +233,8 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 		if _, err := sessions.RevokeSession(ctx, cookie); err != nil {
 			t.Fatal(err)
 		}
-		hub.Publish(ctx, Event{Type: EventTyping, PlaceID: placeID})
+		store := w.store.mustScopeForPlace(t, ctx, placeID, w.humanA)
+		_ = hub.PublishScoped(ctx, store, Event{Type: EventTyping, PlaceID: placeID})
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		if _, _, err := conn.ReadMessage(); err == nil {
 			t.Fatal("revoked session received a positive-cached hub event")
@@ -409,7 +410,7 @@ func TestHubReauthorizesWarmedVisibilityAfterMembershipRemoval(t *testing.T) {
 			// This is the broad fallback frame (no OnlyFor). Even though the
 			// subscriber once had a positive cache entry, current membership must
 			// fence the full message body after the removal commit.
-			hub.Publish(ctx, Event{
+			_ = hub.PublishScoped(ctx, w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanA), Event{
 				Type: EventMessageCreated, PlaceID: ch.PlaceID, Message: &wire,
 			})
 			if got := len(sub.send); got != 0 {
@@ -423,27 +424,24 @@ type countingHubAuthorizer struct {
 	placeCalls       int
 	participantCalls int
 	audience         map[ParticipantRef]struct{}
-	store            hubAuthorizer
+	store            *testMessagingStore
 }
 
-func (a *countingHubAuthorizer) ActiveParticipantsForPlace(
-	ctx context.Context, placeID string,
-) (map[ParticipantRef]struct{}, error) {
-	a.placeCalls++
-	if a.store != nil {
-		return a.store.ActiveParticipantsForPlace(ctx, placeID)
+func (a *countingHubAuthorizer) withLiveAudience(
+	ctx context.Context,
+	scope Scope,
+	boundary liveBoundary,
+	deliver func(map[ParticipantRef]struct{}) error,
+) error {
+	if boundary.placeID != "" {
+		a.placeCalls++
+	} else {
+		a.participantCalls++
 	}
-	return a.audience, nil
-}
-
-func (a *countingHubAuthorizer) ParticipantsVisibleTo(
-	ctx context.Context, participant ParticipantRef,
-) (map[ParticipantRef]struct{}, error) {
-	a.participantCalls++
 	if a.store != nil {
-		return a.store.ParticipantsVisibleTo(ctx, participant)
+		return a.store.core.withLiveAudience(ctx, scope, boundary, deliver)
 	}
-	return a.audience, nil
+	return deliver(a.audience)
 }
 
 func TestHubBatchesAuthorizationAndVariantFanout(t *testing.T) {
