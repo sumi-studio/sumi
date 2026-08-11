@@ -301,6 +301,7 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	var databasePool *pgxpool.Pool
 	var messagingServer *messaging.Server
+	var workspaceServer *workspacecontrol.Server
 	if database != nil {
 		databasePool = database.Pool
 	}
@@ -347,6 +348,11 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		workspaceStore := workspacecontrol.New(database.Pool)
 		appStore := applicationapps.New(database.Pool, workspaceStore)
+		workspaceServer = workspacecontrol.NewServer(workspaceStore, appStore, messagingSessions)
+		workspaceServer.AllowedOrigins = browserOrigins
+		workspaceServer.RegisterRoutes(mux)
+		log.Print("workspace and app lifecycle routes ready")
+
 		messagingStore := messaging.New(database.Pool, workspaceStore, appStore)
 		messagingHub := messaging.NewHub(messagingStore)
 		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
@@ -374,6 +380,12 @@ func newApplicationFromEnv() (*application, error) {
 		if err := messagingServer.RegisterLocalControlRoutes(localControl); err != nil {
 			closeOnError()
 			return nil, fmt.Errorf("register messaging local control routes: %w", err)
+		}
+	}
+	if localControl != nil && workspaceServer != nil {
+		if err := workspaceServer.RegisterLocalControlRoutes(localControl); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("register workspace local control routes: %w", err)
 		}
 	}
 	localListener, err := localControlListenerFromEnv(enabled)
