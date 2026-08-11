@@ -243,7 +243,7 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 		s.enqueueError(sub, "invalid_urgency", frame.ClientNonce)
 		return
 	}
-	if frame.Content == "" || len(frame.Content) > MaxContentBytes {
+	if frame.Content == "" || !messageContentFitsStorage(frame.Content) {
 		s.enqueueError(sub, "invalid_content", frame.ClientNonce)
 		return
 	}

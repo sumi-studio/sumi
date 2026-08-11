@@ -238,8 +238,10 @@ export interface SendMessageInput {
 
 /** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
 export interface SendReceipt {
+  clientNonce: string;
   messageId: string;
   seq: number;
+  created: boolean;
 }
 
 export type ConnectionState = "connected" | "reconnecting" | "disconnected";

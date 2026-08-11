@@ -722,7 +722,12 @@ mod tests {
                 request.content.to_owned(),
                 request.client_nonce.to_owned(),
             ));
-            Ok(json!({"message_id": "m8", "seq": 8}))
+            Ok(json!({
+                "client_nonce": request.client_nonce,
+                "message_id": "m8",
+                "seq": 8,
+                "created": true
+            }))
         }
 
         async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {
@@ -1053,10 +1058,23 @@ mod tests {
         execute(&tool, json!({"action": "write", "content": "hi"}), "write")
             .await
             .unwrap();
+        execute(&tool, json!({"action": "write", "content": "hi"}), "write")
+            .await
+            .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "hi"}),
+            "write-again",
+        )
+        .await
+        .unwrap();
         let writes = api.writes.lock().await;
         assert_eq!(writes[0].0, "general");
         assert_eq!(writes[0].1, "hi");
         assert_eq!(writes[0].2, client_nonce("flow", "write"));
+        assert_eq!(writes[1].2, writes[0].2);
+        assert_eq!(writes[2].2, client_nonce("flow", "write-again"));
+        assert_ne!(writes[2].2, writes[0].2);
     }
 
     #[tokio::test]

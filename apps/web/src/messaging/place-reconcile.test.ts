@@ -120,7 +120,12 @@ class FakeBackend implements MessagingBackend {
     throw new Error("unused");
   }
   async sendMessage() {
-    return { messageId: "unused", seq: 1 };
+    return {
+      clientNonce: "unused",
+      messageId: "unused",
+      seq: 1,
+      created: true,
+    };
   }
   async editMessage() {}
   async deleteMessage() {}

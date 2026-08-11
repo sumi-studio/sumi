@@ -183,18 +183,25 @@ func TestSendIsIdempotentAcrossRetriesOverHTTP(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("send: status %d body %v", resp.StatusCode, body)
 	}
-	msg := body["message"].(map[string]any)
-	if msg["urgency"] != "urgent" || len(msg["mentions"].([]any)) != 1 {
-		t.Fatalf("message = %v", msg)
-	}
 	firstID := body["message_id"].(string)
+	if body["client_nonce"] != "nonce-1" || body["created"] != true || len(body) != 4 {
+		t.Fatalf("create receipt = %v", body)
+	}
+	history, err := w.store.History(ctx, ch.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil || len(history) != 1 {
+		t.Fatalf("history after send = %#v, err %v", history, err)
+	}
+	if history[0].Urgency != "urgent" || len(history[0].Mentions) != 1 {
+		t.Fatalf("stored message = %#v", history[0])
+	}
 
 	// Retry with the same nonce: 200, same identity, no second message.
 	resp, body = call(t, ts, http.MethodPost, path, w.humanA.ID, send)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("retry: status %d, want 200", resp.StatusCode)
 	}
-	if body["message_id"] != firstID || body["seq"].(float64) != 1 {
+	if body["message_id"] != firstID || body["seq"].(float64) != 1 ||
+		body["client_nonce"] != "nonce-1" || body["created"] != false || len(body) != 4 {
 		t.Fatalf("retry receipt = %v", body)
 	}
 

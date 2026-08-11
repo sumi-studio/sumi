@@ -14,9 +14,10 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
-// maxRequestBytes bounds any /messaging request body: the largest legal
-// message content plus envelope headroom.
-const maxRequestBytes = MaxContentBytes + 64*1024
+// maxRequestBytes bounds any /messaging JSON request body. One legal content
+// byte can occupy six wire bytes when JSON escapes a control character
+// ("\\u0001"), so the cap covers that worst case plus envelope headroom.
+const maxRequestBytes = 6*MaxContentBytes + 64*1024
 
 // maxTopicBytes bounds a channel topic: one header line, not a document.
 const maxTopicBytes = 1000
@@ -179,6 +180,26 @@ func reactionUpdateToWire(m Message) reactionUpdateWire {
 	return reactionUpdateWire{
 		MessageID: m.MessageID,
 		Reactions: reactionsToWire(m.Reactions),
+	}
+}
+
+// messageReceiptWire is the shared mutation acknowledgement for browser REST
+// and the agent local-control adapter. It excludes message content so a
+// maximum-size committed write always fits the agent's bounded response. The
+// durable message itself arrives through timeline/event projection.
+type messageReceiptWire struct {
+	ClientNonce string `json:"client_nonce"`
+	MessageID   string `json:"message_id"`
+	Seq         int64  `json:"seq"`
+	Created     bool   `json:"created"`
+}
+
+func messageReceiptToWire(message Message, created bool) messageReceiptWire {
+	return messageReceiptWire{
+		ClientNonce: message.ClientNonce,
+		MessageID:   message.MessageID,
+		Seq:         message.Seq,
+		Created:     created,
 	}
 }
 
@@ -861,7 +882,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_urgency")
 		return
 	}
-	if req.Content == "" || len(req.Content) > MaxContentBytes {
+	if req.Content == "" || !messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
@@ -901,11 +922,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	if created {
 		publishMessageCreated(r.Context(), s.Store, s.Hub, place, msg)
 	}
-	writeJSON(w, status, struct {
-		MessageID string      `json:"message_id"`
-		Seq       int64       `json:"seq"`
-		Message   messageWire `json:"message"`
-	}{MessageID: msg.MessageID, Seq: msg.Seq, Message: messageToWire(place, msg)})
+	writeJSON(w, status, messageReceiptToWire(msg, created))
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
@@ -920,7 +937,7 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Content == "" || len(req.Content) > MaxContentBytes {
+	if req.Content == "" || !messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
