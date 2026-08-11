@@ -12,6 +12,7 @@ import type {
   WorkspaceRole,
   WorkspaceRoleInput,
 } from "./model";
+import { participantID } from "./model";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -61,8 +62,11 @@ export interface WorkspaceControlClient {
     roleIds: string[],
   ): Promise<string[]>;
   listAppCatalog(): Promise<AppDescriptor[]>;
-  listInstallations(workspaceId: string): Promise<AppInstallation[]>;
-  installApp(workspaceId: string, appId: string): Promise<AppInstallation>;
+  // Lifecycle reads and installs carry the canonical AppInstallationOwnerRef.
+  // Workspace and Participant owners share one operation; only the owner ref
+  // differs, so no scope is ever inferred from the client's current Workspace.
+  listInstallations(owner: AppOwnerRef): Promise<AppInstallation[]>;
+  installApp(owner: AppOwnerRef, appId: string): Promise<AppInstallation>;
   setInstallationState(
     installationId: string,
     state: AppInstallationState,
@@ -254,26 +258,21 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
     return asArray(body.apps).map(parseAppDescriptor);
   }
 
-  async listInstallations(workspaceId: string): Promise<AppInstallation[]> {
-    const query = new URLSearchParams({
-      owner_kind: "workspace",
-      owner_id: workspaceId,
-    });
-    const body = asRecord(await this.request(`/app-installations?${query}`));
+  async listInstallations(owner: AppOwnerRef): Promise<AppInstallation[]> {
+    const body = asRecord(
+      await this.request(`/app-installations?${appOwnerQuery(owner)}`),
+    );
     return asArray(body.installations).map(parseInstallation);
   }
 
   async installApp(
-    workspaceId: string,
+    owner: AppOwnerRef,
     appId: string,
   ): Promise<AppInstallation> {
     return parseInstallation(
       await this.request("/app-installations", {
         method: "POST",
-        body: {
-          owner: { kind: "workspace", workspace_id: workspaceId },
-          app_id: appId,
-        },
+        body: { owner: appOwnerToWire(owner), app_id: appId },
       }),
     );
   }
@@ -437,6 +436,40 @@ function parseAppDescriptor(value: unknown): AppDescriptor {
       },
     ),
   };
+}
+
+/**
+ * Owner refs travel as `owner_kind`/`owner_id` (+ `participant_kind` for the
+ * Participant variant) on reads and as the nested `AppOwnerRef` sum on install.
+ * Both encodings name the owner exactly; neither is derived from UI state.
+ */
+function appOwnerQuery(owner: AppOwnerRef): URLSearchParams {
+  if (owner.kind === "workspace") {
+    return new URLSearchParams({
+      owner_kind: "workspace",
+      owner_id: owner.workspaceId,
+    });
+  }
+  return new URLSearchParams({
+    owner_kind: "participant",
+    owner_id: participantID(owner.participant),
+    participant_kind: owner.participant.kind,
+  });
+}
+
+function participantToWire(participant: ParticipantRef): Record<string, string> {
+  return participant.kind === "human"
+    ? { kind: "human", human_id: participant.humanId }
+    : {
+        kind: "personality_agent",
+        personality_agent_id: participant.personalityAgentId,
+      };
+}
+
+function appOwnerToWire(owner: AppOwnerRef): Record<string, unknown> {
+  return owner.kind === "workspace"
+    ? { kind: "workspace", workspace_id: owner.workspaceId }
+    : { kind: "participant", participant: participantToWire(owner.participant) };
 }
 
 function parseAppOwner(value: unknown): AppOwnerRef {

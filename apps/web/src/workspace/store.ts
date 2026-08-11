@@ -212,7 +212,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         client.listMembers(workspaceId),
         client.listRoles(workspaceId),
         client.listAppCatalog(),
-        client.listInstallations(workspaceId),
+        client.listInstallations({ kind: "workspace", workspaceId }),
       ])
         .then(
           async ([
@@ -794,7 +794,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         }
         try {
           const installation = await client.installApp(
-            token.workspaceId,
+            { kind: "workspace", workspaceId: token.workspaceId },
             appId,
           );
           if (!isCurrentScope(token)) return installation;

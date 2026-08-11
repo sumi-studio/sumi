@@ -122,3 +122,21 @@ export function isWorkspaceInstallation(
     installation.owner.workspaceId === workspaceId
   );
 }
+
+/**
+ * Stable identity of one `AppInstallationOwnerRef`. Owner equality is compared
+ * through this key so a Participant owner never collapses into the Workspace
+ * that happened to be selected when the installation was read.
+ */
+export function appOwnerKey(owner: AppOwnerRef): string {
+  return owner.kind === "workspace"
+    ? `workspace:${owner.workspaceId}`
+    : `participant:${participantKey(owner.participant)}`;
+}
+
+export function isOwnedBy(
+  installation: AppInstallation,
+  owner: AppOwnerRef,
+): boolean {
+  return appOwnerKey(installation.owner) === appOwnerKey(owner);
+}
