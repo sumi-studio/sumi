@@ -78,6 +78,7 @@ export type AuthSessionState =
 
 export const preissuedSessionMode =
   import.meta.env.VITE_SUMI_AUTH_MODE === "preissued";
+const preissuedUserID = import.meta.env.VITE_SUMI_PREISSUED_USER_ID?.trim();
 
 /**
  * Browser session cookies and the authenticated WebSocket are one origin
@@ -865,6 +866,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
 
   const user = useMemo<AuthUser | null>(() => {
+    if (sessionState === "preissued" && preissuedUserID) {
+      return {
+        id: preissuedUserID,
+        displayName: null,
+        email: null,
+        photoURL: null,
+      };
+    }
     if (!session.authenticated) {
       return null;
     }
@@ -874,7 +883,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       email: null,
       photoURL: null,
     };
-  }, [session]);
+  }, [session, sessionState]);
 
   const value = useMemo<AuthContextValue>(
     () => ({

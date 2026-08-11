@@ -43,6 +43,10 @@ export function createDevServerConfig(
       "/auth": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
       "/messaging": apiProxy(target.origin, true),
+      "/workspaces": apiProxy(target.origin),
+      "/workspace-invites": apiProxy(target.origin),
+      "/apps": apiProxy(target.origin),
+      "/app-installations": apiProxy(target.origin),
     },
   };
 }

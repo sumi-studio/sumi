@@ -128,13 +128,18 @@ describe("Sidebar route authority", () => {
     vi.restoreAllMocks();
   });
 
-  it("uses the route-selected Workspace, then targets nothing on home", async () => {
+  it("uses the route-selected Workspace, then retains its exact scope on home", async () => {
     const createChannel = vi.fn(
       async (): Promise<PlaceKey> => "channel:created-for-b",
     );
     setTwoWorkspaceState(createChannel);
 
-    const view = render(<Sidebar selectedPlaceKey="channel:channel-b" />);
+    const view = render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-b"
+        workspaceId="workspace-b"
+      />,
+    );
 
     expect(screen.getByText("Workspace B")).toBeVisible();
     expect(screen.getByRole("button", { name: "beta" })).toHaveAttribute(
@@ -161,18 +166,50 @@ describe("Sidebar route authority", () => {
     expect(
       screen.getByRole("dialog", { name: "チャンネルを作成" }),
     ).toBeVisible();
-    view.rerender(<Sidebar selectedPlaceKey={null} />);
+    view.rerender(
+      <Sidebar selectedPlaceKey={null} workspaceId="workspace-b" />,
+    );
 
-    expect(screen.getByText("場所を選択")).toBeVisible();
+    expect(screen.getByText("Workspace B")).toBeVisible();
     expect(screen.queryByRole("button", { current: "page" })).toBeNull();
-    expect(screen.queryByTitle("チャンネルを作成")).toBeNull();
-    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTitle("チャンネルを作成")).toBeVisible();
+    expect(
+      screen.getByRole("dialog", { name: "チャンネルを作成" }),
+    ).toBeVisible();
+  });
+
+  it("creates the first channel from the exact bound Workspace", async () => {
+    const createChannel = vi.fn(
+      async (): Promise<PlaceKey> => "channel:first-b",
+    );
+    setTwoWorkspaceState(createChannel);
+    useMessaging.setState({ channels: [], activePlaceKey: null });
+
+    render(<Sidebar selectedPlaceKey={null} workspaceId="workspace-b" />);
+
+    expect(screen.getByText("Workspace B")).toBeVisible();
+    fireEvent.click(screen.getByTitle("チャンネルを作成"));
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "名前" }), {
+      target: { value: "first-b" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
+
+    await waitFor(() =>
+      expect(createChannel).toHaveBeenCalledWith("workspace-b", "first-b", ""),
+    );
+    expect(navigation.navigate).toHaveBeenCalledWith("channel:first-b");
   });
 
   it("rechecks identity after store completion before channel navigation", async () => {
     const createChannel = vi.fn(resolveThenSwitchIdentity);
     setTwoWorkspaceState(createChannel);
-    render(<Sidebar selectedPlaceKey="channel:channel-b" />);
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-b"
+        workspaceId="workspace-b"
+      />,
+    );
 
     fireEvent.click(screen.getByTitle("チャンネルを作成"));
     const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
@@ -191,7 +228,12 @@ describe("Sidebar route authority", () => {
     const pending = deferred<PlaceKey>();
     const createChannel = vi.fn(() => pending.promise);
     setTwoWorkspaceState(createChannel);
-    const view = render(<Sidebar selectedPlaceKey="channel:channel-b" />);
+    const view = render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-b"
+        workspaceId="workspace-b"
+      />,
+    );
 
     fireEvent.click(screen.getByTitle("チャンネルを作成"));
     const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
@@ -201,7 +243,12 @@ describe("Sidebar route authority", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
     expect(createChannel).toHaveBeenCalledWith("workspace-b", "late-b", "");
 
-    view.rerender(<Sidebar selectedPlaceKey="channel:channel-a" />);
+    view.rerender(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
     expect(screen.getByText("Workspace A")).toBeVisible();
     expect(screen.queryByRole("dialog")).toBeNull();
 
@@ -256,7 +303,12 @@ describe("Sidebar overlay and IME behavior", () => {
   });
 
   it("shows the selected place notification level as a radio and closes after selection", () => {
-    render(<Sidebar selectedPlaceKey="channel:channel-a" />);
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
 
     fireEvent.click(screen.getAllByRole("button", { name: "通知設定" })[0]);
     expect(screen.getByRole("radio", { name: /すべて通知/ })).toBeChecked();
@@ -270,7 +322,12 @@ describe("Sidebar overlay and IME behavior", () => {
   });
 
   it("closes the status menu on an outside pointerdown", () => {
-    render(<Sidebar selectedPlaceKey="channel:channel-a" />);
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
     expect(screen.getByRole("radio", { name: "取り込み中" })).toBeVisible();
 
@@ -280,7 +337,12 @@ describe("Sidebar overlay and IME behavior", () => {
   });
 
   it("does not implicitly submit channel creation on an IME Enter", () => {
-    render(<Sidebar selectedPlaceKey="channel:channel-a" />);
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
     fireEvent.click(screen.getByTitle("チャンネルを作成"));
     const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
     const name = within(dialog).getByRole("textbox", { name: "名前" });
