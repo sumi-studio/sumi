@@ -20,9 +20,9 @@ type BrowserServer struct {
 	Sessions UserSessionAuthorizer
 	Appender CommandAppender
 	Events   *DurableGateway
-	// Authorizer gates admission and every live private-data boundary on current
-	// Employer-ship (私信 Surface, ADR 0009 §5). A nil Authorizer permits any
-	// verified session.
+	// Authorizer gates admission and every live private-data boundary on Current
+	// Employer and the exact enabled Human-owned direct-chat AppInstallation. A
+	// nil Authorizer fails closed.
 	Authorizer DirectChatAuthorizer
 	// Spawner optionally lazily starts the target agent runtime on connect
 	// (ADR 0010). A nil Spawner assumes the agent is already running.
@@ -60,9 +60,20 @@ func (s *BrowserServer) SetSpawner(spawner DirectChatSpawner) {
 	}
 }
 
+// SetAuthorizer installs one composite authority boundary for both browser
+// transports. It is primarily useful for explicit application assembly and
+// fixtures; handlers still fail closed until it is called.
+func (s *BrowserServer) SetAuthorizer(authorizer DirectChatAuthorizer) {
+	s.Authorizer = authorizer
+	if s.commandIngress != nil {
+		s.commandIngress.Authorizer = authorizer
+	}
+}
+
 type browserConnection struct {
-	sessionID string
-	conn      *websocket.Conn
+	sessionID      string
+	installationID string
+	conn           *websocket.Conn
 }
 
 type idempotencyAwareCommandAppender interface {
@@ -328,18 +339,20 @@ func (s *BrowserServer) checkOrigin(r *http.Request) bool {
 func (s *BrowserServer) authorizeDirectChat(
 	ctx context.Context,
 	claims UserSessionClaims,
+	installationID string,
 	operation func() error,
 ) error {
 	if operation == nil {
 		return errors.New("browser direct-chat authorization operation is required")
 	}
 	if s.Authorizer == nil {
-		return operation()
+		return ErrDirectChatAuthorizationUnavailable
 	}
 	if err := s.Authorizer.AuthorizeDirectChat(
 		ctx,
 		claims.UserID,
 		claims.PersonalityAgentID,
+		installationID,
 		operation,
 	); err != nil {
 		return fmt.Errorf("authorize browser direct chat: %w", err)
@@ -350,13 +363,14 @@ func (s *BrowserServer) authorizeDirectChat(
 func (s *BrowserServer) authorizeBrowserOperation(
 	ctx context.Context,
 	claims UserSessionClaims,
+	installationID string,
 	operation func() error,
 ) error {
 	if operation == nil {
 		return errors.New("browser authorization operation is required")
 	}
 	return s.Sessions.AuthorizeSession(ctx, claims, func() error {
-		return s.authorizeDirectChat(ctx, claims, operation)
+		return s.authorizeDirectChat(ctx, claims, installationID, operation)
 	})
 }
 
@@ -364,7 +378,7 @@ func (s *BrowserServer) authorizeBrowserOperation(
 // authentication happens before upgrade so a rejected session cannot consume a
 // WebSocket or leak whether an agent connection exists.
 func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.Sessions == nil || s.Appender == nil || s.Events == nil {
+	if s.Sessions == nil || s.Appender == nil || s.Events == nil || s.Authorizer == nil {
 		http.Error(w, "browser websocket not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -386,6 +400,11 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
+	installationID, err := directChatInstallationID(r)
+	if err != nil {
+		http.Error(w, "invalid_scope", http.StatusBadRequest)
+		return
+	}
 	if s.Spawner != nil {
 		// The global browser-session lease authorizes only this bounded,
 		// side-effect-free intent. EnsureRunning owns idempotent provisioning and
@@ -398,7 +417,7 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 		err = s.Sessions.AuthorizeSession(intentContext, claims, func() error {
 			intentLeaseEntered = true
-			return s.authorizeDirectChat(intentContext, claims, func() error {
+			return s.authorizeDirectChat(intentContext, claims, installationID, func() error {
 				intentAuthorized = true
 				return nil
 			})
@@ -407,6 +426,8 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			if !intentLeaseEntered {
 				http.Error(w, "invalid session", http.StatusUnauthorized)
+			} else if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
+				http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
 			} else if !intentAuthorized {
 				http.Error(w, "not authorized for this agent", http.StatusForbidden)
 			} else {
@@ -443,7 +464,7 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	err = s.Sessions.AuthorizeSession(finalContext, claims, func() error {
 		finalLeaseEntered = true
-		return s.authorizeDirectChat(finalContext, claims, func() error {
+		return s.authorizeDirectChat(finalContext, claims, installationID, func() error {
 			finalAuthorized = true
 			if err := finalContext.Err(); err != nil {
 				return err
@@ -463,7 +484,7 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if upgradeErr != nil {
 				return upgradeErr
 			}
-			if !s.addConnection(conn, claims.sessionID) {
+			if !s.addConnection(conn, claims.sessionID, installationID) {
 				return errors.New("browser gateway is shutting down")
 			}
 			return nil
@@ -484,6 +505,8 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case !finalLeaseEntered:
 			http.Error(w, "invalid session", http.StatusUnauthorized)
+		case errors.Is(err, ErrDirectChatAuthorizationUnavailable):
+			http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
 		case !finalAuthorized:
 			http.Error(w, "not authorized for this agent", http.StatusForbidden)
 		case !upgradeAttempted:
@@ -493,7 +516,7 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.removeConnection(conn)
 	defer conn.Close()
-	if err := s.run(r.Context(), conn, claims); err != nil && !errors.Is(err, context.Canceled) {
+	if err := s.run(r.Context(), conn, claims, installationID); err != nil && !errors.Is(err, context.Canceled) {
 		deadline := s.sessionDeadline(claims, s.writeTimeout())
 		if deadline.After(time.Now()) {
 			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "browser gateway closed"), deadline)
@@ -586,13 +609,13 @@ func (s *BrowserServer) ConnectionStats() BrowserConnectionStats {
 	}
 }
 
-func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID string) bool {
+func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID, installationID string) bool {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
 	if s.closing {
 		return false
 	}
-	s.connections[conn] = browserConnection{sessionID: sessionID, conn: conn}
+	s.connections[conn] = browserConnection{sessionID: sessionID, installationID: installationID, conn: conn}
 	s.accepted++
 	return true
 }
@@ -603,11 +626,11 @@ func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
 	delete(s.connections, conn)
 }
 
-func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims) error {
+func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims, installationID string) error {
 	ctx, cancel := browserSessionOperationContext(ctx, claims)
 	defer cancel()
 	authorize := func(operation func() error) error {
-		return s.authorizeBrowserOperation(ctx, claims, operation)
+		return s.authorizeBrowserOperation(ctx, claims, installationID, operation)
 	}
 	if s.MaxReadLimit > 0 {
 		conn.SetReadLimit(s.MaxReadLimit)
@@ -750,7 +773,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 	}()
 
-	readErr := s.browserReadPump(ctx, conn, claims, write, withExclusiveWrite)
+	readErr := s.browserReadPump(ctx, conn, claims, installationID, write, withExclusiveWrite)
 	cancel()
 	writerResult := <-writerErr
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
@@ -875,6 +898,7 @@ func (s *BrowserServer) browserReadPump(
 	ctx context.Context,
 	conn *websocket.Conn,
 	claims UserSessionClaims,
+	installationID string,
 	write func(any) error,
 	withExclusiveWrite func(func(func(any) error) error) error,
 ) error {
@@ -883,7 +907,7 @@ func (s *BrowserServer) browserReadPump(
 		if err != nil {
 			return err
 		}
-		if err := s.authorizeBrowserOperation(ctx, claims, func() error {
+		if err := s.authorizeBrowserOperation(ctx, claims, installationID, func() error {
 			if s.Spawner != nil {
 				s.Spawner.Touch(claims.PersonalityAgentID)
 			}
@@ -926,7 +950,7 @@ func (s *BrowserServer) browserReadPump(
 		operationContext, cancelOperation := browserSessionOperationContext(ctx, claims)
 		var admissionErr error
 		writeErr := withExclusiveWrite(func(writeUnlocked func(any) error) error {
-			admissionErr = s.authorizeBrowserOperation(ctx, claims, func() error {
+			admissionErr = s.authorizeBrowserOperation(ctx, claims, installationID, func() error {
 				appendCalled = true
 				var appendErr error
 				if appender, ok := s.Appender.(idempotencyAwareCommandAppender); ok {
@@ -979,7 +1003,8 @@ func (s *BrowserServer) browserReadPump(
 			if !appendCalled {
 				return errors.New("browser direct-chat authority ended")
 			}
-			if errors.Is(err, errBrowserRuntimeUnavailable) {
+			if errors.Is(err, errBrowserRuntimeUnavailable) ||
+				errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
 				if writeErr := write(browserCommandRejectedFrame{
 					Type:           "command_rejected",
 					IdempotencyKey: frame.IdempotencyKey,

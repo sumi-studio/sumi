@@ -22,6 +22,30 @@ import (
 var testIngressSecret = []byte("test-ingress-session-secret-32!")
 
 const testBrowserOrigin = "https://web.example"
+const testDirectChatInstallationID = "018f47a2-9b3c-7def-8abc-0123456789ac"
+
+type allowDirectChatAuthorizer struct{}
+
+func (allowDirectChatAuthorizer) AuthorizeDirectChat(
+	_ context.Context,
+	_, _, installationID string,
+	operation func() error,
+) error {
+	if installationID != testDirectChatInstallationID {
+		return ErrDirectChatAuthorizationDenied
+	}
+	return operation()
+}
+
+func newAuthorizedBrowserServer(
+	sessions UserSessionAuthorizer,
+	appender CommandAppender,
+	events *DurableGateway,
+) *BrowserServer {
+	server := NewBrowserServer(sessions, appender, events)
+	server.Authorizer = allowDirectChatAuthorizer{}
+	return server
+}
 
 type fakeCommandAppender struct {
 	mu      sync.Mutex
@@ -182,12 +206,21 @@ func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 		t.Fatalf("new ingress: %v", err)
 	}
 	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
 	return ingress, appender
 }
 
 func postWithSessionCookie(t *testing.T, url string, body []byte, personalityAgentID string) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	separator := "?"
+	if strings.Contains(url, "?") {
+		separator = "&"
+	}
+	req, err := http.NewRequest(
+		http.MethodPost,
+		url+separator+"installation_id="+testDirectChatInstallationID,
+		bytes.NewReader(body),
+	)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -253,6 +286,84 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	}
 	if env.CommandID == "" {
 		t.Fatal("expected non-empty command_id")
+	}
+}
+
+func TestUserCommandIngress_RequiresOneExactInstallationScope(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		query string
+	}{
+		{name: "missing"},
+		{name: "empty", query: "?installation_id="},
+		{name: "duplicate", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ingress, appender := newTestIngress(t)
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/direct-chat/commands"+testCase.query,
+				strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`),
+			)
+			request.Header.Set("Origin", testBrowserOrigin)
+			request.Header.Set("Idempotency-Key", "scope-test")
+			request.AddCookie(&http.Cookie{
+				Name:  BrowserSessionCookie,
+				Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab"),
+			})
+			response := httptest.NewRecorder()
+			ingress.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest ||
+				strings.TrimSpace(response.Body.String()) != "invalid_scope" {
+				t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+			}
+			if appender.callCount() != 0 {
+				t.Fatalf("invalid scope appended %d commands", appender.callCount())
+			}
+		})
+	}
+}
+
+func TestUserCommandIngress_DistinguishesDeniedFromUnboundAuthority(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		authorizer DirectChatAuthorizer
+		wantStatus int
+	}{
+		{name: "wrong installation", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusForbidden},
+		{name: "unbound authorizer", authorizer: nil, wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ingress, appender := newTestIngress(t)
+			ingress.Authorizer = testCase.authorizer
+			server := httptest.NewServer(newCommandMux(ingress))
+			defer server.Close()
+			request, err := http.NewRequest(
+				http.MethodPost,
+				server.URL+"/direct-chat/commands?installation_id=0198f0f4-9b72-7000-8000-000000000099",
+				strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Origin", testBrowserOrigin)
+			request.Header.Set("Idempotency-Key", "authority-test")
+			request.AddCookie(&http.Cookie{
+				Name:  BrowserSessionCookie,
+				Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab"),
+			})
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != testCase.wantStatus {
+				t.Fatalf("status=%d, want %d", response.StatusCode, testCase.wantStatus)
+			}
+			if appender.callCount() != 0 {
+				t.Fatalf("failed authority appended %d commands", appender.callCount())
+			}
+		})
 	}
 }
 
@@ -440,7 +551,7 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 
 func TestUserCommandIngressRequiresNonemptyIdempotencyKey(t *testing.T) {
 	ingress, appender := newTestIngress(t)
-	req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands", strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands?installation_id="+testDirectChatInstallationID, strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`))
 	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	recorder := httptest.NewRecorder()
@@ -477,7 +588,7 @@ func TestUserCommandIngress_BodyReadFailureIsNotMisclassifiedAsOversized(t *test
 	ingress, appender := newTestIngress(t)
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/direct-chat/commands",
+		"/direct-chat/commands?installation_id="+testDirectChatInstallationID,
 		nil,
 	)
 	req.SetPathValue("personality_agent_id", "018f47a2-9b3c-7def-8abc-0123456789ab")
@@ -529,6 +640,7 @@ func TestUserCommandIngress_RequiresSessionCookie(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
@@ -597,6 +709,7 @@ func TestUserCommandIngress_TargetComesOnlyFromVerifiedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
@@ -650,7 +763,7 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

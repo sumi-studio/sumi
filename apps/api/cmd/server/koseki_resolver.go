@@ -6,8 +6,11 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
 // kosekiIdentityBindingResolver replaces StaticIdentityBindingResolver with a
@@ -68,31 +71,66 @@ func (r *kosekiIdentityBindingResolver) claims(humanID, agentID string) agenteve
 	}
 }
 
-// kosekiDirectChatAuthorizer enforces the 私信 Surface contract (ADR 0009 §5):
-// raw direct chat is restricted to the agent's current Employer. A Human who is
-// not the active Employer (e.g. after 異動 to a Workspace) cannot direct-chat
-// with the agent.
-type kosekiDirectChatAuthorizer struct {
-	store *koseki.Store
+// directChatAuthorizer composes the 私信 Surface's two independent authority
+// sources under one transaction: Current Human Employer first, then the exact
+// enabled Human-owned direct-chat AppInstallation. Durable/private operations
+// run while both shared leases are held.
+type directChatAuthorizer struct {
+	pool   *pgxpool.Pool
+	koseki *koseki.Store
+	apps   *applicationapps.Store
 }
 
-func newKosekiDirectChatAuthorizer(store *koseki.Store) *kosekiDirectChatAuthorizer {
-	return &kosekiDirectChatAuthorizer{store: store}
+func newDirectChatAuthorizer(
+	pool *pgxpool.Pool,
+	kosekiStore *koseki.Store,
+	appStore *applicationapps.Store,
+) *directChatAuthorizer {
+	return &directChatAuthorizer{pool: pool, koseki: kosekiStore, apps: appStore}
 }
 
-func (a *kosekiDirectChatAuthorizer) AuthorizeDirectChat(
+func (a *directChatAuthorizer) AuthorizeDirectChat(
 	ctx context.Context,
 	humanID,
-	personalityAgentID string,
+	personalityAgentID,
+	installationID string,
 	operation func() error,
 ) error {
-	if err := a.store.AuthorizeCurrentHumanEmployer(
+	if operation == nil {
+		return errors.New("direct-chat authorization operation is required")
+	}
+	if a == nil || a.pool == nil || a.koseki == nil || a.apps == nil {
+		return agentevents.ErrDirectChatAuthorizationUnavailable
+	}
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: begin composite authority: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := a.koseki.RequireCurrentHumanEmployerInTx(ctx, tx, humanID, personalityAgentID); err != nil {
+		if errors.Is(err, koseki.ErrNotCurrentEmployer) {
+			return agentevents.ErrDirectChatAuthorizationDenied
+		}
+		return fmt.Errorf("%w: require current Employer: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
+	}
+	if _, err := a.apps.RequireEnabledInstallationInTx(
 		ctx,
-		humanID,
-		personalityAgentID,
-		operation,
+		tx,
+		installationID,
+		applicationapps.ParticipantOwner(participant.Human(humanID)),
+		"direct-chat",
 	); err != nil {
-		return fmt.Errorf("authorize current Employer operation: %w", err)
+		if errors.Is(err, applicationapps.ErrInstallationNotFound) ||
+			errors.Is(err, applicationapps.ErrAppDisabled) {
+			return agentevents.ErrDirectChatAuthorizationDenied
+		}
+		return fmt.Errorf("%w: require direct-chat installation: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
+	}
+	if err := operation(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("%w: commit composite authority: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
 	}
 	return nil
 }

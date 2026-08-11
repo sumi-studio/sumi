@@ -17,6 +17,7 @@ const HUMAN_ID = "0198f0f4-9b72-7000-8000-000000000021";
 const INSTALLATION_ID = "0198f0f4-9b72-7000-8000-000000000051";
 
 const mocks = vi.hoisted(() => ({
+  connection: "closed",
   installApp: vi.fn(),
   refresh: vi.fn(),
   refreshSession: vi.fn(),
@@ -25,11 +26,15 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../agent/store", () => ({
   useConversation: (selector: (state: { connection: string }) => unknown) =>
-    selector({ connection: "closed" }),
+    selector({ connection: mocks.connection }),
 }));
 
 vi.mock("../components/chat-screen", () => ({
-  ChatScreen: () => <div data-testid="direct-chat">direct chat</div>,
+  ChatScreen: ({ installationId }: { installationId: string }) => (
+    <div data-testid="direct-chat" data-installation-id={installationId}>
+      direct chat
+    </div>
+  ),
 }));
 
 vi.mock("../shell/app-rail", () => ({
@@ -46,6 +51,7 @@ vi.mock("./auth-context", () => ({
 }));
 
 beforeEach(() => {
+  mocks.connection = "closed";
   mocks.installApp.mockReset();
   mocks.installApp.mockResolvedValue(undefined);
   mocks.refresh.mockReset();
@@ -86,7 +92,10 @@ describe("DirectChatGate", () => {
 
     render(<DirectChatGate />);
 
-    expect(screen.getByTestId("direct-chat")).toBeInTheDocument();
+    expect(screen.getByTestId("direct-chat")).toHaveAttribute(
+      "data-installation-id",
+      INSTALLATION_ID,
+    );
     expect(screen.queryByTestId("app-rail")).not.toBeInTheDocument();
   });
 
@@ -132,6 +141,19 @@ describe("DirectChatGate", () => {
 
     expect(screen.queryByTestId("direct-chat")).not.toBeInTheDocument();
     expect(screen.getByText("直通を確認しています…")).toBeInTheDocument();
+  });
+
+  it("refreshes both session and exact app policy after a live close", async () => {
+    useParticipantApps.setState({ installations: [installation("enabled")] });
+    mocks.connection = "connecting";
+    const view = render(<DirectChatGate />);
+    mocks.connection = "closed";
+    view.rerender(<DirectChatGate />);
+
+    await waitFor(() => {
+      expect(mocks.refreshSession).toHaveBeenCalledTimes(1);
+      expect(mocks.refresh).toHaveBeenCalledTimes(1);
+    });
   });
 });
 

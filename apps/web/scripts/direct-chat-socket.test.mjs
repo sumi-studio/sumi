@@ -29,6 +29,7 @@ class FakeWebSocket {
 
 const originalWebSocket = globalThis.WebSocket;
 const originalLocation = globalThis.location;
+const installationId = "0198f0f4-9b72-7000-8000-000000000051";
 globalThis.WebSocket = FakeWebSocket;
 Object.defineProperty(globalThis, "location", { configurable: true, value: { origin: "http://browser.test" } });
 test.after(() => {
@@ -71,10 +72,11 @@ const approvalRequest = (overrides = {}) => ({
 test("uses the session-resolved direct-chat route and sends no target or provenance", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   socket.connect();
   const wire = FakeWebSocket.instances.at(-1);
   assert.equal(new URL(wire.url).pathname, "/direct-chat/ws");
-  assert.equal(new URL(wire.url).search, "");
+  assert.equal(new URL(wire.url).search, `?installation_id=${installationId}`);
   assert.deepEqual(wire.sent, []);
   assert.equal(socket.sendCommand({ type: "user_message", text: "hello", attachments: [] }, "key-1"), true);
   assert.deepEqual(wire.sent, []);
@@ -98,6 +100,7 @@ test("rejects a path-prefixed API base instead of silently discarding it", () =>
     () =>
       resolveDirectChatURL({
         apiBaseURL: "http://browser.test/api",
+        installationId,
         pageOrigin: "http://browser.test",
       }),
     /must contain only an origin/,
@@ -107,12 +110,14 @@ test("rejects a path-prefixed API base instead of silently discarding it", () =>
 test("retries an uncertain command with its original key and stops after acceptance", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
   first.receive({ type: "direct_chat_status", status: "ready" });
   socket.sendCommand({ type: "abort" }, "stable-key");
   first.close();
+  socket.bindInstallation(installationId);
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();
@@ -125,6 +130,7 @@ test("retries an uncertain command with its original key and stops after accepta
   second.receive(accepted("stable-key"));
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
   second.close();
+  socket.bindInstallation(installationId);
   socket.connect();
   const third = FakeWebSocket.instances.at(-1);
   third.open();
@@ -135,6 +141,7 @@ test("retries an uncertain command with its original key and stops after accepta
 test("a terminal idempotency conflict clears its pending key without reconnect resend", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
@@ -143,6 +150,7 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
   first.receive({ type: "command_rejected", idempotency_key: "conflicting-key", reject_reason: "idempotency_conflict" });
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
   first.close();
+  socket.bindInstallation(installationId);
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();
@@ -153,6 +161,7 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
 test("unavailable status retains pending commands without sending until ready", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   socket.connect();
   const wire = FakeWebSocket.instances.at(-1);
   wire.open();
@@ -172,6 +181,7 @@ test("unavailable status retains pending commands without sending until ready", 
 test("authority reset drops replay cursor and pending commands before reconnect", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
@@ -183,6 +193,7 @@ test("authority reset drops replay cursor and pending commands before reconnect"
 
   assert.equal(first.readyState, FakeWebSocket.CLOSED);
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  socket.bindInstallation(installationId);
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();
@@ -199,9 +210,36 @@ test("authority reset drops replay cursor and pending commands before reconnect"
   socket.close();
 });
 
+test("installation replacement preserves the admitted cursor but fences pending retry", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive(event(1, { type: "agent_start" }));
+  first.receive({ type: "direct_chat_status", status: "ready" });
+  socket.sendCommand({ type: "abort" }, "old-installation-key");
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["old-installation-key"]);
+
+  const replacement = "0198f0f4-9b72-7000-8000-000000000052";
+  socket.bindInstallation(replacement);
+  assert.equal(first.readyState, FakeWebSocket.CLOSED);
+  assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  assert.equal(new URL(second.url).search, `?installation_id=${replacement}`);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 1 }]);
+  second.receive({ type: "direct_chat_status", status: "ready" });
+  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  socket.close();
+});
+
 test("tracks browser connection separately from authoritative agent readiness", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   const connections = [];
   const readiness = [];
   socket.onConnection((state) => connections.push(state));
@@ -344,6 +382,7 @@ test("acceptance permits only an exactly correlated terminal disposition", () =>
 test("durable disposition advances the socket replay cursor", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
@@ -354,6 +393,7 @@ test("durable disposition advances the socket replay cursor", () => {
     status: "applied",
   }));
   first.close();
+  socket.bindInstallation(installationId);
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();

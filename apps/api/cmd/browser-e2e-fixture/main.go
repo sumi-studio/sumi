@@ -19,6 +19,21 @@ import (
 
 var secret = []byte("browser-e2e-session-secret-32-bytes")
 
+const directChatInstallationID = "0198f0f4-9b72-7000-8000-000000000051"
+
+type fixtureDirectChatAuthorizer struct{}
+
+func (fixtureDirectChatAuthorizer) AuthorizeDirectChat(
+	_ context.Context,
+	_, _, installationID string,
+	operation func() error,
+) error {
+	if installationID != directChatInstallationID {
+		return agentevents.ErrDirectChatAuthorizationDenied
+	}
+	return operation()
+}
+
 func main() {
 	dir := os.Getenv("SUMI_E2E_RUNTIME_DIR")
 	if dir == "" || !filepath.IsAbs(dir) {
@@ -62,7 +77,15 @@ func main() {
 	// Use the same production router as cmd/server so the E2E journey exercises
 	// production wiring. We do not expose the agent WebSocket boundary in this
 	// fixture; nil TokenVerifier makes it fail-closed.
-	mux, browser, _, err := agentevents.NewProductionMux(store, gateway, nil, browserSessions, nil, []string{"http://127.0.0.1:4173"}, nil)
+	mux, browser, _, err := agentevents.NewProductionMux(
+		store,
+		gateway,
+		nil,
+		browserSessions,
+		nil,
+		[]string{"http://127.0.0.1:4173"},
+		fixtureDirectChatAuthorizer{},
+	)
 	if err != nil {
 		log.Fatal(err)
 	}

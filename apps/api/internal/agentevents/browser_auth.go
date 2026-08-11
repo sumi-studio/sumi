@@ -55,15 +55,25 @@ type HumanProfileReader interface {
 	HumanDisplayName(ctx context.Context, humanID string) (string, error)
 }
 
-// DirectChatAuthorizer holds Current-Employer authority across one private
-// direct-chat operation (ADR 0009 §5). Employment transfer must serialize with
-// the operation rather than racing a point-in-time check. A nil authorizer
-// permits all verified sessions, preserving the static binding fallback.
+var (
+	// ErrDirectChatAuthorizationDenied deliberately collapses Employer and
+	// exact AppInstallation mismatches at the browser boundary.
+	ErrDirectChatAuthorizationDenied = errors.New("direct-chat authorization denied")
+	// ErrDirectChatAuthorizationUnavailable distinguishes an unbound or failed
+	// authority store from a valid-but-denied capability.
+	ErrDirectChatAuthorizationUnavailable = errors.New("direct-chat authorization unavailable")
+)
+
+// DirectChatAuthorizer holds Current-Employer and the authenticated Human's
+// exact enabled participant-owned direct-chat AppInstallation authority across
+// one private operation. The installation identity is control metadata from
+// the entry surface; it never becomes command or provenance data.
 type DirectChatAuthorizer interface {
 	AuthorizeDirectChat(
 		ctx context.Context,
 		humanID,
-		personalityAgentID string,
+		personalityAgentID,
+		installationID string,
 		operation func() error,
 	) error
 }

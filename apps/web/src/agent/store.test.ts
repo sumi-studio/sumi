@@ -18,6 +18,7 @@ import { userMessageIdFromCommandId } from "./user-message-id";
 
 const CommandId = "00000000-0000-4000-8000-000000000001";
 const Timestamp = "2026-07-30T12:00:00Z";
+const InstallationId = "0198f0f4-9b72-7000-8000-000000000051";
 
 test("UUIDv5 derivation matches the Rust USER_MESSAGE_ID_NAMESPACE contract", () => {
   assert.equal(
@@ -31,7 +32,7 @@ test("one mounted owner opens one connection and releases it promptly", async ()
   const transport = new FakeTransport();
   const store = createConversationStore({ transport });
 
-  const release = store.getState().acquireConnection();
+  const release = store.getState().acquireConnection(InstallationId);
   assert.equal(transport.connectCalls, 0);
 
   await flushConnectionMicrotasks();
@@ -51,9 +52,9 @@ test("StrictMode probe cleanup cannot create or close the live socket", async ()
     connectionStates.push(state.connection);
   });
 
-  const releaseProbe = store.getState().acquireConnection();
+  const releaseProbe = store.getState().acquireConnection(InstallationId);
   releaseProbe();
-  const releaseLive = store.getState().acquireConnection();
+  const releaseLive = store.getState().acquireConnection(InstallationId);
 
   await flushConnectionMicrotasks();
   assert.equal(transport.connectCalls, 1);
@@ -69,7 +70,7 @@ test("a real unmount before deferred connect leaves no phantom socket", async ()
   const transport = new FakeTransport();
   const store = createConversationStore({ transport });
 
-  const release = store.getState().acquireConnection();
+  const release = store.getState().acquireConnection(InstallationId);
   release();
   await flushConnectionMicrotasks();
 
@@ -82,8 +83,8 @@ test("stale owner cleanup cannot close a later owner's connection", async () => 
   const transport = new FakeTransport();
   const store = createConversationStore({ transport });
 
-  const releaseStale = store.getState().acquireConnection();
-  const releaseCurrent = store.getState().acquireConnection();
+  const releaseStale = store.getState().acquireConnection(InstallationId);
+  const releaseCurrent = store.getState().acquireConnection(InstallationId);
   await flushConnectionMicrotasks();
 
   releaseStale();
@@ -97,7 +98,7 @@ test("stale owner cleanup cannot close a later owner's connection", async () => 
 test("rapid authority switches connect only the latest mounted generation", async () => {
   const transport = new FakeTransport();
   const store = createConversationStore({ transport });
-  const release = store.getState().acquireConnection();
+  const release = store.getState().acquireConnection(InstallationId);
 
   await flushConnectionMicrotasks();
   assert.equal(transport.connectCalls, 1);
@@ -106,12 +107,14 @@ test("rapid authority switches connect only the latest mounted generation", asyn
   store.getState().resumeMountedConnection();
   assert.equal(store.getState().resetAuthority(), true);
   store.getState().resumeMountedConnection();
+  const releaseRebound = store.getState().acquireConnection(InstallationId);
   await flushConnectionMicrotasks();
 
   assert.equal(transport.resetAuthorityCalls, 2);
   assert.equal(transport.connectCalls, 2);
   assert.equal(store.getState().connection, "connected");
 
+  releaseRebound();
   release();
   assert.equal(transport.closeCalls, 3);
 });
@@ -119,15 +122,58 @@ test("rapid authority switches connect only the latest mounted generation", asyn
 test("authority rebind invalidates a deferred pre-reset connection", async () => {
   const transport = new FakeTransport();
   const store = createConversationStore({ transport });
-  const release = store.getState().acquireConnection();
+  const release = store.getState().acquireConnection(InstallationId);
 
   assert.equal(store.getState().resetAuthority(), true);
   store.getState().resumeMountedConnection();
+  const releaseRebound = store.getState().acquireConnection(InstallationId);
   await flushConnectionMicrotasks();
 
   assert.equal(transport.resetAuthorityCalls, 1);
   assert.equal(transport.connectCalls, 1);
+  releaseRebound();
   release();
+});
+
+test("installation replacement fences unaccepted replay into a recoverable draft", async () => {
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox();
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "pending-before-reinstall",
+  });
+  const releaseOld = store.getState().acquireConnection(InstallationId);
+  await flushConnectionMicrotasks();
+  assert.equal(store.getState().sendMessage("keep this text"), true);
+  assert.equal(transport.sent.length, 1);
+
+  const replacement = "0198f0f4-9b72-7000-8000-000000000052";
+  const releaseNew = store.getState().acquireConnection(replacement);
+  await flushConnectionMicrotasks();
+
+  assert.deepEqual(transport.installationBindings, [
+    InstallationId,
+    replacement,
+  ]);
+  assert.deepEqual(outbox.entries(), [
+    {
+      state: "recoverable",
+      idempotencyKey: "pending-before-reinstall",
+      text: "keep this text",
+      reason: "installation_changed",
+    },
+  ]);
+  assert.equal(transport.sent.length, 1);
+  assert.equal(
+    Object.keys(store.getState().conversation.entries).some((key) =>
+      key.startsWith("optimistic:"),
+    ),
+    false,
+  );
+
+  releaseNew();
+  releaseOld();
 });
 
 test("admission is provisional and canonical user arrival replaces it", () => {
@@ -1228,6 +1274,7 @@ class FakeTransport implements DirectChatTransport {
   connectCalls = 0;
   closeCalls = 0;
   resetAuthorityCalls = 0;
+  readonly installationBindings: string[] = [];
   private readonly frameListeners = new Set<
     (frame: DirectChatServerFrame) => void
   >();
@@ -1237,6 +1284,10 @@ class FakeTransport implements DirectChatTransport {
   private readonly readyListeners = new Set<
     (state: DirectChatReadyState) => void
   >();
+
+  bindInstallation(installationId: string) {
+    this.installationBindings.push(installationId);
+  }
 
   connect() {
     this.connectCalls += 1;

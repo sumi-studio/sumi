@@ -754,6 +754,8 @@ async function startRealAgentStackOnce(
           ...process.env,
           VITE_API_BASE_URL: apiURL,
           VITE_SUMI_AUTH_MODE: "preissued",
+          VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID:
+            "0198f0f4-9b72-7000-8000-000000000051",
         },
         redactions,
       },

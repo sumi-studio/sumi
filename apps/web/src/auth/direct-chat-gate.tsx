@@ -47,10 +47,17 @@ export function DirectChatGate() {
     owner.participant.kind === "human" &&
     owner.participant.humanId === user.id;
   const directChatEnabled =
-    preissuedSessionMode ||
+    (preissuedSessionMode && preissuedDirectChatInstallationId !== null) ||
     (exactHumanOwner &&
       installation !== "duplicate" &&
       installation?.state === "enabled");
+  const installationId = preissuedSessionMode
+    ? preissuedDirectChatInstallationId
+    : exactHumanOwner &&
+        installation !== "duplicate" &&
+        installation?.state === "enabled"
+      ? installation.installationId
+      : null;
 
   useEffect(() => {
     const previous = previousConnection.current;
@@ -60,12 +67,12 @@ export function DirectChatGate() {
       connection === "closed" &&
       (previous === "connecting" || previous === "connected")
     ) {
-      void refreshSession();
+      void Promise.allSettled([refreshSession(), refresh()]);
     }
-  }, [connection, directChatEnabled, refreshSession]);
+  }, [connection, directChatEnabled, refresh, refreshSession]);
 
-  if (directChatEnabled) {
-    return <ChatScreen />;
+  if (directChatEnabled && installationId) {
+    return <ChatScreen installationId={installationId} />;
   }
 
   if (!exactHumanOwner || status === "idle" || status === "loading") {
@@ -149,6 +156,12 @@ export function DirectChatGate() {
     />
   );
 }
+
+const preissuedDirectChatInstallationId = preissuedSessionMode
+  ? (
+      import.meta as ImportMeta & { env?: Record<string, string | undefined> }
+    ).env?.VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID?.trim() || null
+  : null;
 
 function DirectChatLifecycle({
   title,

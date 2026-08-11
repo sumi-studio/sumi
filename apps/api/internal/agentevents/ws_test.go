@@ -646,7 +646,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	browserServer := NewBrowserServer(sessions, gateway, gateway)
+	browserServer := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	browserServer.AllowedOrigins = []string{"https://web.example"}
 	browserMux := http.NewServeMux()
 	browserMux.Handle("GET /direct-chat/ws", browserServer)

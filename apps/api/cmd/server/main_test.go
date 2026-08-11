@@ -31,6 +31,31 @@ var testSessionSecret = []byte("browser-session-secret-32-bytes!!")
 
 const testLocalControlPAID = "0198f0f4-9b72-7000-8000-000000000001"
 const testBrowserOrigin = "https://web.example"
+const testDirectChatInstallationID = "018f47a2-9b3c-7def-8abc-0123456789ac"
+
+type allowDirectChatAuthorizer struct{}
+
+func (allowDirectChatAuthorizer) AuthorizeDirectChat(
+	_ context.Context,
+	_, _, installationID string,
+	operation func() error,
+) error {
+	if installationID != testDirectChatInstallationID {
+		return agentevents.ErrDirectChatAuthorizationDenied
+	}
+	return operation()
+}
+
+func newAuthorizedTestRouter(t *testing.T) (*http.ServeMux, error) {
+	t.Helper()
+	app, err := newApplicationFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	app.browser.SetAuthorizer(allowDirectChatAuthorizer{})
+	t.Cleanup(func() { _ = app.Close() })
+	return app.publicMux, nil
+}
 
 type testTokenClaims struct {
 	TenantID           string `json:"tenant_id"`
@@ -184,7 +209,7 @@ func postAuthorized(t *testing.T, serverURL, personalityAgentID string, body []b
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                "sumi:agent:events",
 	})
-	req, err := http.NewRequest(http.MethodPost, serverURL+"/direct-chat/commands", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -212,7 +237,7 @@ func postWithSessionCookieAndKey(t *testing.T, serverURL, personalityAgentID, id
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                agentevents.DefaultBrowserAudience(),
 	})
-	req, err := http.NewRequest(http.MethodPost, serverURL+"/direct-chat/commands", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -346,6 +371,7 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 	}
 	browser := agentevents.NewBrowserServer(sessions, runtime, runtime)
 	browser.AllowedOrigins = []string{testBrowserOrigin}
+	browser.SetAuthorizer(allowDirectChatAuthorizer{})
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", browser)
 	server := httptest.NewServer(mux)
@@ -360,7 +386,7 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 		_ = store.Close()
 		t.Fatal(err)
 	}
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/direct-chat/ws"
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 		"Origin": {testBrowserOrigin},
 		"Cookie": {agentevents.BrowserSessionCookie + "=" + session},
@@ -539,7 +565,7 @@ func TestNewRouter_RequiresAgentRuntimeStateDir(t *testing.T) {
 func TestNewRouter_RegistersCommandRouteWithBrowserSession(t *testing.T) {
 	setSessionSecret(t)
 	setReadyRouterState(t, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	mux, err := newRouter()
+	mux, err := newAuthorizedTestRouter(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +596,7 @@ func TestNewRouter_CommandRouteRejectsUnavailableWithoutDurableAppend(t *testing
 	setSessionSecret(t)
 	commandDir := t.TempDir()
 	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
-	mux, err := newRouter()
+	mux, err := newAuthorizedTestRouter(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,6 +641,7 @@ func TestDirectCommandLazySpawnIsolatesThreePAIDLogsAndRejectsTargetInjection(t 
 	}
 	defer app.Close()
 	app.browser.SetSpawner(&readyingDirectChatSpawner{gateway: app.browser.Events})
+	app.browser.SetAuthorizer(allowDirectChatAuthorizer{})
 	server := httptest.NewServer(app.publicMux)
 	defer server.Close()
 
@@ -674,7 +701,7 @@ func TestNewRouter_CommandRouteRejectsAgentToken(t *testing.T) {
 	setTokenSecret(t)
 	setSessionSecret(t)
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
-	mux, err := newRouter()
+	mux, err := newAuthorizedTestRouter(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -693,7 +720,7 @@ func TestNewRouter_CommandRouteRejectsAgentToken(t *testing.T) {
 func TestNewRouter_CommandRouteRejectsOversized(t *testing.T) {
 	setSessionSecret(t)
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
-	mux, err := newRouter()
+	mux, err := newAuthorizedTestRouter(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +740,7 @@ func TestNewRouter_CommandRouteRejectsOversized(t *testing.T) {
 func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	setSessionSecret(t)
 	setReadyRouterState(t, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	mux, err := newRouter()
+	mux, err := newAuthorizedTestRouter(t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +750,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 
 	body := []byte(`{"type":"user_message","text":"idem","attachments":[]}`)
 
-	req1, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands", bytes.NewReader(body))
+	req1, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,7 +781,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 		t.Fatalf("expected non-empty first command envelope, got %+v", env1)
 	}
 
-	req2, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands", bytes.NewReader(body))
+	req2, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
