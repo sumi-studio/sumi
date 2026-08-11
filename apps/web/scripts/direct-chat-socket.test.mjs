@@ -236,6 +236,32 @@ test("installation replacement preserves the admitted cursor but fences pending 
   socket.close();
 });
 
+test("same-installation suspend starts a fresh transport epoch without losing the cursor", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(installationId);
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive(event(1, { type: "agent_start" }));
+  first.receive({ type: "direct_chat_status", status: "ready" });
+  socket.sendCommand({ type: "abort" }, "pre-disable-key");
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["pre-disable-key"]);
+
+  socket.suspendInstallation();
+
+  assert.equal(first.readyState, FakeWebSocket.CLOSED);
+  assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  socket.bindInstallation(installationId);
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 1 }]);
+  second.receive({ type: "direct_chat_status", status: "ready" });
+  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  socket.close();
+});
+
 test("tracks browser connection separately from authoritative agent readiness", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();

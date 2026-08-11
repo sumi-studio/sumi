@@ -24,6 +24,7 @@ import { userMessageIdFromCommandId } from "./user-message-id";
 
 export interface DirectChatTransport {
   bindInstallation(installationId: string): void;
+  suspendInstallation(): void;
   connect(): void;
   close(): void;
   resetAuthority?(): void;
@@ -47,6 +48,7 @@ export interface ConversationState {
   lastError: string | null;
   recoverableDrafts: RecoverableDraft[];
   acquireConnection: (installationId: string) => () => void;
+  suspendInstallation: (installationId: string) => boolean;
   connect: () => void;
   disconnect: () => void;
   resumeMountedConnection: () => void;
@@ -205,26 +207,13 @@ export function createConversationStore({
 
       cancelPendingConnection();
       if (started) stopConnection();
-      let recoveryFailed = false;
-      for (const entry of outbox.entries()) {
-        if (entry.state !== "pending") continue;
-        const recovered = outbox.recoverByIdempotencyKey(
-          entry.idempotencyKey,
+      if (
+        !recoverPendingCommands(
           "installation_changed",
-        );
-        if (!recovered) {
-          recoveryFailed = true;
-          continue;
-        }
-        removeOptimistic(entry.idempotencyKey);
-      }
-      if (recoveryFailed) {
-        privateStateQuarantined = true;
-        publish(
           "Pending direct-chat text could not be fenced before the app installation changed",
-        );
+        )
+      )
         return false;
-      }
       transport.bindInstallation(normalized);
       boundInstallationId = normalized;
       publish(null);
@@ -238,6 +227,46 @@ export function createConversationStore({
         ...session,
         conversation: removeEntry(session.conversation, optimistic.id),
       };
+    };
+
+    const recoverPendingCommands = (
+      reason: string,
+      failureMessage: string,
+    ): boolean => {
+      let recoveryFailed = false;
+      for (const entry of outbox.entries()) {
+        if (entry.state !== "pending") continue;
+        const recovered = outbox.recoverByIdempotencyKey(
+          entry.idempotencyKey,
+          reason,
+        );
+        if (!recovered) {
+          recoveryFailed = true;
+          continue;
+        }
+        removeOptimistic(entry.idempotencyKey);
+      }
+      if (!recoveryFailed) return true;
+      privateStateQuarantined = true;
+      publish(failureMessage);
+      return false;
+    };
+
+    const suspendInstallation = (installationId: string): boolean => {
+      const normalized = installationId.trim();
+      if (!normalized || boundInstallationId !== normalized) return true;
+
+      cancelPendingConnection();
+      if (started) stopConnection();
+      transport.suspendInstallation();
+      boundInstallationId = null;
+      approvalSubmissionLatches.clear();
+      const recovered = recoverPendingCommands(
+        "installation_suspended",
+        "Pending direct-chat text could not be recovered after the app was disabled",
+      );
+      if (recovered) publish(null);
+      return recovered;
     };
 
     const ensureOptimistic = (
@@ -530,6 +559,7 @@ export function createConversationStore({
           }
         };
       },
+      suspendInstallation,
       connect() {
         cancelPendingConnection();
         startConnection();

@@ -11,6 +11,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
@@ -111,8 +112,9 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
-	appStore := applicationapps.New(pool, workspacecontrol.New(pool))
+	lifecycle := directchat.NewLifecycleFence()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
 	authorizer := newDirectChatAuthorizer(pool, store, appStore)
 
 	// Two Humans, each with their own Secretary.
@@ -144,7 +146,7 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	}
 
 	// Each Human is the Employer of their own Secretary: direct chat allowed.
-	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); err != nil {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); err != nil {
 		t.Fatalf("owner should be authorized for own secretary: %v", err)
 	}
 	alarmInstallation, err := appStore.Install(
@@ -156,24 +158,24 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	if err != nil {
 		t.Fatalf("install alarm: %v", err)
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, alarmInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, first.HumanID, first.AgentID, alarmInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatalf("wrong app installation error = %v", err)
 	}
 	if _, err := appStore.SetEnabledByID(ctx, firstInstallation.InstallationID, participant.Human(first.HumanID), false); err != nil {
 		t.Fatalf("disable first direct chat: %v", err)
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatalf("disabled direct chat error = %v", err)
 	}
 	if _, err := appStore.SetEnabledByID(ctx, firstInstallation.InstallationID, participant.Human(first.HumanID), true); err != nil {
 		t.Fatalf("re-enable first direct chat: %v", err)
 	}
 	// A Human is NOT the Employer of another Human's Secretary: rejected.
-	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID, secondInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, second.HumanID, first.AgentID, secondInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatal("non-employer human must not direct-chat with another's secretary")
 	}
 	// An exact installation cannot be borrowed across Humans.
-	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, second.AgentID, firstInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, second.HumanID, second.AgentID, firstInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatalf("wrong Human installation error = %v", err)
 	}
 
@@ -187,10 +189,10 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	); err != nil {
 		t.Fatalf("transfer employment: %v", err)
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatal("former employer must lose direct-chat access after 異動")
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID, secondInstallation.InstallationID, func() error { return nil }); err != nil {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, second.HumanID, first.AgentID, secondInstallation.InstallationID, func() error { return nil }); err != nil {
 		t.Fatalf("new employer should be authorized after 異動: %v", err)
 	}
 }
@@ -199,8 +201,9 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
-	appStore := applicationapps.New(pool, workspacecontrol.New(pool))
+	lifecycle := directchat.NewLifecycleFence()
+	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
 	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
 	registration, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-disable-race")
 	if err != nil {
@@ -216,8 +219,10 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	releaseOperation := make(chan struct{})
 	authorizeDone := make(chan error, 1)
 	go func() {
-		authorizeDone <- authorizer.AuthorizeDirectChat(
+		authorizeDone <- authorizeDirectChatWithFence(
 			ctx,
+			lifecycle,
+			authorizer,
 			registration.HumanID,
 			registration.AgentID,
 			installation.InstallationID,
@@ -252,8 +257,10 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	}
 
 	operationCalled := false
-	if err := authorizer.AuthorizeDirectChat(
+	if err := authorizeDirectChatWithFence(
 		ctx,
+		lifecycle,
+		authorizer,
 		registration.HumanID,
 		registration.AgentID,
 		installation.InstallationID,
@@ -271,6 +278,16 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	if _, err := appStore.SetEnabledByID(ctx, installation.InstallationID, actor, true); err != nil {
 		t.Fatalf("re-enable before lifecycle-first race: %v", err)
 	}
+	releaseLifecycle, err := lifecycle.AcquireMutation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycleReleased := false
+	defer func() {
+		if !lifecycleReleased {
+			releaseLifecycle()
+		}
+	}()
 	lifecycleTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -294,8 +311,10 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	lifecycleFirstCalled := false
 	lifecycleFirstDone := make(chan error, 1)
 	go func() {
-		lifecycleFirstDone <- authorizer.AuthorizeDirectChat(
+		lifecycleFirstDone <- authorizeDirectChatWithFence(
 			ctx,
+			lifecycle,
+			authorizer,
 			registration.HumanID,
 			registration.AgentID,
 			installation.InstallationID,
@@ -310,6 +329,8 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	if err := lifecycleTx.Commit(ctx); err != nil {
 		t.Fatalf("commit lifecycle-first disable: %v", err)
 	}
+	releaseLifecycle()
+	lifecycleReleased = true
 	if err := <-lifecycleFirstDone; !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatalf("lifecycle-first authorization error = %v", err)
 	}
@@ -318,12 +339,163 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	}
 }
 
+func TestDirectChatProcessFenceSurvivesPostgresBackendLoss(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	lifecycle := directchat.NewLifecycleFence()
+	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
+	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
+	first, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-backend-loss-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-backend-loss-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := participant.Human(first.HumanID)
+	installation, err := appStore.Install(
+		ctx,
+		applicationapps.ParticipantOwner(actor),
+		actor,
+		directchat.AppID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	operationEntered := make(chan struct{})
+	releaseEffect := make(chan struct{})
+	authorizeDone := make(chan error, 1)
+	go func() {
+		authorizeDone <- authorizeDirectChatWithFence(
+			ctx,
+			lifecycle,
+			authorizer,
+			first.HumanID,
+			first.AgentID,
+			installation.InstallationID,
+			func() error {
+				close(operationEntered)
+				select {
+				case <-releaseEffect:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		)
+	}()
+	select {
+	case <-operationEntered:
+	case <-ctx.Done():
+		t.Fatalf("authorized effect did not start: %v", ctx.Err())
+	}
+
+	var backendPID int32
+	deadline := time.Now().Add(2 * time.Second)
+	for backendPID == 0 && time.Now().Before(deadline) {
+		err = pool.QueryRow(ctx, `
+			SELECT pid
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND state = 'idle in transaction'
+			  AND query LIKE '%app_installations%'
+			ORDER BY backend_start DESC
+			LIMIT 1`).Scan(&backendPID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatalf("locate composite authorization backend: %v", err)
+		}
+	}
+	if backendPID == 0 {
+		t.Fatal("composite authorization backend was not observable")
+	}
+	var terminated bool
+	if err := pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", backendPID).Scan(&terminated); err != nil {
+		t.Fatalf("terminate authorization backend: %v", err)
+	}
+	if !terminated {
+		t.Fatalf("authorization backend %d was not terminated", backendPID)
+	}
+
+	disableDone := make(chan error, 1)
+	go func() {
+		_, disableErr := appStore.SetEnabledByID(
+			ctx,
+			installation.InstallationID,
+			actor,
+			false,
+		)
+		disableDone <- disableErr
+	}()
+	transferDone := make(chan error, 1)
+	go func() {
+		transferDone <- kosekiStore.TransferEmployment(
+			ctx,
+			first.AgentID,
+			koseki.EmployerHuman,
+			second.HumanID,
+		)
+	}()
+	for name, done := range map[string]<-chan error{
+		"disable":  disableDone,
+		"transfer": transferDone,
+	} {
+		select {
+		case mutationErr := <-done:
+			close(releaseEffect)
+			t.Fatalf("%s committed after PG lease loss but before effect completion: %v", name, mutationErr)
+		case <-time.After(75 * time.Millisecond):
+		}
+	}
+	close(releaseEffect)
+	if err := <-authorizeDone; !errors.Is(err, agentevents.ErrDirectChatAuthorizationUnavailable) {
+		t.Fatalf("backend-loss authorization result = %v", err)
+	}
+	if err := <-disableDone; err != nil {
+		t.Fatalf("disable after effect completion: %v", err)
+	}
+	if err := <-transferDone; err != nil {
+		t.Fatalf("transfer after effect completion: %v", err)
+	}
+	var enabled bool
+	if err := pool.QueryRow(
+		ctx,
+		"SELECT enabled FROM app_installations WHERE installation_id = $1",
+		installation.InstallationID,
+	).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled {
+		t.Fatal("direct-chat installation remained enabled")
+	}
+	var employerID string
+	if err := pool.QueryRow(
+		ctx,
+		"SELECT employer_id FROM employments WHERE agent_id = $1 AND ended_at IS NULL",
+		first.AgentID,
+	).Scan(&employerID); err != nil {
+		t.Fatal(err)
+	}
+	if employerID != second.HumanID {
+		t.Fatalf("current Employer = %q, want %q", employerID, second.HumanID)
+	}
+}
+
 func TestDirectChatAuthorizerUninstallReinstallDoesNotReviveStaleInstallation(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
-	appStore := applicationapps.New(pool, workspacecontrol.New(pool))
+	lifecycle := directchat.NewLifecycleFence()
+	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
 	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
 	registration, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-reinstall")
 	if err != nil {
@@ -345,10 +517,33 @@ func TestDirectChatAuthorizerUninstallReinstallDoesNotReviveStaleInstallation(t 
 	if oldInstallation.InstallationID == newInstallation.InstallationID {
 		t.Fatal("reinstall reused installation identity")
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, registration.HumanID, registration.AgentID, oldInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, registration.HumanID, registration.AgentID, oldInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatalf("stale installation error = %v", err)
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, registration.HumanID, registration.AgentID, newInstallation.InstallationID, func() error { return nil }); err != nil {
+	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, registration.HumanID, registration.AgentID, newInstallation.InstallationID, func() error { return nil }); err != nil {
 		t.Fatalf("new installation rejected: %v", err)
 	}
+}
+
+func authorizeDirectChatWithFence(
+	ctx context.Context,
+	lifecycle *directchat.LifecycleFence,
+	authorizer *directChatAuthorizer,
+	humanID,
+	agentID,
+	installationID string,
+	operation func() error,
+) error {
+	release, err := lifecycle.AcquireOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return authorizer.AuthorizeDirectChat(
+		ctx,
+		humanID,
+		agentID,
+		installationID,
+		operation,
+	)
 }

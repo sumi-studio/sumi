@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 type dispositionBeforeAppendReturn struct {
@@ -39,6 +40,12 @@ type blockingDirectChatSpawner struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type dialBrowserResult struct {
+	conn     *websocket.Conn
+	response *http.Response
+	err      error
 }
 
 func (s *blockingDirectChatSpawner) EnsureRunning(ctx context.Context, _ string) error {
@@ -417,6 +424,7 @@ func TestBrowserWebSocketRequiresExactInstallationScopeAndBoundAuthorizer(t *tes
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			browser := NewBrowserServer(sessions, gateway, gateway)
+			browser.SetLifecycleFence(directchat.NewLifecycleFence())
 			browser.AllowedOrigins = []string{browserAuthTestOrigin}
 			browser.Authorizer = testCase.authorizer
 			server := httptest.NewServer(browser)
@@ -1178,6 +1186,119 @@ func TestBrowserWebSocketLogoutCompletesWhileSpawnerIsBlocked(t *testing.T) {
 	if stats := server.ConnectionStats(); stats != (BrowserConnectionStats{}) {
 		t.Fatalf("revoked post-spawn admission registered a connection: %+v", stats)
 	}
+}
+
+func TestBrowserWebSocketLifecycleMutationWaitsForBoundedProvisioning(t *testing.T) {
+	newAdmission := func(
+		t *testing.T,
+		spawnTimeout time.Duration,
+	) (*blockingDirectChatSpawner, *directchat.LifecycleFence, <-chan dialBrowserResult) {
+		t.Helper()
+		gateway := openRuntimeGateway(t)
+		sessions, err := NewHMACUserSessionVerifier(testSecret, "", gateway)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
+			TenantID:           "tenant-1",
+			UserID:             "user-1",
+			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		}, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spawner := &blockingDirectChatSpawner{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		fence := directchat.NewLifecycleFence()
+		server := newAuthorizedBrowserServer(sessions, gateway, gateway)
+		server.SetLifecycleFence(fence)
+		server.AllowedOrigins = []string{browserAuthTestOrigin}
+		server.Spawner = spawner
+		server.SpawnTimeout = spawnTimeout
+		mux := http.NewServeMux()
+		mux.Handle("GET /direct-chat/ws", server)
+		httpServer := httptest.NewServer(mux)
+		t.Cleanup(httpServer.Close)
+		dialed := make(chan dialBrowserResult, 1)
+		go func() {
+			wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) +
+				"/direct-chat/ws?installation_id=" + testDirectChatInstallationID
+			header := http.Header{
+				"Origin": {browserAuthTestOrigin},
+				"Cookie": {BrowserSessionCookie + "=" + session},
+			}
+			conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, header)
+			dialed <- dialBrowserResult{conn: conn, response: response, err: dialErr}
+		}()
+		select {
+		case <-spawner.started:
+		case <-time.After(time.Second):
+			t.Fatal("browser admission did not reach provisioning")
+		}
+		return spawner, fence, dialed
+	}
+
+	t.Run("mutation waits and the admitted spawn finishes in its prior epoch", func(t *testing.T) {
+		spawner, fence, dialed := newAdmission(t, time.Second)
+		mutationDone := make(chan error, 1)
+		go func() {
+			release, err := fence.AcquireMutation(context.Background())
+			if err == nil {
+				release()
+			}
+			mutationDone <- err
+		}()
+		select {
+		case err := <-mutationDone:
+			close(spawner.release)
+			t.Fatalf("lifecycle mutation crossed blocked provisioning: %v", err)
+		case <-time.After(40 * time.Millisecond):
+		}
+		close(spawner.release)
+		got := <-dialed
+		if got.response != nil && got.response.Body != nil {
+			defer got.response.Body.Close()
+		}
+		if got.err != nil || got.conn == nil {
+			t.Fatalf("operation-first admission = response %v, error %v", got.response, got.err)
+		}
+		defer got.conn.Close()
+		if err := <-mutationDone; err != nil {
+			t.Fatalf("mutation after provisioning: %v", err)
+		}
+	})
+
+	t.Run("spawn timeout releases the lifecycle fence", func(t *testing.T) {
+		_, fence, dialed := newAdmission(t, 30*time.Millisecond)
+		mutationDone := make(chan error, 1)
+		go func() {
+			release, err := fence.AcquireMutation(context.Background())
+			if err == nil {
+				release()
+			}
+			mutationDone <- err
+		}()
+		select {
+		case err := <-mutationDone:
+			if err != nil {
+				t.Fatalf("mutation after spawn timeout: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed-out provisioning wedged direct-chat lifecycle")
+		}
+		got := <-dialed
+		if got.conn != nil {
+			got.conn.Close()
+		}
+		if got.response != nil && got.response.Body != nil {
+			defer got.response.Body.Close()
+		}
+		if got.err == nil || got.response == nil || got.response.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("spawn timeout response=%v err=%v, want 503", got.response, got.err)
+		}
+	})
 }
 
 func TestBrowserWebSocketSpawnUsesServerTimeoutAndSessionTarget(t *testing.T) {

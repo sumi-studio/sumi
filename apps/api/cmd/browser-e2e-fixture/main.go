@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 var secret = []byte("browser-e2e-session-secret-32-bytes")
@@ -85,6 +86,7 @@ func main() {
 		nil,
 		[]string{"http://127.0.0.1:4173"},
 		fixtureDirectChatAuthorizer{},
+		directchat.NewLifecycleFence(),
 	)
 	if err != nil {
 		log.Fatal(err)

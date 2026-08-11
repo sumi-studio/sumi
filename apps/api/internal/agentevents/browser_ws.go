@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 // BrowserServer is the browser-facing direct-chat WebSocket boundary. It never
@@ -24,6 +25,9 @@ type BrowserServer struct {
 	// Employer and the exact enabled Human-owned direct-chat AppInstallation. A
 	// nil Authorizer fails closed.
 	Authorizer DirectChatAuthorizer
+	// LifecycleFence orders all effect-capable operations against app and
+	// Employer lifecycle commits in this single API process. Nil fails closed.
+	LifecycleFence *directchat.LifecycleFence
 	// Spawner optionally lazily starts the target agent runtime on connect
 	// (ADR 0010). A nil Spawner assumes the agent is already running.
 	Spawner DirectChatSpawner
@@ -67,6 +71,16 @@ func (s *BrowserServer) SetAuthorizer(authorizer DirectChatAuthorizer) {
 	s.Authorizer = authorizer
 	if s.commandIngress != nil {
 		s.commandIngress.Authorizer = authorizer
+	}
+}
+
+// SetLifecycleFence installs the same single-process fence for both browser
+// transports. Application assembly must also pass this exact instance to the
+// app and Employer stores.
+func (s *BrowserServer) SetLifecycleFence(fence *directchat.LifecycleFence) {
+	s.LifecycleFence = fence
+	if s.commandIngress != nil {
+		s.commandIngress.LifecycleFence = fence
 	}
 }
 
@@ -366,6 +380,23 @@ func (s *BrowserServer) authorizeBrowserOperation(
 	installationID string,
 	operation func() error,
 ) error {
+	if s.LifecycleFence == nil {
+		return ErrDirectChatAuthorizationUnavailable
+	}
+	releaseLifecycle, err := s.LifecycleFence.AcquireOperation(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: acquire direct-chat lifecycle operation: %v", ErrDirectChatAuthorizationUnavailable, err)
+	}
+	defer releaseLifecycle()
+	return s.authorizeBrowserOperationUnderFence(ctx, claims, installationID, operation)
+}
+
+func (s *BrowserServer) authorizeBrowserOperationUnderFence(
+	ctx context.Context,
+	claims UserSessionClaims,
+	installationID string,
+	operation func() error,
+) error {
 	if operation == nil {
 		return errors.New("browser authorization operation is required")
 	}
@@ -378,7 +409,8 @@ func (s *BrowserServer) authorizeBrowserOperation(
 // authentication happens before upgrade so a rejected session cannot consume a
 // WebSocket or leak whether an agent connection exists.
 func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.Sessions == nil || s.Appender == nil || s.Events == nil || s.Authorizer == nil {
+	if s.Sessions == nil || s.Appender == nil || s.Events == nil ||
+		s.Authorizer == nil || s.LifecycleFence == nil {
 		http.Error(w, "browser websocket not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -405,6 +437,12 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid_scope", http.StatusBadRequest)
 		return
 	}
+	releaseLifecycle, err := s.LifecycleFence.AcquireOperation(r.Context())
+	if err != nil {
+		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseLifecycle()
 	if s.Spawner != nil {
 		// The global browser-session lease authorizes only this bounded,
 		// side-effect-free intent. EnsureRunning owns idempotent provisioning and
@@ -514,6 +552,10 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// The admission epoch ends once the exact socket has been upgraded and
+	// registered. Live effects below acquire their own bounded read permit, so a
+	// lifecycle mutation never waits for the lifetime of an idle connection.
+	releaseLifecycle()
 	defer s.removeConnection(conn)
 	defer conn.Close()
 	if err := s.run(r.Context(), conn, claims, installationID); err != nil && !errors.Is(err, context.Canceled) {
@@ -647,7 +689,9 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		return err
 	}
 
-	if err := s.Events.EnsureAgentSessionStateRebuilt(ctx, claims.PersonalityAgentID); err != nil {
+	if err := authorize(func() error {
+		return s.Events.EnsureAgentSessionStateRebuilt(ctx, claims.PersonalityAgentID)
+	}); err != nil {
 		return fmt.Errorf("rebuild agent session state: %w", err)
 	}
 
@@ -968,31 +1012,30 @@ func (s *BrowserServer) browserReadPump(
 						frame.Command,
 					)
 				}
-				return appendErr
-			})
-			if admissionErr != nil {
-				return nil
-			}
-			var disposition json.RawMessage
-			found := false
-			if existingAcceptance {
-				var lookupErr error
-				disposition, found, lookupErr = s.Events.CommandDispositionFor(operationContext, envelope)
-				if lookupErr != nil {
-					admissionErr = fmt.Errorf("lookup browser command disposition: %w", lookupErr)
-					return nil
+				if appendErr != nil {
+					return appendErr
 				}
-			}
-			accepted := browserCommandAcceptedFrame{
-				Type:           "command_accepted",
-				IdempotencyKey: frame.IdempotencyKey,
-				CommandID:      envelope.CommandID,
-				Seq:            envelope.Seq,
-			}
-			if found {
-				accepted.Disposition = disposition
-			}
-			return writeUnlocked(accepted)
+				var disposition json.RawMessage
+				found := false
+				if existingAcceptance {
+					var lookupErr error
+					disposition, found, lookupErr = s.Events.CommandDispositionFor(operationContext, envelope)
+					if lookupErr != nil {
+						return fmt.Errorf("lookup browser command disposition: %w", lookupErr)
+					}
+				}
+				accepted := browserCommandAcceptedFrame{
+					Type:           "command_accepted",
+					IdempotencyKey: frame.IdempotencyKey,
+					CommandID:      envelope.CommandID,
+					Seq:            envelope.Seq,
+				}
+				if found {
+					accepted.Disposition = disposition
+				}
+				return writeUnlocked(accepted)
+			})
+			return nil
 		})
 		cancelOperation()
 		if writeErr != nil {

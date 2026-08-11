@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 // NewProductionMux assembles the production API router. All dependencies are
@@ -12,10 +14,10 @@ import (
 //
 // A nil TokenVerifier makes /agent/ws fail-closed. A nil UserSessionVerifier
 // makes the browser command and WebSocket routes fail-closed. A nil direct-chat
-// authorizer also fails those routes closed. browserOrigins is the single
-// exact-origin allowlist for both direct-chat browser routes and is fail-closed
-// when empty. /health is not registered by this helper so callers can attach
-// their own health handler.
+// authorizer or lifecycle fence also fails those routes closed. browserOrigins
+// is the single exact-origin allowlist for both direct-chat browser routes and
+// is fail-closed when empty. /health is not registered by this helper so callers
+// can attach their own health handler.
 func NewProductionMux(
 	store *CommandStore,
 	runtime *DurableGateway,
@@ -24,6 +26,7 @@ func NewProductionMux(
 	agentOrigins,
 	browserOrigins []string,
 	authorizer DirectChatAuthorizer,
+	lifecycleFence *directchat.LifecycleFence,
 ) (*http.ServeMux, *BrowserServer, *Server, error) {
 	mux := http.NewServeMux()
 
@@ -42,12 +45,14 @@ func NewProductionMux(
 	}
 	ingress.AllowedOrigins = browserOrigins
 	ingress.Authorizer = authorizer
+	ingress.LifecycleFence = lifecycleFence
 	mux.Handle("POST /direct-chat/commands", ingress)
 
 	browser := NewBrowserServer(sv, runtime, runtime)
 	browser.commandIngress = ingress
 	browser.AllowedOrigins = browserOrigins
 	browser.Authorizer = authorizer
+	browser.LifecycleFence = lifecycleFence
 	mux.Handle("GET /direct-chat/ws", browser)
 
 	return mux, browser, agent, nil

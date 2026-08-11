@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"time"
 	"unicode/utf8"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 // MaxUserCommandBytes is the wire-size limit for a user_message command before
@@ -68,12 +70,16 @@ type UserCommandIngress struct {
 	Readiness interface {
 		IsPersonalityAgentReady(context.Context, string) (bool, error)
 	}
+	SpawnTimeout      time.Duration
 	SpawnReadyTimeout time.Duration
 	MaxBytes          int64
 	AllowedOrigins    []string
 	// Authorizer gates direct chat on Current Employer and the exact enabled
 	// Human-owned direct-chat AppInstallation. A nil Authorizer fails closed.
 	Authorizer DirectChatAuthorizer
+	// LifecycleFence must be the same process fence used by app and Employer
+	// lifecycle mutations. Nil fails closed.
+	LifecycleFence *directchat.LifecycleFence
 }
 
 var errCommandAppenderRequired = errors.New("CommandAppender is required")
@@ -149,10 +155,16 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid_scope", http.StatusBadRequest)
 		return
 	}
-	if h.Authorizer == nil {
+	if h.Authorizer == nil || h.LifecycleFence == nil {
 		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	releaseLifecycle, err := h.LifecycleFence.AcquireOperation(r.Context())
+	if err != nil {
+		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseLifecycle()
 	if err := h.authorizeDirectChat(r.Context(), claims, installationID, func() error { return nil }); err != nil {
 		if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
 			http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
@@ -187,7 +199,10 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.Spawner != nil {
-		if err := h.Spawner.EnsureRunning(r.Context(), claims.PersonalityAgentID); err != nil {
+		spawnContext, cancelSpawn := context.WithTimeout(r.Context(), h.spawnTimeout())
+		err := h.Spawner.EnsureRunning(spawnContext, claims.PersonalityAgentID)
+		cancelSpawn()
+		if err != nil {
 			log.Printf("direct command lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
 			writeUnavailable(w, idempotencyKey)
 			return
@@ -266,6 +281,13 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CommandID:      env.CommandID,
 		Seq:            env.Seq,
 	})
+}
+
+func (h *UserCommandIngress) spawnTimeout() time.Duration {
+	if h.SpawnTimeout > 0 {
+		return h.SpawnTimeout
+	}
+	return 30 * time.Second
 }
 
 func (h *UserCommandIngress) awaitSpawnReady(ctx context.Context, personalityAgentID string) error {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/testfs"
 )
@@ -36,6 +37,7 @@ func TestWorkspaceDomainErrorsExposeCanonicalCodes(t *testing.T) {
 		{"last administrator", ErrLastAdministrator, http.StatusConflict, "last_administrator"},
 		{"generic conflict", ErrRoleNameTaken, http.StatusConflict, "conflict"},
 		{"invalid Workspace list cursor", ErrInvalidWorkspaceListCursor, http.StatusBadRequest, "invalid_request"},
+		{"direct-chat lifecycle unavailable", directchat.ErrLifecycleFenceUnavailable, http.StatusServiceUnavailable, "unavailable"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

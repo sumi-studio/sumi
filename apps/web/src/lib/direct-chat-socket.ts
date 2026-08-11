@@ -883,6 +883,21 @@ export class DirectChatSocket {
     this.setReadyState("unknown");
   }
 
+  /**
+   * Ends one installation's transport authority epoch without discarding the
+   * Human's durable event cursor. A later enable of the same installation id
+   * must bind and connect as a fresh epoch, and must not replay commands that
+   * were never accepted before suspension.
+   */
+  suspendInstallation() {
+    this.close();
+    this.installationId = undefined;
+    this.reconnectAttempt = 0;
+    this.pending.clear();
+    this.setConnectionState("closed");
+    this.setReadyState("unknown");
+  }
+
   connect() {
     if (!this.installationId) {
       this.setConnectionState("closed");
