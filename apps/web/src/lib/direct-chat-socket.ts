@@ -812,13 +812,18 @@ export function parseDirectChatServerFrame(
 export function resolveDirectChatURL({
   apiBaseURL,
   authMode,
+  installationId,
   pageOrigin,
 }: {
   apiBaseURL?: string;
   authMode?: string;
+  installationId: string;
   pageOrigin?: string;
 }): URL {
   if (!pageOrigin) throw new Error("direct chat page origin is unavailable");
+  if (!installationId.trim()) {
+    throw new Error("direct chat installation is unavailable");
+  }
 
   const pageURL = new URL(pageOrigin);
   const configuredBase = apiBaseURL?.trim();
@@ -842,6 +847,7 @@ export function resolveDirectChatURL({
   }
 
   const url = new URL("/direct-chat/ws", apiURL);
+  url.searchParams.set("installation_id", installationId);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 }
@@ -854,12 +860,35 @@ export class DirectChatSocket {
   private reconnectAttempt = 0;
   private lastEventSeq = 0;
   private admissionReady = false;
+  private installationId?: string;
   private readonly pending = new Map<string, DirectChatCommand>();
   private readonly listeners = new Set<Listener>();
   private readonly connectionListeners = new Set<ConnectionListener>();
   private readonly readyListeners = new Set<ReadyListener>();
 
+  /**
+   * Binds the socket to one exact app installation. Changing the binding is an
+   * authority transition: unaccepted transport retries are fenced, while the
+   * durable event cursor remains valid for the same Human's private chat log.
+   */
+  bindInstallation(installationId: string) {
+    const normalized = installationId.trim();
+    if (!normalized) throw new Error("direct chat installation is unavailable");
+    if (this.installationId === normalized) return;
+    this.close();
+    this.installationId = normalized;
+    this.reconnectAttempt = 0;
+    this.pending.clear();
+    this.setConnectionState("closed");
+    this.setReadyState("unknown");
+  }
+
   connect() {
+    if (!this.installationId) {
+      this.setConnectionState("closed");
+      this.setReadyState("unknown");
+      return;
+    }
     if (this.socket) {
       const { readyState } = this.socket;
       if (
@@ -878,6 +907,7 @@ export class DirectChatSocket {
     const url = resolveDirectChatURL({
       apiBaseURL: env?.VITE_API_BASE_URL,
       authMode: env?.VITE_SUMI_AUTH_MODE,
+      installationId: this.installationId,
       pageOrigin: globalThis.location?.origin,
     });
     const socket = new WebSocket(url);
@@ -982,6 +1012,7 @@ export class DirectChatSocket {
     this.reconnectAttempt = 0;
     this.lastEventSeq = 0;
     this.pending.clear();
+    this.installationId = undefined;
     this.setConnectionState("closed");
     this.setReadyState("unknown");
   }

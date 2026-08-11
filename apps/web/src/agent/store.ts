@@ -23,6 +23,7 @@ import {
 import { userMessageIdFromCommandId } from "./user-message-id";
 
 export interface DirectChatTransport {
+  bindInstallation(installationId: string): void;
   connect(): void;
   close(): void;
   resetAuthority?(): void;
@@ -45,7 +46,7 @@ export interface ConversationState {
   ready: DirectChatReadyState;
   lastError: string | null;
   recoverableDrafts: RecoverableDraft[];
-  acquireConnection: () => () => void;
+  acquireConnection: (installationId: string) => () => void;
   connect: () => void;
   disconnect: () => void;
   resumeMountedConnection: () => void;
@@ -83,6 +84,7 @@ export function createConversationStore({
   const connectionOwners = new Set<symbol>();
   let connectionGeneration = 0;
   let pendingConnectionGeneration: number | null = null;
+  let boundInstallationId: string | null = null;
   const approvalSubmissionLatches = new Set<string>();
   const undurableAdmissions = new Map<
     string,
@@ -191,6 +193,42 @@ export function createConversationStore({
         ready = "unknown";
         publish();
       });
+    };
+
+    const bindInstallation = (installationId: string): boolean => {
+      const normalized = installationId.trim();
+      if (!normalized) {
+        publish("Direct chat installation is unavailable");
+        return false;
+      }
+      if (boundInstallationId === normalized) return true;
+
+      cancelPendingConnection();
+      if (started) stopConnection();
+      let recoveryFailed = false;
+      for (const entry of outbox.entries()) {
+        if (entry.state !== "pending") continue;
+        const recovered = outbox.recoverByIdempotencyKey(
+          entry.idempotencyKey,
+          "installation_changed",
+        );
+        if (!recovered) {
+          recoveryFailed = true;
+          continue;
+        }
+        removeOptimistic(entry.idempotencyKey);
+      }
+      if (recoveryFailed) {
+        privateStateQuarantined = true;
+        publish(
+          "Pending direct-chat text could not be fenced before the app installation changed",
+        );
+        return false;
+      }
+      transport.bindInstallation(normalized);
+      boundInstallationId = normalized;
+      publish(null);
+      return true;
     };
 
     const removeOptimistic = (idempotencyKey: string) => {
@@ -471,7 +509,8 @@ export function createConversationStore({
       ready,
       lastError: null,
       recoverableDrafts: outbox.recoverableDrafts(),
-      acquireConnection() {
+      acquireConnection(installationId) {
+        if (!bindInstallation(installationId)) return () => undefined;
         const owner = Symbol("direct-chat-connection-owner");
         connectionOwners.add(owner);
         scheduleMountedConnection();
@@ -500,7 +539,7 @@ export function createConversationStore({
         stopConnection();
       },
       resumeMountedConnection() {
-        scheduleMountedConnection();
+        if (boundInstallationId !== null) scheduleMountedConnection();
       },
       resetAuthority() {
         cancelPendingConnection();
@@ -510,6 +549,7 @@ export function createConversationStore({
         } else {
           transport.close();
         }
+        boundInstallationId = null;
         const cleared = outbox.clear();
         privateStateQuarantined = !cleared;
         undurableAdmissions.clear();

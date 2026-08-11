@@ -121,8 +121,9 @@ func (s *blockingAdmissionSessionAuthorizer) revoke() {
 }
 
 type mutableDirectChatAuthorizer struct {
-	mu      sync.RWMutex
-	allowed bool
+	mu             sync.RWMutex
+	allowed        bool
+	installationID string
 }
 
 type coordinatedDirectChatAuthorizer struct {
@@ -141,6 +142,7 @@ func newCoordinatedDirectChatAuthorizer() *coordinatedDirectChatAuthorizer {
 
 func (a *coordinatedDirectChatAuthorizer) AuthorizeDirectChat(
 	_ context.Context,
+	_ string,
 	_ string,
 	_ string,
 	operation func() error,
@@ -212,14 +214,22 @@ func (a *mutableDirectChatAuthorizer) AuthorizeDirectChat(
 	_ context.Context,
 	_ string,
 	_ string,
+	installationID string,
 	operation func() error,
 ) error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.allowed {
-		return errors.New("human is not the current Employer")
+	if !a.allowed ||
+		(a.installationID != "" && a.installationID != installationID) {
+		return ErrDirectChatAuthorizationDenied
 	}
 	return operation()
+}
+
+func (a *mutableDirectChatAuthorizer) setInstallationID(installationID string) {
+	a.mu.Lock()
+	a.installationID = installationID
+	a.mu.Unlock()
 }
 
 func (a *mutableDirectChatAuthorizer) setAllowed(allowed bool) {
@@ -268,7 +278,7 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -374,6 +384,68 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 }
 
+func TestBrowserWebSocketRequiresExactInstallationScopeAndBoundAuthorizer(t *testing.T) {
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	gateway := openRuntimeGateway(t)
+	sessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	})
+
+	for _, testCase := range []struct {
+		name       string
+		query      string
+		authorizer DirectChatAuthorizer
+		wantStatus int
+	}{
+		{name: "missing", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "empty", query: "?installation_id=", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "duplicate", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID, authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusBadRequest},
+		{name: "wrong", query: "?installation_id=0198f0f4-9b72-7000-8000-000000000099", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusForbidden},
+		{name: "unbound", query: "?installation_id=" + testDirectChatInstallationID, wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			browser := NewBrowserServer(sessions, gateway, gateway)
+			browser.AllowedOrigins = []string{browserAuthTestOrigin}
+			browser.Authorizer = testCase.authorizer
+			server := httptest.NewServer(browser)
+			defer server.Close()
+			request, err := http.NewRequest(
+				http.MethodGet,
+				server.URL+"/direct-chat/ws"+testCase.query,
+				nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Origin", browserAuthTestOrigin)
+			request.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: session})
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != testCase.wantStatus {
+				t.Fatalf("status=%d, want %d", response.StatusCode, testCase.wantStatus)
+			}
+			if stats := browser.ConnectionStats(); stats != (BrowserConnectionStats{}) {
+				t.Fatalf("rejected scope registered connection: %+v", stats)
+			}
+		})
+	}
+}
+
 func TestBrowserWebSocketFirstAdmissionPrecedesItsRacingDisposition(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	gateway.PollInterval = time.Millisecond
@@ -392,7 +464,7 @@ func TestBrowserWebSocketFirstAdmissionPrecedesItsRacingDisposition(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(
+	server := newAuthorizedBrowserServer(
 		sessions,
 		dispositionBeforeAppendReturn{gateway: gateway, claims: agentClaims},
 		gateway,
@@ -546,7 +618,7 @@ func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfte
 			if err != nil {
 				t.Fatal(err)
 			}
-			server := NewBrowserServer(sessions, gateway, gateway)
+			server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 			server.AllowedOrigins = []string{"https://web.example"}
 			mux := http.NewServeMux()
 			mux.Handle("GET /direct-chat/ws", server)
@@ -722,7 +794,7 @@ func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -787,14 +859,14 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 	for _, test := range []struct {
 		name   string
 		cookie string
@@ -844,7 +916,7 @@ func TestBrowserWebSocketRejectsOriginAndAuthorityBeforeRuntimeActivity(t *testi
 		t.Fatal(err)
 	}
 	spawner := &countingDirectChatSpawner{}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{browserAuthTestOrigin}
 	server.Spawner = spawner
 	mux := http.NewServeMux()
@@ -870,7 +942,7 @@ func TestBrowserWebSocketRejectsOriginAndAuthorityBeforeRuntimeActivity(t *testi
 		t.Fatal(err)
 	}
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 	for _, test := range []struct {
 		name       string
 		origin     string
@@ -960,7 +1032,7 @@ func TestBrowserWebSocketRevocationWinsAdmissionBeforeSpawn(t *testing.T) {
 		release:          make(chan struct{}),
 	}
 	spawner := &countingDirectChatSpawner{}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{browserAuthTestOrigin}
 	server.Spawner = spawner
 	mux := http.NewServeMux()
@@ -975,7 +1047,7 @@ func TestBrowserWebSocketRevocationWinsAdmissionBeforeSpawn(t *testing.T) {
 	}
 	result := make(chan dialResult, 1)
 	go func() {
-		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 		header := http.Header{
 			"Origin": {browserAuthTestOrigin},
 			"Cookie": {BrowserSessionCookie + "=verified-before-race"},
@@ -1040,7 +1112,7 @@ func TestBrowserWebSocketLogoutCompletesWhileSpawnerIsBlocked(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{browserAuthTestOrigin}
 	server.Spawner = spawner
 	server.SpawnTimeout = time.Second
@@ -1056,7 +1128,7 @@ func TestBrowserWebSocketLogoutCompletesWhileSpawnerIsBlocked(t *testing.T) {
 	}
 	dialed := make(chan dialResult, 1)
 	go func() {
-		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 		header := http.Header{
 			"Origin": {browserAuthTestOrigin},
 			"Cookie": {BrowserSessionCookie + "=" + session},
@@ -1235,6 +1307,23 @@ func TestBrowserWebSocketRevalidatesCurrentEmployerOnLiveBoundaries(t *testing.T
 		assertBrowserConnectionClosedBeforeFrame(t, conn)
 		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
 	})
+
+	t.Run("uninstall and reinstall cannot revive the old socket", func(t *testing.T) {
+		authorizer := &mutableDirectChatAuthorizer{
+			allowed:        true,
+			installationID: testDirectChatInstallationID,
+		}
+		_, server, conn := openLiveAuthorizedBrowser(
+			t,
+			authorizer,
+			nil,
+			10*time.Millisecond,
+			false,
+		)
+		authorizer.setInstallationID("0198f0f4-9b72-7000-8000-000000000052")
+		assertBrowserConnectionClosedBeforeFrame(t, conn)
+		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+	})
 }
 
 func TestBrowserWebSocketEmployerTransferSerializesCommandAppend(t *testing.T) {
@@ -1376,7 +1465,7 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -1425,7 +1514,7 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	browser.AllowedOrigins = []string{browserAuthTestOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", browser)
@@ -1498,7 +1587,7 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 		t.Fatalf("unexpected command result: %+v", accepted)
 	}
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 	header := http.Header{
 		"Origin": {"https://web.example"},
 		"Cookie": {BrowserSessionCookie + "=" + firstSession},
@@ -1576,7 +1665,7 @@ func TestBrowserSessionLineageLogoutStopsSuccessorOutboundFramesAcrossGateways(
 	if err != nil || !valid {
 		t.Fatalf("rotate browser session: valid=%v err=%v", valid, err)
 	}
-	browser := NewBrowserServer(secondSessions, secondGateway, secondGateway)
+	browser := newAuthorizedBrowserServer(secondSessions, secondGateway, secondGateway)
 	browser.AllowedOrigins = []string{browserAuthTestOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", browser)
@@ -1632,7 +1721,7 @@ func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	browser.AllowedOrigins = []string{browserAuthTestOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", browser)
@@ -1682,7 +1771,7 @@ func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	browser.AllowedOrigins = []string{browserAuthTestOrigin}
 	writeReached := make(chan struct{})
 	releaseWrite := make(chan struct{})
@@ -1784,9 +1873,11 @@ func openLiveAuthorizedBrowserWithOptions(
 	if appender == nil {
 		appender = gateway
 	}
-	server := NewBrowserServer(sessions, appender, gateway)
+	server := newAuthorizedBrowserServer(sessions, appender, gateway)
 	server.AllowedOrigins = []string{browserAuthTestOrigin}
-	server.Authorizer = authorizer
+	if authorizer != nil {
+		server.Authorizer = authorizer
+	}
 	server.Spawner = spawner
 	server.AuthorizationPollInterval = authorizationPollInterval
 	server.beforeWrite = beforeWrite
@@ -1831,7 +1922,8 @@ func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want Bro
 
 func dialBrowserWS(t *testing.T, server *httptest.Server, cookie, personalityAgentID string) *websocket.Conn {
 	t.Helper()
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/direct-chat/ws"
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) +
+		"/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 	header := http.Header{"Origin": {"https://web.example"}, "Cookie": {BrowserSessionCookie + "=" + cookie}}
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
@@ -1933,7 +2025,7 @@ func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -1970,7 +2062,7 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	claims := TokenClaims{TenantID: "tenant", PersonalityAgentID: personalityAgentID, Generation: 1}
@@ -2058,7 +2150,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -2143,14 +2235,14 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws?installation_id=" + testDirectChatInstallationID
 	header := http.Header{"Origin": {"https://web.example"}, "Cookie": {BrowserSessionCookie + "=" + signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant-1", UserID: "user-1", PersonalityAgentID: personalityAgentID, Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})}}
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {

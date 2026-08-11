@@ -71,8 +71,8 @@ type UserCommandIngress struct {
 	SpawnReadyTimeout time.Duration
 	MaxBytes          int64
 	AllowedOrigins    []string
-	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
-	// ADR 0009 §5). A nil Authorizer permits any verified session.
+	// Authorizer gates direct chat on Current Employer and the exact enabled
+	// Human-owned direct-chat AppInstallation. A nil Authorizer fails closed.
 	Authorizer DirectChatAuthorizer
 }
 
@@ -100,18 +100,20 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 func (h *UserCommandIngress) authorizeDirectChat(
 	ctx context.Context,
 	claims UserSessionClaims,
+	installationID string,
 	operation func() error,
 ) error {
 	if operation == nil {
 		return errors.New("direct-chat authorization operation is required")
 	}
 	if h.Authorizer == nil {
-		return operation()
+		return ErrDirectChatAuthorizationUnavailable
 	}
 	return h.Authorizer.AuthorizeDirectChat(
 		ctx,
 		claims.UserID,
 		claims.PersonalityAgentID,
+		installationID,
 		operation,
 	)
 }
@@ -142,7 +144,20 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
-	if err := h.authorizeDirectChat(r.Context(), claims, func() error { return nil }); err != nil {
+	installationID, err := directChatInstallationID(r)
+	if err != nil {
+		http.Error(w, "invalid_scope", http.StatusBadRequest)
+		return
+	}
+	if h.Authorizer == nil {
+		http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := h.authorizeDirectChat(r.Context(), claims, installationID, func() error { return nil }); err != nil {
+		if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
+			http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "not authorized for this agent", http.StatusForbidden)
 		return
 	}
@@ -193,7 +208,7 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancelOperation()
 	err = h.Sessions.AuthorizeSession(r.Context(), claims, func() error {
 		sessionLeaseEntered = true
-		return h.authorizeDirectChat(r.Context(), claims, func() error {
+		return h.authorizeDirectChat(r.Context(), claims, installationID, func() error {
 			appendCalled = true
 			var appendErr error
 			env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
@@ -207,11 +222,19 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !appendCalled {
+			if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
+				http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "not authorized for this agent", http.StatusForbidden)
 			return
 		}
 		if errors.Is(err, errBrowserRuntimeUnavailable) {
 			writeUnavailable(w, idempotencyKey)
+			return
+		}
+		if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
+			http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		// Idempotency conflicts are exposed as 409 so callers cannot

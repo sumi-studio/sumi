@@ -194,11 +194,33 @@ func (s *Store) AuthorizeCurrentHumanEmployer(
 		return fmt.Errorf("begin current Employer authorization: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := s.RequireCurrentHumanEmployerInTx(ctx, tx, humanID, agentID); err != nil {
+		return err
+	}
+	if err := operation(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("release current Employer authority lease: %w", err)
+	}
+	return nil
+}
+
+// RequireCurrentHumanEmployerInTx acquires the shared side of the employment
+// authority lease and proves that humanID is the agent's current Human
+// Employer. Callers composing more authority in the same transaction must call
+// this before acquiring downstream app-owned rows.
+func (s *Store) RequireCurrentHumanEmployerInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	humanID,
+	agentID string,
+) error {
 	if err := lockEmploymentAuthority(ctx, tx, agentID, true); err != nil {
 		return err
 	}
 	var employerType, employerID string
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		ctx,
 		"SELECT employer_type, employer_id FROM employments WHERE agent_id = $1 AND ended_at IS NULL",
 		agentID,
@@ -211,12 +233,6 @@ func (s *Store) AuthorizeCurrentHumanEmployer(
 	}
 	if employerType != EmployerHuman || employerID != humanID {
 		return ErrNotCurrentEmployer
-	}
-	if err := operation(); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("release current Employer authority lease: %w", err)
 	}
 	return nil
 }

@@ -298,7 +298,7 @@ func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway, gateway)
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)

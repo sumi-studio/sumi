@@ -302,8 +302,12 @@ func newApplicationFromEnv() (*application, error) {
 	var databasePool *pgxpool.Pool
 	var messagingServer *messaging.Server
 	var workspaceServer *workspacecontrol.Server
+	var workspaceStore *workspacecontrol.Store
+	var appStore *applicationapps.Store
 	if database != nil {
 		databasePool = database.Pool
+		workspaceStore = workspacecontrol.New(database.Pool)
+		appStore = applicationapps.New(database.Pool, workspaceStore)
 	}
 	closeOnError := func() {
 		_ = store.Close()
@@ -314,7 +318,11 @@ func newApplicationFromEnv() (*application, error) {
 
 	var directChatAuthorizer agentevents.DirectChatAuthorizer
 	if database != nil {
-		directChatAuthorizer = newKosekiDirectChatAuthorizer(koseki.New(database.Pool))
+		directChatAuthorizer = newDirectChatAuthorizer(
+			database.Pool,
+			koseki.New(database.Pool),
+			appStore,
+		)
 	}
 	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins, directChatAuthorizer)
 	if err != nil {
@@ -346,8 +354,6 @@ func newApplicationFromEnv() (*application, error) {
 		if sv != nil {
 			messagingSessions = sv
 		}
-		workspaceStore := workspacecontrol.New(database.Pool)
-		appStore := applicationapps.New(database.Pool, workspaceStore)
 		workspaceServer = workspacecontrol.NewServer(workspaceStore, appStore, messagingSessions)
 		workspaceServer.AllowedOrigins = browserOrigins
 		workspaceServer.RegisterRoutes(mux)
