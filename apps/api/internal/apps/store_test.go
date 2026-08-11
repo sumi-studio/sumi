@@ -157,12 +157,13 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install Messaging: %v", err)
 	}
-	if installed.State != applicationapps.StateEnabled {
-		t.Fatalf("initial state = %q", installed.State)
+	if installed.State != applicationapps.StateEnabled || installed.AuthorityEpoch != 1 {
+		t.Fatalf("initial lifecycle = %#v", installed)
 	}
 	projected, err := w.apps.RequireEnabledInstallation(ctx,
 		installed.InstallationID, workspaceOwner, "messaging")
-	if err != nil || projected.InstallationID != installed.InstallationID {
+	if err != nil || projected.InstallationID != installed.InstallationID ||
+		projected.AuthorityEpoch != 1 {
 		t.Fatalf("exact enabled projection = %#v, %v", projected, err)
 	}
 	resolved, err := w.apps.ResolveEnabledInstallation(ctx, workspaceOwner, w.owner, "messaging")
@@ -173,8 +174,19 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 		"messaging"); !errors.Is(err, workspace.ErrNotFound) {
 		t.Fatalf("non-member resolution error = %v", err)
 	}
-	if _, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, false); err != nil {
+	disabled, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, false)
+	if err != nil {
 		t.Fatalf("disable Messaging: %v", err)
+	}
+	if disabled.AuthorityEpoch != 2 {
+		t.Fatalf("disable authority epoch = %d, want 2", disabled.AuthorityEpoch)
+	}
+	disabledAgain, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, false)
+	if err != nil {
+		t.Fatalf("idempotent disable Messaging: %v", err)
+	}
+	if disabledAgain.AuthorityEpoch != 2 {
+		t.Fatalf("idempotent disable churned authority epoch to %d", disabledAgain.AuthorityEpoch)
 	}
 	list, err := w.apps.Installations(ctx, workspaceOwner, w.owner)
 	if err != nil || len(list) != 1 || list[0].State != applicationapps.StateDisabled {
@@ -194,9 +206,30 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 		"messaging"); !errors.Is(err, applicationapps.ErrAppDisabled) {
 		t.Fatalf("disabled bind-time resolution = %v", err)
 	}
-	if _, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, true); err != nil {
+	reenabled, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, true)
+	if err != nil {
 		t.Fatalf("re-enable Messaging: %v", err)
 	}
+	if reenabled.AuthorityEpoch != 2 {
+		t.Fatalf("re-enable authority epoch = %d, want 2", reenabled.AuthorityEpoch)
+	}
+	tx, err = w.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.apps.RequireEnabledInstallationEpochInTx(
+		ctx, tx, installed.InstallationID, 1, workspaceOwner, "messaging",
+	); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("stale authority epoch admission = %v", err)
+	}
+	if _, err := w.apps.RequireEnabledInstallationEpochInTx(
+		ctx, tx, installed.InstallationID, 2, workspaceOwner, "messaging",
+	); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("current authority epoch admission = %v", err)
+	}
+	_ = tx.Rollback(ctx)
 
 	// Messaging data is owned by Messaging and references Workspace, never the
 	// installation row. Uninstall must remove only the binding.

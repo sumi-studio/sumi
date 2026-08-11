@@ -502,9 +502,26 @@ function parseInstallation(value: unknown): AppInstallation {
     owner: parseAppOwner(wire.owner),
     appId: asString(wire.app_id),
     state,
+    authorityEpoch: asAuthorityEpoch(wire.authority_epoch),
     installedAt: asTimestamp(wire.installed_at),
     updatedAt: asTimestamp(wire.updated_at),
   };
+}
+
+const MAX_SIGNED_INT64 = 9_223_372_036_854_775_807n;
+
+function asAuthorityEpoch(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^[1-9][0-9]*$/.test(value) ||
+    value.length > 19
+  ) {
+    throw new Error("invalid app installation authority epoch");
+  }
+  if (BigInt(value) > MAX_SIGNED_INT64) {
+    throw new Error("invalid app installation authority epoch");
+  }
+  return value;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

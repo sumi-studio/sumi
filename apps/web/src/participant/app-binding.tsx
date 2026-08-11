@@ -1,6 +1,7 @@
 import { type ReactNode, useLayoutEffect } from "react";
 import { useConversation } from "../agent/store";
 import { useAuth } from "../auth/auth-context";
+import type { DirectChatInstallationBinding } from "../lib/direct-chat-socket";
 import { DIRECT_CHAT_RENDERER } from "../shell/app-descriptors";
 import type { ParticipantAppState } from "./app-store";
 import { participantInstallation, useParticipantApps } from "./app-store";
@@ -29,29 +30,26 @@ export function ParticipantAppBinding({ children }: { children: ReactNode }) {
     // Lifecycle mutations can complete in one React batch while this route is
     // elsewhere; every enabled -> disabled/uninstalled/replaced transition
     // must still suspend the old installation's transport authority epoch.
-    let previousInstallationId = enabledDirectChatInstallationId(
+    let previousBinding = enabledDirectChatBinding(
       useParticipantApps.getState(),
       humanId,
     );
     return useParticipantApps.subscribe((state) => {
-      const installationId = enabledDirectChatInstallationId(state, humanId);
-      if (
-        previousInstallationId !== null &&
-        previousInstallationId !== installationId
-      ) {
-        suspendInstallation(previousInstallationId);
+      const binding = enabledDirectChatBinding(state, humanId);
+      if (previousBinding !== null && !sameBinding(previousBinding, binding)) {
+        suspendInstallation(previousBinding);
       }
-      previousInstallationId = installationId;
+      previousBinding = binding;
     });
   }, [humanId, suspendInstallation]);
 
   return children;
 }
 
-function enabledDirectChatInstallationId(
+function enabledDirectChatBinding(
   state: ParticipantAppState,
   humanId: string,
-): string | null {
+): DirectChatInstallationBinding | null {
   if (
     state.owner?.kind !== "participant" ||
     state.owner.participant.kind !== "human" ||
@@ -64,6 +62,20 @@ function enabledDirectChatInstallationId(
     DIRECT_CHAT_RENDERER.appId,
   );
   return installation !== "duplicate" && installation?.state === "enabled"
-    ? installation.installationId
+    ? {
+        installationId: installation.installationId,
+        authorityEpoch: installation.authorityEpoch,
+      }
     : null;
+}
+
+function sameBinding(
+  left: DirectChatInstallationBinding,
+  right: DirectChatInstallationBinding | null,
+): boolean {
+  return (
+    right !== null &&
+    left.installationId === right.installationId &&
+    left.authorityEpoch === right.authorityEpoch
+  );
 }

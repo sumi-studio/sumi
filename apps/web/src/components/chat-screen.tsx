@@ -29,8 +29,19 @@ const ChatItemView = lazy(() =>
   import("./chat-item").then((module) => ({ default: module.ChatItemView })),
 );
 
-export function ChatScreen({ installationId }: { installationId: string }) {
-  return <ChatScreenContent installationId={installationId} />;
+export function ChatScreen({
+  installationId,
+  authorityEpoch,
+}: {
+  installationId: string;
+  authorityEpoch: string;
+}) {
+  return (
+    <ChatScreenContent
+      installationId={installationId}
+      authorityEpoch={authorityEpoch}
+    />
+  );
 }
 
 const WAITING_ROW_ID = "__sumi_waiting_for_first_token__";
@@ -45,7 +56,13 @@ type ConversationRow =
   | ChatItem
   | { id: typeof WAITING_ROW_ID; kind: "waiting" };
 
-function ChatScreenContent({ installationId }: { installationId: string }) {
+function ChatScreenContent({
+  installationId,
+  authorityEpoch,
+}: {
+  installationId: string;
+  authorityEpoch: string;
+}) {
   const {
     conversation,
     running,
@@ -79,8 +96,8 @@ function ChatScreenContent({ installationId }: { installationId: string }) {
   );
 
   useEffect(() => {
-    return acquireConnection(installationId);
-  }, [acquireConnection, installationId]);
+    return acquireConnection({ installationId, authorityEpoch });
+  }, [acquireConnection, authorityEpoch, installationId]);
 
   const available = connection === "connected" && ready === "ready";
   const send = () => {

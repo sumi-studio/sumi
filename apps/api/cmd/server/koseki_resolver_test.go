@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +23,29 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
+
+type backendLossCommandAppender struct {
+	inner   agentevents.CommandAppender
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (a *backendLossCommandAppender) Append(
+	ctx context.Context,
+	provenance agentevents.DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (agentevents.CommandEnvelope, error) {
+	envelope, err := a.inner.Append(ctx, provenance, idempotencyKey, command)
+	a.once.Do(func() { close(a.started) })
+	select {
+	case <-a.release:
+	case <-ctx.Done():
+		return agentevents.CommandEnvelope{}, ctx.Err()
+	}
+	return envelope, err
+}
 
 func kosekiResolverTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
@@ -170,6 +199,18 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	if _, err := appStore.SetEnabledByID(ctx, firstInstallation.InstallationID, participant.Human(first.HumanID), true); err != nil {
 		t.Fatalf("re-enable first direct chat: %v", err)
 	}
+	if err := authorizeDirectChatEpochWithFence(
+		ctx, lifecycle, authorizer, first.HumanID, first.AgentID,
+		firstInstallation.InstallationID, 1, func() error { return nil },
+	); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
+		t.Fatalf("pre-disable authority epoch revived after re-enable: %v", err)
+	}
+	if err := authorizeDirectChatEpochWithFence(
+		ctx, lifecycle, authorizer, first.HumanID, first.AgentID,
+		firstInstallation.InstallationID, 2, func() error { return nil },
+	); err != nil {
+		t.Fatalf("current authority epoch rejected after re-enable: %v", err)
+	}
 	// A Human is NOT the Employer of another Human's Secretary: rejected.
 	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, second.HumanID, first.AgentID, secondInstallation.InstallationID, func() error { return nil }); !errors.Is(err, agentevents.ErrDirectChatAuthorizationDenied) {
 		t.Fatal("non-employer human must not direct-chat with another's secretary")
@@ -303,7 +344,7 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	}
 	if _, err := lifecycleTx.Exec(
 		ctx,
-		"UPDATE app_installations SET enabled = FALSE, updated_at = NOW() WHERE installation_id = $1",
+		"UPDATE app_installations SET enabled = FALSE, authority_epoch = authority_epoch + 1, updated_at = NOW() WHERE installation_id = $1",
 		installation.InstallationID,
 	); err != nil {
 		t.Fatalf("stage disable: %v", err)
@@ -339,14 +380,33 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	}
 }
 
-func TestDirectChatProcessFenceSurvivesPostgresBackendLoss(t *testing.T) {
+func TestDirectChatProcessFenceSurvivesBackendLossAfterAuthorizationCommit(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	lifecycle := directchat.NewLifecycleFence()
 	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
 	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
-	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
+	const authorizationApplicationName = "sumi-direct-chat-auth-backend-loss"
+	authorizationConfig, err := pgxpool.ParseConfig(pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizationConfig.MaxConns = 1
+	authorizationConfig.MinConns = 1
+	if authorizationConfig.ConnConfig.RuntimeParams == nil {
+		authorizationConfig.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	authorizationConfig.ConnConfig.RuntimeParams["application_name"] = authorizationApplicationName
+	authorizationPool, err := pgxpool.NewWithConfig(ctx, authorizationConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authorizationPool.Close()
+	if err := authorizationPool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	authorizer := newDirectChatAuthorizer(authorizationPool, kosekiStore, appStore)
 	first, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-backend-loss-first")
 	if err != nil {
 		t.Fatal(err)
@@ -366,56 +426,102 @@ func TestDirectChatProcessFenceSurvivesPostgresBackendLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	operationEntered := make(chan struct{})
+	commandStore, err := agentevents.OpenCommandStore(privateRuntimeDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = commandStore.Close() })
+	gateway, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), commandStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeReceipt := "backend-loss-runtime-ready"
+	if err := gateway.PublishRuntimeState(first.AgentID, 1, &runtimeReceipt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := agentevents.NewHMACUserSessionVerifier(
+		testSessionSecret,
+		agentevents.DefaultBrowserAudience(),
+		gateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := sessions.IssueSession(ctx, agentevents.UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             first.HumanID,
+		PersonalityAgentID: first.AgentID,
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	releaseEffect := make(chan struct{})
-	authorizeDone := make(chan error, 1)
+	appender := &backendLossCommandAppender{
+		inner: gateway, started: make(chan struct{}), release: releaseEffect,
+	}
+	ingress, err := agentevents.NewUserCommandIngress(appender, sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = authorizer
+	ingress.LifecycleFence = lifecycle
+	server := httptest.NewServer(ingress)
+	defer server.Close()
+
+	type commandResult struct {
+		response *http.Response
+		err      error
+	}
+	commandDone := make(chan commandResult, 1)
 	go func() {
-		authorizeDone <- authorizeDirectChatWithFence(
-			ctx,
-			lifecycle,
-			authorizer,
-			first.HumanID,
-			first.AgentID,
-			installation.InstallationID,
-			func() error {
-				close(operationEntered)
-				select {
-				case <-releaseEffect:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			},
+		body := bytes.NewBufferString(
+			`{"type":"user_message","text":"survive backend loss","attachments":[]}`,
 		)
+		req, requestErr := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			fmt.Sprintf(
+				"%s/direct-chat/commands?installation_id=%s&authority_epoch=1",
+				server.URL,
+				installation.InstallationID,
+			),
+			body,
+		)
+		if requestErr != nil {
+			commandDone <- commandResult{err: requestErr}
+			return
+		}
+		req.Header.Set("Origin", testBrowserOrigin)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "backend-loss-after-auth")
+		req.AddCookie(&http.Cookie{
+			Name: agentevents.BrowserSessionCookie, Value: session,
+		})
+		response, requestErr := http.DefaultClient.Do(req)
+		commandDone <- commandResult{response: response, err: requestErr}
 	}()
 	select {
-	case <-operationEntered:
+	case <-appender.started:
+		// The appender is entered only after the second composite authorization
+		// transaction committed. The durable filesystem append has completed,
+		// while returning its receipt and the HTTP acceptance are still fenced by
+		// the process-lifetime operation permit.
 	case <-ctx.Done():
-		t.Fatalf("authorized effect did not start: %v", ctx.Err())
+		t.Fatalf("authorized command effect did not start: %v", ctx.Err())
 	}
 
 	var backendPID int32
-	deadline := time.Now().Add(2 * time.Second)
-	for backendPID == 0 && time.Now().Before(deadline) {
-		err = pool.QueryRow(ctx, `
-			SELECT pid
-			FROM pg_stat_activity
-			WHERE datname = current_database()
-			  AND pid <> pg_backend_pid()
-			  AND state = 'idle in transaction'
-			  AND query LIKE '%app_installations%'
-			ORDER BY backend_start DESC
-			LIMIT 1`).Scan(&backendPID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		if err != nil {
-			t.Fatalf("locate composite authorization backend: %v", err)
-		}
-	}
-	if backendPID == 0 {
-		t.Fatal("composite authorization backend was not observable")
+	if err := pool.QueryRow(ctx, `
+		SELECT pid
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND application_name = $1
+		  AND state = 'idle'
+		ORDER BY backend_start DESC
+		LIMIT 1`, authorizationApplicationName).Scan(&backendPID); err != nil {
+		t.Fatalf("locate committed authorization backend: %v", err)
 	}
 	var terminated bool
 	if err := pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", backendPID).Scan(&terminated); err != nil {
@@ -456,8 +562,27 @@ func TestDirectChatProcessFenceSurvivesPostgresBackendLoss(t *testing.T) {
 		}
 	}
 	close(releaseEffect)
-	if err := <-authorizeDone; !errors.Is(err, agentevents.ErrDirectChatAuthorizationUnavailable) {
-		t.Fatalf("backend-loss authorization result = %v", err)
+	result := <-commandDone
+	if result.err != nil {
+		t.Fatalf("authorized command became ambiguous after backend loss: %v", result.err)
+	}
+	defer result.response.Body.Close()
+	if result.response.StatusCode != http.StatusCreated {
+		t.Fatalf("authorized command status after backend loss = %d", result.response.StatusCode)
+	}
+	var receipt testCommandReceipt
+	if err := json.NewDecoder(result.response.Body).Decode(&receipt); err != nil {
+		t.Fatalf("decode command acceptance after backend loss: %v", err)
+	}
+	commands, err := gateway.CatchUp(ctx, agentevents.TokenClaims{
+		PersonalityAgentID: first.AgentID,
+	}, 1)
+	if err != nil {
+		t.Fatalf("read durable command after backend loss: %v", err)
+	}
+	if len(commands) != 1 || commands[0].CommandID != receipt.CommandID ||
+		commands[0].Seq != receipt.Seq {
+		t.Fatalf("accepted command does not match durable log: receipt=%+v commands=%+v", receipt, commands)
 	}
 	if err := <-disableDone; err != nil {
 		t.Fatalf("disable after effect completion: %v", err)
@@ -534,16 +659,41 @@ func authorizeDirectChatWithFence(
 	installationID string,
 	operation func() error,
 ) error {
+	return authorizeDirectChatEpochWithFence(
+		ctx,
+		lifecycle,
+		authorizer,
+		humanID,
+		agentID,
+		installationID,
+		1,
+		operation,
+	)
+}
+
+func authorizeDirectChatEpochWithFence(
+	ctx context.Context,
+	lifecycle *directchat.LifecycleFence,
+	authorizer *directChatAuthorizer,
+	humanID,
+	agentID,
+	installationID string,
+	authorityEpoch int64,
+	operation func() error,
+) error {
 	release, err := lifecycle.AcquireOperation(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
-	return authorizer.AuthorizeDirectChat(
+	if err := authorizer.AuthorizeDirectChat(
 		ctx,
 		humanID,
 		agentID,
 		installationID,
-		operation,
-	)
+		authorityEpoch,
+	); err != nil {
+		return err
+	}
+	return operation()
 }

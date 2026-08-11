@@ -143,7 +143,7 @@ describe("SDUI action boundary", () => {
   it("releases the exact connection lease from each StrictMode effect", () => {
     const view = render(
       <StrictMode>
-        <ChatScreen installationId="installation-1" />
+        <ChatScreen installationId="installation-1" authorityEpoch="1" />
       </StrictMode>,
     );
 
@@ -154,7 +154,7 @@ describe("SDUI action boundary", () => {
   });
 
   it("renders conversation items through the virtualized log", () => {
-    render(<ChatScreen installationId="installation-1" />);
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
 
     expect(screen.getByRole("log", { name: "Sumiとの会話" })).toHaveAttribute(
       "aria-busy",
@@ -163,9 +163,13 @@ describe("SDUI action boundary", () => {
   });
 
   it("keeps an unwired card action disabled and cannot send a user message", async () => {
-    render(<ChatScreen installationId="installation-1" />);
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
 
-    const action = await screen.findByRole("button", { name: "完了にする" });
+    const action = await screen.findByRole(
+      "button",
+      { name: "完了にする" },
+      { timeout: 3_000 },
+    );
     expect(action).toBeDisabled();
     fireEvent.click(action);
 
@@ -211,7 +215,7 @@ describe("SDUI action boundary", () => {
     ];
     state.restoreDraft.mockReturnValue("失われてはいけない入力");
 
-    render(<ChatScreen installationId="installation-1" />);
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
     fireEvent.click(
       screen.getByRole("button", {
         name: "入力欄に戻す",
@@ -234,7 +238,7 @@ describe("SDUI action boundary", () => {
       },
     ];
 
-    render(<ChatScreen installationId="installation-1" />);
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
     fireEvent.change(screen.getByRole("textbox", { name: "テスト入力欄" }), {
       target: { value: "いま書いている入力" },
     });

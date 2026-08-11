@@ -107,6 +107,36 @@ func (s *Store) RequireEnabledInstallationInTx(
 	owner OwnerRef,
 	appID string,
 ) (Installation, error) {
+	return s.requireEnabledInstallationInTx(ctx, tx, installationID, nil, owner, appID)
+}
+
+// RequireEnabledInstallationEpochInTx additionally seals a lifecycle authority
+// epoch. Direct Chat browser transports use it so a disable -> enable cycle
+// cannot revive a socket or retry bound before the disable.
+func (s *Store) RequireEnabledInstallationEpochInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID string,
+	authorityEpoch int64,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
+	if authorityEpoch < 1 {
+		return Installation{}, ErrInstallationNotFound
+	}
+	return s.requireEnabledInstallationInTx(
+		ctx, tx, installationID, &authorityEpoch, owner, appID,
+	)
+}
+
+func (s *Store) requireEnabledInstallationInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID string,
+	authorityEpoch *int64,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
 	if !isCanonicalUUIDv7(installationID) {
 		return Installation{}, ErrInstallationNotFound
 	}
@@ -114,13 +144,20 @@ func (s *Store) RequireEnabledInstallationInTx(
 		return Installation{}, err
 	}
 	storageKind, storageID := ownerStorageKey(owner)
-	row := tx.QueryRow(ctx, `
-		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+	query := `
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		       installed_at, updated_at
 		FROM app_installations
 		WHERE installation_id = $1
 		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4
-		FOR SHARE`, installationID, storageKind, storageID, appID)
+	`
+	args := []any{installationID, storageKind, storageID, appID}
+	if authorityEpoch != nil {
+		query += " AND authority_epoch = $5"
+		args = append(args, *authorityEpoch)
+	}
+	query += " FOR SHARE"
+	row := tx.QueryRow(ctx, query, args...)
 	installation, err := scanInstallation(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Installation{}, ErrInstallationNotFound
@@ -190,7 +227,7 @@ func (s *Store) RequireEnabledInstallation(
 	}
 	storageKind, storageID := ownerStorageKey(owner)
 	row := s.pool.QueryRow(ctx, `
-		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		       installed_at, updated_at
 		FROM app_installations
 		WHERE installation_id = $1
@@ -232,7 +269,7 @@ func (s *Store) ResolveEnabledInstallation(
 	}
 	storageKind, storageID := ownerStorageKey(owner)
 	row := tx.QueryRow(ctx, `
-		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		       installed_at, updated_at
 		FROM app_installations
 		WHERE owner_kind = $1 AND owner_id = $2 AND app_id = $3`,
@@ -266,7 +303,7 @@ func (s *Store) Installations(ctx context.Context, owner OwnerRef, actor partici
 	}
 	storageKind, storageID := ownerStorageKey(owner)
 	rows, err := tx.Query(ctx, `
-		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		       installed_at, updated_at
 		FROM app_installations
 		WHERE owner_kind = $1 AND owner_id = $2
@@ -317,14 +354,14 @@ func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.R
 	now := s.now().UTC()
 	installation := Installation{
 		InstallationID: newUUIDv7(), Owner: owner, AppID: appID,
-		State: StateEnabled, InstalledAt: now, UpdatedAt: now,
+		State: StateEnabled, AuthorityEpoch: 1, InstalledAt: now, UpdatedAt: now,
 	}
 	storageKind, storageID := ownerStorageKey(owner)
 	_, err = tx.Exec(ctx, `
 		INSERT INTO app_installations
-			(installation_id, owner_kind, owner_id, app_id, enabled,
+			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 			 installed_at, updated_at)
-		VALUES ($1, $2, $3, $4, true, $5, $5)`,
+		VALUES ($1, $2, $3, $4, true, 1, $5, $5)`,
 		installation.InstallationID, storageKind, storageID, appID, now)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -355,9 +392,15 @@ func (s *Store) SetEnabled(ctx context.Context, owner OwnerRef, actor participan
 	storageKind, storageID := ownerStorageKey(owner)
 	now := s.now().UTC()
 	row := tx.QueryRow(ctx, `
-		UPDATE app_installations SET enabled = $4, updated_at = $5
+		UPDATE app_installations
+		SET authority_epoch = CASE
+		        WHEN enabled AND NOT $4 THEN authority_epoch + 1
+		        ELSE authority_epoch
+		    END,
+		    enabled = $4,
+		    updated_at = $5
 		WHERE owner_kind = $1 AND owner_id = $2 AND app_id = $3
-		RETURNING installation_id, owner_kind, owner_id, app_id, enabled,
+		RETURNING installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		          installed_at, updated_at`, storageKind, storageID, appID, enabled, now)
 	installation, err := scanInstallation(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -399,9 +442,15 @@ func (s *Store) SetEnabledByID(ctx context.Context, installationID string, actor
 	storageKind, storageID := ownerStorageKey(owner)
 	now := s.now().UTC()
 	row := tx.QueryRow(ctx, `
-		UPDATE app_installations SET enabled = $2, updated_at = $3
+		UPDATE app_installations
+		SET authority_epoch = CASE
+		        WHEN enabled AND NOT $2 THEN authority_epoch + 1
+		        ELSE authority_epoch
+		    END,
+		    enabled = $2,
+		    updated_at = $3
 		WHERE installation_id = $1 AND owner_kind = $4 AND owner_id = $5 AND app_id = $6
-		RETURNING installation_id, owner_kind, owner_id, app_id, enabled,
+		RETURNING installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		          installed_at, updated_at`, installationID, enabled, now,
 		storageKind, storageID, appID)
 	installation, err := scanInstallation(row)
@@ -623,7 +672,8 @@ func scanInstallation(row rowScanner) (Installation, error) {
 	var ownerKind, ownerID string
 	var enabled bool
 	err := row.Scan(&installation.InstallationID, &ownerKind, &ownerID,
-		&installation.AppID, &enabled, &installation.InstalledAt, &installation.UpdatedAt)
+		&installation.AppID, &enabled, &installation.AuthorityEpoch,
+		&installation.InstalledAt, &installation.UpdatedAt)
 	if err != nil {
 		return Installation{}, err
 	}

@@ -66,7 +66,10 @@ describe("ParticipantAppBinding", () => {
     });
 
     expect(mocks.suspendInstallation).toHaveBeenCalledTimes(1);
-    expect(mocks.suspendInstallation).toHaveBeenCalledWith(INSTALLATION_ID);
+    expect(mocks.suspendInstallation).toHaveBeenCalledWith({
+      installationId: INSTALLATION_ID,
+      authorityEpoch: "1",
+    });
   });
 
   it("suspends the old epoch when uninstall and reinstall replace its ID", () => {
@@ -89,7 +92,30 @@ describe("ParticipantAppBinding", () => {
     });
 
     expect(mocks.suspendInstallation).toHaveBeenCalledTimes(1);
-    expect(mocks.suspendInstallation).toHaveBeenCalledWith(INSTALLATION_ID);
+    expect(mocks.suspendInstallation).toHaveBeenCalledWith({
+      installationId: INSTALLATION_ID,
+      authorityEpoch: "1",
+    });
+  });
+
+  it("suspends a stale tab binding when another tab disables and re-enables the same installation ID", () => {
+    render(
+      <ParticipantAppBinding>
+        <div>another app</div>
+      </ParticipantAppBinding>,
+    );
+
+    act(() => {
+      useParticipantApps.setState({
+        installations: [{ ...installation("enabled"), authorityEpoch: "2" }],
+      });
+    });
+
+    expect(mocks.suspendInstallation).toHaveBeenCalledTimes(1);
+    expect(mocks.suspendInstallation).toHaveBeenCalledWith({
+      installationId: INSTALLATION_ID,
+      authorityEpoch: "1",
+    });
   });
 
   it("does not suspend on a refresh state while enabled policy is retained", () => {
@@ -118,6 +144,7 @@ function installation(state: "enabled" | "disabled"): AppInstallation {
     },
     appId: "direct-chat",
     state,
+    authorityEpoch: "1",
     installedAt: 1,
     updatedAt: 2,
   };

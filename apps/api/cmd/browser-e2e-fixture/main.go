@@ -27,12 +27,12 @@ type fixtureDirectChatAuthorizer struct{}
 func (fixtureDirectChatAuthorizer) AuthorizeDirectChat(
 	_ context.Context,
 	_, _, installationID string,
-	operation func() error,
+	authorityEpoch int64,
 ) error {
-	if installationID != directChatInstallationID {
+	if installationID != directChatInstallationID || authorityEpoch != 1 {
 		return agentevents.ErrDirectChatAuthorizationDenied
 	}
-	return operation()
+	return nil
 }
 
 func main() {

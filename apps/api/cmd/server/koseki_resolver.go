@@ -94,11 +94,8 @@ func (a *directChatAuthorizer) AuthorizeDirectChat(
 	humanID,
 	personalityAgentID,
 	installationID string,
-	operation func() error,
+	authorityEpoch int64,
 ) error {
-	if operation == nil {
-		return errors.New("direct-chat authorization operation is required")
-	}
 	if a == nil || a.pool == nil || a.koseki == nil || a.apps == nil {
 		return agentevents.ErrDirectChatAuthorizationUnavailable
 	}
@@ -113,10 +110,11 @@ func (a *directChatAuthorizer) AuthorizeDirectChat(
 		}
 		return fmt.Errorf("%w: require current Employer: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
 	}
-	if _, err := a.apps.RequireEnabledInstallationInTx(
+	if _, err := a.apps.RequireEnabledInstallationEpochInTx(
 		ctx,
 		tx,
 		installationID,
+		authorityEpoch,
 		applicationapps.ParticipantOwner(participant.Human(humanID)),
 		"direct-chat",
 	); err != nil {
@@ -125,9 +123,6 @@ func (a *directChatAuthorizer) AuthorizeDirectChat(
 			return agentevents.ErrDirectChatAuthorizationDenied
 		}
 		return fmt.Errorf("%w: require direct-chat installation: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
-	}
-	if err := operation(); err != nil {
-		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("%w: commit composite authority: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)

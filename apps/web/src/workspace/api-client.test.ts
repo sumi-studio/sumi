@@ -335,16 +335,19 @@ describe("WorkspaceApiClient", () => {
       owner: { kind: "workspace", workspace_id: WORKSPACE_A_ID },
       app_id: APP_ID,
       state: "enabled",
+      authority_epoch: "1",
       installed_at: "2026-08-10T05:06:07.890Z",
       updated_at: "2026-08-10T05:06:07.890Z",
     };
     const disabledWire = {
       ...installedWire,
       state: "disabled",
+      authority_epoch: "2",
       updated_at: "2026-08-10T05:07:08.901Z",
     };
     const reenabledWire = {
       ...installedWire,
+      authority_epoch: "2",
       updated_at: "2026-08-10T05:08:09.012Z",
     };
     const fetcher = fetchSequence(
@@ -399,6 +402,7 @@ describe("WorkspaceApiClient", () => {
       owner: { kind: "workspace", workspaceId: WORKSPACE_A_ID },
       appId: APP_ID,
       state: "enabled",
+      authorityEpoch: "1",
       installedAt: Date.parse("2026-08-10T05:06:07.890Z"),
       updatedAt: Date.parse("2026-08-10T05:06:07.890Z"),
     });
@@ -407,6 +411,7 @@ describe("WorkspaceApiClient", () => {
     ).resolves.toMatchObject({
       installationId: INSTALLATION_ID,
       state: "disabled",
+      authorityEpoch: "2",
       updatedAt: Date.parse("2026-08-10T05:07:08.901Z"),
     });
     await expect(
@@ -414,6 +419,7 @@ describe("WorkspaceApiClient", () => {
     ).resolves.toMatchObject({
       installationId: INSTALLATION_ID,
       state: "enabled",
+      authorityEpoch: "2",
       updatedAt: Date.parse("2026-08-10T05:08:09.012Z"),
     });
     await client.uninstallApp(INSTALLATION_ID);
@@ -463,6 +469,7 @@ describe("WorkspaceApiClient", () => {
       },
       app_id: "direct-chat",
       state: "enabled",
+      authority_epoch: "1",
       installed_at: "2026-08-10T05:06:07.890Z",
       updated_at: "2026-08-10T05:06:07.890Z",
     };
@@ -482,6 +489,7 @@ describe("WorkspaceApiClient", () => {
         owner,
         appId: "direct-chat",
         state: "enabled",
+        authorityEpoch: "1",
         installedAt: Date.parse("2026-08-10T05:06:07.890Z"),
         updatedAt: Date.parse("2026-08-10T05:06:07.890Z"),
       },

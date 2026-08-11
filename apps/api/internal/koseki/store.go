@@ -193,10 +193,11 @@ func (s *Store) CurrentEmployer(ctx context.Context, agentID string) (string, st
 	return employerType, employerID, nil
 }
 
-// AuthorizeCurrentHumanEmployer holds a shared, operation-scoped authority
-// lease for one private direct-chat action. TransferEmployment takes the
-// matching exclusive lease, so a transfer either completes before this check
-// or waits until operation returns; it cannot land between them.
+// AuthorizeCurrentHumanEmployer commits a Current-Employer snapshot, then
+// holds the process-lifetime operation side of the Direct Chat lifecycle fence
+// across one private effect. TransferEmployment takes the exclusive side, so a
+// transfer either completes before authorization or waits until operation
+// returns. PostgreSQL locks are deliberately not held across the effect.
 func (s *Store) AuthorizeCurrentHumanEmployer(
 	ctx context.Context,
 	humanID,
@@ -222,13 +223,10 @@ func (s *Store) AuthorizeCurrentHumanEmployer(
 	if err := s.RequireCurrentHumanEmployerInTx(ctx, tx, humanID, agentID); err != nil {
 		return err
 	}
-	if err := operation(); err != nil {
-		return err
-	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("release current Employer authority lease: %w", err)
+		return fmt.Errorf("commit current Employer authority: %w", err)
 	}
-	return nil
+	return operation()
 }
 
 // RequireCurrentHumanEmployerInTx acquires the shared side of the employment

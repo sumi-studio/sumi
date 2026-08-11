@@ -85,9 +85,9 @@ func (s *BrowserServer) SetLifecycleFence(fence *directchat.LifecycleFence) {
 }
 
 type browserConnection struct {
-	sessionID      string
-	installationID string
-	conn           *websocket.Conn
+	sessionID string
+	scope     directChatScope
+	conn      *websocket.Conn
 }
 
 type idempotencyAwareCommandAppender interface {
@@ -353,12 +353,8 @@ func (s *BrowserServer) checkOrigin(r *http.Request) bool {
 func (s *BrowserServer) authorizeDirectChat(
 	ctx context.Context,
 	claims UserSessionClaims,
-	installationID string,
-	operation func() error,
+	scope directChatScope,
 ) error {
-	if operation == nil {
-		return errors.New("browser direct-chat authorization operation is required")
-	}
 	if s.Authorizer == nil {
 		return ErrDirectChatAuthorizationUnavailable
 	}
@@ -366,8 +362,8 @@ func (s *BrowserServer) authorizeDirectChat(
 		ctx,
 		claims.UserID,
 		claims.PersonalityAgentID,
-		installationID,
-		operation,
+		scope.InstallationID,
+		scope.AuthorityEpoch,
 	); err != nil {
 		return fmt.Errorf("authorize browser direct chat: %w", err)
 	}
@@ -377,7 +373,7 @@ func (s *BrowserServer) authorizeDirectChat(
 func (s *BrowserServer) authorizeBrowserOperation(
 	ctx context.Context,
 	claims UserSessionClaims,
-	installationID string,
+	scope directChatScope,
 	operation func() error,
 ) error {
 	if s.LifecycleFence == nil {
@@ -388,20 +384,26 @@ func (s *BrowserServer) authorizeBrowserOperation(
 		return fmt.Errorf("%w: acquire direct-chat lifecycle operation: %v", ErrDirectChatAuthorizationUnavailable, err)
 	}
 	defer releaseLifecycle()
-	return s.authorizeBrowserOperationUnderFence(ctx, claims, installationID, operation)
+	return s.authorizeBrowserOperationUnderFence(ctx, claims, scope, operation)
 }
 
 func (s *BrowserServer) authorizeBrowserOperationUnderFence(
 	ctx context.Context,
 	claims UserSessionClaims,
-	installationID string,
+	scope directChatScope,
 	operation func() error,
 ) error {
 	if operation == nil {
 		return errors.New("browser authorization operation is required")
 	}
 	return s.Sessions.AuthorizeSession(ctx, claims, func() error {
-		return s.authorizeDirectChat(ctx, claims, installationID, operation)
+		// The composite PostgreSQL snapshot commits before the effect. The
+		// caller's lifecycle read permit and this session lease remain held across
+		// operation, so no database lock is claimed across filesystem/socket work.
+		if err := s.authorizeDirectChat(ctx, claims, scope); err != nil {
+			return err
+		}
+		return operation()
 	})
 }
 
@@ -432,9 +434,9 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
-	installationID, err := directChatInstallationID(r)
+	scope, err := directChatScopeFromRequest(r)
 	if err != nil {
-		http.Error(w, "invalid_scope", http.StatusBadRequest)
+		writeDirectChatInvalidScope(w)
 		return
 	}
 	releaseLifecycle, err := s.LifecycleFence.AcquireOperation(r.Context())
@@ -455,10 +457,11 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 		err = s.Sessions.AuthorizeSession(intentContext, claims, func() error {
 			intentLeaseEntered = true
-			return s.authorizeDirectChat(intentContext, claims, installationID, func() error {
-				intentAuthorized = true
-				return nil
-			})
+			if err := s.authorizeDirectChat(intentContext, claims, scope); err != nil {
+				return err
+			}
+			intentAuthorized = true
+			return nil
 		})
 		cancelIntent()
 		if err != nil {
@@ -502,31 +505,32 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	err = s.Sessions.AuthorizeSession(finalContext, claims, func() error {
 		finalLeaseEntered = true
-		return s.authorizeDirectChat(finalContext, claims, installationID, func() error {
-			finalAuthorized = true
-			if err := finalContext.Err(); err != nil {
-				return err
+		if err := s.authorizeDirectChat(finalContext, claims, scope); err != nil {
+			return err
+		}
+		finalAuthorized = true
+		if err := finalContext.Err(); err != nil {
+			return err
+		}
+		handshakeTimeout := s.writeTimeout()
+		if deadline, ok := finalContext.Deadline(); ok {
+			handshakeTimeout = time.Until(deadline)
+			if handshakeTimeout <= 0 {
+				return context.DeadlineExceeded
 			}
-			handshakeTimeout := s.writeTimeout()
-			if deadline, ok := finalContext.Deadline(); ok {
-				handshakeTimeout = time.Until(deadline)
-				if handshakeTimeout <= 0 {
-					return context.DeadlineExceeded
-				}
-			}
-			upgrader := s.upgrader
-			upgrader.HandshakeTimeout = handshakeTimeout
-			upgradeAttempted = true
-			var upgradeErr error
-			conn, upgradeErr = upgrader.Upgrade(w, r, nil)
-			if upgradeErr != nil {
-				return upgradeErr
-			}
-			if !s.addConnection(conn, claims.sessionID, installationID) {
-				return errors.New("browser gateway is shutting down")
-			}
-			return nil
-		})
+		}
+		upgrader := s.upgrader
+		upgrader.HandshakeTimeout = handshakeTimeout
+		upgradeAttempted = true
+		var upgradeErr error
+		conn, upgradeErr = upgrader.Upgrade(w, r, nil)
+		if upgradeErr != nil {
+			return upgradeErr
+		}
+		if !s.addConnection(conn, claims.sessionID, scope) {
+			return errors.New("browser gateway is shutting down")
+		}
+		return nil
 	})
 	cancelFinal()
 	cancelFinalBase()
@@ -558,7 +562,7 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	releaseLifecycle()
 	defer s.removeConnection(conn)
 	defer conn.Close()
-	if err := s.run(r.Context(), conn, claims, installationID); err != nil && !errors.Is(err, context.Canceled) {
+	if err := s.run(r.Context(), conn, claims, scope); err != nil && !errors.Is(err, context.Canceled) {
 		deadline := s.sessionDeadline(claims, s.writeTimeout())
 		if deadline.After(time.Now()) {
 			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "browser gateway closed"), deadline)
@@ -651,13 +655,13 @@ func (s *BrowserServer) ConnectionStats() BrowserConnectionStats {
 	}
 }
 
-func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID, installationID string) bool {
+func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID string, scope directChatScope) bool {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
 	if s.closing {
 		return false
 	}
-	s.connections[conn] = browserConnection{sessionID: sessionID, installationID: installationID, conn: conn}
+	s.connections[conn] = browserConnection{sessionID: sessionID, scope: scope, conn: conn}
 	s.accepted++
 	return true
 }
@@ -668,11 +672,11 @@ func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
 	delete(s.connections, conn)
 }
 
-func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims, installationID string) error {
+func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims, scope directChatScope) error {
 	ctx, cancel := browserSessionOperationContext(ctx, claims)
 	defer cancel()
 	authorize := func(operation func() error) error {
-		return s.authorizeBrowserOperation(ctx, claims, installationID, operation)
+		return s.authorizeBrowserOperation(ctx, claims, scope, operation)
 	}
 	if s.MaxReadLimit > 0 {
 		conn.SetReadLimit(s.MaxReadLimit)
@@ -758,19 +762,16 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 		return conn.WriteJSON(frame)
 	}
-	writeUnlocked := func(frame any) error {
-		return authorize(func() error {
-			return writeSocketUnlocked(frame)
-		})
-	}
-	withExclusiveWrite := func(operation func(func(any) error) error) error {
+	withExclusiveSocketWrite := func(operation func(func(any) error) error) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return operation(writeUnlocked)
+		return operation(writeSocketUnlocked)
 	}
 	write := func(frame any) error {
-		return withExclusiveWrite(func(write func(any) error) error {
-			return write(frame)
+		return withExclusiveSocketWrite(func(writeSocketUnlocked func(any) error) error {
+			return authorize(func() error {
+				return writeSocketUnlocked(frame)
+			})
 		})
 	}
 	// Subscribe before replay so volatile traffic produced during catch-up stays
@@ -817,7 +818,14 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 	}()
 
-	readErr := s.browserReadPump(ctx, conn, claims, installationID, write, withExclusiveWrite)
+	readErr := s.browserReadPump(
+		ctx,
+		conn,
+		claims,
+		scope,
+		write,
+		withExclusiveSocketWrite,
+	)
 	cancel()
 	writerResult := <-writerErr
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
@@ -942,16 +950,16 @@ func (s *BrowserServer) browserReadPump(
 	ctx context.Context,
 	conn *websocket.Conn,
 	claims UserSessionClaims,
-	installationID string,
+	scope directChatScope,
 	write func(any) error,
-	withExclusiveWrite func(func(func(any) error) error) error,
+	withExclusiveSocketWrite func(func(func(any) error) error) error,
 ) error {
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return err
 		}
-		if err := s.authorizeBrowserOperation(ctx, claims, installationID, func() error {
+		if err := s.authorizeBrowserOperation(ctx, claims, scope, func() error {
 			if s.Spawner != nil {
 				s.Spawner.Touch(claims.PersonalityAgentID)
 			}
@@ -993,8 +1001,8 @@ func (s *BrowserServer) browserReadPump(
 		appendCalled := false
 		operationContext, cancelOperation := browserSessionOperationContext(ctx, claims)
 		var admissionErr error
-		writeErr := withExclusiveWrite(func(writeUnlocked func(any) error) error {
-			admissionErr = s.authorizeBrowserOperation(ctx, claims, installationID, func() error {
+		writeErr := withExclusiveSocketWrite(func(writeSocketUnlocked func(any) error) error {
+			admissionErr = s.authorizeBrowserOperation(ctx, claims, scope, func() error {
 				appendCalled = true
 				var appendErr error
 				if appender, ok := s.Appender.(idempotencyAwareCommandAppender); ok {
@@ -1033,7 +1041,11 @@ func (s *BrowserServer) browserReadPump(
 				if found {
 					accepted.Disposition = disposition
 				}
-				return writeUnlocked(accepted)
+				// Command append and its acceptance are one effect boundary under
+				// the outer lifecycle permit. Calling the generally-authorized
+				// writer here would acquire a second read permit and deadlock when
+				// an exclusive lifecycle mutation is queued between them.
+				return writeSocketUnlocked(accepted)
 			})
 			return nil
 		})

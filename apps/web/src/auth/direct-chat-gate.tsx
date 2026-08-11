@@ -47,16 +47,19 @@ export function DirectChatGate() {
     owner.participant.kind === "human" &&
     owner.participant.humanId === user.id;
   const directChatEnabled =
-    (preissuedSessionMode && preissuedDirectChatInstallationId !== null) ||
+    (preissuedSessionMode && preissuedDirectChatBinding !== null) ||
     (exactHumanOwner &&
       installation !== "duplicate" &&
       installation?.state === "enabled");
-  const installationId = preissuedSessionMode
-    ? preissuedDirectChatInstallationId
+  const binding = preissuedSessionMode
+    ? preissuedDirectChatBinding
     : exactHumanOwner &&
         installation !== "duplicate" &&
         installation?.state === "enabled"
-      ? installation.installationId
+      ? {
+          installationId: installation.installationId,
+          authorityEpoch: installation.authorityEpoch,
+        }
       : null;
 
   useEffect(() => {
@@ -71,8 +74,8 @@ export function DirectChatGate() {
     }
   }, [connection, directChatEnabled, refresh, refreshSession]);
 
-  if (directChatEnabled && installationId) {
-    return <ChatScreen installationId={installationId} />;
+  if (directChatEnabled && binding) {
+    return <ChatScreen {...binding} />;
   }
 
   if (!exactHumanOwner || status === "idle" || status === "loading") {
@@ -157,11 +160,17 @@ export function DirectChatGate() {
   );
 }
 
-const preissuedDirectChatInstallationId = preissuedSessionMode
-  ? (
-      import.meta as ImportMeta & { env?: Record<string, string | undefined> }
-    ).env?.VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID?.trim() || null
-  : null;
+const preissuedDirectChatBinding = (() => {
+  if (!preissuedSessionMode) return null;
+  const env = (
+    import.meta as ImportMeta & { env?: Record<string, string | undefined> }
+  ).env;
+  const installationId = env?.VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID?.trim();
+  const authorityEpoch = env?.VITE_SUMI_DIRECT_CHAT_AUTHORITY_EPOCH?.trim();
+  return installationId && authorityEpoch
+    ? { installationId, authorityEpoch }
+    : null;
+})();
 
 function DirectChatLifecycle({
   title,

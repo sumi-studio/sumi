@@ -26,18 +26,20 @@ var testIngressSecret = []byte("test-ingress-session-secret-32!")
 
 const testBrowserOrigin = "https://web.example"
 const testDirectChatInstallationID = "018f47a2-9b3c-7def-8abc-0123456789ac"
+const testDirectChatAuthorityEpoch int64 = 1
 
 type allowDirectChatAuthorizer struct{}
 
 func (allowDirectChatAuthorizer) AuthorizeDirectChat(
 	_ context.Context,
 	_, _, installationID string,
-	operation func() error,
+	authorityEpoch int64,
 ) error {
-	if installationID != testDirectChatInstallationID {
+	if installationID != testDirectChatInstallationID ||
+		authorityEpoch != testDirectChatAuthorityEpoch {
 		return ErrDirectChatAuthorizationDenied
 	}
-	return operation()
+	return nil
 }
 
 func newAuthorizedBrowserServer(
@@ -223,7 +225,7 @@ func postWithSessionCookie(t *testing.T, url string, body []byte, personalityAge
 	}
 	req, err := http.NewRequest(
 		http.MethodPost,
-		url+separator+"installation_id="+testDirectChatInstallationID,
+		url+separator+"installation_id="+testDirectChatInstallationID+"&authority_epoch=1",
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -300,8 +302,15 @@ func TestUserCommandIngress_RequiresOneExactInstallationScope(t *testing.T) {
 		query string
 	}{
 		{name: "missing"},
-		{name: "empty", query: "?installation_id="},
-		{name: "duplicate", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID},
+		{name: "missing installation", query: "?authority_epoch=1"},
+		{name: "empty installation", query: "?installation_id=&authority_epoch=1"},
+		{name: "duplicate installation", query: "?installation_id=" + testDirectChatInstallationID + "&installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"},
+		{name: "missing epoch", query: "?installation_id=" + testDirectChatInstallationID},
+		{name: "empty epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch="},
+		{name: "duplicate epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1&authority_epoch=1"},
+		{name: "zero epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=0"},
+		{name: "leading-zero epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=01"},
+		{name: "overflow epoch", query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=9223372036854775808"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			ingress, appender := newTestIngress(t)
@@ -319,7 +328,7 @@ func TestUserCommandIngress_RequiresOneExactInstallationScope(t *testing.T) {
 			response := httptest.NewRecorder()
 			ingress.ServeHTTP(response, request)
 			if response.Code != http.StatusBadRequest ||
-				strings.TrimSpace(response.Body.String()) != "invalid_scope" {
+				response.Body.String() != "invalid_scope" {
 				t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
 			}
 			if appender.callCount() != 0 {
@@ -333,10 +342,12 @@ func TestUserCommandIngress_DistinguishesDeniedFromUnboundAuthority(t *testing.T
 	for _, testCase := range []struct {
 		name       string
 		authorizer DirectChatAuthorizer
+		query      string
 		wantStatus int
 	}{
-		{name: "wrong installation", authorizer: allowDirectChatAuthorizer{}, wantStatus: http.StatusForbidden},
-		{name: "unbound authorizer", authorizer: nil, wantStatus: http.StatusServiceUnavailable},
+		{name: "wrong installation", authorizer: allowDirectChatAuthorizer{}, query: "?installation_id=0198f0f4-9b72-7000-8000-000000000099&authority_epoch=1", wantStatus: http.StatusForbidden},
+		{name: "stale authority epoch", authorizer: allowDirectChatAuthorizer{}, query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=2", wantStatus: http.StatusForbidden},
+		{name: "unbound authorizer", authorizer: nil, query: "?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1", wantStatus: http.StatusServiceUnavailable},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			ingress, appender := newTestIngress(t)
@@ -345,7 +356,7 @@ func TestUserCommandIngress_DistinguishesDeniedFromUnboundAuthority(t *testing.T
 			defer server.Close()
 			request, err := http.NewRequest(
 				http.MethodPost,
-				server.URL+"/direct-chat/commands?installation_id=0198f0f4-9b72-7000-8000-000000000099",
+				server.URL+"/direct-chat/commands"+testCase.query,
 				strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`),
 			)
 			if err != nil {
@@ -556,7 +567,7 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 
 func TestUserCommandIngressRequiresNonemptyIdempotencyKey(t *testing.T) {
 	ingress, appender := newTestIngress(t)
-	req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands?installation_id="+testDirectChatInstallationID, strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`))
+	req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands?installation_id="+testDirectChatInstallationID+"&authority_epoch=1", strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`))
 	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	recorder := httptest.NewRecorder()
@@ -593,7 +604,7 @@ func TestUserCommandIngress_BodyReadFailureIsNotMisclassifiedAsOversized(t *test
 	ingress, appender := newTestIngress(t)
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/direct-chat/commands?installation_id="+testDirectChatInstallationID,
+		"/direct-chat/commands?installation_id="+testDirectChatInstallationID+"&authority_epoch=1",
 		nil,
 	)
 	req.SetPathValue("personality_agent_id", "018f47a2-9b3c-7def-8abc-0123456789ab")
@@ -744,7 +755,7 @@ func TestUserCommandIngressLifecycleFenceBoundsProvisioning(t *testing.T) {
 		t.Helper()
 		req, err := http.NewRequest(
 			http.MethodPost,
-			serverURL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID,
+			serverURL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID+"&authority_epoch=1",
 			strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`),
 		)
 		if err != nil {
@@ -865,7 +876,7 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID+"&authority_epoch=1", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
