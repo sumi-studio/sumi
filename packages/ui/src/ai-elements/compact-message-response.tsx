@@ -1,6 +1,7 @@
 import { Check, Copy, Image as ImageIcon } from "lucide-react";
 import {
   Children,
+  type ClipboardEvent,
   isValidElement,
   type ReactElement,
   type ReactNode,
@@ -17,15 +18,70 @@ import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough";
 import remarkGfm from "remark-gfm";
 import {
+  REMARK_MATH_OPTIONS,
   rehypeCompactKatex,
   rehypeCompactMathLayout,
   remarkCompactMath,
   remarkMath,
 } from "./compact-message-math";
+import { remarkSafeSingleDollar } from "./compact-message-math-syntax";
 import "katex/dist/katex.min.css";
 
 const LINK_CLASS =
   "break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary";
+
+function elementForNode(node: Node | null): Element | null {
+  if (node instanceof Element) return node;
+  return node?.parentElement ?? null;
+}
+
+function katexSource(element: ParentNode): string | null {
+  return (
+    element.querySelector('annotation[encoding="application/x-tex"]')
+      ?.textContent ?? null
+  );
+}
+
+/** Replace KaTeX's visual+MathML duplicate selection with one TeX source. */
+function normalizedMathSelection(
+  selection: Selection,
+  boundary: HTMLElement,
+): string | null {
+  if (selection.isCollapsed || selection.rangeCount !== 1) return null;
+  const anchor = elementForNode(selection.anchorNode);
+  const focus = elementForNode(selection.focusNode);
+  if (
+    !anchor ||
+    !focus ||
+    !boundary.contains(anchor) ||
+    !boundary.contains(focus)
+  ) {
+    return null;
+  }
+
+  const anchorMath = anchor.closest(".katex");
+  if (anchorMath && anchorMath === focus.closest(".katex")) {
+    return katexSource(anchorMath);
+  }
+
+  const fragment = selection.getRangeAt(0).cloneContents();
+  const formulae = [...fragment.querySelectorAll(".katex")];
+  if (formulae.length === 0) return null;
+  for (const formula of formulae) {
+    const source = katexSource(formula);
+    if (source !== null) formula.replaceWith(document.createTextNode(source));
+  }
+  return fragment.textContent;
+}
+
+function copyMathAsTex(event: ClipboardEvent<HTMLDivElement>) {
+  const selection = window.getSelection();
+  if (!selection) return;
+  const text = normalizedMathSelection(selection, event.currentTarget);
+  if (text === null) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", text);
+}
 
 export interface CompactMessageTrailer {
   text: string;
@@ -233,9 +289,10 @@ const STANDARD_REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [
   remarkCjkFriendly,
   remarkCjkFriendlyGfmStrikethrough,
   remarkBreaks,
-  remarkMath,
-  // Currency demotion must precede consumer transforms such as mentions so
-  // text restored from a false-positive formula still receives decoration.
+  [remarkMath, REMARK_MATH_OPTIONS],
+  // This tokenizer admits currency-safe single dollars before any Markdown
+  // construct can destructively consume the same source range.
+  remarkSafeSingleDollar,
   remarkCompactMath,
 ];
 
@@ -244,7 +301,7 @@ export interface CompactMessageResponseProps {
   /** Trusted domain transforms, such as membership-bound mention rendering. */
   extraRemarkPlugins?: Options["remarkPlugins"];
   trailer?: CompactMessageTrailer;
-  /** Optional wrapper class. Without it, no extra DOM wrapper is introduced. */
+  /** Optional class for the copy-normalizing renderer boundary. */
   className?: string;
 }
 
@@ -287,5 +344,13 @@ export function CompactMessageResponse({
       {children}
     </ReactMarkdown>
   );
-  return className ? <div className={className}>{rendered}</div> : rendered;
+  return (
+    <div
+      className={className}
+      data-compact-message-response=""
+      onCopy={copyMathAsTex}
+    >
+      {rendered}
+    </div>
+  );
 }
