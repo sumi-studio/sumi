@@ -28,8 +28,12 @@ type world struct {
 }
 
 func newWorld(t *testing.T, ctx context.Context) world {
+	return newWorldWithMaxConns(t, ctx, 10)
+}
+
+func newWorldWithMaxConns(t *testing.T, ctx context.Context, maxConns int32) world {
 	t.Helper()
-	pool := testdb.Create(t)
+	pool := testdb.CreateWithMaxConns(t, maxConns)
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

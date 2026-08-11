@@ -326,13 +326,12 @@ func (s *WSServer) handleTyping(
 	if sub == nil || sub.store == nil || s.Sessions == nil || s.Hub == nil {
 		return
 	}
-	boundary := liveBoundary{placeID: frame.PlaceID}
-	_ = s.Sessions.AuthorizeSession(ctx, claims, func() error {
-		return sub.store.withLiveAuthorityLease(ctx, boundary, func() error {
-			actor := participantToWire(sub.viewer)
-			return s.Hub.PublishScoped(ctx, sub.store, Event{
-				Type: EventTyping, PlaceID: frame.PlaceID, Actor: &actor,
-			})
+	typingCtx, cancel := context.WithTimeout(ctx, s.WriteTimeout)
+	defer cancel()
+	_ = s.Sessions.AuthorizeSession(typingCtx, claims, func() error {
+		actor := participantToWire(sub.viewer)
+		return s.Hub.PublishActorScoped(typingCtx, sub.store, Event{
+			Type: EventTyping, PlaceID: frame.PlaceID, Actor: &actor,
 		})
 	})
 }

@@ -129,6 +129,7 @@ type hubAuthorizer interface {
 		context.Context,
 		Scope,
 		liveBoundary,
+		bool,
 		func(map[ParticipantRef]struct{}) error,
 	) error
 }
@@ -182,7 +183,7 @@ func (h *Hub) unsubscribe(sub *subscriber) {
 // its scope (place, or subject participant for place-less events). Slow
 // subscribers are dropped rather than blocking the publisher.
 func (h *Hub) Publish(ctx context.Context, event Event) error {
-	return h.publishVariants(ctx, Scope{}, []Event{event})
+	return h.publishVariants(ctx, Scope{}, false, []Event{event})
 }
 
 // PublishScoped projects an event from one exact installed Messaging app.
@@ -192,7 +193,18 @@ func (h *Hub) PublishScoped(ctx context.Context, store *ScopedStore, event Event
 	if store == nil {
 		return ErrInvalidScope
 	}
-	return h.publishVariants(ctx, store.Scope, []Event{event})
+	return h.publishVariants(ctx, store.Scope, false, []Event{event})
+}
+
+// PublishActorScoped publishes a fresh volatile actor operation. Unlike a
+// post-commit durable projection, the actor's exact Workspace/place authority
+// is checked in the same transaction that resolves and enqueues the immutable
+// current audience.
+func (h *Hub) PublishActorScoped(ctx context.Context, store *ScopedStore, event Event) error {
+	if store == nil {
+		return ErrInvalidScope
+	}
+	return h.publishVariants(ctx, store.Scope, true, []Event{event})
 }
 
 // PublishVariants delivers mutually exclusive recipient variants of one
@@ -200,7 +212,7 @@ func (h *Hub) PublishScoped(ctx context.Context, store *ScopedStore, event Event
 // then OnlyFor/ExceptFor partitions the already-authorized subscribers fully
 // in memory. A subscriber receives at most one variant.
 func (h *Hub) PublishVariants(ctx context.Context, events []Event) error {
-	return h.publishVariants(ctx, Scope{}, events)
+	return h.publishVariants(ctx, Scope{}, false, events)
 }
 
 // PublishVariantsScoped is PublishScoped for mutually exclusive payload
@@ -209,10 +221,15 @@ func (h *Hub) PublishVariantsScoped(ctx context.Context, store *ScopedStore, eve
 	if store == nil {
 		return ErrInvalidScope
 	}
-	return h.publishVariants(ctx, store.Scope, events)
+	return h.publishVariants(ctx, store.Scope, false, events)
 }
 
-func (h *Hub) publishVariants(ctx context.Context, scope Scope, events []Event) error {
+func (h *Hub) publishVariants(
+	ctx context.Context,
+	scope Scope,
+	requireActor bool,
+	events []Event,
+) error {
 	if h == nil {
 		return nil
 	}
@@ -313,7 +330,7 @@ func (h *Hub) publishVariants(ctx context.Context, scope Scope, events []Event) 
 		return nil
 	}
 	if h.authorizer != nil {
-		return h.authorizer.withLiveAudience(ctx, scope, boundary, fanout)
+		return h.authorizer.withLiveAudience(ctx, scope, boundary, requireActor, fanout)
 	}
 	return fanout(nil)
 }
