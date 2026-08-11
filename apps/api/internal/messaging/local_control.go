@@ -142,6 +142,23 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	if !decodeJSON(w, r, &request) {
 		return
 	}
+	switch request.Urgency {
+	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_urgency")
+		return
+	}
+	// Validate the complete mutation shape before authorization and storage.
+	// A rejected write must not allocate a sequence or create any durable row.
+	if request.PlaceID == "" || request.Content == "" ||
+		!messageContentFitsStorage(request.Content) {
+		writeError(w, http.StatusBadRequest, "invalid_content")
+		return
+	}
+	if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	viewer := localViewer(authorization)
 	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
 	if err != nil {
@@ -167,11 +184,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	if !created {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, struct {
-		MessageID string      `json:"message_id"`
-		Seq       int64       `json:"seq"`
-		Message   messageWire `json:"message"`
-	}{message.MessageID, message.Seq, messageToWire(place, message)})
+	writeJSON(w, status, messageReceiptToWire(message, created))
 }
 
 // localReact toggles the agent's emoji on a message through the identical

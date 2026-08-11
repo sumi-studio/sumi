@@ -515,8 +515,10 @@ export class MockMessagingServer implements MessagingBackend {
     );
     if (existing) {
       return Promise.resolve({
+        clientNonce: input.clientNonce,
         messageId: existing.messageId,
         seq: existing.seq,
+        created: false,
       });
     }
     return new Promise((resolve) => {
@@ -538,7 +540,12 @@ export class MockMessagingServer implements MessagingBackend {
           notify: this.notifyFor(message),
         });
         this.scheduleAgentResponses(message);
-        resolve({ messageId: message.messageId, seq: message.seq });
+        resolve({
+          clientNonce: input.clientNonce,
+          messageId: message.messageId,
+          seq: message.seq,
+          created: true,
+        });
       }, SEND_LATENCY_MS);
     });
   }

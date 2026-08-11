@@ -69,6 +69,117 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 16)
+
+	const (
+		workspaceID = "0198f0f4-9b72-7000-8000-000000000101"
+		placeID     = "0198f0f4-9b72-7000-8000-000000000102"
+		authorID    = "0198f0f4-9b72-7000-8000-000000000103"
+	)
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", authorID); err != nil {
+		t.Fatalf("insert message author: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO workspaces (workspace_id, name) VALUES ($1, 'byte-boundary')",
+		workspaceID); err != nil {
+		t.Fatalf("insert message workspace: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO places
+		(place_id, kind, workspace_id, name, last_seq)
+		VALUES ($1, 'channel', $2, 'boundary', 10)`, placeID, workspaceID); err != nil {
+		t.Fatalf("insert message place: %v", err)
+	}
+
+	const maxContentBytes = 65536
+	exactContent := strings.Repeat("界", 21845) + "a"
+	overContent := exactContent + "b"
+	exactNonce := strings.Repeat("界", 42) + "aa"
+	overNonce := strings.Repeat("界", 43)
+	if len(exactContent) != maxContentBytes || len(overContent) != maxContentBytes+1 ||
+		len(exactNonce) != 128 || len(overNonce) != 129 {
+		t.Fatalf("invalid multibyte boundary fixture: content=%d/%d nonce=%d/%d",
+			len(exactContent), len(overContent), len(exactNonce), len(overNonce))
+	}
+
+	insertMessage := func(messageID string, seq int, content, nonce string) error {
+		t.Helper()
+		_, err := pool.Exec(ctx, `INSERT INTO messages
+			(message_id, place_id, seq, author_kind, author_id, content, client_nonce)
+			VALUES ($1, $2, $3, 'human', $4, $5, $6)`,
+			messageID, placeID, seq, authorID, content, nonce)
+		return err
+	}
+	assertCheckViolation := func(err error, boundary string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s unexpectedly accepted", boundary)
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("%s returned %v, want PostgreSQL check violation", boundary, err)
+		}
+	}
+
+	// 0008 used character counts, so a direct insert could bypass both byte
+	// limits. Keeping that invalid row must make the tightening migration fail
+	// atomically rather than silently retaining or truncating it.
+	if err := insertMessage(
+		"0198f0f4-9b72-7000-8000-000000000104", 1, overContent, overNonce,
+	); err != nil {
+		t.Fatalf("pre-0017 character constraints rejected multibyte fixture: %v", err)
+	}
+	if err := Migrate(ctx, pool); err == nil {
+		t.Fatal("byte-constraint migration accepted a pre-existing oversized row")
+	}
+	latest, err := LatestAppliedVersion(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != 16 {
+		t.Fatalf("failed byte-constraint migration was recorded: latest=%d", latest)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM messages WHERE place_id=$1", placeID); err != nil {
+		t.Fatalf("remove pre-migration oversized row: %v", err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("apply byte-constraint migration: %v", err)
+	}
+
+	if err := insertMessage(
+		"0198f0f4-9b72-7000-8000-000000000105", 2, exactContent, "content-exact",
+	); err != nil {
+		t.Fatalf("exact 65,536-byte content was rejected: %v", err)
+	}
+	assertCheckViolation(insertMessage(
+		"0198f0f4-9b72-7000-8000-000000000106", 3, overContent, "content-over",
+	), "65,537-byte content")
+	if err := insertMessage(
+		"0198f0f4-9b72-7000-8000-000000000107", 4, "nonce exact", exactNonce,
+	); err != nil {
+		t.Fatalf("exact 128-byte client nonce was rejected: %v", err)
+	}
+	assertCheckViolation(insertMessage(
+		"0198f0f4-9b72-7000-8000-000000000108", 5, "nonce over", overNonce,
+	), "129-byte client nonce")
+
+	down, err := migrationFS.ReadFile("migrations/0017_messaging_byte_constraints.down.sql")
+	if err != nil {
+		t.Fatalf("read messaging byte-constraint down migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("apply messaging byte-constraint down migration: %v", err)
+	}
+	if err := insertMessage(
+		"0198f0f4-9b72-7000-8000-000000000109", 6, overContent, overNonce,
+	); err != nil {
+		t.Fatalf("down migration did not restore character constraints: %v", err)
+	}
+}
+
 // TestKosekiSchemaConstraints verifies the 戸籍 invariants from issue #119
 // against a migrated database: a credential cannot be rebound to a different
 // Human, and an agent has at most one active Employer at a time.

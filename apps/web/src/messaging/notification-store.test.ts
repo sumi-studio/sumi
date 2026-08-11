@@ -115,7 +115,12 @@ class StubBackend implements MessagingBackend {
     throw new Error("unused");
   }
   async sendMessage() {
-    return { messageId: "m", seq: 1 };
+    return {
+      clientNonce: "notification-test",
+      messageId: "m",
+      seq: 1,
+      created: true,
+    };
   }
   async editMessage(): Promise<void> {}
   async deleteMessage(): Promise<void> {}
