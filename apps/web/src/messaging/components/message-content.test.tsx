@@ -138,6 +138,16 @@ describe("MessageContent mentions and links", () => {
     expect(getByText("@スミ")).toHaveAttribute("data-mention", "other");
     expect(container.querySelectorAll("[data-mention]")).toHaveLength(1);
   });
+
+  it("decorates mentions restored from currency text before rendering real math", () => {
+    const { container, getByText } = renderContent(
+      "@Haku の予算は $5 と $10、式は $x + 1$",
+    );
+
+    expect(getByText("@Haku")).toHaveAttribute("data-mention", "self");
+    expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    expect(container).toHaveTextContent("$5 と $10");
+  });
 });
 
 describe("MessageContent sanitization", () => {
