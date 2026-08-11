@@ -11,6 +11,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
+import { useParticipantApps } from "../participant/app-store";
 import { AppRail } from "./app-rail";
 
 const mocks = vi.hoisted(() => ({
@@ -27,6 +28,7 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 
 vi.mock("../auth/auth-context", () => ({
+  preissuedSessionMode: false,
   useAuth: () => ({
     authenticated: true,
     logout: mocks.logout,
@@ -57,9 +59,79 @@ vi.mock("../theme/theme-provider", () => ({
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  useParticipantApps.setState({
+    owner: null,
+    status: "idle",
+    catalog: [],
+    installations: [],
+    errorCode: null,
+    mutation: null,
+  });
 });
 
 describe("AppRail settings", () => {
+  it("shows a Participant-owned rail only for its exact enabled installation", () => {
+    useParticipantApps.setState({
+      owner: {
+        kind: "participant",
+        participant: {
+          kind: "human",
+          humanId: "01913f5e-7b8a-7abc-8def-0123456789ab",
+        },
+      },
+      status: "ready",
+      catalog: [
+        {
+          appId: "direct-chat",
+          displayName: "Direct Chat",
+          workspaceOwnerAllowed: false,
+          participantOwnerAllowed: true,
+          workspaceRoleCapabilities: [],
+        },
+      ],
+      installations: [
+        {
+          installationId: "0198f0f4-9b72-7000-8000-000000000051",
+          owner: {
+            kind: "participant",
+            participant: {
+              kind: "human",
+              humanId: "01913f5e-7b8a-7abc-8def-0123456789ab",
+            },
+          },
+          appId: "direct-chat",
+          state: "enabled",
+          installedAt: 1,
+          updatedAt: 2,
+        },
+      ],
+    });
+    const { rerender } = render(
+      <TooltipProvider>
+        <AppRail activeAppId="workspace" />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: "直通" })).toBeInTheDocument();
+
+    useParticipantApps.setState({
+      installations: useParticipantApps
+        .getState()
+        .installations.map((installation) => ({
+          ...installation,
+          state: "disabled",
+        })),
+    });
+    rerender(
+      <TooltipProvider>
+        <AppRail activeAppId="workspace" />
+      </TooltipProvider>,
+    );
+    expect(
+      screen.queryByRole("button", { name: "直通" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("uses the direct-chat settings control with provider management", () => {
     render(
       <TooltipProvider>

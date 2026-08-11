@@ -11,7 +11,7 @@ import type {
   AppOwnerRef,
   ParticipantRef,
 } from "../workspace/model";
-import { appOwnerKey, isOwnedBy, participantKey } from "../workspace/model";
+import { appOwnerKey, isOwnedBy } from "../workspace/model";
 
 export type ParticipantAppStatus = "idle" | "loading" | "ready" | "error";
 
@@ -323,10 +323,3 @@ function errorCode(error: unknown): string {
 export const useParticipantApps = createParticipantAppStore(
   new WorkspaceApiClient(),
 );
-
-/** Stable key for the bound Participant, for effect dependencies. */
-export function boundParticipantKey(owner: AppOwnerRef | null): string | null {
-  return owner?.kind === "participant"
-    ? participantKey(owner.participant)
-    : null;
-}

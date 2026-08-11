@@ -29,6 +29,7 @@ import { ProviderSettings } from "../auth/provider-settings";
 import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
 import { isImeComposing } from "../lib/ime";
 import { refreshMessagingMemberProfiles } from "../messaging/store";
+import { ParticipantAppsMenu } from "../participant/app-menu";
 import { DIRECT_CHAT_RENDERER } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
@@ -234,6 +235,7 @@ export function SettingsPopover() {
             </Button>
           </div>
         )}
+        {authenticated ? <ParticipantAppsMenu /> : null}
         <ThemePicker />
         {logoutError && (
           <p role="alert" className="mt-1 max-w-56 px-2.5 text-red-600 text-xs">
