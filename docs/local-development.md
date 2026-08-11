@@ -148,6 +148,29 @@ The `down -v` command deletes the local control-plane volume. Do not run it
 against a database whose contents must be retained; this boundary exists only
 for the current pre-cutover environment.
 
+This exception ends immediately before the first real Developer Workspace
+message. Rehearse an empty deploy, insert a representative Workspace / member /
+installation / message / notification-intent chain, restore a database backup
+into a second empty database, and verify both the rows and the latest migration
+version. Then seal the exact migration bytes:
+
+```sh
+node scripts/dev/migration-freeze.mjs seal
+(cd apps/api && go test ./internal/db)
+```
+
+Commit `apps/api/internal/db/migrations/FROZEN.sha256` before allowing that
+first message. From that commit onward, every migration file named in the
+manifest is immutable and all schema changes use a new forward migration. The
+ordinary database test suite validates the seal; `node
+scripts/dev/migration-freeze.mjs check` provides the same explicit operator
+check. A later forward migration must be added to the manifest with
+`node scripts/dev/migration-freeze.mjs extend`; that command refuses to extend
+over any changed or deleted sealed entry, a numeric gap at or below the sealed
+maximum, or anything other than one matching `up`/`down` pair at a new higher
+version. Resetting or replacing an applied migration is no longer an available
+operation after this point.
+
 First validate configuration, then start:
 
 ```sh
