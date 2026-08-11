@@ -14,6 +14,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
+	"github.com/sumi-studio/sumi/apps/api/internal/testfs"
 )
 
 type transportTestSessions struct {
@@ -597,7 +598,7 @@ func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *t
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = commandStore.Close() })
-	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), commandStore)
+	gateway, err := agentevents.OpenDurableGateway(testfs.PrivateDir(t), commandStore)
 	if err != nil {
 		t.Fatal(err)
 	}
