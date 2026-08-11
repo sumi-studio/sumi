@@ -76,17 +76,33 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 	applyMigrationsThrough(t, ctx, pool, 16)
 
 	const (
-		workspaceID = "0198f0f4-9b72-7000-8000-000000000101"
-		placeID     = "0198f0f4-9b72-7000-8000-000000000102"
-		authorID    = "0198f0f4-9b72-7000-8000-000000000103"
+		workspaceID       = "0198f0f4-9b72-7000-8000-000000000101"
+		placeID           = "0198f0f4-9b72-7000-8000-000000000102"
+		authorID          = "0198f0f4-9b72-7000-8000-000000000103"
+		workspaceMemberID = "0198f0f4-9b72-7000-8000-000000000110"
 	)
 	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", authorID); err != nil {
 		t.Fatalf("insert message author: %v", err)
 	}
-	if _, err := pool.Exec(ctx,
-		"INSERT INTO workspaces (workspace_id, name) VALUES ($1, 'byte-boundary')",
-		workspaceID); err != nil {
-		t.Fatalf("insert message workspace: %v", err)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspaces (workspace_id, name, owner_workspace_member_id)
+		VALUES ($1, 'byte-boundary', $2)`, workspaceID, workspaceMemberID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("insert canonical workspace: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspace_members
+			(workspace_member_id, workspace_id, member_kind, member_id)
+		VALUES ($1, $2, 'human', $3)`, workspaceMemberID, workspaceID, authorID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("insert canonical owner membership: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit canonical message workspace: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO places
 		(place_id, kind, workspace_id, name, last_seq)
@@ -108,9 +124,9 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 	insertMessage := func(messageID string, seq int, content, nonce string) error {
 		t.Helper()
 		_, err := pool.Exec(ctx, `INSERT INTO messages
-			(message_id, place_id, seq, author_kind, author_id, content, client_nonce)
-			VALUES ($1, $2, $3, 'human', $4, $5, $6)`,
-			messageID, placeID, seq, authorID, content, nonce)
+			(message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
+			VALUES ($1, $2, $3, $4, 'human', $5, $6, $7)`,
+			messageID, workspaceID, placeID, seq, authorID, content, nonce)
 		return err
 	}
 	assertCheckViolation := func(err error, boundary string) {

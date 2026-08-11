@@ -11,6 +11,7 @@
 --    「まだ何も言っていない」であって未設定エラーではないので、読み出し側は
 --    defaults_level の DEFAULT と同じ既定値へ落とす。
 CREATE TABLE notification_settings (
+    workspace_id   uuidv7      NOT NULL REFERENCES workspaces(workspace_id),
     member_kind    text        NOT NULL
         CHECK (member_kind IN ('human', 'personality_agent')),
     member_id      uuidv7      NOT NULL,
@@ -20,27 +21,31 @@ CREATE TABLE notification_settings (
     keywords       text[]      NOT NULL DEFAULT '{}'
         CHECK (cardinality(keywords) <= 32),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (member_kind, member_id)
+    PRIMARY KEY (workspace_id, member_kind, member_id)
 );
 
 -- 2. notification_setting_places — place 単位の上書き。既定と同じ値でも
 --    「その place について明示的にそう決めた」という別の事実なので、行を
 --    残すか消すかは本人の操作がそのまま反映される。
 CREATE TABLE notification_setting_places (
+    workspace_id uuidv7      NOT NULL,
     member_kind text        NOT NULL
         CHECK (member_kind IN ('human', 'personality_agent')),
     member_id   uuidv7      NOT NULL,
-    place_id    uuidv7      NOT NULL REFERENCES places(place_id) ON DELETE CASCADE,
+    place_id    uuidv7      NOT NULL,
     level       text        NOT NULL CHECK (level IN ('all', 'mentions', 'mute')),
     updated_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (member_kind, member_id, place_id),
-    FOREIGN KEY (member_kind, member_id)
-        REFERENCES notification_settings (member_kind, member_id) ON DELETE CASCADE
+    PRIMARY KEY (workspace_id, member_kind, member_id, place_id),
+    FOREIGN KEY (workspace_id, place_id)
+        REFERENCES places (workspace_id, place_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, member_kind, member_id)
+        REFERENCES notification_settings
+            (workspace_id, member_kind, member_id) ON DELETE CASCADE
 );
 
 -- 送信ごとに「この place を mute している人は誰か」を引く経路。
 CREATE INDEX notification_setting_places_by_place
-    ON notification_setting_places (place_id);
+    ON notification_setting_places (workspace_id, place_id);
 
 -- 3. message_notification_intents — message と同じ transaction で発行する
 --    typed intent。live WebSocket / Push / AttentionCandidate はこの正本から

@@ -14,7 +14,8 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	_, channel := w.workspaceWithChannel(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
 	first := w.send(t, ctx, channel.PlaceID, w.humanA, "first")
 	if err := w.store.ReadThrough(ctx, channel.PlaceID, w.agent, first.Seq); err != nil {
 		t.Fatalf("establish initial Agent cursor: %v", err)
@@ -23,14 +24,21 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 	// Mirror OpenSnapshot through its first authorized read, then keep that
 	// real PostgreSQL snapshot open while another transaction appends and
 	// advances this exact viewer's cursor.
-	reader, err := w.store.beginOpenSnapshot(ctx)
+	reader, err := scoped.Store.beginOpenSnapshot(ctx)
 	if err != nil {
 		t.Fatalf("begin reader snapshot: %v", err)
 	}
 	defer func() { _ = reader.Rollback(ctx) }()
-	place, err := w.store.placeFor(ctx, reader, channel.PlaceID, w.agent)
+	if _, err := scoped.authorizeSnapshotInTx(ctx, reader); err != nil {
+		t.Fatalf("authorize exact reader scope: %v", err)
+	}
+	place, err := scoped.loadScopedPlace(ctx, reader, channel.PlaceID)
 	if err != nil {
 		t.Fatalf("authorize reader snapshot: %v", err)
+	}
+	access, err := scoped.placeAccessAfterAuthorization(ctx, reader, place, w.agent)
+	if err != nil {
+		t.Fatalf("authorize reader place tenure: %v", err)
 	}
 	var isolation, readOnly string
 	if err := reader.QueryRow(ctx,
@@ -47,7 +55,7 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 		t.Fatalf("advance concurrent Agent cursor: %v", err)
 	}
 
-	old, err := w.store.openSnapshotFromPlace(ctx, reader, place, w.agent, HistoryOptions{Limit: 10})
+	old, err := scoped.openSnapshotFromPlace(ctx, reader, place, access, HistoryOptions{Limit: 10})
 	if err != nil {
 		t.Fatalf("finish reader snapshot: %v", err)
 	}
@@ -61,7 +69,7 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 
 	// A new screen sees the later commit coherently as well. Either side of the
 	// race is valid; mixing latest/history/cursor from both sides is not.
-	fresh, err := w.store.OpenSnapshot(ctx, channel.PlaceID, w.agent, HistoryOptions{Limit: 10})
+	fresh, err := scoped.OpenSnapshot(ctx, channel.PlaceID, HistoryOptions{Limit: 10})
 	if err != nil {
 		t.Fatalf("open fresh snapshot: %v", err)
 	}
@@ -75,9 +83,14 @@ func TestLocalAgentOpenCarriesExactCursorForContiguousAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	server := NewServer(w.store, nil)
+	server := NewServer(w.store.core, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	_, channel := w.workspaceWithChannel(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	scope := map[string]any{
+		"workspace_id":    workspace.WorkspaceID,
+		"installation_id": scoped.Scope.InstallationID,
+	}
 
 	messages := make([]Message, 25)
 	for i := range messages {
@@ -95,9 +108,13 @@ func TestLocalAgentOpenCarriesExactCursorForContiguousAdmission(t *testing.T) {
 
 	open := func(beforeSeq int64) map[string]any {
 		t.Helper()
-		status, body := callLocal(t, ctx, server.localOpen, LocalOpenPath, map[string]any{
+		request := map[string]any{
 			"place_id": channel.PlaceID, "before_seq": beforeSeq, "limit": 10,
-		}, authorization)
+		}
+		for key, value := range scope {
+			request[key] = value
+		}
+		status, body := callLocal(t, ctx, server.localOpen, LocalOpenPath, request, authorization)
 		if status != http.StatusOK {
 			t.Fatalf("open before %d: status %d body %v", beforeSeq, status, body)
 		}
@@ -105,8 +122,12 @@ func TestLocalAgentOpenCarriesExactCursorForContiguousAdmission(t *testing.T) {
 	}
 	readThrough := func(seq int64) {
 		t.Helper()
+		request := map[string]any{"place_id": channel.PlaceID, "seq": seq}
+		for key, value := range scope {
+			request[key] = value
+		}
 		status, body := callLocal(t, ctx, server.localReadThrough, LocalReadThroughPath,
-			map[string]any{"place_id": channel.PlaceID, "seq": seq}, authorization)
+			request, authorization)
 		if status != http.StatusOK {
 			t.Fatalf("read through %d: status %d body %v", seq, status, body)
 		}

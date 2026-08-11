@@ -82,56 +82,35 @@ func TestStatusIsReplacedInPlaceAndExpiresAtReadTime(t *testing.T) {
 	}
 }
 
-func TestStatusIsVisibleOnlyThroughASharedWorkspaceOrPlace(t *testing.T) {
+func TestStatusVisibilityIsBoundToExactWorkspace(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	strangerID, err := koseki.New(w.store.pool).MintHuman(ctx)
-	if err != nil {
-		t.Fatalf("mint stranger: %v", err)
-	}
-	stranger := Human(strangerID)
-
+	w.workspaceWithChannel(t, ctx)
 	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "", nil); err != nil {
 		t.Fatalf("set status: %v", err)
 	}
-
-	// Before any shared membership nobody but the owner sees it.
-	visible, err := w.store.ParticipantVisible(ctx, w.humanB, w.humanA)
+	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanB)
 	if err != nil {
-		t.Fatalf("visibility before workspace: %v", err)
+		t.Fatal(err)
 	}
-	if visible {
-		t.Fatal("an unrelated participant must not see a self-declared status")
+	if _, ok := statusOf(t, statuses, w.humanA); !ok {
+		t.Fatalf("shared exact Workspace did not expose status: %+v", statuses)
 	}
-	own, err := w.store.ParticipantVisible(ctx, w.humanA, w.humanA)
-	if err != nil || !own {
-		t.Fatalf("own visibility = %v (%v)", own, err)
-	}
-
-	w.workspaceWithChannel(t, ctx)
-	visible, err = w.store.ParticipantVisible(ctx, w.humanB, w.humanA)
-	if err != nil || !visible {
-		t.Fatalf("shared workspace visibility = %v (%v)", visible, err)
-	}
-
-	// Someone in no shared workspace and no shared place still sees nothing.
-	statuses, err := w.store.StatusesVisibleTo(ctx, stranger)
+	strangerID, err := koseki.New(w.store.core.pool).MintHuman(ctx)
 	if err != nil {
-		t.Fatalf("stranger statuses: %v", err)
+		t.Fatal(err)
+	}
+	stranger := Human(strangerID)
+	if _, err := w.store.createWorkspace(ctx, "isolated", stranger); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = w.store.StatusesVisibleTo(ctx, stranger)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if _, ok := statusOf(t, statuses, w.humanA); ok {
-		t.Fatalf("stranger must see no status, got %+v", statuses)
-	}
-	// bootstrap and the live fan-out share this basis, so they cannot disagree.
-	for _, viewer := range []ParticipantRef{w.humanB, w.agent} {
-		statuses, err := w.store.StatusesVisibleTo(ctx, viewer)
-		if err != nil {
-			t.Fatalf("statuses for %s: %v", viewer.Key(), err)
-		}
-		if _, ok := statusOf(t, statuses, w.humanA); !ok {
-			t.Fatalf("%s should see the status, got %+v", viewer.Key(), statuses)
-		}
+		t.Fatalf("status leaked across exact Workspace: %+v", statuses)
 	}
 }
 
@@ -195,7 +174,8 @@ func TestLocalStatusSetsTheAgentsOwnAttentionState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	server := NewServer(w.store, nil)
+	w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 
 	status, body := callLocal(t, ctx, server.localStatus, LocalStatusPath, map[string]any{

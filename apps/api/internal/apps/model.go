@@ -75,6 +75,14 @@ var (
 	ErrAppDisabled          = errors.New("app installation is disabled")
 )
 
+// ValidateInstallationID validates an opaque exact installation address.
+func ValidateInstallationID(value string) error {
+	if !isCanonicalUUIDv7(value) {
+		return ErrInstallationNotFound
+	}
+	return nil
+}
+
 type Descriptor struct {
 	AppID                     string
 	DisplayName               string

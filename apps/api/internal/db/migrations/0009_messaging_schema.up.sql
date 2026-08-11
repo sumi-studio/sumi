@@ -120,7 +120,8 @@ CREATE TRIGGER workspace_tenure_close_requires_closed_places
 
 CREATE TABLE messages (
     message_id   uuidv7      PRIMARY KEY,
-    place_id     uuidv7      NOT NULL REFERENCES places(place_id),
+    workspace_id uuidv7      NOT NULL,
+    place_id     uuidv7      NOT NULL,
     seq          bigint      NOT NULL CHECK (seq > 0 AND seq <= 9007199254740991),
     author_kind  text        NOT NULL
         CHECK (author_kind IN ('human', 'personality_agent')),
@@ -136,8 +137,12 @@ CREATE TABLE messages (
     CHECK ((content IS NULL) = (deleted_at IS NOT NULL)),
     UNIQUE (place_id, seq),
     UNIQUE (place_id, message_id),
-    FOREIGN KEY (place_id, reply_to)
-        REFERENCES messages (place_id, message_id)
+    UNIQUE (workspace_id, message_id),
+    UNIQUE (workspace_id, place_id, message_id),
+    FOREIGN KEY (workspace_id, place_id)
+        REFERENCES places (workspace_id, place_id),
+    FOREIGN KEY (workspace_id, place_id, reply_to)
+        REFERENCES messages (workspace_id, place_id, message_id)
 );
 
 CREATE UNIQUE INDEX messages_idempotent_send

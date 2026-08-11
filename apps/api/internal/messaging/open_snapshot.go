@@ -21,23 +21,32 @@ type OpenSnapshot struct {
 // OpenSnapshot loads one read-only screen at REPEATABLE READ. READ COMMITTED
 // is not sufficient: each statement could otherwise observe a different
 // concurrent append or cursor advance.
-func (s *Store) OpenSnapshot(
+func (s *ScopedStore) OpenSnapshot(
 	ctx context.Context,
 	placeID string,
-	viewer ParticipantRef,
 	opt HistoryOptions,
 ) (OpenSnapshot, error) {
-	tx, err := s.beginOpenSnapshot(ctx)
+	tx, err := s.Store.beginOpenSnapshot(ctx)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	place, err := s.placeFor(ctx, tx, placeID, viewer)
+	// Scope authority is part of the screen snapshot: the exact enabled
+	// installation and active Workspace tenure cannot change between
+	// authorization and any response projection.
+	if _, err := s.authorizeSnapshotInTx(ctx, tx); err != nil {
+		return OpenSnapshot{}, err
+	}
+	place, err := s.loadScopedPlace(ctx, tx, placeID)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
-	snapshot, err := s.openSnapshotFromPlace(ctx, tx, place, viewer, opt)
+	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
+	if err != nil {
+		return OpenSnapshot{}, err
+	}
+	snapshot, err := s.openSnapshotFromPlace(ctx, tx, place, access, opt)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
@@ -58,24 +67,25 @@ func (s *Store) beginOpenSnapshot(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// openSnapshotFromPlace finishes a screen after placeFor has authorized the
-// viewer. Its querier must be the same snapshot that produced place.
-func (s *Store) openSnapshotFromPlace(
+// openSnapshotFromPlace finishes a screen after the exact app scope and place
+// tenure have been authorized. Its querier must be the same snapshot that
+// produced place and access.
+func (s *ScopedStore) openSnapshotFromPlace(
 	ctx context.Context,
 	q querier,
 	place Place,
-	viewer ParticipantRef,
+	access PlaceAccess,
 	opt HistoryOptions,
 ) (OpenSnapshot, error) {
-	messages, err := s.history(ctx, q, place.PlaceID, opt)
+	messages, err := s.historyAfterAuthorization(ctx, q, place, access, opt)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
-	members, err := s.activeMembers(ctx, q, place)
+	members, err := s.activeMembersScoped(ctx, q, place)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
-	lastRead, err := s.readMarker(ctx, q, place.PlaceID, viewer)
+	lastRead, err := s.readMarkerAfterAuthorization(ctx, q, place, access)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}

@@ -109,6 +109,45 @@ func (s *Store) RequireEnabledInstallationInTx(
 	return installation, nil
 }
 
+// RequireEnabledInstallationInSnapshot is the read-only transaction variant
+// used when an app response must bind exact lifecycle admission and every
+// projected row to one database snapshot. It intentionally does not lock:
+// REPEATABLE READ supplies a coherent historical view, while mutating app
+// operations use RequireEnabledInstallationInTx for commit-time ordering.
+func (s *Store) RequireEnabledInstallationInSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID string,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
+	if !isCanonicalUUIDv7(installationID) {
+		return Installation{}, ErrInstallationNotFound
+	}
+	if err := owner.Validate(); err != nil {
+		return Installation{}, err
+	}
+	storageKind, storageID := ownerStorageKey(owner)
+	row := tx.QueryRow(ctx, `
+		SELECT installation_id, owner_kind, owner_id, app_id, enabled,
+		       installed_at, updated_at
+		FROM app_installations
+		WHERE installation_id = $1
+		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4`,
+		installationID, storageKind, storageID, appID)
+	installation, err := scanInstallation(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Installation{}, ErrInstallationNotFound
+	}
+	if err != nil {
+		return Installation{}, fmt.Errorf("load exact app snapshot admission: %w", err)
+	}
+	if installation.State != StateEnabled {
+		return Installation{}, ErrAppDisabled
+	}
+	return installation, nil
+}
+
 // RequireEnabledInstallation is the read-side equivalent used by entry
 // surfaces and delivery workers. It deliberately preserves exact installation
 // identity instead of collapsing missing and disabled bindings into a boolean.

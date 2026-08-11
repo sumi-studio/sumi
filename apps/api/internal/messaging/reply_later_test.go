@@ -205,7 +205,7 @@ func TestLocalReplyLaterAndResolveUseTheSharedStore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	server := NewServer(w.store, nil)
+	server := NewServer(w.store.core, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 	_, channel := w.workspaceWithChannel(t, ctx)
 	msg := w.send(t, ctx, channel.PlaceID, w.humanA, "手が空いたら見てください")
@@ -278,7 +278,7 @@ func TestLocalOverviewRestoresReplyLaterMarkerAfterServerReconstruction(t *testi
 	_, channel := w.workspaceWithChannel(t, ctx)
 	message := w.send(t, ctx, channel.PlaceID, w.humanA, "再起動後に対応してください")
 
-	beforeRestart := NewServer(w.store, nil)
+	beforeRestart := NewServer(w.store.core, nil)
 	status, body := callLocal(t, ctx, beforeRestart.localReplyLater, LocalReplyLaterPath, map[string]any{
 		"place_id": channel.PlaceID, "message_id": message.MessageID,
 		"note": "再起動後も覚えておく", "remind_in_minutes": 30,
@@ -291,7 +291,7 @@ func TestLocalOverviewRestoresReplyLaterMarkerAfterServerReconstruction(t *testi
 	// The overview is the reconstruction boundary for the agent adapter. A new
 	// server instance sharing only the durable Store must return the marker with
 	// the same owner-private schedule that the Human bootstrap returns.
-	afterRestart := NewServer(w.store, nil)
+	afterRestart := NewServer(w.store.core, nil)
 	status, body = callLocal(t, ctx, afterRestart.localOverview, LocalOverviewPath,
 		map[string]any{}, authorization)
 	if status != http.StatusOK {

@@ -60,13 +60,53 @@ func localViewer(authorization agentevents.LocalRuntimeAuthorization) Participan
 	return PersonalityAgent(authorization.PersonalityAgentID)
 }
 
+type localScopeWire struct {
+	WorkspaceID    string `json:"workspace_id"`
+	InstallationID string `json:"installation_id"`
+}
+
+func (s *Server) localScopedStore(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization, scope localScopeWire) (*ScopedStore, bool) {
+	store, ok := s.localBoundStore(w, authorization, scope)
+	if !ok {
+		return nil, false
+	}
+	if err := store.authorize(r.Context()); err != nil {
+		writeStoreError(w, err)
+		return nil, false
+	}
+	return store, true
+}
+
+// localBoundStore only constructs the exact immutable app address. Read
+// operations that promise one coherent snapshot must perform lifecycle and
+// membership authorization inside that same snapshot, not through the pool
+// here and then again while projecting the response.
+func (s *Server) localBoundStore(w http.ResponseWriter, authorization agentevents.LocalRuntimeAuthorization, scope localScopeWire) (*ScopedStore, bool) {
+	if s.Store == nil {
+		writeError(w, http.StatusServiceUnavailable, "messaging_unavailable")
+		return nil, false
+	}
+	store, err := s.Store.Scoped(Scope{
+		WorkspaceID: scope.WorkspaceID, InstallationID: scope.InstallationID,
+		Actor: localViewer(authorization),
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return nil, false
+	}
+	return store, true
+}
+
 func (s *Server) localOverview(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
-	var request struct{}
+	var request struct{ localScopeWire }
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	viewer := localViewer(authorization)
-	overview, err := s.buildOverview(r.Context(), viewer)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	overview, err := s.buildOverview(r.Context(), store)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -76,6 +116,7 @@ func (s *Server) localOverview(w http.ResponseWriter, r *http.Request, authoriza
 
 func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		PlaceID   string `json:"place_id"`
 		BeforeSeq int64  `json:"before_seq,omitempty"`
 		Limit     int    `json:"limit,omitempty"`
@@ -93,8 +134,11 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	if request.Limit > 50 {
 		request.Limit = 50
 	}
-	viewer := localViewer(authorization)
-	snapshot, err := s.Store.OpenSnapshot(r.Context(), request.PlaceID, viewer,
+	store, ok := s.localBoundStore(w, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	snapshot, err := store.OpenSnapshot(r.Context(), request.PlaceID,
 		HistoryOptions{BeforeSeq: request.BeforeSeq, Limit: request.Limit})
 	if err != nil {
 		writeStoreError(w, err)
@@ -119,6 +163,7 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		PlaceID     string  `json:"place_id"`
 		Content     string  `json:"content"`
 		Urgency     string  `json:"urgency"`
@@ -134,8 +179,8 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		writeError(w, http.StatusBadRequest, "invalid_urgency")
 		return
 	}
-	// Validate the complete mutation shape before authorization and storage.
-	// A rejected write must not allocate a sequence or create any durable row.
+	// Reject an invalid mutation before scope authorization or storage. A
+	// rejected write must not allocate a sequence or create a durable row.
 	if request.PlaceID == "" || request.Content == "" ||
 		!messageContentFitsStorage(request.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
@@ -145,8 +190,11 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
-	viewer := localViewer(authorization)
-	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, err := store.PlaceFor(r.Context(), request.PlaceID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -155,8 +203,8 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	if request.ReplyTo != nil {
 		replyTo = *request.ReplyTo
 	}
-	message, created, err := s.Store.AppendMessage(r.Context(), AppendInput{
-		PlaceID: request.PlaceID, Author: viewer, Content: request.Content,
+	message, created, err := store.AppendMessage(r.Context(), AppendInput{
+		PlaceID: request.PlaceID, Content: request.Content,
 		Urgency: request.Urgency, ReplyTo: replyTo, ClientNonce: request.ClientNonce,
 	})
 	if err != nil {
@@ -164,7 +212,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		return
 	}
 	if created {
-		publishMessageCreated(r.Context(), s.Store, s.Hub, place, message)
+		publishMessageCreated(r.Context(), store, s.Hub, place, message)
 	}
 	status := http.StatusCreated
 	if !created {
@@ -179,6 +227,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 // the server enforces the shared permission model.
 func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		PlaceID     string `json:"place_id"`
 		MessageID   string `json:"message_id"`
 		Emoji       string `json:"emoji"`
@@ -191,13 +240,16 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	viewer := localViewer(authorization)
-	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, err := store.PlaceFor(r.Context(), request.PlaceID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	message, reacted, err := s.toggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji, request.ClientNonce)
+	message, reacted, err := s.toggleScopedReaction(r.Context(), store, request.PlaceID, request.MessageID, request.Emoji, request.ClientNonce)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -214,6 +266,7 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 // open place: a person's attention state is about the person, not a screen.
 func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		Status string `json:"status"`
 		Note   string `json:"note,omitempty"`
 		// 0 (or omitted) means the status holds until it is replaced.
@@ -238,8 +291,11 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 		moment := time.Now().Add(time.Duration(request.ExpiresInMinutes) * time.Minute)
 		expiresAt = &moment
 	}
-	viewer := localViewer(authorization)
-	status, err := s.Store.SetStatus(r.Context(), viewer, request.Status, request.Note, expiresAt)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	status, err := store.SetStatus(r.Context(), request.Status, request.Note, expiresAt)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -257,6 +313,7 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 // owner — other participants' wires never do.
 func (s *Server) localReplyLater(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		PlaceID   string `json:"place_id"`
 		MessageID string `json:"message_id"`
 		Note      string `json:"note,omitempty"`
@@ -276,9 +333,13 @@ func (s *Server) localReplyLater(w http.ResponseWriter, r *http.Request, authori
 	if request.RemindInMinutes > 0 {
 		remindAt = time.Now().Add(time.Duration(request.RemindInMinutes) * time.Minute)
 	}
-	viewer := localViewer(authorization)
-	marker, created, err := s.Store.CreateReplyLater(
-		r.Context(), request.PlaceID, request.MessageID, viewer, request.Note, remindAt)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	viewer := store.Scope.Actor
+	marker, created, err := store.CreateReplyLater(
+		r.Context(), request.PlaceID, request.MessageID, request.Note, remindAt)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -302,6 +363,7 @@ func (s *Server) localReplyLater(w http.ResponseWriter, r *http.Request, authori
 // marker is reported as missing, never as forbidden.
 func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		MarkerID string `json:"marker_id"`
 	}
 	if !decodeJSON(w, r, &request) {
@@ -311,8 +373,12 @@ func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	viewer := localViewer(authorization)
-	marker, err := s.Store.ResolveReplyLater(r.Context(), request.MarkerID, viewer)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	viewer := store.Scope.Actor
+	marker, err := store.ResolveReplyLater(r.Context(), request.MarkerID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -330,6 +396,7 @@ func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, 
 // silently discard the rest of its setting the way a full PUT would.
 func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		DefaultsLevel *string `json:"defaults_level,omitempty"`
 		PerPlace      *[]struct {
 			PlaceID string `json:"place_id"`
@@ -340,8 +407,11 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	viewer := localViewer(authorization)
-	current, err := s.Store.NotificationSettingFor(r.Context(), viewer)
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	current, err := store.NotificationSettingFor(r.Context())
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -371,7 +441,7 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	if request.Keywords != nil {
 		keywords = *request.Keywords
 	}
-	stored, err := s.Store.SetNotificationSetting(r.Context(), viewer, defaultLevel, perPlace, keywords)
+	stored, err := store.SetNotificationSetting(r.Context(), defaultLevel, perPlace, keywords)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -383,23 +453,27 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
+		localScopeWire
 		PlaceID string `json:"place_id"`
 		Seq     int64  `json:"seq"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	viewer := localViewer(authorization)
-	if err := s.Store.ReadThrough(r.Context(), request.PlaceID, viewer, request.Seq); err != nil {
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	if err := store.ReadThrough(r.Context(), request.PlaceID, request.Seq); err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	place, err := store.PlaceFor(r.Context(), request.PlaceID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	lastRead, err := s.Store.ReadMarker(r.Context(), request.PlaceID, viewer)
+	lastRead, err := store.ReadMarker(r.Context(), request.PlaceID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
