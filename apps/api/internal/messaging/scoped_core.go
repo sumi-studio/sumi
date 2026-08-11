@@ -128,7 +128,7 @@ func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place
 		return Place{}, false, fmt.Errorf("begin ensure dm: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	actorMembership, err := s.authorizeInTx(ctx, tx)
+	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
 	if err != nil {
 		return Place{}, false, err
 	}
@@ -147,6 +147,10 @@ func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place
 	created := true
 	if errors.Is(err, pgx.ErrNoRows) {
 		created = false
+		// Existing private-place tenure changes use the place row as their
+		// audience fence. Append locks the same row while allocating seq before
+		// it snapshots recipients, so re-admission either commits first and is
+		// included or waits until the message transaction commits.
 		if err := tx.QueryRow(ctx, `
 			SELECT place_id FROM places
 			WHERE workspace_id = $1 AND dm_key = $2 FOR UPDATE`,
@@ -187,7 +191,7 @@ func (s *ScopedStore) CreateGroupDM(ctx context.Context, others []ParticipantRef
 		return Place{}, fmt.Errorf("begin create group dm: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	actorMembership, err := s.authorizeInTx(ctx, tx)
+	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
 	if err != nil {
 		return Place{}, err
 	}

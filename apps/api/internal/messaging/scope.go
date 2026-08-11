@@ -45,6 +45,7 @@ type WorkspaceAuthority interface {
 	Members(context.Context, string, participant.Ref) ([]workspacecontrol.Membership, error)
 	ActiveMembershipInTx(context.Context, pgx.Tx, string, participant.Ref) (workspacecontrol.Membership, error)
 	ActiveMembershipsInTx(context.Context, pgx.Tx, string) ([]workspacecontrol.Membership, error)
+	LockSharedAndRequireMembership(context.Context, pgx.Tx, string, participant.Ref) (workspacecontrol.Membership, error)
 	LockAndRequireAppCapability(context.Context, pgx.Tx, string, participant.Ref, string) error
 	RequireMembership(context.Context, string, participant.Ref) error
 }
@@ -75,6 +76,10 @@ func (s *ScopedStore) authorize(ctx context.Context) error {
 
 func (s *ScopedStore) authorizeInTx(ctx context.Context, tx pgx.Tx) (workspacecontrol.Membership, error) {
 	return s.Store.authorizeScopeInTx(ctx, tx, s.Scope)
+}
+
+func (s *ScopedStore) authorizeMutationInTx(ctx context.Context, tx pgx.Tx) (workspacecontrol.Membership, error) {
+	return s.Store.authorizeScopeMutationInTx(ctx, tx, s.Scope)
 }
 
 func (s *ScopedStore) authorizeSnapshotInTx(ctx context.Context, tx pgx.Tx) (workspacecontrol.Membership, error) {
@@ -146,6 +151,36 @@ func (s *Store) authorizeScopeInTx(ctx context.Context, tx pgx.Tx, scope Scope) 
 	membership, err := s.workspaces.ActiveMembershipInTx(ctx, tx, scope.WorkspaceID, scope.Actor)
 	if err != nil {
 		return workspacecontrol.Membership{}, ErrPlaceNotFound
+	}
+	return membership, nil
+}
+
+// authorizeScopeMutationInTx fixes the lock order for every ordinary
+// Messaging mutation: Workspace shared authority fence, exact installation
+// lifecycle fence, then app/place operation locks. Workspace membership and
+// role mutations, invite redemption, and app lifecycle mutations take the
+// conflicting Workspace exclusive fence before touching their child rows.
+func (s *Store) authorizeScopeMutationInTx(ctx context.Context, tx pgx.Tx, scope Scope) (workspacecontrol.Membership, error) {
+	if err := scope.Validate(); err != nil {
+		return workspacecontrol.Membership{}, err
+	}
+	if s.workspaces == nil || s.apps == nil {
+		return workspacecontrol.Membership{}, errors.New("messaging authority dependencies are unavailable")
+	}
+	membership, err := s.workspaces.LockSharedAndRequireMembership(
+		ctx, tx, scope.WorkspaceID, scope.Actor,
+	)
+	if err != nil {
+		if errors.Is(err, workspacecontrol.ErrNotFound) {
+			return workspacecontrol.Membership{}, ErrPlaceNotFound
+		}
+		return workspacecontrol.Membership{}, err
+	}
+	if _, err := s.apps.RequireEnabledInstallationInTx(
+		ctx, tx, scope.InstallationID,
+		applicationapps.WorkspaceOwner(scope.WorkspaceID), MessagingAppID,
+	); err != nil {
+		return workspacecontrol.Membership{}, err
 	}
 	return membership, nil
 }

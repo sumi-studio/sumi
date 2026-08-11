@@ -80,7 +80,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		return Message{}, false, fmt.Errorf("begin scoped append: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return Message{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, in.PlaceID)
@@ -317,7 +317,7 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, fmt.Errorf("begin scoped edit: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return Message{}, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
@@ -386,7 +386,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if !preflight.Deleted && preflight.Author != s.Scope.Actor {
 		_, err = s.authorizeManageChannelsInTx(ctx, tx)
 	} else {
-		_, err = s.authorizeInTx(ctx, tx)
+		_, err = s.authorizeMutationInTx(ctx, tx)
 	}
 	if err != nil {
 		return Message{}, err
@@ -462,7 +462,7 @@ func (s *ScopedStore) ReadThrough(ctx context.Context, placeID string, seq int64
 		return fmt.Errorf("begin scoped read-through: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	membership, err := s.authorizeInTx(ctx, tx)
+	membership, err := s.authorizeMutationInTx(ctx, tx)
 	if err != nil {
 		return err
 	}
