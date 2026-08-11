@@ -176,6 +176,53 @@ test("installation replacement fences unaccepted replay into a recoverable draft
   releaseOld();
 });
 
+test("disable and re-enable of the same installation starts a fresh authority epoch", async () => {
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox();
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "pending-before-disable",
+  });
+  const releaseOld = store.getState().acquireConnection(InstallationId);
+  await flushConnectionMicrotasks();
+  transport.emit(canonicalFrame(1, CommandId, "already admitted"));
+  assert.equal(store.getState().sendMessage("recover this text"), true);
+  assert.equal(transport.sent.length, 1);
+
+  assert.equal(store.getState().suspendInstallation(InstallationId), true);
+
+  assert.equal(transport.suspendInstallationCalls, 1);
+  assert.deepEqual(outbox.entries(), [
+    {
+      state: "recoverable",
+      idempotencyKey: "pending-before-disable",
+      text: "recover this text",
+      reason: "installation_suspended",
+    },
+  ]);
+  assert.equal(
+    store.getState().conversation.entries[userMessageIdFromCommandId(CommandId)]
+      ?.kind,
+    "user",
+  );
+  assert.equal(
+    store.getState().conversation.entries["optimistic:pending-before-disable"],
+    undefined,
+  );
+
+  releaseOld();
+  const releaseReenabled = store.getState().acquireConnection(InstallationId);
+  await flushConnectionMicrotasks();
+  assert.deepEqual(transport.installationBindings, [
+    InstallationId,
+    InstallationId,
+  ]);
+  assert.equal(transport.connectCalls, 2);
+  assert.equal(transport.sent.length, 1);
+  releaseReenabled();
+});
+
 test("admission is provisional and canonical user arrival replaces it", () => {
   const transport = new FakeTransport();
   const outbox = new PrivateOutbox();
@@ -1274,6 +1321,7 @@ class FakeTransport implements DirectChatTransport {
   connectCalls = 0;
   closeCalls = 0;
   resetAuthorityCalls = 0;
+  suspendInstallationCalls = 0;
   readonly installationBindings: string[] = [];
   private readonly frameListeners = new Set<
     (frame: DirectChatServerFrame) => void
@@ -1304,6 +1352,10 @@ class FakeTransport implements DirectChatTransport {
   resetAuthority() {
     this.resetAuthorityCalls += 1;
     this.close();
+  }
+
+  suspendInstallation() {
+    this.suspendInstallationCalls += 1;
   }
 
   sendCommand(command: unknown, idempotencyKey?: string) {

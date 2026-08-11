@@ -24,6 +24,7 @@ import (
 	firebaseauth "firebase.google.com/go/v4/auth"
 	"github.com/gorilla/websocket"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 var testTokenSecret = []byte("test-secret-32bytes-long-string!!")
@@ -372,6 +373,7 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 	browser := agentevents.NewBrowserServer(sessions, runtime, runtime)
 	browser.AllowedOrigins = []string{testBrowserOrigin}
 	browser.SetAuthorizer(allowDirectChatAuthorizer{})
+	browser.SetLifecycleFence(directchat.NewLifecycleFence())
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", browser)
 	server := httptest.NewServer(mux)

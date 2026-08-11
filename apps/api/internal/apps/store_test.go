@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 	"github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -28,6 +29,92 @@ type appWorld struct {
 	owner      participant.Ref
 	member     participant.Ref
 	agent      participant.Ref
+}
+
+func TestDirectChatLifecycleUsesProcessFenceAndOtherAppsDoNot(t *testing.T) {
+	w := newAppWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	owner := applicationapps.ParticipantOwner(w.owner)
+	withoutFence := applicationapps.New(w.pool, w.workspaces)
+	if _, err := withoutFence.Install(ctx, owner, w.owner, directchat.AppID); !errors.Is(err, directchat.ErrLifecycleFenceUnavailable) {
+		t.Fatalf("direct-chat install without lifecycle fence = %v", err)
+	}
+
+	fence := directchat.NewLifecycleFence()
+	store := applicationapps.New(w.pool, w.workspaces, fence)
+	releaseOperation, err := fence.AcquireOperation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type installResult struct {
+		installation applicationapps.Installation
+		err          error
+	}
+	directChatDone := make(chan installResult, 1)
+	go func() {
+		installation, installErr := store.Install(ctx, owner, w.owner, directchat.AppID)
+		directChatDone <- installResult{installation: installation, err: installErr}
+	}()
+	alarmDone := make(chan error, 1)
+	go func() {
+		_, installErr := store.Install(
+			ctx,
+			applicationapps.ParticipantOwner(w.member),
+			w.member,
+			"alarm",
+		)
+		alarmDone <- installErr
+	}()
+	select {
+	case err := <-alarmDone:
+		if err != nil {
+			t.Fatalf("unrelated app serialized or failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated app was serialized behind direct-chat operation")
+	}
+	select {
+	case result := <-directChatDone:
+		t.Fatalf("direct-chat install crossed operation fence: %v", result.err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	releaseOperation()
+	result := <-directChatDone
+	if result.err != nil {
+		t.Fatalf("direct-chat install after operation: %v", result.err)
+	}
+
+	assertMutationWaits := func(name string, mutate func() error) {
+		t.Helper()
+		release, acquireErr := fence.AcquireOperation(ctx)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		done := make(chan error, 1)
+		go func() { done <- mutate() }()
+		select {
+		case err := <-done:
+			release()
+			t.Fatalf("%s crossed operation fence: %v", name, err)
+		case <-time.After(30 * time.Millisecond):
+		}
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("%s after operation: %v", name, err)
+		}
+	}
+	assertMutationWaits("disable", func() error {
+		_, err := store.SetEnabledByID(ctx, result.installation.InstallationID, w.owner, false)
+		return err
+	})
+	assertMutationWaits("enable", func() error {
+		_, err := store.SetEnabledByID(ctx, result.installation.InstallationID, w.owner, true)
+		return err
+	})
+	assertMutationWaits("uninstall", func() error {
+		return store.UninstallByID(ctx, result.installation.InstallationID, w.owner)
+	})
 }
 
 func newAppWorld(t *testing.T) appWorld {

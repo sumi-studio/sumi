@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -246,7 +247,8 @@ func TestEmployerAuthorityLeaseSerializesTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	lifecycle := directchat.NewLifecycleFence()
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
 	first, err := store.AutoRegister(ctx, "firebase", "authority-lease-first")
 	if err != nil {
 		t.Fatalf("auto-register first Human: %v", err)

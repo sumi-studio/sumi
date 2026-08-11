@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
@@ -23,13 +24,37 @@ type WorkspaceAuthorizer interface {
 }
 
 type Store struct {
-	pool       *pgxpool.Pool
-	workspaces WorkspaceAuthorizer
-	now        func() time.Time
+	pool                *pgxpool.Pool
+	workspaces          WorkspaceAuthorizer
+	directChatLifecycle *directchat.LifecycleFence
+	now                 func() time.Time
 }
 
-func New(pool *pgxpool.Pool, workspaces WorkspaceAuthorizer) *Store {
-	return &Store{pool: pool, workspaces: workspaces, now: time.Now}
+func New(
+	pool *pgxpool.Pool,
+	workspaces WorkspaceAuthorizer,
+	directChatLifecycle ...*directchat.LifecycleFence,
+) *Store {
+	var lifecycle *directchat.LifecycleFence
+	if len(directChatLifecycle) > 0 {
+		lifecycle = directChatLifecycle[0]
+	}
+	return &Store{
+		pool:                pool,
+		workspaces:          workspaces,
+		directChatLifecycle: lifecycle,
+		now:                 time.Now,
+	}
+}
+
+func (s *Store) acquireLifecycleMutation(ctx context.Context, appID string) (func(), error) {
+	if appID != directchat.AppID {
+		return func() {}, nil
+	}
+	if s == nil || s.directChatLifecycle == nil {
+		return nil, directchat.ErrLifecycleFenceUnavailable
+	}
+	return s.directChatLifecycle.AcquireMutation(ctx)
 }
 
 func (s *Store) Catalog(ctx context.Context) ([]Descriptor, error) {
@@ -269,6 +294,11 @@ func (s *Store) Installations(ctx context.Context, owner OwnerRef, actor partici
 }
 
 func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.Ref, appID string) (Installation, error) {
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
+	if err != nil {
+		return Installation{}, err
+	}
+	defer releaseLifecycle()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Installation{}, fmt.Errorf("begin install app: %w", err)
@@ -309,6 +339,11 @@ func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.R
 }
 
 func (s *Store) SetEnabled(ctx context.Context, owner OwnerRef, actor participant.Ref, appID string, enabled bool) (Installation, error) {
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
+	if err != nil {
+		return Installation{}, err
+	}
+	defer releaseLifecycle()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Installation{}, fmt.Errorf("begin change app state: %w", err)
@@ -345,6 +380,14 @@ func (s *Store) SetEnabledByID(ctx context.Context, installationID string, actor
 	if err != nil {
 		return Installation{}, err
 	}
+	// Address classification completes before the process fence is acquired and
+	// holds no database lock. The exact row is revalidated in the transaction,
+	// whose lock order remains lifecycle fence then PostgreSQL.
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
+	if err != nil {
+		return Installation{}, err
+	}
+	defer releaseLifecycle()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Installation{}, fmt.Errorf("begin change app state: %w", err)
@@ -378,6 +421,11 @@ func (s *Store) SetEnabledByID(ctx context.Context, installationID string, actor
 }
 
 func (s *Store) Uninstall(ctx context.Context, owner OwnerRef, actor participant.Ref, appID string) error {
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin uninstall app: %w", err)
@@ -408,6 +456,13 @@ func (s *Store) UninstallByID(ctx context.Context, installationID string, actor 
 	if err != nil {
 		return err
 	}
+	// See SetEnabledByID: no database lock is held while acquiring the process
+	// fence, and the addressed row is checked again under the mutation tx.
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin uninstall app: %w", err)

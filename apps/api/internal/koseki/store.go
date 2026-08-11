@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 )
 
@@ -46,20 +47,36 @@ const employmentAuthorityLockDomain = "sumi:employment-authority:v1:"
 // Store is the trusted provisioning boundary for the 戸籍. All minting and
 // credential binding flows through it; no other component writes the registry.
 type Store struct {
-	pool          *pgxpool.Pool
-	wrappingKeyID string
+	pool                *pgxpool.Pool
+	wrappingKeyID       string
+	directChatLifecycle *directchat.LifecycleFence
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to a
 // database that has had the 戸籍 migrations applied.
-func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+func New(pool *pgxpool.Pool, directChatLifecycle ...*directchat.LifecycleFence) *Store {
+	return &Store{pool: pool, directChatLifecycle: firstLifecycleFence(directChatLifecycle)}
 }
 
 // NewWithWrappingKeyID returns a Store that can provision new agents using the
 // configured current key identity. Read-only stores may use New.
-func NewWithWrappingKeyID(pool *pgxpool.Pool, wrappingKeyID string) *Store {
-	return &Store{pool: pool, wrappingKeyID: wrappingKeyID}
+func NewWithWrappingKeyID(
+	pool *pgxpool.Pool,
+	wrappingKeyID string,
+	directChatLifecycle ...*directchat.LifecycleFence,
+) *Store {
+	return &Store{
+		pool:                pool,
+		wrappingKeyID:       wrappingKeyID,
+		directChatLifecycle: firstLifecycleFence(directChatLifecycle),
+	}
+}
+
+func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.LifecycleFence {
+	if len(fences) == 0 {
+		return nil
+	}
+	return fences[0]
 }
 
 // MintHuman mints a fresh, globally unique HumanId (UUIDv7) and records the
@@ -189,6 +206,14 @@ func (s *Store) AuthorizeCurrentHumanEmployer(
 	if operation == nil {
 		return errors.New("current Employer authorization operation is required")
 	}
+	if s == nil || s.directChatLifecycle == nil {
+		return directchat.ErrLifecycleFenceUnavailable
+	}
+	releaseLifecycle, err := s.directChatLifecycle.AcquireOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin current Employer authorization: %w", err)
@@ -248,6 +273,14 @@ func (s *Store) TransferEmployment(
 	if employerType != EmployerHuman && employerType != EmployerWorkspace {
 		return errors.New("unsupported Employer type")
 	}
+	if s == nil || s.directChatLifecycle == nil {
+		return directchat.ErrLifecycleFenceUnavailable
+	}
+	releaseLifecycle, err := s.directChatLifecycle.AcquireMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	if employerType == EmployerHuman {
 		if err := s.humanExists(ctx, employerID); err != nil {
 			return err

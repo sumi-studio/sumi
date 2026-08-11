@@ -12,6 +12,7 @@ import (
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
@@ -395,6 +396,8 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		errors.Is(err, ErrInvalidInvite), errors.Is(err, ErrInvalidWorkspaceListCursor),
 		errors.Is(err, applicationapps.ErrOwnerKindUnsupported):
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+	case errors.Is(err, directchat.ErrLifecycleFenceUnavailable):
+		writeAPIError(w, http.StatusServiceUnavailable, "unavailable")
 	default:
 		writeAPIError(w, http.StatusInternalServerError, "internal_error")
 	}

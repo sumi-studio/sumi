@@ -13,10 +13,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
 var testIngressSecret = []byte("test-ingress-session-secret-32!")
@@ -44,6 +47,7 @@ func newAuthorizedBrowserServer(
 ) *BrowserServer {
 	server := NewBrowserServer(sessions, appender, events)
 	server.Authorizer = allowDirectChatAuthorizer{}
+	server.SetLifecycleFence(directchat.NewLifecycleFence())
 	return server
 }
 
@@ -207,6 +211,7 @@ func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	}
 	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	ingress.Authorizer = allowDirectChatAuthorizer{}
+	ingress.LifecycleFence = directchat.NewLifecycleFence()
 	return ingress, appender
 }
 
@@ -710,6 +715,7 @@ func TestUserCommandIngress_TargetComesOnlyFromVerifiedSession(t *testing.T) {
 	}
 	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	ingress.Authorizer = allowDirectChatAuthorizer{}
+	ingress.LifecycleFence = directchat.NewLifecycleFence()
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
@@ -730,6 +736,102 @@ func TestUserCommandIngress_TargetComesOnlyFromVerifiedSession(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for rejected session, got %d", resp2.StatusCode)
+	}
+}
+
+func TestUserCommandIngressLifecycleFenceBoundsProvisioning(t *testing.T) {
+	newRequest := func(t *testing.T, serverURL string) *http.Request {
+		t.Helper()
+		req, err := http.NewRequest(
+			http.MethodPost,
+			serverURL+"/direct-chat/commands?installation_id="+testDirectChatInstallationID,
+			strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Origin", testBrowserOrigin)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "bounded-spawn")
+		req.AddCookie(&http.Cookie{
+			Name:  BrowserSessionCookie,
+			Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab"),
+		})
+		return req
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		timeout    time.Duration
+		release    bool
+		wantStatus int
+	}{
+		{name: "mutation waits for operation-first spawn", timeout: time.Second, release: true, wantStatus: http.StatusCreated},
+		{name: "spawn timeout releases mutation", timeout: 30 * time.Millisecond, wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ingress, _ := newTestIngress(t)
+			fence := directchat.NewLifecycleFence()
+			ingress.LifecycleFence = fence
+			spawner := &blockingDirectChatSpawner{
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+			}
+			ingress.Spawner = spawner
+			ingress.SpawnTimeout = testCase.timeout
+			server := httptest.NewServer(ingress)
+			defer server.Close()
+			request := newRequest(t, server.URL)
+			responseDone := make(chan struct {
+				response *http.Response
+				err      error
+			}, 1)
+			go func() {
+				response, err := http.DefaultClient.Do(request)
+				responseDone <- struct {
+					response *http.Response
+					err      error
+				}{response: response, err: err}
+			}()
+			select {
+			case <-spawner.started:
+			case <-time.After(time.Second):
+				t.Fatal("command admission did not reach provisioning")
+			}
+			mutationDone := make(chan error, 1)
+			go func() {
+				releaseMutation, err := fence.AcquireMutation(context.Background())
+				if err == nil {
+					releaseMutation()
+				}
+				mutationDone <- err
+			}()
+			if testCase.release {
+				select {
+				case err := <-mutationDone:
+					close(spawner.release)
+					t.Fatalf("mutation crossed blocked provisioning: %v", err)
+				case <-time.After(40 * time.Millisecond):
+				}
+				close(spawner.release)
+			}
+			select {
+			case err := <-mutationDone:
+				if err != nil {
+					t.Fatalf("mutation after bounded provisioning: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("bounded provisioning wedged lifecycle mutation")
+			}
+			got := <-responseDone
+			if got.err != nil {
+				t.Fatal(got.err)
+			}
+			defer got.response.Body.Close()
+			if got.response.StatusCode != testCase.wantStatus {
+				t.Fatalf("status = %d, want %d", got.response.StatusCode, testCase.wantStatus)
+			}
+		})
 	}
 }
 

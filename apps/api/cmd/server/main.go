@@ -25,6 +25,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
@@ -304,10 +305,11 @@ func newApplicationFromEnv() (*application, error) {
 	var workspaceServer *workspacecontrol.Server
 	var workspaceStore *workspacecontrol.Store
 	var appStore *applicationapps.Store
+	directChatLifecycle := directchat.NewLifecycleFence()
 	if database != nil {
 		databasePool = database.Pool
 		workspaceStore = workspacecontrol.New(database.Pool)
-		appStore = applicationapps.New(database.Pool, workspaceStore)
+		appStore = applicationapps.New(database.Pool, workspaceStore, directChatLifecycle)
 	}
 	closeOnError := func() {
 		_ = store.Close()
@@ -320,11 +322,20 @@ func newApplicationFromEnv() (*application, error) {
 	if database != nil {
 		directChatAuthorizer = newDirectChatAuthorizer(
 			database.Pool,
-			koseki.New(database.Pool),
+			koseki.New(database.Pool, directChatLifecycle),
 			appStore,
 		)
 	}
-	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins, directChatAuthorizer)
+	mux, browser, _, err := agentevents.NewProductionMux(
+		store,
+		runtime,
+		tv,
+		sv,
+		allowedOriginsFromEnv(),
+		browserOrigins,
+		directChatAuthorizer,
+		directChatLifecycle,
+	)
 	if err != nil {
 		closeOnError()
 		return nil, err
