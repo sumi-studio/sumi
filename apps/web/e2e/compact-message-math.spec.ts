@@ -49,6 +49,18 @@ test("math stays locally scrollable and copies one TeX source", async ({
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()))
       .toBe(String.raw`\frac{1}{2}`);
+
+    const mixed = String.raw`E=mc^2 tail
+next line
+Second \frac{1}{2}`;
+    await copyMixedFormulae(page, false);
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(mixed);
+    await copyMixedFormulae(page, true);
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(mixed);
   } finally {
     await stop(vite);
   }
@@ -71,6 +83,42 @@ async function copyFormula(
     selection.addRange(range);
     return document.execCommand("copy");
   });
+  expect(copied).toBe(true);
+}
+
+async function copyMixedFormulae(
+  page: {
+    locator(selector: string): {
+      evaluate(
+        fn: (node: HTMLElement, backwards: boolean) => boolean,
+        arg: boolean,
+      ): Promise<boolean>;
+    };
+  },
+  backwards: boolean,
+) {
+  const copied = await page.locator("#copy-mixed").evaluate((node, reverse) => {
+    const visuals = node.querySelectorAll(".katex-html");
+    const selection = window.getSelection();
+    const textNode = (element: Element): Text | null => {
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      let current = walker.nextNode();
+      while (current) {
+        if (current.textContent) return current as Text;
+        current = walker.nextNode();
+      }
+      return null;
+    };
+    const first = visuals[0] ? textNode(visuals[0]) : null;
+    const second = visuals[1] ? textNode(visuals[1]) : null;
+    if (!selection || !first || !second) return false;
+    if (reverse) {
+      selection.setBaseAndExtent(second, second.length, first, 0);
+    } else {
+      selection.setBaseAndExtent(first, 0, second, second.length);
+    }
+    return document.execCommand("copy");
+  }, backwards);
   expect(copied).toBe(true);
 }
 

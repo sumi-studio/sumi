@@ -42,6 +42,71 @@ function katexSource(element: ParentNode): string | null {
   );
 }
 
+const BLOCK_TEXT_ELEMENTS = new Set([
+  "ADDRESS",
+  "ARTICLE",
+  "ASIDE",
+  "BLOCKQUOTE",
+  "DIV",
+  "DL",
+  "DT",
+  "DD",
+  "FIGCAPTION",
+  "FIGURE",
+  "FOOTER",
+  "FORM",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "HEADER",
+  "HR",
+  "LI",
+  "MAIN",
+  "NAV",
+  "OL",
+  "P",
+  "PRE",
+  "SECTION",
+  "TABLE",
+  "TR",
+  "UL",
+]);
+
+function fragmentPlainText(fragment: DocumentFragment): string {
+  let output = "";
+  const lineBreak = () => {
+    if (output !== "" && !output.endsWith("\n")) output += "\n";
+  };
+  const serialize = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      let value = node.nodeValue ?? "";
+      // React's HTML shape includes a source newline after `<br>` and between
+      // block elements. The structural branch already emitted that break.
+      if (output.endsWith("\n")) value = value.replace(/^\r?\n/, "");
+      output += value;
+      return;
+    }
+    if (!(node instanceof Element)) {
+      for (const child of node.childNodes) serialize(child);
+      return;
+    }
+    if (node.tagName === "BR") {
+      output += "\n";
+      return;
+    }
+    const block = BLOCK_TEXT_ELEMENTS.has(node.tagName);
+    if (block) lineBreak();
+    for (const child of node.childNodes) serialize(child);
+    if (node.tagName === "TD" || node.tagName === "TH") output += "\t";
+    if (block) lineBreak();
+  };
+  serialize(fragment);
+  return output.replace(/^\n+|[\t\n]+$/g, "").replace(/\t+\n/g, "\n");
+}
+
 /** Replace KaTeX's visual+MathML duplicate selection with one TeX source. */
 function normalizedMathSelection(
   selection: Selection,
@@ -59,19 +124,27 @@ function normalizedMathSelection(
     return null;
   }
 
-  const anchorMath = anchor.closest(".katex");
-  if (anchorMath && anchorMath === focus.closest(".katex")) {
-    return katexSource(anchorMath);
-  }
+  const range = selection.getRangeAt(0).cloneRange();
+  const startMath = elementForNode(range.startContainer)?.closest(".katex");
+  const endMath = elementForNode(range.endContainer)?.closest(".katex");
+  if (startMath && boundary.contains(startMath))
+    range.setStartBefore(startMath);
+  if (endMath && boundary.contains(endMath)) range.setEndAfter(endMath);
 
-  const fragment = selection.getRangeAt(0).cloneContents();
-  const formulae = [...fragment.querySelectorAll(".katex")];
-  if (formulae.length === 0) return null;
-  for (const formula of formulae) {
-    const source = katexSource(formula);
-    if (source !== null) formula.replaceWith(document.createTextNode(source));
+  const liveFormulae = [...boundary.querySelectorAll(".katex")].filter(
+    (formula) => range.intersectsNode(formula),
+  );
+  if (liveFormulae.length === 0) return null;
+  const sources = liveFormulae.map(katexSource);
+  if (sources.some((source) => source === null)) return null;
+
+  const fragment = range.cloneContents();
+  const clonedFormulae = [...fragment.querySelectorAll(".katex")];
+  if (clonedFormulae.length !== sources.length) return null;
+  for (const [index, formula] of clonedFormulae.entries()) {
+    formula.replaceWith(document.createTextNode(sources[index] ?? ""));
   }
-  return fragment.textContent;
+  return fragmentPlainText(fragment);
 }
 
 function copyMathAsTex(event: ClipboardEvent<HTMLDivElement>) {
@@ -290,8 +363,8 @@ const STANDARD_REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [
   remarkCjkFriendlyGfmStrikethrough,
   remarkBreaks,
   [remarkMath, REMARK_MATH_OPTIONS],
-  // This tokenizer admits currency-safe single dollars before any Markdown
-  // construct can destructively consume the same source range.
+  // Single-dollar math is admitted only after native Markdown constructs have
+  // established safe plain-text boundaries.
   remarkSafeSingleDollar,
   remarkCompactMath,
 ];

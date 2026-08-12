@@ -243,6 +243,40 @@ describe("@sumi/ui CompactMessageResponse", () => {
     ).toHaveTextContent("x+1");
   });
 
+  it("treats native inline constructs as barriers after a currency dollar", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {
+          "Price $5. Use `$PATH`, **bold**, [link](https://example.com/$PATH), <https://example.com/$PATH>; then $x+1$"
+        }
+      </CompactMessageResponse>,
+    );
+
+    expect(container).toHaveTextContent("Price $5.");
+    expect(container.querySelector("code")).toHaveTextContent("$PATH");
+    expect(container.querySelector("strong")).toHaveTextContent("bold");
+    expect(container.querySelectorAll("a")).toHaveLength(2);
+    expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent("x+1");
+  });
+
+  it.each([
+    [String.raw`Price $5. type \$PATH`, []],
+    [String.raw`escaped \$x$ remains text; later $y+1$ renders`, ["y+1"]],
+    ["tabs $\tx$ and $x\t$ remain text; later $z$ renders", ["z"]],
+  ])("does not admit escaped or tab-adjacent delimiters: %s", (source, expected) => {
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    const annotations = [
+      ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
+    ].map((annotation) => annotation.textContent);
+    expect(annotations).toEqual(expected);
+  });
+
   it("respects escaped delimiters and leaves unclosed math readable", () => {
     const { container } = render(
       <CompactMessageResponse>
@@ -334,7 +368,7 @@ describe("@sumi/ui CompactMessageResponse", () => {
   it("keeps KaTeX trust disabled for author-controlled commands", () => {
     const { container } = render(
       <CompactMessageResponse>
-        {String.raw`$\href{https://attacker.example}{click}$ $\htmlClass{owned}{x}$`}
+        {String.raw`$\href{javascript:alert(1)}{click}$ $\htmlClass{owned}{x}$`}
       </CompactMessageResponse>,
     );
 
