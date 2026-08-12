@@ -13,6 +13,11 @@ function App() {
           {String.raw`$$\frac{1}{2}$$`}
         </CompactMessageResponse>
       </section>
+      <section id="copy-mixed">
+        <CompactMessageResponse>
+          {"Start $E=mc^2$ tail\nnext line\n\nSecond $\\frac{1}{2}$ end"}
+        </CompactMessageResponse>
+      </section>
       <section id="narrow-message" className="w-[220px] border p-2">
         <CompactMessageResponse>
           {

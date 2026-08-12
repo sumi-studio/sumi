@@ -1,133 +1,173 @@
-import { math as micromarkMath } from "micromark-extension-math";
-import { markdownLineEnding } from "micromark-util-character";
-import { codes, types } from "micromark-util-symbol";
-import type {
-  Code,
-  Construct,
-  Effects,
-  State,
-  Token,
-} from "micromark-util-types";
-import type { Processor } from "unified";
-
-const baseTextConstruct = micromarkMath({
-  singleDollarTextMath: true,
-}).text?.[codes.dollarSign];
-const baseSingleDollar = (
-  Array.isArray(baseTextConstruct) ? baseTextConstruct[0] : baseTextConstruct
-) as Construct;
-
-function whitespace(code: Code): boolean {
-  return code === codes.space || markdownLineEnding(code);
+interface Position {
+  start?: { offset?: number };
+  end?: { offset?: number };
 }
 
-function digit(code: Code): boolean {
-  return code !== null && code >= codes.digit0 && code <= codes.digit9;
+interface MdNode {
+  type: string;
+  value?: string;
+  position?: Position;
+  children?: MdNode[];
+  data?: {
+    hName: string;
+    hProperties: { className: string[] };
+    hChildren: Array<{ type: "text"; value: string }>;
+  };
+}
+
+interface DollarToken {
+  escaped: boolean;
+}
+
+function markdownWhitespace(character: string | undefined): boolean {
+  return character !== undefined && /[\t\n\r ]/.test(character);
+}
+
+function digit(character: string | undefined): boolean {
+  return character !== undefined && /[0-9]/.test(character);
 }
 
 /**
- * A single-dollar math tokenizer with Pandoc-like boundary admission. When a
- * would-be closer is instead another valid opener, the current construct
- * fails atomically so micromark retries at that later dollar. This prevents a
- * price from consuming later Markdown or a later real formula.
+ * Match decoded dollars to their source spelling. Markdown escapes and
+ * character references become literal text, but must never become delimiters.
  */
-const safeSingleDollar: Construct = {
-  ...baseSingleDollar,
-  tokenize(effects: Effects, ok: State, nok: State): State {
-    const self = this;
-    let sizeOpen = 0;
-    let sizeClose = 0;
-    let beforeClose: Code = codes.eof;
-    let sequenceToken: Token;
+function sourceDollarTokens(raw: string): DollarToken[] {
+  const tokens: DollarToken[] = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] === "\\" && raw[index + 1] === "$") {
+      tokens.push({ escaped: true });
+      index += 1;
+      continue;
+    }
+    if (raw[index] === "$") {
+      tokens.push({ escaped: false });
+      continue;
+    }
+    const reference =
+      raw[index] === "&"
+        ? raw.slice(index, index + 12).match(/^&(?:#0*36|#x0*24|dollar);/i)?.[0]
+        : undefined;
+    if (reference) {
+      tokens.push({ escaped: true });
+      index += reference.length - 1;
+    }
+  }
+  return tokens;
+}
 
-    return start;
+function eligibleDollars(value: string, raw: string): Set<number> {
+  const sourceTokens = sourceDollarTokens(raw);
+  const eligible = new Set<number>();
+  let tokenIndex = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "$") continue;
+    const token = sourceTokens[tokenIndex];
+    if (token && !token.escaped) eligible.add(index);
+    tokenIndex += 1;
+  }
+  return eligible;
+}
 
-    function start(code: Code): State | undefined {
-      if (code !== codes.dollarSign) return nok(code);
-      effects.enter("mathText");
-      effects.enter("mathTextSequence");
-      return sequenceOpen(code);
+function splitSingleDollarMath(value: string, raw: string): MdNode[] | null {
+  const dollars = eligibleDollars(value, raw);
+  const output: MdNode[] = [];
+  let textStart = 0;
+  let opener = value.indexOf("$");
+  let changed = false;
+
+  while (opener !== -1) {
+    if (
+      !dollars.has(opener) ||
+      markdownWhitespace(value[opener + 1]) ||
+      value[opener + 1] === undefined
+    ) {
+      opener = value.indexOf("$", opener + 1);
+      continue;
     }
 
-    function sequenceOpen(code: Code): State | undefined {
-      if (code === codes.dollarSign) {
-        effects.consume(code);
-        sizeOpen += 1;
-        return sequenceOpen;
+    let closer = value.indexOf("$", opener + 1);
+    let retryAt = -1;
+    while (closer !== -1) {
+      if (!dollars.has(closer)) {
+        closer = value.indexOf("$", closer + 1);
+        continue;
       }
-      if (sizeOpen !== 1 || code === codes.eof || whitespace(code)) {
-        return nok(code);
+      if (!markdownWhitespace(value[closer - 1]) && !digit(value[closer + 1])) {
+        break;
       }
-      effects.exit("mathTextSequence");
-      return between(code);
-    }
-
-    function between(code: Code): State | undefined {
-      if (code === codes.eof) return nok(code);
-      if (code === codes.dollarSign) {
-        beforeClose = self.previous;
-        sequenceToken = effects.enter("mathTextSequence");
-        sizeClose = 0;
-        return sequenceClose(code);
-      }
-      if (code === codes.space) {
-        effects.enter("space");
-        effects.consume(code);
-        effects.exit("space");
-        return between;
-      }
-      if (markdownLineEnding(code)) {
-        effects.enter(types.lineEnding);
-        effects.consume(code);
-        effects.exit(types.lineEnding);
-        return between;
-      }
-      effects.enter("mathTextData");
-      return data(code);
-    }
-
-    function data(code: Code): State | undefined {
       if (
-        code === codes.eof ||
-        code === codes.space ||
-        code === codes.dollarSign ||
-        markdownLineEnding(code)
+        value[closer + 1] !== undefined &&
+        !markdownWhitespace(value[closer + 1])
       ) {
-        effects.exit("mathTextData");
-        return between(code);
+        retryAt = closer;
+        break;
       }
-      effects.consume(code);
-      return data;
+      closer = value.indexOf("$", closer + 1);
     }
 
-    function sequenceClose(code: Code): State | undefined {
-      if (code === codes.dollarSign) {
-        effects.consume(code);
-        sizeClose += 1;
-        return sequenceClose;
-      }
-      if (sizeClose === sizeOpen && !whitespace(beforeClose) && !digit(code)) {
-        effects.exit("mathTextSequence");
-        effects.exit("mathText");
-        return ok(code);
-      }
-      if (sizeClose === 1 && code !== codes.eof && !whitespace(code)) {
-        return nok(code);
-      }
-      sequenceToken.type = "mathTextData";
-      return data(code);
+    if (retryAt !== -1) {
+      opener = retryAt;
+      continue;
     }
-  },
-};
+    if (closer === -1) break;
+    if (opener > textStart) {
+      output.push({ type: "text", value: value.slice(textStart, opener) });
+    }
+    const math = value.slice(opener + 1, closer);
+    output.push({
+      type: "inlineMath",
+      value: math,
+      data: {
+        hName: "code",
+        hProperties: { className: ["language-math", "math-inline"] },
+        hChildren: [{ type: "text", value: math }],
+      },
+    });
+    changed = true;
+    textStart = closer + 1;
+    opener = value.indexOf("$", textStart);
+  }
 
-const safeSingleDollarExtension = {
-  text: { [codes.dollarSign]: safeSingleDollar },
-};
+  if (!changed) return null;
+  if (textStart < value.length) {
+    output.push({ type: "text", value: value.slice(textStart) });
+  }
+  return output;
+}
 
-/** Register safe single-dollar syntax beside remark-math's double-dollar syntax. */
-export function remarkSafeSingleDollar(this: Processor) {
-  const data = this.data() as { micromarkExtensions?: unknown[] };
-  const extensions = data.micromarkExtensions ?? [];
-  data.micromarkExtensions = extensions;
-  extensions.push(safeSingleDollarExtension);
+/**
+ * Parse safe single-dollar math only inside Markdown's already-established
+ * plain-text nodes. Native code, links/autolinks, escapes, and formatting are
+ * therefore barriers rather than source that a math tokenizer can consume.
+ */
+export function remarkSafeSingleDollar() {
+  return (tree: MdNode, file: { value?: unknown }) => {
+    const source = typeof file.value === "string" ? file.value : "";
+    const walk = (node: MdNode) => {
+      if (
+        !node.children ||
+        node.type === "link" ||
+        node.type === "linkReference"
+      ) {
+        return;
+      }
+      const next: MdNode[] = [];
+      for (const child of node.children) {
+        if (child.type !== "text" || child.value === undefined) {
+          walk(child);
+          next.push(child);
+          continue;
+        }
+        const start = child.position?.start?.offset;
+        const end = child.position?.end?.offset;
+        const raw =
+          start === undefined || end === undefined
+            ? child.value
+            : source.slice(start, end);
+        next.push(...(splitSingleDollarMath(child.value, raw) ?? [child]));
+      }
+      node.children = next;
+    };
+    walk(tree);
+  };
 }
