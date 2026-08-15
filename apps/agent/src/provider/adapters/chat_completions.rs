@@ -2129,14 +2129,20 @@ mod tests {
         let encoded_schema = serde_json::to_string(&output.schema).unwrap();
 
         let kimi = build_request(&ModelSpec::preset("kimi-k3").unwrap(), &context, &options)
-            .expect("Moonshot documents prompt-based format shaping");
-        assert!(kimi.get("response_format").is_none());
-        assert!(
-            kimi["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .ends_with(&encoded_schema)
+            .expect("Kimi K3 supports native strict JSON Schema output");
+        assert_eq!(
+            kimi["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": output.name,
+                    "description": output.description,
+                    "schema": output.schema,
+                    "strict": true
+                }
+            })
         );
+        assert_eq!(kimi["messages"][0]["content"], "System.");
 
         let glm = build_request(&ModelSpec::preset("glm-5.2").unwrap(), &context, &options)
             .expect("Z.AI documents JSON object mode");
@@ -2155,27 +2161,14 @@ mod tests {
             ));
         }
 
-        let mut openai_compatible = ModelSpec::preset("glm-5.2").unwrap();
-        let crate::provider::model::ProtocolCompat::Chat(compat) = &mut openai_compatible.compat
-        else {
-            unreachable!()
-        };
-        compat.structured_output = ChatStructuredOutputMode::JsonSchema;
-        let native = build_request(&openai_compatible, &context, &options)
-            .expect("explicit native Chat schema capability");
         assert_eq!(
-            native["response_format"],
-            json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": output.name,
-                    "description": output.description,
-                    "schema": output.schema,
-                    "strict": true
-                }
-            })
+            ModelSpec::preset("kimi-k3")
+                .unwrap()
+                .chat_compat()
+                .unwrap()
+                .structured_output,
+            ChatStructuredOutputMode::JsonSchema
         );
-        assert_eq!(native["messages"][0]["content"], "System.");
     }
 
     fn user_message(text: &str) -> Message {

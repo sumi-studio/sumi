@@ -168,7 +168,7 @@ impl ModelSpec {
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: false,
-                    structured_output: ChatStructuredOutputMode::PromptSchema,
+                    structured_output: ChatStructuredOutputMode::JsonSchema,
                 },
             ),
             "glm-5.2" => (
