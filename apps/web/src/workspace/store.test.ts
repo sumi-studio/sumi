@@ -28,6 +28,20 @@ const INSTALLATION_ID = "0198f0f4-9b72-7000-8000-000000000141";
 const INSTALLATION_B_ID = "0198f0f4-9b72-7000-8000-000000000142";
 const APP_ID = "messaging";
 const INVITE_CODE = "r".repeat(43);
+const TARGETED_INVITE_A = {
+  kind: "targeted_personality_agent" as const,
+  inviteId: "0198f0f4-9b72-7000-8000-000000000161",
+  workspaceId: WORKSPACE_A_ID,
+  expiresAt: Date.parse("2026-08-11T08:01:02.345Z"),
+  createdAt: Date.parse("2026-08-10T08:01:02.345Z"),
+};
+const TARGETED_INVITE_B = {
+  kind: "targeted_personality_agent" as const,
+  inviteId: "0198f0f4-9b72-7000-8000-000000000162",
+  workspaceId: WORKSPACE_A_ID,
+  expiresAt: Date.parse("2026-08-11T08:02:03.456Z"),
+  createdAt: Date.parse("2026-08-10T08:02:03.456Z"),
+};
 
 const WORKSPACE_A: Workspace = {
   workspaceId: WORKSPACE_A_ID,
@@ -107,12 +121,13 @@ describe("Workspace control store", () => {
     const listWorkspaces = vi.fn(async () => [] as Workspace[]);
     const store = createWorkspaceControlStore(clientWith({ listWorkspaces }));
 
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     expect(listWorkspaces).toHaveBeenCalledOnce();
     expect(store.getState()).toMatchObject({
       sessionIdentity: HUMAN_ID,
+      sessionScopeKey: "binding-a",
       listStatus: "ready",
       selectionStatus: "idle",
       workspaces: [],
@@ -144,7 +159,7 @@ describe("Workspace control store", () => {
       }),
     );
 
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     expect(getWorkspace).not.toHaveBeenCalled();
@@ -198,7 +213,7 @@ describe("Workspace control store", () => {
         ],
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
@@ -243,7 +258,7 @@ describe("Workspace control store", () => {
         ],
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
@@ -302,7 +317,7 @@ describe("Workspace control store", () => {
         listInstallations: async () => [],
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
@@ -364,7 +379,7 @@ describe("Workspace control store", () => {
         listInstallations: async () => [],
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
@@ -398,7 +413,7 @@ describe("Workspace control store", () => {
     const store = createWorkspaceControlStore(
       clientWith({ listWorkspaces, previewInvite, redeemInvite }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     await expect(
@@ -424,6 +439,7 @@ describe("Workspace control store", () => {
 
   it("keeps invitation identity while clearing the one-time secret", async () => {
     const existing = {
+      kind: "share_code" as const,
       inviteId: "0198f0f4-9b72-7000-8000-000000000150",
       workspaceId: WORKSPACE_A_ID,
       expiresAt: Date.parse("2026-08-11T05:01:02.345Z"),
@@ -451,7 +467,10 @@ describe("Workspace control store", () => {
           workspaceId === WORKSPACE_A_ID ? [...activeInvites] : [],
         createInvite: async () => {
           const { code: _code, ...record } = invite;
-          activeInvites = [...activeInvites, record];
+          activeInvites = [
+            ...activeInvites,
+            { ...record, kind: "share_code" as const },
+          ];
           return invite;
         },
         revokeInvite: async (_workspaceId, inviteId) => {
@@ -461,7 +480,7 @@ describe("Workspace control store", () => {
         },
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
 
@@ -489,6 +508,276 @@ describe("Workspace control store", () => {
     expect(store.getState().invites).toEqual([activeInvites[0]]);
   });
 
+  it("identifies the current Direct Chat invite only through its exact subresource", async () => {
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [TARGETED_INVITE_A, TARGETED_INVITE_B],
+        getCurrentAgentInvite: async () => ({
+          status: "pending",
+          invite: TARGETED_INVITE_B,
+        }),
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    expect(store.getState()).toMatchObject({
+      selectionStatus: "ready",
+      selectedWorkspace: WORKSPACE_A,
+      invites: [TARGETED_INVITE_A, TARGETED_INVITE_B],
+      currentAgentInvite: {
+        status: "pending",
+        invite: TARGETED_INVITE_B,
+      },
+      errorCode: null,
+    });
+  });
+
+  it.each([
+    ["forbidden", new WorkspaceAPIError("forbidden", 403), "unavailable"],
+    ["unauthorized", new WorkspaceAPIError("invalid_session", 401), "error"],
+    ["unavailable", new WorkspaceAPIError("unavailable", 503), "error"],
+    ["network", new Error("network failed"), "error"],
+  ] as const)("isolates a current-agent %s failure without discarding the Workspace registry", async (_case, exactError, expectedStatus) => {
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [TARGETED_INVITE_A, TARGETED_INVITE_B],
+        getCurrentAgentInvite: async () => {
+          throw exactError;
+        },
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    expect(store.getState()).toMatchObject({
+      selectionStatus: "ready",
+      selectedWorkspace: WORKSPACE_A,
+      invites: [TARGETED_INVITE_A, TARGETED_INVITE_B],
+      currentAgentInvite: { status: expectedStatus },
+      errorCode: null,
+    });
+  });
+
+  it("keeps anonymous targeted records and an enabled CTA when the exact resource is absent", async () => {
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [TARGETED_INVITE_A, TARGETED_INVITE_B],
+        getCurrentAgentInvite: async () => ({ status: "none" }),
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    expect(store.getState().invites).toEqual([
+      TARGETED_INVITE_A,
+      TARGETED_INVITE_B,
+    ]);
+    expect(store.getState().currentAgentInvite).toEqual({ status: "none" });
+  });
+
+  it("rejects a cross-Workspace exact response without admitting its identity", async () => {
+    const crossed = {
+      ...TARGETED_INVITE_B,
+      inviteId: "0198f0f4-9b72-7000-8000-000000000163",
+      workspaceId: WORKSPACE_B_ID,
+    };
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [TARGETED_INVITE_A],
+        getCurrentAgentInvite: async () => ({
+          status: "pending",
+          invite: crossed,
+        }),
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    expect(store.getState()).toMatchObject({
+      selectionStatus: "ready",
+      selectedWorkspace: WORKSPACE_A,
+      invites: [TARGETED_INVITE_A],
+      currentAgentInvite: { status: "error" },
+      errorCode: null,
+    });
+    expect(JSON.stringify(store.getState())).not.toContain(crossed.inviteId);
+    expect(JSON.stringify(store.getState())).not.toContain(WORKSPACE_B_ID);
+  });
+
+  it("keeps exact and generic invite state coherent across create and revoke", async () => {
+    const revokeInvite = vi.fn(async () => undefined);
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [TARGETED_INVITE_A],
+        getCurrentAgentInvite: async () => ({ status: "none" }),
+        createCurrentAgentInvite: async () => TARGETED_INVITE_B,
+        revokeInvite,
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    await expect(store.getState().createCurrentAgentInvite()).resolves.toBe(
+      TARGETED_INVITE_B,
+    );
+    expect(store.getState().currentAgentInvite).toEqual({
+      status: "pending",
+      invite: TARGETED_INVITE_B,
+    });
+    expect(store.getState().invites).toEqual([
+      TARGETED_INVITE_A,
+      TARGETED_INVITE_B,
+    ]);
+
+    await store.getState().revokeInvite(TARGETED_INVITE_A.inviteId);
+    expect(store.getState().currentAgentInvite).toEqual({
+      status: "pending",
+      invite: TARGETED_INVITE_B,
+    });
+    expect(store.getState().invites).toEqual([TARGETED_INVITE_B]);
+
+    await store.getState().revokeInvite(TARGETED_INVITE_B.inviteId);
+    expect(revokeInvite).toHaveBeenCalledWith(
+      WORKSPACE_A_ID,
+      TARGETED_INVITE_B.inviteId,
+    );
+    expect(store.getState().currentAgentInvite).toEqual({ status: "none" });
+    expect(store.getState().invites).toEqual([]);
+  });
+
+  it("ignores a delayed exact GET after the same Human switches authority binding", async () => {
+    const oldRead = deferred<{
+      status: "pending";
+      invite: typeof TARGETED_INVITE_A;
+    }>();
+    const oldReadStarted = deferred<void>();
+    let readCount = 0;
+    const getCurrentAgentInvite = vi.fn(() => {
+      readCount += 1;
+      if (readCount === 1) {
+        oldReadStarted.resolve(undefined);
+        return oldRead.promise;
+      }
+      return Promise.resolve({ status: "none" as const });
+    });
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [],
+        getCurrentAgentInvite,
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    const oldSelection = store.getState().selectWorkspace(WORKSPACE_A_ID);
+    await oldReadStarted.promise;
+
+    store.getState().resetSession(HUMAN_ID, "binding-b");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+    oldRead.resolve({ status: "pending", invite: TARGETED_INVITE_A });
+    await oldSelection;
+
+    expect(store.getState()).toMatchObject({
+      sessionIdentity: HUMAN_ID,
+      sessionScopeKey: "binding-b",
+      selectionStatus: "ready",
+      selectedWorkspace: WORKSPACE_A,
+      invites: [],
+      currentAgentInvite: { status: "none" },
+      mutation: null,
+    });
+    expect(JSON.stringify(store.getState())).not.toContain(
+      TARGETED_INVITE_A.inviteId,
+    );
+  });
+
+  it("ignores a delayed exact POST after the same Human switches authority binding", async () => {
+    const oldCreate = deferred<typeof TARGETED_INVITE_A>();
+    const oldCreateStarted = deferred<void>();
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [],
+        listAppCatalog: async () => [],
+        listInstallations: async () => [],
+        listInvites: async () => [],
+        getCurrentAgentInvite: async () => ({ status: "none" }),
+        createCurrentAgentInvite: () => {
+          oldCreateStarted.resolve(undefined);
+          return oldCreate.promise;
+        },
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+    const pendingCreate = store.getState().createCurrentAgentInvite();
+    await oldCreateStarted.promise;
+
+    store.getState().resetSession(HUMAN_ID, "binding-b");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+    oldCreate.resolve(TARGETED_INVITE_A);
+    await expect(pendingCreate).resolves.toBe(TARGETED_INVITE_A);
+
+    expect(store.getState()).toMatchObject({
+      sessionIdentity: HUMAN_ID,
+      sessionScopeKey: "binding-b",
+      selectionStatus: "ready",
+      selectedWorkspace: WORKSPACE_A,
+      invites: [],
+      currentAgentInvite: { status: "none" },
+      mutation: null,
+    });
+    expect(JSON.stringify(store.getState())).not.toContain(
+      TARGETED_INVITE_A.inviteId,
+    );
+  });
+
   it("mutates the exact membership tenure rather than its participant identity", async () => {
     const setMemberRoles = vi.fn(async () => [ROLE_A_ID]);
     const removeMember = vi.fn(async () => undefined);
@@ -502,7 +791,7 @@ describe("Workspace control store", () => {
         removeMember,
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
 
@@ -548,7 +837,7 @@ describe("Workspace control store", () => {
         transferOwnership,
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
 
@@ -601,7 +890,7 @@ describe("Workspace control store", () => {
         uninstallApp,
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
     await store.getState().selectWorkspace(WORKSPACE_A_ID);
 
@@ -697,7 +986,7 @@ describe("Workspace control store", () => {
             : Promise.resolve([installationB]),
       }),
     );
-    store.getState().resetSession(HUMAN_ID);
+    store.getState().resetSession(HUMAN_ID, "binding-a");
     await store.getState().init();
 
     const oldSelection = store.getState().selectWorkspace(WORKSPACE_A_ID);
@@ -751,6 +1040,8 @@ function clientWith(
     removeMember: () => unexpected("removeMember"),
     createInvite: () => unexpected("createInvite"),
     listInvites: async () => [],
+    getCurrentAgentInvite: async () => ({ status: "none" }),
+    createCurrentAgentInvite: () => unexpected("createCurrentAgentInvite"),
     revokeInvite: () => unexpected("revokeInvite"),
     previewInvite: () => unexpected("previewInvite"),
     redeemInvite: () => unexpected("redeemInvite"),

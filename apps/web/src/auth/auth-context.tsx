@@ -127,12 +127,13 @@ export interface AuthUser {
   photoURL: string | null;
 }
 
-interface AuthContextValue {
+export interface AuthContextValue {
   configured: boolean;
   loading: boolean;
   sessionState: AuthSessionState;
   authenticated: boolean;
   canUseDirectChat: boolean;
+  authorityBindingId: string | null;
   user: AuthUser | null;
   confirmation: PendingAuthConfirmation | null;
   outcomeNotice: AuthOutcomeNotice | null;
@@ -885,6 +886,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [session, sessionState]);
 
+  const authorityBindingId =
+    sessionState === "authenticated" && session.authenticated
+      ? session.authorityBindingId
+      : null;
+
   const value = useMemo<AuthContextValue>(
     () => ({
       configured: isFirebaseConfigured,
@@ -893,6 +899,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authenticated: sessionState === "authenticated" && session.authenticated,
       canUseDirectChat:
         sessionState === "authenticated" || sessionState === "preissued",
+      authorityBindingId,
       user,
       confirmation,
       outcomeNotice,
@@ -910,6 +917,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refreshSession,
     }),
     [
+      authorityBindingId,
       cancelIntentTransition,
       confirmation,
       completeEmailLink,

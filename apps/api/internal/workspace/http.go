@@ -19,14 +19,24 @@ import (
 const maxControlPlaneRequestBytes = 64 * 1024
 
 type Server struct {
-	Store          *Store
-	Apps           *applicationapps.Store
-	Sessions       agentevents.UserSessionAuthorizer
-	AllowedOrigins []string
+	Store                    *Store
+	Apps                     *applicationapps.Store
+	Sessions                 agentevents.UserSessionAuthorizer
+	CurrentEmployerAuthority CurrentEmployerAuthority
+	AllowedOrigins           []string
 }
 
-func NewServer(store *Store, apps *applicationapps.Store, sessions agentevents.UserSessionAuthorizer) *Server {
-	return &Server{Store: store, Apps: apps, Sessions: sessions}
+func NewServer(
+	store *Store,
+	apps *applicationapps.Store,
+	sessions agentevents.UserSessionAuthorizer,
+	currentEmployerAuthority ...CurrentEmployerAuthority,
+) *Server {
+	server := &Server{Store: store, Apps: apps, Sessions: sessions}
+	if len(currentEmployerAuthority) > 0 {
+		server.CurrentEmployerAuthority = currentEmployerAuthority[0]
+	}
+	return server
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
@@ -40,6 +50,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/members/{workspace_member_id}", s.serveRemoveMember)
 	mux.HandleFunc("POST /workspaces/{workspace_id}/invites", s.serveCreateInvite)
 	mux.HandleFunc("GET /workspaces/{workspace_id}/invites", s.serveInvites)
+	mux.HandleFunc("GET /workspaces/{workspace_id}/invites/current-agent", s.serveCurrentAgentInvite)
+	mux.HandleFunc("POST /workspaces/{workspace_id}/invites/current-agent", s.serveCreateCurrentAgentInvite)
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/invites/{invite_id}", s.serveRevokeInvite)
 	mux.HandleFunc("GET /workspace-invites/preview", s.servePreviewInvite)
 	mux.HandleFunc("POST /workspace-invites/redeem", s.serveRedeemInvite)
@@ -172,6 +184,7 @@ func inviteToWire(item Invite) inviteWire {
 type inviteRecordWire struct {
 	InviteID    string    `json:"invite_id"`
 	WorkspaceID string    `json:"workspace_id"`
+	Kind        string    `json:"kind"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	CreatedAt   time.Time `json:"created_at"`
 }
@@ -179,7 +192,7 @@ type inviteRecordWire struct {
 func inviteRecordToWire(item InviteRecord) inviteRecordWire {
 	return inviteRecordWire{
 		InviteID: item.InviteID, WorkspaceID: item.WorkspaceID,
-		ExpiresAt: item.ExpiresAt, CreatedAt: item.CreatedAt,
+		Kind: string(item.Kind), ExpiresAt: item.ExpiresAt, CreatedAt: item.CreatedAt,
 	}
 }
 
@@ -362,6 +375,30 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	return true
 }
 
+// decodeExactEmptyJSONObject admits the current-agent issuance intent only as
+// a JSON object with no fields. In particular, decoding into struct{} directly
+// would also accept null, which would make the public contract less strict
+// than the OpenAPI schema and leave room for future caller-authored targeting.
+func decodeExactEmptyJSONObject(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneRequestBytes)
+	decoder := json.NewDecoder(r.Body)
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil || len(object) != 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return false
+	}
+	return true
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -406,7 +443,8 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		errors.Is(err, applicationapps.ErrInstallOperationInvalid):
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 	case errors.Is(err, directchat.ErrLifecycleFenceUnavailable),
-		errors.Is(err, applicationapps.ErrInstallIntentIncomplete):
+		errors.Is(err, applicationapps.ErrInstallIntentIncomplete),
+		errors.Is(err, ErrInviteAuthorityUnavailable):
 		writeAPIError(w, http.StatusServiceUnavailable, "unavailable")
 	default:
 		writeAPIError(w, http.StatusInternalServerError, "internal_error")

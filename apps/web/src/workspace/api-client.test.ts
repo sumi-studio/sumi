@@ -12,6 +12,7 @@ const HUMAN_A_ID = "0198f0f4-9b72-7000-8000-000000000021";
 const ROLE_A_ID = "0198f0f4-9b72-7000-8000-000000000031";
 const ROLE_B_ID = "0198f0f4-9b72-7000-8000-000000000032";
 const INVITE_ID = "0198f0f4-9b72-7000-8000-000000000041";
+const TARGETED_INVITE_ID = "0198f0f4-9b72-7000-8000-000000000042";
 const INVITE_CODE = "v".repeat(43);
 const INSTALLATION_ID = "0198f0f4-9b72-7000-8000-000000000051";
 const APP_ID = "messaging";
@@ -265,6 +266,7 @@ describe("WorkspaceApiClient", () => {
       json({
         invites: [
           {
+            kind: "share_code",
             invite_id: INVITE_ID,
             workspace_id: WORKSPACE_A_ID,
             expires_at: "2026-08-11T04:05:06.789Z",
@@ -287,6 +289,7 @@ describe("WorkspaceApiClient", () => {
     });
     await expect(client.listInvites(WORKSPACE_A_ID)).resolves.toEqual([
       {
+        kind: "share_code",
         inviteId: INVITE_ID,
         workspaceId: WORKSPACE_A_ID,
         expiresAt: Date.parse("2026-08-11T04:05:06.789Z"),
@@ -329,6 +332,113 @@ describe("WorkspaceApiClient", () => {
       4,
       `/workspaces/${WORKSPACE_A_ID}/invites/${INVITE_ID}`,
       "DELETE",
+    );
+  });
+
+  it("keeps targeted PA invitations discriminated and maps the exact current-agent resource", async () => {
+    const shareRecord = {
+      kind: "share_code",
+      invite_id: INVITE_ID,
+      workspace_id: WORKSPACE_A_ID,
+      expires_at: "2026-08-11T04:05:06.789Z",
+      created_at: "2026-08-10T04:05:06.789Z",
+    };
+    const targetedRecord = {
+      kind: "targeted_personality_agent",
+      invite_id: TARGETED_INVITE_ID,
+      workspace_id: WORKSPACE_A_ID,
+      expires_at: "2026-08-11T05:05:06.789Z",
+      created_at: "2026-08-10T05:05:06.789Z",
+    };
+    const fetcher = fetchSequence(
+      json({ invites: [shareRecord, targetedRecord] }),
+      json(targetedRecord),
+      json(targetedRecord, 201),
+      json({ error: "not_found" }, 404),
+      json({ error: "conflict" }, 409),
+    );
+    const client = new WorkspaceApiClient(fetcher);
+
+    await expect(client.listInvites(WORKSPACE_A_ID)).resolves.toEqual([
+      {
+        kind: "share_code",
+        inviteId: INVITE_ID,
+        workspaceId: WORKSPACE_A_ID,
+        expiresAt: Date.parse(shareRecord.expires_at),
+        createdAt: Date.parse(shareRecord.created_at),
+      },
+      {
+        kind: "targeted_personality_agent",
+        inviteId: TARGETED_INVITE_ID,
+        workspaceId: WORKSPACE_A_ID,
+        expiresAt: Date.parse(targetedRecord.expires_at),
+        createdAt: Date.parse(targetedRecord.created_at),
+      },
+    ]);
+    await expect(client.getCurrentAgentInvite(WORKSPACE_A_ID)).resolves.toEqual(
+      {
+        status: "pending",
+        invite: {
+          kind: "targeted_personality_agent",
+          inviteId: TARGETED_INVITE_ID,
+          workspaceId: WORKSPACE_A_ID,
+          expiresAt: Date.parse(targetedRecord.expires_at),
+          createdAt: Date.parse(targetedRecord.created_at),
+        },
+      },
+    );
+    await expect(
+      client.createCurrentAgentInvite(WORKSPACE_A_ID),
+    ).resolves.toMatchObject({
+      kind: "targeted_personality_agent",
+      inviteId: TARGETED_INVITE_ID,
+      workspaceId: WORKSPACE_A_ID,
+    });
+    await expect(client.getCurrentAgentInvite(WORKSPACE_A_ID)).resolves.toEqual(
+      {
+        status: "none",
+      },
+    );
+    await expect(client.getCurrentAgentInvite(WORKSPACE_A_ID)).resolves.toEqual(
+      {
+        status: "member",
+      },
+    );
+
+    expectRequest(fetcher, 0, `/workspaces/${WORKSPACE_A_ID}/invites`, "GET");
+    expectRequest(
+      fetcher,
+      1,
+      `/workspaces/${WORKSPACE_A_ID}/invites/current-agent`,
+      "GET",
+    );
+    expectRequest(
+      fetcher,
+      2,
+      `/workspaces/${WORKSPACE_A_ID}/invites/current-agent`,
+      "POST",
+      {},
+    );
+  });
+
+  it("rejects missing and unknown Workspace invite discriminators", async () => {
+    const common = {
+      invite_id: INVITE_ID,
+      workspace_id: WORKSPACE_A_ID,
+      expires_at: "2026-08-11T04:05:06.789Z",
+      created_at: "2026-08-10T04:05:06.789Z",
+    };
+    const fetcher = fetchSequence(
+      json({ invites: [common] }),
+      json({ invites: [{ ...common, kind: "current_agent" }] }),
+    );
+    const client = new WorkspaceApiClient(fetcher);
+
+    await expect(client.listInvites(WORKSPACE_A_ID)).rejects.toThrow(
+      "invalid Workspace invite kind",
+    );
+    await expect(client.listInvites(WORKSPACE_A_ID)).rejects.toThrow(
+      "invalid Workspace invite kind",
     );
   });
 

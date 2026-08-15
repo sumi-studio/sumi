@@ -92,6 +92,96 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
     await expect(
       page.getByText("Human · 0000e2e0", { exact: true }),
     ).toBeVisible();
+
+    const currentInvitePath = `/workspaces/${alpha.workspaceID}/invites/current-agent`;
+    const createCurrentInviteResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === currentInvitePath,
+    );
+    await page.getByRole("button", { name: "招待する" }).click();
+    const currentInviteCreated = await createCurrentInviteResponse;
+    expect(currentInviteCreated.status()).toBe(201);
+    const currentInvite = assertTargetedInvitePayload(
+      await currentInviteCreated.json(),
+      alpha.workspaceID,
+    );
+    await expect(
+      page.getByText("招待済み・承諾待ち", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Direct Chatで招待を確認してもらってください。", {
+        exact: true,
+      }),
+    ).toBeVisible();
+
+    const reloadedCurrentInviteResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "GET" &&
+        new URL(response.url()).pathname === currentInvitePath,
+    );
+    await page.reload();
+    const currentInviteReloaded = await reloadedCurrentInviteResponse;
+    expect(currentInviteReloaded.status()).toBe(200);
+    expect(
+      assertTargetedInvitePayload(
+        await currentInviteReloaded.json(),
+        alpha.workspaceID,
+      ).inviteID,
+    ).toBe(currentInvite.inviteID);
+    await page.getByRole("button", { name: "参加者と招待" }).click();
+    await expect(
+      page.getByText("招待済み・承諾待ち", { exact: true }),
+    ).toBeVisible();
+
+    const replay = await page.evaluate(async (path) => {
+      const response = await fetch(path, {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      return {
+        status: response.status,
+        body: (await response.json()) as unknown,
+      };
+    }, currentInvitePath);
+    expect(replay.status).toBe(200);
+    expect(
+      assertTargetedInvitePayload(replay.body, alpha.workspaceID).inviteID,
+    ).toBe(currentInvite.inviteID);
+
+    const revokeCurrentInviteResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "DELETE" &&
+        new URL(response.url()).pathname ===
+          `/workspaces/${alpha.workspaceID}/invites/${currentInvite.inviteID}`,
+    );
+    await page
+      .getByRole("button", {
+        name: "Direct Chatの相手への招待を取り消す",
+      })
+      .click();
+    expect((await revokeCurrentInviteResponse).status()).toBe(204);
+    await expect(page.getByRole("button", { name: "招待する" })).toBeVisible();
+    const [currentAfterRevoke, registryAfterRevoke] = await Promise.all([
+      page.request.get(`${stack.apiURL}${currentInvitePath}`),
+      page.request.get(
+        `${stack.apiURL}/workspaces/${alpha.workspaceID}/invites`,
+      ),
+    ]);
+    expect(currentAfterRevoke.status()).toBe(404);
+    expect(registryAfterRevoke.status()).toBe(200);
+    const registry = asRecord(await registryAfterRevoke.json());
+    const activeInviteIDs = asArray(registry.invites).map((entry) =>
+      asString(asRecord(entry).invite_id),
+    );
+    expect(activeInviteIDs).not.toContain(currentInvite.inviteID);
+
     const createInviteResponse = page.waitForResponse(
       (response) =>
         response.request().method() === "POST" &&
@@ -354,4 +444,35 @@ function asString(value: unknown): string {
     throw new Error("expected non-empty string");
   }
   return value;
+}
+
+function asArray(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error("expected JSON array");
+  return value;
+}
+
+function assertTargetedInvitePayload(
+  value: unknown,
+  workspaceID: string,
+): { inviteID: string } {
+  const body = asRecord(value);
+  expect(Object.keys(body).sort()).toEqual([
+    "created_at",
+    "expires_at",
+    "invite_id",
+    "kind",
+    "workspace_id",
+  ]);
+  expect(body.kind).toBe("targeted_personality_agent");
+  expect(body.workspace_id).toBe(workspaceID);
+  for (const forbidden of [
+    "personality_agent_id",
+    "target_id",
+    "target_kind",
+    "code",
+    "code_hash",
+  ]) {
+    expect(body).not.toHaveProperty(forbidden);
+  }
+  return { inviteID: asString(body.invite_id) };
 }

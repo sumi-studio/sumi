@@ -5,12 +5,14 @@ import type {
   AppOwnerRef,
   ParticipantRef,
   Workspace,
+  WorkspaceCurrentAgentInviteState,
   WorkspaceInvite,
   WorkspaceInvitePreview,
   WorkspaceInviteRecord,
   WorkspaceMembership,
   WorkspaceRole,
   WorkspaceRoleInput,
+  WorkspaceTargetedPersonalityAgentInviteRecord,
 } from "./model";
 import { participantID } from "./model";
 
@@ -60,6 +62,12 @@ export interface WorkspaceControlClient {
   removeMember(workspaceId: string, workspaceMemberId: string): Promise<void>;
   createInvite(workspaceId: string): Promise<WorkspaceInvite>;
   listInvites(workspaceId: string): Promise<WorkspaceInviteRecord[]>;
+  getCurrentAgentInvite(
+    workspaceId: string,
+  ): Promise<WorkspaceCurrentAgentInviteState>;
+  createCurrentAgentInvite(
+    workspaceId: string,
+  ): Promise<WorkspaceTargetedPersonalityAgentInviteRecord>;
   revokeInvite(workspaceId: string, inviteId: string): Promise<void>;
   previewInvite(code: string): Promise<WorkspaceInvitePreview>;
   redeemInvite(code: string): Promise<WorkspaceMembership>;
@@ -192,6 +200,42 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
       ),
     );
     return asArray(response.invites).map(parseInviteRecord);
+  }
+
+  async getCurrentAgentInvite(
+    workspaceId: string,
+  ): Promise<WorkspaceCurrentAgentInviteState> {
+    try {
+      const invite = parseTargetedPersonalityAgentInviteRecord(
+        await this.request(
+          `/workspaces/${encodeURIComponent(workspaceId)}/invites/current-agent`,
+        ),
+      );
+      return { status: "pending", invite };
+    } catch (error) {
+      if (error instanceof WorkspaceAPIError && error.status === 404) {
+        return { status: "none" };
+      }
+      if (
+        error instanceof WorkspaceAPIError &&
+        error.status === 409 &&
+        error.code === "conflict"
+      ) {
+        return { status: "member" };
+      }
+      throw error;
+    }
+  }
+
+  async createCurrentAgentInvite(
+    workspaceId: string,
+  ): Promise<WorkspaceTargetedPersonalityAgentInviteRecord> {
+    return parseTargetedPersonalityAgentInviteRecord(
+      await this.request(
+        `/workspaces/${encodeURIComponent(workspaceId)}/invites/current-agent`,
+        { method: "POST", body: {} },
+      ),
+    );
   }
 
   async revokeInvite(workspaceId: string, inviteId: string): Promise<void> {
@@ -419,12 +463,29 @@ function parseInvite(value: unknown): WorkspaceInvite {
 
 function parseInviteRecord(value: unknown): WorkspaceInviteRecord {
   const wire = asRecord(value);
+  if (
+    wire.kind !== "share_code" &&
+    wire.kind !== "targeted_personality_agent"
+  ) {
+    throw new Error("invalid Workspace invite kind");
+  }
   return {
+    kind: wire.kind,
     inviteId: asString(wire.invite_id),
     workspaceId: asString(wire.workspace_id),
     expiresAt: asTimestamp(wire.expires_at),
     createdAt: asTimestamp(wire.created_at),
   };
+}
+
+function parseTargetedPersonalityAgentInviteRecord(
+  value: unknown,
+): WorkspaceTargetedPersonalityAgentInviteRecord {
+  const record = parseInviteRecord(value);
+  if (record.kind !== "targeted_personality_agent") {
+    throw new Error("invalid current-agent Workspace invite response");
+  }
+  return record;
 }
 
 function parseInvitePreview(value: unknown): WorkspaceInvitePreview {

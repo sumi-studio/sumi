@@ -10,8 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -33,6 +36,31 @@ type testWorld struct {
 	humanC participant.Ref
 	agentA participant.Ref
 	agentB participant.Ref
+}
+
+type pausingEmployerAuthority struct {
+	delegate CurrentEmployerAuthority
+	acquired chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (a *pausingEmployerAuthority) RequireCurrentHumanEmployerInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	humanID string,
+	agentID string,
+) error {
+	if err := a.delegate.RequireCurrentHumanEmployerInTx(ctx, tx, humanID, agentID); err != nil {
+		return err
+	}
+	a.once.Do(func() { close(a.acquired) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-a.release:
+		return nil
+	}
 }
 
 func newTestWorld(t *testing.T) testWorld {
@@ -591,6 +619,460 @@ func TestInviteListingRetainsOnlyRevocableNonSecretRecords(t *testing.T) {
 	listed, err = w.store.Invites(ctx, created.WorkspaceID, w.humanA)
 	if err != nil || len(listed) != 0 {
 		t.Fatalf("owner saw invalid issuer invite = %#v, %v", listed, err)
+	}
+}
+
+func TestCurrentAgentInviteIsNonSecretIdempotentAndClosesObsoleteIntents(t *testing.T) {
+	w := newTestWorld(t)
+	ctx := context.Background()
+	seedHumanEmployer(t, ctx, w, w.humanA, w.agentA)
+	authority := koseki.New(w.pool)
+	created, err := w.store.CreateWorkspace(ctx, "targeted invitation", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	share, err := w.store.CreateInvite(ctx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targeted, wasCreated, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || !wasCreated {
+		t.Fatalf("first current-agent invite = %#v created=%v err=%v", targeted, wasCreated, err)
+	}
+	if targeted.Kind != InviteKindTargetedPersonalityAgent || targeted.WorkspaceID != created.WorkspaceID {
+		t.Fatalf("current-agent invite = %#v", targeted)
+	}
+	var codeHash []byte
+	var inviteKind, targetKind, targetID string
+	if err := w.pool.QueryRow(ctx, `
+		SELECT code_hash, invite_kind, target_kind, target_id
+		FROM workspace_invites WHERE invite_id=$1`, targeted.InviteID).Scan(
+		&codeHash, &inviteKind, &targetKind, &targetID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if codeHash != nil || inviteKind != "targeted_personality_agent" ||
+		targetKind != string(participant.KindPersonalityAgent) || targetID != w.agentA.ID {
+		t.Fatalf("targeted ledger row hash=%x kind=%q target=%s:%s",
+			codeHash, inviteKind, targetKind, targetID)
+	}
+	replayed, wasCreated, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || wasCreated || replayed != targeted {
+		t.Fatalf("same pending invite replay = %#v created=%v err=%v", replayed, wasCreated, err)
+	}
+	read, err := w.store.CurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || read != targeted {
+		t.Fatalf("CurrentAgentInvite = %#v, %v", read, err)
+	}
+	listed, err := w.store.Invites(ctx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 || listed[0].Kind != InviteKindShareCode ||
+		listed[1].Kind != InviteKindTargetedPersonalityAgent {
+		t.Fatalf("mixed invite registry = %#v", listed)
+	}
+	if _, err := w.store.PreviewInvite(ctx, share.Code); err != nil {
+		t.Fatalf("legacy share preview changed: %v", err)
+	}
+	agentMembership, err := w.store.RedeemInvite(ctx, share.Code, w.agentA)
+	if err != nil {
+		t.Fatalf("legacy share redemption changed: %v", err)
+	}
+	if _, err := w.store.CurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	); !errors.Is(err, ErrAlreadyMember) {
+		t.Fatalf("active target retained current-agent invite: %v", err)
+	}
+	listed, err = w.store.Invites(ctx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inviteRecordIDs(listed)[targeted.InviteID] {
+		t.Fatalf("obsolete targeted invite remained in generic list: %#v", listed)
+	}
+	var revokedAt *time.Time
+	if err := w.pool.QueryRow(ctx,
+		"SELECT revoked_at FROM workspace_invites WHERE invite_id=$1", targeted.InviteID,
+	).Scan(&revokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if revokedAt == nil {
+		t.Fatal("share-code admission did not close the obsolete targeted invite")
+	}
+	if _, _, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	); !errors.Is(err, ErrAlreadyMember) {
+		t.Fatalf("active target issuance error = %v", err)
+	}
+	if err := w.store.RemoveMember(
+		ctx, created.WorkspaceID, agentMembership.WorkspaceMemberID, w.humanA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	reissued, wasCreated, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || !wasCreated || reissued.InviteID == targeted.InviteID {
+		t.Fatalf("post-leave issuance = %#v created=%v err=%v", reissued, wasCreated, err)
+	}
+}
+
+func TestCurrentAgentInviteReplacesExpiredAndIssuerTenureInvalidatedIntents(t *testing.T) {
+	w := newTestWorld(t)
+	ctx := context.Background()
+	seedHumanEmployer(t, ctx, w, w.humanA, w.agentA)
+	authority := koseki.New(w.pool)
+	created, err := w.store.CreateWorkspace(ctx, "targeted issuer tenure", w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	join, err := w.store.CreateInvite(ctx, created.WorkspaceID, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTenure, err := w.store.RedeemInvite(ctx, join.Code, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := w.store.CreateRole(
+		ctx,
+		created.WorkspaceID,
+		w.humanB,
+		"Inviter",
+		"",
+		map[string]bool{PermissionManageMembers: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.SetMembershipRoles(
+		ctx,
+		created.WorkspaceID,
+		firstTenure.WorkspaceMemberID,
+		w.humanB,
+		[]string{manager.RoleID},
+	); err != nil {
+		t.Fatal(err)
+	}
+	stale, wasCreated, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || !wasCreated {
+		t.Fatalf("delegated targeted issuance = %#v created=%v err=%v", stale, wasCreated, err)
+	}
+
+	if _, err := w.store.SetMembershipRoles(
+		ctx,
+		created.WorkspaceID,
+		firstTenure.WorkspaceMemberID,
+		w.humanB,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.CurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("issuer without manage_members exact read = %v", err)
+	}
+	listed, err := w.store.Invites(ctx, created.WorkspaceID, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inviteRecordIDs(listed)[stale.InviteID] {
+		t.Fatalf("owner registry treated invalid issuer intent as active: %#v", listed)
+	}
+
+	if err := w.store.RemoveMember(
+		ctx, created.WorkspaceID, firstTenure.WorkspaceMemberID, w.humanB,
+	); err != nil {
+		t.Fatal(err)
+	}
+	rejoin, err := w.store.CreateInvite(ctx, created.WorkspaceID, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTenure, err := w.store.RedeemInvite(ctx, rejoin.Code, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondTenure.WorkspaceMemberID == firstTenure.WorkspaceMemberID {
+		t.Fatal("rejoin reused the invalidated issuer tenure")
+	}
+	if _, err := w.store.TransferOwnership(
+		ctx, created.WorkspaceID, secondTenure.WorkspaceMemberID, w.humanB,
+	); err != nil {
+		t.Fatal(err)
+	}
+	replaced, wasCreated, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || !wasCreated || replaced.InviteID == stale.InviteID {
+		t.Fatalf("new owner tenure replacement = %#v created=%v err=%v", replaced, wasCreated, err)
+	}
+	var staleRevokedAt *time.Time
+	var replacementIssuer string
+	if err := w.pool.QueryRow(ctx, `
+		SELECT stale.revoked_at, replacement.created_by_workspace_member_id
+		FROM workspace_invites stale
+		JOIN workspace_invites replacement ON replacement.invite_id=$2
+		WHERE stale.invite_id=$1`, stale.InviteID, replaced.InviteID).Scan(
+		&staleRevokedAt, &replacementIssuer,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if staleRevokedAt == nil || replacementIssuer != secondTenure.WorkspaceMemberID {
+		t.Fatalf("replacement did not bind new owner tenure: revoked=%v issuer=%s",
+			staleRevokedAt, replacementIssuer)
+	}
+	listed, err = w.store.Invites(ctx, created.WorkspaceID, w.humanA)
+	if err != nil || len(listed) != 1 || listed[0].InviteID != replaced.InviteID {
+		t.Fatalf("new tenure revived stale targeted intent: %#v, %v", listed, err)
+	}
+
+	if _, err := w.pool.Exec(ctx, `
+		UPDATE workspace_invites
+		SET expires_at=now() - interval '1 second'
+		WHERE invite_id=$1`, replaced.InviteID); err != nil {
+		t.Fatal(err)
+	}
+	fresh, wasCreated, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || !wasCreated || fresh.InviteID == replaced.InviteID {
+		t.Fatalf("expired targeted replacement = %#v created=%v err=%v", fresh, wasCreated, err)
+	}
+	var expiredRevokedAt *time.Time
+	if err := w.pool.QueryRow(ctx,
+		"SELECT revoked_at FROM workspace_invites WHERE invite_id=$1",
+		replaced.InviteID,
+	).Scan(&expiredRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if expiredRevokedAt == nil {
+		t.Fatal("expired pending targeted intent was not explicitly revoked")
+	}
+}
+
+func TestCurrentAgentInviteConcurrentIssuanceConvergesOnOneRecord(t *testing.T) {
+	w := newTestWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	seedHumanEmployer(t, ctx, w, w.humanA, w.agentA)
+	authority := koseki.New(w.pool)
+	created, err := w.store.CreateWorkspace(ctx, "concurrent targeted invitation", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 12
+	type result struct {
+		invite  InviteRecord
+		created bool
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	var group sync.WaitGroup
+	for range callers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			invite, wasCreated, err := w.store.CreateCurrentAgentInvite(
+				ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+			)
+			results <- result{invite: invite, created: wasCreated, err: err}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+
+	var inviteID string
+	createdCount := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent issuance returned an ambiguous error: %v", result.err)
+		}
+		if inviteID == "" {
+			inviteID = result.invite.InviteID
+		}
+		if result.invite.InviteID != inviteID || result.invite.Kind != InviteKindTargetedPersonalityAgent {
+			t.Fatalf("concurrent issuance diverged: first=%s result=%#v", inviteID, result)
+		}
+		if result.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created responses = %d, want exactly one", createdCount)
+	}
+	var pending int
+	if err := w.pool.QueryRow(ctx, `
+		SELECT count(*) FROM workspace_invites
+		WHERE workspace_id=$1 AND invite_kind='targeted_personality_agent'
+		  AND target_id=$2 AND revoked_at IS NULL AND redeemed_at IS NULL`,
+		created.WorkspaceID, w.agentA.ID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending current-agent invite rows = %d", pending)
+	}
+}
+
+func TestCurrentAgentInviteExactResourceDoesNotInferFromMixedTargetedRegistry(t *testing.T) {
+	w := newTestWorld(t)
+	ctx := context.Background()
+	seedHumanEmployer(t, ctx, w, w.humanA, w.agentA)
+	seedHumanEmployer(t, ctx, w, w.humanB, w.agentB)
+	authority := koseki.New(w.pool)
+	created, err := w.store.CreateWorkspace(ctx, "mixed targeted registry", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	join, err := w.store.CreateInvite(ctx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	humanBMembership, err := w.store.RedeemInvite(ctx, join.Code, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := w.store.CreateRole(
+		ctx,
+		created.WorkspaceID,
+		w.humanA,
+		"Inviter",
+		"",
+		map[string]bool{PermissionManageMembers: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.SetMembershipRoles(
+		ctx,
+		created.WorkspaceID,
+		humanBMembership.WorkspaceMemberID,
+		w.humanA,
+		[]string{manager.RoleID},
+	); err != nil {
+		t.Fatal(err)
+	}
+	forHumanA, _, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forHumanB, _, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanB, w.agentB, authority,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := w.store.Invites(ctx, created.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registry) != 2 || !inviteRecordIDs(registry)[forHumanA.InviteID] ||
+		!inviteRecordIDs(registry)[forHumanB.InviteID] {
+		t.Fatalf("mixed targeted registry = %#v", registry)
+	}
+	for _, record := range registry {
+		if record.Kind != InviteKindTargetedPersonalityAgent {
+			t.Fatalf("mixed targeted record kind = %#v", record)
+		}
+	}
+	exactA, err := w.store.CurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, authority,
+	)
+	if err != nil || exactA.InviteID != forHumanA.InviteID {
+		t.Fatalf("Human A exact invite = %#v, %v", exactA, err)
+	}
+	exactB, err := w.store.CurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanB, w.agentB, authority,
+	)
+	if err != nil || exactB.InviteID != forHumanB.InviteID {
+		t.Fatalf("Human B exact invite = %#v, %v", exactB, err)
+	}
+}
+
+func TestCurrentAgentInviteEmploymentLeaseSerializesTransfer(t *testing.T) {
+	w := newTestWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	seedHumanEmployer(t, ctx, w, w.humanA, w.agentA)
+	lifecycle := directchat.NewLifecycleFence()
+	kosekiStore := koseki.New(w.pool, lifecycle)
+	created, err := w.store.CreateWorkspace(ctx, "employment lease", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pausing := &pausingEmployerAuthority{
+		delegate: kosekiStore,
+		acquired: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	issueDone := make(chan error, 1)
+	go func() {
+		_, _, err := w.store.CreateCurrentAgentInvite(
+			ctx, created.WorkspaceID, w.humanA, w.agentA, pausing,
+		)
+		issueDone <- err
+	}()
+	select {
+	case <-pausing.acquired:
+	case <-ctx.Done():
+		t.Fatal("issuance never acquired the shared employment lease")
+	}
+	transferStarted := make(chan struct{})
+	transferDone := make(chan error, 1)
+	go func() {
+		close(transferStarted)
+		transferDone <- kosekiStore.TransferEmployment(
+			ctx, w.agentA.ID, koseki.EmployerHuman, w.humanB.ID,
+		)
+	}()
+	<-transferStarted
+	select {
+	case err := <-transferDone:
+		t.Fatalf("employment transfer bypassed the shared issuance lease: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(pausing.release)
+	if err := <-issueDone; err != nil {
+		t.Fatalf("leased issuance: %v", err)
+	}
+	if err := <-transferDone; err != nil {
+		t.Fatalf("serialized employment transfer: %v", err)
+	}
+	if _, _, err := w.store.CreateCurrentAgentInvite(
+		ctx, created.WorkspaceID, w.humanA, w.agentA, kosekiStore,
+	); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("former Employer issuance error = %v", err)
+	}
+}
+
+func seedHumanEmployer(
+	t *testing.T,
+	ctx context.Context,
+	w testWorld,
+	human participant.Ref,
+	agent participant.Ref,
+) {
+	t.Helper()
+	if _, err := w.pool.Exec(ctx, `
+		INSERT INTO employments (agent_id, employer_type, employer_id)
+		VALUES ($1, 'human', $2)`, agent.ID, human.ID); err != nil {
+		t.Fatalf("seed current Human Employer: %v", err)
 	}
 }
 

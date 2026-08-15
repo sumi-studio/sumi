@@ -349,6 +349,87 @@ for (const { name, definition, valid, invalid } of appLifecycleRequestCases) {
   }
 }
 
+const workspaceInviteCommon = {
+  invite_id: "018f1e72-6e9a-7c20-8e90-123456789abe",
+  workspace_id: workspaceId,
+  expires_at: "2026-08-11T04:05:06.789Z",
+  created_at: "2026-08-10T04:05:06.789Z",
+};
+const workspaceInviteSchemaCases = [
+  {
+    name: "current-agent Workspace invite request",
+    definition: "WorkspaceCurrentAgentInviteRequest",
+    valid: [{}],
+    invalid: [
+      null,
+      [],
+      { personality_agent_id: humanId },
+      { target_id: humanId },
+      { workspace_id: workspaceId },
+    ],
+  },
+  {
+    name: "Workspace invite strict sum",
+    definition: "WorkspaceInviteRecord",
+    valid: [
+      { ...workspaceInviteCommon, kind: "share_code" },
+      {
+        ...workspaceInviteCommon,
+        kind: "targeted_personality_agent",
+      },
+    ],
+    invalid: [
+      { ...workspaceInviteCommon },
+      { ...workspaceInviteCommon, kind: "current_agent" },
+      {
+        ...workspaceInviteCommon,
+        kind: "share_code",
+        code: "one-time-secret",
+      },
+      {
+        ...workspaceInviteCommon,
+        kind: "share_code",
+        target_id: humanId,
+      },
+      {
+        ...workspaceInviteCommon,
+        kind: "targeted_personality_agent",
+        personality_agent_id: humanId,
+      },
+      {
+        ...workspaceInviteCommon,
+        kind: "targeted_personality_agent",
+        target_kind: "personality_agent",
+      },
+      {
+        ...workspaceInviteCommon,
+        kind: "targeted_personality_agent",
+        code_hash: "not-public",
+      },
+    ],
+  },
+];
+
+for (const { name, definition, valid, invalid } of workspaceInviteSchemaCases) {
+  const validate = getOpenApiSchemaValidator(definition);
+  for (const value of valid) {
+    if (!validate(value)) {
+      console.error(
+        `${name} rejected valid wire value ${JSON.stringify(value)}: ${describeErrors(validate.errors)}`,
+      );
+      failed = true;
+    }
+  }
+  for (const value of invalid) {
+    if (validate(value)) {
+      console.error(
+        `${name} accepted privacy/strict-sum counterexample ${JSON.stringify(value)}`,
+      );
+      failed = true;
+    }
+  }
+}
+
 const lifecycleErrorSchemaCases = [
   {
     name: "app install conflict response",
@@ -864,5 +945,5 @@ if (failed) {
 }
 
 console.log(
-  "All contract fixtures, app-lifecycle requests and responses, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
+  "All contract fixtures, app-lifecycle and Workspace-invite schemas, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
 );

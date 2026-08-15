@@ -365,7 +365,12 @@ func newApplicationFromEnv() (*application, error) {
 		if sv != nil {
 			messagingSessions = sv
 		}
-		workspaceServer = workspacecontrol.NewServer(workspaceStore, appStore, messagingSessions)
+		workspaceServer = workspacecontrol.NewServer(
+			workspaceStore,
+			appStore,
+			messagingSessions,
+			koseki.New(database.Pool),
+		)
 		workspaceServer.AllowedOrigins = browserOrigins
 		workspaceServer.RegisterRoutes(mux)
 		log.Print("workspace and app lifecycle routes ready")

@@ -265,6 +265,69 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /workspaces/{workspace_id}/invites/current-agent:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getCurrentAgentWorkspaceInvite
+      summary: Read the pending invitation for the signed session's exact PersonalityAgent
+      description: The target is derived only from the signed Human session and is never returned. This operation composes current Human Employer and manage_members authority before reading the pending ledger record.
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Active pending invitation for the session-bound PersonalityAgent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceTargetedPersonalityAgentInviteRecord"
+        "401":
+          description: Missing or invalid browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/AppLifecycleUnavailable"
+    post:
+      operationId: createCurrentAgentWorkspaceInvite
+      summary: Invite the signed session's exact PersonalityAgent to one exact Workspace
+      description: The request is exactly an empty object. Neither a PersonalityAgentId nor a selector is accepted or returned. Replays return the same active pending record; the PersonalityAgent must later accept as itself.
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceCurrentAgentInviteRequest"
+      responses:
+        "200":
+          description: Existing active pending invitation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceTargetedPersonalityAgentInviteRecord"
+        "201":
+          description: New pending invitation created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceTargetedPersonalityAgentInviteRecord"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/AppLifecycleUnavailable"
   /workspaces/{workspace_id}/invites/{invite_id}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1012,11 +1075,37 @@ components:
         created_at:
           type: string
           format: date-time
-    WorkspaceInviteRecord:
+    WorkspaceCurrentAgentInviteRequest:
       type: object
-      required: [invite_id, workspace_id, expires_at, created_at]
+      additionalProperties: false
+    WorkspaceInviteRecord:
+      oneOf:
+        - $ref: "#/components/schemas/WorkspaceShareCodeInviteRecord"
+        - $ref: "#/components/schemas/WorkspaceTargetedPersonalityAgentInviteRecord"
+    WorkspaceShareCodeInviteRecord:
+      type: object
+      required: [kind, invite_id, workspace_id, expires_at, created_at]
       additionalProperties: false
       properties:
+        kind:
+          const: share_code
+        invite_id:
+          $ref: "#/components/schemas/UUIDv7"
+        workspace_id:
+          $ref: "#/components/schemas/UUIDv7"
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    WorkspaceTargetedPersonalityAgentInviteRecord:
+      type: object
+      required: [kind, invite_id, workspace_id, expires_at, created_at]
+      additionalProperties: false
+      properties:
+        kind:
+          const: targeted_personality_agent
         invite_id:
           $ref: "#/components/schemas/UUIDv7"
         workspace_id:

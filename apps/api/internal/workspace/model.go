@@ -40,20 +40,21 @@ var administrativePermissions = []string{
 }
 
 var (
-	ErrNotFound          = errors.New("workspace not found")
-	ErrForbidden         = errors.New("workspace operation forbidden")
-	ErrInvalidName       = errors.New("invalid workspace or role name")
-	ErrInvalidColor      = errors.New("invalid role color")
-	ErrInvalidPosition   = errors.New("invalid role position")
-	ErrInvalidPermission = errors.New("invalid workspace permission")
-	ErrRoleNotFound      = errors.New("workspace role not found")
-	ErrRoleNameTaken     = errors.New("workspace role name is already used")
-	ErrMemberNotFound    = errors.New("workspace member not found")
-	ErrAlreadyMember     = errors.New("participant is already a workspace member")
-	ErrOwnerProtected    = errors.New("workspace owner membership cannot change")
-	ErrLastAdministrator = errors.New("workspace must retain an effective administrator")
-	ErrInviteUnavailable = errors.New("workspace invite is unavailable")
-	ErrInvalidInvite     = errors.New("invalid workspace invite settings")
+	ErrNotFound                   = errors.New("workspace not found")
+	ErrForbidden                  = errors.New("workspace operation forbidden")
+	ErrInvalidName                = errors.New("invalid workspace or role name")
+	ErrInvalidColor               = errors.New("invalid role color")
+	ErrInvalidPosition            = errors.New("invalid role position")
+	ErrInvalidPermission          = errors.New("invalid workspace permission")
+	ErrRoleNotFound               = errors.New("workspace role not found")
+	ErrRoleNameTaken              = errors.New("workspace role name is already used")
+	ErrMemberNotFound             = errors.New("workspace member not found")
+	ErrAlreadyMember              = errors.New("participant is already a workspace member")
+	ErrOwnerProtected             = errors.New("workspace owner membership cannot change")
+	ErrLastAdministrator          = errors.New("workspace must retain an effective administrator")
+	ErrInviteUnavailable          = errors.New("workspace invite is unavailable")
+	ErrInvalidInvite              = errors.New("invalid workspace invite settings")
+	ErrInviteAuthorityUnavailable = errors.New("current-agent invite authority is unavailable")
 )
 
 var ErrInvalidWorkspaceListCursor = errors.New("invalid workspace list cursor")
@@ -152,11 +153,19 @@ type Invite struct {
 	CreatedAt   time.Time
 }
 
+type InviteKind string
+
+const (
+	InviteKindShareCode                InviteKind = "share_code"
+	InviteKindTargetedPersonalityAgent InviteKind = "targeted_personality_agent"
+)
+
 // InviteRecord is the non-secret control-plane projection retained after the
 // one-time plaintext code has left the create response.
 type InviteRecord struct {
 	InviteID    string
 	WorkspaceID string
+	Kind        InviteKind
 	ExpiresAt   time.Time
 	CreatedAt   time.Time
 }
