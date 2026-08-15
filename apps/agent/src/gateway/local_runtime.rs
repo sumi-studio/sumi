@@ -35,8 +35,12 @@ use super::supervisor::seams::T17HydrationLatch;
 use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
+use crate::apiclient::apps::{
+    AppInstallationResolutionError, AppInstallationResolutionResult, AppInstallationResolver,
+    ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
+};
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
+    CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi, OpenMessagingPlaceRequest,
     ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
     SetMessagingStatusRequest, WriteMessagingMessageRequest,
 };
@@ -62,6 +66,35 @@ const DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 const TRUSTED_UNIX_SOCKET_MODE: u32 = 0o660;
 const TRUSTED_UNIX_PARENT_MODE: u32 = 0o750;
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedMessagingRequest<'a, T> {
+    workspace_id: &'a str,
+    installation_id: &'a str,
+    #[serde(flatten)]
+    operation: T,
+}
+
+impl<'a, T> ScopedMessagingRequest<'a, T> {
+    fn new(scope: &'a ExactMessagingScope, operation: T) -> Self {
+        Self {
+            workspace_id: &scope.workspace_id,
+            installation_id: &scope.installation_id,
+            operation,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyMessagingOperation {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppResolutionErrorResponse {
+    error: String,
+}
 
 /// Short-lived credential accepted only by the local-control transport.
 ///
@@ -263,11 +296,27 @@ impl LocalControlHttpClient {
         authority: RuntimeEpochAuthority,
         credential: LocalControlCredential,
     ) -> Result<Self> {
+        Self::new_loopback_with_timeouts(
+            base_url,
+            authority,
+            credential,
+            DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT,
+            DEFAULT_LOCAL_CONTROL_TIMEOUT,
+        )
+    }
+
+    fn new_loopback_with_timeouts(
+        base_url: impl AsRef<str>,
+        authority: RuntimeEpochAuthority,
+        credential: LocalControlCredential,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         credential.validate_at(&authority, SystemTime::now())?;
         let base_url = validate_loopback_base_url(base_url.as_ref())?;
         let http = reqwest::Client::builder()
-            .connect_timeout(DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT)
-            .timeout(DEFAULT_LOCAL_CONTROL_TIMEOUT)
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
@@ -494,37 +543,138 @@ impl LocalControlPlane for LocalControlHttpClient {
 }
 
 #[async_trait]
+impl AppInstallationResolver for LocalControlHttpClient {
+    async fn resolve_enabled_workspace_app(
+        &self,
+        request: ResolveEnabledWorkspaceAppRequest<'_>,
+    ) -> AppInstallationResolutionResult<ResolvedAppInstallation> {
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())
+            .map_err(|_| AppInstallationResolutionError::AuthenticationUnavailable)?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => (
+                build_unix_http_client(&endpoint.path)
+                    .map_err(|_| AppInstallationResolutionError::TransportUnavailable)?,
+                Some(endpoint),
+            ),
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let url = self
+            .base_url
+            .join("/local-control/v1/apps:resolve-enabled")
+            .map_err(|_| AppInstallationResolutionError::Protocol)?;
+        let mut request = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .json(&request);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request
+            .build()
+            .map_err(|_| AppInstallationResolutionError::Protocol)?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint
+                .revalidate()
+                .map_err(|_| AppInstallationResolutionError::AuthenticationUnavailable)?;
+        }
+        let response = http
+            .execute(request)
+            .await
+            .map_err(|_| AppInstallationResolutionError::TransportUnavailable)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(AppInstallationResolutionError::AuthenticationUnavailable);
+        }
+        if status.is_server_error() {
+            return Err(AppInstallationResolutionError::ServiceUnavailable);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_LOCAL_CONTROL_RESPONSE_BYTES as u64)
+        {
+            return Err(AppInstallationResolutionError::Protocol);
+        }
+        let mut body = Zeroizing::new(Vec::new());
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| AppInstallationResolutionError::TransportUnavailable)?;
+            if body.len().saturating_add(chunk.len()) > MAX_LOCAL_CONTROL_RESPONSE_BYTES {
+                return Err(AppInstallationResolutionError::Protocol);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if status.is_success() {
+            return serde_json::from_slice(body.as_slice())
+                .map_err(|_| AppInstallationResolutionError::Protocol);
+        }
+        let rejection: AppResolutionErrorResponse = serde_json::from_slice(body.as_slice())
+            .map_err(|_| AppInstallationResolutionError::Protocol)?;
+        match (status, rejection.error.as_str()) {
+            (reqwest::StatusCode::FORBIDDEN, "forbidden") => {
+                Err(AppInstallationResolutionError::Forbidden)
+            }
+            (reqwest::StatusCode::NOT_FOUND, "not_found") => {
+                Err(AppInstallationResolutionError::NotFound)
+            }
+            (reqwest::StatusCode::NOT_FOUND, "installation_not_found") => {
+                Err(AppInstallationResolutionError::InstallationNotFound)
+            }
+            (reqwest::StatusCode::CONFLICT, "app_disabled") => {
+                Err(AppInstallationResolutionError::AppDisabled)
+            }
+            _ => Err(AppInstallationResolutionError::Protocol),
+        }
+    }
+}
+
+#[async_trait]
 impl MessagingApi for LocalControlHttpClient {
-    async fn overview(&self) -> Result<serde_json::Value> {
+    async fn overview(&self, scope: &ExactMessagingScope) -> Result<serde_json::Value> {
         self.post_json_bounded(
             "/local-control/v1/messaging:overview",
-            &serde_json::json!({}),
+            &ScopedMessagingRequest::new(scope, EmptyMessagingOperation {}),
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
     }
 
-    async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<serde_json::Value> {
+    async fn open(
+        &self,
+        scope: &ExactMessagingScope,
+        request: OpenMessagingPlaceRequest<'_>,
+    ) -> Result<serde_json::Value> {
         self.post_json_bounded(
             "/local-control/v1/messaging:open",
-            &request,
+            &ScopedMessagingRequest::new(scope, request),
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
     }
 
-    async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<serde_json::Value> {
-        self.post_json("/local-control/v1/messaging:write", &request)
-            .await
+    async fn write(
+        &self,
+        scope: &ExactMessagingScope,
+        request: WriteMessagingMessageRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:write",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
     }
 
-    async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<serde_json::Value> {
+    async fn react(
+        &self,
+        scope: &ExactMessagingScope,
+        request: ReactMessagingReactionRequest<'_>,
+    ) -> Result<serde_json::Value> {
         // The response echoes the full message (content up to 64 KiB plus its
         // reaction state), so it shares the messaging screen bound rather than
         // the tighter control-plane bound.
         self.post_json_bounded(
             "/local-control/v1/messaging:react",
-            &request,
+            &ScopedMessagingRequest::new(scope, request),
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
@@ -532,34 +682,50 @@ impl MessagingApi for LocalControlHttpClient {
 
     async fn set_status(
         &self,
+        scope: &ExactMessagingScope,
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json("/local-control/v1/messaging:status", &request)
-            .await
+        self.post_json(
+            "/local-control/v1/messaging:status",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
     }
 
     async fn reply_later(
         &self,
+        scope: &ExactMessagingScope,
         request: CreateMessagingReplyLaterRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json("/local-control/v1/messaging:reply-later", &request)
-            .await
+        self.post_json(
+            "/local-control/v1/messaging:reply-later",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
     }
 
     async fn resolve_reply_later(
         &self,
+        scope: &ExactMessagingScope,
         request: ResolveMessagingReplyLaterRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json("/local-control/v1/messaging:reply-later-resolve", &request)
-            .await
+        self.post_json(
+            "/local-control/v1/messaging:reply-later-resolve",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
     }
 
     async fn read_through(
         &self,
+        scope: &ExactMessagingScope,
         request: ReadMessagingThroughRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json("/local-control/v1/messaging:read-through", &request)
-            .await
+        self.post_json(
+            "/local-control/v1/messaging:read-through",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
     }
 }
 
@@ -1488,6 +1654,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
@@ -1545,6 +1712,13 @@ mod tests {
 
     fn authority() -> RuntimeEpochAuthority {
         authority_with(PAID, 7, "boot-a")
+    }
+
+    fn messaging_scope() -> ExactMessagingScope {
+        ExactMessagingScope {
+            workspace_id: "0198f0f4-9b72-7000-8000-000000000201".to_owned(),
+            installation_id: "0198f0f4-9b72-7000-8000-000000000301".to_owned(),
+        }
     }
 
     fn current_euid() -> u32 {
@@ -2703,6 +2877,89 @@ mod tests {
         request_body: Arc<StdMutex<Option<Vec<u8>>>>,
     }
 
+    #[derive(Clone, Default)]
+    struct AppResolutionFixtureState {
+        request_body: Arc<StdMutex<Option<Vec<u8>>>>,
+    }
+
+    async fn app_resolution_fixture(
+        State(state): State<AppResolutionFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer control-secret")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        serde_json::from_slice::<serde_json::Value>(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        *state.request_body.lock().unwrap() = Some(body.to_vec());
+        Ok(Json(serde_json::json!({
+            "installation_id": "0198f0f4-9b72-7000-8000-000000000301"
+        })))
+    }
+
+    #[derive(Clone, Copy)]
+    enum AppResolutionFailureFixture {
+        Forbidden,
+        NotFound,
+        InstallationNotFound,
+        Disabled,
+        Unauthorized,
+        Unavailable,
+        Timeout,
+        MalformedSuccess,
+    }
+
+    async fn app_resolution_failure_fixture(
+        State(behavior): State<AppResolutionFailureFixture>,
+    ) -> Response {
+        match behavior {
+            AppResolutionFailureFixture::Forbidden => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "forbidden"})),
+            )
+                .into_response(),
+            AppResolutionFailureFixture::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_found"})),
+            )
+                .into_response(),
+            AppResolutionFailureFixture::InstallationNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "installation_not_found"})),
+            )
+                .into_response(),
+            AppResolutionFailureFixture::Disabled => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "app_disabled"})),
+            )
+                .into_response(),
+            AppResolutionFailureFixture::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response(),
+            AppResolutionFailureFixture::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "apps_unavailable"})),
+            )
+                .into_response(),
+            AppResolutionFailureFixture::Timeout => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Json(serde_json::json!({
+                    "installation_id": "0198f0f4-9b72-7000-8000-000000000301"
+                }))
+                .into_response()
+            }
+            AppResolutionFailureFixture::MalformedSuccess => {
+                (StatusCode::OK, "not-json").into_response()
+            }
+        }
+    }
+
     async fn compact_write_fixture(
         State(state): State<CompactWriteFixtureState>,
         headers: HeaderMap,
@@ -2761,15 +3018,19 @@ mod tests {
         )
         .unwrap();
         let content = "\u{1}".repeat(64 * 1024);
+        let scope = messaging_scope();
 
         let receipt = client
-            .write(WriteMessagingMessageRequest {
-                place_id: "01900000-0000-7000-8000-000000000002",
-                content: &content,
-                urgency: "normal",
-                reply_to: None,
-                client_nonce: "nonce-max-escaped",
-            })
+            .write(
+                &scope,
+                WriteMessagingMessageRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    content: &content,
+                    urgency: "normal",
+                    reply_to: None,
+                    client_nonce: "nonce-max-escaped",
+                },
+            )
             .await
             .expect("a legal maximum write must be observed as success");
 
@@ -2780,11 +3041,146 @@ mod tests {
         let raw = state.request_body.lock().unwrap().take().unwrap();
         assert!(raw.len() > 2 * 64 * 1024);
         let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(request["workspace_id"], scope.workspace_id);
+        assert_eq!(request["installation_id"], scope.installation_id);
+        assert!(request.get("app_id").is_none());
         assert_eq!(
             request["content"].as_str().unwrap().as_bytes().len(),
             64 * 1024
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn app_resolver_sends_only_explicit_workspace_and_adapter_owned_app_identity() {
+        let state = AppResolutionFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/apps:resolve-enabled",
+                post(app_resolution_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let resolved = client
+            .resolve_enabled_workspace_app(ResolveEnabledWorkspaceAppRequest {
+                workspace_id: "0198f0f4-9b72-7000-8000-000000000201",
+                app_id: "messaging",
+            })
+            .await
+            .expect("resolve exact current app installation");
+        assert_eq!(
+            resolved.installation_id,
+            "0198f0f4-9b72-7000-8000-000000000301"
+        );
+        let raw = state.request_body.lock().unwrap().take().unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "workspace_id": "0198f0f4-9b72-7000-8000-000000000201",
+                "app_id": "messaging"
+            })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn app_resolver_preserves_redacted_domain_and_infrastructure_failures() {
+        for (behavior, expected, timeout) in [
+            (
+                AppResolutionFailureFixture::Forbidden,
+                AppInstallationResolutionError::Forbidden,
+                Duration::from_secs(1),
+            ),
+            (
+                AppResolutionFailureFixture::NotFound,
+                AppInstallationResolutionError::NotFound,
+                Duration::from_secs(1),
+            ),
+            (
+                AppResolutionFailureFixture::InstallationNotFound,
+                AppInstallationResolutionError::InstallationNotFound,
+                Duration::from_secs(1),
+            ),
+            (
+                AppResolutionFailureFixture::Disabled,
+                AppInstallationResolutionError::AppDisabled,
+                Duration::from_secs(1),
+            ),
+            (
+                AppResolutionFailureFixture::Unauthorized,
+                AppInstallationResolutionError::AuthenticationUnavailable,
+                Duration::from_secs(1),
+            ),
+            (
+                AppResolutionFailureFixture::Unavailable,
+                AppInstallationResolutionError::ServiceUnavailable,
+                Duration::from_secs(1),
+            ),
+            (
+                AppResolutionFailureFixture::Timeout,
+                AppInstallationResolutionError::TransportUnavailable,
+                Duration::from_millis(20),
+            ),
+            (
+                AppResolutionFailureFixture::MalformedSuccess,
+                AppInstallationResolutionError::Protocol,
+                Duration::from_secs(1),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/apps:resolve-enabled",
+                    post(app_resolution_failure_fixture),
+                )
+                .with_state(behavior);
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let authority = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                authority.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback_with_timeouts(
+                format!("http://{address}/"),
+                authority,
+                credential,
+                Duration::from_secs(1),
+                timeout,
+            )
+            .unwrap();
+            let error = client
+                .resolve_enabled_workspace_app(ResolveEnabledWorkspaceAppRequest {
+                    workspace_id: "0198f0f4-9b72-7000-8000-000000000201",
+                    app_id: "messaging",
+                })
+                .await
+                .expect_err("resolver failure must retain its redacted class");
+            assert_eq!(error, expected);
+            server.abort();
+        }
     }
 
     async fn response_limit_fixture(
@@ -2822,12 +3218,16 @@ mod tests {
     async fn messaging_open_has_a_dedicated_response_bound_without_widening_control_responses() {
         let payload_bytes = MAX_LOCAL_CONTROL_RESPONSE_BYTES + 1024;
         let (client, server) = response_limit_fixture(payload_bytes).await;
+        let scope = messaging_scope();
         let response = client
-            .open(OpenMessagingPlaceRequest {
-                place_id: "01900000-0000-7000-8000-000000000002",
-                before_seq: None,
-                limit: Some(20),
-            })
+            .open(
+                &scope,
+                OpenMessagingPlaceRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    before_seq: None,
+                    limit: Some(20),
+                },
+            )
             .await
             .expect("messaging screen larger than 64 KiB remains readable");
         assert_eq!(
@@ -2846,12 +3246,16 @@ mod tests {
     #[tokio::test]
     async fn messaging_open_rejects_a_response_above_its_dedicated_bound() {
         let (client, server) = response_limit_fixture(MAX_MESSAGING_RESPONSE_BYTES + 1).await;
+        let scope = messaging_scope();
         let error = client
-            .open(OpenMessagingPlaceRequest {
-                place_id: "01900000-0000-7000-8000-000000000002",
-                before_seq: None,
-                limit: Some(50),
-            })
+            .open(
+                &scope,
+                OpenMessagingPlaceRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    before_seq: None,
+                    limit: Some(50),
+                },
+            )
             .await
             .expect_err("messaging responses must remain bounded");
         assert!(error.to_string().contains("exceeds bounded size"));

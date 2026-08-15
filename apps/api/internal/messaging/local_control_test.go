@@ -5,12 +5,35 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
+
+func callLocalWithoutFixtureInference(
+	t *testing.T,
+	ctx context.Context,
+	handler func(http.ResponseWriter, *http.Request, agentevents.LocalRuntimeAuthorization),
+	path string,
+	body map[string]any,
+	authorization agentevents.LocalRuntimeAuthorization,
+) (int, map[string]any) {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw)).WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler(response, request, authorization)
+	var decoded map[string]any
+	_ = json.Unmarshal(response.Body.Bytes(), &decoded)
+	return response.Code, decoded
+}
 
 func TestLocalWritePreservesBoundedReceiptUnderExactScope(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -106,5 +129,60 @@ func TestLocalControlRequiresAuthenticatedExactScope(t *testing.T) {
 	}, authorization)
 	if status != http.StatusOK {
 		t.Fatalf("local control exact scope=%d body=%v", status, body)
+	}
+}
+
+func TestLocalWriteReauthorizesASealedInstallationAtCommit(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		wantStatus int
+		wantError  string
+		retire     func(context.Context, world, *ScopedStore) error
+	}{
+		{
+			name: "disabled after bind", wantStatus: http.StatusForbidden, wantError: "app_disabled",
+			retire: func(ctx context.Context, w world, scoped *ScopedStore) error {
+				_, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, false)
+				return err
+			},
+		},
+		{
+			name: "uninstalled after bind", wantStatus: http.StatusNotFound, wantError: "installation_not_found",
+			retire: func(ctx context.Context, w world, scoped *ScopedStore) error {
+				return w.apps.UninstallByID(ctx, scoped.Scope.InstallationID, w.humanA)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			workspace, channel := w.workspaceWithChannel(t, ctx)
+			scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+			sealedWorkspaceID := scoped.Scope.WorkspaceID
+			sealedInstallationID := scoped.Scope.InstallationID
+			if err := test.retire(ctx, w, scoped); err != nil {
+				t.Fatal(err)
+			}
+			server := NewServer(w.store.core, nil)
+			status, body := callLocalWithoutFixtureInference(t, ctx, server.localWrite, LocalWritePath, map[string]any{
+				"workspace_id": sealedWorkspaceID, "installation_id": sealedInstallationID,
+				"place_id": channel.PlaceID, "content": "must not commit", "urgency": "normal",
+				"client_nonce": "stale-exact-installation",
+			}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
+			if status != test.wantStatus || body["error"] != test.wantError {
+				t.Fatalf("stale exact write = %d %v, want %d %s",
+					status, body, test.wantStatus, test.wantError)
+			}
+			var messages int
+			if err := w.store.core.pool.QueryRow(ctx,
+				"SELECT count(*) FROM messages WHERE workspace_id=$1 AND place_id=$2",
+				workspace.WorkspaceID, channel.PlaceID).Scan(&messages); err != nil {
+				t.Fatal(err)
+			}
+			if messages != 0 {
+				t.Fatalf("stale exact scope committed %d messages", messages)
+			}
+		})
 	}
 }

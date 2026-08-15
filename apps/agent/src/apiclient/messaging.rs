@@ -9,6 +9,14 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::apps::AppInstallationResolver;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ExactMessagingScope {
+    pub workspace_id: String,
+    pub installation_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenMessagingPlaceRequest<'a> {
@@ -80,23 +88,48 @@ pub(crate) struct ReadMessagingThroughRequest<'a> {
 }
 
 #[async_trait]
-pub(crate) trait MessagingApi: Send + Sync + 'static {
-    async fn overview(&self) -> Result<Value>;
+pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
+    async fn overview(&self, scope: &ExactMessagingScope) -> Result<Value>;
 
-    async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<Value>;
+    async fn open(
+        &self,
+        scope: &ExactMessagingScope,
+        request: OpenMessagingPlaceRequest<'_>,
+    ) -> Result<Value>;
 
-    async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value>;
+    async fn write(
+        &self,
+        scope: &ExactMessagingScope,
+        request: WriteMessagingMessageRequest<'_>,
+    ) -> Result<Value>;
 
-    async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value>;
+    async fn react(
+        &self,
+        scope: &ExactMessagingScope,
+        request: ReactMessagingReactionRequest<'_>,
+    ) -> Result<Value>;
 
-    async fn set_status(&self, request: SetMessagingStatusRequest<'_>) -> Result<Value>;
+    async fn set_status(
+        &self,
+        scope: &ExactMessagingScope,
+        request: SetMessagingStatusRequest<'_>,
+    ) -> Result<Value>;
 
-    async fn reply_later(&self, request: CreateMessagingReplyLaterRequest<'_>) -> Result<Value>;
+    async fn reply_later(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingReplyLaterRequest<'_>,
+    ) -> Result<Value>;
 
     async fn resolve_reply_later(
         &self,
+        scope: &ExactMessagingScope,
         request: ResolveMessagingReplyLaterRequest<'_>,
     ) -> Result<Value>;
 
-    async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value>;
+    async fn read_through(
+        &self,
+        scope: &ExactMessagingScope,
+        request: ReadMessagingThroughRequest<'_>,
+    ) -> Result<Value>;
 }
