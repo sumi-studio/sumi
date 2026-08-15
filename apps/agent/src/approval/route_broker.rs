@@ -45,6 +45,11 @@ use crate::{
 const MAX_CONTEXT_MESSAGES: usize = 12;
 const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
 const MAX_CONTEXT_TOTAL_CHARS: usize = 24_000;
+pub(crate) const MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS: usize = 3;
+
+pub(crate) const fn normal_reauthorization_exhausted(attempts: usize) -> bool {
+    attempts >= MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS
+}
 
 #[derive(Debug)]
 pub(crate) enum RouteApprovalOutcome {
@@ -257,6 +262,38 @@ impl RouteApprovalBroker {
         current.validate_replacement(&next, now)?;
         *current = next;
         Ok(())
+    }
+
+    /// Terminalize a Normal call whose exact grant repeatedly expired or was
+    /// replaced before its durable start. Re-running AutoReview forever would
+    /// make a sufficiently short-lived policy source a liveness failure. This
+    /// is a foundation denial, never an escalation to Human review.
+    pub(crate) async fn deny_reauthorization_exhausted(
+        &self,
+        sealed: SealedBoundToolInvocation,
+        route: ToolInvocationRoute,
+        attempts: usize,
+    ) -> Result<RouteApprovalOutcome> {
+        if route != ToolInvocationRoute::Normal {
+            anyhow::bail!("only a Normal route may exhaust automatic reauthorization");
+        }
+        let bound = sealed.invocation();
+        let now = (self.clock)();
+        let snapshot = match self.policy.read().await.evaluate_normal(bound, now) {
+            PolicyEvaluation::Ready { snapshot, .. }
+            | PolicyEvaluation::Unavailable { snapshot, .. } => snapshot,
+        };
+        self.deny(
+            bound,
+            route,
+            snapshot,
+            PolicyDecisionRecord::Unavailable,
+            None,
+            None,
+            format!(
+                "authorization policy could not remain valid through durable start after {attempts} attempts"
+            ),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -877,9 +914,13 @@ fn non_empty_reason(reason: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
+    use chrono::{Duration, TimeZone};
     use serde_json::json;
 
     use super::*;
@@ -1149,6 +1190,112 @@ mod tests {
             grant.evidence().policy_decision,
             PolicyDecisionRecord::Allow
         );
+        assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn expiring_policy_reauthorization_terminates_after_bounded_attempts() {
+        let before_expiry = Utc
+            .with_ymd_and_hms(2026, 8, 12, 0, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let after_expiry = before_expiry + Duration::seconds(2);
+        let expires_at = before_expiry + Duration::seconds(1);
+        let source = crate::approval::route_policy::PolicySourceState::verified_overlay_v1(
+            1,
+            "signed-policy-1",
+            expires_at,
+            None,
+            before_expiry,
+        )
+        .expect("valid policy source");
+        let policy =
+            RoutePolicy::verified_overlay_v1(source, BTreeMap::new()).expect("valid route policy");
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let clock_ticks = ticks.clone();
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"block",
+                "risk":"high",
+                "misunderstanding":null,
+                "rationale":"unused"
+            }),
+        );
+        let broker = broker.with_clock(move || {
+            if clock_ticks.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+                before_expiry
+            } else {
+                after_expiry
+            }
+        });
+        broker
+            .replace_policy(policy)
+            .await
+            .expect("install verified policy");
+        ticks.store(0, Ordering::SeqCst);
+
+        let mut sealed = sealed(CapabilityClass::Read, ToolInvocationRoute::Normal).await;
+        let mut terminal = None;
+        for attempt in 1..=MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS {
+            let outcome = broker
+                .start_request(
+                    sealed,
+                    ToolInvocationRoute::Normal,
+                    &[],
+                    scope(),
+                    "run-1",
+                    "turn-1",
+                    "context-1",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("route decision");
+            let RouteApprovalOutcome::Allowed { grant } = outcome else {
+                panic!("pre-expiry policy evaluation must allow the exact read")
+            };
+            let (status, lease, _, _) = grant
+                .authorize(
+                    "tool-call-1",
+                    "app_action",
+                    ToolInvocationRoute::Normal,
+                    "run-1",
+                    "turn-1",
+                )
+                .await
+                .expect("grant revalidation");
+            assert_eq!(status, GrantRevalidation::Reauthorize);
+            drop(lease);
+            sealed = grant.into_authorized_bound().into_sealed();
+            if normal_reauthorization_exhausted(attempt) {
+                terminal = Some(
+                    broker
+                        .deny_reauthorization_exhausted(
+                            sealed,
+                            ToolInvocationRoute::Normal,
+                            attempt,
+                        )
+                        .await
+                        .expect("terminal denial"),
+                );
+                break;
+            }
+            assert!(
+                attempt < MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS,
+                "the retry budget must not terminate early"
+            );
+        }
+
+        let Some(RouteApprovalOutcome::Denied {
+            evidence, reason, ..
+        }) = terminal
+        else {
+            panic!("the bounded retry budget must end in a denial")
+        };
+        assert_eq!(evidence.error_code(), "policy_unavailable");
+        assert_eq!(evidence.policy_decision, PolicyDecisionRecord::Unavailable);
+        assert!(reason.contains("after 3 attempts"));
         assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
         assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
     }
