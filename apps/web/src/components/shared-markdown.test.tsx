@@ -13,6 +13,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+const MATH_SOURCE_MODE_TITLE = "数式の量が多いため原文のまま表示しています";
+
+function expectOneMathSourceMode(container: HTMLElement) {
+  const markers = container.querySelectorAll(
+    '[data-math-source-mode="budget"]',
+  );
+  expect(markers).toHaveLength(1);
+  expect(markers[0]).toHaveAttribute("title", MATH_SOURCE_MODE_TITLE);
+}
+
 describe("@sumi/ui CompactMessageResponse", () => {
   it("keeps presentation and security overrides out of the public API", () => {
     type UnsafeOverride = Extract<
@@ -500,20 +510,12 @@ describe("@sumi/ui CompactMessageResponse", () => {
       <CompactMessageResponse>{source}</CompactMessageResponse>,
     );
 
-    const fallbacks = container.querySelectorAll(
-      "[data-math-fallback=aggregate]",
-    );
     expect(new TextEncoder().encode(source)).toHaveLength(55_999);
     expect(container.querySelector(".katex")).toBeNull();
-    expect(fallbacks).toHaveLength(4_000);
-    expect(fallbacks[0]).toHaveTextContent(tex);
-    expect(fallbacks[0]).toHaveAttribute("data-math-source", "budget");
-    expect(fallbacks[0]).toHaveAttribute(
-      "title",
-      "数式の量が多いため原文のまま表示しています",
-    );
+    expect(container.textContent).toBe(source);
     expect(container.querySelector(".katex-error")).toBeNull();
-    expect(container.querySelectorAll("*").length).toBeLessThan(20_000);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
   });
 
   it("renders the aggregate formula-count boundary as one coherent mode", () => {
@@ -524,15 +526,42 @@ describe("@sumi/ui CompactMessageResponse", () => {
       <CompactMessageResponse>{atBudget}</CompactMessageResponse>,
     ).container;
     expect(accepted.querySelectorAll(".katex")).toHaveLength(500);
-    expect(accepted.querySelector("[data-math-fallback=aggregate]")).toBeNull();
 
     const rejected = render(
       <CompactMessageResponse>{overBudget}</CompactMessageResponse>,
     ).container;
     expect(rejected.querySelector(".katex")).toBeNull();
-    expect(
-      rejected.querySelectorAll("[data-math-fallback=aggregate]"),
-    ).toHaveLength(501);
+    expect(rejected.textContent).toBe(overBudget);
+    expectOneMathSourceMode(rejected);
+    expect(rejected.querySelectorAll("*").length).toBeLessThan(10);
+  });
+
+  it("coalesces a maximum-size 16,000-formula message to bounded DOM", () => {
+    const source = Array.from({ length: 16_000 }, () => "$x$").join(" ");
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(new TextEncoder().encode(source)).toHaveLength(63_999);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toBe(source);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
+  });
+
+  it("preserves exact TeX escapes and delimiters in aggregate source mode", () => {
+    const source = `${String.raw`formula $a\_b$`} ${Array.from(
+      { length: 500 },
+      () => "$x$",
+    ).join(" ")}`;
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toBe(source);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
   });
 
   it("caps aggregate TeX source even when each formula is individually small", () => {
@@ -543,12 +572,9 @@ describe("@sumi/ui CompactMessageResponse", () => {
     );
 
     expect(container.querySelector(".katex")).toBeNull();
-    expect(
-      container.querySelectorAll("[data-math-fallback=aggregate]"),
-    ).toHaveLength(30);
-    expect(
-      container.querySelector("[data-math-fallback=aggregate]")?.textContent,
-    ).toBe(tex);
+    expect(container.textContent).toBe(source);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
   });
 
   it("caps aggregate TeX tokens before rendering later formulae", () => {
@@ -560,12 +586,9 @@ describe("@sumi/ui CompactMessageResponse", () => {
 
     expect(tex).toHaveLength(2_048);
     expect(container.querySelector(".katex")).toBeNull();
-    expect(
-      container.querySelectorAll("[data-math-fallback=aggregate]"),
-    ).toHaveLength(3);
-    expect(
-      container.querySelector("[data-math-fallback=aggregate]")?.textContent,
-    ).toBe(tex);
+    expect(container.textContent).toBe(source);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
   });
 
   it("caps aggregate KaTeX output nodes after bounded individual renders", () => {
@@ -576,13 +599,32 @@ describe("@sumi/ui CompactMessageResponse", () => {
     );
 
     expect(container.querySelector(".katex")).toBeNull();
-    expect(
-      container.querySelectorAll("[data-math-fallback=aggregate]"),
-    ).toHaveLength(4);
-    expect(
-      container.querySelector("[data-math-fallback=aggregate]"),
-    ).toHaveTextContent(tex);
-    expect(container.querySelectorAll("*").length).toBeLessThan(10_000);
+    expect(container.textContent).toBe(source);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
+  });
+
+  it.each([
+    ["square roots", String.raw`\sqrt{x}`.repeat(512)],
+    ["fractions", String.raw`\frac{1}{2}`.repeat(292)],
+    ["scripts", "x^{y}_{z}".repeat(227)],
+    ["text", String.raw`\text{x}`.repeat(512)],
+    ["accents", String.raw`\hat{x}`.repeat(512)],
+    ["overbraces", String.raw`\overbrace{x}`.repeat(315)],
+    [
+      "arrays",
+      `${String.raw`\begin{matrix}`}${Array.from({ length: 200 }, () => "x&x&x&x").join(String.raw`\\`)}${String.raw`\end{matrix}`}`,
+    ],
+  ])("keeps high-expansion built-in %s source-only before KaTeX", (_name, tex) => {
+    const { container } = render(
+      <CompactMessageResponse>{`$$${tex}$$`}</CompactMessageResponse>,
+    );
+
+    expect(tex.length).toBeLessThanOrEqual(4_096);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toBe(`$$${tex}$$`);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
   });
 
   it("preserves non-math Markdown when aggregate math stays source text", () => {
@@ -600,13 +642,9 @@ describe("@sumi/ui CompactMessageResponse", () => {
     );
     expect(container.querySelector("code")).toHaveTextContent("code");
     expect(container.querySelector(".katex")).toBeNull();
-    const fallbacks = container.querySelectorAll(
-      "[data-math-fallback=aggregate]",
-    );
-    expect(fallbacks).toHaveLength(501);
-    expect(
-      [...fallbacks].every((fallback) => fallback.textContent === "x"),
-    ).toBe(true);
+    expect(container).toHaveTextContent(formulae);
+    expectOneMathSourceMode(container);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
   });
 
   it.each([

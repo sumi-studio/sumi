@@ -10,7 +10,7 @@ interface MdNode {
   children?: MdNode[];
   data?: {
     hName: string;
-    hProperties: { className: string[] };
+    hProperties: Record<string, unknown>;
     hChildren: Array<{ type: "text"; value: string }>;
   };
 }
@@ -268,12 +268,16 @@ function splitSingleDollarMath(value: string, raw: string): MdNode[] | null {
     const closerToken = dollars.get(closer);
     if (!openerToken || !closerToken) return null;
     const math = raw.slice(openerToken.rawEnd, closerToken.rawStart);
+    const mathRaw = raw.slice(openerToken.rawStart, closerToken.rawEnd);
     output.push({
       type: "inlineMath",
       value: math,
       data: {
         hName: "code",
-        hProperties: { className: ["language-math", "math-inline"] },
+        hProperties: {
+          className: ["language-math", "math-inline"],
+          "data-math-raw": mathRaw,
+        },
         hChildren: [{ type: "text", value: math }],
       },
     });

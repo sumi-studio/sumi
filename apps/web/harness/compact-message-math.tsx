@@ -3,10 +3,9 @@ import { CompactMessageResponse } from "@sumi/ui/ai-elements/compact-message-res
 import { createRoot } from "react-dom/client";
 
 const macroExpansionProbe = `\\def\\boom{${"x".repeat(200)}}${"\\boom".repeat(200)}`;
-const aggregateMathProbe = Array.from(
-  { length: 4_000 },
-  () => String.raw`$\frac{1}{2}$`,
-).join(" ");
+const aggregateMathProbe = Array.from({ length: 16_000 }, () => "$x$").join(
+  " ",
+);
 
 function App() {
   return (

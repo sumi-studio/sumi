@@ -96,33 +96,46 @@ test("math stays locally scrollable and copies one TeX source", async ({
       .locator("#aggregate-math")
       .evaluate((message) => ({
         descendants: message.querySelectorAll("*").length,
-        firstFallback:
-          message.querySelector<HTMLElement>("[data-math-fallback=aggregate]")
-            ?.textContent ?? null,
-        fallbacks: message.querySelectorAll("[data-math-fallback=aggregate]")
-          .length,
         formulae: message.querySelectorAll(".katex").length,
+        sourceModeTitle:
+          message
+            .querySelector<HTMLElement>("[data-math-source-mode=budget]")
+            ?.getAttribute("title") ?? null,
+        sourceModes: message.querySelectorAll("[data-math-source-mode=budget]")
+          .length,
+        text: message.textContent ?? "",
       }));
     expect(aggregate.formulae).toBe(0);
-    expect(aggregate.fallbacks).toBe(4_000);
-    expect(aggregate.firstFallback).toBe(String.raw`\frac{1}{2}`);
-    expect(aggregate.descendants).toBeLessThan(20_000);
+    expect(aggregate.text).toBe(
+      Array.from({ length: 16_000 }, () => "$x$").join(" "),
+    );
+    expect(aggregate.sourceModes).toBe(1);
+    expect(aggregate.sourceModeTitle).toBe(
+      "数式の量が多いため原文のまま表示しています",
+    );
+    expect(aggregate.descendants).toBeLessThan(10);
 
-    await copyFormula(page, "#aggregate-math [data-math-fallback=aggregate]");
+    await copyFormula(page, "#aggregate-math [data-compact-message-response]");
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()))
-      .toBe(String.raw`\frac{1}{2}`);
+      .toBe(Array.from({ length: 16_000 }, () => "$x$").join(" "));
 
     await page.reload();
     await page.waitForFunction(() => "__compactMathReady" in window);
     const aggregateAfterReload = await page
       .locator("#aggregate-math")
       .evaluate((message) => ({
-        fallbacks: message.querySelectorAll("[data-math-fallback=aggregate]")
-          .length,
+        descendants: message.querySelectorAll("*").length,
         formulae: message.querySelectorAll(".katex").length,
+        sourceModeTitle:
+          message
+            .querySelector<HTMLElement>("[data-math-source-mode=budget]")
+            ?.getAttribute("title") ?? null,
+        sourceModes: message.querySelectorAll("[data-math-source-mode=budget]")
+          .length,
+        text: message.textContent ?? "",
       }));
-    expect(aggregateAfterReload).toEqual({ fallbacks: 4_000, formulae: 0 });
+    expect(aggregateAfterReload).toEqual(aggregate);
 
     const mixed = String.raw`E=mc^2 tail
 next line

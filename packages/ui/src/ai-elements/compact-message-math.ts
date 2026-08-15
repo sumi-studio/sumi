@@ -26,6 +26,7 @@ interface HastNode {
 
 interface MathScope {
   display: boolean;
+  raw: string;
   source: string;
 }
 
@@ -36,6 +37,10 @@ const MAX_MESSAGE_MATH_EXPRESSIONS = 500;
 const MAX_MESSAGE_TEX_SOURCE_LENGTH = 32_768;
 const MAX_MESSAGE_TEX_TOKENS = 6_000;
 const MAX_MESSAGE_MATH_OUTPUT_NODES = 8_192;
+const MAX_MESSAGE_TEX_RENDER_RISK = 8_192;
+const TEX_RENDER_FORMULA_RISK = 8;
+const TEX_RENDER_TOKEN_RISK = 8;
+const TEX_RENDER_COMMAND_RISK = 64;
 
 // KaTeX supports these author-controlled assignment primitives. Even with a
 // finite maxExpand, a short definition body can be repeated enough times to
@@ -68,12 +73,13 @@ function rawSource(source: string, node: MdNode): string | null {
   return raw.startsWith("$") && raw.endsWith("$") ? raw : null;
 }
 
-function displayMathNode(value: string): MdNode {
+function displayMathNode(value: string, raw: string): MdNode {
   return {
     type: "math",
     value,
     data: {
       hName: "pre",
+      hProperties: { "data-math-raw": raw },
       hChildren: [
         {
           type: "element",
@@ -116,7 +122,7 @@ function splitDisplayMathLines(
     const raw = child.type === "inlineMath" ? rawSource(source, child) : null;
     if (aloneOnLine && raw !== null && dollarRun(raw) >= 2) {
       flush();
-      output.push(displayMathNode(child.value ?? ""));
+      output.push(displayMathNode(child.value ?? "", raw));
       promoted = true;
       continue;
     }
@@ -131,6 +137,23 @@ export function remarkCompactMath() {
   return (tree: MdNode, file: { value?: unknown }) => {
     const source = typeof file.value === "string" ? file.value : "";
     if (source === "") return;
+
+    const preserveRawMathSource = (node: MdNode) => {
+      if (node.type === "inlineMath" || node.type === "math") {
+        const raw = rawSource(source, node);
+        if (raw !== null) {
+          node.data = {
+            ...node.data,
+            hProperties: {
+              ...node.data?.hProperties,
+              "data-math-raw": raw,
+            },
+          };
+        }
+      }
+      for (const child of node.children ?? []) preserveRawMathSource(child);
+    };
+    preserveRawMathSource(tree);
 
     const promoteDisplays = (node: MdNode) => {
       if (!node.children) return;
@@ -166,6 +189,22 @@ function hastText(node: HastNode): string {
   return (node.children ?? []).map(hastText).join("");
 }
 
+function hastStringProperty(node: HastNode, name: string): string | null {
+  const value = node.properties?.[name];
+  return typeof value === "string" ? value : null;
+}
+
+function sourceWithDelimiters(
+  node: HastNode,
+  source: string,
+  display: boolean,
+): string {
+  return (
+    hastStringProperty(node, "data-math-raw") ??
+    (display ? `$$${source}$$` : `$${source}$`)
+  );
+}
+
 function mathScope(node: HastNode): MathScope | null {
   if (node.type !== "element") return null;
   const classes = hastClassNames(node);
@@ -173,9 +212,12 @@ function mathScope(node: HastNode): MathScope | null {
     node.tagName === "code" &&
     (classes.includes("math-inline") || classes.includes("math-display"))
   ) {
+    const display = classes.includes("math-display");
+    const source = hastText(node);
     return {
-      display: classes.includes("math-display"),
-      source: hastText(node),
+      display,
+      raw: sourceWithDelimiters(node, source, display),
+      source,
     };
   }
   if (node.tagName !== "pre") return null;
@@ -185,21 +227,31 @@ function mathScope(node: HastNode): MathScope | null {
       child.tagName === "code" &&
       hastClassNames(child).includes("language-math"),
   );
-  return code ? { display: true, source: hastText(code) } : null;
+  if (!code) return null;
+  const source = hastText(code);
+  return {
+    display: true,
+    raw:
+      hastStringProperty(node, "data-math-raw") ??
+      sourceWithDelimiters(code, source, true),
+    source,
+  };
 }
 
 type MathLimit = "length" | "depth" | "tokens" | "macro";
 
 interface TexInspection {
   limit: MathLimit | null;
+  renderRisk: number;
   tokens: number;
 }
 
 function inspectTex(source: string): TexInspection {
   if (source.length > MAX_TEX_SOURCE_LENGTH) {
-    return { limit: "length", tokens: 0 };
+    return { limit: "length", renderRisk: 0, tokens: 0 };
   }
   let depth = 0;
+  let renderRisk = TEX_RENDER_FORMULA_RISK;
   let tokens = 0;
   for (let index = 0; index < source.length; index += 1) {
     const character = source.charAt(index);
@@ -214,8 +266,11 @@ function inspectTex(source: string): TexInspection {
       continue;
     }
     tokens += 1;
-    if (tokens > MAX_TEX_TOKENS) return { limit: "tokens", tokens };
+    if (tokens > MAX_TEX_TOKENS) {
+      return { limit: "tokens", renderRisk: 0, tokens };
+    }
     if (character === "\\") {
+      renderRisk += TEX_RENDER_COMMAND_RISK;
       const commandStart = index;
       if (/[A-Za-z@]/.test(source[index + 1] ?? "")) {
         while (/[A-Za-z@]/.test(source[index + 1] ?? "")) index += 1;
@@ -223,45 +278,41 @@ function inspectTex(source: string): TexInspection {
         index += 1;
       }
       if (AUTHOR_MACRO_PRIMITIVES.has(source.slice(commandStart, index + 1))) {
-        return { limit: "macro", tokens };
+        return { limit: "macro", renderRisk: 0, tokens };
       }
       continue;
     }
+    renderRisk += TEX_RENDER_TOKEN_RISK;
     if (character === "{") {
       depth += 1;
       if (depth > MAX_TEX_NESTING_DEPTH) {
-        return { limit: "depth", tokens };
+        return { limit: "depth", renderRisk: 0, tokens };
       }
     } else if (character === "}") {
       depth = Math.max(0, depth - 1);
     }
   }
-  return { limit: null, tokens };
+  return { limit: null, renderRisk, tokens };
 }
 
 function mathFallback(
   source: string,
   display: boolean,
-  reason: MathLimit | "aggregate" | "render",
+  reason: MathLimit | "render",
 ): HastNode {
-  const aggregateSource = reason === "aggregate";
   const error: HastNode = {
     type: "element",
     tagName: "span",
     properties: {
-      className: aggregateSource
-        ? ["rounded", "bg-muted", "px-1", "py-px", "font-mono", "text-[12.5px]"]
-        : ["katex-error"],
-      ...(aggregateSource ? {} : { style: "color:var(--destructive)" }),
-      title: aggregateSource
-        ? "数式の量が多いため原文のまま表示しています"
-        : reason === "render"
+      className: ["katex-error"],
+      style: "color:var(--destructive)",
+      title:
+        reason === "render"
           ? "数式を描画できませんでした"
           : reason === "macro"
             ? "数式内でのコマンド定義は使用できません"
             : "数式が表示上限を超えています",
       "data-math-fallback": reason,
-      ...(aggregateSource ? { "data-math-source": "budget" } : {}),
     },
     children: [{ type: "text", value: source }],
   };
@@ -343,6 +394,42 @@ function cloneHast(node: HastNode): HastNode {
   };
 }
 
+function coalesceMathSource(tree: HastNode) {
+  replaceMath(tree, (scope) => ({ type: "text", value: scope.raw }));
+
+  const mergeText = (node: HastNode) => {
+    const children = node.children;
+    if (!children) return;
+    const merged: HastNode[] = [];
+    for (const child of children) {
+      mergeText(child);
+      const previous = merged.at(-1);
+      if (child.type === "text" && previous?.type === "text") {
+        previous.value = `${previous.value ?? ""}${child.value ?? ""}`;
+      } else {
+        merged.push(child);
+      }
+    }
+    node.children = merged;
+  };
+  mergeText(tree);
+
+  const sourceModeProperties = {
+    "data-math-source-mode": "budget",
+    title: "数式の量が多いため原文のまま表示しています",
+  };
+  if (tree.children && tree.children.length > 0) {
+    tree.children = [
+      {
+        type: "element",
+        tagName: "div",
+        properties: sourceModeProperties,
+        children: tree.children,
+      },
+    ];
+  }
+}
+
 function boundedHastNodeCount(
   node: HastNode,
   remaining: number,
@@ -363,21 +450,22 @@ const KATEX_OPTIONS = {
   strict: "ignore" as const,
   errorColor: "var(--destructive)",
   trust: false,
-  maxExpand: 1_000,
+  maxExpand: 100,
   maxSize: 20,
 };
 
+type KatexTransform = (tree: HastNode, file: unknown) => void;
+
 /**
  * Decide the message-wide rendering mode before KaTeX allocates layout nodes.
- * Input limits and the bounded output preflight are deterministic from the
- * message: if the aggregate budget is exceeded, every formula stays source
- * text rather than exposing an unexplained first-N rendering boundary.
+ * The lexical render-risk score is deliberately conservative: it is not a
+ * claimed HAST-node estimate, but it charges control sequences more heavily
+ * than ordinary tokens so known high-expansion built-ins never reach KaTeX.
+ * Post-render node counting remains a separate defense for admitted input.
  */
-export function rehypeCompactKatex() {
-  const render = rehypeKatex(KATEX_OPTIONS) as unknown as (
-    tree: HastNode,
-    file: unknown,
-  ) => void;
+export function rehypeCompactKatex(renderOverride?: KatexTransform) {
+  const render =
+    renderOverride ?? (rehypeKatex(KATEX_OPTIONS) as unknown as KatexTransform);
   return (tree: HastNode, file: unknown) => {
     const occurrences = collectMath(tree);
     const aggregateSourceLength = occurrences.reduce(
@@ -388,15 +476,18 @@ export function rehypeCompactKatex() {
       (total, occurrence) => total + occurrence.inspection.tokens,
       0,
     );
+    const aggregateRenderRisk = occurrences.reduce(
+      (total, occurrence) => total + occurrence.inspection.renderRisk,
+      0,
+    );
     const aggregateInputExceeded =
       occurrences.length > MAX_MESSAGE_MATH_EXPRESSIONS ||
       aggregateSourceLength > MAX_MESSAGE_TEX_SOURCE_LENGTH ||
-      aggregateTokens > MAX_MESSAGE_TEX_TOKENS;
+      aggregateTokens > MAX_MESSAGE_TEX_TOKENS ||
+      aggregateRenderRisk > MAX_MESSAGE_TEX_RENDER_RISK;
 
     if (aggregateInputExceeded) {
-      replaceMath(tree, (scope) =>
-        mathFallback(scope.source, scope.display, "aggregate"),
-      );
+      coalesceMathSource(tree);
       return;
     }
 
@@ -435,13 +526,7 @@ export function rehypeCompactKatex() {
         MAX_MESSAGE_MATH_OUTPUT_NODES - outputNodes,
       );
       if (renderedNodes === null) {
-        replaceMath(tree, (fallbackScope) =>
-          mathFallback(
-            fallbackScope.source,
-            fallbackScope.display,
-            "aggregate",
-          ),
-        );
+        coalesceMathSource(tree);
         return;
       }
       outputNodes += renderedNodes;
