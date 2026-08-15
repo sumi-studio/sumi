@@ -131,25 +131,51 @@ function hasLaterCloser(
 }
 
 /**
- * A leading number followed by prose is much more likely to be a price than a
- * TeX expression. Keep conservative numeric expressions such as `$5+x$`
- * intact while allowing a later complete formula to recover after currency.
+ * One dollar can be both the closer of a numeric expression and the opener of
+ * later math. Re-synchronize only across a structured prose label, retain
+ * concrete TeX syntax, and leave the whole text node inert when neither is
+ * established.
  */
-function currencyProseBefore(
+type SharedNumericDelimiter = "formula" | "currency" | "ambiguous";
+
+function currencyTransition(suffix: string): boolean {
+  const englishLabel =
+    /^[,.;!?]\s*[A-Za-z]+(?:\s+[A-Za-z]+)*\s*[:：]\s*$/u.test(suffix);
+  const japaneseLabel =
+    /^[、。，．：；！？]\s*[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]+(?:は|が|を|に|へ|で|と|も|の|[:：])\s*$/u.test(
+      suffix,
+    );
+  return englishLabel || japaneseLabel;
+}
+
+function numericFormula(suffix: string): boolean {
+  if (/\\(?:[A-Za-z]+|[^A-Za-z\s])/u.test(suffix)) return true;
+  if (/[+\-*/=^_<>{}()[\]|±∓×÷·⋅≤≥≈≠]/u.test(suffix)) return true;
+
+  const compactVariable =
+    /^[\p{L}][\p{L}\p{N}]*$/u.test(suffix) ||
+    /^(?:\p{White_Space}|\uFEFF)*[A-Za-z\u0370-\u03ff](?:\p{White_Space}|\uFEFF)*$/u.test(
+      suffix,
+    );
+  const commaSeparatedVariable =
+    /^[,;](?:\p{White_Space}|\uFEFF)*[A-Za-z\u0370-\u03ff](?:\p{White_Space}|\uFEFF)*$/u.test(
+      suffix,
+    );
+  return compactVariable || commaSeparatedVariable;
+}
+
+function sharedNumericDelimiter(
   value: string,
   opener: number,
   candidate: number,
-): boolean {
-  if (!digit(value[opener + 1])) return false;
+): SharedNumericDelimiter {
   const body = value.slice(opener + 1, candidate);
   const amount = body.match(/^[0-9]+(?:[.,][0-9]+)*/u)?.[0] ?? "";
+  if (amount === "") return "ambiguous";
   const suffix = body.slice(amount.length);
-  if (suffix === "") return false;
-  return (
-    UNICODE_WHITESPACE.test(suffix) ||
-    /[、，：][\p{L}\p{N}]/u.test(suffix) ||
-    /[,;:][A-Za-z]{2,}/u.test(suffix)
-  );
+  if (currencyTransition(suffix)) return "currency";
+  if (numericFormula(suffix)) return "formula";
+  return "ambiguous";
 }
 
 function splitSingleDollarMath(value: string, raw: string): MdNode[] | null {
@@ -176,10 +202,12 @@ function splitSingleDollarMath(value: string, raw: string): MdNode[] | null {
       if (canClose(value, dollars, closer)) {
         if (
           canOpen(value, dollars, closer) &&
-          currencyProseBefore(value, opener, closer) &&
+          digit(value[opener + 1]) &&
           hasLaterCloser(value, dollars, closer)
         ) {
-          retryAt = closer;
+          const decision = sharedNumericDelimiter(value, opener, closer);
+          if (decision === "currency") retryAt = closer;
+          else if (decision === "ambiguous") return null;
         }
         break;
       }

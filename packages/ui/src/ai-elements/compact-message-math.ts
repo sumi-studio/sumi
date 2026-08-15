@@ -33,6 +33,21 @@ const MAX_TEX_SOURCE_LENGTH = 4_096;
 const MAX_TEX_NESTING_DEPTH = 64;
 const MAX_TEX_TOKENS = 2_048;
 
+// KaTeX supports these author-controlled assignment primitives. Even with a
+// finite maxExpand, a short definition body can be repeated enough times to
+// allocate a much larger render tree than the source limits imply.
+const AUTHOR_MACRO_PRIMITIVES = new Set([
+  "\\def",
+  "\\gdef",
+  "\\edef",
+  "\\xdef",
+  "\\let",
+  "\\futurelet",
+  "\\newcommand",
+  "\\renewcommand",
+  "\\providecommand",
+]);
+
 export const REMARK_MATH_OPTIONS = { singleDollarTextMath: false } as const;
 
 function dollarRun(raw: string): number {
@@ -169,7 +184,7 @@ function mathScope(node: HastNode): MathScope | null {
   return code ? { display: true, source: hastText(code) } : null;
 }
 
-type MathLimit = "length" | "depth" | "tokens";
+type MathLimit = "length" | "depth" | "tokens" | "macro";
 
 function texLimit(source: string): MathLimit | null {
   if (source.length > MAX_TEX_SOURCE_LENGTH) return "length";
@@ -178,10 +193,27 @@ function texLimit(source: string): MathLimit | null {
   for (let index = 0; index < source.length; index += 1) {
     const character = source.charAt(index);
     if (/\s/.test(character)) continue;
+    if (character === "%") {
+      while (
+        index + 1 < source.length &&
+        !/[\n\r]/.test(source.charAt(index + 1))
+      ) {
+        index += 1;
+      }
+      continue;
+    }
     tokens += 1;
     if (tokens > MAX_TEX_TOKENS) return "tokens";
     if (character === "\\") {
-      while (/[A-Za-z]/.test(source[index + 1] ?? "")) index += 1;
+      const commandStart = index;
+      if (/[A-Za-z@]/.test(source[index + 1] ?? "")) {
+        while (/[A-Za-z@]/.test(source[index + 1] ?? "")) index += 1;
+      } else if (source[index + 1] !== undefined) {
+        index += 1;
+      }
+      if (AUTHOR_MACRO_PRIMITIVES.has(source.slice(commandStart, index + 1))) {
+        return "macro";
+      }
       continue;
     }
     if (character === "{") {
@@ -208,7 +240,9 @@ function mathFallback(
       title:
         reason === "render"
           ? "数式を描画できませんでした"
-          : "数式が表示上限を超えています",
+          : reason === "macro"
+            ? "数式内でのコマンド定義は使用できません"
+            : "数式が表示上限を超えています",
       "data-math-fallback": reason,
     },
     children: [{ type: "text", value: source }],

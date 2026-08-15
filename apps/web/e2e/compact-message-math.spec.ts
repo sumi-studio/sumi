@@ -68,6 +68,30 @@ test("math stays locally scrollable and copies one TeX source", async ({
     expect(adjacentCurrency.text).toContain("Price $5, formula:");
     expect(adjacentCurrency.sources).toEqual(["x"]);
 
+    const japaneseCurrency = await mathSources(page, "#currency-japanese");
+    expect(japaneseCurrency.text).toContain("価格は$5。式は");
+    expect(japaneseCurrency.sources).toEqual(["x"]);
+
+    const numericFormula = await mathSources(page, "#numeric-formula-adjacent");
+    expect(numericFormula.sources).toEqual(["5 + x", "y"]);
+
+    const macroSource = `\\def\\boom{${"x".repeat(200)}}${"\\boom".repeat(200)}`;
+    const macro = await page.locator("#macro-expansion").evaluate((message) => {
+      const fallback = message.querySelector<HTMLElement>(
+        "[data-math-fallback=macro]",
+      );
+      return {
+        descendants: message.querySelectorAll("*").length,
+        fallback: fallback?.textContent ?? null,
+        katex: message.querySelector(".katex") !== null,
+      };
+    });
+    expect(macro).toEqual({
+      descendants: 4,
+      fallback: macroSource,
+      katex: false,
+    });
+
     const mixed = String.raw`E=mc^2 tail
 next line
 Second \frac{1}{2}`;
@@ -83,6 +107,22 @@ Second \frac{1}{2}`;
     await stop(vite);
   }
 });
+
+async function mathSources(
+  page: {
+    locator(selector: string): {
+      evaluate<T>(fn: (node: HTMLElement) => T): Promise<T>;
+    };
+  },
+  selector: string,
+) {
+  return page.locator(selector).evaluate((message) => ({
+    text: message.textContent ?? "",
+    sources: [
+      ...message.querySelectorAll('annotation[encoding="application/x-tex"]'),
+    ].map((annotation) => annotation.textContent),
+  }));
+}
 
 async function copyFormula(
   page: {
