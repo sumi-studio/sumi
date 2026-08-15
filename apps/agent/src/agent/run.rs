@@ -31,6 +31,7 @@ use crate::{
         route_broker::{
             ApprovalPrincipalScope, CurrentCallResolution, PendingApproval as RoutePendingApproval,
             RouteApprovalBroker, RouteApprovalOutcome, WaiterResult as RouteWaiterResult,
+            normal_reauthorization_exhausted,
         },
     },
     gateway::Command,
@@ -1545,8 +1546,10 @@ impl Runner {
                 .saturating_add(index as u64)
                 .saturating_add(1)
                 .to_string();
+            let mut authorization_attempts = 0_usize;
 
             'authorize: loop {
+                authorization_attempts = authorization_attempts.saturating_add(1);
                 match self
                     .evaluate_route_call(
                         broker.clone(),
@@ -1579,8 +1582,49 @@ impl Runner {
                                 cancel_reason = Some(reason);
                             }
                             RouteExecutionDisposition::Reauthorize { sealed: next } => {
-                                sealed = next;
-                                continue 'authorize;
+                                if normal_reauthorization_exhausted(authorization_attempts) {
+                                    let RouteApprovalOutcome::Denied {
+                                        reason,
+                                        evidence,
+                                        bound,
+                                    } = broker
+                                        .deny_reauthorization_exhausted(
+                                            next,
+                                            call.route,
+                                            authorization_attempts,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            WorkerFailure::Error(format!(
+                                                "route reauthorization exhaustion failed closed: {error}"
+                                            ))
+                                        })?
+                                    else {
+                                        unreachable!(
+                                            "reauthorization exhaustion only returns a denial"
+                                        )
+                                    };
+                                    let result = route_denial_tool_result(
+                                        call,
+                                        evidence.error_code(),
+                                        &reason,
+                                    );
+                                    let result_message = PublicMessage::ToolResult(result.clone());
+                                    let waiter = self
+                                        .emit_route_denied_result_message(
+                                            assistant_message_id,
+                                            &result,
+                                            bound,
+                                            evidence,
+                                        )
+                                        .await?;
+                                    receipts.push(self.await_message_receipt(waiter).await?);
+                                    results.push(result);
+                                    transcript.push(result_message);
+                                } else {
+                                    sealed = next;
+                                    continue 'authorize;
+                                }
                             }
                         }
                     }
@@ -3502,7 +3546,10 @@ impl Runner {
                 self.core
                     .queue_followup(command)
                     .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                Ok(ToolStartOutcome::Preempted)
+                let result = (&mut *committed).await.map_err(|_| {
+                    WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
+                })?;
+                Ok(tool_start_outcome(result))
             }
             RunControl::HardSteer { command, accepted } => {
                 if accepted.send(true).is_ok() {
@@ -3511,7 +3558,10 @@ impl Runner {
                         .queue_followup(command)
                         .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                 }
-                Ok(ToolStartOutcome::Preempted)
+                let result = (&mut *committed).await.map_err(|_| {
+                    WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
+                })?;
+                Ok(tool_start_outcome(result))
             }
             RunControl::SoftSteer {
                 command,

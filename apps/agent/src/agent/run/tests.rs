@@ -4988,6 +4988,104 @@ async fn tool_start_barrier_held_by_abort_preempts() {
 }
 
 #[tokio::test]
+async fn queued_command_cannot_preempt_an_unresolved_tool_start() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (commit_start_tx, commit_start_rx) = oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        let barrier = output
+            .commit_barrier
+            .expect("ToolExecutionStart commit barrier");
+        start_held_tx.send(()).expect("announce held start");
+        commit_start_rx.await.expect("release held start");
+        barrier.committed();
+    });
+    let mut handle = tokio::spawn(async move {
+        let mut runner = runner;
+        let outcome = runner
+            .emit_tool_start_and_wait_committed(&call("command-race"), None)
+            .await;
+        (runner, outcome)
+    });
+
+    start_held_rx.await.expect("start held");
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("queue command during start commit");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut handle)
+            .await
+            .is_err(),
+        "worker must retain the start permit until the durable barrier resolves"
+    );
+    commit_start_tx.send(()).expect("commit held start");
+
+    let (mut runner, outcome) = handle.await.expect("worker join");
+    assert_eq!(outcome.expect("start outcome"), ToolStartOutcome::Started);
+    assert!(
+        runner.core.next_followup().is_some(),
+        "the command remains queued after the already-started tool"
+    );
+    collector.await.expect("collector");
+}
+
+#[tokio::test]
+async fn hard_steer_cannot_drop_an_unresolved_tool_start_permit() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (commit_start_tx, commit_start_rx) = oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        let barrier = output
+            .commit_barrier
+            .expect("ToolExecutionStart commit barrier");
+        start_held_tx.send(()).expect("announce held start");
+        commit_start_rx.await.expect("release held start");
+        barrier.committed();
+    });
+    let mut handle = tokio::spawn(async move {
+        let mut runner = runner;
+        let outcome = runner
+            .emit_tool_start_and_wait_committed(&call("hard-steer-race"), None)
+            .await;
+        (runner, outcome)
+    });
+
+    start_held_rx.await.expect("start held");
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("queue hard steer during start commit");
+    assert!(accepted_rx.await.expect("hard steer acceptance"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut handle)
+            .await
+            .is_err(),
+        "accepted hard steer must not discard the unresolved start permit"
+    );
+    commit_start_tx.send(()).expect("commit held start");
+
+    let (mut runner, outcome) = handle.await.expect("worker join");
+    assert_eq!(outcome.expect("start outcome"), ToolStartOutcome::Started);
+    assert!(runner.core.next_followup().is_some());
+    collector.await.expect("collector");
+}
+
+#[tokio::test]
 async fn dropped_soft_steer_authorization_cannot_preempt_tool_start() {
     let driver = Arc::new(FixtureDriver::new(Vec::new()));
     let (control_tx, control_rx) = mpsc::channel(1);
