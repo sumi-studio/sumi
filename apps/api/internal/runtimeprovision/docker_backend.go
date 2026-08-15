@@ -306,6 +306,7 @@ func sanitizeSupervisorError(message string, environment []string) string {
 		switch name {
 		case "SUMI_LOCAL_CONTROL_BEARER", "SUMI_AGENT_WRAPPING_KEY",
 			"SUMI_APPROVAL_SECRET_DIGEST_KEY", "SUMI_PROVIDER_API_KEY",
+			"SUMI_EXECUTION_REVIEWER_API_KEY", "SUMI_ESCALATION_REVIEWER_API_KEY",
 			"SUMI_EXPECTED_RPC_NONCE":
 			message = strings.ReplaceAll(message, value, "<redacted:"+name+">")
 		}
@@ -378,21 +379,39 @@ func (backend *DockerBackend) Activate(ctx context.Context, request ActivateRequ
 
 func activationEnvironment(config ActivationConfig) map[string]string {
 	values := map[string]string{
-		"SUMI_GATEWAY_URL":                          config.GatewayURL,
-		"SUMI_LOCAL_CONTROL_BEARER":                 config.LocalControlBearer,
-		"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX": fmt.Sprint(config.LocalControlBearerExpiresAtUnix),
-		"SUMI_LOCAL_CONTROL_SERVER_UID":             fmt.Sprint(config.LocalControlServerUID),
-		"SUMI_LOCAL_CONTROL_SOCKET_GID":             fmt.Sprint(config.LocalControlSocketGID),
-		"SUMI_AGENT_WRAPPING_KEY":                   config.AgentWrappingKey,
-		"SUMI_AGENT_WRAPPING_KEY_ID":                config.AgentWrappingKeyID,
-		"SUMI_APPROVAL_SECRET_DIGEST_KEY":           config.ApprovalSecretDigestKey,
-		"SUMI_PROVIDER_API_KEY":                     config.ProviderAPIKey,
+		"SUMI_GATEWAY_URL":                           config.GatewayURL,
+		"SUMI_LOCAL_CONTROL_BEARER":                  config.LocalControlBearer,
+		"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX":  fmt.Sprint(config.LocalControlBearerExpiresAtUnix),
+		"SUMI_LOCAL_CONTROL_SERVER_UID":              fmt.Sprint(config.LocalControlServerUID),
+		"SUMI_LOCAL_CONTROL_SOCKET_GID":              fmt.Sprint(config.LocalControlSocketGID),
+		"SUMI_AGENT_WRAPPING_KEY":                    config.AgentWrappingKey,
+		"SUMI_AGENT_WRAPPING_KEY_ID":                 config.AgentWrappingKeyID,
+		"SUMI_APPROVAL_SECRET_DIGEST_KEY":            config.ApprovalSecretDigestKey,
+		"SUMI_PROVIDER_API_KEY":                      config.ProviderAPIKey,
+		"SUMI_EXECUTION_REVIEWER_API_KEY":            config.ExecutionReviewerAPIKey,
+		"SUMI_EXECUTION_REVIEWER_MODEL_PRESET":       config.ExecutionReviewerModelPreset,
+		"SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV":  "SUMI_EXECUTION_REVIEWER_API_KEY",
+		"SUMI_ESCALATION_REVIEWER_API_KEY":           config.EscalationReviewerAPIKey,
+		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET":      config.EscalationReviewerModelPreset,
+		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV": "SUMI_ESCALATION_REVIEWER_API_KEY",
 	}
 	if config.ModelPreset != "" {
 		values["SUMI_MODEL_PRESET"] = config.ModelPreset
 	}
 	if config.ModelID != "" {
 		values["SUMI_MODEL_ID"] = config.ModelID
+	}
+	for name, value := range map[string]string{
+		"SUMI_EXECUTION_REVIEWER_MODEL_ID":             config.ExecutionReviewerModelID,
+		"SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL":       config.ExecutionReviewerModelBaseURL,
+		"SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE":  config.ExecutionReviewerAccountScope,
+		"SUMI_ESCALATION_REVIEWER_MODEL_ID":            config.EscalationReviewerModelID,
+		"SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL":      config.EscalationReviewerModelBaseURL,
+		"SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE": config.EscalationReviewerAccountScope,
+	} {
+		if value != "" {
+			values[name] = value
+		}
 	}
 	if config.AllowInsecureLoopbackGateway {
 		values["SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY"] = "true"
@@ -474,19 +493,31 @@ var reservedEnvironment = map[string]bool{
 }
 
 var allowedActivationEnvironment = map[string]bool{
-	"SUMI_GATEWAY_URL":                          true,
-	"SUMI_LOCAL_CONTROL_BEARER":                 true,
-	"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX": true,
-	"SUMI_LOCAL_CONTROL_SERVER_UID":             true,
-	"SUMI_LOCAL_CONTROL_SOCKET_GID":             true,
-	"SUMI_AGENT_WRAPPING_KEY":                   true,
-	"SUMI_AGENT_WRAPPING_KEY_ID":                true,
-	"SUMI_APPROVAL_SECRET_DIGEST_KEY":           true,
-	"SUMI_PROVIDER_API_KEY":                     true,
-	"SUMI_MODEL_PRESET":                         true,
-	"SUMI_MODEL_ID":                             true,
-	"SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY":      true,
-	"SUMI_LOG":                                  true,
+	"SUMI_GATEWAY_URL":                             true,
+	"SUMI_LOCAL_CONTROL_BEARER":                    true,
+	"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX":    true,
+	"SUMI_LOCAL_CONTROL_SERVER_UID":                true,
+	"SUMI_LOCAL_CONTROL_SOCKET_GID":                true,
+	"SUMI_AGENT_WRAPPING_KEY":                      true,
+	"SUMI_AGENT_WRAPPING_KEY_ID":                   true,
+	"SUMI_APPROVAL_SECRET_DIGEST_KEY":              true,
+	"SUMI_PROVIDER_API_KEY":                        true,
+	"SUMI_EXECUTION_REVIEWER_API_KEY":              true,
+	"SUMI_EXECUTION_REVIEWER_MODEL_PRESET":         true,
+	"SUMI_EXECUTION_REVIEWER_MODEL_ID":             true,
+	"SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL":       true,
+	"SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE":  true,
+	"SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV":    true,
+	"SUMI_ESCALATION_REVIEWER_API_KEY":             true,
+	"SUMI_ESCALATION_REVIEWER_MODEL_PRESET":        true,
+	"SUMI_ESCALATION_REVIEWER_MODEL_ID":            true,
+	"SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL":      true,
+	"SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE": true,
+	"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV":   true,
+	"SUMI_MODEL_PRESET":                            true,
+	"SUMI_MODEL_ID":                                true,
+	"SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY":         true,
+	"SUMI_LOG":                                     true,
 }
 
 func mergeEnvironment(base []string, supplied, forced map[string]string, personalityAgentID string) ([]string, error) {

@@ -15,9 +15,9 @@ use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{
-    ModelSpec, RequestOptions,
-    model::StructuredOutputSchema,
-    stream,
+    ModelSpec, ProtocolCompat, RequestOptions,
+    model::{ChatStructuredOutputMode, StructuredOutputSchema},
+    retry, stream,
     types::{
         AssistantContent, ContextMessage, Message, PromptContext, ProviderEvent, StopReason,
         UserContent, UserMessage,
@@ -121,6 +121,134 @@ pub enum ReviewerNotReady {
     InvalidBudget(String),
     #[error("reviewer model is outside the configured trust bindings")]
     UntrustedModel,
+    #[error("{reviewer} reviewer model does not support structured output")]
+    StructuredOutputUnsupported { reviewer: &'static str },
+    #[error("{left} and {right} must use distinct provider-instance/account/model identities")]
+    CollapsedModelIdentity {
+        left: &'static str,
+        right: &'static str,
+    },
+    #[error("{left} and {right} must use distinct normalized provider base endpoints")]
+    CollapsedProviderOrigin {
+        left: &'static str,
+        right: &'static str,
+    },
+    #[error("{left} and {right} must use distinct credential sources")]
+    CollapsedCredentialSource {
+        left: &'static str,
+        right: &'static str,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct IndependentReviewerModels {
+    execution: ModelSpec,
+    escalation: ModelSpec,
+}
+
+impl IndependentReviewerModels {
+    pub fn new(
+        conversation: &ModelSpec,
+        execution: ModelSpec,
+        escalation: ModelSpec,
+    ) -> Result<Self, ReviewerNotReady> {
+        require_structured_output("Execution", &execution)?;
+        require_structured_output("Escalation", &escalation)?;
+        require_independent_pair(
+            "conversation",
+            conversation,
+            "Execution reviewer",
+            &execution,
+        )?;
+        require_independent_pair(
+            "conversation",
+            conversation,
+            "Escalation reviewer",
+            &escalation,
+        )?;
+        require_independent_pair(
+            "Execution reviewer",
+            &execution,
+            "Escalation reviewer",
+            &escalation,
+        )?;
+        Ok(Self {
+            execution,
+            escalation,
+        })
+    }
+
+    pub fn into_parts(self) -> (ModelSpec, ModelSpec, ReviewerTrustSet) {
+        let execution_model = ReviewerModelSpec::from_provider(&self.execution);
+        let escalation_model = ReviewerModelSpec::from_provider(&self.escalation);
+        let trust = ReviewerTrustSet::new(vec![execution_model.clone(), escalation_model.clone()]);
+        (self.execution, self.escalation, trust)
+    }
+}
+
+fn require_independent_pair(
+    left_name: &'static str,
+    left: &ModelSpec,
+    right_name: &'static str,
+    right: &ModelSpec,
+) -> Result<(), ReviewerNotReady> {
+    require_distinct_identity(left_name, left, right_name, right)?;
+    if left.provider_origin_id() == right.provider_origin_id() {
+        return Err(ReviewerNotReady::CollapsedProviderOrigin {
+            left: left_name,
+            right: right_name,
+        });
+    }
+    if left.api_key_env == right.api_key_env {
+        return Err(ReviewerNotReady::CollapsedCredentialSource {
+            left: left_name,
+            right: right_name,
+        });
+    }
+    Ok(())
+}
+
+fn require_structured_output(
+    reviewer: &'static str,
+    spec: &ModelSpec,
+) -> Result<(), ReviewerNotReady> {
+    let supported = match &spec.compat {
+        ProtocolCompat::Chat(compat) => {
+            compat.structured_output != ChatStructuredOutputMode::Unsupported
+        }
+        ProtocolCompat::Responses(_) | ProtocolCompat::Anthropic(_) => true,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(ReviewerNotReady::StructuredOutputUnsupported { reviewer })
+    }
+}
+
+fn require_distinct_identity(
+    left_name: &'static str,
+    left: &ModelSpec,
+    right_name: &'static str,
+    right: &ModelSpec,
+) -> Result<(), ReviewerNotReady> {
+    let left_identity = (
+        left.provider_instance_id(),
+        left.account_scope.as_str(),
+        left.id.as_str(),
+    );
+    let right_identity = (
+        right.provider_instance_id(),
+        right.account_scope.as_str(),
+        right.id.as_str(),
+    );
+    if left_identity == right_identity {
+        Err(ReviewerNotReady::CollapsedModelIdentity {
+            left: left_name,
+            right: right_name,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// Complete reviewer identity. A friendly trust-domain label alone is not a
@@ -203,14 +331,10 @@ pub struct ReviewerTrustSet {
 }
 
 impl ReviewerTrustSet {
-    pub fn new(
-        conversation_model: ReviewerModelSpec,
-        allowed_reviewer_models: Vec<ReviewerModelSpec>,
-    ) -> Self {
-        let mut allowed = Vec::with_capacity(1 + allowed_reviewer_models.len());
-        allowed.push(conversation_model);
-        allowed.extend(allowed_reviewer_models);
-        Self { allowed }
+    pub fn new(allowed_reviewer_models: Vec<ReviewerModelSpec>) -> Self {
+        Self {
+            allowed: allowed_reviewer_models,
+        }
     }
 
     pub fn allows(&self, model: &ReviewerModelSpec) -> bool {
@@ -509,41 +633,77 @@ async fn complete_provider_review(
                 "provider ended without a terminal event".to_owned(),
             ));
         };
-        match event {
-            ProviderEvent::Done { output, .. } => {
-                if output.message.stop_reason == StopReason::Error {
-                    return Err(ReviewerTransportError::Transient(
-                        "provider returned an error terminal".to_owned(),
-                    ));
-                }
-                let mut parts = Vec::new();
-                for content in output.message.content {
-                    match content {
-                        AssistantContent::Text { text, .. } => parts.push(text),
-                        AssistantContent::Thinking { .. } => {}
-                        AssistantContent::ToolCall { .. }
-                        | AssistantContent::RejectedToolCall { .. } => {
-                            return Err(ReviewerTransportError::ToolCall);
-                        }
-                    }
-                }
-                let text = parts.join("").trim().to_owned();
-                return if text.is_empty() {
-                    Err(ReviewerTransportError::Empty)
-                } else {
-                    Ok(text)
-                };
-            }
-            ProviderEvent::Error { .. } if cancel.is_cancelled() => {
-                return Err(ReviewerTransportError::Cancelled);
-            }
-            ProviderEvent::Error { .. } => {
-                return Err(ReviewerTransportError::Transient(
-                    "provider returned an error event".to_owned(),
-                ));
-            }
-            _ => {}
+        if let Some(terminal) = classify_provider_review_terminal(event, cancel.is_cancelled()) {
+            return terminal;
         }
+    }
+}
+
+fn classify_provider_review_terminal(
+    event: ProviderEvent,
+    cancelled: bool,
+) -> Option<Result<String, ReviewerTransportError>> {
+    let (kind, reason, output) = match event {
+        ProviderEvent::Done { reason, output } => ("done", reason, output),
+        ProviderEvent::Error { reason, output } => ("error", reason, output),
+        _ => return None,
+    };
+    if cancelled || reason == StopReason::Aborted {
+        return Some(Err(ReviewerTransportError::Cancelled));
+    }
+    if reason != output.message.stop_reason {
+        return Some(Err(ReviewerTransportError::Fatal(format!(
+            "provider {kind} terminal reason disagrees with its message"
+        ))));
+    }
+    match reason {
+        StopReason::Stop if kind == "done" => Some(extract_provider_review_text(output.message)),
+        StopReason::ToolUse => Some(Err(ReviewerTransportError::ToolCall)),
+        StopReason::Length => Some(Err(ReviewerTransportError::Fatal(
+            "provider truncated the reviewer response".to_owned(),
+        ))),
+        StopReason::Error => Some(Err(classify_provider_review_error(&output.message))),
+        StopReason::Stop => Some(Err(ReviewerTransportError::Fatal(
+            "provider emitted an error terminal with a success reason".to_owned(),
+        ))),
+        StopReason::Aborted => unreachable!("aborted terminals return above"),
+    }
+}
+
+fn extract_provider_review_text(
+    message: crate::provider::types::AssistantMessage,
+) -> Result<String, ReviewerTransportError> {
+    let mut parts = Vec::new();
+    for content in message.content {
+        match content {
+            AssistantContent::Text { text, .. } => parts.push(text),
+            AssistantContent::Thinking { .. } => {}
+            AssistantContent::ToolCall { .. } | AssistantContent::RejectedToolCall { .. } => {
+                return Err(ReviewerTransportError::ToolCall);
+            }
+        }
+    }
+    let text = parts.join("").trim().to_owned();
+    if text.is_empty() {
+        Err(ReviewerTransportError::Empty)
+    } else {
+        Ok(text)
+    }
+}
+
+fn classify_provider_review_error(
+    message: &crate::provider::types::AssistantMessage,
+) -> ReviewerTransportError {
+    let detail = match (&message.provider_code, &message.error_message) {
+        (Some(code), Some(error)) => format!("{code}: {error}"),
+        (Some(code), None) => code.clone(),
+        (None, Some(error)) => error.clone(),
+        (None, None) => "provider returned an unclassified error".to_owned(),
+    };
+    if retry::is_retryable(message) {
+        ReviewerTransportError::Transient(detail)
+    } else {
+        ReviewerTransportError::Fatal(detail)
     }
 }
 
@@ -1214,7 +1374,54 @@ mod tests {
     }
 
     fn reviewer_trust(model: &ReviewerModelSpec) -> ReviewerTrustSet {
-        ReviewerTrustSet::new(model.clone(), Vec::new())
+        ReviewerTrustSet::new(vec![model.clone()])
+    }
+
+    fn distinct_model(preset: &str, id: &str, account_scope: &str) -> ModelSpec {
+        let mut spec = ModelSpec::preset(preset).expect("fixture preset");
+        spec.id = id.to_owned();
+        spec.account_scope = account_scope.to_owned();
+        spec
+    }
+
+    fn provider_terminal(
+        event_kind: &str,
+        reason: StopReason,
+        text: Option<&str>,
+        provider_code: Option<&str>,
+    ) -> ProviderEvent {
+        let message = crate::provider::types::AssistantMessage {
+            content: text
+                .map(|text| {
+                    vec![AssistantContent::Text {
+                        text: text.to_owned(),
+                        wire_item_index: 0,
+                    }]
+                })
+                .unwrap_or_default(),
+            model: "reviewer".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: crate::provider::types::ProviderOrigin {
+                provider_instance_id: "fixture-instance".to_owned(),
+                protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
+                model: "reviewer".to_owned(),
+            },
+            usage: crate::provider::types::Usage::default(),
+            stop_reason: reason,
+            error_message: provider_code.map(|code| format!("fixture error {code}")),
+            provider_code: provider_code.map(str::to_owned),
+            interrupted: reason == StopReason::Aborted,
+            timestamp: Utc::now(),
+        };
+        let output = crate::provider::types::ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        };
+        match event_kind {
+            "done" => ProviderEvent::Done { reason, output },
+            "error" => ProviderEvent::Error { reason, output },
+            other => panic!("unknown terminal fixture {other}"),
+        }
     }
 
     #[test]
@@ -1233,6 +1440,135 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_models_are_explicit_structured_and_independent() {
+        let conversation = distinct_model("opencode-go", "conversation", "conversation-account");
+        let execution = distinct_model("kimi-k3", "execution", "execution-account");
+        let escalation = distinct_model("glm-5.2", "escalation", "escalation-account");
+        let (_, _, trust) =
+            IndependentReviewerModels::new(&conversation, execution.clone(), escalation.clone())
+                .expect("three independent reviewer identities")
+                .into_parts();
+
+        assert!(!trust.allows(&ReviewerModelSpec::from_provider(&conversation)));
+        assert!(trust.allows(&ReviewerModelSpec::from_provider(&execution)));
+        assert!(trust.allows(&ReviewerModelSpec::from_provider(&escalation)));
+
+        let conversation = distinct_model("kimi-k3", "conversation", "conversation-account");
+        let error = IndependentReviewerModels::new(&conversation, conversation.clone(), escalation)
+            .expect_err("Execution reviewer must not collapse to conversation model");
+        assert!(matches!(
+            error,
+            ReviewerNotReady::CollapsedModelIdentity {
+                left: "conversation",
+                right: "Execution reviewer"
+            }
+        ));
+
+        let execution = distinct_model("glm-5.2", "execution", "execution-account");
+        let error = IndependentReviewerModels::new(&conversation, execution.clone(), execution)
+            .expect_err("the two reviewers must not collapse to one identity");
+        assert!(matches!(
+            error,
+            ReviewerNotReady::CollapsedModelIdentity {
+                left: "Execution reviewer",
+                right: "Escalation reviewer"
+            }
+        ));
+
+        let conversation = distinct_model("opencode-go", "conversation", "conversation-account");
+        let execution = distinct_model("kimi-k3", "execution", "execution-account");
+        let same_origin = distinct_model("kimi-k3", "escalation", "escalation-account");
+        assert!(matches!(
+            IndependentReviewerModels::new(&conversation, execution.clone(), same_origin),
+            Err(ReviewerNotReady::CollapsedProviderOrigin {
+                left: "Execution reviewer",
+                right: "Escalation reviewer"
+            })
+        ));
+
+        let mut renamed_same_endpoint =
+            distinct_model("glm-5.2", "escalation", "escalation-account");
+        renamed_same_endpoint
+            .base_url
+            .clone_from(&execution.base_url);
+        assert!(matches!(
+            IndependentReviewerModels::new(&conversation, execution.clone(), renamed_same_endpoint,),
+            Err(ReviewerNotReady::CollapsedProviderOrigin {
+                left: "Execution reviewer",
+                right: "Escalation reviewer"
+            })
+        ));
+
+        let mut shared_credential = distinct_model("glm-5.2", "escalation", "escalation-account");
+        shared_credential
+            .api_key_env
+            .clone_from(&execution.api_key_env);
+        assert!(matches!(
+            IndependentReviewerModels::new(&conversation, execution, shared_credential),
+            Err(ReviewerNotReady::CollapsedCredentialSource {
+                left: "Execution reviewer",
+                right: "Escalation reviewer"
+            })
+        ));
+    }
+
+    #[test]
+    fn structured_output_incompatible_reviewer_fails_startup() {
+        let conversation =
+            distinct_model("openai-responses", "conversation", "conversation-account");
+        let unsupported = ModelSpec::preset("opencode-go").expect("OpenCode fixture preset");
+        let escalation = distinct_model("glm-5.2", "escalation", "escalation-account");
+
+        assert!(matches!(
+            IndependentReviewerModels::new(&conversation, unsupported, escalation),
+            Err(ReviewerNotReady::StructuredOutputUnsupported {
+                reviewer: "Execution"
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_review_terminal_rejects_truncation_abort_and_permanent_errors() {
+        let valid_json = r#"{"outcome":"allow","risk":"low","rationale":"complete"}"#;
+
+        assert!(matches!(
+            classify_provider_review_terminal(
+                provider_terminal("done", StopReason::Length, Some(valid_json), None),
+                false,
+            ),
+            Some(Err(ReviewerTransportError::Fatal(message)))
+                if message.contains("truncated")
+        ));
+        assert!(matches!(
+            classify_provider_review_terminal(
+                provider_terminal("done", StopReason::Aborted, Some(valid_json), None),
+                false,
+            ),
+            Some(Err(ReviewerTransportError::Cancelled))
+        ));
+        assert!(matches!(
+            classify_provider_review_terminal(
+                provider_terminal(
+                    "error",
+                    StopReason::Error,
+                    Some(valid_json),
+                    Some("invalid_provider_request"),
+                ),
+                false,
+            ),
+            Some(Err(ReviewerTransportError::Fatal(message)))
+                if message.contains("invalid_provider_request")
+        ));
+        assert_eq!(
+            classify_provider_review_terminal(
+                provider_terminal("done", StopReason::Stop, Some(valid_json), None),
+                false,
+            ),
+            Some(Ok(valid_json.to_owned()))
+        );
+    }
+
+    #[test]
     fn reviewer_model_and_transport_must_match_the_trusted_binding() {
         let declared = ReviewerModelSpec::new(
             "reviewer",
@@ -1242,7 +1578,7 @@ mod tests {
             "fixture-trust-domain",
             "fixture-no-training",
         );
-        let trust = ReviewerTrustSet::new(declared.clone(), Vec::new());
+        let trust = ReviewerTrustSet::new(vec![declared.clone()]);
         let result = ExecutionReviewer::new(
             declared,
             trust,

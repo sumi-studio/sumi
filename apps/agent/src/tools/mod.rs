@@ -442,6 +442,10 @@ impl SealedBoundToolInvocation {
     pub(crate) fn invocation(&self) -> &BoundToolInvocation {
         &self.invocation
     }
+
+    pub(crate) fn evidence_digest(&self) -> bound::InvocationDigest {
+        self.sealed_evidence_digest
+    }
 }
 
 impl ToolRegistry {

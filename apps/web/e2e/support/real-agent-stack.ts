@@ -166,6 +166,7 @@ export class RealAgentStack {
   private readonly runtimeDirectory: string;
   private readonly sessionCookie: string;
   private readonly children: ManagedProcess[];
+  private readonly reviewerProviders: LoopbackChatProvider[];
   private stopped = false;
 
   constructor({
@@ -175,6 +176,7 @@ export class RealAgentStack {
     runtimeDirectory,
     sessionCookie,
     children,
+    reviewerProviders,
   }: {
     apiURL: string;
     webURL: string;
@@ -182,6 +184,7 @@ export class RealAgentStack {
     runtimeDirectory: string;
     sessionCookie: string;
     children: ManagedProcess[];
+    reviewerProviders: LoopbackChatProvider[];
   }) {
     this.apiURL = apiURL;
     this.webURL = webURL;
@@ -189,6 +192,7 @@ export class RealAgentStack {
     this.runtimeDirectory = runtimeDirectory;
     this.sessionCookie = sessionCookie;
     this.children = children;
+    this.reviewerProviders = reviewerProviders;
   }
 
   async installSession(context: BrowserContext): Promise<void> {
@@ -226,6 +230,13 @@ export class RealAgentStack {
     for (const child of [...this.children].reverse()) {
       try {
         await child.stop();
+      } catch (error) {
+        errors.push(toError(error));
+      }
+    }
+    for (const provider of this.reviewerProviders) {
+      try {
+        await provider.stop();
       } catch (error) {
         errors.push(toError(error));
       }
@@ -588,6 +599,18 @@ async function startRealAgentStackOnce(
   const children: ManagedProcess[] = [];
   const providerApiKey = randomToken();
   const provider = new LoopbackChatProvider(providerApiKey);
+  const executionReviewerApiKey = randomToken();
+  const executionReviewerProvider = new LoopbackChatProvider(
+    executionReviewerApiKey,
+  );
+  const escalationReviewerApiKey = randomToken();
+  const escalationReviewerProvider = new LoopbackChatProvider(
+    escalationReviewerApiKey,
+  );
+  const reviewerProviders = [
+    executionReviewerProvider,
+    escalationReviewerProvider,
+  ];
   try {
     const paths = {
       commandLog: join(runtimeDirectory, "command-log"),
@@ -634,6 +657,8 @@ async function startRealAgentStackOnce(
       browserSessionSecret,
       localControlBearer,
       providerApiKey,
+      executionReviewerApiKey,
+      escalationReviewerApiKey,
       wrappingKey,
       databaseURL,
     ];
@@ -645,7 +670,11 @@ async function startRealAgentStackOnce(
     };
     const firebaseAuthEmulator = requiredFirebaseAuthEmulator();
 
-    await provider.start();
+    await Promise.all([
+      provider.start(),
+      executionReviewerProvider.start(),
+      escalationReviewerProvider.start(),
+    ]);
     await assertFirebaseAuthEmulator(firebaseAuthEmulator);
 
     const api = ManagedProcess.start("Go production API", build.apiServer, [], {
@@ -761,7 +790,23 @@ async function startRealAgentStackOnce(
           SUMI_MODEL_PRESET: "opencode-go",
           SUMI_MODEL_BASE_URL: provider.url,
           SUMI_MODEL_API_KEY_ENV: "SUMI_E2E_PROVIDER_API_KEY",
+          SUMI_EXECUTION_REVIEWER_MODEL_PRESET: "kimi-k3",
+          SUMI_EXECUTION_REVIEWER_MODEL_ID: "e2e-execution-reviewer",
+          SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL: executionReviewerProvider.url,
+          SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE: "e2e-execution-reviewer",
+          SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV:
+            "SUMI_E2E_EXECUTION_REVIEWER_API_KEY",
+          SUMI_ESCALATION_REVIEWER_MODEL_PRESET: "glm-5.2",
+          SUMI_ESCALATION_REVIEWER_MODEL_ID: "e2e-escalation-reviewer",
+          SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL:
+            escalationReviewerProvider.url,
+          SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE:
+            "e2e-escalation-reviewer",
+          SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV:
+            "SUMI_E2E_ESCALATION_REVIEWER_API_KEY",
           SUMI_E2E_PROVIDER_API_KEY: providerApiKey,
+          SUMI_E2E_EXECUTION_REVIEWER_API_KEY: executionReviewerApiKey,
+          SUMI_E2E_ESCALATION_REVIEWER_API_KEY: escalationReviewerApiKey,
           SUMI_SYSTEM_PROMPT:
             "Answer each user message with the deterministic provider response.",
           SUMI_LOG: "sumi_agent=info",
@@ -808,6 +853,7 @@ async function startRealAgentStackOnce(
       runtimeDirectory,
       sessionCookie,
       children,
+      reviewerProviders,
     });
   } catch (error) {
     const cleanupErrors: Error[] = [];
@@ -822,6 +868,13 @@ async function startRealAgentStackOnce(
       await provider.stop();
     } catch (cleanupError) {
       cleanupErrors.push(toError(cleanupError));
+    }
+    for (const reviewerProvider of reviewerProviders) {
+      try {
+        await reviewerProvider.stop();
+      } catch (cleanupError) {
+        cleanupErrors.push(toError(cleanupError));
+      }
     }
     try {
       await rm(runtimeDirectory, { recursive: true, force: true });

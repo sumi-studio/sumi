@@ -24,6 +24,56 @@ func testActivationConfig() ActivationConfig {
 		AgentWrappingKeyID:              "wrapping/v1",
 		ApprovalSecretDigestKey:         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
 		ProviderAPIKey:                  "provider-key",
+		ExecutionReviewerAPIKey:         "execution-reviewer-key",
+		ExecutionReviewerModelPreset:    "kimi-k3",
+		EscalationReviewerAPIKey:        "escalation-reviewer-key",
+		EscalationReviewerModelPreset:   "glm-5.2",
+	}
+}
+
+func TestActivationConfigRequiresBothReviewerBoundaries(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ActivationConfig)
+	}{
+		{
+			name: "missing execution credential",
+			mutate: func(config *ActivationConfig) {
+				config.ExecutionReviewerAPIKey = ""
+			},
+		},
+		{
+			name: "missing execution preset",
+			mutate: func(config *ActivationConfig) {
+				config.ExecutionReviewerModelPreset = ""
+			},
+		},
+		{
+			name: "missing escalation credential",
+			mutate: func(config *ActivationConfig) {
+				config.EscalationReviewerAPIKey = ""
+			},
+		},
+		{
+			name: "missing escalation preset",
+			mutate: func(config *ActivationConfig) {
+				config.EscalationReviewerModelPreset = ""
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := testActivationConfig()
+			test.mutate(&config)
+			if err := config.Validate(); err == nil {
+				t.Fatal("incomplete reviewer boundary was accepted")
+			}
+		})
+	}
+
+	config := testActivationConfig()
+	if err := config.Validate(); err != nil {
+		t.Fatalf("complete reviewer boundaries were rejected: %v", err)
 	}
 }
 

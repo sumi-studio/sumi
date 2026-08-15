@@ -19,6 +19,8 @@ readonly LOCAL_CONTROL_BEARER_FILE=/run/secrets/sumi_local_control_bearer
 readonly AGENT_WRAPPING_KEY_FILE=/run/secrets/sumi_agent_wrapping_key
 readonly APPROVAL_SECRET_DIGEST_KEY_FILE=/run/secrets/sumi_approval_secret_digest_key
 readonly PROVIDER_API_KEY_FILE=/run/secrets/sumi_provider_api_key
+readonly EXECUTION_REVIEWER_API_KEY_FILE=/run/secrets/sumi_execution_reviewer_api_key
+readonly ESCALATION_REVIEWER_API_KEY_FILE=/run/secrets/sumi_escalation_reviewer_api_key
 
 fail() {
   printf '[sumi-entrypoint] %s\n' "$*" >&2
@@ -206,10 +208,14 @@ case "${role}" in
     unset SUMI_AGENT_WRAPPING_KEY
     unset SUMI_APPROVAL_SECRET_DIGEST_KEY
     unset SUMI_PROVIDER_API_KEY
+    unset SUMI_EXECUTION_REVIEWER_API_KEY
+    unset SUMI_ESCALATION_REVIEWER_API_KEY
     load_runtime_secret SUMI_LOCAL_CONTROL_BEARER "${LOCAL_CONTROL_BEARER_FILE}"
     load_runtime_secret SUMI_AGENT_WRAPPING_KEY "${AGENT_WRAPPING_KEY_FILE}"
     load_runtime_secret SUMI_APPROVAL_SECRET_DIGEST_KEY "${APPROVAL_SECRET_DIGEST_KEY_FILE}"
     load_runtime_secret SUMI_PROVIDER_API_KEY "${PROVIDER_API_KEY_FILE}"
+    load_runtime_secret SUMI_EXECUTION_REVIEWER_API_KEY "${EXECUTION_REVIEWER_API_KEY_FILE}"
+    load_runtime_secret SUMI_ESCALATION_REVIEWER_API_KEY "${ESCALATION_REVIEWER_API_KEY_FILE}"
     for name in \
       SUMI_GATEWAY_URL \
       SUMI_WORKSPACE \
@@ -221,7 +227,11 @@ case "${role}" in
       SUMI_AGENT_WRAPPING_KEY \
       SUMI_AGENT_WRAPPING_KEY_ID \
       SUMI_APPROVAL_SECRET_DIGEST_KEY \
-      SUMI_PROVIDER_API_KEY
+      SUMI_PROVIDER_API_KEY \
+      SUMI_EXECUTION_REVIEWER_API_KEY \
+      SUMI_EXECUTION_REVIEWER_MODEL_PRESET \
+      SUMI_ESCALATION_REVIEWER_API_KEY \
+      SUMI_ESCALATION_REVIEWER_MODEL_PRESET
     do
       require_env "${name}"
     done
@@ -255,12 +265,31 @@ case "${role}" in
       "SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET:-kimi-k3}"
       "SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY"
       "SUMI_PROVIDER_API_KEY=${SUMI_PROVIDER_API_KEY}"
+      "SUMI_EXECUTION_REVIEWER_MODEL_PRESET=${SUMI_EXECUTION_REVIEWER_MODEL_PRESET}"
+      "SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV=SUMI_EXECUTION_REVIEWER_API_KEY"
+      "SUMI_EXECUTION_REVIEWER_API_KEY=${SUMI_EXECUTION_REVIEWER_API_KEY}"
+      "SUMI_ESCALATION_REVIEWER_MODEL_PRESET=${SUMI_ESCALATION_REVIEWER_MODEL_PRESET}"
+      "SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV=SUMI_ESCALATION_REVIEWER_API_KEY"
+      "SUMI_ESCALATION_REVIEWER_API_KEY=${SUMI_ESCALATION_REVIEWER_API_KEY}"
       "SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY=${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}"
       "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}"
     )
     if [[ -v SUMI_MODEL_ID ]]; then
       runtime_environment+=("SUMI_MODEL_ID=${SUMI_MODEL_ID}")
     fi
+    for name in \
+      SUMI_EXECUTION_REVIEWER_MODEL_ID \
+      SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL \
+      SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE \
+      SUMI_ESCALATION_REVIEWER_MODEL_ID \
+      SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL \
+      SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE
+    do
+      if [[ -v "${name}" ]]; then
+        [[ -n "${!name}" ]] || fail "${name} must not be empty when set"
+        runtime_environment+=("${name}=${!name}")
+      fi
+    done
     close_unlisted_fds
     exec env -i "${runtime_environment[@]}" /usr/local/bin/sumi-agent
     ;;

@@ -135,7 +135,17 @@ fn launch_env(command: &mut Command, paid: &str) {
         .env("SUMI_AGENT_WRAPPING_KEY", TEST_WRAPPING_KEY)
         .env("SUMI_AGENT_WRAPPING_KEY_ID", "wrapping-key/v1")
         .env("SUMI_APPROVAL_SECRET_DIGEST_KEY", TEST_APPROVAL_DIGEST_KEY)
-        .env("SUMI_PROVIDER_API_KEY", "provider-secret");
+        .env("SUMI_PROVIDER_API_KEY", "provider-secret")
+        .env(
+            "SUMI_EXECUTION_REVIEWER_API_KEY",
+            "execution-reviewer-secret",
+        )
+        .env("SUMI_EXECUTION_REVIEWER_MODEL_PRESET", "kimi-k3")
+        .env(
+            "SUMI_ESCALATION_REVIEWER_API_KEY",
+            "escalation-reviewer-secret",
+        )
+        .env("SUMI_ESCALATION_REVIEWER_MODEL_PRESET", "glm-5.2");
 }
 
 fn docker_fixture_host_available() -> bool {
@@ -403,6 +413,16 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env("SUMI_AGENT_WRAPPING_KEY_ID", "deployment-test/wrapping")
         .env("SUMI_APPROVAL_SECRET_DIGEST_KEY", hex_credential())
         .env("SUMI_PROVIDER_API_KEY", credential("provider"))
+        .env(
+            "SUMI_EXECUTION_REVIEWER_API_KEY",
+            credential("execution-reviewer"),
+        )
+        .env("SUMI_EXECUTION_REVIEWER_MODEL_PRESET", "kimi-k3")
+        .env(
+            "SUMI_ESCALATION_REVIEWER_API_KEY",
+            credential("escalation-reviewer"),
+        )
+        .env("SUMI_ESCALATION_REVIEWER_MODEL_PRESET", "glm-5.2")
         .env(
             "SUMI_LOCAL_CONTROL_SERVER_UID",
             unsafe { libc::geteuid() }.to_string(),
@@ -993,6 +1013,8 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
         "/run/secrets/sumi_agent_wrapping_key",
         "/run/secrets/sumi_approval_secret_digest_key",
         "/run/secrets/sumi_provider_api_key",
+        "/run/secrets/sumi_execution_reviewer_api_key",
+        "/run/secrets/sumi_escalation_reviewer_api_key",
     ] {
         assert!(
             dockerfile.contains(target),
@@ -1313,6 +1335,8 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
             "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_agent_wrapping_key",
             "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_approval_secret_digest_key",
             "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_provider_api_key",
+            "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_execution_reviewer_api_key",
+            "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_escalation_reviewer_api_key",
         ])
     );
     assert_eq!(
@@ -1400,6 +1424,8 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         "SUMI_AGENT_WRAPPING_KEY",
         "SUMI_APPROVAL_SECRET_DIGEST_KEY",
         "SUMI_PROVIDER_API_KEY",
+        "SUMI_EXECUTION_REVIEWER_API_KEY",
+        "SUMI_ESCALATION_REVIEWER_API_KEY",
     ] {
         assert!(
             !runtime_env.contains(sensitive),
@@ -1413,6 +1439,8 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         "sumi_agent_wrapping_key",
         "sumi_approval_secret_digest_key",
         "sumi_provider_api_key",
+        "sumi_execution_reviewer_api_key",
+        "sumi_escalation_reviewer_api_key",
     ];
     assert!(
         compose.get("secrets").is_none(),
@@ -3535,6 +3563,8 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
             "SUMI_AGENT_WRAPPING_KEY",
             "SUMI_APPROVAL_SECRET_DIGEST_KEY",
             "SUMI_PROVIDER_API_KEY",
+            "SUMI_EXECUTION_REVIEWER_API_KEY",
+            "SUMI_ESCALATION_REVIEWER_API_KEY",
         ] {
             assert!(
                 rendered["services"]["runtime"]["environment"]
@@ -3744,7 +3774,9 @@ for secret in \
   /run/secrets/sumi_local_control_bearer \
   /run/secrets/sumi_agent_wrapping_key \
   /run/secrets/sumi_approval_secret_digest_key \
-  /run/secrets/sumi_provider_api_key
+  /run/secrets/sumi_provider_api_key \
+  /run/secrets/sumi_execution_reviewer_api_key \
+  /run/secrets/sumi_escalation_reviewer_api_key
 do
   test -f "$secret"
   test ! -L "$secret"
@@ -3796,6 +3828,8 @@ done
             "SUMI_AGENT_WRAPPING_KEY",
             "SUMI_APPROVAL_SECRET_DIGEST_KEY",
             "SUMI_PROVIDER_API_KEY",
+            "SUMI_EXECUTION_REVIEWER_API_KEY",
+            "SUMI_ESCALATION_REVIEWER_API_KEY",
         ] {
             assert!(
                 runtime_environment.iter().all(|entry| {

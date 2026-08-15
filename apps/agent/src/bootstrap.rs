@@ -33,9 +33,9 @@ use crate::{
         route_broker::RouteApprovalBroker,
         route_policy::RoutePolicy,
         route_reviewer::{
-            EscalationReviewer, ExecutionReviewer, ProviderEscalationReviewerTransport,
-            ProviderExecutionReviewerTransport, ReviewerBudgetV1,
-            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerTrustSet as RouteReviewerTrustSet,
+            EscalationReviewer, ExecutionReviewer, IndependentReviewerModels,
+            ProviderEscalationReviewerTransport, ProviderExecutionReviewerTransport,
+            ReviewerBudgetV1, ReviewerModelSpec as RouteReviewerModelSpec,
         },
     },
     config::Config,
@@ -984,6 +984,29 @@ async fn run_after_not_ready(
         let model_spec = config.model_spec().context("resolve production provider")?;
         validate_production_provider_endpoint(&model_spec.base_url)?;
         validate_provider_credential(&model_spec.api_key_env)?;
+        let execution_reviewer_spec = config
+            .execution_reviewer_model_spec()
+            .context("resolve Execution reviewer provider")?;
+        let escalation_reviewer_spec = config
+            .escalation_reviewer_model_spec()
+            .context("resolve Escalation reviewer provider")?;
+        for (label, spec) in [
+            ("Execution reviewer", &execution_reviewer_spec),
+            ("Escalation reviewer", &escalation_reviewer_spec),
+        ] {
+            validate_production_provider_endpoint(&spec.base_url)
+                .with_context(|| format!("validate {label} provider endpoint"))?;
+            validate_provider_credential(&spec.api_key_env)
+                .with_context(|| format!("validate {label} provider credential"))?;
+        }
+        let reviewer_models = IndependentReviewerModels::new(
+            &model_spec,
+            execution_reviewer_spec,
+            escalation_reviewer_spec,
+        )
+        .context("validate independent fail-closed reviewer models")?;
+        let (execution_reviewer_spec, escalation_reviewer_spec, reviewer_trust) =
+            reviewer_models.into_parts();
 
         let key_provider = Arc::new(EnvironmentKeyProvider::from_env(
             "SUMI_AGENT_WRAPPING_KEY",
@@ -1005,22 +1028,28 @@ async fn run_after_not_ready(
         )
         .await?;
 
-        let reviewer_model = RouteReviewerModelSpec::from_provider(&model_spec);
-        let reviewer_trust = RouteReviewerTrustSet::new(reviewer_model.clone(), Vec::new());
+        let execution_reviewer_model =
+            RouteReviewerModelSpec::from_provider(&execution_reviewer_spec);
+        let escalation_reviewer_model =
+            RouteReviewerModelSpec::from_provider(&escalation_reviewer_spec);
         let execution_reviewer = Arc::new(
             ExecutionReviewer::new(
-                reviewer_model.clone(),
+                execution_reviewer_model,
                 reviewer_trust.clone(),
-                Arc::new(ProviderExecutionReviewerTransport::new(model_spec.clone())),
+                Arc::new(ProviderExecutionReviewerTransport::new(
+                    execution_reviewer_spec,
+                )),
                 ReviewerBudgetV1::execution(),
             )
             .context("construct fail-closed Execution AutoReview")?,
         );
         let escalation_reviewer = Arc::new(
             EscalationReviewer::new(
-                reviewer_model,
+                escalation_reviewer_model,
                 reviewer_trust,
-                Arc::new(ProviderEscalationReviewerTransport::new(model_spec.clone())),
+                Arc::new(ProviderEscalationReviewerTransport::new(
+                    escalation_reviewer_spec,
+                )),
                 ReviewerBudgetV1::escalation(),
             )
             .context("construct fail-closed Escalation AutoReview")?,

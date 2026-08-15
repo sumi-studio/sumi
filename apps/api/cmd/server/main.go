@@ -2089,6 +2089,22 @@ func spawnManagerFromEnv(
 	if err != nil {
 		return nil, err
 	}
+	executionReviewerKey, err := require("SUMI_EXECUTION_REVIEWER_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	executionReviewerPreset, err := require("SUMI_EXECUTION_REVIEWER_MODEL_PRESET")
+	if err != nil {
+		return nil, err
+	}
+	escalationReviewerKey, err := require("SUMI_ESCALATION_REVIEWER_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	escalationReviewerPreset, err := require("SUMI_ESCALATION_REVIEWER_MODEL_PRESET")
+	if err != nil {
+		return nil, err
+	}
 	allowInsecure := false
 	if raw := strings.TrimSpace(os.Getenv("SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY")); raw != "" {
 		allowInsecure, err = strconv.ParseBool(raw)
@@ -2111,6 +2127,28 @@ func spawnManagerFromEnv(
 			ProviderAPIKey:               providerKey,
 			ModelPreset:                  strings.TrimSpace(os.Getenv("SUMI_MODEL_PRESET")),
 			ModelID:                      strings.TrimSpace(os.Getenv("SUMI_MODEL_ID")),
+			ExecutionReviewerAPIKey:      executionReviewerKey,
+			ExecutionReviewerModelPreset: executionReviewerPreset,
+			ExecutionReviewerModelID: strings.TrimSpace(
+				os.Getenv("SUMI_EXECUTION_REVIEWER_MODEL_ID"),
+			),
+			ExecutionReviewerModelBaseURL: strings.TrimSpace(
+				os.Getenv("SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL"),
+			),
+			ExecutionReviewerAccountScope: strings.TrimSpace(
+				os.Getenv("SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE"),
+			),
+			EscalationReviewerAPIKey:      escalationReviewerKey,
+			EscalationReviewerModelPreset: escalationReviewerPreset,
+			EscalationReviewerModelID: strings.TrimSpace(
+				os.Getenv("SUMI_ESCALATION_REVIEWER_MODEL_ID"),
+			),
+			EscalationReviewerModelBaseURL: strings.TrimSpace(
+				os.Getenv("SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL"),
+			),
+			EscalationReviewerAccountScope: strings.TrimSpace(
+				os.Getenv("SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE"),
+			),
 			AllowInsecureLoopbackGateway: allowInsecure,
 			LogFilter:                    strings.TrimSpace(os.Getenv("SUMI_LOG")),
 		},

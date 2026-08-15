@@ -15278,11 +15278,21 @@ mod tests {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> InboundCommand {
+        approval_command_with_provenance(seq, command_id, request_id, decision, test_provenance())
+    }
+
+    fn approval_command_with_provenance(
+        seq: u64,
+        command_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+        provenance: DirectChatProvenanceV1,
+    ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
             personality_agent_id: scope().personality_agent_id,
-            provenance: test_provenance(),
+            provenance,
             command: Command::ApprovalDecision {
                 request_id: request_id.to_owned(),
                 decision,
@@ -15665,6 +15675,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_resolution_rejects_a_decision_actor_different_from_the_origin() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-route-wrong-actor";
+        let turn_id = "turn-1";
+        let tool_call_id = "tool-route-wrong-actor";
+        let request_id = "request-route-wrong-actor";
+        seed_tool_owner(&store, &writer, run_id).await;
+        let bound = BoundToolInvocation::test_fixture(tool_call_id, CapabilityClass::Mutate);
+        let policy = route_policy_snapshot(&bound);
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"approval_requested",
+                            "request":approval_request(request_id, tool_call_id, "mutating")
+                        }))
+                        .expect("route approval event"),
+                    ),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: tool_call_id.to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: run_id.to_owned(),
+                            executor_generation: test_process_generation(1),
+                            idempotency_key: format!("{run_id}/{tool_call_id}"),
+                        }),
+                        Projection::RouteApprovalPending {
+                            request_id: request_id.to_owned(),
+                            tool_call_id: tool_call_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            bound: Box::new(bound.clone()),
+                            policy: Box::new(policy.clone()),
+                            escalation_review: Box::new(escalation_ask_human_evidence()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit pending route operation");
+
+        let decision_provenance =
+            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-2")
+                .expect("valid different decision actor");
+        let decision_command_id = "00000000-0000-4000-8000-000000000023";
+        writer
+            .persist_inbound(&approval_command_with_provenance(
+                2,
+                decision_command_id,
+                request_id,
+                ApprovalDecision::ApproveOnce,
+                decision_provenance.clone(),
+            ))
+            .await
+            .expect("persist authenticated decision from a different Human");
+        let human = HumanDecisionEvidence::from_context(HumanAuthorizationContextV1 {
+            request_id,
+            command_id: decision_command_id,
+            command_seq: 2,
+            tenant_id: decision_provenance.tenant_id(),
+            personality_agent_id: decision_provenance.personality_agent_id().as_str(),
+            human_principal_id: decision_provenance.actor().principal_id(),
+            decision: CurrentCallDecision::ApproveOnce,
+            received_at: durable_test_timestamp(),
+            tool_call_id,
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: &bound.proposal_digest.to_hex(),
+            descriptor_digest: &bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: &bound.evidence_digest().unwrap().to_hex(),
+            policy_source_digest: &policy.source_digest,
+            run_id,
+            turn_id,
+        })
+        .expect("decision evidence exactly matches its own authenticated command");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::approval_resolved(
+                            request_id.to_owned(),
+                            ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                            decision_provenance.actor().principal_id().to_owned(),
+                        )
+                        .expect("approval resolution event"),
+                    ),
+                    projections: vec![
+                        Projection::RouteApprovalResolve {
+                            request_id: request_id.to_owned(),
+                            state: "approved_once",
+                            actor: decision_provenance.actor().principal_id().to_owned(),
+                            human_decision: Box::new(human),
+                        },
+                        Projection::CommandApplied {
+                            command_id: decision_command_id.to_owned(),
+                            command_seq: 2,
+                            run_id: Some(run_id.to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("a different Human must not consume the originator's approval");
+        assert!(format!("{error:#}").contains("origin actor"), "{error:#}");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM approval_log WHERE id=?")
+                .bind(request_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load pending approval"),
+            "pending"
+        );
+        assert_ne!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(decision_command_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load ignored decision command"),
+            "applied"
+        );
+
+        let owner_provenance = test_provenance();
+        let owner_command_id = "00000000-0000-4000-8000-000000000024";
+        writer
+            .persist_inbound(&approval_command_with_provenance(
+                3,
+                owner_command_id,
+                request_id,
+                ApprovalDecision::ApproveOnce,
+                owner_provenance.clone(),
+            ))
+            .await
+            .expect("persist later decision from the owning Human");
+        let owner_human = HumanDecisionEvidence::from_context(HumanAuthorizationContextV1 {
+            request_id,
+            command_id: owner_command_id,
+            command_seq: 3,
+            tenant_id: owner_provenance.tenant_id(),
+            personality_agent_id: owner_provenance.personality_agent_id().as_str(),
+            human_principal_id: owner_provenance.actor().principal_id(),
+            decision: CurrentCallDecision::ApproveOnce,
+            received_at: durable_test_timestamp(),
+            tool_call_id,
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: &bound.proposal_digest.to_hex(),
+            descriptor_digest: &bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: &bound.evidence_digest().unwrap().to_hex(),
+            policy_source_digest: &policy.source_digest,
+            run_id,
+            turn_id,
+        })
+        .expect("owning Human evidence matches the pending origin");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::approval_resolved(
+                            request_id.to_owned(),
+                            ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                            owner_provenance.actor().principal_id().to_owned(),
+                        )
+                        .expect("owning approval resolution event"),
+                    ),
+                    projections: vec![
+                        Projection::RouteApprovalResolve {
+                            request_id: request_id.to_owned(),
+                            state: "approved_once",
+                            actor: owner_provenance.actor().principal_id().to_owned(),
+                            human_decision: Box::new(owner_human),
+                        },
+                        Projection::CommandApplied {
+                            command_id: owner_command_id.to_owned(),
+                            command_seq: 3,
+                            run_id: Some(run_id.to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("the owning Human must still resolve after the ignored command");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM approval_log WHERE id=?")
+                .bind(request_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load resolved approval"),
+            "approved_once"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(owner_command_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load owning decision command"),
+            "applied"
+        );
+    }
+
+    #[tokio::test]
     async fn route_rejection_keeps_authenticated_human_approve_once_evidence() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -15914,6 +16132,47 @@ mod tests {
             escalation_review: Some(review),
             human_decision: Some(human),
         };
+        let mut invalid_tuple = authorization.clone();
+        invalid_tuple.resolved_authority = ExecutionAuthorityProvenance::HumanAccountOneShot;
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"tool_execution_start",
+                            "tool_call_id":tool_call_id,
+                            "tool_name":bound.tool_name.clone(),
+                            "args":Value::Object(bound.execution_arguments.as_object().clone()),
+                            "state":"running"
+                        }))
+                        .expect("invalid authority tuple start event"),
+                    ),
+                    projections: vec![Projection::RouteToolExecutionStart {
+                        tool_call_id: tool_call_id.to_owned(),
+                        run_id: run_id.to_owned(),
+                        bound: Box::new(bound.clone()),
+                        authorization: Box::new(invalid_tuple),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("an impossible route/decision/authority tuple must fail closed");
+        assert!(
+            format!("{error:#}").contains("invalid route/decision tuple"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id=?",
+            )
+            .bind(tool_call_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load tool after invalid authority tuple"),
+            "prepared"
+        );
+
         let mut mismatched_authorization = authorization.clone();
         mismatched_authorization
             .human_decision

@@ -252,11 +252,15 @@ func newProvisioningTestSpawner(t *testing.T) (*provisionedRuntimeSpawner, *fake
 		BearerTTL:        time.Hour,
 		LifecycleTimeout: time.Second,
 		Activation: runtimeprovision.ActivationConfig{
-			LocalControlServerUID:   65532,
-			LocalControlSocketGID:   20000,
-			AgentWrappingKeyID:      "template-must-be-overridden",
-			ApprovalSecretDigestKey: provisionedTestApprovalKey,
-			ProviderAPIKey:          "provider-key",
+			LocalControlServerUID:         65532,
+			LocalControlSocketGID:         20000,
+			AgentWrappingKeyID:            "template-must-be-overridden",
+			ApprovalSecretDigestKey:       provisionedTestApprovalKey,
+			ProviderAPIKey:                "provider-key",
+			ExecutionReviewerAPIKey:       "execution-reviewer-key",
+			ExecutionReviewerModelPreset:  "kimi-k3",
+			EscalationReviewerAPIKey:      "escalation-reviewer-key",
+			EscalationReviewerModelPreset: "glm-5.2",
 		},
 	})
 	if err != nil {
@@ -449,7 +453,7 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 		Readiness: &fakeRuntimeReadiness{ready: true},
 		TenantID:  "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
 		BearerTTL: time.Hour, LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key"},
+		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -501,7 +505,7 @@ func TestProvisionedRuntimeSpawnerFreshProcessReconcilesThreePAIDs(t *testing.T)
 		Readiness: &fakeRuntimeReadiness{ready: true},
 		TenantID:  "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
 		LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key"},
+		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -568,7 +572,7 @@ func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListen
 			Readiness: &fakeRuntimeReadiness{ready: true},
 			TenantID:  "tenant", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
 			LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-			Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: uint32(os.Geteuid() + 1), LocalControlSocketGID: uint32(os.Getegid() + 1), AgentWrappingKeyID: "key", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider"},
+			Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: uint32(os.Geteuid() + 1), LocalControlSocketGID: uint32(os.Getegid() + 1), AgentWrappingKeyID: "key", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
 		})
 		if err != nil {
 			t.Fatal(err)

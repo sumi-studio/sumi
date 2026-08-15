@@ -108,6 +108,25 @@ impl ApprovalRuntime {
         }
     }
 
+    fn pending_scope_matches(
+        &self,
+        request_id: &str,
+        tenant_id: &str,
+        personality_agent_id: &str,
+        human_principal_id: &str,
+    ) -> bool {
+        match self {
+            Self::Route(broker) => broker.pending_scope_matches(
+                request_id,
+                tenant_id,
+                personality_agent_id,
+                human_principal_id,
+            ),
+            #[cfg(test)]
+            Self::Legacy(_) => true,
+        }
+    }
+
     fn pending_summary(&self, request_id: &str) -> Option<ApprovalPendingSummary> {
         match self {
             Self::Route(broker) => {
@@ -1734,6 +1753,21 @@ impl<G: Gateway + 'static> Session<G> {
             .is_some_and(|broker| broker.has_pending(request_id));
         if !is_pending {
             self.apply_idle_approval_decision(command).await?;
+            return Ok(true);
+        }
+        let provenance = &command.envelope().provenance;
+        if !active.approval.as_ref().is_some_and(|broker| {
+            broker.pending_scope_matches(
+                request_id,
+                provenance.tenant_id(),
+                provenance.personality_agent_id().as_str(),
+                provenance.actor().principal_id(),
+            )
+        }) {
+            // The command remains durably received, but it does not become the
+            // in-flight resolver for a pending approval owned by another
+            // Human. In particular, it must not block the owning Human's later
+            // exact decision in `resolving_approvals`.
             return Ok(true);
         }
         let request_id = request_id.clone();

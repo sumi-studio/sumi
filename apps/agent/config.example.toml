@@ -30,3 +30,21 @@ preset = "opencode-go"
 # requires_reasoning_content_on_assistant = true
 # zai_tool_stream = false
 # supports_required_tool_choice = false
+
+# AutoReview never inherits [model]. Configure both blocks before production
+# startup. Each reviewer must support structured output; its provider/base
+# origin and credential source must differ from [model] and from the other
+# reviewer. account_scope is retained in the trust identity, but a label alone
+# is not proof that two credentials belong to separate provider accounts.
+#
+# [reviewers.execution]
+# preset = "<structured-output-capable-preset>"
+# id = "<execution-reviewer-model>"
+# account_scope = "<declared-account-scope>"
+# api_key_env = "SUMI_EXECUTION_REVIEWER_API_KEY"
+#
+# [reviewers.escalation]
+# preset = "<different-structured-output-capable-preset>"
+# id = "<escalation-reviewer-model>"
+# account_scope = "<declared-account-scope>"
+# api_key_env = "SUMI_ESCALATION_REVIEWER_API_KEY"

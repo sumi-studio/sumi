@@ -330,6 +330,19 @@ printf '%s\\n' "$SUMI_DOCKER_CONFIG_FILE" > "$SUMI_TEST_DOCKER_CONFIG_ENV_LOG"
     ].join("\n"),
     { mode: 0o600 },
   );
+  await writeFile(
+    runtimeEnvFile,
+    [
+      "SUMI_EXECUTION_REVIEWER_MODEL_PRESET=kimi-k3",
+      "SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV=SUMI_TEST_EXECUTION_REVIEWER_KEY",
+      "SUMI_TEST_EXECUTION_REVIEWER_KEY=test-execution-reviewer-key",
+      "SUMI_ESCALATION_REVIEWER_MODEL_PRESET=glm-5.2",
+      "SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV=SUMI_TEST_ESCALATION_REVIEWER_KEY",
+      "SUMI_TEST_ESCALATION_REVIEWER_KEY=test-escalation-reviewer-key",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
   return {
     root,
     bin,

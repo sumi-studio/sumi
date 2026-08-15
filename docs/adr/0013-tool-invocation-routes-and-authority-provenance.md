@@ -207,6 +207,17 @@ Execution AutoReview、Escalation AutoReviewを含むproductionのmodel-facing p
 JSON schemaやredacted action/transcriptなどの動的payloadはtyped構造として分離し、Markdownへ
 文字列補間してprompt境界を曖昧にしない。
 
+conversation generation、Execution AutoReview、Escalation AutoReviewは、それぞれ明示的な
+`ModelSpec`を持つ。reviewerはconversation modelを暗黙に継承せず、reviewer trust setも
+conversation modelを自動許可しない。起動時に、各reviewerがstructured outputを扱えることと、
+`provider_instance_id / account_scope / model_id`のtrust identityがconversationと一致せず、かつ
+二つのreviewer間でも一致しないことを検証する。さらに、設定labelだけでは偽装できない境界として
+normalized provider base endpointとcredential sourceも三者で別でなければならない。provider名や
+protocol labelを変えただけで同一endpointを別originとして扱わない。`account_scope`は
+trust bindingへ含めるが、その文字列だけで実provider accountの分離を証明したとは扱わない。
+未設定、未対応preset、identity/origin/credential sourceのcollapseはruntimeを起動せず
+`ReviewerNotReady`としてfail closedにする。
+
 Executionの`Allow`をEscalationの`AskHuman`として再利用せず、Escalationのpositive resultで
 実行しない。`StrictAutoReview`はproduct-wide execution modeにしない。Stage 1/Stage 2や
 shadow二重判定を品質計測へ残すかは未決であり、残す場合もruntime authority semanticsを
