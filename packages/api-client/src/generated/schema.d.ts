@@ -715,24 +715,12 @@ export interface components {
             type: "hello";
             last_event_seq: components["schemas"]["JsonSafeInteger"];
         };
-        /** @description any JSON value */
-        AnyJSON: {
-            [key: string]: components["schemas"]["AnyJSON"];
-        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
-        /** @description object boundary preserved for T22/T23; properties are intentionally open */
-        DeferredApprovalRule: {
-            [key: string]: components["schemas"]["AnyJSON"];
-        };
         ApprovalDecision: {
             /** @constant */
             type: "approve_once";
         } | {
             /** @constant */
-            type: "approve_always";
-            rule: components["schemas"]["DeferredApprovalRule"];
-        } | {
-            /** @constant */
-            type: "deny";
+            type: "deny_once";
         };
         Command: {
             /** @constant */
@@ -784,6 +772,10 @@ export interface components {
             /** Format: date-time */
             timestamp: string;
         };
+        /** @description any JSON value */
+        AnyJSON: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
         ToolCall: {
             id: string;
             name: string;

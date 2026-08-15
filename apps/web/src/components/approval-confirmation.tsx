@@ -13,7 +13,6 @@ interface ApprovalConfirmationProps {
   summary: string;
   reason: string;
   status?: "pending" | "allowed" | "denied" | "cancelled";
-  decision?: ApprovalDecision | null;
   sending?: boolean;
   onDecision?: (decision: ApprovalDecision) => void;
 }
@@ -23,7 +22,6 @@ export function ApprovalConfirmation({
   summary,
   reason,
   status = "pending",
-  decision = null,
   sending = false,
   onDecision,
 }: ApprovalConfirmationProps) {
@@ -41,11 +39,7 @@ export function ApprovalConfirmation({
     >
       <ConfirmationTitle>{summary}</ConfirmationTitle>
       <ConfirmationRequest>{reason}</ConfirmationRequest>
-      <ConfirmationAccepted>
-        {decision?.type === "approve_always"
-          ? "このルールで許可しました"
-          : "今回のみ許可しました"}
-      </ConfirmationAccepted>
+      <ConfirmationAccepted>今回のみ許可しました</ConfirmationAccepted>
       <ConfirmationRejected>
         {status === "cancelled" ? "キャンセルされました" : "拒否しました"}
       </ConfirmationRejected>
@@ -64,7 +58,7 @@ export function ApprovalConfirmation({
         <ConfirmationAction
           variant="outline"
           disabled={sending}
-          onClick={() => onDecision?.({ type: "deny" })}
+          onClick={() => onDecision?.({ type: "deny_once" })}
         >
           拒否
         </ConfirmationAction>

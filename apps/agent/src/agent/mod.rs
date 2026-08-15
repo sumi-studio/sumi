@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    approval::ApprovalBroker,
+    approval::route_broker::RouteApprovalBroker,
     gateway::{
         Command, CommandAck, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed,
         GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
@@ -53,6 +53,118 @@ use crate::{
 };
 
 #[cfg(test)]
+use crate::approval::ApprovalBroker;
+
+#[derive(Clone, Debug)]
+pub(crate) enum ApprovalRuntime {
+    Route(Arc<RouteApprovalBroker>),
+    #[cfg(test)]
+    Legacy(Arc<ApprovalBroker>),
+}
+
+impl From<Arc<RouteApprovalBroker>> for ApprovalRuntime {
+    fn from(broker: Arc<RouteApprovalBroker>) -> Self {
+        Self::Route(broker)
+    }
+}
+
+#[cfg(test)]
+impl From<Arc<ApprovalBroker>> for ApprovalRuntime {
+    fn from(broker: Arc<ApprovalBroker>) -> Self {
+        Self::Legacy(broker)
+    }
+}
+
+impl ApprovalRuntime {
+    pub(crate) fn route(&self) -> Option<&Arc<RouteApprovalBroker>> {
+        match self {
+            Self::Route(broker) => Some(broker),
+            #[cfg(test)]
+            Self::Legacy(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy(&self) -> Option<&Arc<ApprovalBroker>> {
+        match self {
+            Self::Route(_) => None,
+            Self::Legacy(broker) => Some(broker),
+        }
+    }
+
+    fn is_resolving(&self, request_id: &str) -> bool {
+        match self {
+            Self::Route(broker) => broker.is_resolving(request_id),
+            #[cfg(test)]
+            Self::Legacy(broker) => broker.is_resolving(request_id),
+        }
+    }
+
+    fn has_pending(&self, request_id: &str) -> bool {
+        match self {
+            Self::Route(broker) => broker.has_pending(request_id),
+            #[cfg(test)]
+            Self::Legacy(broker) => broker.has_pending(request_id),
+        }
+    }
+
+    fn pending_summary(&self, request_id: &str) -> Option<ApprovalPendingSummary> {
+        match self {
+            Self::Route(broker) => {
+                broker
+                    .pending_summary(request_id)
+                    .map(|summary| ApprovalPendingSummary {
+                        tool_call_id: summary.tool_call_id,
+                        tool_name: summary.tool_name,
+                    })
+            }
+            #[cfg(test)]
+            Self::Legacy(broker) => {
+                broker
+                    .pending_summary(request_id)
+                    .map(|summary| ApprovalPendingSummary {
+                        tool_call_id: summary.tool_call_id,
+                        tool_name: summary.tool_name,
+                    })
+            }
+        }
+    }
+
+    fn finish_resolution(&self, request_id: &str) {
+        match self {
+            Self::Route(broker) => broker.commit_resolution(request_id),
+            #[cfg(test)]
+            Self::Legacy(broker) => broker.finish_resolution(request_id),
+        }
+    }
+
+    fn cancel(&self, request_id: &str) -> bool {
+        match self {
+            Self::Route(broker) => broker.cancel(request_id),
+            #[cfg(test)]
+            Self::Legacy(broker) => broker.cancel(request_id),
+        }
+    }
+
+    fn cancel_all(&self) {
+        match self {
+            Self::Route(broker) => {
+                broker.cancel_all();
+            }
+            #[cfg(test)]
+            Self::Legacy(broker) => {
+                broker.cancel_all();
+            }
+        }
+    }
+}
+
+struct ApprovalPendingSummary {
+    tool_call_id: String,
+    tool_name: String,
+}
+
+#[cfg(test)]
 use crate::store::SuffixRecovery;
 
 mod driver;
@@ -68,8 +180,9 @@ mod steer;
 pub(crate) use durable_bridge::DurableRunBinding;
 
 use durable_bridge::{
-    CommittedOutput, DurableBridge, MessageCommitBarrier, MessageCommitReceipt,
-    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier, ToolStartCommitResult,
+    ApprovalDecisionOutput, ApprovalNotStartedContext, ApprovalOutputContext, CommittedOutput,
+    DurableBridge, MessageCommitBarrier, MessageCommitReceipt, RetryWaitCommitBarrier, RunOutput,
+    ToolStartCommitBarrier, ToolStartCommitResult,
 };
 use queue::MessageQueue;
 
@@ -283,7 +396,7 @@ pub(crate) struct RunCore {
     /// child token, and every externally backed phase derives from that child.
     /// This is runtime-only state and is never used as durable replay proof.
     runtime_shutdown: CancellationToken,
-    approval: Option<Arc<ApprovalBroker>>,
+    approval: Option<ApprovalRuntime>,
     #[cfg(test)]
     fixture_bypass_approval: bool,
 }
@@ -332,8 +445,8 @@ impl RunCore {
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
     }
 
-    pub(crate) fn set_approval(&mut self, broker: Arc<ApprovalBroker>) {
-        self.approval = Some(broker);
+    pub(crate) fn set_approval(&mut self, broker: impl Into<ApprovalRuntime>) {
+        self.approval = Some(broker.into());
         self.mark_mutated();
     }
 
@@ -426,7 +539,7 @@ impl SessionStartAuthority {
     pub(crate) fn from_hydrated(
         runtime: RuntimeEpochAuthority,
         hydrated: &HydratedRunState,
-        approval: Arc<ApprovalBroker>,
+        approval: impl Into<ApprovalRuntime>,
     ) -> Result<(RunCore, Self)> {
         if hydrated.scope.personality_agent_id != *runtime.personality_agent_id() {
             bail!("hydrated Store scope does not match the authenticated runtime PAID");
@@ -447,7 +560,7 @@ impl SessionStartAuthority {
         // Approval is a security-sensitive dependency of this exact RunCore.
         // Compose it before minting the binding; every later replacement goes
         // through `set_approval` and invalidates the binding.
-        core.approval = Some(approval);
+        core.approval = Some(approval.into());
         let binding = HydratedSessionBinding {
             binding_id: Uuid::now_v7(),
             runtime,
@@ -745,7 +858,7 @@ pub(crate) struct ActiveRun {
     join: JoinHandle<()>,
     bridge: DurableBridge,
     attempt_cancellation: Arc<AttemptCancellation>,
-    approval: Option<Arc<ApprovalBroker>>,
+    approval: Option<ApprovalRuntime>,
     resolving_approvals: HashSet<String>,
 }
 
@@ -1423,7 +1536,7 @@ impl<G: Gateway + 'static> Session<G> {
                 ControlAcceptanceProgress::Event(Some(event)) => {
                     // Persistence can reclassify a deferred control and
                     // re-enter this wait, so this edge needs type indirection.
-                    Box::pin(self.persist_active_event(event)).await?
+                    Box::pin(self.persist_active_event(event)).await?;
                 }
                 ControlAcceptanceProgress::Event(None) => {
                     self.resolve_closed_event_channel().await?;

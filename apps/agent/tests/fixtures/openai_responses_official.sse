@@ -46,15 +46,15 @@ event: response.output_item.added
 data: {"type":"response.output_item.added","sequence_number":13,"output_index":2,"item":{"id":"fc_fixture","type":"function_call","call_id":"call_fixture","name":"weather","arguments":""}}
 
 event: response.function_call_arguments.delta
-data: {"type":"response.function_call_arguments.delta","sequence_number":14,"item_id":"fc_fixture","output_index":2,"delta":"{\"city\":\"Tokyo\"}"}
+data: {"type":"response.function_call_arguments.delta","sequence_number":14,"item_id":"fc_fixture","output_index":2,"delta":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}
 
 event: response.function_call_arguments.done
-data: {"type":"response.function_call_arguments.done","sequence_number":15,"item_id":"fc_fixture","output_index":2,"arguments":"{\"city\":\"Tokyo\"}"}
+data: {"type":"response.function_call_arguments.done","sequence_number":15,"item_id":"fc_fixture","output_index":2,"arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","sequence_number":16,"output_index":2,"item":{"id":"fc_fixture","type":"function_call","call_id":"call_fixture","name":"weather","arguments":"{\"city\":\"Tokyo\"}","status":"completed"}}
+data: {"type":"response.output_item.done","sequence_number":16,"output_index":2,"item":{"id":"fc_fixture","type":"function_call","call_id":"call_fixture","name":"weather","arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}","status":"completed"}}
 
 event: response.completed
-data: {"type":"response.completed","sequence_number":17,"response":{"id":"resp_fixture","model":"gpt-5.6","status":"completed","output":[{"id":"msg_fixture","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Weather: ","annotations":[]}]},{"id":"rs_fixture","type":"reasoning","summary":[{"type":"summary_text","text":"Checking."}],"encrypted_content":"opaque-reasoning"},{"id":"fc_fixture","type":"function_call","call_id":"call_fixture","name":"weather","arguments":"{\"city\":\"Tokyo\"}","status":"completed"}],"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":5},"output_tokens":12,"output_tokens_details":{"reasoning_tokens":4},"total_tokens":32}}}
+data: {"type":"response.completed","sequence_number":17,"response":{"id":"resp_fixture","model":"gpt-5.6","status":"completed","output":[{"id":"msg_fixture","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Weather: ","annotations":[]}]},{"id":"rs_fixture","type":"reasoning","summary":[{"type":"summary_text","text":"Checking."}],"encrypted_content":"opaque-reasoning"},{"id":"fc_fixture","type":"function_call","call_id":"call_fixture","name":"weather","arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}","status":"completed"}],"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":5},"output_tokens":12,"output_tokens_details":{"reasoning_tokens":4},"total_tokens":32}}}
 
 : fixture-end

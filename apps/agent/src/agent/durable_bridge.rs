@@ -5,8 +5,21 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::approval::{
+    ExecutableGrant as LegacyExecutableGrant, GrantLease as LegacyGrantLease,
+    GrantRevalidation as LegacyGrantRevalidation,
+};
+
 use crate::{
-    approval::{ExecutableGrant, GrantLease, GrantRevalidation},
+    approval::{
+        authority::{
+            AuthorizedBoundInvocation, ExecutableGrant as RouteExecutableGrant,
+            GrantLease as RouteGrantLease, GrantRevalidation as RouteGrantRevalidation,
+            HumanDecisionEvidence, ToolExecutionAuthorizationEvidence, ToolExecutionDenialEvidence,
+        },
+        route_broker::DurablePendingApprovalEvidence,
+    },
     gateway::{ApprovalDecision, Command, CommandAck},
     memory::estimate::eviction_footprint_for_payload,
     provider::{
@@ -22,6 +35,7 @@ use crate::{
         ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection,
         RunPhase, ToolExecutionMutation,
     },
+    tools::BoundToolInvocation,
 };
 
 struct PendingSteerMessage {
@@ -79,16 +93,39 @@ pub(crate) struct RunOutput {
     pub retry_wait_commit_barrier: Option<RetryWaitCommitBarrier>,
     /// For `ApprovalResolved` decisions, the authenticated `AdmittedCommand`
     /// whose `CommandApplied` projection must accompany the resolution.
-    pub approval_command: Option<AdmittedCommand>,
+    pub approval_command: Option<ApprovalOutputContext>,
     /// Tool-call ID whose `ToolResult` should be durably skipped as
     /// approval-denied before any matching `ToolExecutionStart`.
-    pub approval_not_started: Option<String>,
+    pub approval_not_started: Option<ApprovalNotStartedContext>,
     /// Tool-call ID whose `ToolResult` should be durably skipped as
     /// approval-cancelled before any matching `ToolExecutionStart`.
     pub approval_cancelled: Option<String>,
 }
 
+pub(crate) enum ApprovalOutputContext {
+    PendingRoute(Box<DurablePendingApprovalEvidence>),
+    Decision(Box<ApprovalDecisionOutput>),
+}
+
+pub(crate) struct ApprovalDecisionOutput {
+    pub command: AdmittedCommand,
+    pub human_decision: Option<HumanDecisionEvidence>,
+}
+
+pub(crate) enum ApprovalNotStartedContext {
+    Legacy(String),
+    /// A Human approved the exact call, but commit-time reauthorization
+    /// refused to start it. The Human decision remains ApproveOnce.
+    HumanRejected(String),
+    RouteDenied {
+        tool_call_id: String,
+        bound: Box<BoundToolInvocation>,
+        denial: Box<ToolExecutionDenialEvidence>,
+    },
+}
+
 impl RunOutput {
+    #[cfg(test)]
     pub(super) fn detached(
         binding: DurableRunBinding,
         event: AgentEvent,
@@ -188,18 +225,45 @@ impl MessageCommitBarrier {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolStartCommitResult {
     Committed,
     Reauthorize,
+    RouteCommitted(AuthorizedBoundInvocation),
+    RouteReauthorize(crate::tools::SealedBoundToolInvocation),
+}
+
+impl ToolStartCommitResult {
+    pub(crate) const fn is_reauthorize(&self) -> bool {
+        matches!(self, Self::Reauthorize | Self::RouteReauthorize(_))
+    }
+}
+
+enum ToolStartGrant {
+    #[cfg(test)]
+    Legacy(LegacyExecutableGrant),
+    Route(RouteExecutableGrant),
+}
+
+enum RevalidatedToolGrant<'a> {
+    #[cfg(test)]
+    LegacyValid(LegacyGrantLease<'a>),
+    #[cfg(test)]
+    LegacyReauthorize,
+    RouteValid {
+        lease: RouteGrantLease<'a>,
+        bound: Box<BoundToolInvocation>,
+        authorization: Box<ToolExecutionAuthorizationEvidence>,
+    },
+    RouteReauthorize,
 }
 
 pub(crate) struct ToolStartCommitBarrier {
     sender: oneshot::Sender<ToolStartCommitResult>,
-    grant: Option<ExecutableGrant>,
+    grant: Option<ToolStartGrant>,
 }
 
 impl ToolStartCommitBarrier {
+    #[cfg(test)]
     pub(crate) fn channel() -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
         let (sender, receiver) = oneshot::channel();
         (
@@ -211,14 +275,28 @@ impl ToolStartCommitBarrier {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn channel_with_grant(
-        grant: ExecutableGrant,
+        grant: LegacyExecutableGrant,
     ) -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
         let (sender, receiver) = oneshot::channel();
         (
             Self {
                 sender,
-                grant: Some(grant),
+                grant: Some(ToolStartGrant::Legacy(grant)),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn channel_with_route_grant(
+        grant: RouteExecutableGrant,
+    ) -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender,
+                grant: Some(ToolStartGrant::Route(grant)),
             },
             receiver,
         )
@@ -228,26 +306,65 @@ impl ToolStartCommitBarrier {
         &self,
         tool_call_id: &str,
         tool_name: &str,
-        args: &Value,
+        _args: &Value,
         run_id: &str,
         turn_id: &str,
-    ) -> Result<(GrantRevalidation, GrantLease<'_>)> {
+    ) -> Result<RevalidatedToolGrant<'_>> {
         match self.grant.as_ref() {
-            Some(grant) => {
-                grant
-                    .authorize(tool_call_id, tool_name, args, run_id, turn_id)
-                    .await
+            #[cfg(test)]
+            Some(ToolStartGrant::Legacy(grant)) => {
+                let (status, lease) = grant
+                    .authorize(tool_call_id, tool_name, _args, run_id, turn_id)
+                    .await?;
+                Ok(match status {
+                    LegacyGrantRevalidation::Valid => RevalidatedToolGrant::LegacyValid(lease),
+                    LegacyGrantRevalidation::Reauthorize => RevalidatedToolGrant::LegacyReauthorize,
+                })
             }
-            None => Ok((GrantRevalidation::Valid, GrantLease::empty())),
+            Some(ToolStartGrant::Route(grant)) => {
+                let (status, lease, bound, authorization) = grant
+                    .authorize(tool_call_id, tool_name, grant.route(), run_id, turn_id)
+                    .await?;
+                Ok(match status {
+                    RouteGrantRevalidation::Valid => RevalidatedToolGrant::RouteValid {
+                        lease: lease.expect("valid route grant retains its policy lease"),
+                        bound: Box::new(bound),
+                        authorization: Box::new(authorization),
+                    },
+                    RouteGrantRevalidation::Reauthorize => RevalidatedToolGrant::RouteReauthorize,
+                })
+            }
+            #[cfg(test)]
+            None => Ok(RevalidatedToolGrant::LegacyValid(LegacyGrantLease::empty())),
+            #[cfg(not(test))]
+            None => bail!("route-aware ToolExecutionStart is missing exact-call authority"),
         }
     }
 
     pub(super) fn committed(self) {
-        let _ = self.sender.send(ToolStartCommitResult::Committed);
+        let result = match self.grant {
+            Some(ToolStartGrant::Route(grant)) => {
+                ToolStartCommitResult::RouteCommitted(grant.into_authorized_bound())
+            }
+            #[cfg(test)]
+            Some(ToolStartGrant::Legacy(_)) | None => ToolStartCommitResult::Committed,
+            #[cfg(not(test))]
+            None => ToolStartCommitResult::Reauthorize,
+        };
+        let _ = self.sender.send(result);
     }
 
     fn reauthorize(self) {
-        let _ = self.sender.send(ToolStartCommitResult::Reauthorize);
+        let result = match self.grant {
+            Some(ToolStartGrant::Route(grant)) => {
+                ToolStartCommitResult::RouteReauthorize(grant.into_authorized_bound().into_sealed())
+            }
+            #[cfg(test)]
+            Some(ToolStartGrant::Legacy(_)) | None => ToolStartCommitResult::Reauthorize,
+            #[cfg(not(test))]
+            None => ToolStartCommitResult::Reauthorize,
+        };
+        let _ = self.sender.send(result);
     }
 }
 
@@ -356,11 +473,11 @@ pub(super) struct DurableBridge {
     /// Original owner command cut off by an active Abort; applied alongside the
     /// final AgentEnd so the owner terminates with the aborted run.
     aborted_owner: Option<(String, u64)>,
-    /// Tool-call IDs that were approval-denied and must be durably skipped as
-    /// `approval_denied` when their `ToolResult` arrives, before any matching
-    /// `ToolExecutionStart`. Inserted by `ApprovalResolved` Deny; removed when
-    /// the skip/finish projection is committed.
-    approval_not_started: HashSet<String>,
+    /// Tool-call IDs deliberately not started, mapped to their exact durable
+    /// disposition. Human DenyOnce, foundation denial, and post-approval
+    /// reauthorization rejection are different facts.
+    approval_not_started: HashMap<String, &'static str>,
+    route_denials: HashMap<String, (Box<BoundToolInvocation>, Box<ToolExecutionDenialEvidence>)>,
     /// Tool-call IDs that were approval-cancelled and must be durably finished
     /// as `approval_cancelled` when their `ToolResult` arrives. Inserted by
     /// `ApprovalResolved` Cancelled or idle cancellation; removed when the finish
@@ -370,7 +487,7 @@ pub(super) struct DurableBridge {
     /// approval. Set from the worker's `RunOutput` when `ApprovalResolved` is
     /// emitted and consumed when the Decision is committed so the matching
     /// `CommandApplied` projection can be emitted. At most one command is kept.
-    approval_command: Option<AdmittedCommand>,
+    approval_command: Option<Box<ApprovalDecisionOutput>>,
     /// Maps an active approval `request_id` to the `tool_call_id` it controls.
     /// Inserted when `ApprovalRequested` commits; consumed by the matching
     /// `ApprovalResolved` to locate the affected tool.
@@ -387,12 +504,12 @@ pub(super) struct DurableBridge {
     /// order by the matching `ToolExecutionStart`, which emits the
     /// `ApprovalResolved` and `CommandApplied` projections atomically. `AgentEnd`
     /// cannot commit while this queue is non-empty.
-    pending_approval_resolved: Vec<(String, ApprovalResolution, AdmittedCommand)>,
+    pending_approval_resolved: Vec<(String, ApprovalResolution, Box<ApprovalDecisionOutput>)>,
     /// Approved decisions preempted before their tool start. The matching
     /// runtime cancellation, prepared-tool terminal, ToolResult, and this
     /// authenticated command's terminal no-op commit together when the worker
     /// supplies the cancellation result.
-    pending_cancelled_approval_commands: HashMap<String, (String, AdmittedCommand)>,
+    pending_cancelled_approval_commands: HashMap<String, (String, Box<ApprovalDecisionOutput>)>,
     committed_terminal_command_ids: Vec<String>,
 }
 
@@ -431,7 +548,8 @@ impl DurableBridge {
             pending_hard_steer_user_message_id: None,
             pending_hard_steer_message_barrier: None,
             aborted_owner: None,
-            approval_not_started: HashSet::new(),
+            approval_not_started: HashMap::new(),
+            route_denials: HashMap::new(),
             approval_cancelled: HashSet::new(),
             approval_command: None,
             approval_request_tools: HashMap::new(),
@@ -547,13 +665,15 @@ impl DurableBridge {
             bail!("hard steer requires a UserMessage");
         }
         let new_turn_id = Uuid::now_v7().to_string();
-        writer
-            .apply(hard_steer_step_zero_batch(
-                &self.binding,
-                &command,
-                &new_turn_id,
-            )?)
-            .await?;
+        // Keep EventWriter's evidence-heavy mutation future behind a heap
+        // boundary. Inlining it here makes every active-control admission
+        // future carry the complete projection materialization state.
+        Box::pin(writer.apply(hard_steer_step_zero_batch(
+            &self.binding,
+            &command,
+            &new_turn_id,
+        )?))
+        .await?;
         self.pending_hard_steer = Some(command);
         self.pending_hard_steer_turn_id = Some(new_turn_id);
         Ok(())
@@ -861,11 +981,43 @@ impl DurableBridge {
             bail!("run output durable binding changed while the worker was active");
         }
         let steer_group_active = self.pending_steer_group.is_some();
-        if output.approval_command.is_some() {
-            self.approval_command = output.approval_command;
+        let mut route_pending_evidence = None;
+        if let Some(context) = output.approval_command.take() {
+            match context {
+                ApprovalOutputContext::PendingRoute(evidence) => {
+                    route_pending_evidence = Some(*evidence);
+                }
+                ApprovalOutputContext::Decision(decision) => {
+                    self.approval_command = Some(decision);
+                }
+            }
         }
-        if let Some(tool_call_id) = output.approval_not_started {
-            self.approval_not_started.insert(tool_call_id);
+        if let Some(context) = output.approval_not_started {
+            match context {
+                ApprovalNotStartedContext::Legacy(tool_call_id) => {
+                    self.approval_not_started
+                        .insert(tool_call_id, "approval_denied");
+                }
+                ApprovalNotStartedContext::HumanRejected(tool_call_id) => {
+                    self.approval_not_started
+                        .insert(tool_call_id, "approval_rejected");
+                }
+                ApprovalNotStartedContext::RouteDenied {
+                    tool_call_id,
+                    bound,
+                    denial,
+                } => {
+                    self.approval_not_started
+                        .insert(tool_call_id.clone(), denial.error_code());
+                    if self
+                        .route_denials
+                        .insert(tool_call_id, (bound, denial))
+                        .is_some()
+                    {
+                        bail!("duplicate route denial evidence for one tool call");
+                    }
+                }
+            }
         }
         if let Some(tool_call_id) = output.approval_cancelled {
             self.approval_cancelled.insert(tool_call_id);
@@ -1124,7 +1276,7 @@ impl DurableBridge {
                         });
                     }
                 }
-                let (grant_status, grant_lease) = output
+                let grant_revalidation = output
                     .commit_barrier
                     .as_ref()
                     .expect("ToolExecutionStart barrier checked")
@@ -1136,8 +1288,14 @@ impl DurableBridge {
                         &self.binding.turn_id,
                     )
                     .await?;
-                if grant_status == GrantRevalidation::Reauthorize {
-                    drop(grant_lease);
+                let must_reauthorize = match &grant_revalidation {
+                    #[cfg(test)]
+                    RevalidatedToolGrant::LegacyReauthorize => true,
+                    RevalidatedToolGrant::RouteReauthorize => true,
+                    _ => false,
+                };
+                if must_reauthorize {
+                    drop(grant_revalidation);
                     output
                         .commit_barrier
                         .take()
@@ -1163,8 +1321,12 @@ impl DurableBridge {
                         self.approval_request_tools.get(req) == Some(&tool_call_id)
                     })
                 {
-                    let (request_id, resolution, command) =
+                    let (request_id, resolution, decision_output) =
                         self.pending_approval_resolved.remove(pos);
+                    let ApprovalDecisionOutput {
+                        command,
+                        human_decision,
+                    } = *decision_output;
                     let expected_tool_call_id = self
                         .approval_request_tools
                         .get(&request_id)
@@ -1183,12 +1345,29 @@ impl DurableBridge {
                         .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let public_resolution = resolution.clone();
-                    let mut resolution_projections = vec![
-                        Projection::Approval(ApprovalMutation::Resolve {
+                    if let RevalidatedToolGrant::RouteValid { authorization, .. } =
+                        &grant_revalidation
+                        && authorization.human_decision.as_ref() != human_decision.as_ref()
+                    {
+                        bail!(
+                            "route ToolExecutionStart authority does not match its Human decision"
+                        );
+                    }
+                    let approval_projection = match human_decision {
+                        Some(human_decision) => Projection::RouteApprovalResolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: actor.clone(),
+                            human_decision: Box::new(human_decision),
+                        },
+                        None => Projection::Approval(ApprovalMutation::Resolve {
                             request_id: request_id.clone(),
                             state,
                             actor: actor.clone(),
                         }),
+                    };
+                    let mut resolution_projections = vec![
+                        approval_projection,
                         Projection::CommandApplied {
                             command_id: command_id.clone(),
                             command_seq,
@@ -1198,6 +1377,34 @@ impl DurableBridge {
                     if let Some(rule) = approval_rule_projection(&public_resolution)? {
                         resolution_projections.push(Projection::ApprovalRule(rule));
                     }
+                    let start_projection = match &grant_revalidation {
+                        RevalidatedToolGrant::RouteValid {
+                            bound,
+                            authorization,
+                            ..
+                        } => Projection::RouteToolExecutionStart {
+                            tool_call_id: tool_call_id.clone(),
+                            run_id: run_id.clone(),
+                            bound: Box::new(bound.as_ref().clone()),
+                            authorization: Box::new(authorization.as_ref().clone()),
+                        },
+                        #[cfg(test)]
+                        RevalidatedToolGrant::LegacyValid(_) => {
+                            Projection::ToolExecution(ToolExecutionMutation::Start {
+                                tool_call_id: tool_call_id.clone(),
+                                run_id: run_id.clone(),
+                            })
+                        }
+                        #[cfg(test)]
+                        RevalidatedToolGrant::LegacyReauthorize
+                        | RevalidatedToolGrant::RouteReauthorize => {
+                            unreachable!("reauthorization returned before durable start")
+                        }
+                        #[cfg(not(test))]
+                        RevalidatedToolGrant::RouteReauthorize => {
+                            unreachable!("reauthorization returned before durable start")
+                        }
+                    };
                     let writes = vec![
                         EventWrite {
                             event: Some(DurableEvent::approval_resolved(
@@ -1216,12 +1423,7 @@ impl DurableBridge {
                                 run_id.clone(),
                                 self.binding.executor_generation,
                             )?),
-                            projections: vec![Projection::ToolExecution(
-                                ToolExecutionMutation::Start {
-                                    tool_call_id: tool_call_id.clone(),
-                                    run_id: run_id.clone(),
-                                },
-                            )],
+                            projections: vec![start_projection],
                         },
                     ];
                     self.approval_prepared_tools.remove(&tool_call_id);
@@ -1247,7 +1449,7 @@ impl DurableBridge {
                             public,
                         )
                         .await?;
-                    drop(grant_lease);
+                    drop(grant_revalidation);
                     return Ok(CommittedRunOutput {
                         outputs,
                         tool_start_barrier: output.commit_barrier,
@@ -1268,10 +1470,34 @@ impl DurableBridge {
                         idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
                     }));
                 }
-                projections.push(Projection::ToolExecution(ToolExecutionMutation::Start {
-                    tool_call_id: tool_call_id.clone(),
-                    run_id: self.binding.run_id.clone(),
-                }));
+                projections.push(match &grant_revalidation {
+                    RevalidatedToolGrant::RouteValid {
+                        bound,
+                        authorization,
+                        ..
+                    } => Projection::RouteToolExecutionStart {
+                        tool_call_id: tool_call_id.clone(),
+                        run_id: self.binding.run_id.clone(),
+                        bound: Box::new(bound.as_ref().clone()),
+                        authorization: Box::new(authorization.as_ref().clone()),
+                    },
+                    #[cfg(test)]
+                    RevalidatedToolGrant::LegacyValid(_) => {
+                        Projection::ToolExecution(ToolExecutionMutation::Start {
+                            tool_call_id: tool_call_id.clone(),
+                            run_id: self.binding.run_id.clone(),
+                        })
+                    }
+                    #[cfg(test)]
+                    RevalidatedToolGrant::LegacyReauthorize
+                    | RevalidatedToolGrant::RouteReauthorize => {
+                        unreachable!("reauthorization returned before durable start")
+                    }
+                    #[cfg(not(test))]
+                    RevalidatedToolGrant::RouteReauthorize => {
+                        unreachable!("reauthorization returned before durable start")
+                    }
+                });
                 let committed = self
                     .commit_single(
                         writer,
@@ -1291,7 +1517,7 @@ impl DurableBridge {
                         },
                     )
                     .await?;
-                drop(grant_lease);
+                drop(grant_revalidation);
                 Ok(committed)
             }
             AgentEvent::RetryScheduled {
@@ -1460,6 +1686,26 @@ impl DurableBridge {
                 self.approval_request_tools
                     .insert(request_id.clone(), tool_call_id.clone());
                 self.approval_prepared_tools.insert(tool_call_id.clone());
+                let approval_projection = match route_pending_evidence.take() {
+                    Some(evidence) => Projection::RouteApprovalPending {
+                        request_id: request_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        run_id: self.binding.run_id.clone(),
+                        turn_id: self.binding.turn_id.clone(),
+                        bound: Box::new(evidence.bound),
+                        policy: Box::new(evidence.policy),
+                        escalation_review: Box::new(evidence.escalation_review),
+                    },
+                    #[cfg(test)]
+                    None => Projection::Approval(ApprovalMutation::Pending {
+                        request_id: request_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        run_id: self.binding.run_id.clone(),
+                        turn_id: self.binding.turn_id.clone(),
+                    }),
+                    #[cfg(not(test))]
+                    None => bail!("route ApprovalRequested is missing exact durable evidence"),
+                };
                 self.commit_single(
                     writer,
                     DurableEvent::approval_requested(request.clone())?,
@@ -1473,12 +1719,7 @@ impl DurableBridge {
                                 .binding
                                 .tool_execution_idempotency_key(&tool_call_id),
                         }),
-                        Projection::Approval(ApprovalMutation::Pending {
-                            request_id,
-                            tool_call_id,
-                            run_id: self.binding.run_id.clone(),
-                            turn_id: self.binding.turn_id.clone(),
-                        }),
+                        approval_projection,
                     ],
                     AgentEvent::ApprovalRequested { request },
                 )
@@ -1493,7 +1734,8 @@ impl DurableBridge {
                     .iter()
                     .position(|(rid, _, _)| rid == &request_id)
                 {
-                    let (request_id, _, command) = self.pending_approval_resolved.remove(pos);
+                    let (request_id, _, decision_output) =
+                        self.pending_approval_resolved.remove(pos);
                     let tool_call_id = self
                         .approval_request_tools
                         .get(&request_id)
@@ -1501,10 +1743,38 @@ impl DurableBridge {
                         .ok_or_else(|| anyhow!("cancelled approval has no tool binding"))?;
                     if self
                         .pending_cancelled_approval_commands
-                        .insert(tool_call_id, (request_id, command))
+                        .insert(tool_call_id, (request_id, decision_output))
                         .is_some()
                     {
                         bail!("duplicate pre-start cancelled approval command");
+                    }
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                } else if let Some(decision_output) = self.approval_command.take() {
+                    #[cfg(not(test))]
+                    if decision_output.human_decision.is_none() {
+                        bail!("route approval cancellation is missing Human decision evidence");
+                    }
+                    let tool_call_id = self
+                        .approval_request_tools
+                        .get(&request_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow!("cancelled approval decision has no tool binding")
+                        })?;
+                    if self
+                        .pending_cancelled_approval_commands
+                        .insert(tool_call_id, (request_id, decision_output))
+                        .is_some()
+                    {
+                        bail!("duplicate cancelled approval decision command");
                     }
                     return Ok(CommittedRunOutput {
                         outputs: Vec::new(),
@@ -1540,7 +1810,9 @@ impl DurableBridge {
             }
             AgentEvent::ApprovalResolved {
                 request_id,
-                resolution: resolution @ ApprovalResolution::Decision(..),
+                resolution:
+                    resolution
+                    @ (ApprovalResolution::Decision(..) | ApprovalResolution::Rejected { .. }),
             } => {
                 if self.phase != RunPhase::AssistantStarted
                     || !self.turn_open
@@ -1553,22 +1825,41 @@ impl DurableBridge {
                 let state = approval_state(&resolution);
                 if matches!(
                     resolution,
-                    ApprovalResolution::Decision(ApprovalDecision::Deny)
+                    ApprovalResolution::Decision(ApprovalDecision::DenyOnce)
+                        | ApprovalResolution::Rejected { .. }
                 ) && let Some(tool_call_id) = self.approval_request_tools.get(&request_id)
                 {
-                    self.approval_not_started.insert(tool_call_id.clone());
+                    self.approval_not_started.insert(
+                        tool_call_id.clone(),
+                        if matches!(resolution, ApprovalResolution::Rejected { .. }) {
+                            "approval_rejected"
+                        } else {
+                            "approval_denied"
+                        },
+                    );
                 }
-                let command = self.approval_command.take().ok_or_else(|| {
-                    anyhow!("ApprovalResolved Decision requires a pending command")
-                })?;
-                if matches!(
-                    resolution,
-                    ApprovalResolution::Decision(
-                        ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveAlways { .. }
-                    )
-                ) {
+                let decision_output =
+                    if matches!(resolution, ApprovalResolution::Rejected { .. }) {
+                        self.pending_approval_resolved
+                            .iter()
+                            .position(|(pending_request_id, _, _)| {
+                                pending_request_id == &request_id
+                            })
+                            .map(|position| self.pending_approval_resolved.remove(position).2)
+                            .or_else(|| self.approval_command.take())
+                    } else {
+                        self.approval_command.take()
+                    }
+                    .ok_or_else(|| {
+                        anyhow!("ApprovalResolved Decision requires a pending command")
+                    })?;
+                #[cfg(not(test))]
+                if decision_output.human_decision.is_none() {
+                    bail!("route approval resolution is missing Human decision evidence");
+                }
+                if approval_resolution_allows_start(&resolution) {
                     self.pending_approval_resolved
-                        .push((request_id, resolution, command));
+                        .push((request_id, resolution, decision_output));
                     return Ok(CommittedRunOutput {
                         outputs: Vec::new(),
                         tool_start_barrier: None,
@@ -1579,6 +1870,10 @@ impl DurableBridge {
                         ),
                     });
                 } else {
+                    let ApprovalDecisionOutput {
+                        command,
+                        human_decision,
+                    } = *decision_output;
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
                     let actor = command
@@ -1588,12 +1883,21 @@ impl DurableBridge {
                         .principal_id()
                         .to_owned();
                     let run_id = self.binding.run_id.clone();
-                    let projections = vec![
-                        Projection::Approval(ApprovalMutation::Resolve {
+                    let approval_projection = match human_decision {
+                        Some(human_decision) => Projection::RouteApprovalResolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: actor.clone(),
+                            human_decision: Box::new(human_decision),
+                        },
+                        None => Projection::Approval(ApprovalMutation::Resolve {
                             request_id: request_id.clone(),
                             state,
                             actor: actor.clone(),
                         }),
+                    };
+                    let projections = vec![
+                        approval_projection,
                         Projection::CommandApplied {
                             command_id: command_id.clone(),
                             command_seq,
@@ -1834,23 +2138,39 @@ impl DurableBridge {
                     result: serde_json::to_value(result)?,
                     is_error,
                 });
-            } else if self.approval_not_started.contains(&tool_call_id)
+            } else if self.approval_not_started.contains_key(&tool_call_id)
                 && self.pending_tool_calls.contains(&tool_call_id)
             {
                 if !result.is_error {
                     bail!("Approval-not-started ToolResult must be is_error=true");
                 }
-                self.approval_not_started.remove(&tool_call_id);
+                let disposition_error_code = self
+                    .approval_not_started
+                    .remove(&tool_call_id)
+                    .expect("not-started disposition presence was checked");
                 self.pending_tool_calls.remove(&tool_call_id);
-                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
-                    tool_call_id: tool_call_id.clone(),
-                    command_id: self.binding.command_id.clone(),
-                    run_id: self.binding.run_id.clone(),
-                    turn_id: self.binding.turn_id.clone(),
-                    executor_generation: self.binding.executor_generation,
-                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
-                    error_code: "approval_denied",
-                }));
+                projections.push(match self.route_denials.remove(&tool_call_id) {
+                    Some((bound, denial)) => Projection::RouteToolExecutionDenied {
+                        tool_call_id: tool_call_id.clone(),
+                        command_id: self.binding.command_id.clone(),
+                        run_id: self.binding.run_id.clone(),
+                        turn_id: self.binding.turn_id.clone(),
+                        executor_generation: self.binding.executor_generation,
+                        idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                        error_code: denial.error_code(),
+                        bound,
+                        denial,
+                    },
+                    None => Projection::ToolExecution(ToolExecutionMutation::Skip {
+                        tool_call_id: tool_call_id.clone(),
+                        command_id: self.binding.command_id.clone(),
+                        run_id: self.binding.run_id.clone(),
+                        turn_id: self.binding.turn_id.clone(),
+                        executor_generation: self.binding.executor_generation,
+                        idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                        error_code: disposition_error_code,
+                    }),
+                });
             } else if self.pending_tool_calls.remove(&tool_call_id) {
                 if !result.is_error {
                     bail!("Cancelled ToolResult must be is_error=true");
@@ -1906,11 +2226,28 @@ impl DurableBridge {
                 }
                 self.approval_prepared_tools.remove(&tool_call_id);
                 let result_value = serde_json::to_value(result)?;
-                if let Some((request_id, command)) = self
+                if let Some((request_id, decision_output)) = self
                     .pending_cancelled_approval_commands
                     .remove(&tool_call_id)
                 {
+                    let ApprovalDecisionOutput {
+                        command,
+                        human_decision,
+                    } = *decision_output;
                     let command_id = command.envelope().command_id.to_string();
+                    let approval_projection = match human_decision {
+                        Some(human_decision) => Projection::RouteApprovalResolve {
+                            request_id: request_id.clone(),
+                            state: "cancelled",
+                            actor: "runtime".to_owned(),
+                            human_decision: Box::new(human_decision),
+                        },
+                        None => Projection::Approval(ApprovalMutation::Resolve {
+                            request_id: request_id.clone(),
+                            state: "cancelled",
+                            actor: "runtime".to_owned(),
+                        }),
+                    };
                     writes.push(EventWrite {
                         event: Some(DurableEvent::approval_resolved(
                             request_id.clone(),
@@ -1918,11 +2255,7 @@ impl DurableBridge {
                             "runtime".to_owned(),
                         )?),
                         projections: vec![
-                            Projection::Approval(ApprovalMutation::Resolve {
-                                request_id: request_id.clone(),
-                                state: "cancelled",
-                                actor: "runtime".to_owned(),
-                            }),
+                            approval_projection,
                             Projection::CommandApplied {
                                 command_id: command_id.clone(),
                                 command_seq: command.envelope().seq,
@@ -1956,7 +2289,7 @@ impl DurableBridge {
                     result: result_value,
                     is_error: true,
                 });
-            } else if self.approval_not_started.remove(&tool_call_id) {
+            } else if let Some(error_code) = self.approval_not_started.remove(&tool_call_id) {
                 if !result.is_error {
                     bail!("Approval-not-started ToolResult must be is_error=true");
                 }
@@ -1968,13 +2301,13 @@ impl DurableBridge {
                         result_value.clone(),
                         true,
                         "cancelled".to_owned(),
-                        Some("approval_denied".to_owned()),
+                        Some(error_code.to_owned()),
                     )?),
                     projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
                         tool_call_id: tool_call_id.clone(),
                         expected: "prepared",
                         state: "cancelled",
-                        error_code: Some("approval_denied"),
+                        error_code: Some(error_code),
                     })],
                 });
                 public_prefix.push(AgentEvent::ToolExecutionEnd {
@@ -2164,9 +2497,12 @@ impl DurableBridge {
         }
 
         self.collect_terminal_command_ids(&batch);
-        let (events, calibration_ratio_bits) = writer
-            .apply_with_events_and_calibration_receipt(batch)
-            .await?;
+        // MessageEnd materialization carries transcript, provider-context,
+        // memory, and route-authority projections. Keep that mutation future
+        // off the caller's poll stack so a full bounded provider tail can be
+        // drained under Tokio's default worker-stack size.
+        let (events, calibration_ratio_bits) =
+            Box::pin(writer.apply_with_events_and_calibration_receipt(batch)).await?;
         let outputs = reconcile_committed_events(events, public)?;
         let calibration_receipt_count = receipt_requests
             .iter()
@@ -2662,12 +2998,26 @@ fn approval_state(resolution: &ApprovalResolution) -> &'static str {
     use crate::gateway::ApprovalDecision;
     match resolution {
         ApprovalResolution::Decision(ApprovalDecision::ApproveOnce) => "approved_once",
+        #[cfg(test)]
         ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { .. }) => "approved_always",
-        ApprovalResolution::Decision(ApprovalDecision::Deny) => "denied",
+        ApprovalResolution::Decision(ApprovalDecision::DenyOnce) => "denied",
+        ApprovalResolution::Rejected { .. } => "rejected",
         ApprovalResolution::Cancelled => "cancelled",
     }
 }
 
+fn approval_resolution_allows_start(resolution: &ApprovalResolution) -> bool {
+    match resolution {
+        ApprovalResolution::Decision(ApprovalDecision::ApproveOnce) => true,
+        #[cfg(test)]
+        ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { .. }) => true,
+        ApprovalResolution::Decision(ApprovalDecision::DenyOnce)
+        | ApprovalResolution::Rejected { .. }
+        | ApprovalResolution::Cancelled => false,
+    }
+}
+
+#[cfg(test)]
 fn approval_rule_projection(
     resolution: &ApprovalResolution,
 ) -> Result<Option<ApprovalRuleMutation>> {
@@ -2690,6 +3040,13 @@ fn approval_rule_projection(
         tool,
         pattern: serde_json::to_string(&value)?,
     }))
+}
+
+#[cfg(not(test))]
+fn approval_rule_projection(
+    _resolution: &ApprovalResolution,
+) -> Result<Option<ApprovalRuleMutation>> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -4301,6 +4658,7 @@ mod tests {
         let tool_call = ToolCall {
             id: "soft-call".to_owned(),
             name: "fixture-tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"safe": true}),
             )
@@ -4585,6 +4943,7 @@ mod tests {
         let length_call = ToolCall {
             id: "length-call".to_owned(),
             name: "fixture-tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"safe": true}),
             )
@@ -4792,6 +5151,7 @@ mod tests {
         let tool_call = ToolCall {
             id: "policy-denied-call".to_owned(),
             name: "fixture-tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"safe": true}),
             )
@@ -4878,7 +5238,9 @@ mod tests {
                     message_commit_barrier: Some(result_barrier),
                     retry_wait_commit_barrier: None,
                     approval_command: None,
-                    approval_not_started: Some(tool_call.id.clone()),
+                    approval_not_started: Some(ApprovalNotStartedContext::Legacy(
+                        tool_call.id.clone(),
+                    )),
                     approval_cancelled: None,
                 },
             )
@@ -5033,7 +5395,10 @@ mod tests {
         bridge.pending_approval_resolved = vec![(
             "request-1".to_owned(),
             ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
-            decision_command,
+            Box::new(ApprovalDecisionOutput {
+                command: decision_command,
+                human_decision: None,
+            }),
         )];
 
         let result = bridge
@@ -5096,7 +5461,12 @@ mod tests {
                         commit_barrier: None,
                         message_commit_barrier: None,
                         retry_wait_commit_barrier: None,
-                        approval_command: Some(decision_command(seq, request_id)),
+                        approval_command: Some(ApprovalOutputContext::Decision(Box::new(
+                            ApprovalDecisionOutput {
+                                command: decision_command(seq, request_id),
+                                human_decision: None,
+                            },
+                        ))),
                         approval_not_started: None,
                         approval_cancelled: None,
                     },
@@ -5164,7 +5534,12 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
-                    approval_command: Some(decision_command),
+                    approval_command: Some(ApprovalOutputContext::Decision(Box::new(
+                        ApprovalDecisionOutput {
+                            command: decision_command,
+                            human_decision: None,
+                        },
+                    ))),
                     approval_not_started: None,
                     approval_cancelled: None,
                 },
@@ -5237,12 +5612,13 @@ mod tests {
             .await
             .expect("commit ApprovalResolved Cancelled");
         assert!(bridge.pending_approval_resolved.is_empty());
-        let (request_id, command) = bridge
+        let (request_id, decision_output) = bridge
             .pending_cancelled_approval_commands
             .get("tool-call-1")
             .expect("cancelled approved command remains staged until its result commits");
         assert_eq!(request_id, "request-1");
-        assert_eq!(command.envelope().seq, 3);
+        assert_eq!(decision_output.command.envelope().seq, 3);
+        assert!(decision_output.human_decision.is_none());
         assert!(
             !bridge.approval_cancelled.contains("tool-call-1"),
             "the worker's cancelled ToolResult marker selects the atomic terminal commit"
@@ -5273,6 +5649,7 @@ mod tests {
         let tool_call = ToolCall {
             id: "soft-bound-call".to_owned(),
             name: "fixture-tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"safe": true}),
             )
@@ -5385,6 +5762,7 @@ mod tests {
         let tool_call = ToolCall {
             id: "abort-bound-call".to_owned(),
             name: "fixture-tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"safe": true}),
             )
@@ -5515,6 +5893,7 @@ mod tests {
         let tool_call = ToolCall {
             id: tool_call_id.to_owned(),
             name: "bash".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"command": "echo hello", "description": "test"}),
             )
@@ -5611,7 +5990,7 @@ mod tests {
 
         let decision_id = "00000000-0000-4000-8000-000000000802";
         let decision_command =
-            test_admitted_approval_decision(2, decision_id, request_id, ApprovalDecision::Deny);
+            test_admitted_approval_decision(2, decision_id, request_id, ApprovalDecision::DenyOnce);
         writer
             .persist_inbound(&InboundCommand::Valid(decision_command.envelope().clone()))
             .await
@@ -5624,12 +6003,17 @@ mod tests {
                     binding: binding.clone(),
                     event: AgentEvent::ApprovalResolved {
                         request_id: request_id.to_owned(),
-                        resolution: ApprovalResolution::Decision(ApprovalDecision::Deny),
+                        resolution: ApprovalResolution::Decision(ApprovalDecision::DenyOnce),
                     },
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
-                    approval_command: Some(decision_command),
+                    approval_command: Some(ApprovalOutputContext::Decision(Box::new(
+                        ApprovalDecisionOutput {
+                            command: decision_command,
+                            human_decision: None,
+                        },
+                    ))),
                     approval_not_started: None,
                     approval_cancelled: None,
                 },
@@ -5681,7 +6065,9 @@ mod tests {
                     message_commit_barrier: Some(result_barrier),
                     retry_wait_commit_barrier: None,
                     approval_command: None,
-                    approval_not_started: Some(tool_call.id.clone()),
+                    approval_not_started: Some(ApprovalNotStartedContext::Legacy(
+                        tool_call.id.clone(),
+                    )),
                     approval_cancelled: None,
                 },
             )
@@ -5749,6 +6135,156 @@ mod tests {
             start_count, 0,
             "denied approval must not emit ToolExecutionStart"
         );
+    }
+
+    #[tokio::test]
+    async fn start_revalidation_rejection_preserves_human_approve_once_exactly() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let request_id = "request-revalidation-rejected";
+        let (mut bridge, binding, _assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000811",
+            "run-revalidation-rejected",
+            "turn-revalidation-rejected",
+            "revalidation-rejected-call",
+            request_id,
+        )
+        .await;
+        let decision_command = test_admitted_approval_decision(
+            2,
+            "00000000-0000-4000-8000-000000000812",
+            request_id,
+            ApprovalDecision::ApproveOnce,
+        );
+        writer
+            .persist_inbound(&InboundCommand::Valid(decision_command.envelope().clone()))
+            .await
+            .expect("persist Human ApproveOnce");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: request_id.to_owned(),
+                        resolution: ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: Some(ApprovalOutputContext::Decision(Box::new(
+                        ApprovalDecisionOutput {
+                            command: decision_command,
+                            human_decision: None,
+                        },
+                    ))),
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("buffer approved resolution until durable tool start");
+        assert_eq!(bridge.pending_approval_resolved.len(), 1);
+
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput::detached(
+                    binding.clone(),
+                    AgentEvent::ApprovalResolved {
+                        request_id: request_id.to_owned(),
+                        resolution: ApprovalResolution::Rejected {
+                            decision: ApprovalDecision::ApproveOnce,
+                        },
+                    },
+                    None,
+                ),
+            )
+            .await
+            .expect("replace buffered approval with rejected execution disposition");
+        assert!(committed.outputs.iter().any(|output| matches!(
+            &output.event,
+            AgentEvent::ApprovalResolved {
+                request_id: committed_request_id,
+                resolution: ApprovalResolution::Rejected {
+                    decision: ApprovalDecision::ApproveOnce
+                }
+            } if committed_request_id == request_id
+        )));
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: Vec::new(),
+            details: serde_json::json!({"error":"approval_rejected"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_id = "revalidation-rejected-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput::detached(
+                    binding.clone(),
+                    AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    None,
+                ),
+            )
+            .await
+            .expect("commit rejected result start");
+        let (barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: Some(ApprovalNotStartedContext::HumanRejected(
+                        tool_call.id.clone(),
+                    )),
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit rejected result end")
+            .resolve_message_receipts();
+
+        let projection: (String, String, Option<String>, String) = sqlx::query_as(
+            "SELECT a.state, t.state, t.error_code, c.status
+             FROM approval_log a
+             JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+             JOIN inbound_commands c ON c.command_id = ?
+             WHERE a.id = ?",
+        )
+        .bind("00000000-0000-4000-8000-000000000812")
+        .bind(request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("load rejected execution disposition");
+        assert_eq!(
+            projection,
+            (
+                "rejected".to_owned(),
+                "cancelled".to_owned(),
+                Some("approval_rejected".to_owned()),
+                "applied".to_owned(),
+            )
+        );
+        assert!(bridge.pending_approval_resolved.is_empty());
+        assert!(bridge.approval_prepared_tools.is_empty());
     }
 
     #[tokio::test]

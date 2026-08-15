@@ -34,6 +34,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::approval::{
+    authority::{
+        CurrentCallDecision, HUMAN_DECISION_PROVENANCE_VERSION_V1, HumanAuthorizationContextV1,
+        HumanDecisionEvidence, ToolExecutionAuthorizationEvidence, ToolExecutionDenialEvidence,
+    },
+    route_policy::PolicySnapshot,
+    route_reviewer::{EscalationReviewEvidence, EscalationReviewOutcome},
+};
 use crate::memory::{
     HydratedMemoryBatch, HydratedMemoryCursor, HydratedMemoryJob, HydratedMemoryMembership,
     HydratedMemoryRuntime, HydratedMemorySummary,
@@ -52,6 +60,7 @@ use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{
     GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
 };
+use crate::tools::BoundToolInvocation;
 
 use self::crypto::{
     DataKeyScope, KeyWrapAad, PersonalityAgentCommandDigestFactory, WRAP_ALGORITHM,
@@ -655,6 +664,8 @@ impl Store {
 
         event_writer::authenticate_event_log_snapshot(self, &mut transaction).await?;
         provider_context::verify_provider_context_projection_set(self, &mut transaction).await?;
+        self.verify_route_authority_evidence(&mut transaction)
+            .await?;
         let intents = self.hydrate_running_intents(&mut transaction).await?;
         if !intents.is_empty() {
             transaction
@@ -689,6 +700,8 @@ impl Store {
             .context("failed to begin post-recovery hydration snapshot")?;
         event_writer::authenticate_event_log_snapshot(self, &mut transaction).await?;
         provider_context::verify_provider_context_projection_set(self, &mut transaction).await?;
+        self.verify_route_authority_evidence(&mut transaction)
+            .await?;
         let post_recovery_intents = self.hydrate_running_intents(&mut transaction).await?;
         if !post_recovery_intents.is_empty() {
             transaction.rollback().await?;
@@ -716,7 +729,7 @@ impl Store {
             .commit()
             .await
             .context("failed to commit hydration snapshot transaction")?;
-        let mut recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
+        let mut recovery_steps = SuffixRecovery::plan_full_suffix(self, &recovery).await?;
         if let Some(pending_error_context) = pending_error_context {
             let mut matching_steps = recovery_steps.iter_mut().filter(|step| {
                 matches!(step, RecoveryStep::ResumeAssistantFromDurableEvents { .. })
@@ -767,6 +780,674 @@ impl Store {
             memory,
             resume: ResumeDirective::AdmitCommands,
         }))
+    }
+
+    async fn decrypt_route_evidence<T: serde::de::DeserializeOwned>(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        namespace: &str,
+        row_id: &str,
+        key_ref: &str,
+        ciphertext: &[u8],
+    ) -> Result<T> {
+        let key = self
+            .data_key_by_ref_in_transaction(transaction, key_ref)
+            .await
+            .with_context(|| {
+                format!("private route evidence {namespace}/{row_id} key is unavailable")
+            })?;
+        if key.purpose != DataKeyPurpose::Mutation {
+            bail!("private route evidence {namespace}/{row_id} references a non-mutation key");
+        }
+        let aad = self
+            .scope()
+            .row_aad(namespace, row_id, DataKeyPurpose::Mutation);
+        let plaintext =
+            Zeroizing::new(decrypt_content(&key, ciphertext, &aad).with_context(|| {
+                format!("private route evidence {namespace}/{row_id} failed authentication")
+            })?);
+        serde_json::from_slice(&plaintext)
+            .with_context(|| format!("private route evidence {namespace}/{row_id} is invalid"))
+    }
+
+    async fn verify_human_decision_command(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        human: &HumanDecisionEvidence,
+    ) -> Result<()> {
+        let row = sqlx::query(
+            "SELECT personality_agent_id, provenance_json
+             FROM inbound_commands WHERE command_id=? AND seq=?",
+        )
+        .bind(&human.command_id)
+        .bind(i64::try_from(human.command_seq).context("Human decision command seq overflow")?)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| anyhow!("Human decision command is not durably authenticated"))?;
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let provenance_json: String = row.try_get("provenance_json")?;
+        let provenance: crate::runtime::contracts::DirectChatProvenanceV1 =
+            serde_json::from_str(&provenance_json)
+                .context("Human decision command provenance is invalid")?;
+        provenance
+            .validate(&self.scope.personality_agent_id)
+            .context("Human decision command provenance is not bound to this Store")?;
+        if personality_agent_id != self.scope.personality_agent_id.as_str()
+            || serde_json::to_string(&provenance)? != provenance_json
+            || human.tenant_id != provenance.tenant_id()
+            || human.personality_agent_id != provenance.personality_agent_id().as_str()
+            || human.human_principal_id != provenance.actor().principal_id()
+        {
+            bail!("Human decision evidence disagrees with authenticated command provenance");
+        }
+        let command = event_writer::load_authenticated_command(
+            self,
+            transaction,
+            &human.command_id,
+            human.command_seq,
+            "approval_decision",
+        )
+        .await?;
+        let crate::gateway::Command::ApprovalDecision {
+            request_id,
+            decision,
+        } = command
+        else {
+            bail!("Human decision command contains a different command variant");
+        };
+        let decision = match decision {
+            crate::gateway::ApprovalDecision::ApproveOnce => CurrentCallDecision::ApproveOnce,
+            crate::gateway::ApprovalDecision::DenyOnce => CurrentCallDecision::DenyOnce,
+            #[cfg(test)]
+            crate::gateway::ApprovalDecision::ApproveAlways { .. } => {
+                bail!("route approval cannot use standing-policy mutation")
+            }
+        };
+        if request_id != human.request_id || decision != human.decision {
+            bail!("Human decision evidence disagrees with authenticated command payload");
+        }
+        Ok(())
+    }
+
+    async fn verify_route_approval_origin_actor(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        tool_call_id: &str,
+        human: &HumanDecisionEvidence,
+    ) -> Result<()> {
+        let row = sqlx::query(
+            "SELECT command.personality_agent_id, command.provenance_json
+             FROM tool_executions AS tool
+             JOIN inbound_commands AS command ON command.command_id = tool.command_id
+             WHERE tool.tool_call_id=?",
+        )
+        .bind(tool_call_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| anyhow!("route approval has no originating authenticated command"))?;
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let provenance_json: String = row.try_get("provenance_json")?;
+        let provenance: crate::runtime::contracts::DirectChatProvenanceV1 =
+            serde_json::from_str(&provenance_json)
+                .context("route approval origin provenance is invalid")?;
+        provenance
+            .validate(&self.scope.personality_agent_id)
+            .context("route approval origin is not bound to this Store")?;
+        if personality_agent_id != self.scope.personality_agent_id.as_str()
+            || serde_json::to_string(&provenance)? != provenance_json
+            || human.tenant_id != provenance.tenant_id()
+            || human.personality_agent_id != provenance.personality_agent_id().as_str()
+            || human.human_principal_id != provenance.actor().principal_id()
+        {
+            bail!("Human decision actor differs from the route approval origin actor");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn verify_pending_route_human_decision(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        human: &HumanDecisionEvidence,
+    ) -> Result<()> {
+        self.verify_human_decision_command(transaction, human)
+            .await?;
+        let row = sqlx::query(
+            "SELECT tool_call_id, run_id, turn_id, state, invocation_route,
+                    bound_invocation_key_ref, bound_invocation_ciphertext,
+                    policy_snapshot_key_ref, policy_snapshot_ciphertext
+             FROM approval_log WHERE id=?",
+        )
+        .bind(&human.request_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| anyhow!("Human decision has no durable pending approval"))?;
+        let state: String = row.try_get("state")?;
+        let route: Option<String> = row.try_get("invocation_route")?;
+        if state != "pending" || route.as_deref() != Some("elevated") {
+            bail!("Human decision target is not a pending elevated approval");
+        }
+        let tool_call_id: String = row.try_get("tool_call_id")?;
+        let run_id: String = row.try_get("run_id")?;
+        let turn_id: String = row.try_get("turn_id")?;
+        self.verify_route_approval_origin_actor(transaction, &tool_call_id, human)
+            .await?;
+        let bound_key: String = row
+            .try_get::<Option<String>, _>("bound_invocation_key_ref")?
+            .ok_or_else(|| anyhow!("pending route approval is missing bound key"))?;
+        let bound_ciphertext: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("bound_invocation_ciphertext")?
+            .ok_or_else(|| anyhow!("pending route approval is missing bound evidence"))?;
+        let policy_key: String = row
+            .try_get::<Option<String>, _>("policy_snapshot_key_ref")?
+            .ok_or_else(|| anyhow!("pending route approval is missing policy key"))?;
+        let policy_ciphertext: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("policy_snapshot_ciphertext")?
+            .ok_or_else(|| anyhow!("pending route approval is missing policy evidence"))?;
+        let bound: BoundToolInvocation = self
+            .decrypt_route_evidence(
+                transaction,
+                "approval_log.bound_invocation",
+                &human.request_id,
+                &bound_key,
+                &bound_ciphertext,
+            )
+            .await?;
+        let policy: PolicySnapshot = self
+            .decrypt_route_evidence(
+                transaction,
+                "approval_log.policy_snapshot",
+                &human.request_id,
+                &policy_key,
+                &policy_ciphertext,
+            )
+            .await?;
+        policy.validate()?;
+        let proposal_digest = bound.proposal_digest.to_hex();
+        let descriptor_digest = bound.descriptor_digest.to_hex();
+        let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+        human.validate_for(HumanAuthorizationContextV1 {
+            request_id: &human.request_id,
+            command_id: &human.command_id,
+            command_seq: human.command_seq,
+            tenant_id: &human.tenant_id,
+            personality_agent_id: &human.personality_agent_id,
+            human_principal_id: &human.human_principal_id,
+            decision: human.decision,
+            received_at: human.received_at,
+            tool_call_id: &tool_call_id,
+            route: crate::provider::types::ToolInvocationRoute::Elevated,
+            proposal_digest: &proposal_digest,
+            descriptor_digest: &descriptor_digest,
+            bound_evidence_digest: &bound_evidence_digest,
+            policy_source_digest: &policy.source_digest,
+            run_id: &run_id,
+            turn_id: &turn_id,
+        })?;
+        Ok(())
+    }
+
+    pub(super) async fn verify_elevated_authorization_approval(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        tool_call_id: &str,
+        run_id: &str,
+        bound: &BoundToolInvocation,
+        authorization: &ToolExecutionAuthorizationEvidence,
+    ) -> Result<()> {
+        let Some(human) = authorization.human_decision.as_ref() else {
+            return Ok(());
+        };
+        self.verify_human_decision_command(transaction, human)
+            .await?;
+        self.verify_route_approval_origin_actor(transaction, tool_call_id, human)
+            .await?;
+        let row = sqlx::query(
+            "SELECT tool_call_id, run_id, turn_id, state, bound_evidence_digest,
+                    policy_snapshot_key_ref, policy_snapshot_ciphertext,
+                    escalation_review_key_ref, escalation_review_ciphertext,
+                    human_decision_key_ref, human_decision_ciphertext
+             FROM approval_log WHERE id=?",
+        )
+        .bind(&human.request_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| anyhow!("elevated tool authorization has no durable approval"))?;
+        let approval_tool_call_id: String = row.try_get("tool_call_id")?;
+        let approval_run_id: String = row.try_get("run_id")?;
+        let approval_turn_id: String = row.try_get("turn_id")?;
+        let approval_state: String = row.try_get("state")?;
+        let approval_bound_digest: Option<String> = row.try_get("bound_evidence_digest")?;
+        if approval_tool_call_id != tool_call_id
+            || approval_run_id != run_id
+            || approval_state != "approved_once"
+            || approval_bound_digest.as_deref() != Some(&bound.evidence_digest()?.to_hex())
+        {
+            bail!("elevated tool authorization disagrees with its durable approval identity");
+        }
+
+        let policy_key: String = row
+            .try_get::<Option<String>, _>("policy_snapshot_key_ref")?
+            .ok_or_else(|| anyhow!("elevated approval is missing policy key"))?;
+        let policy_ciphertext: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("policy_snapshot_ciphertext")?
+            .ok_or_else(|| anyhow!("elevated approval is missing policy evidence"))?;
+        let review_key: String = row
+            .try_get::<Option<String>, _>("escalation_review_key_ref")?
+            .ok_or_else(|| anyhow!("elevated approval is missing review key"))?;
+        let review_ciphertext: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("escalation_review_ciphertext")?
+            .ok_or_else(|| anyhow!("elevated approval is missing review evidence"))?;
+        let human_key: String = row
+            .try_get::<Option<String>, _>("human_decision_key_ref")?
+            .ok_or_else(|| anyhow!("elevated approval is missing Human decision key"))?;
+        let human_ciphertext: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("human_decision_ciphertext")?
+            .ok_or_else(|| anyhow!("elevated approval is missing Human decision"))?;
+        let policy: PolicySnapshot = self
+            .decrypt_route_evidence(
+                transaction,
+                "approval_log.policy_snapshot",
+                &human.request_id,
+                &policy_key,
+                &policy_ciphertext,
+            )
+            .await?;
+        let escalation_review: EscalationReviewEvidence = self
+            .decrypt_route_evidence(
+                transaction,
+                "approval_log.escalation_review",
+                &human.request_id,
+                &review_key,
+                &review_ciphertext,
+            )
+            .await?;
+        let stored_human: HumanDecisionEvidence = self
+            .decrypt_route_evidence(
+                transaction,
+                "approval_log.human_decision",
+                &human.request_id,
+                &human_key,
+                &human_ciphertext,
+            )
+            .await?;
+        if policy != authorization.policy
+            || Some(&escalation_review) != authorization.escalation_review.as_ref()
+            || &stored_human != human
+        {
+            bail!("elevated tool authorization disagrees with durable approval evidence");
+        }
+
+        let proposal_digest = bound.proposal_digest.to_hex();
+        let descriptor_digest = bound.descriptor_digest.to_hex();
+        let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+        human.validate_for(HumanAuthorizationContextV1 {
+            request_id: &human.request_id,
+            command_id: &human.command_id,
+            command_seq: human.command_seq,
+            tenant_id: &human.tenant_id,
+            personality_agent_id: &human.personality_agent_id,
+            human_principal_id: &human.human_principal_id,
+            decision: human.decision,
+            received_at: human.received_at,
+            tool_call_id,
+            route: authorization.route,
+            proposal_digest: &proposal_digest,
+            descriptor_digest: &descriptor_digest,
+            bound_evidence_digest: &bound_evidence_digest,
+            policy_source_digest: &authorization.policy.source_digest,
+            run_id,
+            turn_id: &approval_turn_id,
+        })?;
+        Ok(())
+    }
+
+    /// Authenticate every ADR 0013 private evidence tuple before recovery may
+    /// interpret a pending approval or a running tool. Historical pre-route
+    /// rows are accepted only when every route-evidence column is NULL.
+    async fn verify_route_authority_evidence(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<()> {
+        let tool_rows = sqlx::query(
+            "SELECT tool_call_id, run_id, state, invocation_route, authority_provenance,
+                    descriptor_digest, bound_evidence_digest,
+                    bound_invocation_key_ref, bound_invocation_ciphertext,
+                    authorization_evidence_key_ref, authorization_evidence_ciphertext,
+                    authorization_evidence_digest, denial_evidence_key_ref,
+                    denial_evidence_ciphertext, denial_evidence_digest
+             FROM tool_executions
+             WHERE invocation_route IS NOT NULL OR authority_provenance IS NOT NULL
+                OR descriptor_digest IS NOT NULL OR bound_evidence_digest IS NOT NULL
+                OR bound_invocation_key_ref IS NOT NULL
+                OR bound_invocation_ciphertext IS NOT NULL
+                OR authorization_evidence_key_ref IS NOT NULL
+                OR authorization_evidence_ciphertext IS NOT NULL
+                OR authorization_evidence_digest IS NOT NULL
+                OR denial_evidence_key_ref IS NOT NULL
+                OR denial_evidence_ciphertext IS NOT NULL
+                OR denial_evidence_digest IS NOT NULL
+             ORDER BY tool_call_id",
+        )
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to inspect route-aware tool evidence")?;
+
+        for row in tool_rows {
+            let tool_call_id: String = row.try_get("tool_call_id")?;
+            let run_id: String = row.try_get("run_id")?;
+            let state: String = row.try_get("state")?;
+            let route = row
+                .try_get::<Option<String>, _>("invocation_route")?
+                .ok_or_else(|| anyhow!("tool {tool_call_id} has partial route evidence"))?;
+            if !matches!(route.as_str(), "normal" | "elevated") {
+                bail!("tool {tool_call_id} has unknown invocation route {route}");
+            }
+            let descriptor_digest = row
+                .try_get::<Option<String>, _>("descriptor_digest")?
+                .ok_or_else(|| anyhow!("tool {tool_call_id} is missing descriptor digest"))?;
+            let bound_evidence_digest = row
+                .try_get::<Option<String>, _>("bound_evidence_digest")?
+                .ok_or_else(|| anyhow!("tool {tool_call_id} is missing bound evidence digest"))?;
+            let bound_key_ref = row
+                .try_get::<Option<String>, _>("bound_invocation_key_ref")?
+                .ok_or_else(|| anyhow!("tool {tool_call_id} is missing bound evidence key"))?;
+            let bound_ciphertext = row
+                .try_get::<Option<Vec<u8>>, _>("bound_invocation_ciphertext")?
+                .ok_or_else(|| anyhow!("tool {tool_call_id} is missing bound evidence"))?;
+            let bound: BoundToolInvocation = self
+                .decrypt_route_evidence(
+                    transaction,
+                    "tool_executions.bound_invocation",
+                    &tool_call_id,
+                    &bound_key_ref,
+                    &bound_ciphertext,
+                )
+                .await?;
+            if bound.tool_call_id != tool_call_id
+                || bound.recompute_descriptor_digest()? != bound.descriptor_digest
+                || bound.descriptor_digest.to_hex() != descriptor_digest
+                || bound.evidence_digest()?.to_hex() != bound_evidence_digest
+            {
+                bail!("tool {tool_call_id} bound evidence does not match durable metadata");
+            }
+
+            let authorization_key_ref =
+                row.try_get::<Option<String>, _>("authorization_evidence_key_ref")?;
+            let authorization_ciphertext =
+                row.try_get::<Option<Vec<u8>>, _>("authorization_evidence_ciphertext")?;
+            let authorization_digest =
+                row.try_get::<Option<String>, _>("authorization_evidence_digest")?;
+            let denial_key_ref = row.try_get::<Option<String>, _>("denial_evidence_key_ref")?;
+            let denial_ciphertext =
+                row.try_get::<Option<Vec<u8>>, _>("denial_evidence_ciphertext")?;
+            let denial_digest = row.try_get::<Option<String>, _>("denial_evidence_digest")?;
+            let authorization_complete = authorization_key_ref.is_some()
+                && authorization_ciphertext.is_some()
+                && authorization_digest.is_some();
+            let denial_complete =
+                denial_key_ref.is_some() && denial_ciphertext.is_some() && denial_digest.is_some();
+            let authorization_partial = authorization_key_ref.is_some()
+                || authorization_ciphertext.is_some()
+                || authorization_digest.is_some();
+            let denial_partial =
+                denial_key_ref.is_some() || denial_ciphertext.is_some() || denial_digest.is_some();
+            if authorization_partial != authorization_complete || denial_partial != denial_complete
+            {
+                bail!("tool {tool_call_id} has partial private authority evidence");
+            }
+
+            match (authorization_complete, denial_complete) {
+                (true, false) => {
+                    if matches!(state.as_str(), "prepared" | "not_started") {
+                        bail!("tool {tool_call_id} has executable authority in state {state}");
+                    }
+                    let authority = row
+                        .try_get::<Option<String>, _>("authority_provenance")?
+                        .ok_or_else(|| {
+                            anyhow!("tool {tool_call_id} is missing authority provenance")
+                        })?;
+                    let authorization: ToolExecutionAuthorizationEvidence = self
+                        .decrypt_route_evidence(
+                            transaction,
+                            "tool_executions.authorization_evidence",
+                            &tool_call_id,
+                            authorization_key_ref.as_deref().expect("complete shape"),
+                            authorization_ciphertext.as_deref().expect("complete shape"),
+                        )
+                        .await?;
+                    authorization.validate(&bound)?;
+                    if authorization.route.as_str() != route
+                        || authorization.resolved_authority.as_str() != authority
+                        || event_writer::route_evidence_digest("authorization", &authorization)?
+                            != authorization_digest.expect("complete shape")
+                    {
+                        bail!("tool {tool_call_id} authorization evidence disagrees with metadata");
+                    }
+                    self.verify_elevated_authorization_approval(
+                        transaction,
+                        &tool_call_id,
+                        &run_id,
+                        &bound,
+                        &authorization,
+                    )
+                    .await?;
+                }
+                (false, true) => {
+                    if state != "not_started"
+                        || row
+                            .try_get::<Option<String>, _>("authority_provenance")?
+                            .is_some()
+                    {
+                        bail!("tool {tool_call_id} denial evidence has executable state/authority");
+                    }
+                    let denial: ToolExecutionDenialEvidence = self
+                        .decrypt_route_evidence(
+                            transaction,
+                            "tool_executions.denial_evidence",
+                            &tool_call_id,
+                            denial_key_ref.as_deref().expect("complete shape"),
+                            denial_ciphertext.as_deref().expect("complete shape"),
+                        )
+                        .await?;
+                    denial.validate(&bound)?;
+                    if denial.route.as_str() != route
+                        || event_writer::route_evidence_digest("denial", &denial)?
+                            != denial_digest.expect("complete shape")
+                    {
+                        bail!("tool {tool_call_id} denial evidence disagrees with metadata");
+                    }
+                }
+                _ => bail!("tool {tool_call_id} must have exactly one authority outcome"),
+            }
+        }
+
+        let approval_rows = sqlx::query(
+            "SELECT id, tool_call_id, run_id, turn_id, state, invocation_route, descriptor_digest,
+                    bound_evidence_digest, bound_invocation_key_ref,
+                    bound_invocation_ciphertext, policy_snapshot_key_ref,
+                    policy_snapshot_ciphertext, policy_snapshot_digest,
+                    escalation_review_key_ref,
+                    escalation_review_ciphertext, escalation_review_digest,
+                    human_decision_key_ref, human_decision_ciphertext,
+                    human_decision_digest
+             FROM approval_log
+             WHERE invocation_route IS NOT NULL OR descriptor_digest IS NOT NULL
+                OR bound_evidence_digest IS NOT NULL
+                OR bound_invocation_key_ref IS NOT NULL
+                OR bound_invocation_ciphertext IS NOT NULL
+                OR policy_snapshot_key_ref IS NOT NULL
+                OR policy_snapshot_ciphertext IS NOT NULL
+                OR policy_snapshot_digest IS NOT NULL
+                OR escalation_review_key_ref IS NOT NULL
+                OR escalation_review_ciphertext IS NOT NULL
+                OR escalation_review_digest IS NOT NULL
+                OR human_decision_key_ref IS NOT NULL
+                OR human_decision_ciphertext IS NOT NULL
+                OR human_decision_digest IS NOT NULL
+             ORDER BY id",
+        )
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to inspect route-aware approval evidence")?;
+
+        for row in approval_rows {
+            let request_id: String = row.try_get("id")?;
+            let tool_call_id: String = row.try_get("tool_call_id")?;
+            let run_id: String = row.try_get("run_id")?;
+            let turn_id: String = row.try_get("turn_id")?;
+            let state: String = row.try_get("state")?;
+            if row
+                .try_get::<Option<String>, _>("invocation_route")?
+                .as_deref()
+                != Some("elevated")
+            {
+                bail!("approval {request_id} has partial or invalid route evidence");
+            }
+            let descriptor_digest = row
+                .try_get::<Option<String>, _>("descriptor_digest")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing descriptor digest"))?;
+            let bound_evidence_digest = row
+                .try_get::<Option<String>, _>("bound_evidence_digest")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing bound evidence digest"))?;
+            let bound_key_ref = row
+                .try_get::<Option<String>, _>("bound_invocation_key_ref")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing bound evidence key"))?;
+            let bound_ciphertext = row
+                .try_get::<Option<Vec<u8>>, _>("bound_invocation_ciphertext")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing bound evidence"))?;
+            let bound: BoundToolInvocation = self
+                .decrypt_route_evidence(
+                    transaction,
+                    "approval_log.bound_invocation",
+                    &request_id,
+                    &bound_key_ref,
+                    &bound_ciphertext,
+                )
+                .await?;
+            if bound.tool_call_id != tool_call_id
+                || bound.recompute_descriptor_digest()? != bound.descriptor_digest
+                || bound.descriptor_digest.to_hex() != descriptor_digest
+                || bound.evidence_digest()?.to_hex() != bound_evidence_digest
+            {
+                bail!("approval {request_id} bound evidence disagrees with metadata");
+            }
+
+            let policy_key_ref = row
+                .try_get::<Option<String>, _>("policy_snapshot_key_ref")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing policy key"))?;
+            let policy_ciphertext = row
+                .try_get::<Option<Vec<u8>>, _>("policy_snapshot_ciphertext")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing policy evidence"))?;
+            let policy_digest = row
+                .try_get::<Option<String>, _>("policy_snapshot_digest")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing policy digest"))?;
+            let policy: PolicySnapshot = self
+                .decrypt_route_evidence(
+                    transaction,
+                    "approval_log.policy_snapshot",
+                    &request_id,
+                    &policy_key_ref,
+                    &policy_ciphertext,
+                )
+                .await?;
+            policy.validate()?;
+            if event_writer::route_evidence_digest("policy_snapshot", &policy)? != policy_digest {
+                bail!("approval {request_id} has invalid policy snapshot evidence");
+            }
+
+            let review_key_ref = row
+                .try_get::<Option<String>, _>("escalation_review_key_ref")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing review key"))?;
+            let review_ciphertext = row
+                .try_get::<Option<Vec<u8>>, _>("escalation_review_ciphertext")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing review evidence"))?;
+            let review_digest = row
+                .try_get::<Option<String>, _>("escalation_review_digest")?
+                .ok_or_else(|| anyhow!("approval {request_id} is missing review digest"))?;
+            let review: EscalationReviewEvidence = self
+                .decrypt_route_evidence(
+                    transaction,
+                    "approval_log.escalation_review",
+                    &request_id,
+                    &review_key_ref,
+                    &review_ciphertext,
+                )
+                .await?;
+            if review.decision.outcome != EscalationReviewOutcome::AskHuman
+                || event_writer::route_evidence_digest("escalation_review", &review)?
+                    != review_digest
+            {
+                bail!("approval {request_id} has invalid Escalation AutoReview evidence");
+            }
+
+            let human_key_ref = row.try_get::<Option<String>, _>("human_decision_key_ref")?;
+            let human_ciphertext =
+                row.try_get::<Option<Vec<u8>>, _>("human_decision_ciphertext")?;
+            let human_digest = row.try_get::<Option<String>, _>("human_decision_digest")?;
+            let human_complete =
+                human_key_ref.is_some() && human_ciphertext.is_some() && human_digest.is_some();
+            let human_partial =
+                human_key_ref.is_some() || human_ciphertext.is_some() || human_digest.is_some();
+            if human_partial != human_complete {
+                bail!("approval {request_id} has partial Human decision evidence");
+            }
+            if state == "pending" && human_complete {
+                bail!("pending approval {request_id} already contains a Human decision");
+            }
+            if state == "approved_always" {
+                bail!("route approval {request_id} uses removed approved_always semantics");
+            }
+            if human_complete {
+                let human: HumanDecisionEvidence = self
+                    .decrypt_route_evidence(
+                        transaction,
+                        "approval_log.human_decision",
+                        &request_id,
+                        human_key_ref.as_deref().expect("complete shape"),
+                        human_ciphertext.as_deref().expect("complete shape"),
+                    )
+                    .await?;
+                self.verify_human_decision_command(transaction, &human)
+                    .await?;
+                self.verify_route_approval_origin_actor(transaction, &tool_call_id, &human)
+                    .await?;
+                let proposal_digest = bound.proposal_digest.to_hex();
+                let descriptor_digest = bound.descriptor_digest.to_hex();
+                let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+                human.validate_for(HumanAuthorizationContextV1 {
+                    request_id: &request_id,
+                    command_id: &human.command_id,
+                    command_seq: human.command_seq,
+                    tenant_id: &human.tenant_id,
+                    personality_agent_id: &human.personality_agent_id,
+                    human_principal_id: &human.human_principal_id,
+                    decision: human.decision,
+                    received_at: human.received_at,
+                    tool_call_id: &tool_call_id,
+                    route: crate::provider::types::ToolInvocationRoute::Elevated,
+                    proposal_digest: &proposal_digest,
+                    descriptor_digest: &descriptor_digest,
+                    bound_evidence_digest: &bound_evidence_digest,
+                    policy_source_digest: &policy.source_digest,
+                    run_id: &run_id,
+                    turn_id: &turn_id,
+                })?;
+                if human.request_id != request_id
+                    || human.provenance_version != HUMAN_DECISION_PROVENANCE_VERSION_V1
+                    || event_writer::route_evidence_digest("human_decision", &human)?
+                        != human_digest.expect("complete shape")
+                    || matches!(state.as_str(), "approved_once")
+                        && human.decision != CurrentCallDecision::ApproveOnce
+                    || state == "rejected" && human.decision != CurrentCallDecision::ApproveOnce
+                    || state == "denied" && human.decision != CurrentCallDecision::DenyOnce
+                {
+                    bail!("approval {request_id} Human decision disagrees with durable state");
+                }
+            } else if matches!(state.as_str(), "approved_once" | "denied" | "rejected") {
+                bail!("resolved route approval {request_id} is missing its Human decision");
+            }
+        }
+        Ok(())
     }
 
     async fn hydrate_running_intents(
@@ -1921,7 +2602,7 @@ impl Store {
     /// on malformed JSON or a column/pattern mismatch. The returned rules are
     /// not validated here; callers must feed them through `Policy::from_rules`
     /// (or `try_with_rule`) before trusting them.
-    #[allow(dead_code)] // Production bootstrap (T26) owns construction of the broker.
+    #[cfg(test)]
     pub(crate) async fn load_approval_rules(
         &self,
     ) -> Result<Vec<crate::approval::policy::ApprovalRule>> {
@@ -1944,7 +2625,7 @@ impl Store {
     }
 
     /// Load and verify the control-plane-signed D6 materialized policy cache.
-    #[allow(dead_code)] // T26 consumes this control-plane cache load seam.
+    #[cfg(test)]
     pub(crate) async fn load_approval_policy(
         &self,
         workspace_root: impl Into<std::path::PathBuf>,
@@ -2021,7 +2702,7 @@ impl Store {
         })
     }
 
-    #[allow(dead_code)] // T26 consumes this control-plane cache installation seam.
+    #[cfg(test)]
     pub(crate) async fn install_approval_policy_bundle(
         &self,
         signed: &crate::approval::policy::SignedApprovalPolicyBundle,
@@ -6739,6 +7420,7 @@ mod tests {
         let tool_call = ToolCall {
             id: "call-1".to_owned(),
             name: "bash".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments,
         };
         let outcome = broker
@@ -7162,7 +7844,7 @@ mod tests {
         MIGRATOR
             .run(&pool)
             .await
-            .expect("apply migrations 0003 through 0010");
+            .expect("apply migrations 0003 through 0011");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -7170,7 +7852,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",
@@ -7198,7 +7880,15 @@ mod tests {
             2
         );
 
-        for error_code in ["approval_denied", "approval_cancelled"] {
+        for error_code in [
+            "approval_denied",
+            "approval_cancelled",
+            "approval_rejected",
+            "policy_denied",
+            "policy_unavailable",
+            "execution_review_blocked",
+            "escalation_review_blocked",
+        ] {
             sqlx::query(
                 "INSERT INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,

@@ -445,7 +445,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "source":"persisted","id":format!("assistant-{id}"),"seq":1,
             "message":{
-                "role":"assistant","content":[{"type":"tool_call","tool_call":{"id":id,"name":"read_file","arguments":{"path":"x"}},"wire_item_index":0}],
+                "role":"assistant","content":[{"type":"tool_call","tool_call":{"id":id,"name":"read_file","route":"normal","arguments":{"path":"x"}},"wire_item_index":0}],
                 "model":"model","provider":"provider","origin":{"provider_instance_id":"provider","protocol":"open_ai_responses","model":"model"},
                 "usage":{"input":1,"output":1,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":2},"stop_reason":"tool_use","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-21T00:00:00Z"
             }
@@ -485,7 +485,7 @@ mod tests {
             message.content.push(
                 serde_json::from_value(serde_json::json!({
                     "type":"tool_call",
-                    "tool_call":{"id":id,"name":"read_file","arguments":{"path":"x"}},
+                    "tool_call":{"id":id,"name":"read_file","route":"normal","arguments":{"path":"x"}},
                     "wire_item_index":wire_item_index
                 }))
                 .expect("additional assistant call"),

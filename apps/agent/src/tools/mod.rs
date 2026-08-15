@@ -916,6 +916,7 @@ mod tests {
         ToolCall {
             id: id.to_owned(),
             name: name.to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: validated(arguments),
         }
     }

@@ -423,7 +423,39 @@ pub enum PublicAssistantContent {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
+    pub route: ToolInvocationRoute,
     pub arguments: ValidatedToolArguments,
+}
+
+/// The agent-selected path for one exact validated tool call.
+///
+/// This value is part of the durable transcript and is never inferred from
+/// risk, policy, reviewer availability, or missing provider output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInvocationRoute {
+    Normal,
+    Elevated,
+}
+
+impl ToolInvocationRoute {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Elevated => "elevated",
+        }
+    }
+}
+
+impl ToolCall {
+    /// Reconstruct the required provider-visible envelope without exposing it
+    /// to app tools. Provider replay must preserve the immutable route.
+    pub fn provider_arguments(&self) -> Value {
+        serde_json::json!({
+            "route": self.route.as_str(),
+            "input": self.arguments.as_object(),
+        })
+    }
 }
 
 /// Live construction is reserved for the schema-validating assembler.
@@ -1180,6 +1212,36 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+impl ToolDefinition {
+    /// Provider-visible contract. The app-owned input schema remains unchanged
+    /// in `parameters`; the provider boundary alone owns the route envelope.
+    pub fn provider_parameters(&self) -> Value {
+        let mut input = self.parameters.clone();
+        let definitions = input
+            .as_object_mut()
+            .and_then(|object| object.remove("$defs"));
+        let mut envelope = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "route": {
+                    "type": "string",
+                    "enum": ["normal", "elevated"]
+                },
+                "input": input
+            },
+            "required": ["route", "input"],
+            "additionalProperties": false
+        });
+        if let Some(definitions) = definitions {
+            envelope
+                .as_object_mut()
+                .expect("provider tool envelope is an object")
+                .insert("$defs".to_owned(), definitions);
+        }
+        envelope
+    }
+}
+
 /// Validate native compaction invariants for `messages`.
 ///
 /// Persisted message `seq` values are the global `agent_events.seq` assigned to
@@ -1262,6 +1324,7 @@ mod tests {
         ToolCall {
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
+            route: ToolInvocationRoute::Normal,
             arguments: ValidatedToolArguments::from_schema_validated(
                 json!({"path": "notes.txt"})
                     .as_object()

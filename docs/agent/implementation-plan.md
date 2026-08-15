@@ -404,7 +404,7 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: ValidatedToolArguments,  // live受信時はstrict parse + Object + tool schema通過済み
     /// strict検証境界で確定し、policy/review/approval/execution/recoveryを通じて不変。
-    /// provider-neutralなwire encodingはADR 0013の未決事項であり、欠落をNormalへ補わない。
+    /// provider-neutralなwire encodingはADR 0013の`{route,input}` envelope。欠落をNormalへ補わない。
     pub route: ToolInvocationRoute,
     /// routeとは別軸。NormalはAgentOwnだけ、Elevatedは後二者のいずれかを要求する。
     pub requested_authority: RequestedExecutionAuthority,
@@ -2988,7 +2988,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 - `approval/`(immutable route、authority provenance、CanonicalAction、secret-aware projection、Normal policy、二種類のAutoReview、current-call ApprovalBroker)+ `gateway/ws.rs`/`gateway/supervisor.rs`(第11章)+ M3で凍結した contracts の互換性確認 + apiclient 雛形
 - **ゲート**:
-  1. validated ToolCallがimmutable `Normal | Elevated` routeとrequested authority provenanceを持ち、欠落・途中変更をfail-closedに拒否する。provider-neutral encodingは実装開始前にADR 0013の未決を解消する
+  1. validated ToolCallがimmutable `Normal | Elevated` routeとrequested authority provenanceを持ち、欠落・途中変更をfail-closedに拒否する。provider-neutral encodingはADR 0013の`{route,input}` envelopeを全provider adapterで共有する
   2. Normalのshell fixture (`&&`, pipe, newline, subshell, heredoc, interpreter wrapper)をsegment分解し、どれかexplicit DenyならDeny、全segment explicit AllowならAllow、それ以外はUnmatchedにする。Denyはreviewer/Human promptとも0件
   3. Normal/UnmatchedだけがExecution AutoReviewへ進み、`Allow`だけがagent-own exact callを一回実行する。`Block`、timeout、invalid JSON、transport error、未許可trust domain、InsufficientEvidenceは実行0件かつHuman prompt 0件
   4. Elevatedだけが別prompt/schemaのEscalation AutoReviewへ進み、`AskHuman`だけが`ApprovalRequested + pending`を作り、実行は0件。`Block`と全failureはHuman prompt/実行とも0件。二reviewerのrequest/result型、prompt/schema version、cache、metricを交差利用しない

@@ -17,8 +17,7 @@ export type DirectChatCommand =
       request_id: string;
       decision:
         | { type: "approve_once" }
-        | { type: "approve_always"; rule: Record<string, unknown> }
-        | { type: "deny" };
+        | { type: "deny_once" };
     };
 
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
@@ -550,15 +549,10 @@ function isApprovalRequest(value: unknown): boolean {
 
 function isApprovalDecision(value: unknown): boolean {
   if (!isRecord(value) || typeof value.type !== "string") return false;
-  if (value.type === "approve_once" || value.type === "deny") {
+  if (value.type === "approve_once" || value.type === "deny_once") {
     return hasRequiredAndOnlyKeys(value, ["type"]);
   }
-  return (
-    value.type === "approve_always" &&
-    hasRequiredAndOnlyKeys(value, ["type", "rule"]) &&
-    isRecord(value.rule) &&
-    isSafeAnyJSON(value.rule)
-  );
+  return false;
 }
 
 function isApprovalResolution(value: unknown): boolean {

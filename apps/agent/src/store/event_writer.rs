@@ -28,6 +28,14 @@ use crate::{
         AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode,
         events::{CommandDisposition, CommandDispositionEvent, CommandDispositionRejectReason},
     },
+    approval::{
+        authority::{
+            CurrentCallDecision, HUMAN_DECISION_PROVENANCE_VERSION_V1, HumanDecisionEvidence,
+            ToolExecutionAuthorizationEvidence, ToolExecutionDenialEvidence,
+        },
+        route_policy::PolicySnapshot,
+        route_reviewer::{EscalationReviewEvidence, EscalationReviewOutcome},
+    },
     gateway::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
@@ -45,13 +53,14 @@ use crate::{
         types::{
             ApiProtocol, ContextMessage, Message, ProviderContextAnchor, ProviderContextFragment,
             ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-            StopReason, ToolResultMessage,
+            StopReason, ToolInvocationRoute, ToolResultMessage,
         },
     },
     runtime::contracts::{
         DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration,
         ProcessGenerationLease,
     },
+    tools::BoundToolInvocation,
 };
 
 use super::{
@@ -605,7 +614,10 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
                     "approved_always" => serde_json::json!({
                         "decision":{"type":"approve_always","rule":{}}
                     }),
-                    "denied" => serde_json::json!({"decision":{"type":"deny"}}),
+                    "denied" => serde_json::json!({"decision":{"type":"deny_once"}}),
+                    "rejected" => serde_json::json!({
+                        "rejected":{"decision":{"type":"approve_once"}}
+                    }),
                     _ => Value::String(resolution),
                 };
                 object.insert("resolution".to_owned(), canonical);
@@ -1171,6 +1183,46 @@ pub(crate) enum Projection {
     },
     ToolExecution(ToolExecutionMutation),
     Approval(ApprovalMutation),
+    /// ADR 0013 pending approval plus its private exact-operation and
+    /// Escalation AutoReview evidence. EventWriter encrypts the private
+    /// values and commits them with the prepared tool/request lifecycle.
+    RouteApprovalPending {
+        request_id: String,
+        tool_call_id: String,
+        run_id: String,
+        turn_id: String,
+        bound: Box<BoundToolInvocation>,
+        policy: Box<PolicySnapshot>,
+        escalation_review: Box<EscalationReviewEvidence>,
+    },
+    /// Authenticated current-call Human decision. This is deliberately
+    /// separate from standing policy mutation and from the public projection.
+    RouteApprovalResolve {
+        request_id: String,
+        state: &'static str,
+        actor: String,
+        human_decision: Box<HumanDecisionEvidence>,
+    },
+    /// ADR 0013 execution start. The bound operation and complete authority
+    /// evidence are durably committed before the post-commit executor RPC.
+    RouteToolExecutionStart {
+        tool_call_id: String,
+        run_id: String,
+        bound: Box<BoundToolInvocation>,
+        authorization: Box<ToolExecutionAuthorizationEvidence>,
+    },
+    /// Route-aware policy/reviewer denial which never starts the operation.
+    RouteToolExecutionDenied {
+        tool_call_id: String,
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        executor_generation: ProcessGeneration,
+        idempotency_key: String,
+        error_code: &'static str,
+        bound: Box<BoundToolInvocation>,
+        denial: Box<ToolExecutionDenialEvidence>,
+    },
     /// T27 supplies the physical proof; T17 validates and applies this
     /// projection only after the complete logical suffix is in the same
     /// EventWriter transaction.
@@ -1248,6 +1300,11 @@ const SKIP_ERROR_CODES: &[&str] = &[
     "user_steer_cancelled",
     "approval_denied",
     "approval_cancelled",
+    "approval_rejected",
+    "policy_denied",
+    "policy_unavailable",
+    "execution_review_blocked",
+    "escalation_review_blocked",
     "process_restarted",
 ];
 
@@ -1380,6 +1437,49 @@ struct L0BatchAllocator {
     next_l1_ord: i64,
 }
 
+struct PreparedEncryptedRouteEvidence {
+    key_ref: String,
+    key_proof: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+fn prepare_encrypted_route_evidence(
+    store: &Store,
+    key: &super::crypto::DataKeyMaterial,
+    namespace: &str,
+    row_id: &str,
+    value: &impl Serialize,
+) -> Result<PreparedEncryptedRouteEvidence> {
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(value).context("failed to serialize private route evidence")?,
+    );
+    let aad = store
+        .scope()
+        .row_aad(namespace, row_id, DataKeyPurpose::Mutation);
+    let ciphertext = super::crypto::encrypt_content(key, &plaintext, &aad)
+        .context("failed to encrypt private route evidence")?;
+    Ok(PreparedEncryptedRouteEvidence {
+        key_ref: key.key_ref.clone(),
+        key_proof: super::crypto::keyed_proof(
+            key,
+            PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+            PREPARED_KEY_MATERIAL_PROOF,
+        ),
+        ciphertext,
+    })
+}
+
+pub(super) fn route_evidence_digest(namespace: &str, value: &impl Serialize) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sumi-route-private-evidence/v1\0");
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(
+        serde_json::to_vec(value).context("failed to serialize route evidence digest input")?,
+    );
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 enum PreparedProjection {
     MessageEnd {
         event_seq: u64,
@@ -1458,6 +1558,55 @@ enum PreparedProjection {
     MemoryCalibrationObservation {
         observed_prompt_tokens: u64,
         uncalibrated_prompt_estimate: u64,
+    },
+    RouteApprovalPending {
+        request_id: String,
+        tool_call_id: String,
+        run_id: String,
+        turn_id: String,
+        descriptor_digest: String,
+        bound_evidence_digest: String,
+        policy_snapshot_digest: String,
+        escalation_review_digest: String,
+        bound: PreparedEncryptedRouteEvidence,
+        policy: PreparedEncryptedRouteEvidence,
+        escalation_review: PreparedEncryptedRouteEvidence,
+    },
+    RouteApprovalResolve {
+        request_id: String,
+        state: &'static str,
+        actor: String,
+        human_decision_digest: String,
+        human: Box<HumanDecisionEvidence>,
+        human_decision: PreparedEncryptedRouteEvidence,
+    },
+    RouteToolExecutionStart {
+        tool_call_id: String,
+        run_id: String,
+        route: ToolInvocationRoute,
+        authority_provenance: &'static str,
+        descriptor_digest: String,
+        bound_evidence_digest: String,
+        authorization_evidence_digest: String,
+        bound_evidence: Box<BoundToolInvocation>,
+        authorization_evidence: Box<ToolExecutionAuthorizationEvidence>,
+        bound: PreparedEncryptedRouteEvidence,
+        authorization: PreparedEncryptedRouteEvidence,
+    },
+    RouteToolExecutionDenied {
+        tool_call_id: String,
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        executor_generation: ProcessGeneration,
+        idempotency_key: String,
+        error_code: &'static str,
+        route: ToolInvocationRoute,
+        descriptor_digest: String,
+        bound_evidence_digest: String,
+        denial_evidence_digest: String,
+        bound: PreparedEncryptedRouteEvidence,
+        denial: PreparedEncryptedRouteEvidence,
     },
     Plain(Projection),
 }
@@ -1656,6 +1805,7 @@ struct ApprovalRequestedEvent {
 struct ApprovalResolvedEvent {
     resolution: String,
     actor: String,
+    decision_kind: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -1667,6 +1817,7 @@ struct ApprovalPendingEvidence {
 struct ApprovalResolveEvidence {
     resolution: String,
     actor: String,
+    decision_kind: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -3457,6 +3608,21 @@ impl EventWriter {
         } else {
             None
         };
+        let route_evidence_key = if batch.writes.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::RouteApprovalPending { .. }
+                        | Projection::RouteApprovalResolve { .. }
+                        | Projection::RouteToolExecutionStart { .. }
+                        | Projection::RouteToolExecutionDenied { .. }
+                )
+            })
+        }) {
+            Some(self.store.private_key(DataKeyPurpose::Mutation).await?)
+        } else {
+            None
+        };
         let mut next_seq = first_seq;
         let mut pending_l0_batch: Option<PendingL0Batch> = None;
         let mut l0_allocator: Option<L0BatchAllocator> = None;
@@ -3786,6 +3952,270 @@ impl EventWriter {
                             prepared_projection_size(&prepared),
                         )?;
                         projections.push(prepared);
+                    }
+                    Projection::RouteApprovalPending {
+                        request_id,
+                        tool_call_id,
+                        run_id,
+                        turn_id,
+                        bound,
+                        policy,
+                        escalation_review,
+                    } => {
+                        if request_id.trim().is_empty()
+                            || run_id.trim().is_empty()
+                            || turn_id.trim().is_empty()
+                            || tool_call_id != bound.tool_call_id
+                            || bound.recompute_descriptor_digest()? != bound.descriptor_digest
+                            || policy.validate().is_err()
+                            || escalation_review.decision.outcome
+                                != EscalationReviewOutcome::AskHuman
+                        {
+                            bail!("route approval pending evidence is not exactly bound");
+                        }
+                        let descriptor_digest = bound.descriptor_digest.to_hex();
+                        let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+                        let policy_snapshot_digest =
+                            route_evidence_digest("policy_snapshot", policy.as_ref())?;
+                        let escalation_review_digest =
+                            route_evidence_digest("escalation_review", escalation_review.as_ref())?;
+                        let key = route_evidence_key
+                            .as_ref()
+                            .expect("route evidence key was loaded");
+                        let bound = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "approval_log.bound_invocation",
+                            &request_id,
+                            bound.as_ref(),
+                        )?;
+                        let policy = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "approval_log.policy_snapshot",
+                            &request_id,
+                            policy.as_ref(),
+                        )?;
+                        let escalation_review = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "approval_log.escalation_review",
+                            &request_id,
+                            escalation_review.as_ref(),
+                        )?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            bound
+                                .ciphertext
+                                .len()
+                                .saturating_add(policy.ciphertext.len())
+                                .saturating_add(escalation_review.ciphertext.len())
+                                .saturating_add(descriptor_digest.len())
+                                .saturating_add(bound_evidence_digest.len())
+                                .saturating_add(policy_snapshot_digest.len())
+                                .saturating_add(DURABLE_ROW_OVERHEAD_BYTES),
+                        )?;
+                        projections.push(PreparedProjection::RouteApprovalPending {
+                            request_id,
+                            tool_call_id,
+                            run_id,
+                            turn_id,
+                            descriptor_digest,
+                            bound_evidence_digest,
+                            policy_snapshot_digest,
+                            escalation_review_digest,
+                            bound,
+                            policy,
+                            escalation_review,
+                        });
+                    }
+                    Projection::RouteApprovalResolve {
+                        request_id,
+                        state,
+                        actor,
+                        human_decision,
+                    } => {
+                        let resolution_matches = match (state, human_decision.decision) {
+                            ("approved_once", CurrentCallDecision::ApproveOnce)
+                            | ("rejected", CurrentCallDecision::ApproveOnce)
+                            | ("denied", CurrentCallDecision::DenyOnce) => {
+                                actor == human_decision.human_principal_id
+                            }
+                            ("cancelled", _) => actor == "runtime",
+                            _ => false,
+                        };
+                        if request_id.trim().is_empty()
+                            || actor.trim().is_empty()
+                            || human_decision.request_id != request_id
+                            || human_decision.provenance_version
+                                != HUMAN_DECISION_PROVENANCE_VERSION_V1
+                            || !resolution_matches
+                            || !matches!(
+                                human_decision.decision,
+                                CurrentCallDecision::ApproveOnce | CurrentCallDecision::DenyOnce
+                            )
+                        {
+                            bail!("route approval resolution evidence is not exactly bound");
+                        }
+                        let key = route_evidence_key
+                            .as_ref()
+                            .expect("route evidence key was loaded");
+                        let human_decision_digest =
+                            route_evidence_digest("human_decision", human_decision.as_ref())?;
+                        let human = human_decision.clone();
+                        let human_decision = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "approval_log.human_decision",
+                            &request_id,
+                            human_decision.as_ref(),
+                        )?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            human_decision
+                                .ciphertext
+                                .len()
+                                .saturating_add(DURABLE_ROW_OVERHEAD_BYTES),
+                        )?;
+                        projections.push(PreparedProjection::RouteApprovalResolve {
+                            request_id,
+                            state,
+                            actor,
+                            human_decision_digest,
+                            human,
+                            human_decision,
+                        });
+                    }
+                    Projection::RouteToolExecutionStart {
+                        tool_call_id,
+                        run_id,
+                        bound,
+                        authorization,
+                    } => {
+                        if tool_call_id != bound.tool_call_id
+                            || run_id.trim().is_empty()
+                            || authorization.tool_call_id != tool_call_id
+                        {
+                            bail!("route tool start evidence is not exactly bound");
+                        }
+                        authorization.validate(bound.as_ref())?;
+                        let route = authorization.route;
+                        let authority_provenance = authorization.resolved_authority.as_str();
+                        let descriptor_digest = bound.descriptor_digest.to_hex();
+                        let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+                        let authorization_evidence_digest =
+                            route_evidence_digest("authorization", authorization.as_ref())?;
+                        let key = route_evidence_key
+                            .as_ref()
+                            .expect("route evidence key was loaded");
+                        let bound_evidence = bound;
+                        let authorization_evidence = authorization;
+                        let bound = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "tool_executions.bound_invocation",
+                            &tool_call_id,
+                            bound_evidence.as_ref(),
+                        )?;
+                        let authorization = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "tool_executions.authorization_evidence",
+                            &tool_call_id,
+                            authorization_evidence.as_ref(),
+                        )?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            bound
+                                .ciphertext
+                                .len()
+                                .saturating_add(authorization.ciphertext.len())
+                                .saturating_add(descriptor_digest.len())
+                                .saturating_add(bound_evidence_digest.len())
+                                .saturating_add(DURABLE_ROW_OVERHEAD_BYTES),
+                        )?;
+                        projections.push(PreparedProjection::RouteToolExecutionStart {
+                            tool_call_id,
+                            run_id,
+                            route,
+                            authority_provenance,
+                            descriptor_digest,
+                            bound_evidence_digest,
+                            authorization_evidence_digest,
+                            bound_evidence,
+                            authorization_evidence,
+                            bound,
+                            authorization,
+                        });
+                    }
+                    Projection::RouteToolExecutionDenied {
+                        tool_call_id,
+                        command_id,
+                        run_id,
+                        turn_id,
+                        executor_generation,
+                        idempotency_key,
+                        error_code,
+                        bound,
+                        denial,
+                    } => {
+                        if tool_call_id != bound.tool_call_id
+                            || denial.tool_call_id != tool_call_id
+                            || error_code != denial.error_code()
+                            || command_id.trim().is_empty()
+                            || run_id.trim().is_empty()
+                            || turn_id.trim().is_empty()
+                        {
+                            bail!("route tool denial evidence is not exactly bound");
+                        }
+                        denial.validate(bound.as_ref())?;
+                        let route = denial.route;
+                        let descriptor_digest = bound.descriptor_digest.to_hex();
+                        let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+                        let denial_evidence_digest =
+                            route_evidence_digest("denial", denial.as_ref())?;
+                        let key = route_evidence_key
+                            .as_ref()
+                            .expect("route evidence key was loaded");
+                        let bound = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "tool_executions.bound_invocation",
+                            &tool_call_id,
+                            bound.as_ref(),
+                        )?;
+                        let denial = prepare_encrypted_route_evidence(
+                            self.store.as_ref(),
+                            key,
+                            "tool_executions.denial_evidence",
+                            &tool_call_id,
+                            denial.as_ref(),
+                        )?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            bound
+                                .ciphertext
+                                .len()
+                                .saturating_add(denial.ciphertext.len())
+                                .saturating_add(descriptor_digest.len())
+                                .saturating_add(bound_evidence_digest.len())
+                                .saturating_add(DURABLE_ROW_OVERHEAD_BYTES),
+                        )?;
+                        projections.push(PreparedProjection::RouteToolExecutionDenied {
+                            tool_call_id,
+                            command_id,
+                            run_id,
+                            turn_id,
+                            executor_generation,
+                            idempotency_key,
+                            error_code,
+                            route,
+                            descriptor_digest,
+                            bound_evidence_digest,
+                            denial_evidence_digest,
+                            bound,
+                            denial,
+                        });
                     }
                     Projection::ProviderContextMutation(
                         super::provider_context::ProviderContextMutation { mutation_id },
@@ -5385,6 +5815,44 @@ impl BootstrapRecoveryGuard<'_> {
         Ok(turn_id)
     }
 
+    /// Returns the unresolved approval authenticated by the durable lifecycle
+    /// prefix for one run. Projection rows are deliberately not consulted:
+    /// recovery compares this event-owned identity with the mutable approval
+    /// and tool projections before selecting a suffix.
+    pub(in crate::store) fn authenticated_pending_approval_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let lifecycle = &self
+            .state
+            .checkpoint
+            .as_ref()
+            .expect("bootstrap recovery initializes the lifecycle checkpoint")
+            .lifecycle;
+        let mut matching = None;
+        for (request_id, tool_call_id) in &lifecycle.pending_approvals {
+            let origin = lifecycle.tool_call_origins.get(tool_call_id).ok_or_else(|| {
+                anyhow!(
+                    "authenticated pending approval {request_id} references unknown ToolCall {tool_call_id}"
+                )
+            })?;
+            if origin.run_id != run_id {
+                continue;
+            }
+            if matching.is_some() {
+                bail!(
+                    "authenticated run {run_id} has multiple unresolved approvals despite sequential execution"
+                );
+            }
+            matching = Some((
+                request_id.clone(),
+                tool_call_id.clone(),
+                origin.turn_id.clone(),
+            ));
+        }
+        Ok(matching)
+    }
+
     pub(in crate::store) async fn recover_provider_context_mutations(&mut self) -> Result<()> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT mutation_id FROM provider_context_mutations
@@ -5428,7 +5896,7 @@ fn decrypt_replay_payload(
     )?))
 }
 
-async fn load_authenticated_command(
+pub(super) async fn load_authenticated_command(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     command_id: &str,
@@ -5511,7 +5979,11 @@ fn prepared_consumes_lifecycle_history(prepared: &[PreparedWrite]) -> bool {
                         ToolExecutionMutation::Prepare { .. }
                             | ToolExecutionMutation::Start { .. }
                             | ToolExecutionMutation::Skip { .. }
-                    )) | PreparedProjection::Plain(Projection::CommandClassified { .. })
+                    )) | PreparedProjection::RouteApprovalPending { .. }
+                        | PreparedProjection::RouteApprovalResolve { .. }
+                        | PreparedProjection::RouteToolExecutionStart { .. }
+                        | PreparedProjection::RouteToolExecutionDenied { .. }
+                        | PreparedProjection::Plain(Projection::CommandClassified { .. })
                         | PreparedProjection::Plain(Projection::RunPhase { .. })
                         | PreparedProjection::Plain(Projection::CommandApplied {
                             run_id: Some(_),
@@ -5708,6 +6180,53 @@ async fn revalidate_prepared_key_refs(
                             key_ref,
                             DataKeyPurpose::MemorySummary,
                             proof,
+                        )?;
+                    }
+                }
+                PreparedProjection::RouteApprovalPending {
+                    bound,
+                    policy,
+                    escalation_review,
+                    ..
+                } => {
+                    for evidence in [bound, policy, escalation_review] {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            &evidence.key_ref,
+                            DataKeyPurpose::Mutation,
+                            &evidence.key_proof,
+                        )?;
+                    }
+                }
+                PreparedProjection::RouteApprovalResolve { human_decision, .. } => {
+                    insert_prepared_key_expectation(
+                        &mut refs,
+                        &human_decision.key_ref,
+                        DataKeyPurpose::Mutation,
+                        &human_decision.key_proof,
+                    )?;
+                }
+                PreparedProjection::RouteToolExecutionStart {
+                    bound,
+                    authorization,
+                    ..
+                } => {
+                    for evidence in [bound, authorization] {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            &evidence.key_ref,
+                            DataKeyPurpose::Mutation,
+                            &evidence.key_proof,
+                        )?;
+                    }
+                }
+                PreparedProjection::RouteToolExecutionDenied { bound, denial, .. } => {
+                    for evidence in [bound, denial] {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            &evidence.key_ref,
+                            DataKeyPurpose::Mutation,
+                            &evidence.key_proof,
                         )?;
                     }
                 }
@@ -6370,11 +6889,13 @@ fn validate_batch_shape_with_recovery(
     let mut tool_end_events = HashMap::new();
     let mut tool_result_ids = HashSet::new();
     let mut tool_result_message_ids = HashMap::new();
+    let mut tool_result_messages = HashMap::new();
     let mut tool_mutation_ids = HashSet::new();
     let mut tool_prepare_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_start_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_finish_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_skip_mutation_ids: HashSet<String> = HashSet::new();
+    let mut route_tool_denials = HashMap::new();
     let mut approval_mutation_ids = HashSet::new();
     let mut approval_pending_mutation_ids: HashSet<String> = HashSet::new();
     let mut approval_resolve_mutation_ids: HashSet<String> = HashSet::new();
@@ -6455,6 +6976,7 @@ fn validate_batch_shape_with_recovery(
                     request_id,
                     resolution,
                 } => {
+                    let decision_kind = approval_resolution_decision_kind(resolution);
                     let resolution = approval_resolution_state(resolution);
                     let actor = event.metadata.approval_actor.as_deref().ok_or_else(|| {
                         anyhow!("approval_resolved requires internal actor metadata")
@@ -6470,6 +6992,7 @@ fn validate_batch_shape_with_recovery(
                         ApprovalResolvedEvent {
                             resolution: resolution.to_owned(),
                             actor: actor.to_owned(),
+                            decision_kind,
                         },
                     );
                     approval_resolved_positions.insert(request_id.as_str(), write_position);
@@ -6722,6 +7245,12 @@ fn validate_batch_shape_with_recovery(
                     bail!("duplicate approval mutation for request {request_id}");
                 }
             }
+            if let Projection::RouteApprovalPending { request_id, .. }
+            | Projection::RouteApprovalResolve { request_id, .. } = projection
+                && !approval_mutation_ids.insert(request_id.as_str())
+            {
+                bail!("duplicate approval mutation for request {request_id}");
+            }
             if let Projection::MessageEnd {
                 message_id,
                 role,
@@ -6748,6 +7277,7 @@ fn validate_batch_shape_with_recovery(
                         }
                         tool_result_message_ids
                             .insert(message.tool_call_id.as_str(), message_id.as_str());
+                        tool_result_messages.insert(message.tool_call_id.clone(), message.clone());
                         tool_result_positions.insert(
                             message.tool_call_id.as_str(),
                             (message_id.as_str(), write_position, message.is_error),
@@ -6859,6 +7389,40 @@ fn validate_batch_shape_with_recovery(
                     }
                 }
             }
+            match projection {
+                Projection::RouteToolExecutionStart { tool_call_id, .. } => {
+                    let is_atomic_start = tool_prepare_mutation_ids.contains(tool_call_id)
+                        && !tool_start_mutation_ids.contains(tool_call_id);
+                    if !tool_mutation_ids.insert(tool_call_id.as_str()) && !is_atomic_start {
+                        bail!("duplicate tool mutation for tool {tool_call_id}");
+                    }
+                    tool_start_mutation_ids.insert(tool_call_id.clone());
+                }
+                Projection::RouteToolExecutionDenied {
+                    tool_call_id,
+                    error_code,
+                    denial,
+                    ..
+                } => {
+                    if !tool_mutation_ids.insert(tool_call_id.as_str()) {
+                        bail!("duplicate tool mutation for tool {tool_call_id}");
+                    }
+                    if !SKIP_ERROR_CODES.contains(error_code) {
+                        bail!("ToolExecution Skip only supports {SKIP_ERROR_CODES:?}");
+                    }
+                    tool_skip_mutation_ids.insert(tool_call_id.clone());
+                    if route_tool_denials
+                        .insert(
+                            tool_call_id.clone(),
+                            ((*error_code).to_owned(), denial.as_ref().clone()),
+                        )
+                        .is_some()
+                    {
+                        bail!("duplicate route denial for tool {tool_call_id}");
+                    }
+                }
+                _ => {}
+            }
             if let Projection::Approval(mutation) = projection {
                 match mutation {
                     ApprovalMutation::Pending { request_id, .. } => {
@@ -6888,10 +7452,54 @@ fn validate_batch_shape_with_recovery(
                             ApprovalResolveEvidence {
                                 resolution: (*state).to_owned(),
                                 actor: actor.clone(),
+                                decision_kind: approval_state_decision_kind(state),
                             },
                         );
                     }
                 }
+            }
+            match projection {
+                Projection::RouteApprovalPending {
+                    request_id,
+                    tool_call_id,
+                    ..
+                } => {
+                    approval_pending_mutation_ids.insert(request_id.clone());
+                    approval_pending_mutations.insert(
+                        request_id.clone(),
+                        ApprovalPendingEvidence {
+                            tool_call_id: tool_call_id.clone(),
+                        },
+                    );
+                }
+                Projection::RouteApprovalResolve {
+                    request_id,
+                    state,
+                    actor,
+                    human_decision,
+                } => {
+                    validate_approval_resolution(state)?;
+                    if actor.is_empty() {
+                        bail!("Approval Resolve actor must not be empty");
+                    }
+                    approval_resolve_mutation_ids.insert(request_id.clone());
+                    approval_resolve_mutations.insert(
+                        request_id.clone(),
+                        ApprovalResolveEvidence {
+                            resolution: (*state).to_owned(),
+                            actor: actor.clone(),
+                            decision_kind: if *state == "cancelled" {
+                                None
+                            } else {
+                                Some(match human_decision.decision {
+                                    CurrentCallDecision::ApproveOnce => "approve_once",
+                                    CurrentCallDecision::DenyOnce => "deny_once",
+                                })
+                            },
+                        },
+                    );
+                }
+                _ => {}
             }
             if let Projection::RunPhase {
                 command_id,
@@ -7170,6 +7778,12 @@ fn validate_batch_shape_with_recovery(
             );
         }
     }
+    for (tool_call_id, (error_code, denial)) in &route_tool_denials {
+        let result = tool_result_messages.get(tool_call_id).ok_or_else(|| {
+            anyhow!("route denial for {tool_call_id} has no exact tool-result message")
+        })?;
+        validate_typed_route_denial_tool_result(result, error_code, denial)?;
+    }
     for (tool_call_id, (message_id, result_position, is_error)) in &tool_result_positions {
         let Some(start_position) = message_start_positions.get(message_id) else {
             bail!("tool-result MessageEnd for {tool_call_id} requires its same-batch MessageStart");
@@ -7257,7 +7871,10 @@ fn validate_batch_shape_with_recovery(
         let event = approval_resolved_events
             .get(request_id)
             .ok_or_else(|| anyhow!("missing typed approval_resolved event for {request_id}"))?;
-        if event.resolution != mutation.resolution || event.actor != mutation.actor {
+        if event.resolution != mutation.resolution
+            || event.actor != mutation.actor
+            || event.decision_kind != mutation.decision_kind
+        {
             bail!("approval resolution event and mutation disagree for {request_id}");
         }
     }
@@ -7524,10 +8141,11 @@ fn validate_memory_job_mutation_shape(mutation: &MemoryJobMutation) -> Result<()
 }
 
 fn validate_approval_resolution(resolution: &str) -> Result<()> {
-    if !matches!(
+    let valid = matches!(
         resolution,
-        "approved_once" | "approved_always" | "denied" | "cancelled"
-    ) {
+        "approved_once" | "denied" | "rejected" | "cancelled"
+    ) || cfg!(test) && resolution == "approved_always";
+    if !valid {
         bail!("invalid terminal approval resolution");
     }
     Ok(())
@@ -7536,10 +8154,69 @@ fn validate_approval_resolution(resolution: &str) -> Result<()> {
 fn approval_resolution_state(resolution: &ApprovalResolution) -> &'static str {
     match resolution {
         ApprovalResolution::Decision(ApprovalDecision::ApproveOnce) => "approved_once",
+        #[cfg(test)]
         ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { .. }) => "approved_always",
-        ApprovalResolution::Decision(ApprovalDecision::Deny) => "denied",
+        ApprovalResolution::Decision(ApprovalDecision::DenyOnce) => "denied",
+        ApprovalResolution::Rejected { .. } => "rejected",
         ApprovalResolution::Cancelled => "cancelled",
     }
+}
+
+fn approval_decision_kind(decision: &ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::ApproveOnce => "approve_once",
+        #[cfg(test)]
+        ApprovalDecision::ApproveAlways { .. } => "approve_always",
+        ApprovalDecision::DenyOnce => "deny_once",
+    }
+}
+
+fn approval_resolution_decision_kind(resolution: &ApprovalResolution) -> Option<&'static str> {
+    match resolution {
+        ApprovalResolution::Decision(decision) | ApprovalResolution::Rejected { decision } => {
+            Some(approval_decision_kind(decision))
+        }
+        ApprovalResolution::Cancelled => None,
+    }
+}
+
+fn approval_state_decision_kind(state: &str) -> Option<&'static str> {
+    match state {
+        "approved_once" | "rejected" => Some("approve_once"),
+        "approved_always" => Some("approve_always"),
+        "denied" => Some("deny_once"),
+        "cancelled" => None,
+        _ => None,
+    }
+}
+
+fn validate_typed_route_denial_tool_result(
+    result: &ToolResultMessage,
+    error_code: &str,
+    evidence: &ToolExecutionDenialEvidence,
+) -> Result<()> {
+    if error_code != evidence.error_code() {
+        bail!("route denial error code differs from its private evidence");
+    }
+    if !result.is_error || result.tool_call_id != evidence.tool_call_id {
+        bail!("route denial ToolResult identity differs from its private evidence");
+    }
+    let Some(details) = result.details.as_object() else {
+        bail!("route denial ToolResult details must be an object");
+    };
+    if details.len() != 2
+        || details.get("error").and_then(Value::as_str) != Some(error_code)
+        || details.get("reason").and_then(Value::as_str) != Some(evidence.reason.as_str())
+    {
+        bail!("route denial ToolResult details differ from its private evidence");
+    }
+    let [crate::provider::types::UserContent::Text { text }] = result.content.as_slice() else {
+        bail!("route denial ToolResult must contain exactly one text reason");
+    };
+    if text != &evidence.reason {
+        bail!("route denial ToolResult text differs from its private evidence");
+    }
+    Ok(())
 }
 
 fn validate_tool_transition(expected: &str, state: &str) -> Result<()> {
@@ -7574,6 +8251,7 @@ fn validate_terminal_tool_semantics(
                 | "invalid_result"
                 | "internal"
                 | "approval_denied"
+                | "approval_rejected"
                 | "approval_cancelled"
         )
     ) {
@@ -8423,6 +9101,62 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
             unreachable!("memory projections use checked dedicated sizing")
         }
         Projection::MemoryCalibrationObservation { .. } => 16,
+        Projection::RouteApprovalPending {
+            request_id,
+            tool_call_id,
+            run_id,
+            turn_id,
+            bound,
+            policy,
+            escalation_review,
+        } => request_id
+            .len()
+            .saturating_add(tool_call_id.len())
+            .saturating_add(run_id.len())
+            .saturating_add(turn_id.len())
+            .saturating_add(serde_json::to_vec(bound)?.len())
+            .saturating_add(serde_json::to_vec(policy)?.len())
+            .saturating_add(serde_json::to_vec(escalation_review)?.len())
+            .saturating_add(1024),
+        Projection::RouteApprovalResolve {
+            request_id,
+            actor,
+            human_decision,
+            ..
+        } => request_id
+            .len()
+            .saturating_add(actor.len())
+            .saturating_add(serde_json::to_vec(human_decision)?.len())
+            .saturating_add(512),
+        Projection::RouteToolExecutionStart {
+            tool_call_id,
+            run_id,
+            bound,
+            authorization,
+        } => tool_call_id
+            .len()
+            .saturating_add(run_id.len())
+            .saturating_add(serde_json::to_vec(bound)?.len())
+            .saturating_add(serde_json::to_vec(authorization)?.len())
+            .saturating_add(768),
+        Projection::RouteToolExecutionDenied {
+            tool_call_id,
+            command_id,
+            run_id,
+            turn_id,
+            idempotency_key,
+            bound,
+            denial,
+            ..
+        } => tool_call_id
+            .len()
+            .saturating_add(command_id.len())
+            .saturating_add(run_id.len())
+            .saturating_add(turn_id.len())
+            .saturating_add(idempotency_key.len())
+            .saturating_add(serde_json::to_vec(bound)?.len())
+            .saturating_add(serde_json::to_vec(denial)?.len())
+            .saturating_add(768),
         Projection::ApprovalRule(rule) => rule
             .id
             .len()
@@ -9240,9 +9974,11 @@ async fn validate_tool_finish_owner(
                 let request_id: String = row.try_get("id")?;
                 let state: String = row.try_get("state")?;
                 match state.as_str() {
-                    "denied" | "cancelled" => true,
+                    "denied" | "rejected" | "cancelled" => true,
                     "pending" => approval_resolutions.get(request_id.as_str()).is_some_and(
-                        |(resolution, _)| matches!(*resolution, "denied" | "cancelled"),
+                        |(resolution, _)| {
+                            matches!(*resolution, "denied" | "rejected" | "cancelled")
+                        },
                     ),
                     _ => false,
                 }
@@ -9344,7 +10080,7 @@ async fn validate_owner_active_work_terminalized(
                 "owner {command_id} cannot close run {run_id} with pending approval {request_id} for {tool_call_id}"
             )
         })?;
-        if !matches!(resolution.0, "denied" | "cancelled") {
+        if !matches!(resolution.0, "denied" | "rejected" | "cancelled") {
             bail!(
                 "owner {command_id} close requires denial/cancellation cleanup for pending approval {request_id}"
             );
@@ -9393,6 +10129,15 @@ async fn validate_required_projection_sets(
                     approval_resolutions.insert(request_id.as_str(), (*state, actor.as_str()));
                     approval_resolution_positions.insert(request_id.as_str(), projection_position);
                 }
+                PreparedProjection::RouteApprovalResolve {
+                    request_id,
+                    state,
+                    actor,
+                    ..
+                } => {
+                    approval_resolutions.insert(request_id.as_str(), (*state, actor.as_str()));
+                    approval_resolution_positions.insert(request_id.as_str(), projection_position);
+                }
                 PreparedProjection::Plain(Projection::ApprovalRule(rule))
                     if approval_rule_inserts
                         .insert(
@@ -9409,6 +10154,18 @@ async fn validate_required_projection_sets(
                     run_id,
                     ..
                 })) => {
+                    approval_pendings.push((
+                        request_id.as_str(),
+                        tool_call_id.as_str(),
+                        run_id.as_str(),
+                    ));
+                }
+                PreparedProjection::RouteApprovalPending {
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    ..
+                } => {
                     approval_pendings.push((
                         request_id.as_str(),
                         tool_call_id.as_str(),
@@ -9438,6 +10195,14 @@ async fn validate_required_projection_sets(
                     tool_starts.insert(tool_call_id.as_str(), run_id.as_str());
                     tool_start_positions.insert(tool_call_id.as_str(), projection_position);
                 }
+                PreparedProjection::RouteToolExecutionStart {
+                    tool_call_id,
+                    run_id,
+                    ..
+                } => {
+                    tool_starts.insert(tool_call_id.as_str(), run_id.as_str());
+                    tool_start_positions.insert(tool_call_id.as_str(), projection_position);
+                }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Finish {
                         tool_call_id,
@@ -9451,7 +10216,8 @@ async fn validate_required_projection_sets(
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Skip { .. },
-                )) => {}
+                ))
+                | PreparedProjection::RouteToolExecutionDenied { .. } => {}
                 PreparedProjection::Plain(Projection::CommandApplied {
                     command_id,
                     command_seq,
@@ -9931,7 +10697,10 @@ async fn validate_required_projection_sets(
     }
 
     let mut consumed_approval_resolutions = HashSet::new();
-    let mut consumed_approval_rule_ids = HashSet::new();
+    #[cfg(test)]
+    let mut consumed_approval_rule_ids: HashSet<String> = HashSet::new();
+    #[cfg(not(test))]
+    let consumed_approval_rule_ids: HashSet<String> = HashSet::new();
     let mut active_abort_runs = HashSet::new();
     let mut user_owner_close_runs = HashSet::new();
     let mut user_owner_closes = Vec::new();
@@ -10051,14 +10820,17 @@ async fn validate_required_projection_sets(
                         };
                         let require_atomic_pending_tool_start = match decision {
                             ApprovalDecision::ApproveOnce => {
-                                if *resolution != "approved_once" {
+                                if *resolution != "approved_once"
+                                    && *resolution != "rejected"
+                                    && !(*resolution == "cancelled" && *actor == "runtime")
+                                {
                                     bail!(
-                                        "ApprovalDecision {request_id} maps to approved_once, not {resolution}"
+                                        "ApprovalDecision {request_id} maps to approved_once, rejected, or an explicit runtime cancellation, not {resolution}"
                                     );
                                 }
                                 false
                             }
-                            ApprovalDecision::Deny => {
+                            ApprovalDecision::DenyOnce => {
                                 if *resolution != "denied" {
                                     bail!(
                                         "ApprovalDecision {request_id} maps to denied, not {resolution}"
@@ -10066,6 +10838,7 @@ async fn validate_required_projection_sets(
                                 }
                                 false
                             }
+                            #[cfg(test)]
                             ApprovalDecision::ApproveAlways { rule } => match *resolution {
                                 "approved_always" => {
                                     let mut value = serde_json::to_value(&rule)?;
@@ -10130,7 +10903,7 @@ async fn validate_required_projection_sets(
                                 }
                             },
                         };
-                        if *actor == "runtime" {
+                        if *actor == "runtime" && *resolution != "cancelled" {
                             bail!("user ApprovalDecision cannot use the runtime resolution actor");
                         }
                         let (approval_run, tool_call_id) = approval_resolution_bindings
@@ -10145,8 +10918,10 @@ async fn validate_required_projection_sets(
                                 "ApprovalDecision {request_id} does not resolve a pending approval in run {run_id}"
                             );
                         }
-                        if *resolution == "denied" && !tool_starts.is_empty() {
-                            bail!("denied ApprovalDecision cannot co-commit ToolExecutionStart");
+                        if matches!(*resolution, "denied" | "rejected") && !tool_starts.is_empty() {
+                            bail!(
+                                "non-executed ApprovalDecision cannot co-commit ToolExecutionStart"
+                            );
                         }
                         if require_atomic_pending_tool_start
                             && (tool_starts.len() != 1
@@ -11540,6 +12315,32 @@ async fn validate_durable_lifecycle_suffix(
                     run_id,
                     turn_id,
                 )?,
+                PreparedProjection::RouteApprovalPending {
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                    ..
+                } if request_id.is_empty()
+                    || tool_call_id.is_empty()
+                    || run_id.is_empty()
+                    || turn_id.is_empty() =>
+                {
+                    bail!("Approval Pending identity and run/turn context must not be empty")
+                }
+                PreparedProjection::RouteApprovalPending {
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                    ..
+                } => require_canonical_pending_approval_turn(
+                    &state,
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                )?,
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Start {
                         tool_call_id,
@@ -11554,6 +12355,23 @@ async fn validate_durable_lifecycle_suffix(
                         run_id,
                     },
                 )) => require_canonical_tool_call_origin(
+                    &state,
+                    tool_call_id,
+                    run_id,
+                    "ToolExecutionStart",
+                )?,
+                PreparedProjection::RouteToolExecutionStart {
+                    tool_call_id,
+                    run_id,
+                    ..
+                } if tool_call_id.is_empty() || run_id.is_empty() => {
+                    bail!("ToolExecutionStart identity must not be empty")
+                }
+                PreparedProjection::RouteToolExecutionStart {
+                    tool_call_id,
+                    run_id,
+                    ..
+                } => require_canonical_tool_call_origin(
                     &state,
                     tool_call_id,
                     run_id,
@@ -11593,6 +12411,40 @@ async fn validate_durable_lifecycle_suffix(
                         ..
                     },
                 )) => {
+                    let origin = state.tool_call_origins.get(tool_call_id).ok_or_else(|| {
+                        anyhow!(
+                            "ToolExecutionSkip has no canonical assistant ToolCall {tool_call_id}"
+                        )
+                    })?;
+                    if origin.run_id != *run_id || origin.turn_id != *turn_id {
+                        bail!("ToolExecutionSkip does not match the canonical run/turn origin");
+                    }
+                }
+                PreparedProjection::RouteToolExecutionDenied {
+                    tool_call_id,
+                    command_id,
+                    run_id,
+                    turn_id,
+                    idempotency_key,
+                    error_code,
+                    ..
+                } if tool_call_id.is_empty()
+                    || command_id.is_empty()
+                    || run_id.is_empty()
+                    || turn_id.is_empty()
+                    || idempotency_key.is_empty()
+                    || !SKIP_ERROR_CODES.contains(error_code) =>
+                {
+                    bail!(
+                        "ToolExecutionSkip identity must be non-empty and use a supported error code"
+                    )
+                }
+                PreparedProjection::RouteToolExecutionDenied {
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                    ..
+                } => {
                     let origin = state.tool_call_origins.get(tool_call_id).ok_or_else(|| {
                         anyhow!(
                             "ToolExecutionSkip has no canonical assistant ToolCall {tool_call_id}"
@@ -12714,6 +13566,277 @@ async fn apply_projection(
             )
             .await?;
         }
+        PreparedProjection::RouteApprovalPending {
+            request_id,
+            tool_call_id,
+            run_id,
+            turn_id,
+            descriptor_digest,
+            bound_evidence_digest,
+            policy_snapshot_digest,
+            escalation_review_digest,
+            bound,
+            policy,
+            escalation_review,
+        } => {
+            apply_approval_mutation(
+                transaction,
+                ApprovalMutation::Pending {
+                    request_id: request_id.clone(),
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                },
+            )
+            .await?;
+            let result = sqlx::query(
+                "UPDATE approval_log
+                 SET invocation_route='elevated', descriptor_digest=?,
+                     bound_evidence_digest=?, bound_invocation_key_ref=?,
+                     bound_invocation_ciphertext=?, policy_snapshot_key_ref=?,
+                     policy_snapshot_ciphertext=?, policy_snapshot_digest=?,
+                     escalation_review_key_ref=?,
+                     escalation_review_ciphertext=?, escalation_review_digest=?
+                 WHERE id=? AND state='pending' AND invocation_route IS NULL
+                   AND descriptor_digest IS NULL AND bound_evidence_digest IS NULL
+                   AND bound_invocation_key_ref IS NULL
+                   AND bound_invocation_ciphertext IS NULL
+                   AND policy_snapshot_key_ref IS NULL
+                   AND policy_snapshot_ciphertext IS NULL
+                   AND policy_snapshot_digest IS NULL
+                   AND escalation_review_key_ref IS NULL
+                   AND escalation_review_ciphertext IS NULL
+                   AND escalation_review_digest IS NULL",
+            )
+            .bind(&descriptor_digest)
+            .bind(&bound_evidence_digest)
+            .bind(&bound.key_ref)
+            .bind(&bound.ciphertext)
+            .bind(&policy.key_ref)
+            .bind(&policy.ciphertext)
+            .bind(&policy_snapshot_digest)
+            .bind(&escalation_review.key_ref)
+            .bind(&escalation_review.ciphertext)
+            .bind(&escalation_review_digest)
+            .bind(&request_id)
+            .execute(&mut **transaction)
+            .await?;
+            if result.rows_affected() == 0 {
+                let row = sqlx::query(
+                    "SELECT invocation_route, descriptor_digest, bound_evidence_digest,
+                            bound_invocation_key_ref, bound_invocation_ciphertext,
+                            policy_snapshot_key_ref, policy_snapshot_ciphertext,
+                            policy_snapshot_digest,
+                            escalation_review_key_ref, escalation_review_ciphertext,
+                            escalation_review_digest
+                     FROM approval_log WHERE id=? AND state='pending'",
+                )
+                .bind(&request_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or_else(|| anyhow!("route approval pending evidence target disappeared"))?;
+                let exact_replay = row
+                    .try_get::<Option<String>, _>("invocation_route")?
+                    .as_deref()
+                    == Some("elevated")
+                    && row
+                        .try_get::<Option<String>, _>("descriptor_digest")?
+                        .as_deref()
+                        == Some(descriptor_digest.as_str())
+                    && row
+                        .try_get::<Option<String>, _>("bound_evidence_digest")?
+                        .as_deref()
+                        == Some(bound_evidence_digest.as_str())
+                    && row
+                        .try_get::<Option<String>, _>("policy_snapshot_digest")?
+                        .as_deref()
+                        == Some(policy_snapshot_digest.as_str())
+                    && row
+                        .try_get::<Option<String>, _>("escalation_review_digest")?
+                        .as_deref()
+                        == Some(escalation_review_digest.as_str())
+                    && row
+                        .try_get::<Option<String>, _>("bound_invocation_key_ref")?
+                        .is_some()
+                    && row
+                        .try_get::<Option<Vec<u8>>, _>("bound_invocation_ciphertext")?
+                        .is_some()
+                    && row
+                        .try_get::<Option<String>, _>("policy_snapshot_key_ref")?
+                        .is_some()
+                    && row
+                        .try_get::<Option<Vec<u8>>, _>("policy_snapshot_ciphertext")?
+                        .is_some()
+                    && row
+                        .try_get::<Option<String>, _>("escalation_review_key_ref")?
+                        .is_some()
+                    && row
+                        .try_get::<Option<Vec<u8>>, _>("escalation_review_ciphertext")?
+                        .is_some();
+                if !exact_replay {
+                    bail!("route approval pending evidence replay does not match durable state");
+                }
+            }
+        }
+        PreparedProjection::RouteApprovalResolve {
+            request_id,
+            state,
+            actor,
+            human_decision_digest,
+            human,
+            human_decision,
+        } => {
+            store
+                .verify_pending_route_human_decision(transaction, human.as_ref())
+                .await?;
+            apply_approval_mutation(
+                transaction,
+                ApprovalMutation::Resolve {
+                    request_id: request_id.clone(),
+                    state,
+                    actor,
+                },
+            )
+            .await?;
+            let result = sqlx::query(
+                "UPDATE approval_log
+                 SET human_decision_key_ref=?, human_decision_ciphertext=?,
+                     human_decision_digest=?
+                 WHERE id=? AND state=? AND invocation_route='elevated'
+                   AND human_decision_key_ref IS NULL
+                   AND human_decision_ciphertext IS NULL
+                   AND human_decision_digest IS NULL",
+            )
+            .bind(human_decision.key_ref)
+            .bind(human_decision.ciphertext)
+            .bind(human_decision_digest)
+            .bind(request_id)
+            .bind(state)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "RouteApprovalResolve evidence")?;
+        }
+        PreparedProjection::RouteToolExecutionStart {
+            tool_call_id,
+            run_id,
+            route,
+            authority_provenance,
+            descriptor_digest,
+            bound_evidence_digest,
+            authorization_evidence_digest,
+            bound_evidence,
+            authorization_evidence,
+            bound,
+            authorization,
+        } => {
+            store
+                .verify_elevated_authorization_approval(
+                    transaction,
+                    &tool_call_id,
+                    &run_id,
+                    bound_evidence.as_ref(),
+                    authorization_evidence.as_ref(),
+                )
+                .await?;
+            apply_tool_mutation(
+                transaction,
+                ToolExecutionMutation::Start {
+                    tool_call_id: tool_call_id.clone(),
+                    run_id,
+                },
+            )
+            .await?;
+            let result = sqlx::query(
+                "UPDATE tool_executions
+                 SET invocation_route=?, authority_provenance=?, descriptor_digest=?,
+                     bound_evidence_digest=?, bound_invocation_key_ref=?,
+                     bound_invocation_ciphertext=?, authorization_evidence_key_ref=?,
+                     authorization_evidence_ciphertext=?, authorization_evidence_digest=?
+                 WHERE tool_call_id=? AND state='running'
+                   AND invocation_route IS NULL AND authority_provenance IS NULL
+                   AND descriptor_digest IS NULL AND bound_evidence_digest IS NULL
+                   AND bound_invocation_key_ref IS NULL
+                   AND bound_invocation_ciphertext IS NULL
+                   AND authorization_evidence_key_ref IS NULL
+                   AND authorization_evidence_ciphertext IS NULL
+                   AND authorization_evidence_digest IS NULL
+                   AND denial_evidence_key_ref IS NULL
+                   AND denial_evidence_ciphertext IS NULL
+                   AND denial_evidence_digest IS NULL",
+            )
+            .bind(route.as_str())
+            .bind(authority_provenance)
+            .bind(descriptor_digest)
+            .bind(bound_evidence_digest)
+            .bind(bound.key_ref)
+            .bind(bound.ciphertext)
+            .bind(authorization.key_ref)
+            .bind(authorization.ciphertext)
+            .bind(authorization_evidence_digest)
+            .bind(tool_call_id)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "RouteToolExecutionStart evidence")?;
+        }
+        PreparedProjection::RouteToolExecutionDenied {
+            tool_call_id,
+            command_id,
+            run_id,
+            turn_id,
+            executor_generation,
+            idempotency_key,
+            error_code,
+            route,
+            descriptor_digest,
+            bound_evidence_digest,
+            denial_evidence_digest,
+            bound,
+            denial,
+        } => {
+            apply_tool_mutation(
+                transaction,
+                ToolExecutionMutation::Skip {
+                    tool_call_id: tool_call_id.clone(),
+                    command_id,
+                    run_id,
+                    turn_id,
+                    executor_generation,
+                    idempotency_key,
+                    error_code,
+                },
+            )
+            .await?;
+            let result = sqlx::query(
+                "UPDATE tool_executions
+                 SET invocation_route=?, descriptor_digest=?, bound_evidence_digest=?,
+                     bound_invocation_key_ref=?, bound_invocation_ciphertext=?,
+                     denial_evidence_key_ref=?, denial_evidence_ciphertext=?,
+                     denial_evidence_digest=?
+                 WHERE tool_call_id=? AND state='not_started'
+                   AND invocation_route IS NULL AND authority_provenance IS NULL
+                   AND descriptor_digest IS NULL AND bound_evidence_digest IS NULL
+                   AND bound_invocation_key_ref IS NULL
+                   AND bound_invocation_ciphertext IS NULL
+                   AND authorization_evidence_key_ref IS NULL
+                   AND authorization_evidence_ciphertext IS NULL
+                   AND authorization_evidence_digest IS NULL
+                   AND denial_evidence_key_ref IS NULL
+                   AND denial_evidence_ciphertext IS NULL
+                   AND denial_evidence_digest IS NULL",
+            )
+            .bind(route.as_str())
+            .bind(descriptor_digest)
+            .bind(bound_evidence_digest)
+            .bind(bound.key_ref)
+            .bind(bound.ciphertext)
+            .bind(denial.key_ref)
+            .bind(denial.ciphertext)
+            .bind(denial_evidence_digest)
+            .bind(tool_call_id)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "RouteToolExecutionDenied evidence")?;
+        }
         PreparedProjection::Plain(projection) => {
             return apply_plain_projection(
                 store,
@@ -12742,6 +13865,12 @@ async fn apply_plain_projection(
         }
         Projection::CommandReceived { .. } | Projection::CommandRejected { .. } => {
             unreachable!("command insert is prepared separately")
+        }
+        Projection::RouteApprovalPending { .. }
+        | Projection::RouteApprovalResolve { .. }
+        | Projection::RouteToolExecutionStart { .. }
+        | Projection::RouteToolExecutionDenied { .. } => {
+            unreachable!("route evidence lifecycle is prepared separately")
         }
         Projection::CommandClassified {
             command_id,
@@ -13712,7 +14841,7 @@ async fn apply_approval_mutation(
         } => {
             if !matches!(
                 state,
-                "approved_once" | "approved_always" | "denied" | "cancelled"
+                "approved_once" | "approved_always" | "denied" | "rejected" | "cancelled"
             ) {
                 bail!("invalid terminal approval state {state}");
             }
@@ -13765,6 +14894,19 @@ mod tests {
             AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
             ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
         },
+        approval::{
+            authority::{
+                AUTHORIZATION_EVIDENCE_VERSION_V1, ExecutionAuthorityProvenance,
+                HumanAuthorizationContextV1, PolicyDecisionRecord,
+                ToolExecutionAuthorizationEvidence,
+            },
+            route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
+            route_reviewer::{
+                ESCALATION_PROMPT_VERSION_V1, ESCALATION_REVIEWER_VERSION_V1,
+                ESCALATION_SCHEMA_VERSION_V1, EscalationReviewDecision, EscalationReviewEvidence,
+                EscalationReviewOutcome, ReviewerBudgetV1, ReviewerTerminalClass, RiskLevel,
+            },
+        },
         gateway::{
             ApprovalDecision, Command, CommandEnvelope, CommandId, DeferredApprovalRule,
             SensitiveCommandPayload,
@@ -13799,6 +14941,7 @@ mod tests {
                 InjectionCommandSizeInput, canonical_user_message,
             },
         },
+        tools::{BoundToolInvocation, CapabilityClass},
     };
 
     fn test_process_generation(raw: u64) -> ProcessGeneration {
@@ -14173,6 +15316,80 @@ mod tests {
         })
     }
 
+    fn route_policy_snapshot(bound: &BoundToolInvocation) -> PolicySnapshot {
+        match RoutePolicy::baseline_only_v1().evaluate_elevated(bound, durable_test_timestamp()) {
+            ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
+            outcome => panic!("fixture elevated policy must be ready: {outcome:?}"),
+        }
+    }
+
+    fn escalation_ask_human_evidence() -> EscalationReviewEvidence {
+        EscalationReviewEvidence {
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V1.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V1.to_owned(),
+            schema_version: ESCALATION_SCHEMA_VERSION_V1.to_owned(),
+            model_id: "fixture-reviewer".to_owned(),
+            model_binding_digest: "fixture-model-binding".to_owned(),
+            budget: ReviewerBudgetV1::escalation()
+                .compile()
+                .expect("fixture reviewer budget")
+                .evidence(1, ReviewerTerminalClass::ValidDecision),
+            decision: EscalationReviewDecision {
+                outcome: EscalationReviewOutcome::AskHuman,
+                risk: RiskLevel::Medium,
+                misunderstanding: None,
+                rationale: "fixture operation is understood and needs one-time consent".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn route_denial_result_must_match_private_reason_and_error_code() {
+        let bound =
+            BoundToolInvocation::test_fixture("tool-route-denied-result", CapabilityClass::Mutate);
+        let evidence = ToolExecutionDenialEvidence {
+            evidence_version: crate::approval::authority::DENIAL_EVIDENCE_VERSION_V1.to_owned(),
+            tool_call_id: bound.tool_call_id.clone(),
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest().unwrap().to_hex(),
+            policy: route_policy_snapshot(&bound),
+            policy_decision: PolicyDecisionRecord::Unavailable,
+            execution_review: None,
+            escalation_review: None,
+            reason: "policy source is unavailable".to_owned(),
+        };
+        evidence
+            .validate(&bound)
+            .expect("valid route denial fixture");
+        let exact = ToolResultMessage {
+            tool_call_id: evidence.tool_call_id.clone(),
+            tool_name: "fixture".to_owned(),
+            content: vec![UserContent::Text {
+                text: evidence.reason.clone(),
+            }],
+            details: json!({
+                "error": evidence.error_code(),
+                "reason": evidence.reason.clone(),
+            }),
+            is_error: true,
+            timestamp: durable_test_timestamp(),
+        };
+        validate_typed_route_denial_tool_result(&exact, evidence.error_code(), &evidence)
+            .expect("exact public result matches private denial evidence");
+
+        let mut mismatched = exact;
+        mismatched.details = json!({
+            "error": "approval_denied",
+            "reason": evidence.reason.clone(),
+        });
+        let error =
+            validate_typed_route_denial_tool_result(&mismatched, evidence.error_code(), &evidence)
+                .expect_err("generic approval denial must not erase the exact route disposition");
+        assert!(format!("{error:#}").contains("private evidence"));
+    }
+
     const TOOL_OWNER_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
 
     async fn seed_tool_owner(store: &Arc<Store>, writer: &EventWriter, run_id: &str) {
@@ -14235,6 +15452,569 @@ mod tests {
             })
             .await
             .expect("seed pending approval and prepared tool");
+    }
+
+    #[tokio::test]
+    async fn route_pending_evidence_is_atomic_authenticated_and_tamper_evident() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-route-evidence").await;
+        let bound =
+            BoundToolInvocation::test_fixture("tool-route-evidence", CapabilityClass::Mutate);
+        let policy = route_policy_snapshot(&bound);
+        let review = escalation_ask_human_evidence();
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"approval_requested",
+                            "request":approval_request(
+                                "request-route-evidence",
+                                "tool-route-evidence",
+                                "mutating"
+                            )
+                        }))
+                        .expect("route approval event"),
+                    ),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: "tool-route-evidence".to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: "run-route-evidence".to_owned(),
+                            executor_generation: test_process_generation(1),
+                            idempotency_key: "route-evidence/tool-route-evidence".to_owned(),
+                        }),
+                        Projection::RouteApprovalPending {
+                            request_id: "request-route-evidence".to_owned(),
+                            tool_call_id: "tool-route-evidence".to_owned(),
+                            run_id: "run-route-evidence".to_owned(),
+                            turn_id: "turn-1".to_owned(),
+                            bound: Box::new(bound.clone()),
+                            policy: Box::new(policy.clone()),
+                            escalation_review: Box::new(review),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit route pending evidence atomically");
+
+        let row = sqlx::query(
+            "SELECT invocation_route, bound_invocation_ciphertext,
+                    policy_snapshot_ciphertext, escalation_review_ciphertext
+             FROM approval_log WHERE id='request-route-evidence'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load route pending evidence");
+        assert_eq!(row.get::<String, _>("invocation_route"), "elevated");
+        assert!(
+            !row.get::<Vec<u8>, _>("bound_invocation_ciphertext")
+                .is_empty()
+        );
+        assert!(
+            !row.get::<Vec<u8>, _>("policy_snapshot_ciphertext")
+                .is_empty()
+        );
+        assert!(
+            !row.get::<Vec<u8>, _>("escalation_review_ciphertext")
+                .is_empty()
+        );
+
+        let mut transaction = store.pool().begin().await.expect("verify route evidence");
+        store
+            .verify_route_authority_evidence(&mut transaction)
+            .await
+            .expect("fresh route evidence authenticates");
+        transaction
+            .rollback()
+            .await
+            .expect("release verification snapshot");
+
+        let decision_command_id = "00000000-0000-4000-8000-000000000020";
+        writer
+            .persist_inbound(&approval_command(
+                2,
+                decision_command_id,
+                "request-route-evidence",
+            ))
+            .await
+            .expect("persist authenticated one-time decision");
+        let provenance = test_provenance();
+        let proposal_digest = bound.proposal_digest.to_hex();
+        let descriptor_digest = bound.descriptor_digest.to_hex();
+        let bound_evidence_digest = bound.evidence_digest().unwrap().to_hex();
+        let human = HumanDecisionEvidence::from_context(HumanAuthorizationContextV1 {
+            request_id: "request-route-evidence",
+            command_id: decision_command_id,
+            command_seq: 2,
+            tenant_id: provenance.tenant_id(),
+            personality_agent_id: provenance.personality_agent_id().as_str(),
+            human_principal_id: provenance.actor().principal_id(),
+            decision: CurrentCallDecision::ApproveOnce,
+            received_at: durable_test_timestamp(),
+            tool_call_id: "tool-route-evidence",
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: &proposal_digest,
+            descriptor_digest: &descriptor_digest,
+            bound_evidence_digest: &bound_evidence_digest,
+            policy_source_digest: &policy.source_digest,
+            run_id: "run-route-evidence",
+            turn_id: "turn-1",
+        })
+        .expect("construct exact Human decision evidence");
+        let mut transaction = store.pool().begin().await.expect("verify Human decision");
+        store
+            .verify_pending_route_human_decision(&mut transaction, &human)
+            .await
+            .expect("exact Human decision matches command and pending operation");
+        let mut mismatched = human.clone();
+        mismatched.authorization_context_digest = "00".repeat(32);
+        let error = store
+            .verify_pending_route_human_decision(&mut transaction, &mismatched)
+            .await
+            .expect_err("mismatched Human context must fail closed");
+        assert!(
+            format!("{error:#}").contains("exact authorization context"),
+            "{error:#}"
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("release Human decision snapshot");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::approval_resolved(
+                            "request-route-evidence".to_owned(),
+                            ApprovalResolution::Cancelled,
+                            "runtime".to_owned(),
+                        )
+                        .expect("route cancellation event"),
+                    ),
+                    projections: vec![
+                        Projection::RouteApprovalResolve {
+                            request_id: "request-route-evidence".to_owned(),
+                            state: "cancelled",
+                            actor: "runtime".to_owned(),
+                            human_decision: Box::new(human),
+                        },
+                        Projection::CommandApplied {
+                            command_id: decision_command_id.to_owned(),
+                            command_seq: 2,
+                            run_id: None,
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit authenticated runtime cancellation after Human approval");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM approval_log WHERE id='request-route-evidence'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("load cancelled route approval"),
+            "cancelled"
+        );
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("verify cancelled route evidence");
+        store
+            .verify_route_authority_evidence(&mut transaction)
+            .await
+            .expect("cancelled route approval retains authenticated Human evidence");
+        transaction
+            .rollback()
+            .await
+            .expect("release cancelled route verification snapshot");
+
+        sqlx::query(
+            "UPDATE approval_log
+             SET policy_snapshot_ciphertext = policy_snapshot_ciphertext || x'00'
+             WHERE id='request-route-evidence'",
+        )
+        .execute(store.pool())
+        .await
+        .expect("tamper route policy evidence");
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("verify tampered evidence");
+        let error = store
+            .verify_route_authority_evidence(&mut transaction)
+            .await
+            .expect_err("tampered route evidence must fail closed");
+        assert!(
+            format!("{error:#}").contains("failed authentication"),
+            "{error:#}"
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("release tampered snapshot");
+    }
+
+    #[tokio::test]
+    async fn route_rejection_keeps_authenticated_human_approve_once_evidence() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-route-rejected";
+        let turn_id = "turn-1";
+        let tool_call_id = "tool-route-rejected";
+        let request_id = "request-route-rejected";
+        seed_tool_owner(&store, &writer, run_id).await;
+        let bound = BoundToolInvocation::test_fixture(tool_call_id, CapabilityClass::Mutate);
+        let policy = route_policy_snapshot(&bound);
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"approval_requested",
+                            "request":approval_request(request_id, tool_call_id, "mutating")
+                        }))
+                        .expect("route approval event"),
+                    ),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: tool_call_id.to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: run_id.to_owned(),
+                            executor_generation: test_process_generation(1),
+                            idempotency_key: format!("{run_id}/{tool_call_id}"),
+                        }),
+                        Projection::RouteApprovalPending {
+                            request_id: request_id.to_owned(),
+                            tool_call_id: tool_call_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            bound: Box::new(bound.clone()),
+                            policy: Box::new(policy.clone()),
+                            escalation_review: Box::new(escalation_ask_human_evidence()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit pending elevated operation");
+
+        let decision_command_id = "00000000-0000-4000-8000-000000000022";
+        writer
+            .persist_inbound(&approval_command(2, decision_command_id, request_id))
+            .await
+            .expect("persist exact approval command");
+        let provenance = test_provenance();
+        let human = HumanDecisionEvidence::from_context(HumanAuthorizationContextV1 {
+            request_id,
+            command_id: decision_command_id,
+            command_seq: 2,
+            tenant_id: provenance.tenant_id(),
+            personality_agent_id: provenance.personality_agent_id().as_str(),
+            human_principal_id: provenance.actor().principal_id(),
+            decision: CurrentCallDecision::ApproveOnce,
+            received_at: durable_test_timestamp(),
+            tool_call_id,
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: &bound.proposal_digest.to_hex(),
+            descriptor_digest: &bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: &bound.evidence_digest().unwrap().to_hex(),
+            policy_source_digest: &policy.source_digest,
+            run_id,
+            turn_id,
+        })
+        .expect("construct exact Human approval evidence");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::approval_resolved(
+                            request_id.to_owned(),
+                            ApprovalResolution::Rejected {
+                                decision: ApprovalDecision::ApproveOnce,
+                            },
+                            provenance.actor().principal_id().to_owned(),
+                        )
+                        .expect("rejected execution disposition event"),
+                    ),
+                    projections: vec![
+                        Projection::RouteApprovalResolve {
+                            request_id: request_id.to_owned(),
+                            state: "rejected",
+                            actor: provenance.actor().principal_id().to_owned(),
+                            human_decision: Box::new(human),
+                        },
+                        Projection::CommandApplied {
+                            command_id: decision_command_id.to_owned(),
+                            command_seq: 2,
+                            run_id: Some(run_id.to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit rejection without rewriting Human ApproveOnce");
+
+        let row = sqlx::query(
+            "SELECT state, human_decision_digest, human_decision_ciphertext
+             FROM approval_log WHERE id = ?",
+        )
+        .bind(request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("load rejected approval evidence");
+        assert_eq!(row.get::<String, _>("state"), "rejected");
+        assert!(
+            row.get::<Option<String>, _>("human_decision_digest")
+                .is_some()
+        );
+        assert!(
+            row.get::<Option<Vec<u8>>, _>("human_decision_ciphertext")
+                .is_some()
+        );
+
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("verify rejected evidence");
+        store
+            .verify_route_authority_evidence(&mut transaction)
+            .await
+            .expect("rejected approval retains authenticated Human evidence");
+        transaction.rollback().await.expect("release verification");
+    }
+
+    #[tokio::test]
+    async fn elevated_route_start_correlates_durable_approval_before_authority_commits() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-route-start";
+        let turn_id = "turn-1";
+        let tool_call_id = "tool-route-start";
+        let request_id = "request-route-start";
+        seed_tool_owner(&store, &writer, run_id).await;
+
+        let bound = BoundToolInvocation::test_fixture(tool_call_id, CapabilityClass::Mutate);
+        let policy = route_policy_snapshot(&bound);
+        let review = escalation_ask_human_evidence();
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"approval_requested",
+                            "request":approval_request(request_id, tool_call_id, "mutating")
+                        }))
+                        .expect("route approval event"),
+                    ),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: tool_call_id.to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: run_id.to_owned(),
+                            executor_generation: test_process_generation(1),
+                            idempotency_key: format!("{run_id}/{tool_call_id}"),
+                        }),
+                        Projection::RouteApprovalPending {
+                            request_id: request_id.to_owned(),
+                            tool_call_id: tool_call_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            bound: Box::new(bound.clone()),
+                            policy: Box::new(policy.clone()),
+                            escalation_review: Box::new(review.clone()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit pending elevated operation");
+
+        let decision_command_id = "00000000-0000-4000-8000-000000000021";
+        writer
+            .persist_inbound(&approval_command(2, decision_command_id, request_id))
+            .await
+            .expect("persist exact approval command");
+        let provenance = test_provenance();
+        let human = HumanDecisionEvidence::from_context(HumanAuthorizationContextV1 {
+            request_id,
+            command_id: decision_command_id,
+            command_seq: 2,
+            tenant_id: provenance.tenant_id(),
+            personality_agent_id: provenance.personality_agent_id().as_str(),
+            human_principal_id: provenance.actor().principal_id(),
+            decision: CurrentCallDecision::ApproveOnce,
+            received_at: durable_test_timestamp(),
+            tool_call_id,
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: &bound.proposal_digest.to_hex(),
+            descriptor_digest: &bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: &bound.evidence_digest().unwrap().to_hex(),
+            policy_source_digest: &policy.source_digest,
+            run_id,
+            turn_id,
+        })
+        .expect("construct exact Human approval evidence");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::approval_resolved(
+                            request_id.to_owned(),
+                            ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                            provenance.actor().principal_id().to_owned(),
+                        )
+                        .expect("approval resolution event"),
+                    ),
+                    projections: vec![
+                        Projection::RouteApprovalResolve {
+                            request_id: request_id.to_owned(),
+                            state: "approved_once",
+                            actor: provenance.actor().principal_id().to_owned(),
+                            human_decision: Box::new(human.clone()),
+                        },
+                        Projection::CommandApplied {
+                            command_id: decision_command_id.to_owned(),
+                            command_seq: 2,
+                            run_id: Some(run_id.to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit exact one-time approval");
+
+        let authorization = ToolExecutionAuthorizationEvidence {
+            evidence_version: AUTHORIZATION_EVIDENCE_VERSION_V1.to_owned(),
+            grant_id: "grant-route-start".to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest().unwrap().to_hex(),
+            policy,
+            policy_decision: PolicyDecisionRecord::ElevatedPreflight,
+            resolved_authority: ExecutionAuthorityProvenance::AgentOwnWithHumanConsent,
+            execution_review: None,
+            escalation_review: Some(review),
+            human_decision: Some(human),
+        };
+        let mut mismatched_authorization = authorization.clone();
+        mismatched_authorization
+            .human_decision
+            .as_mut()
+            .expect("elevated authorization has Human evidence")
+            .request_id = "request-route-start-mismatch".to_owned();
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"tool_execution_start",
+                            "tool_call_id":tool_call_id,
+                            "tool_name":bound.tool_name.clone(),
+                            "args":Value::Object(bound.execution_arguments.as_object().clone()),
+                            "state":"running"
+                        }))
+                        .expect("mismatched route tool start event"),
+                    ),
+                    projections: vec![Projection::RouteToolExecutionStart {
+                        tool_call_id: tool_call_id.to_owned(),
+                        run_id: run_id.to_owned(),
+                        bound: Box::new(bound.clone()),
+                        authorization: Box::new(mismatched_authorization),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("mismatched approval evidence must fail before authority commits");
+        assert!(
+            format!("{error:#}").contains("authenticated command payload"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id=?",
+            )
+            .bind(tool_call_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load tool after rejected start"),
+            "prepared"
+        );
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"tool_execution_start",
+                            "tool_call_id":tool_call_id,
+                            "tool_name":bound.tool_name.clone(),
+                            "args":Value::Object(bound.execution_arguments.as_object().clone()),
+                            "state":"running"
+                        }))
+                        .expect("route tool start event"),
+                    ),
+                    projections: vec![Projection::RouteToolExecutionStart {
+                        tool_call_id: tool_call_id.to_owned(),
+                        run_id: run_id.to_owned(),
+                        bound: Box::new(bound),
+                        authorization: Box::new(authorization),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit authority only after durable approval correlation");
+
+        let row = sqlx::query(
+            "SELECT state, invocation_route, authority_provenance,
+                    authorization_evidence_ciphertext
+             FROM tool_executions WHERE tool_call_id=?",
+        )
+        .bind(tool_call_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("load route-aware tool start");
+        assert_eq!(row.get::<String, _>("state"), "running");
+        assert_eq!(row.get::<String, _>("invocation_route"), "elevated");
+        assert_eq!(
+            row.get::<String, _>("authority_provenance"),
+            "agent_own_with_human_consent"
+        );
+        assert!(
+            !row.get::<Vec<u8>, _>("authorization_evidence_ciphertext")
+                .is_empty()
+        );
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("verify route start evidence");
+        store
+            .verify_route_authority_evidence(&mut transaction)
+            .await
+            .expect("route start remains reconstructable after commit");
+        transaction
+            .rollback()
+            .await
+            .expect("release route start verification snapshot");
     }
 
     async fn continuation_tool_fixture(
@@ -14531,6 +16311,7 @@ mod tests {
                     tool_call: ToolCall {
                         id: (*tool_call_id).to_owned(),
                         name: "test".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: serde_json::from_value(json!({}))
                             .expect("object tool arguments"),
                     },
@@ -16490,7 +18271,7 @@ mod tests {
             json!({
                 "type":"approval_resolved",
                 "request_id":"request-1",
-                "resolution":{"decision":{"type":"deny"}}
+                "resolution":{"decision":{"type":"deny_once"}}
             }),
             json!({"type":"steered","mode":"hard"}),
             json!({"type":"steered","mode":"soft"}),
@@ -22945,7 +24726,7 @@ mod tests {
                 2,
                 "00000000-0000-4000-8000-000000000020",
                 "request-deny-open",
-                ApprovalDecision::Deny,
+                ApprovalDecision::DenyOnce,
             ))
             .await
             .expect("persist standalone denial command");
@@ -23048,7 +24829,7 @@ mod tests {
                 2,
                 "00000000-0000-4000-8000-000000000020",
                 "request-1",
-                ApprovalDecision::Deny,
+                ApprovalDecision::DenyOnce,
             ))
             .await
             .expect("persist denial command for request-1");
@@ -23119,7 +24900,7 @@ mod tests {
                 3,
                 "00000000-0000-4000-8000-000000000021",
                 "request-2",
-                ApprovalDecision::Deny,
+                ApprovalDecision::DenyOnce,
             ))
             .await
             .expect("persist denial command for request-2");
@@ -23657,7 +25438,7 @@ mod tests {
                 2,
                 "00000000-0000-4000-8000-000000000022",
                 "request-1",
-                ApprovalDecision::Deny,
+                ApprovalDecision::DenyOnce,
             ))
             .await
             .expect("persist typed deny");
@@ -23726,7 +25507,7 @@ mod tests {
                 2,
                 "00000000-0000-4000-8000-000000000022",
                 "request-1",
-                ApprovalDecision::Deny,
+                ApprovalDecision::DenyOnce,
             ))
             .await
             .expect("canonical deny replay");

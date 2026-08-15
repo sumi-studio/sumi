@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    approval::authority::AuthorizedBoundInvocation,
     memory::{
         ThreeLayerMemory,
         compactor::apply_ready_memory,
@@ -40,12 +41,15 @@ use crate::{
     },
     store::{HydratedRunState, HydrationOutcome, Store},
     tools::executor::ArtifactBrokerClient,
-    tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
+    tools::{
+        BoundExecutionError, DescribeError, SealedBoundToolInvocation, ToolCtx, ToolError,
+        ToolRegistry, WorkspacePaths,
+    },
 };
 
 use super::{
     OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunCore, RunDriver,
-    run::ProviderCallAttempt,
+    run::{BoundToolResult, ProviderCallAttempt},
 };
 
 pub(crate) type StreamStarter = dyn Fn(
@@ -559,6 +563,39 @@ impl RunDriver for InjectedRunDriver {
             details: output.details,
             is_error: output.is_error,
             timestamp: Utc::now(),
+        })
+    }
+
+    async fn bind_tool_invocation(
+        &self,
+        flow_id: &str,
+        call: &ToolCall,
+    ) -> Result<SealedBoundToolInvocation, DescribeError> {
+        self.registry.bind(call, flow_id, &self.workspace).await
+    }
+
+    async fn execute_bound_tool_observed(
+        &self,
+        authorized: AuthorizedBoundInvocation,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<BoundToolResult, BoundExecutionError> {
+        let tool_call_id = authorized.tool_call_id().to_owned();
+        let tool_name = authorized.tool_name().to_owned();
+        let outcome = self
+            .registry
+            .execute_bound(authorized.into_sealed(), cancel, on_update)
+            .await?;
+        Ok(BoundToolResult {
+            result: ToolResultMessage {
+                tool_call_id,
+                tool_name,
+                content: outcome.output.content,
+                details: outcome.output.details,
+                is_error: outcome.output.is_error,
+                timestamp: Utc::now(),
+            },
+            live_post_commit: outcome.live_post_commit,
         })
     }
 
@@ -1474,6 +1511,7 @@ mod tests {
         let call = ToolCall {
             id: "call-1".to_owned(),
             name: "fixture_tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(json!({"value":"x"}))
                 .expect("validated-shaped arguments"),
         };
@@ -1573,6 +1611,7 @@ mod tests {
         let call = ToolCall {
             id: "call-1".to_owned(),
             name: "error_tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(json!({}))
                 .expect("empty args"),
         };
@@ -1858,7 +1897,7 @@ mod tests {
                     async move {
                         let body = if ordinal == 0 {
                             concat!(
-                                "data: {\"id\":\"tool-1\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"fixture_tool\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                                "data: {\"id\":\"tool-1\",\"model\":\"kimi-k3\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"fixture_tool\",\"arguments\":\"{\\\"route\\\":\\\"normal\\\",\\\"input\\\":{\\\"value\\\":\\\"x\\\"}}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                                 "data: [DONE]\n\n"
                             )
                         } else {
@@ -2182,7 +2221,6 @@ mod tests {
                 "message_update",
                 "message_update",
                 "message_update",
-                "message_update",
                 "message_end",
                 "tool_execution_start",
                 "tool_execution_update",
@@ -2383,7 +2421,7 @@ mod tests {
                 "tool_calls":[{
                     "id":"call-1",
                     "type":"function",
-                    "function":{"name":"fixture_tool", "arguments":"{\"value\":\"x\"}"}
+                    "function":{"name":"fixture_tool", "arguments":"{\"input\":{\"value\":\"x\"},\"route\":\"normal\"}"}
                 }]
             }))
         );

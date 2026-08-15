@@ -519,6 +519,7 @@ mod tests {
             tool_call: ToolCall {
                 id: "call-1".to_owned(),
                 name: "bash".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: args,
             },
             wire_item_index: 0,

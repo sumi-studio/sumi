@@ -161,7 +161,7 @@ test("uses the session-resolved direct-chat route and sends no target or provena
     isDirectChatCommand({
       type: "approval_decision",
       request_id: "request-1",
-      decision: { type: "approve_always", rule: { source: "project-policy" } },
+      decision: { type: "approve_once" },
     }),
     true,
   );
@@ -169,12 +169,25 @@ test("uses the session-resolved direct-chat route and sends no target or provena
     isDirectChatCommand({
       type: "approval_decision",
       request_id: "request-1",
-      decision: {
-        type: "approve_always",
-        rule: { scope: [{ personalityAgentId: "literal-data", paid: true }] },
-      },
+      decision: { type: "deny_once" },
     }),
     true,
+  );
+  assert.equal(
+    isDirectChatCommand({
+      type: "approval_decision",
+      request_id: "request-1",
+      decision: { type: "approve_always", rule: { source: "project-policy" } },
+    }),
+    false,
+  );
+  assert.equal(
+    isDirectChatCommand({
+      type: "approval_decision",
+      request_id: "request-1",
+      decision: { type: "deny" },
+    }),
+    false,
   );
   socket.close();
 });
@@ -956,11 +969,22 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
       event(1, {
         type: "approval_resolved",
         request_id: "request-1",
-        resolution: { decision: { type: "approve_always", rule: opaque } },
+        resolution: { decision: { type: "approve_once" } },
       }),
       0,
     )?.type,
     "event",
+  );
+  assert.equal(
+    parseDirectChatServerFrame(
+      event(1, {
+        type: "approval_resolved",
+        request_id: "request-1",
+        resolution: { decision: { type: "approve_always", rule: opaque } },
+      }),
+      0,
+    ),
+    undefined,
   );
 });
 

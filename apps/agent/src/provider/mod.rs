@@ -3422,7 +3422,7 @@ fi
         const INVALID_TOOL_CALL: &str = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
             "\"id\":\"call-array\",\"function\":{\"name\":\"array_tool\",",
-            "\"arguments\":\"{\\\"items\\\":[\\\"ok\\\",\\\"raw-argument-secret\\\"]}\"}}]},",
+            "\"arguments\":\"{\\\"route\\\":\\\"normal\\\",\\\"input\\\":{\\\"items\\\":[\\\"ok\\\",\\\"raw-argument-secret\\\"]}}\"}}]},",
             "\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n"
         );
@@ -5239,6 +5239,7 @@ fi
                         tool_call: ToolCall {
                             id: "call-valid".to_owned(),
                             name: "read_file".to_owned(),
+                            route: crate::provider::types::ToolInvocationRoute::Normal,
                             arguments: ValidatedToolArguments::from_schema_validated(arguments),
                         },
                     },
@@ -5307,6 +5308,7 @@ fi
             tool_call: ToolCall {
                 id: "call-valid".to_owned(),
                 name: "read_file".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: ValidatedToolArguments::from_schema_validated(
                     serde_json::json!({"path": "a.txt"})
                         .as_object()

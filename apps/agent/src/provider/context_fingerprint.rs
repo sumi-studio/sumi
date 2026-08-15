@@ -37,7 +37,18 @@ pub fn compute_context_fingerprint(
     system_prompt: &str,
     tools: &[ToolDefinition],
 ) -> Result<String, ContextFingerprintError> {
-    let tools = serde_json::to_vec(tools)?;
+    let tools = serde_json::to_vec(
+        &tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.provider_parameters(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
     let (protocol, beta, version) = protocol_extras(spec)?;
 
     let mut hasher = Sha256::new();

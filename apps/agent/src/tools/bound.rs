@@ -387,7 +387,7 @@ impl BoundToolInvocation {
         })
     }
 
-    pub(super) fn recompute_descriptor_digest(&self) -> Result<InvocationDigest, DescribeError> {
+    pub(crate) fn recompute_descriptor_digest(&self) -> Result<InvocationDigest, DescribeError> {
         digest_json(
             DESCRIPTOR_DIGEST_DOMAIN,
             &serde_json::json!({
@@ -413,6 +413,40 @@ impl BoundToolInvocation {
                 reason: format!("bound evidence serialization failed: {error}"),
             })?,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture(tool_call_id: &str, capability: CapabilityClass) -> Self {
+        let proposal = serde_json::json!({"target":"fixture-record"});
+        let proposal_arguments = proposal.as_object().expect("fixture proposal is an object");
+        Self::seal(
+            tool_call_id,
+            "fixture_tool",
+            proposal_arguments,
+            AdapterIdentity::new("sumi.fixture", 1).expect("fixture adapter"),
+            BoundExecutionIdentity::seal("fixture-flow", Path::new("/workspace"))
+                .expect("fixture execution identity"),
+            ToolBinding::new(
+                AppActionDescriptor::new(
+                    "fixture.operation",
+                    capability,
+                    vec![ResourceScope::resource(
+                        "fixture",
+                        "record",
+                        "fixture-record",
+                    )],
+                )
+                .expect("fixture descriptor"),
+                ReviewProjection::from_value(serde_json::json!({
+                    "operation":"fixture.operation",
+                    "target":"fixture-record"
+                }))
+                .expect("fixture review projection"),
+                BoundExecutionArguments::from_value(proposal.clone())
+                    .expect("fixture execution arguments"),
+            ),
+        )
+        .expect("fixture bound invocation")
     }
 }
 

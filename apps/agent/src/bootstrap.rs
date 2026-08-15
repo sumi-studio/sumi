@@ -30,8 +30,13 @@ use crate::{
     },
     apiclient::{messaging::MessagingApi, workspace::WorkspaceApi},
     approval::{
-        ApprovalBroker, Policy, SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
-        TrustedEnvironment,
+        route_broker::RouteApprovalBroker,
+        route_policy::RoutePolicy,
+        route_reviewer::{
+            EscalationReviewer, ExecutionReviewer, ProviderEscalationReviewerTransport,
+            ProviderExecutionReviewerTransport, ReviewerBudgetV1,
+            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerTrustSet as RouteReviewerTrustSet,
+        },
     },
     config::Config,
     gateway::{
@@ -63,6 +68,8 @@ use crate::{
 };
 
 #[cfg(test)]
+use crate::approval::{ApprovalBroker, Policy, SecretAwareActionProjector, SecretDigestKey};
+#[cfg(test)]
 use crate::gateway::local_runtime::LocalPublicationError;
 #[cfg(test)]
 use crate::tools::executor::remote_executor_registry;
@@ -78,7 +85,6 @@ struct BootstrapContext {
     local_control_bearer: Zeroizing<String>,
     local_control_bearer_expires_at: SystemTime,
     wrapping_key_id: String,
-    approval_secret_digest_key: [u8; 32],
 }
 
 enum LocalControlEndpoint {
@@ -125,10 +131,6 @@ impl BootstrapContext {
             &required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX")?,
         )?;
         let wrapping_key_id = required_value(&mut get, "SUMI_AGENT_WRAPPING_KEY_ID")?;
-        let approval_secret_digest_key = decode_key(
-            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
-            &required_value(&mut get, "SUMI_APPROVAL_SECRET_DIGEST_KEY")?,
-        )?;
         let allow_insecure_loopback_gateway = match get("SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY") {
             None => false,
             Some(value) if value == "true" => true,
@@ -151,7 +153,6 @@ impl BootstrapContext {
             local_control_bearer: Zeroizing::new(local_control_bearer),
             local_control_bearer_expires_at,
             wrapping_key_id,
-            approval_secret_digest_key,
         })
     }
 }
@@ -270,18 +271,6 @@ fn parse_unix_time(name: &str, value: &str) -> Result<SystemTime> {
     UNIX_EPOCH
         .checked_add(Duration::from_secs(seconds))
         .with_context(|| format!("{name} overflows SystemTime"))
-}
-
-fn decode_key(name: &str, value: &str) -> Result<[u8; 32]> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("{name} must be exactly 64 hexadecimal characters");
-    }
-    let mut key = [0_u8; 32];
-    for (index, slot) in key.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .with_context(|| format!("{name} contains invalid hexadecimal"))?;
-    }
-    Ok(key)
 }
 
 /// T17 authenticates and orders this plan, but intentionally does not assign
@@ -1016,23 +1005,31 @@ async fn run_after_not_ready(
         )
         .await?;
 
-        let approval = Arc::new(ApprovalBroker::new(
-            Policy::new(&config.workspace),
-            SecretAwareActionProjector::new(
-                Redactor::v1(),
-                SecretDigestKey::new(context.approval_secret_digest_key),
-            ),
-            None,
-            crate::approval::ReviewerMode::User,
-            false,
-            TrustedEnvironment {
-                workspace_root: config.workspace.to_string_lossy().into_owned(),
-                sandbox: SandboxSummary::workspace(),
-                denied_paths: Vec::new(),
-                denied_network_domains: Vec::new(),
-                repo_visibility: None,
-                git_status: None,
-            },
+        let reviewer_model = RouteReviewerModelSpec::from_provider(&model_spec);
+        let reviewer_trust = RouteReviewerTrustSet::new(reviewer_model.clone(), Vec::new());
+        let execution_reviewer = Arc::new(
+            ExecutionReviewer::new(
+                reviewer_model.clone(),
+                reviewer_trust.clone(),
+                Arc::new(ProviderExecutionReviewerTransport::new(model_spec.clone())),
+                ReviewerBudgetV1::execution(),
+            )
+            .context("construct fail-closed Execution AutoReview")?,
+        );
+        let escalation_reviewer = Arc::new(
+            EscalationReviewer::new(
+                reviewer_model,
+                reviewer_trust,
+                Arc::new(ProviderEscalationReviewerTransport::new(model_spec.clone())),
+                ReviewerBudgetV1::escalation(),
+            )
+            .context("construct fail-closed Escalation AutoReview")?,
+        );
+        let approval = Arc::new(RouteApprovalBroker::new(
+            RoutePolicy::baseline_only_v1(),
+            Redactor::v1(),
+            execution_reviewer,
+            escalation_reviewer,
         ));
 
         let executor_client = Arc::new(ExecutorClient::new(
@@ -2141,10 +2138,6 @@ mod tests {
                 "SUMI_AGENT_WRAPPING_KEY_ID".to_owned(),
                 "wrapping-key-a".into(),
             ),
-            (
-                "SUMI_APPROVAL_SECRET_DIGEST_KEY".to_owned(),
-                "11".repeat(32).into(),
-            ),
             ("SUMI_MODEL_PRESET".to_owned(), "kimi-k3".into()),
         ])
     }
@@ -2536,7 +2529,6 @@ mod tests {
             "SUMI_LOCAL_CONTROL_BEARER",
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
-            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
         ] {
             let mut env = valid_env();
             env.remove(name);
@@ -2562,7 +2554,6 @@ mod tests {
             "SUMI_LOCAL_CONTROL_BEARER",
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
-            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
         ] {
             let mut env = valid_env();
             env.insert(name.to_owned(), OsString::new());

@@ -363,7 +363,7 @@ fn convert_tool(tool: &ToolDefinition, compat: &AnthropicCompat) -> Value {
     let mut value = json!({
         "name": tool.name,
         "description": tool.description,
-        "input_schema": tool.parameters,
+        "input_schema": tool.provider_parameters(),
     });
     if compat.supports_fine_grained_tool_streaming {
         value
@@ -676,7 +676,7 @@ fn convert_messages(
                                 "type":"tool_use",
                                 "id":tool_call.id,
                                 "name":tool_call.name,
-                                "input":tool_call.arguments.as_object(),
+                                "input":tool_call.provider_arguments(),
                             }));
                         }
                         AssistantContent::RejectedToolCall { .. } => blocks.push(json!({
@@ -2206,6 +2206,7 @@ mod tests {
                 tool_call: crate::provider::types::ToolCall {
                     id: "toolu_1".into(),
                     name: "read_file".into(),
+                    route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments:
                         crate::provider::types::ValidatedToolArguments::from_schema_validated(
                             json!({"path":"a"}).as_object().expect("object").clone(),
@@ -2489,6 +2490,7 @@ mod tests {
                     tool_call: crate::provider::types::ToolCall {
                         id: "toolu_image".into(),
                         name: "read_file".into(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments:
                             crate::provider::types::ValidatedToolArguments::from_schema_validated(
                                 json!({"path":"image.png"})
@@ -2693,11 +2695,12 @@ mod tests {
                 && redacted_field == "redacted_thinking.data"
                 && redacted == REDACTED_PLACEHOLDER
                 && redacted_end == REDACTED_PLACEHOLDER
-                && first_delta == "{\"path\":"
-                && second_delta == "\"notes.txt\"}"
+                && first_delta == "{\"route\":\"normal\",\"input\":{\"path\":"
+                && second_delta == "\"notes.txt\"}}"
                 && preview == &json!({"path":"notes.txt"})
                 && tool_call.id == "toolu_01"
                 && tool_call.name == "read_file"
+                && tool_call.route == crate::provider::types::ToolInvocationRoute::Normal
                 && tool_call.arguments.as_object() == json!({"path":"notes.txt"}).as_object().unwrap()
         ));
         assert_eq!(
@@ -2807,6 +2810,7 @@ mod tests {
                     tool_call: crate::provider::types::ToolCall {
                         id: "toolu_1".into(),
                         name: "read_file".into(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments:
                             crate::provider::types::ValidatedToolArguments::from_schema_validated(
                                 json!({"path":"a"}).as_object().unwrap().clone(),

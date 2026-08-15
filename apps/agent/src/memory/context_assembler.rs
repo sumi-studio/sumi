@@ -1721,6 +1721,7 @@ mod tests {
                     tool_call: crate::provider::types::ToolCall {
                         id: covered_call_id.to_owned(),
                         name: "fixture".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: serde_json::from_value::<ValidatedToolArguments>(
                             serde_json::json!({}),
                         )
@@ -2755,6 +2756,7 @@ mod tests {
                     tool_call: crate::provider::types::ToolCall {
                         id: "call-4".to_owned(),
                         name: "fixture".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: serde_json::from_value(serde_json::json!({}))
                             .expect("object tool arguments"),
                     },

@@ -239,6 +239,12 @@ pub enum UserAuthorization {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ApprovalResolution {
     Decision(ApprovalDecision),
+    /// The Human made this exact current-call decision, but the foundation
+    /// refused to start the operation after commit-time reauthorization. This
+    /// is an execution disposition, not a rewritten Human denial.
+    Rejected {
+        decision: ApprovalDecision,
+    },
     Cancelled,
 }
 

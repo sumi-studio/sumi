@@ -2152,6 +2152,7 @@ fn approval_fixture_assistant(tool_call_id: &str) -> PublicMessage {
         tool_call: ToolCall {
             id: tool_call_id.to_owned(),
             name: "fixture-tool".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
                 serde_json::json!({"path":"/workspace/report.txt"}),
             )
@@ -2389,6 +2390,7 @@ async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_com
     let call = ToolCall {
         id: "approval-tool".to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(serde_json::json!({"command": "git status"}))
             .expect("validated bash arguments"),
     };
@@ -3750,6 +3752,7 @@ impl RunDriver for DurableToolBarrierDriver {
             let call = ToolCall {
                 id: "barrier-call".to_owned(),
                 name: "fixture-tool".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
                     serde_json::json!({"safe":true}),
                 )?,
@@ -3885,6 +3888,7 @@ impl RunDriver for IndeterminateToolDriver {
             let call = ToolCall {
                 id: "indeterminate-call".to_owned(),
                 name: "fixture-tool".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
                     serde_json::json!({"safe": true}),
                 )?,
@@ -5203,6 +5207,7 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
             let call = ToolCall {
                 id: "length-call".to_owned(),
                 name: "fixture-tool".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
                     serde_json::json!({"safe":true}),
                 )
@@ -5356,6 +5361,7 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
                 let call = ToolCall {
                     id: format!("length-call-{ordinal}"),
                     name: "fixture-tool".to_owned(),
+                    route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments: serde_json::from_value::<ValidatedToolArguments>(
                         serde_json::json!({"safe":true}),
                     )
@@ -5512,6 +5518,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             let valid = ToolCall {
                 id: "valid-call".to_owned(),
                 name: "fixture-tool".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
                     serde_json::json!({"safe":true}),
                 )
@@ -7330,6 +7337,7 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
     let call = |id: &str, value: &str| ToolCall {
         id: id.to_owned(),
         name: "echo_value".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(serde_json::json!({"value": value}))
             .expect("valid echo_value arguments"),
     };
@@ -7383,6 +7391,7 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
     let unknown = ToolCall {
         id: "unknown".to_owned(),
         name: "unknown_tool".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(serde_json::json!({})).expect("valid object"),
     };
     assert!(matches!(
@@ -8168,6 +8177,7 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: P
             let call = ToolCall {
                 id: "normal-call".to_owned(),
                 name: "fixture-tool".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
                     serde_json::json!({"safe":true}),
                 )
@@ -8334,6 +8344,7 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
             let call = ToolCall {
                 id: "ended-call".to_owned(),
                 name: "fixture-tool".to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
                     serde_json::json!({"safe":true}),
                 )
@@ -10382,6 +10393,7 @@ fn bash_tool_call_with_command(id: &str, command: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value::<ValidatedToolArguments>(
             serde_json::json!({"command": command}),
         )
@@ -11018,12 +11030,18 @@ async fn later_approval_decision_does_not_overtake_an_earlier_deferred_user_mess
                 let call = ToolCall {
                     id: "ordering-call".to_owned(),
                     name: "bash".to_owned(),
+                    route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments: serde_json::from_value(serde_json::json!({
                         "command": "git status"
                     }))
                     .expect("validated bash arguments"),
                 };
-                let broker = core.approval.clone().expect("approval broker");
+                let broker = core
+                    .approval
+                    .as_ref()
+                    .and_then(super::ApprovalRuntime::legacy)
+                    .cloned()
+                    .expect("legacy approval broker");
                 let outcome = broker
                     .start_request(
                         &call,

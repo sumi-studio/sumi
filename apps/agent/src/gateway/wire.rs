@@ -143,6 +143,8 @@ pub enum WireError {
     InvalidMessageId(String),
     #[error("approval rule must be an object")]
     NonObjectApprovalRule,
+    #[error("rejected approval resolution must preserve approve_once")]
+    RejectedApprovalDecision,
     #[error("tool execution args must be an object")]
     NonObjectToolExecutionArgs,
     #[error("content_index `{0}` exceeds the JSON-safe integer range")]
@@ -970,6 +972,7 @@ pub enum WireUserAuthorization {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireApprovalResolution {
     Decision(WireApprovalDecision),
+    Rejected { decision: WireApprovalDecision },
     Cancelled,
 }
 
@@ -977,8 +980,11 @@ pub enum WireApprovalResolution {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireApprovalDecision {
     ApproveOnce {},
-    ApproveAlways { rule: Map<String, Value> },
-    Deny {},
+    #[cfg(test)]
+    ApproveAlways {
+        rule: Map<String, Value>,
+    },
+    DenyOnce {},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1507,6 +1513,14 @@ impl TryFrom<ApprovalResolution> for WireApprovalResolution {
     fn try_from(resolution: ApprovalResolution) -> Result<Self, WireError> {
         Ok(match resolution {
             ApprovalResolution::Decision(decision) => Self::Decision(decision.try_into()?),
+            ApprovalResolution::Rejected {
+                decision: ApprovalDecision::ApproveOnce,
+            } => Self::Rejected {
+                decision: WireApprovalDecision::ApproveOnce {},
+            },
+            ApprovalResolution::Rejected { .. } => {
+                return Err(WireError::RejectedApprovalDecision);
+            }
             ApprovalResolution::Cancelled => Self::Cancelled,
         })
     }
@@ -1517,13 +1531,14 @@ impl TryFrom<ApprovalDecision> for WireApprovalDecision {
     fn try_from(decision: ApprovalDecision) -> Result<Self, WireError> {
         Ok(match decision {
             ApprovalDecision::ApproveOnce => Self::ApproveOnce {},
+            #[cfg(test)]
             ApprovalDecision::ApproveAlways { rule } => Self::ApproveAlways {
                 rule: match rule.0 {
                     Value::Object(m) => m,
                     _ => return Err(WireError::NonObjectApprovalRule),
                 },
             },
-            ApprovalDecision::Deny => Self::Deny {},
+            ApprovalDecision::DenyOnce => Self::DenyOnce {},
         })
     }
 }
@@ -1857,16 +1872,18 @@ mod tests {
                         "tool_call": {
                             "id": "call-1",
                             "name": "read_file",
+                            "route": "normal",
                             "arguments": {"overflow": 9_007_199_254_740_992u64}
                         }
                     }
                 }),
             },
         };
-        assert!(matches!(
-            to_wire_frame(tool_call_end),
-            Err(WireError::AnyJSONNumberOutOfRange)
-        ));
+        let result = to_wire_frame(tool_call_end);
+        assert!(
+            matches!(result, Err(WireError::AnyJSONNumberOutOfRange)),
+            "unexpected conversion result: {result:?}"
+        );
 
         let approval_rule = json!({"overflow": 9_007_199_254_740_992u64});
         assert!(matches!(
@@ -1887,6 +1904,7 @@ mod tests {
         ToolCall {
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: validated_args(),
         }
     }
@@ -2368,6 +2386,19 @@ mod tests {
 
         round_trip_agent_event(AgentEvent::ApprovalResolved {
             request_id: "req-1".to_owned(),
+            resolution: ApprovalResolution::Rejected {
+                decision: ApprovalDecision::ApproveOnce,
+            },
+        });
+        assert!(matches!(
+            WireApprovalResolution::try_from(ApprovalResolution::Rejected {
+                decision: ApprovalDecision::DenyOnce,
+            }),
+            Err(WireError::RejectedApprovalDecision)
+        ));
+
+        round_trip_agent_event(AgentEvent::ApprovalResolved {
+            request_id: "req-1".to_owned(),
             resolution: ApprovalResolution::Cancelled,
         });
 
@@ -2702,17 +2733,9 @@ mod tests {
         };
         round_trip_command(approve_once);
 
-        let approve_always = Command::ApprovalDecision {
-            request_id: "req-1".to_owned(),
-            decision: ApprovalDecision::ApproveAlways {
-                rule: DeferredApprovalRule(json!({"tool_name": "test"})),
-            },
-        };
-        round_trip_command(approve_always);
-
         let deny = Command::ApprovalDecision {
             request_id: "req-1".to_owned(),
-            decision: ApprovalDecision::Deny,
+            decision: ApprovalDecision::DenyOnce,
         };
         round_trip_command(deny);
     }
@@ -2729,26 +2752,28 @@ mod tests {
     }
 
     #[test]
-    fn approval_decision_converts_all_branches() {
+    fn approval_decision_converts_current_call_branches() {
         assert_eq!(
             WireApprovalDecision::try_from(ApprovalDecision::ApproveOnce).unwrap(),
             WireApprovalDecision::ApproveOnce {}
         );
         assert_eq!(
-            WireApprovalDecision::try_from(ApprovalDecision::Deny).unwrap(),
-            WireApprovalDecision::Deny {}
+            WireApprovalDecision::try_from(ApprovalDecision::DenyOnce).unwrap(),
+            WireApprovalDecision::DenyOnce {}
         );
+    }
 
+    #[test]
+    fn legacy_approve_always_is_outside_the_canonical_wire_contract() {
         let object = json!({"tool_name": "test"});
-        assert_eq!(
-            WireApprovalDecision::try_from(ApprovalDecision::ApproveAlways {
-                rule: DeferredApprovalRule(object.clone()),
-            })
-            .unwrap(),
-            WireApprovalDecision::ApproveAlways {
-                rule: object.as_object().cloned().unwrap(),
-            }
-        );
+        let wire = WireApprovalDecision::try_from(ApprovalDecision::ApproveAlways {
+            rule: DeferredApprovalRule(object),
+        })
+        .expect("legacy fixture still converts inside cfg(test)");
+        assert!(!canonical_contract_is_valid(
+            "ApprovalDecision",
+            &serde_json::to_value(wire).unwrap()
+        ));
     }
 
     fn round_trip_command(command: Command) {
@@ -3136,9 +3161,9 @@ mod tests {
             "ApprovalDecision",
         );
         assert_unit_variant_rejects_extras::<WireApprovalDecision>(
-            "WireApprovalDecision::Deny",
-            json!({"type": "deny", "extra": true}),
-            json!({"type": "deny"}),
+            "WireApprovalDecision::DenyOnce",
+            json!({"type": "deny_once", "extra": true}),
+            json!({"type": "deny_once"}),
             "ApprovalDecision",
         );
     }

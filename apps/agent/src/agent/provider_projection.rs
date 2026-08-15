@@ -33,6 +33,11 @@ enum ProjectionState {
 #[allow(dead_code, reason = "consumed by the later T15 Session run loop")]
 pub(crate) enum ProjectedProviderEvent {
     Started,
+    /// Provider tool-call deltas carry the foundation-owned `{route,input}`
+    /// envelope. They remain available to the internal assembler but are not
+    /// part of the public/app-facing stream; `ToolCallPreview` carries the
+    /// incrementally parsed inner input instead.
+    PrivateToolEnvelopeDelta,
     Update(AgentEvent),
     RejectedToolCall {
         event: AgentEvent,
@@ -211,12 +216,9 @@ impl ProviderEventProjector {
                 self.update(PublicStreamEvent::ToolCallStart { content_index })
             }
             ProviderEvent::ToolCallDelta {
-                content_index,
-                delta,
-            } => self.update(PublicStreamEvent::ToolCallDelta {
-                content_index,
-                delta,
-            }),
+                content_index: _,
+                delta: _,
+            } => ProjectedProviderEvent::PrivateToolEnvelopeDelta,
             ProviderEvent::ToolCallPreview {
                 content_index,
                 preview,
@@ -426,6 +428,7 @@ mod tests {
         let tool_call: ToolCall = serde_json::from_value(json!({
             "id": "call-1",
             "name": "read",
+            "route": "normal",
             "arguments": {"path": "README.md"}
         }))
         .expect("tool call");
@@ -489,11 +492,11 @@ mod tests {
             (
                 ProviderEvent::ToolCallDelta {
                     content_index: 11,
-                    delta: "{\"path\":".to_owned(),
+                    delta: "{\"route\":\"normal\",\"input\":{\"path\":".to_owned(),
                 },
                 PublicStreamEvent::ToolCallDelta {
                     content_index: 11,
-                    delta: "{\"path\":".to_owned(),
+                    delta: "private envelope is not projected".to_owned(),
                 },
             ),
             (
@@ -542,12 +545,17 @@ mod tests {
             ),
         ];
         for (provider, public) in cases {
-            assert_eq!(
-                projector.project(provider).expect("project event"),
+            let expected = if matches!(&provider, ProviderEvent::ToolCallDelta { .. }) {
+                ProjectedProviderEvent::PrivateToolEnvelopeDelta
+            } else {
                 ProjectedProviderEvent::Update(AgentEvent::MessageUpdate {
                     message_id: "message-1".to_owned(),
                     event: public,
                 })
+            };
+            assert_eq!(
+                projector.project(provider).expect("project event"),
+                expected
             );
         }
     }

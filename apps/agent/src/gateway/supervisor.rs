@@ -10774,6 +10774,7 @@ mod tests {
                                 tool_call: ToolCall {
                                     id: format!("blocked-pump-tool-{index}"),
                                     name: "blocked-pump-tool".to_owned(),
+                                    route: crate::provider::types::ToolInvocationRoute::Normal,
                                     arguments: serde_json::from_value::<ValidatedToolArguments>(
                                         serde_json::json!({"index": index}),
                                     )
