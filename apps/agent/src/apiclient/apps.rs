@@ -18,7 +18,10 @@ pub(crate) struct ResolveEnabledWorkspaceAppRequest<'a> {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResolvedAppInstallation {
+    pub workspace_id: String,
     pub installation_id: String,
+    /// Canonical positive signed-int64 decimal wire value.
+    pub authority_epoch: String,
 }
 
 /// Redacted failure taxonomy for resolving one exact app installation.

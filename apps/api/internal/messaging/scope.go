@@ -20,10 +20,12 @@ var ErrInvalidScope = errors.New("invalid messaging scope")
 
 // Scope is the exact application address required by every Messaging entry
 // surface. Actor always comes from transport authentication; the two opaque
-// IDs select one Workspace-owned Messaging installation.
+// IDs plus the canonical lifecycle epoch select one Workspace-owned Messaging
+// installation without reviving a pre-disable binding.
 type Scope struct {
 	WorkspaceID    string
 	InstallationID string
+	AuthorityEpoch int64
 	Actor          participant.Ref
 }
 
@@ -36,6 +38,9 @@ func (s Scope) Validate() error {
 	}
 	if err := applicationapps.ValidateInstallationID(s.InstallationID); err != nil {
 		return fmt.Errorf("%w: installation_id", ErrInvalidScope)
+	}
+	if s.AuthorityEpoch < 1 {
+		return fmt.Errorf("%w: authority_epoch", ErrInvalidScope)
 	}
 	return nil
 }
@@ -99,9 +104,9 @@ func (s *ScopedStore) withLiveAuthorityLease(
 }
 
 type AppAuthority interface {
-	RequireEnabledInstallation(context.Context, string, applicationapps.OwnerRef, string) (applicationapps.Installation, error)
-	RequireEnabledInstallationInTx(context.Context, pgx.Tx, string, applicationapps.OwnerRef, string) (applicationapps.Installation, error)
-	RequireEnabledInstallationInSnapshot(context.Context, pgx.Tx, string, applicationapps.OwnerRef, string) (applicationapps.Installation, error)
+	RequireEnabledInstallationEpoch(context.Context, string, int64, applicationapps.OwnerRef, string) (applicationapps.Installation, error)
+	RequireEnabledInstallationEpochInTx(context.Context, pgx.Tx, string, int64, applicationapps.OwnerRef, string) (applicationapps.Installation, error)
+	RequireEnabledInstallationEpochInSnapshot(context.Context, pgx.Tx, string, int64, applicationapps.OwnerRef, string) (applicationapps.Installation, error)
 }
 
 // ScopedStore is one immutable view of one installed Messaging app. Keeping
@@ -141,6 +146,27 @@ func (s *ScopedStore) authorizeManageChannelsInTx(ctx context.Context, tx pgx.Tx
 	if s.workspaces == nil || s.apps == nil {
 		return workspacecontrol.Membership{}, errors.New("messaging authority dependencies are unavailable")
 	}
+	membership, err := s.workspaces.LockSharedAndRequireMembership(
+		ctx, tx, s.Scope.WorkspaceID, s.Scope.Actor,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, workspacecontrol.ErrNotFound):
+			return workspacecontrol.Membership{}, ErrPlaceNotFound
+		default:
+			return workspacecontrol.Membership{}, err
+		}
+	}
+	if _, err := s.apps.RequireEnabledInstallationEpochInTx(
+		ctx, tx, s.Scope.InstallationID,
+		s.Scope.AuthorityEpoch,
+		applicationapps.WorkspaceOwner(s.Scope.WorkspaceID), MessagingAppID,
+	); err != nil {
+		return workspacecontrol.Membership{}, err
+	}
+	// App-owned capability/catalog locks come after the exact installation
+	// lifecycle fence. LockAndRequireAppCapability reacquires the already-held
+	// Workspace shared fence before reading those rows.
 	if err := s.workspaces.LockAndRequireAppCapability(
 		ctx, tx, s.Scope.WorkspaceID, s.Scope.Actor, ManageChannelsCapability,
 	); err != nil {
@@ -152,16 +178,6 @@ func (s *ScopedStore) authorizeManageChannelsInTx(ctx context.Context, tx pgx.Tx
 		default:
 			return workspacecontrol.Membership{}, err
 		}
-	}
-	if _, err := s.apps.RequireEnabledInstallationInTx(
-		ctx, tx, s.Scope.InstallationID,
-		applicationapps.WorkspaceOwner(s.Scope.WorkspaceID), MessagingAppID,
-	); err != nil {
-		return workspacecontrol.Membership{}, err
-	}
-	membership, err := s.workspaces.ActiveMembershipInTx(ctx, tx, s.Scope.WorkspaceID, s.Scope.Actor)
-	if err != nil {
-		return workspacecontrol.Membership{}, ErrPlaceNotFound
 	}
 	return membership, nil
 }
@@ -176,8 +192,8 @@ func (s *Store) authorizeScope(ctx context.Context, scope Scope) error {
 	if err := s.workspaces.RequireMembership(ctx, scope.WorkspaceID, scope.Actor); err != nil {
 		return ErrPlaceNotFound
 	}
-	_, err := s.apps.RequireEnabledInstallation(
-		ctx, scope.InstallationID,
+	_, err := s.apps.RequireEnabledInstallationEpoch(
+		ctx, scope.InstallationID, scope.AuthorityEpoch,
 		applicationapps.WorkspaceOwner(scope.WorkspaceID), MessagingAppID,
 	)
 	return err
@@ -190,15 +206,20 @@ func (s *Store) authorizeScopeInTx(ctx context.Context, tx pgx.Tx, scope Scope) 
 	if s.workspaces == nil || s.apps == nil {
 		return workspacecontrol.Membership{}, errors.New("messaging authority dependencies are unavailable")
 	}
-	if _, err := s.apps.RequireEnabledInstallationInTx(
-		ctx, tx, scope.InstallationID,
+	membership, err := s.workspaces.LockSharedAndRequireMembership(
+		ctx, tx, scope.WorkspaceID, scope.Actor,
+	)
+	if err != nil {
+		if errors.Is(err, workspacecontrol.ErrNotFound) {
+			return workspacecontrol.Membership{}, ErrPlaceNotFound
+		}
+		return workspacecontrol.Membership{}, err
+	}
+	if _, err := s.apps.RequireEnabledInstallationEpochInTx(
+		ctx, tx, scope.InstallationID, scope.AuthorityEpoch,
 		applicationapps.WorkspaceOwner(scope.WorkspaceID), MessagingAppID,
 	); err != nil {
 		return workspacecontrol.Membership{}, err
-	}
-	membership, err := s.workspaces.ActiveMembershipInTx(ctx, tx, scope.WorkspaceID, scope.Actor)
-	if err != nil {
-		return workspacecontrol.Membership{}, ErrPlaceNotFound
 	}
 	return membership, nil
 }
@@ -224,8 +245,8 @@ func (s *Store) authorizeScopeMutationInTx(ctx context.Context, tx pgx.Tx, scope
 		}
 		return workspacecontrol.Membership{}, err
 	}
-	if _, err := s.apps.RequireEnabledInstallationInTx(
-		ctx, tx, scope.InstallationID,
+	if _, err := s.apps.RequireEnabledInstallationEpochInTx(
+		ctx, tx, scope.InstallationID, scope.AuthorityEpoch,
 		applicationapps.WorkspaceOwner(scope.WorkspaceID), MessagingAppID,
 	); err != nil {
 		return workspacecontrol.Membership{}, err
@@ -240,15 +261,15 @@ func (s *Store) authorizeScopeSnapshotInTx(ctx context.Context, tx pgx.Tx, scope
 	if s.workspaces == nil || s.apps == nil {
 		return workspacecontrol.Membership{}, errors.New("messaging authority dependencies are unavailable")
 	}
-	if _, err := s.apps.RequireEnabledInstallationInSnapshot(
-		ctx, tx, scope.InstallationID,
-		applicationapps.WorkspaceOwner(scope.WorkspaceID), MessagingAppID,
-	); err != nil {
-		return workspacecontrol.Membership{}, err
-	}
 	membership, err := s.workspaces.ActiveMembershipInTx(ctx, tx, scope.WorkspaceID, scope.Actor)
 	if err != nil {
 		return workspacecontrol.Membership{}, ErrPlaceNotFound
+	}
+	if _, err := s.apps.RequireEnabledInstallationEpochInSnapshot(
+		ctx, tx, scope.InstallationID, scope.AuthorityEpoch,
+		applicationapps.WorkspaceOwner(scope.WorkspaceID), MessagingAppID,
+	); err != nil {
+		return workspacecontrol.Membership{}, err
 	}
 	return membership, nil
 }

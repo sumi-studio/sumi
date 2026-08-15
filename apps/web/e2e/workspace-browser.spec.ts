@@ -34,8 +34,11 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
 
   const stack = await startWorkspaceBrowserStack(build, databaseURL);
   const liveWorkspaceIds = new Set<string>();
+  const liveMessagingScopes = new Set<string>();
+  const malformedMessagingSocketScopes: string[] = [];
   const liveMessageContents = new Set<string>();
   const websocketErrors: string[] = [];
+  const expectedRejectedWebSocketURLs = new Set<string>();
   let primaryError: Error | undefined;
   try {
     page.on("websocket", (socket) => {
@@ -45,10 +48,27 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
         try {
           const payload = asRecord(JSON.parse(frame.payload) as unknown);
           if (payload.type === "hello_ack") {
-            const workspaceId = new URL(socket.url()).searchParams.get(
-              "workspace_id",
-            );
+            const query = new URL(socket.url()).searchParams;
+            const workspaceIds = query.getAll("workspace_id");
+            const installationIds = query.getAll("installation_id");
+            const authorityEpochs = query.getAll("authority_epoch");
+            if (
+              workspaceIds.length !== 1 ||
+              installationIds.length !== 1 ||
+              authorityEpochs.length !== 1
+            ) {
+              malformedMessagingSocketScopes.push(socket.url());
+              return;
+            }
+            const workspaceId = workspaceIds[0];
             if (workspaceId) liveWorkspaceIds.add(workspaceId);
+            const installationId = installationIds[0];
+            const authorityEpoch = authorityEpochs[0];
+            if (workspaceId && installationId && authorityEpoch) {
+              liveMessagingScopes.add(
+                `${workspaceId}:${installationId}:${authorityEpoch}`,
+              );
+            }
           }
           if (payload.type === "event") {
             const event = asRecord(payload.event);
@@ -63,6 +83,7 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
         }
       });
       socket.on("socketerror", (error) => {
+        if (expectedRejectedWebSocketURLs.has(socket.url())) return;
         websocketErrors.push(String(error));
       });
     });
@@ -209,7 +230,9 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
     await page.getByRole("button", { name: "作成", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Observer" })).toBeVisible();
 
-    const alphaInstallationID = await installMessaging(page);
+    const alphaInstallation = await installMessaging(page);
+    const { installationID: alphaInstallationID, authorityEpoch: alphaEpoch } =
+      alphaInstallation;
     await page.getByRole("button", { name: "開く", exact: true }).click();
     await expect.poll(() => liveWorkspaceIds.has(alpha.workspaceID)).toBe(true);
     await expect(
@@ -255,20 +278,70 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
 
     await page.getByRole("button", { name: "Workspace", exact: true }).click();
     await page.getByRole("button", { name: "アプリ", exact: true }).click();
+    const disabled = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname ===
+          `/app-installations/${alphaInstallationID}/state`,
+    );
     await page.getByRole("button", { name: "無効にする" }).click();
+    const disabledInstallation = asRecord(await (await disabled).json());
+    const disabledEpoch = asString(disabledInstallation.authority_epoch);
+    expect(disabledEpoch).not.toBe(alphaEpoch);
     await expectExactScopeStatus(
       page,
       stack.apiURL,
       alpha.workspaceID,
       alphaInstallationID,
-      403,
+      alphaEpoch,
+      404,
+    );
+    await expectExactScopeWebSocketReject(
+      page,
+      stack.apiURL,
+      alpha.workspaceID,
+      alphaInstallationID,
+      alphaEpoch,
+      expectedRejectedWebSocketURLs,
     );
     await page.goto(`${stack.webURL}/w/${alpha.workspaceID}/messaging`);
     await expect(
       page.getByText("Messagingは無効になっています", { exact: true }),
     ).toBeVisible();
+    const reenabled = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname ===
+          `/app-installations/${alphaInstallationID}/state`,
+    );
     await page.getByRole("button", { name: "有効にする" }).click();
+    const reenabledInstallation = asRecord(await (await reenabled).json());
+    const alphaCurrentEpoch = asString(reenabledInstallation.authority_epoch);
+    expect(alphaCurrentEpoch).toBe(disabledEpoch);
+    await expectExactScopeStatus(
+      page,
+      stack.apiURL,
+      alpha.workspaceID,
+      alphaInstallationID,
+      alphaEpoch,
+      404,
+    );
+    await expectExactScopeStatus(
+      page,
+      stack.apiURL,
+      alpha.workspaceID,
+      alphaInstallationID,
+      alphaCurrentEpoch,
+      200,
+    );
     await page.getByText("alpha-general", { exact: true }).click();
+    await expect
+      .poll(() =>
+        liveMessagingScopes.has(
+          `${alpha.workspaceID}:${alphaInstallationID}:${alphaCurrentEpoch}`,
+        ),
+      )
+      .toBe(true);
     await expect(
       page.getByText("alpha-only-message", { exact: true }),
     ).toBeVisible();
@@ -282,6 +355,7 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
       stack.apiURL,
       alpha.workspaceID,
       alphaInstallationID,
+      alphaCurrentEpoch,
       404,
     );
     await page.goto(`${stack.webURL}/w/${alpha.workspaceID}/messaging`);
@@ -299,8 +373,33 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
     const replacementResponse = await replacementInstallation;
     expect(replacementResponse.status()).toBe(201);
     const replacement = asRecord(await replacementResponse.json());
-    expect(asString(replacement.installation_id)).not.toBe(alphaInstallationID);
+    const replacementInstallationID = asString(replacement.installation_id);
+    const replacementEpoch = asString(replacement.authority_epoch);
+    expect(replacementInstallationID).not.toBe(alphaInstallationID);
+    await expectExactScopeStatus(
+      page,
+      stack.apiURL,
+      alpha.workspaceID,
+      alphaInstallationID,
+      alphaCurrentEpoch,
+      404,
+    );
+    await expectExactScopeStatus(
+      page,
+      stack.apiURL,
+      alpha.workspaceID,
+      replacementInstallationID,
+      replacementEpoch,
+      200,
+    );
     await page.getByText("alpha-general", { exact: true }).click();
+    await expect
+      .poll(() =>
+        liveMessagingScopes.has(
+          `${alpha.workspaceID}:${replacementInstallationID}:${replacementEpoch}`,
+        ),
+      )
+      .toBe(true);
     await expect(
       page.getByText("alpha-only-message", { exact: true }),
     ).toBeVisible();
@@ -315,6 +414,7 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
       page.getByText("alpha-only-message", { exact: true }),
     ).toHaveCount(0);
     expect(beta.workspaceID).not.toBe(alpha.workspaceID);
+    expect(malformedMessagingSocketScopes).toEqual([]);
     expect(websocketErrors).toEqual([]);
   } catch (error) {
     const visibleText = await page
@@ -373,7 +473,11 @@ async function installMessaging(page: import("@playwright/test").Page) {
   await page.getByRole("button", { name: "インストール" }).click();
   const response = await responsePromise;
   expect(response.status()).toBe(201);
-  return asString(asRecord(await response.json()).installation_id);
+  const installation = asRecord(await response.json());
+  return {
+    installationID: asString(installation.installation_id),
+    authorityEpoch: asString(installation.authority_epoch),
+  };
 }
 
 async function createChannelAndSend(
@@ -420,16 +524,54 @@ async function expectExactScopeStatus(
   apiURL: string,
   workspaceID: string,
   installationID: string,
+  authorityEpoch: string,
   expected: number,
 ) {
   const query = new URLSearchParams({
     workspace_id: workspaceID,
     installation_id: installationID,
+    authority_epoch: authorityEpoch,
   });
   const response = await page.request.get(
     `${apiURL}/messaging/bootstrap?${query.toString()}`,
   );
   expect(response.status()).toBe(expected);
+}
+
+async function expectExactScopeWebSocketReject(
+  page: import("@playwright/test").Page,
+  apiURL: string,
+  workspaceID: string,
+  installationID: string,
+  authorityEpoch: string,
+  expectedRejectedWebSocketURLs: Set<string>,
+) {
+  const query = new URLSearchParams({
+    workspace_id: workspaceID,
+    installation_id: installationID,
+    authority_epoch: authorityEpoch,
+  });
+  const websocketURL = `${apiURL.replace(/^http/, "ws")}/messaging/ws?${query.toString()}`;
+  expectedRejectedWebSocketURLs.add(websocketURL);
+  const rejected = await page.evaluate(async (url) => {
+    return await new Promise<boolean>((resolve) => {
+      const socket = new WebSocket(url);
+      const timeout = window.setTimeout(() => {
+        socket.close();
+        resolve(false);
+      }, 5_000);
+      socket.addEventListener("open", () => {
+        window.clearTimeout(timeout);
+        socket.close();
+        resolve(false);
+      });
+      socket.addEventListener("close", () => {
+        window.clearTimeout(timeout);
+        resolve(true);
+      });
+    });
+  }, websocketURL);
+  expect(rejected).toBe(true);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

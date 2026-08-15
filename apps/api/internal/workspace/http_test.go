@@ -499,7 +499,10 @@ func TestLocalResolveEnabledAppBindsAuthenticatedActorWithoutInferenceOrSideEffe
 	}
 	var resolution map[string]any
 	decodeRecorder(t, resolved, &resolution)
-	if len(resolution) != 1 || resolution["installation_id"] != installed.InstallationID {
+	if len(resolution) != 3 ||
+		resolution["workspace_id"] != created.WorkspaceID ||
+		resolution["installation_id"] != installed.InstallationID ||
+		resolution["authority_epoch"] != "1" {
 		t.Fatalf("resolver exposed unexpected fields: %#v", resolution)
 	}
 
@@ -554,8 +557,20 @@ func TestLocalResolveEnabledAppBindsAuthenticatedActorWithoutInferenceOrSideEffe
 	if disabled.Code != http.StatusConflict || !strings.Contains(disabled.Body.String(), `"app_disabled"`) {
 		t.Fatalf("disabled installation = %d: %s", disabled.Code, disabled.Body.String())
 	}
-	if _, err := appStore.SetEnabledByID(ctx, installed.InstallationID, w.agentA, true); err != nil {
+	reenabled, err := appStore.SetEnabledByID(ctx, installed.InstallationID, w.agentA, true)
+	if err != nil {
 		t.Fatal(err)
+	}
+	resolvedAgain := invokeLocal(server.localResolveEnabledApp, requestBody, w.agentA.ID)
+	if resolvedAgain.Code != http.StatusOK {
+		t.Fatalf("resolve re-enabled app = %d: %s", resolvedAgain.Code, resolvedAgain.Body.String())
+	}
+	var currentResolution map[string]any
+	decodeRecorder(t, resolvedAgain, &currentResolution)
+	if currentResolution["workspace_id"] != created.WorkspaceID ||
+		currentResolution["installation_id"] != installed.InstallationID ||
+		currentResolution["authority_epoch"] != "2" || reenabled.AuthorityEpoch != 2 {
+		t.Fatalf("re-enabled resolver returned stale address: %#v", currentResolution)
 	}
 	if err := appStore.UninstallByID(ctx, installed.InstallationID, w.agentA); err != nil {
 		t.Fatal(err)
@@ -1208,12 +1223,17 @@ func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *t
 		t.Fatalf("registered app resolver = %d: %s", resolveResponse.Code, resolveResponse.Body.String())
 	}
 	var resolved struct {
+		WorkspaceID    string `json:"workspace_id"`
 		InstallationID string `json:"installation_id"`
+		AuthorityEpoch string `json:"authority_epoch"`
 	}
 	decodeRecorder(t, resolveResponse, &resolved)
-	if resolved.InstallationID != installation.InstallationID {
-		t.Fatalf("registered app resolver id = %q, want %q",
-			resolved.InstallationID, installation.InstallationID)
+	if resolved.WorkspaceID != created.WorkspaceID ||
+		resolved.InstallationID != installation.InstallationID ||
+		resolved.AuthorityEpoch != installation.AuthorityEpoch {
+		t.Fatalf("registered app resolver = %#v, want workspace %q, installation %q, epoch %q",
+			resolved, created.WorkspaceID, installation.InstallationID,
+			installation.AuthorityEpoch)
 	}
 
 	replacement := authorization

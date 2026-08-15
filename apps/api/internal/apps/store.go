@@ -116,8 +116,8 @@ func (s *Store) RequireEnabledInstallationInTx(
 }
 
 // RequireEnabledInstallationEpochInTx additionally seals a lifecycle authority
-// epoch. Direct Chat browser transports use it so a disable -> enable cycle
-// cannot revive a socket or retry bound before the disable.
+// epoch so a disable -> enable cycle cannot revive an app operation, socket, or
+// retry bound before the disable.
 func (s *Store) RequireEnabledInstallationEpochInTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -188,31 +188,29 @@ func (s *Store) RequireEnabledInstallationInSnapshot(
 	owner OwnerRef,
 	appID string,
 ) (Installation, error) {
-	if !isCanonicalUUIDv7(installationID) {
+	return requireEnabledInstallationRead(
+		ctx, tx, installationID, nil, owner, appID, "load exact app snapshot admission",
+	)
+}
+
+// RequireEnabledInstallationEpochInSnapshot is RequireEnabledInstallationInSnapshot
+// additionally sealed to one lifecycle authority epoch, for app read screens
+// whose caller bound that epoch when it resolved the installation.
+func (s *Store) RequireEnabledInstallationEpochInSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	installationID string,
+	authorityEpoch int64,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
+	if authorityEpoch < 1 {
 		return Installation{}, ErrInstallationNotFound
 	}
-	if err := owner.Validate(); err != nil {
-		return Installation{}, err
-	}
-	storageKind, storageID := ownerStorageKey(owner)
-	row := tx.QueryRow(ctx, `
-		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
-		       installed_at, updated_at
-		FROM app_installations
-		WHERE installation_id = $1
-		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4`,
-		installationID, storageKind, storageID, appID)
-	installation, err := scanInstallation(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Installation{}, ErrInstallationNotFound
-	}
-	if err != nil {
-		return Installation{}, fmt.Errorf("load exact app snapshot admission: %w", err)
-	}
-	if installation.State != StateEnabled {
-		return Installation{}, ErrAppDisabled
-	}
-	return installation, nil
+	return requireEnabledInstallationRead(
+		ctx, tx, installationID, &authorityEpoch, owner, appID,
+		"load exact app snapshot admission",
+	)
 }
 
 // RequireEnabledInstallation is the read-side equivalent used by entry
@@ -224,6 +222,44 @@ func (s *Store) RequireEnabledInstallation(
 	owner OwnerRef,
 	appID string,
 ) (Installation, error) {
+	return requireEnabledInstallationRead(
+		ctx, s.pool, installationID, nil, owner, appID, "read exact app lifecycle state",
+	)
+}
+
+// RequireEnabledInstallationEpoch is RequireEnabledInstallation additionally
+// sealed to one lifecycle authority epoch. An epoch that no longer matches
+// reads as ErrInstallationNotFound: the caller's binding predates a disable
+// and must be resolved again rather than revived.
+func (s *Store) RequireEnabledInstallationEpoch(
+	ctx context.Context,
+	installationID string,
+	authorityEpoch int64,
+	owner OwnerRef,
+	appID string,
+) (Installation, error) {
+	if authorityEpoch < 1 {
+		return Installation{}, ErrInstallationNotFound
+	}
+	return requireEnabledInstallationRead(
+		ctx, s.pool, installationID, &authorityEpoch, owner, appID,
+		"read exact app lifecycle state",
+	)
+}
+
+type installationRowReader interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func requireEnabledInstallationRead(
+	ctx context.Context,
+	reader installationRowReader,
+	installationID string,
+	authorityEpoch *int64,
+	owner OwnerRef,
+	appID string,
+	failure string,
+) (Installation, error) {
 	if !isCanonicalUUIDv7(installationID) {
 		return Installation{}, ErrInstallationNotFound
 	}
@@ -231,19 +267,23 @@ func (s *Store) RequireEnabledInstallation(
 		return Installation{}, err
 	}
 	storageKind, storageID := ownerStorageKey(owner)
-	row := s.pool.QueryRow(ctx, `
+	query := `
 		SELECT installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		       installed_at, updated_at
 		FROM app_installations
 		WHERE installation_id = $1
-		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4`,
-		installationID, storageKind, storageID, appID)
-	installation, err := scanInstallation(row)
+		  AND owner_kind = $2 AND owner_id = $3 AND app_id = $4`
+	args := []any{installationID, storageKind, storageID, appID}
+	if authorityEpoch != nil {
+		query += " AND authority_epoch = $5"
+		args = append(args, *authorityEpoch)
+	}
+	installation, err := scanInstallation(reader.QueryRow(ctx, query, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Installation{}, ErrInstallationNotFound
 	}
 	if err != nil {
-		return Installation{}, fmt.Errorf("read exact app lifecycle state: %w", err)
+		return Installation{}, fmt.Errorf("%s: %w", failure, err)
 	}
 	if installation.State != StateEnabled {
 		return Installation{}, ErrAppDisabled
@@ -254,8 +294,8 @@ func (s *Store) RequireEnabledInstallation(
 // ResolveEnabledInstallation turns an authenticated, model-selected app owner
 // address into the exact current installation identity used at bind time. It
 // never supplies a default Workspace and never accepts an installation id from
-// the model. Callers must still seal the returned id into the invocation and
-// use RequireEnabledInstallationInTx again at commit.
+// the model. Callers must seal the returned id and authority epoch into the
+// invocation and use RequireEnabledInstallationEpochInTx again at commit.
 func (s *Store) ResolveEnabledInstallation(
 	ctx context.Context,
 	owner OwnerRef,

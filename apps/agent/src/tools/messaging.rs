@@ -36,7 +36,7 @@ use crate::{
 
 const TOOL_NAME: &str = "messaging";
 const BINDING_ADAPTER_ID: &str = "sumi.messaging";
-const BINDING_ADAPTER_VERSION: u32 = 1;
+const BINDING_ADAPTER_VERSION: u32 = 2;
 const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
@@ -169,6 +169,7 @@ enum BoundMessagingAction {
 struct BoundMessagingInvocation {
     workspace_id: String,
     installation_id: String,
+    authority_epoch: String,
     #[serde(flatten)]
     action: BoundMessagingAction,
 }
@@ -387,11 +388,17 @@ impl MessagingTool {
             })
             .await
             .map_err(map_app_resolution_error)?;
-        validate_canonical_uuid_v7(&installation.installation_id)
-            .map_err(|_| DescribeError::BindingInternal)?;
+        if installation.workspace_id != workspace_id
+            || validate_canonical_uuid_v7(&installation.workspace_id).is_err()
+            || validate_canonical_uuid_v7(&installation.installation_id).is_err()
+            || !is_canonical_authority_epoch(&installation.authority_epoch)
+        {
+            return Err(DescribeError::BindingInternal);
+        }
         Ok(ExactMessagingScope {
             workspace_id: workspace_id.to_owned(),
             installation_id: installation.installation_id,
+            authority_epoch: installation.authority_epoch,
         })
     }
 
@@ -849,6 +856,7 @@ impl BoundToolAdapter for MessagingTool {
         let scope = ExactMessagingScope {
             workspace_id: invocation.workspace_id,
             installation_id: invocation.installation_id,
+            authority_epoch: invocation.authority_epoch,
         };
         validate_exact_scope(&scope)?;
         validate_bound_action(&invocation.action)?;
@@ -1125,6 +1133,10 @@ fn messaging_binding(
     execution_arguments.insert(
         "installation_id".to_owned(),
         Value::String(scope.installation_id.clone()),
+    );
+    execution_arguments.insert(
+        "authority_epoch".to_owned(),
+        Value::String(scope.authority_epoch.clone()),
     );
     Ok(ToolBinding::new(
         AppActionDescriptor::new(operation, capability, resource_scopes)?,
@@ -1433,7 +1445,21 @@ fn validate_canonical_uuid_v7(value: &str) -> Result<(), ToolError> {
 
 fn validate_exact_scope(scope: &ExactMessagingScope) -> Result<(), ToolError> {
     validate_canonical_uuid_v7(&scope.workspace_id)?;
-    validate_canonical_uuid_v7(&scope.installation_id)
+    validate_canonical_uuid_v7(&scope.installation_id)?;
+    if !is_canonical_authority_epoch(&scope.authority_epoch) {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+fn is_canonical_authority_epoch(value: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    value.parse::<i64>().is_ok_and(|epoch| epoch > 0)
 }
 
 fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError> {
@@ -2038,7 +2064,11 @@ mod tests {
             }
             if let Some(installation_id) = self.resolved_installation_override.lock().await.clone()
             {
-                return Ok(ResolvedAppInstallation { installation_id });
+                return Ok(ResolvedAppInstallation {
+                    workspace_id: request.workspace_id.to_owned(),
+                    installation_id,
+                    authority_epoch: "1".to_owned(),
+                });
             }
             if request.app_id != MESSAGING_APP_ID {
                 return Err(AppInstallationResolutionError::Protocol);
@@ -2049,7 +2079,9 @@ mod tests {
                 _ => return Err(AppInstallationResolutionError::NotFound),
             };
             Ok(ResolvedAppInstallation {
+                workspace_id: request.workspace_id.to_owned(),
                 installation_id: installation_id.to_owned(),
+                authority_epoch: "1".to_owned(),
             })
         }
     }
@@ -2272,6 +2304,7 @@ mod tests {
         tool.view_for(&ExactMessagingScope {
             workspace_id: TEST_WORKSPACE_ID.to_owned(),
             installation_id: TEST_INSTALLATION_ID.to_owned(),
+            authority_epoch: "1".to_owned(),
         })
         .await
         .lock_owned()
@@ -2290,6 +2323,7 @@ mod tests {
             "installation_id".to_owned(),
             Value::String(TEST_INSTALLATION_ID.to_owned()),
         );
+        object.insert("authority_epoch".to_owned(), Value::String("1".to_owned()));
         arguments
     }
 
@@ -2349,6 +2383,7 @@ mod tests {
             let scope = ExactMessagingScope {
                 workspace_id: TEST_WORKSPACE_ID.to_owned(),
                 installation_id: TEST_INSTALLATION_ID.to_owned(),
+                authority_epoch: "1".to_owned(),
             };
             let view = tool.view_for(&scope).await;
             let mut state = view.lock().await;
@@ -2397,6 +2432,7 @@ mod tests {
         let scope = ExactMessagingScope {
             workspace_id: TEST_WORKSPACE_ID.to_owned(),
             installation_id: TEST_INSTALLATION_ID.to_owned(),
+            authority_epoch: "1".to_owned(),
         };
         let view = tool.view_for(&scope).await;
         view.lock().await.visible_reply_later_markers[0]
@@ -2588,6 +2624,7 @@ mod tests {
         assert_eq!(schema["properties"]["workspace_id"]["type"], "string");
         assert!(schema["properties"].get("app_id").is_none());
         assert!(schema["properties"].get("installation_id").is_none());
+        assert!(schema["properties"].get("authority_epoch").is_none());
         assert_eq!(
             schema["properties"]["action"]["enum"],
             json!([
@@ -2709,6 +2746,12 @@ mod tests {
                 .contains_key("installation_id")
         );
         assert!(
+            !invocation
+                .review_projection
+                .as_object()
+                .contains_key("authority_epoch")
+        );
+        assert!(
             invocation
                 .descriptor
                 .resource_scopes
@@ -2734,6 +2777,10 @@ mod tests {
             invocation.execution_arguments.as_object()["installation_id"],
             TEST_INSTALLATION_ID
         );
+        assert_eq!(
+            invocation.execution_arguments.as_object()["authority_epoch"],
+            "1"
+        );
 
         let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
         registry
@@ -2750,6 +2797,7 @@ mod tests {
             &[ExactMessagingScope {
                 workspace_id: TEST_WORKSPACE_ID.to_owned(),
                 installation_id: TEST_INSTALLATION_ID.to_owned(),
+                authority_epoch: "1".to_owned(),
             }]
         );
     }
@@ -2973,6 +3021,7 @@ mod tests {
                 "0198f0f4-9b72-7000-8000-{:012x}",
                 index + MAX_CACHED_MESSAGING_VIEWS + 1
             ),
+            authority_epoch: "1".to_owned(),
         }
     }
 
@@ -3032,10 +3081,12 @@ mod tests {
         let prior = ExactMessagingScope {
             workspace_id: TEST_WORKSPACE_ID.to_owned(),
             installation_id: TEST_INSTALLATION_ID.to_owned(),
+            authority_epoch: "1".to_owned(),
         };
         let replacement = ExactMessagingScope {
             workspace_id: TEST_WORKSPACE_ID.to_owned(),
             installation_id: TEST_INSTALLATION_B_ID.to_owned(),
+            authority_epoch: "1".to_owned(),
         };
         tool.view_for(&prior).await.lock().await.focused_place_id = Some("prior-place".to_owned());
         assert!(
@@ -3060,6 +3111,69 @@ mod tests {
                 .as_deref(),
             Some("prior-place")
         );
+    }
+
+    #[tokio::test]
+    async fn authority_epoch_rollover_cannot_inherit_the_prior_installation_view() {
+        let tool = MessagingTool::new(Arc::new(FakeMessagingApi::default()));
+        let epoch_one = ExactMessagingScope {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            installation_id: TEST_INSTALLATION_ID.to_owned(),
+            authority_epoch: "1".to_owned(),
+        };
+        let epoch_two = ExactMessagingScope {
+            authority_epoch: "2".to_owned(),
+            ..epoch_one.clone()
+        };
+        tool.view_for(&epoch_one)
+            .await
+            .lock()
+            .await
+            .focused_place_id = Some("epoch-one".to_owned());
+        assert!(
+            tool.view_for(&epoch_two)
+                .await
+                .lock()
+                .await
+                .focused_place_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_execution_rejects_noncanonical_sealed_authority_epochs() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        for authority_epoch in ["", "0", "01", "+1", "9223372036854775808"] {
+            let args = BoundExecutionArguments::from_value(json!({
+                "workspace_id": TEST_WORKSPACE_ID,
+                "installation_id": TEST_INSTALLATION_ID,
+                "authority_epoch": authority_epoch,
+                "action": "overview"
+            }))
+            .expect("object-shaped private arguments");
+            let result = BoundToolAdapter::execute(
+                &tool,
+                BoundToolCtx {
+                    flow_id: "flow",
+                    call_id: "malformed-epoch",
+                    args: &args,
+                    committed_effect_permit:
+                        crate::approval::authority::CommittedExecutionPermit::executor_fixture(
+                            "malformed-epoch",
+                            ToolInvocationRoute::Normal,
+                            crate::approval::authority::ExecutionAuthorityProvenance::AgentOwn,
+                        ),
+                    cancel: CancellationToken::new(),
+                    on_update: Arc::new(|_| {}),
+                    workspace: &workspace,
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(ToolError::InvalidArguments)));
+        }
+        assert!(api.scopes.lock().await.is_empty());
     }
 
     #[tokio::test]

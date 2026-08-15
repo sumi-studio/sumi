@@ -3,9 +3,11 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,33 @@ type unusedFirebaseVerifier struct{}
 
 func (unusedFirebaseVerifier) VerifyIDToken(context.Context, string) (agentevents.FirebaseIdentity, error) {
 	return agentevents.FirebaseIdentity{}, fmt.Errorf("not used")
+}
+
+type blockingMessagingSessionAuthorizer struct {
+	claims  agentevents.UserSessionClaims
+	started chan struct{}
+	release chan struct{}
+	reject  bool
+}
+
+func (s *blockingMessagingSessionAuthorizer) VerifySession(context.Context, string) (agentevents.UserSessionClaims, error) {
+	return s.claims, nil
+}
+
+func (s *blockingMessagingSessionAuthorizer) AuthorizeSession(ctx context.Context, _ agentevents.UserSessionClaims, operation func() error) error {
+	if s.reject {
+		return errors.New("session admission rejected")
+	}
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return operation()
 }
 
 // wsWorld wires the REST server and WS server onto the same store and hub,
@@ -53,12 +82,14 @@ func dialWS(t *testing.T, ts *httptest.Server, cookie string, cursors map[string
 	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/messaging/ws"
 	if store, ok := testStoreForParticipant(cookie); ok {
 		if scoped, err := store.scopeForActor(context.Background(), Human(cookie)); err == nil {
-			url += "?workspace_id=" + scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID
+			url += "?workspace_id=" + scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID +
+				"&authority_epoch=" + strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10)
 		}
 	} else if store, ok := testStoreForServer(ts.URL); ok {
 		if actor, actorOK := testActorForServer(ts.URL); actorOK {
 			if scoped, err := store.scopeForActor(context.Background(), actor); err == nil {
-				url += "?workspace_id=" + scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID
+				url += "?workspace_id=" + scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID +
+					"&authority_epoch=" + strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10)
 			}
 		}
 	}
@@ -115,6 +146,153 @@ func TestWSRejectsBadOriginAndSession(t *testing.T) {
 	header.Set("Origin", testOrigin)
 	if _, resp, err := websocket.DefaultDialer.Dial(url, header); err == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("missing cookie must be rejected with 401, got err=%v", err)
+	}
+}
+
+func TestWSAuthorityEpochWireIsCanonicalAndStaleDoesNotRevive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	scoped := w.store.mustScopeForActor(t, ctx, w.humanA)
+	base := "ws" + strings.TrimPrefix(ts.URL, "http") + "/messaging/ws?workspace_id=" +
+		scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID
+	header := http.Header{}
+	header.Set("Origin", testOrigin)
+	header.Set("Cookie", agentevents.BrowserSessionCookie+"="+w.humanA.ID)
+
+	for name, suffix := range map[string]string{
+		"missing":      "",
+		"duplicate":    "&authority_epoch=1&authority_epoch=1",
+		"null":         "&authority_epoch=null",
+		"empty":        "&authority_epoch=",
+		"plus":         "&authority_epoch=%2B1",
+		"leading zero": "&authority_epoch=01",
+		"zero":         "&authority_epoch=0",
+		"overflow":     "&authority_epoch=9223372036854775808",
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn, resp, err := websocket.DefaultDialer.Dial(base+suffix, header)
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("dial err=%v response=%v, want 400", err, resp)
+			}
+		})
+	}
+
+	if _, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, false); err != nil {
+		t.Fatal(err)
+	}
+	reenabled, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleURL := base + "&authority_epoch=" + strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10)
+	conn, resp, err := websocket.DefaultDialer.Dial(staleURL, header)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil || resp == nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("stale re-enabled epoch dial err=%v response=%v, want 404", err, resp)
+	}
+	currentURL := base + "&authority_epoch=" + strconv.FormatInt(reenabled.AuthorityEpoch, 10)
+	conn, resp, err = websocket.DefaultDialer.Dial(currentURL, header)
+	if err != nil {
+		t.Fatalf("current epoch dial: %v (response=%v)", err, resp)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "hello", "cursors": map[string]int64{}}); err != nil {
+		t.Fatal(err)
+	}
+	if frame := readFrame(t, conn); frame["type"] != "hello_ack" {
+		t.Fatalf("current epoch hello = %v", frame)
+	}
+}
+
+func TestWSAdmissionRaceClassifiesStaleScopeWithoutMaskingSessionFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, _ = w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScopeForActor(t, ctx, w.humanA)
+	sessions := &blockingMessagingSessionAuthorizer{
+		claims:  agentevents.UserSessionClaims{UserID: w.humanA.ID},
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		reject:  true,
+	}
+	ws := NewWSServer(w.store.core, sessions, NewHub(w.store.core))
+	ws.AllowedOrigins = []string{testOrigin}
+	ts := httptest.NewServer(ws)
+	defer ts.Close()
+	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/messaging/ws?workspace_id=" +
+		scoped.Scope.WorkspaceID + "&installation_id=" + scoped.Scope.InstallationID +
+		"&authority_epoch=" + strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10)
+	header := http.Header{
+		"Origin": {testOrigin},
+		"Cookie": {agentevents.BrowserSessionCookie + "=admission-race"},
+	}
+
+	conn, response, err := websocket.DefaultDialer.Dial(url, header)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("session admission rejection response=%v err=%v, want 401", response, err)
+	}
+
+	sessions.reject = false
+	type dialResult struct {
+		conn     *websocket.Conn
+		response *http.Response
+		err      error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		conn, response, err := websocket.DefaultDialer.Dial(url, header)
+		result <- dialResult{conn: conn, response: response, err: err}
+	}()
+	select {
+	case <-sessions.started:
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket did not enter final session admission")
+	}
+	if _, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, false); err != nil {
+		t.Fatal(err)
+	}
+	close(sessions.release)
+	select {
+	case got := <-result:
+		if got.conn != nil {
+			got.conn.Close()
+		}
+		if got.err == nil || got.response == nil || got.response.StatusCode != http.StatusNotFound {
+			t.Fatalf("stale admission response=%v err=%v, want 404", got.response, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale WebSocket admission did not return")
+	}
+}
+
+func TestWSCatchUpRejectsStaleAuthorityEpochAfterReenable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	stale := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	if _, err := w.apps.SetEnabledByID(ctx, stale.Scope.InstallationID, w.humanA, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.apps.SetEnabledByID(ctx, stale.Scope.InstallationID, w.humanA, true); err != nil {
+		t.Fatal(err)
+	}
+	hub := NewHub(w.store.core)
+	sub := hub.subscribe(stale)
+	defer hub.unsubscribe(sub)
+	server := NewWSServer(w.store.core, stubSessions{}, hub)
+	if server.catchUp(ctx, sub, map[string]int64{channel.PlaceID: 0}) {
+		t.Fatal("catch-up accepted a pre-disable authority epoch")
 	}
 }
 

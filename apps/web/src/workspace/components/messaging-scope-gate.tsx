@@ -59,11 +59,16 @@ export function MessagingScopeGate({
     descriptor && installation?.state === "enabled" && ownMembership
       ? installation.installationId
       : null;
+  const desiredAuthorityEpoch =
+    descriptor && installation?.state === "enabled" && ownMembership
+      ? installation.authorityEpoch
+      : null;
   const desired: MessagingScope | null =
-    desiredWorkspaceId && desiredInstallationId
+    desiredWorkspaceId && desiredInstallationId && desiredAuthorityEpoch
       ? {
           workspaceId: desiredWorkspaceId,
           installationId: desiredInstallationId,
+          authorityEpoch: desiredAuthorityEpoch,
         }
       : null;
   const current = getMessagingScope();
@@ -73,10 +78,11 @@ export function MessagingScopeGate({
 
   useLayoutEffect(() => {
     const nextScope: MessagingScope | null =
-      desiredWorkspaceId && desiredInstallationId
+      desiredWorkspaceId && desiredInstallationId && desiredAuthorityEpoch
         ? {
             workspaceId: desiredWorkspaceId,
             installationId: desiredInstallationId,
+            authorityEpoch: desiredAuthorityEpoch,
           }
         : null;
     if (!sameMessagingScope(getMessagingScope(), nextScope)) {
@@ -88,7 +94,7 @@ export function MessagingScopeGate({
         bindMessagingScope(null);
       }
     };
-  }, [desiredInstallationId, desiredWorkspaceId]);
+  }, [desiredAuthorityEpoch, desiredInstallationId, desiredWorkspaceId]);
 
   if (!ownMembership) {
     return (

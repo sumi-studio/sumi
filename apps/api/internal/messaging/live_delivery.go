@@ -51,10 +51,11 @@ func (s *Store) withLiveAudience(
 			}
 			return err
 		}
-		if _, err := s.apps.RequireEnabledInstallationInTx(
+		if _, err := s.apps.RequireEnabledInstallationEpochInTx(
 			ctx,
 			tx,
 			scope.InstallationID,
+			scope.AuthorityEpoch,
 			applicationapps.WorkspaceOwner(scope.WorkspaceID),
 			MessagingAppID,
 		); err != nil {

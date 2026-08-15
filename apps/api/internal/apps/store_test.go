@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
@@ -218,6 +219,35 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if reenabled.AuthorityEpoch != 2 {
 		t.Fatalf("re-enable authority epoch = %d, want 2", reenabled.AuthorityEpoch)
 	}
+	if _, err := w.apps.RequireEnabledInstallationEpoch(
+		ctx, installed.InstallationID, 1, workspaceOwner, "messaging",
+	); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+		t.Fatalf("stale read authority epoch = %v", err)
+	}
+	if projected, err := w.apps.RequireEnabledInstallationEpoch(
+		ctx, installed.InstallationID, 2, workspaceOwner, "messaging",
+	); err != nil || projected.AuthorityEpoch != 2 {
+		t.Fatalf("current read authority epoch = %#v, %v", projected, err)
+	}
+	snapshot, err := w.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.apps.RequireEnabledInstallationEpochInSnapshot(
+		ctx, snapshot, installed.InstallationID, 1, workspaceOwner, "messaging",
+	); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+		_ = snapshot.Rollback(ctx)
+		t.Fatalf("stale snapshot authority epoch = %v", err)
+	}
+	if projected, err := w.apps.RequireEnabledInstallationEpochInSnapshot(
+		ctx, snapshot, installed.InstallationID, 2, workspaceOwner, "messaging",
+	); err != nil || projected.AuthorityEpoch != 2 {
+		_ = snapshot.Rollback(ctx)
+		t.Fatalf("current snapshot authority epoch = %#v, %v", projected, err)
+	}
+	_ = snapshot.Rollback(ctx)
 	tx, err = w.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)

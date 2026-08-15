@@ -1475,9 +1475,9 @@ func (s *Store) lockSharedAndRequirePermission(ctx context.Context, tx pgx.Tx, w
 }
 
 // LockAndRequireAppCapability evaluates one app-owned, catalog-backed role
-// capability. It does not authorize installation state, place tenure, privacy,
-// or the app's domain operation; the app enforces those around this check in
-// the same transaction.
+// capability under the Workspace shared authority fence. It does not authorize
+// installation state, place tenure, privacy, or the app's domain operation;
+// the app enforces those around this check in the same transaction.
 func (s *Store) LockAndRequireAppCapability(ctx context.Context, tx pgx.Tx, workspaceID string, actor participant.Ref, capabilityRef string) error {
 	if !appCapabilityRefPattern.MatchString(capabilityRef) {
 		return ErrInvalidPermission
@@ -1486,7 +1486,7 @@ func (s *Store) LockAndRequireAppCapability(ctx context.Context, tx pgx.Tx, work
 	// mutation. Resolve the app catalog only after it so role changes,
 	// installation lifecycle, and app-domain writes cannot form a
 	// catalog -> Workspace / Workspace -> catalog lock cycle.
-	if err := lockWorkspace(ctx, tx, workspaceID); err != nil {
+	if err := lockWorkspaceShared(ctx, tx, workspaceID); err != nil {
 		return err
 	}
 	var capabilityID string

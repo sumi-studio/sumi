@@ -291,7 +291,8 @@ func (h *Hub) publishVariants(
 			// subscriber-by-subscriber authorization query.
 			if scope.WorkspaceID != "" && (sub.store == nil ||
 				sub.store.Scope.WorkspaceID != scope.WorkspaceID ||
-				sub.store.Scope.InstallationID != scope.InstallationID) {
+				sub.store.Scope.InstallationID != scope.InstallationID ||
+				sub.store.Scope.AuthorityEpoch != scope.AuthorityEpoch) {
 				continue
 			}
 			visible := false

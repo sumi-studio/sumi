@@ -75,6 +75,7 @@ const TRUSTED_UNIX_PARENT_MODE: u32 = 0o750;
 struct ScopedMessagingRequest<'a, T> {
     workspace_id: &'a str,
     installation_id: &'a str,
+    authority_epoch: &'a str,
     #[serde(flatten)]
     operation: T,
 }
@@ -84,6 +85,7 @@ impl<'a, T> ScopedMessagingRequest<'a, T> {
         Self {
             workspace_id: &scope.workspace_id,
             installation_id: &scope.installation_id,
+            authority_epoch: &scope.authority_epoch,
             operation,
         }
     }
@@ -551,6 +553,7 @@ impl AppInstallationResolver for LocalControlHttpClient {
         &self,
         request: ResolveEnabledWorkspaceAppRequest<'_>,
     ) -> AppInstallationResolutionResult<ResolvedAppInstallation> {
+        let expected_workspace_id = request.workspace_id.to_owned();
         self.credential
             .validate_at(&self.authority, SystemTime::now())
             .map_err(|_| AppInstallationResolutionError::AuthenticationUnavailable)?;
@@ -608,8 +611,16 @@ impl AppInstallationResolver for LocalControlHttpClient {
             body.extend_from_slice(&chunk);
         }
         if status.is_success() {
-            return serde_json::from_slice(body.as_slice())
-                .map_err(|_| AppInstallationResolutionError::Protocol);
+            let resolved: ResolvedAppInstallation = serde_json::from_slice(body.as_slice())
+                .map_err(|_| AppInstallationResolutionError::Protocol)?;
+            if resolved.workspace_id != expected_workspace_id
+                || !is_canonical_uuid_v7(&resolved.workspace_id)
+                || !is_canonical_uuid_v7(&resolved.installation_id)
+                || !is_canonical_authority_epoch(&resolved.authority_epoch)
+            {
+                return Err(AppInstallationResolutionError::Protocol);
+            }
+            return Ok(resolved);
         }
         let rejection: AppResolutionErrorResponse = serde_json::from_slice(body.as_slice())
             .map_err(|_| AppInstallationResolutionError::Protocol)?;
@@ -629,6 +640,16 @@ impl AppInstallationResolver for LocalControlHttpClient {
             _ => Err(AppInstallationResolutionError::Protocol),
         }
     }
+}
+
+fn is_canonical_authority_epoch(value: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    value.parse::<i64>().is_ok_and(|epoch| epoch > 0)
 }
 
 #[async_trait]
@@ -1919,6 +1940,7 @@ mod tests {
         ExactMessagingScope {
             workspace_id: "0198f0f4-9b72-7000-8000-000000000201".to_owned(),
             installation_id: "0198f0f4-9b72-7000-8000-000000000301".to_owned(),
+            authority_epoch: "1".to_owned(),
         }
     }
 
@@ -3098,6 +3120,8 @@ mod tests {
         serde_json::from_slice::<serde_json::Value>(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
         *state.request_body.lock().unwrap() = Some(body.to_vec());
         Ok(Json(serde_json::json!({
+            "workspace_id": "0198f0f4-9b72-7000-8000-000000000201",
+            "authority_epoch": "1",
             "installation_id": "0198f0f4-9b72-7000-8000-000000000301"
         })))
     }
@@ -3151,6 +3175,8 @@ mod tests {
             AppResolutionFailureFixture::Timeout => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Json(serde_json::json!({
+                    "workspace_id": "0198f0f4-9b72-7000-8000-000000000201",
+                    "authority_epoch": "1",
                     "installation_id": "0198f0f4-9b72-7000-8000-000000000301"
                 }))
                 .into_response()
@@ -3159,6 +3185,12 @@ mod tests {
                 (StatusCode::OK, "not-json").into_response()
             }
         }
+    }
+
+    async fn app_resolution_wire_fixture(
+        State(response): State<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        Json(response)
     }
 
     async fn compact_write_fixture(
@@ -3244,6 +3276,7 @@ mod tests {
         let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(request["workspace_id"], scope.workspace_id);
         assert_eq!(request["installation_id"], scope.installation_id);
+        assert_eq!(request["authority_epoch"], scope.authority_epoch);
         assert!(request.get("app_id").is_none());
         assert_eq!(
             request["content"].as_str().unwrap().as_bytes().len(),
@@ -3290,6 +3323,11 @@ mod tests {
             resolved.installation_id,
             "0198f0f4-9b72-7000-8000-000000000301"
         );
+        assert_eq!(
+            resolved.workspace_id,
+            "0198f0f4-9b72-7000-8000-000000000201"
+        );
+        assert_eq!(resolved.authority_epoch, "1");
         let raw = state.request_body.lock().unwrap().take().unwrap();
         let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(
@@ -3300,6 +3338,58 @@ mod tests {
             })
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn app_resolver_fails_closed_for_nonexact_authority_epoch_responses() {
+        let workspace_id = "0198f0f4-9b72-7000-8000-000000000201";
+        let installation_id = "0198f0f4-9b72-7000-8000-000000000301";
+        for response in [
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id}),
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id, "authority_epoch": null}),
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id, "authority_epoch": 1}),
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id, "authority_epoch": "0"}),
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id, "authority_epoch": "01"}),
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id, "authority_epoch": "9223372036854775808"}),
+            serde_json::json!({"workspace_id": workspace_id, "installation_id": installation_id, "authority_epoch": "1", "extra": true}),
+            serde_json::json!({"workspace_id": "0198f0f4-9b72-7000-8000-000000000299", "installation_id": installation_id, "authority_epoch": "1"}),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/apps:resolve-enabled",
+                    post(app_resolution_wire_fixture),
+                )
+                .with_state(response);
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let authority = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                authority.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                authority,
+                credential,
+            )
+            .unwrap();
+            assert_eq!(
+                client
+                    .resolve_enabled_workspace_app(ResolveEnabledWorkspaceAppRequest {
+                        workspace_id,
+                        app_id: "messaging",
+                    })
+                    .await
+                    .expect_err("only one exact resolver tuple may bind Messaging"),
+                AppInstallationResolutionError::Protocol
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]

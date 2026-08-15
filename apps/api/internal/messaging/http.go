@@ -501,12 +501,14 @@ func (s *Server) viewer(w http.ResponseWriter, r *http.Request) (ParticipantRef,
 	}
 	workspaceID, workspaceOK := exactQueryValue(r, "workspace_id")
 	installationID, installationOK := exactQueryValue(r, "installation_id")
-	if !workspaceOK || !installationOK || s.Store == nil {
+	authorityEpoch, epochOK := exactAuthorityEpochQuery(r)
+	if !workspaceOK || !installationOK || !epochOK || s.Store == nil {
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 		return ParticipantRef{}, none, false
 	}
 	scoped, err := s.Store.Scoped(Scope{
-		WorkspaceID: workspaceID, InstallationID: installationID, Actor: viewer,
+		WorkspaceID: workspaceID, InstallationID: installationID,
+		AuthorityEpoch: authorityEpoch, Actor: viewer,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_scope")

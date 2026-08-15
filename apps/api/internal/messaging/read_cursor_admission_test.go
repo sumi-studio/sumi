@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -90,6 +91,7 @@ func TestLocalAgentOpenCarriesExactCursorForContiguousAdmission(t *testing.T) {
 	scope := map[string]any{
 		"workspace_id":    workspace.WorkspaceID,
 		"installation_id": scoped.Scope.InstallationID,
+		"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10),
 	}
 
 	messages := make([]Message, 25)

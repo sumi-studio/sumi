@@ -115,12 +115,14 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	workspaceID, workspaceOK := exactQueryValue(r, "workspace_id")
 	installationID, installationOK := exactQueryValue(r, "installation_id")
-	if !workspaceOK || !installationOK || s.Store == nil {
+	authorityEpoch, epochOK := exactAuthorityEpochQuery(r)
+	if !workspaceOK || !installationOK || !epochOK || s.Store == nil {
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 		return
 	}
 	store, err := s.Store.Scoped(Scope{
-		WorkspaceID: workspaceID, InstallationID: installationID, Actor: viewer,
+		WorkspaceID: workspaceID, InstallationID: installationID,
+		AuthorityEpoch: authorityEpoch, Actor: viewer,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_scope")
@@ -133,9 +135,13 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var conn *websocket.Conn
 	upgradeAttempted := false
+	callbackCalled := false
+	var callbackErr error
 	upgradeCtx, cancelUpgrade := context.WithTimeout(r.Context(), s.WriteTimeout)
 	err = s.Sessions.AuthorizeSession(upgradeCtx, claims, func() error {
+		callbackCalled = true
 		if err := store.authorize(upgradeCtx); err != nil {
+			callbackErr = err
 			return err
 		}
 		upgrader := s.upgrader
@@ -154,7 +160,11 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if conn != nil {
 			_ = conn.Close()
 		} else if !upgradeAttempted {
-			writeError(w, http.StatusUnauthorized, "invalid_session")
+			if callbackCalled && callbackErr != nil {
+				writeStoreError(w, callbackErr)
+			} else {
+				writeError(w, http.StatusUnauthorized, "invalid_session")
+			}
 		}
 		return
 	}
@@ -198,10 +208,16 @@ func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[str
 	for placeID, since := range cursors {
 		place, err := sub.store.PlaceFor(ctx, placeID)
 		if err != nil {
-			// Not visible (or gone): the cursor is silently dropped. The
-			// place's existence is not revealed on this path either.
-			sub.markVisible(placeID, false)
-			continue
+			if errors.Is(err, ErrPlaceNotFound) {
+				// Not visible (or gone): the cursor is silently dropped. The
+				// place's existence is not revealed on this path either.
+				sub.markVisible(placeID, false)
+				continue
+			}
+			// Installation lifecycle failures invalidate the whole sealed
+			// socket. Treating them as an invisible place would let a stale
+			// disable -> re-enable binding survive catch-up.
+			return false
 		}
 		sub.markVisible(placeID, true)
 		messages, err := sub.store.MessagesSince(ctx, placeID, since, catchUpLimit)

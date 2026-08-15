@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -61,8 +62,35 @@ func localViewer(authorization agentevents.LocalRuntimeAuthorization) Participan
 }
 
 type localScopeWire struct {
-	WorkspaceID    string `json:"workspace_id"`
-	InstallationID string `json:"installation_id"`
+	WorkspaceID    localRequiredString `json:"workspace_id"`
+	InstallationID localRequiredString `json:"installation_id"`
+	AuthorityEpoch localAuthorityEpoch `json:"authority_epoch"`
+}
+
+// localRequiredString retains JSON field presence so the shared local-control
+// decoder cannot silently accept duplicate Workspace or installation keys with
+// last-wins semantics. This is scoped to Messaging's sealed address rather
+// than changing decoding rules for unrelated local-control contracts.
+type localRequiredString struct {
+	value string
+	seen  bool
+}
+
+func (value *localRequiredString) UnmarshalJSON(data []byte) error {
+	if value.seen || len(data) < 2 || data[0] != '"' {
+		return errInvalidAuthorityEpoch
+	}
+	var decoded string
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return errInvalidAuthorityEpoch
+	}
+	value.seen = true
+	value.value = decoded
+	return nil
+}
+
+func (scope localScopeWire) valid() bool {
+	return scope.WorkspaceID.seen && scope.InstallationID.seen
 }
 
 func (s *Server) localScopedStore(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization, scope localScopeWire) (*ScopedStore, bool) {
@@ -82,13 +110,17 @@ func (s *Server) localScopedStore(w http.ResponseWriter, r *http.Request, author
 // membership authorization inside that same snapshot, not through the pool
 // here and then again while projecting the response.
 func (s *Server) localBoundStore(w http.ResponseWriter, authorization agentevents.LocalRuntimeAuthorization, scope localScopeWire) (*ScopedStore, bool) {
+	if !scope.valid() {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return nil, false
+	}
 	if s.Store == nil {
 		writeError(w, http.StatusServiceUnavailable, "messaging_unavailable")
 		return nil, false
 	}
 	store, err := s.Store.Scoped(Scope{
-		WorkspaceID: scope.WorkspaceID, InstallationID: scope.InstallationID,
-		Actor: localViewer(authorization),
+		WorkspaceID: scope.WorkspaceID.value, InstallationID: scope.InstallationID.value,
+		AuthorityEpoch: int64(scope.AuthorityEpoch), Actor: localViewer(authorization),
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_scope")

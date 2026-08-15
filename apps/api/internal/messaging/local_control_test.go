@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -143,7 +144,8 @@ func TestLocalWriteBoundaryThroughAuthenticatedUnixControlRoute(t *testing.T) {
 		t.Helper()
 		payload, err := json.Marshal(map[string]any{
 			"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
-			"place_id": channel.PlaceID, "content": content, "urgency": "normal", "client_nonce": nonce,
+			"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10),
+			"place_id":        channel.PlaceID, "content": content, "urgency": "normal", "client_nonce": nonce,
 		})
 		if err != nil {
 			t.Fatalf("marshal local write: %v", err)
@@ -268,6 +270,7 @@ func TestLocalControlRequiresAuthenticatedExactScope(t *testing.T) {
 	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
 	status, body := callLocal(t, ctx, server.localOverview, LocalOverviewPath, map[string]any{
 		"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
+		"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10),
 	}, authorization)
 	if status != http.StatusOK {
 		t.Fatalf("local control exact scope=%d body=%v", status, body)
@@ -282,7 +285,7 @@ func TestLocalWriteReauthorizesASealedInstallationAtCommit(t *testing.T) {
 		retire     func(context.Context, world, *ScopedStore) error
 	}{
 		{
-			name: "disabled after bind", wantStatus: http.StatusForbidden, wantError: "app_disabled",
+			name: "disabled after bind", wantStatus: http.StatusNotFound, wantError: "installation_not_found",
 			retire: func(ctx context.Context, w world, scoped *ScopedStore) error {
 				_, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, false)
 				return err
@@ -294,6 +297,20 @@ func TestLocalWriteReauthorizesASealedInstallationAtCommit(t *testing.T) {
 				return w.apps.UninstallByID(ctx, scoped.Scope.InstallationID, w.humanA)
 			},
 		},
+		{
+			name: "disabled and re-enabled after bind", wantStatus: http.StatusNotFound, wantError: "installation_not_found",
+			retire: func(ctx context.Context, w world, scoped *ScopedStore) error {
+				if _, err := w.apps.SetEnabledByID(
+					ctx, scoped.Scope.InstallationID, w.humanA, false,
+				); err != nil {
+					return err
+				}
+				_, err := w.apps.SetEnabledByID(
+					ctx, scoped.Scope.InstallationID, w.humanA, true,
+				)
+				return err
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -303,13 +320,15 @@ func TestLocalWriteReauthorizesASealedInstallationAtCommit(t *testing.T) {
 			scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
 			sealedWorkspaceID := scoped.Scope.WorkspaceID
 			sealedInstallationID := scoped.Scope.InstallationID
+			sealedAuthorityEpoch := scoped.Scope.AuthorityEpoch
 			if err := test.retire(ctx, w, scoped); err != nil {
 				t.Fatal(err)
 			}
 			server := NewServer(w.store.core, nil)
 			status, body := callLocalWithoutFixtureInference(t, ctx, server.localWrite, LocalWritePath, map[string]any{
 				"workspace_id": sealedWorkspaceID, "installation_id": sealedInstallationID,
-				"place_id": channel.PlaceID, "content": "must not commit", "urgency": "normal",
+				"authority_epoch": strconv.FormatInt(sealedAuthorityEpoch, 10),
+				"place_id":        channel.PlaceID, "content": "must not commit", "urgency": "normal",
 				"client_nonce": "stale-exact-installation",
 			}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
 			if status != test.wantStatus || body["error"] != test.wantError {
@@ -326,5 +345,56 @@ func TestLocalWriteReauthorizesASealedInstallationAtCommit(t *testing.T) {
 				t.Fatalf("stale exact scope committed %d messages", messages)
 			}
 		})
+	}
+}
+
+func TestLocalAuthorityEpochWireIsCanonical(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	prefix := `{"workspace_id":"` + scoped.Scope.WorkspaceID +
+		`","installation_id":"` + scoped.Scope.InstallationID + `"`
+
+	invoke := func(raw string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(
+			http.MethodPost, LocalOverviewPath, strings.NewReader(raw),
+		).WithContext(ctx)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.localOverview(response, request, authorization)
+		return response
+	}
+	for name, raw := range map[string]string{
+		"missing epoch":          prefix + `}`,
+		"missing workspace":      `{"installation_id":"` + scoped.Scope.InstallationID + `","authority_epoch":"1"}`,
+		"missing installation":   `{"workspace_id":"` + scoped.Scope.WorkspaceID + `","authority_epoch":"1"}`,
+		"duplicate workspace":    `{"workspace_id":"shadow","workspace_id":"` + scoped.Scope.WorkspaceID + `","installation_id":"` + scoped.Scope.InstallationID + `","authority_epoch":"1"}`,
+		"duplicate installation": `{"workspace_id":"` + scoped.Scope.WorkspaceID + `","installation_id":"shadow","installation_id":"` + scoped.Scope.InstallationID + `","authority_epoch":"1"}`,
+		"null workspace":         `{"workspace_id":null,"installation_id":"` + scoped.Scope.InstallationID + `","authority_epoch":"1"}`,
+		"number installation":    `{"workspace_id":"` + scoped.Scope.WorkspaceID + `","installation_id":1,"authority_epoch":"1"}`,
+		"duplicate epoch":        prefix + `,"authority_epoch":"1","authority_epoch":"1"}`,
+		"null":                   prefix + `,"authority_epoch":null}`,
+		"empty":                  prefix + `,"authority_epoch":""}`,
+		"plus":                   prefix + `,"authority_epoch":"+1"}`,
+		"leading zero":           prefix + `,"authority_epoch":"01"}`,
+		"zero":                   prefix + `,"authority_epoch":"0"}`,
+		"overflow":               prefix + `,"authority_epoch":"9223372036854775808"}`,
+		"number":                 prefix + `,"authority_epoch":1}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := invoke(raw)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s, want 400", response.Code, response.Body.String())
+			}
+		})
+	}
+	response := invoke(prefix + `,"authority_epoch":"1"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("canonical epoch = %d body=%s", response.Code, response.Body.String())
 	}
 }
