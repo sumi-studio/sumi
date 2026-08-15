@@ -55,6 +55,7 @@ interface LoadToken extends OwnerAuthorityToken {
 
 interface MutationToken extends OwnerAuthorityToken {
   mutationSequence: number;
+  loadSequenceAtStart: number;
 }
 
 export interface ParticipantAppLifecycleCoordinator {
@@ -266,18 +267,27 @@ export function createParticipantAppStore(
       return result;
     };
 
-    const beginMutation = (name: string): MutationToken => {
+    const beginMutation = (): MutationToken => {
       const authority = currentAuthority();
-      if (get().mutation) {
+      if (activeMutationSequence !== null || get().mutation) {
         throw new Error("Participant app mutation is already running");
       }
       const token: MutationToken = {
         ...authority,
         mutationSequence: ++mutationSequence,
+        loadSequenceAtStart: loadSequence,
       };
       activeMutationSequence = token.mutationSequence;
-      set({ mutation: name, errorCode: null });
       return token;
+    };
+
+    const exposeMutation = (token: MutationToken, name: string): void => {
+      if (
+        isCurrentAuthority(token) &&
+        activeMutationSequence === token.mutationSequence
+      ) {
+        set({ mutation: name, errorCode: null });
+      }
     };
 
     const endMutation = (token: MutationToken, error?: unknown): void => {
@@ -288,7 +298,15 @@ export function createParticipantAppStore(
         return;
       }
       activeMutationSequence = null;
-      set({ mutation: null, errorCode: error ? errorCode(error) : null });
+      set((state) => ({
+        mutation: null,
+        errorCode:
+          error !== undefined
+            ? errorCode(error)
+            : state.status === "error"
+              ? state.errorCode
+              : null,
+      }));
     };
 
     const loadOwner = async (owner: AppOwnerRef): Promise<void> => {
@@ -338,22 +356,45 @@ export function createParticipantAppStore(
       return promise;
     };
 
-    const invalidateSnapshotAndRefresh = (ownerKey?: string): void => {
+    const invalidateSnapshotAndRefresh = (
+      ownerKey?: string,
+    ): Promise<void> | null => {
       const owner = get().owner;
-      if (!owner || (ownerKey && appOwnerKey(owner) !== ownerKey)) return;
+      if (!owner || (ownerKey && appOwnerKey(owner) !== ownerKey)) return null;
       snapshotInvalidationGeneration += 1;
       // A new load must be allowed to queue behind the current local tail. The
       // previous promise can still finish, but its captured invalidation
       // generation and load sequence can no longer publish a snapshot.
       load = null;
-      void loadOwner(owner);
+      return loadOwner(owner);
+    };
+
+    const reconcileAfterMutation = async (
+      token: MutationToken,
+    ): Promise<void> => {
+      if (!isCurrentAuthority(token)) return;
+      const queuedLoad = load;
+      if (
+        queuedLoad?.token.ownerKey === token.ownerKey &&
+        queuedLoad.token.authorityGeneration === token.authorityGeneration &&
+        queuedLoad.token.loadSequence > token.loadSequenceAtStart &&
+        queuedLoad.token.snapshotInvalidationGeneration ===
+          snapshotInvalidationGeneration
+      ) {
+        // A refresh requested after this mutation began is already serialized
+        // after its owner operation. Reuse that exact read instead of queuing a
+        // second one; it cannot observe the pre-effect snapshot.
+        await queuedLoad.promise;
+        return;
+      }
+      await invalidateSnapshotAndRefresh(token.ownerKey);
     };
 
     lifecycleCoordinator.subscribeMutations((ownerKey) => {
-      invalidateSnapshotAndRefresh(ownerKey);
+      void invalidateSnapshotAndRefresh(ownerKey);
     });
     lifecycleCoordinator.subscribeResume(() => {
-      invalidateSnapshotAndRefresh();
+      void invalidateSnapshotAndRefresh();
     });
 
     return {
@@ -410,114 +451,126 @@ export function createParticipantAppStore(
       },
 
       async installApp(appId) {
-        const token = beginMutation("install_app");
+        const token = beginMutation();
+        const operation = enqueueOwnerOperation(token, () =>
+          lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
+            const owner = get().owner;
+            if (!owner || !isCurrentAuthority(token)) {
+              throw new Error("Participant app owner changed");
+            }
+            const descriptor = get().catalog.find((app) => app.appId === appId);
+            if (!descriptor?.participantOwnerAllowed) {
+              throw new Error("App does not allow a Participant owner");
+            }
+            if (participantInstallation(get().installations, appId) !== null) {
+              throw new Error("App is already installed");
+            }
+            // Announce only invalidation, while this owner lock is held and
+            // before the effect starts. Peers can queue an authoritative
+            // read behind the lock even if this document disappears before
+            // receiving the lifecycle response.
+            lifecycleCoordinator.publishMutation(token.ownerKey);
+            const response = await client.installApp(owner, appId);
+            if (!isCurrentAuthority(token)) return response;
+            validateInstallation(owner, response, appId);
+            set((state) => ({
+              installations: [...state.installations, response],
+            }));
+            return response;
+          }),
+        );
+        exposeMutation(token, "install_app");
         try {
-          const installation = await enqueueOwnerOperation(token, () =>
-            lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
-              const owner = get().owner;
-              if (!owner || !isCurrentAuthority(token)) {
-                throw new Error("Participant app owner changed");
-              }
-              const descriptor = get().catalog.find(
-                (app) => app.appId === appId,
-              );
-              if (!descriptor?.participantOwnerAllowed) {
-                throw new Error("App does not allow a Participant owner");
-              }
-              if (
-                participantInstallation(get().installations, appId) !== null
-              ) {
-                throw new Error("App is already installed");
-              }
-              const response = await client.installApp(owner, appId);
-              lifecycleCoordinator.publishMutation(token.ownerKey);
-              if (!isCurrentAuthority(token)) return response;
-              validateInstallation(owner, response, appId);
-              set((state) => ({
-                installations: [...state.installations, response],
-              }));
-              return response;
-            }),
-          );
+          const installation = await operation;
+          await reconcileAfterMutation(token);
           endMutation(token);
           return installation;
         } catch (error) {
+          await reconcileAfterMutation(token);
           endMutation(token, error);
           throw error;
         }
       },
 
       async setInstallationState(installationId, state) {
-        const token = beginMutation(`set_installation_${state}`);
+        const token = beginMutation();
+        const operation = enqueueOwnerOperation(token, () =>
+          lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
+            const owner = get().owner;
+            const current = get().installations.find(
+              (entry) => entry.installationId === installationId,
+            );
+            if (!owner || !current || !isCurrentAuthority(token)) {
+              throw new Error("App installation is not active");
+            }
+            lifecycleCoordinator.publishMutation(token.ownerKey);
+            const response = await client.setInstallationState(
+              installationId,
+              state,
+            );
+            if (!isCurrentAuthority(token)) return response;
+            validateInstallation(owner, response, current.appId);
+            if (
+              response.installationId !== installationId ||
+              response.state !== state
+            ) {
+              throw new Error("App lifecycle response does not match intent");
+            }
+            set((ownerState) => ({
+              installations: ownerState.installations.map((entry) =>
+                entry.installationId === installationId ? response : entry,
+              ),
+            }));
+            return response;
+          }),
+        );
+        exposeMutation(token, `set_installation_${state}`);
         try {
-          const installation = await enqueueOwnerOperation(token, () =>
-            lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
-              const owner = get().owner;
-              const current = get().installations.find(
-                (entry) => entry.installationId === installationId,
-              );
-              if (!owner || !current || !isCurrentAuthority(token)) {
-                throw new Error("App installation is not active");
-              }
-              const response = await client.setInstallationState(
-                installationId,
-                state,
-              );
-              lifecycleCoordinator.publishMutation(token.ownerKey);
-              if (!isCurrentAuthority(token)) return response;
-              validateInstallation(owner, response, current.appId);
-              if (
-                response.installationId !== installationId ||
-                response.state !== state
-              ) {
-                throw new Error("App lifecycle response does not match intent");
-              }
-              set((ownerState) => ({
-                installations: ownerState.installations.map((entry) =>
-                  entry.installationId === installationId ? response : entry,
-                ),
-              }));
-              return response;
-            }),
-          );
+          const installation = await operation;
+          await reconcileAfterMutation(token);
           endMutation(token);
           return installation;
         } catch (error) {
+          await reconcileAfterMutation(token);
           endMutation(token, error);
           throw error;
         }
       },
 
       async uninstallApp(installationId) {
-        const token = beginMutation("uninstall_app");
+        const token = beginMutation();
+        const operation = enqueueOwnerOperation(token, () =>
+          lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
+            if (
+              !isCurrentAuthority(token) ||
+              !get().installations.some(
+                (installation) =>
+                  installation.installationId === installationId,
+              )
+            ) {
+              throw new Error("App installation is not active");
+            }
+            lifecycleCoordinator.publishMutation(token.ownerKey);
+            await client.uninstallApp(installationId);
+            if (!isCurrentAuthority(token)) return;
+            // Uninstall removes only the owner binding. App-owned data,
+            // grants, and credentials are separate app operations and are
+            // not cascaded.
+            set((state) => ({
+              installations: state.installations.filter(
+                (installation) =>
+                  installation.installationId !== installationId,
+              ),
+            }));
+          }),
+        );
+        exposeMutation(token, "uninstall_app");
         try {
-          await enqueueOwnerOperation(token, () =>
-            lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
-              if (
-                !isCurrentAuthority(token) ||
-                !get().installations.some(
-                  (installation) =>
-                    installation.installationId === installationId,
-                )
-              ) {
-                throw new Error("App installation is not active");
-              }
-              await client.uninstallApp(installationId);
-              lifecycleCoordinator.publishMutation(token.ownerKey);
-              if (!isCurrentAuthority(token)) return;
-              // Uninstall removes only the owner binding. App-owned data,
-              // grants, and credentials are separate app operations and are
-              // not cascaded.
-              set((state) => ({
-                installations: state.installations.filter(
-                  (installation) =>
-                    installation.installationId !== installationId,
-                ),
-              }));
-            }),
-          );
+          await operation;
+          await reconcileAfterMutation(token);
           endMutation(token);
         } catch (error) {
+          await reconcileAfterMutation(token);
           endMutation(token, error);
           throw error;
         }
