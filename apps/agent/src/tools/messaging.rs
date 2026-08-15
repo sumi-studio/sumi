@@ -1891,6 +1891,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use anyhow::{Result, anyhow};
+    use chrono::Utc;
     use serde_json::json;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio_util::sync::CancellationToken;
@@ -1901,7 +1902,19 @@ mod tests {
         apiclient::apps::{
             AppInstallationResolutionResult, AppInstallationResolver, ResolvedAppInstallation,
         },
+        approval::{
+            authority::PolicyDecisionRecord,
+            route_broker::{PendingApprovalRequest, provider_review_inputs_for_test},
+            route_policy::{
+                ElevatedPolicyEvaluation, NormalPolicyDecision, PolicyEvaluation, RoutePolicy,
+            },
+            route_reviewer::{
+                EscalationReviewRequest, ExecutionReviewRequest,
+                escalation_provider_wire_bodies_for_test, execution_provider_wire_bodies_for_test,
+            },
+        },
         provider::types::{ToolCall, ToolInvocationRoute, ValidatedToolArguments},
+        store::Redactor,
         tools::{
             BoundExecutionError, BoundToolInvocation, ToolRegistry, ToolRegistryBuilder,
             WorkspacePaths,
@@ -2362,6 +2375,158 @@ mod tests {
             .register(tool.clone())
             .expect("register Messaging binder");
         (api, tool, builder.build())
+    }
+
+    #[tokio::test]
+    async fn real_bindings_keep_exact_human_text_but_never_wire_it_to_reviewers() {
+        const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
+
+        let (_, tool, registry) = binding_fixture().await;
+        let scope = ExactMessagingScope {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            installation_id: TEST_INSTALLATION_ID.to_owned(),
+        };
+        let view = tool.view_for(&scope).await;
+        view.lock().await.visible_reply_later_markers[0]
+            .note
+            .clone_from(&INVITE_CODE_SENTINEL.to_owned());
+
+        let actions = [
+            (
+                "write-secret",
+                json!({"action":"write", "content":INVITE_CODE_SENTINEL}),
+            ),
+            (
+                "status-secret",
+                json!({
+                    "action":"status",
+                    "status":"busy",
+                    "note":INVITE_CODE_SENTINEL
+                }),
+            ),
+            (
+                "reply-secret",
+                json!({
+                    "action":"reply_later",
+                    "message_id":"message-6",
+                    "note":INVITE_CODE_SENTINEL
+                }),
+            ),
+            (
+                "react-secret",
+                json!({
+                    "action":"react",
+                    "message_id":"message-7",
+                    "emoji":INVITE_CODE_SENTINEL
+                }),
+            ),
+            (
+                "resolve-secret",
+                json!({
+                    "action":"resolve_reply_later",
+                    "marker_id":"marker-1"
+                }),
+            ),
+        ];
+
+        for (id, action) in actions {
+            let bound = bind_action(&registry, id, action)
+                .await
+                .expect("real Messaging binding");
+            let exact_projection =
+                serde_json::to_string(&bound.review_projection).expect("exact Human projection");
+            assert!(
+                exact_projection.contains(INVITE_CODE_SENTINEL),
+                "{id} must preserve exact local Human review content"
+            );
+            let provider_projection = serde_json::to_string(&bound.provider_review_projection)
+                .expect("provider-safe projection");
+            assert_eq!(
+                provider_projection.matches(INVITE_CODE_SENTINEL).count(),
+                0,
+                "{id} leaked through the provider-safe projection"
+            );
+
+            let human_request = PendingApprovalRequest::from_bound(
+                format!("approval-{id}"),
+                ToolInvocationRoute::Elevated,
+                &bound,
+                &Redactor::v1(),
+            )
+            .expect("Human approval request")
+            .public_request();
+            let human_encoded =
+                serde_json::to_string(&human_request).expect("public Human approval request");
+            assert!(
+                human_encoded.contains(INVITE_CODE_SENTINEL),
+                "{id} Human request lost the exact payload"
+            );
+
+            let policy = RoutePolicy::baseline_only_v1();
+            let normal_snapshot = match policy.evaluate_normal(&bound, Utc::now()) {
+                PolicyEvaluation::Ready {
+                    snapshot,
+                    decision: NormalPolicyDecision::Unmatched,
+                } => snapshot,
+                other => panic!("{id} expected Normal/Unmatched, got {other:?}"),
+            };
+            let (execution_evidence, execution_policy) = provider_review_inputs_for_test(
+                &bound,
+                ToolInvocationRoute::Normal,
+                PolicyDecisionRecord::Unmatched,
+                &normal_snapshot,
+            )
+            .expect("Execution reviewer inputs");
+            let execution_request = ExecutionReviewRequest {
+                sealed_evidence: execution_evidence,
+                policy: execution_policy,
+            };
+
+            let elevated_snapshot = match policy.evaluate_elevated(&bound, Utc::now()) {
+                ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
+                other => panic!("{id} expected Elevated/Ready, got {other:?}"),
+            };
+            let (escalation_evidence, escalation_policy) = provider_review_inputs_for_test(
+                &bound,
+                ToolInvocationRoute::Elevated,
+                PolicyDecisionRecord::ElevatedPreflight,
+                &elevated_snapshot,
+            )
+            .expect("Escalation reviewer inputs");
+            let escalation_request = EscalationReviewRequest {
+                sealed_evidence: escalation_evidence,
+                policy: escalation_policy,
+            };
+
+            let local_digests = [
+                bound.proposal_digest.to_hex(),
+                bound.descriptor_digest.to_hex(),
+                bound
+                    .evidence_digest()
+                    .expect("local evidence digest")
+                    .to_hex(),
+            ];
+            for (provider, body) in execution_provider_wire_bodies_for_test(execution_request)
+                .into_iter()
+                .chain(escalation_provider_wire_bodies_for_test(escalation_request))
+            {
+                let encoded = body.to_string();
+                assert!(encoded.contains("provider_evidence_digest"));
+                assert_eq!(
+                    encoded.matches(INVITE_CODE_SENTINEL).count(),
+                    0,
+                    "{id} leaked free-form text through {provider}"
+                );
+                for digest in &local_digests {
+                    assert_eq!(
+                        encoded.matches(digest).count(),
+                        0,
+                        "{id} leaked an exact local digest through {provider}"
+                    );
+                }
+            }
+        }
     }
 
     fn assert_flat_provider_schema(value: &Value) {

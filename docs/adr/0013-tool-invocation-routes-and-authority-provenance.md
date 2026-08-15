@@ -204,8 +204,20 @@ Humanが書く固定prompt本文はRustの文字列literalへ埋め込まない�
 Execution AutoReview、Escalation AutoReviewを含むproductionのmodel-facing promptは、用途ごとの
 専用`.md`を正本にし、Rustは`include_str!`、typedな動的evidence組立、version/digestの束縛だけを
 持つ。ExecutionとEscalationの`.md`は共通base promptへ畳まず、個別にreview・version管理する。
-JSON schemaやredacted action/transcriptなどの動的payloadはtyped構造として分離し、Markdownへ
-文字列補間してprompt境界を曖昧にしない。
+JSON schema、provider-safe action evidence、評価済みpolicy evidenceなどの動的payloadはtyped構造として
+分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt v2はcanonical
+conversation、user/assistant transcript、tool result、`context_version`、raw execution arguments、
+認証済みtenant/PersonalityAgent/Human principal IDをrequest型で表現せずproviderへ送らない。exact local
+descriptor/`ReviewProjection`はauthenticated Human consentとdurable bindingに保持するが、providerへは送らない。
+providerへ送信できるaction evidenceはroute、production allowlistでclosed codeへ変換したtool/adapter identity、
+operation/capability、resource namespace/kindとcollection/resource別件数、exact projectionの文字列値を持たない
+structural summaryだけである。localのtool/adapter/operation/namespace/kind `String`はnonempty検証だけでtrusted
+vocabularyとは扱わず、closed mappingにない組合せはbind時にfail closedにする。
+resource ID、path、pattern、regex、opaque cursor、任意textと、それらhidden valueから導出した
+proposal/descriptor/evidence digestを送らない。provider evidence digestは外部へ実際に見せるsafe envelopeだけを
+domain-separated hashし、exact local digestの代用とは扱わない。policy decision recordと`PolicySnapshot`の
+source digest/version/valid-untilはtyped policy evidenceとして送る。exact local tuple/digestsはreview response、
+Human decision、grant、durable startをlocalで束縛する。output schemaはv1を維持する。
 
 conversation generation、Execution AutoReview、Escalation AutoReviewは、それぞれ明示的な
 `ModelSpec`を持つ。reviewerはconversation modelを暗黙に継承せず、reviewer trust setも

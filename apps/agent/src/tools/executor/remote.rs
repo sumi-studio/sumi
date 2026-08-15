@@ -1074,6 +1074,7 @@ mod tests {
         time::Duration,
     };
 
+    use chrono::Utc;
     use serde_json::json;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -1086,7 +1087,6 @@ mod tests {
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
-    use crate::provider::types::{ToolCall, ToolInvocationRoute};
     use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
@@ -1094,6 +1094,16 @@ mod tests {
         executor::{RpcFrame, RpcRequest},
         fs::GrepMatch,
         truncate::{TruncatedBy, TruncationResult},
+    };
+    use crate::{
+        approval::{
+            authority::PolicyDecisionRecord,
+            route_broker::{PendingApprovalRequest, provider_review_inputs_for_test},
+            route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
+            route_reviewer::{EscalationReviewRequest, escalation_provider_wire_bodies_for_test},
+        },
+        provider::types::{ToolCall, ToolInvocationRoute},
+        store::Redactor,
     };
 
     #[derive(Default)]
@@ -2149,6 +2159,149 @@ mod tests {
             ExecutorOperation::Grep { path, pattern, .. }
                 if path == "src" && pattern == "foo|bar"
         ));
+    }
+
+    #[tokio::test]
+    async fn elevated_remote_bind_keeps_exact_selectors_local_and_out_of_every_reviewer_wire() {
+        const PATH_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        const PATTERN_SENTINEL: &str = "remote-review-pattern-secret";
+        assert_eq!(PATH_SENTINEL.chars().count(), 43);
+
+        let registry = bound_test_registry_from_invoker(Arc::new(FakeInvoker::default())).unwrap();
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        let cases = [
+            (
+                "read_file",
+                json!({"path": format!("read/{PATH_SENTINEL}.txt")}),
+                false,
+            ),
+            (
+                "list_dir",
+                json!({"path": format!("list/{PATH_SENTINEL}")}),
+                false,
+            ),
+            (
+                "glob",
+                json!({"pattern": format!("glob/**/{PATH_SENTINEL}*.txt")}),
+                false,
+            ),
+            (
+                "grep",
+                json!({
+                    "path": format!("grep/{PATH_SENTINEL}.txt"),
+                    "pattern": PATTERN_SENTINEL,
+                }),
+                true,
+            ),
+        ];
+
+        for (name, arguments, has_private_pattern) in cases {
+            let call = ToolCall {
+                id: format!("remote-elevated-{name}-secret"),
+                name: name.to_owned(),
+                route: ToolInvocationRoute::Elevated,
+                arguments: validated(arguments),
+            };
+            let sealed = registry
+                .bind(&call, "flow-remote-elevated-secret", &workspace)
+                .await
+                .unwrap_or_else(|error| panic!("bind real remote {name} adapter: {error}"));
+            let bound = registry
+                .validate_bound(&sealed)
+                .expect("validate real remote binding");
+
+            let exact_descriptor =
+                serde_json::to_string(&bound.descriptor).expect("exact descriptor");
+            assert!(
+                exact_descriptor.contains(PATH_SENTINEL),
+                "{name} lost exact selector"
+            );
+            for exact in [
+                serde_json::to_string(&bound.review_projection).expect("exact Human projection"),
+                serde_json::to_string(&bound.execution_arguments)
+                    .expect("exact execution arguments"),
+            ] {
+                assert!(exact.contains(PATH_SENTINEL), "{name} lost exact selector");
+                if has_private_pattern {
+                    assert!(exact.contains(PATTERN_SENTINEL), "{name} lost exact regex");
+                }
+            }
+
+            let provider_identity = serde_json::to_string(&bound.provider_review_identity)
+                .expect("closed provider identity");
+            let provider_descriptor = serde_json::to_string(&bound.provider_review_descriptor)
+                .expect("provider-safe descriptor");
+            let provider_projection = serde_json::to_string(&bound.provider_review_projection)
+                .expect("provider-safe projection");
+            for provider_safe in [
+                provider_identity,
+                provider_descriptor.clone(),
+                provider_projection,
+            ] {
+                assert_eq!(provider_safe.matches(PATH_SENTINEL).count(), 0);
+                assert_eq!(provider_safe.matches(PATTERN_SENTINEL).count(), 0);
+                assert!(!provider_safe.contains("sumi.foundation.workspace"));
+            }
+            assert!(provider_descriptor.contains("foundation_workspace"));
+
+            let human_request = PendingApprovalRequest::from_bound(
+                format!("approval-remote-elevated-{name}-secret"),
+                ToolInvocationRoute::Elevated,
+                bound,
+                &Redactor::v1(),
+            )
+            .expect("exact local Human request")
+            .public_request();
+            let human_encoded = serde_json::to_string(&human_request).expect("Human request wire");
+            assert!(human_encoded.contains(PATH_SENTINEL));
+            if has_private_pattern {
+                assert!(human_encoded.contains(PATTERN_SENTINEL));
+            }
+
+            let policy = RoutePolicy::baseline_only_v1();
+            let snapshot = match policy.evaluate_elevated(bound, Utc::now()) {
+                ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
+                other => panic!("remote Elevated review expected Ready, got {other:?}"),
+            };
+            let (sealed_evidence, policy_evidence) = provider_review_inputs_for_test(
+                bound,
+                ToolInvocationRoute::Elevated,
+                PolicyDecisionRecord::ElevatedPreflight,
+                &snapshot,
+            )
+            .expect("remote reviewer inputs");
+            let request = EscalationReviewRequest {
+                sealed_evidence,
+                policy: policy_evidence,
+            };
+            let local_digests = [
+                bound.proposal_digest.to_hex(),
+                bound.descriptor_digest.to_hex(),
+                bound
+                    .evidence_digest()
+                    .expect("local evidence digest")
+                    .to_hex(),
+            ];
+            let bodies = escalation_provider_wire_bodies_for_test(request);
+            assert_eq!(bodies.len(), 8, "four providers x initial/retry");
+            for (provider, body) in bodies {
+                let encoded = body.to_string();
+                for sentinel in [PATH_SENTINEL, PATTERN_SENTINEL] {
+                    assert_eq!(
+                        encoded.matches(sentinel).count(),
+                        0,
+                        "{name} remote selector leaked through {provider}"
+                    );
+                }
+                for digest in &local_digests {
+                    assert_eq!(
+                        encoded.matches(digest).count(),
+                        0,
+                        "{name} remote exact digest leaked through {provider}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

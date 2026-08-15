@@ -2,38 +2,47 @@
 //!
 //! The two reviewers deliberately have separate request, prompt, transport,
 //! decision, evidence, and result types. This module consumes only already
-//! redacted, app-owned evidence; it never receives raw execution arguments.
+//! provider-safe, app-owned evidence; it never receives raw execution
+//! arguments, exact Human projections, or exact resource identifiers.
 
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::{
-    ModelSpec, ProtocolCompat, RequestOptions,
-    model::{ChatStructuredOutputMode, StructuredOutputSchema},
-    retry, stream,
-    types::{
-        AssistantContent, ContextMessage, Message, PromptContext, ProviderEvent, StopReason,
-        UserContent, UserMessage,
+use crate::{
+    approval::{
+        authority::PolicyDecisionRecord,
+        route_policy::{PolicySnapshot, PolicySourceState},
     },
+    provider::{
+        ModelSpec, ProtocolCompat, RequestOptions,
+        model::{ChatStructuredOutputMode, StructuredOutputSchema},
+        retry, stream,
+        types::{
+            AssistantContent, ContextMessage, Message, PromptContext, ProviderEvent, StopReason,
+            ToolInvocationRoute, UserContent, UserMessage,
+        },
+    },
+    tools::{ProviderReviewDescriptor, ProviderReviewIdentity, ProviderReviewProjection},
 };
 
 const MAX_COMPILED_ATTEMPTS: u8 = 2;
 const MAX_COMPILED_TOTAL: Duration = Duration::from_secs(30);
 const MAX_REVIEW_REQUEST_BYTES: usize = 256 * 1024;
+const PROVIDER_REVIEW_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-evidence/v1\0";
 
 pub const REVIEWER_BUDGET_VERSION_V1: &str = "reviewer-budget/v1";
-pub const EXECUTION_REVIEWER_VERSION_V1: &str = "execution-reviewer/v1";
-pub const EXECUTION_PROMPT_VERSION_V1: &str = "execution-review-prompt/v1";
+pub const EXECUTION_REVIEWER_VERSION_V2: &str = "execution-reviewer/v2";
+pub const EXECUTION_PROMPT_VERSION_V2: &str = "execution-review-prompt/v2";
 pub const EXECUTION_SCHEMA_VERSION_V1: &str = "execution-review-schema/v1";
-pub const ESCALATION_REVIEWER_VERSION_V1: &str = "escalation-reviewer/v1";
-pub const ESCALATION_PROMPT_VERSION_V1: &str = "escalation-review-prompt/v1";
+pub const ESCALATION_REVIEWER_VERSION_V2: &str = "escalation-reviewer/v2";
+pub const ESCALATION_PROMPT_VERSION_V2: &str = "escalation-review-prompt/v2";
 pub const ESCALATION_SCHEMA_VERSION_V1: &str = "escalation-review-schema/v1";
 
 const EXECUTION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/execution-review.md");
@@ -410,20 +419,110 @@ pub struct EscalationReviewDecision {
     pub rationale: String,
 }
 
+/// App-owned review material sealed before policy evaluation. This type has
+/// no field capable of carrying conversation messages, provider context, or
+/// raw execution arguments.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedReviewEvidence {
+    schema_version: u32,
+    route: ToolInvocationRoute,
+    provider_evidence_digest: String,
+    identity: ProviderReviewIdentity,
+    provider_descriptor: ProviderReviewDescriptor,
+    provider_review_projection: ProviderReviewProjection,
+}
+
+impl SealedReviewEvidence {
+    pub(crate) fn new(
+        schema_version: u32,
+        route: ToolInvocationRoute,
+        identity: ProviderReviewIdentity,
+        provider_descriptor: ProviderReviewDescriptor,
+        provider_review_projection: ProviderReviewProjection,
+    ) -> Result<Self, serde_json::Error> {
+        #[derive(Serialize)]
+        struct DigestInput<'a> {
+            schema_version: u32,
+            route: ToolInvocationRoute,
+            identity: ProviderReviewIdentity,
+            provider_descriptor: &'a ProviderReviewDescriptor,
+            provider_review_projection: &'a ProviderReviewProjection,
+        }
+
+        let digest_input = serde_json::to_vec(&DigestInput {
+            schema_version,
+            route,
+            identity,
+            provider_descriptor: &provider_descriptor,
+            provider_review_projection: &provider_review_projection,
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(PROVIDER_REVIEW_EVIDENCE_DIGEST_DOMAIN);
+        digest.update(digest_input);
+
+        Ok(Self {
+            schema_version,
+            route,
+            provider_evidence_digest: hex(&digest.finalize()),
+            identity,
+            provider_descriptor,
+            provider_review_projection,
+        })
+    }
+}
+
+/// The exact evaluated policy boundary visible to a reviewer. Authenticated
+/// tenant, PersonalityAgent, and Human principal identifiers stay local.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerPolicyEvidence {
+    route: ToolInvocationRoute,
+    decision: PolicyDecisionRecord,
+    source_digest: String,
+    baseline_version: String,
+    bundle_version: Option<u64>,
+    valid_until: Option<DateTime<Utc>>,
+}
+
+impl ReviewerPolicyEvidence {
+    pub(crate) fn from_snapshot(
+        route: ToolInvocationRoute,
+        decision: PolicyDecisionRecord,
+        snapshot: &PolicySnapshot,
+    ) -> Self {
+        let baseline_version = match &snapshot.source {
+            PolicySourceState::BaselineOnly { baseline_version }
+            | PolicySourceState::VerifiedOverlay {
+                baseline_version, ..
+            }
+            | PolicySourceState::RequiredUnavailable {
+                baseline_version, ..
+            } => baseline_version.clone(),
+        };
+        Self {
+            route,
+            decision,
+            source_digest: snapshot.source_digest.clone(),
+            baseline_version,
+            bundle_version: snapshot.bundle_version,
+            valid_until: snapshot.valid_until,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReviewRequest {
-    pub action_digest: String,
-    pub redacted_evidence: Value,
-    pub bounded_context: Value,
+    pub sealed_evidence: SealedReviewEvidence,
+    pub policy: ReviewerPolicyEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EscalationReviewRequest {
-    pub action_digest: String,
-    pub redacted_evidence: Value,
-    pub bounded_context: Value,
+    pub sealed_evidence: SealedReviewEvidence,
+    pub policy: ReviewerPolicyEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -736,6 +835,92 @@ fn build_provider_review_request(
     Ok((context, options))
 }
 
+#[cfg(test)]
+fn provider_wire_bodies_for_test(
+    system: &str,
+    schema: &StructuredOutputSchema,
+    prompt: &impl Serialize,
+) -> Vec<(&'static str, Value)> {
+    let mut bodies = Vec::new();
+    for (label, preset) in [("kimi", "kimi-k3"), ("glm", "glm-5.2")] {
+        let spec = ModelSpec::preset(preset).expect("chat reviewer preset");
+        let (context, options) = build_provider_review_request(&spec, system, schema, prompt)
+            .expect("provider review request");
+        bodies.push((
+            label,
+            crate::provider::adapters::chat_completions::build_request(&spec, &context, &options)
+                .expect("chat reviewer wire request"),
+        ));
+    }
+
+    let spec = ModelSpec::preset("openai-responses").expect("Responses reviewer preset");
+    let (context, options) = build_provider_review_request(&spec, system, schema, prompt)
+        .expect("Responses review request");
+    bodies.push((
+        "openai-responses",
+        crate::provider::adapters::responses::build_request(&spec, &context, &options)
+            .expect("Responses reviewer wire request"),
+    ));
+
+    let spec = ModelSpec::preset("anthropic").expect("Anthropic reviewer preset");
+    let (context, options) = build_provider_review_request(&spec, system, schema, prompt)
+        .expect("Anthropic review request");
+    bodies.push((
+        "anthropic",
+        crate::provider::adapters::anthropic::build_request(&spec, &context, &options)
+            .expect("Anthropic reviewer wire request"),
+    ));
+    bodies
+}
+
+#[cfg(test)]
+pub(crate) fn execution_provider_wire_bodies_for_test(
+    request: ExecutionReviewRequest,
+) -> Vec<(&'static str, Value)> {
+    [None, Some(ReviewerValidationCode::InvalidJson)]
+        .into_iter()
+        .flat_map(|retry_validation_code| {
+            let prompt = ExecutionReviewerPrompt {
+                system: EXECUTION_SYSTEM_PROMPT,
+                output_schema: ExecutionReviewOutputSchema::v1(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V2,
+                schema_version: EXECUTION_SCHEMA_VERSION_V1,
+                request: request.clone(),
+                retry_validation_code,
+            };
+            provider_wire_bodies_for_test(
+                prompt.system,
+                prompt.output_schema.provider_schema(),
+                &prompt,
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn escalation_provider_wire_bodies_for_test(
+    request: EscalationReviewRequest,
+) -> Vec<(&'static str, Value)> {
+    [None, Some(ReviewerValidationCode::SchemaMismatch)]
+        .into_iter()
+        .flat_map(|retry_validation_code| {
+            let prompt = EscalationReviewerPrompt {
+                system: ESCALATION_SYSTEM_PROMPT,
+                output_schema: EscalationReviewOutputSchema::v1(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V2,
+                schema_version: ESCALATION_SCHEMA_VERSION_V1,
+                request: request.clone(),
+                retry_validation_code,
+            };
+            provider_wire_bodies_for_test(
+                prompt.system,
+                prompt.output_schema.provider_schema(),
+                &prompt,
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReviewEvidence {
@@ -814,7 +999,7 @@ impl ExecutionReviewer {
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
                 output_schema: ExecutionReviewOutputSchema::v1(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V1,
+                prompt_version: EXECUTION_PROMPT_VERSION_V2,
                 schema_version: EXECUTION_SCHEMA_VERSION_V1,
                 request: request.clone(),
                 retry_validation_code,
@@ -922,7 +1107,7 @@ impl EscalationReviewer {
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
                 output_schema: EscalationReviewOutputSchema::v1(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V1,
+                prompt_version: ESCALATION_PROMPT_VERSION_V2,
                 schema_version: ESCALATION_SCHEMA_VERSION_V1,
                 request: request.clone(),
                 retry_validation_code,
@@ -1142,8 +1327,8 @@ fn execution_result(
         decision.outcome = ExecutionReviewOutcome::Block;
     }
     let evidence = ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V1.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V1.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V2.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V2.to_owned(),
         schema_version: EXECUTION_SCHEMA_VERSION_V1.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -1163,8 +1348,8 @@ fn execution_synthetic_block(
     terminal: ReviewerTerminalClass,
 ) -> ExecutionReviewResult {
     ExecutionReviewResult::Block(ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V1.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V1.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V2.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V2.to_owned(),
         schema_version: EXECUTION_SCHEMA_VERSION_V1.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -1188,8 +1373,8 @@ fn escalation_result(
         decision.outcome = EscalationReviewOutcome::Block;
     }
     let evidence = EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V1.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V1.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V2.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V2.to_owned(),
         schema_version: ESCALATION_SCHEMA_VERSION_V1.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -1209,8 +1394,8 @@ fn escalation_synthetic_block(
     terminal: ReviewerTerminalClass,
 ) -> EscalationReviewResult {
     EscalationReviewResult::Block(EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V1.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V1.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V2.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V2.to_owned(),
         schema_version: ESCALATION_SCHEMA_VERSION_V1.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -1244,11 +1429,12 @@ mod duration_millis {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeSet, VecDeque},
+        collections::{BTreeMap, BTreeSet, VecDeque},
         sync::{LazyLock, Mutex},
     };
 
     use super::*;
+    use crate::tools::{BoundToolInvocation, CapabilityClass};
 
     struct ExecutionTransport(Mutex<VecDeque<Result<String, ReviewerTransportError>>>);
 
@@ -1342,19 +1528,53 @@ mod tests {
         }
     }
 
+    fn sealed_evidence(route: ToolInvocationRoute) -> SealedReviewEvidence {
+        let bound = BoundToolInvocation::test_fixture("tool-call-1", CapabilityClass::Mutate);
+        sealed_evidence_from_bound(&bound, route)
+    }
+
+    fn sealed_evidence_from_bound(
+        bound: &BoundToolInvocation,
+        route: ToolInvocationRoute,
+    ) -> SealedReviewEvidence {
+        SealedReviewEvidence::new(
+            bound.schema_version,
+            route,
+            bound.provider_review_identity,
+            bound.provider_review_descriptor.clone(),
+            bound.provider_review_projection.clone(),
+        )
+        .expect("provider-safe sealed evidence")
+    }
+
+    fn policy_evidence(
+        route: ToolInvocationRoute,
+        decision: PolicyDecisionRecord,
+    ) -> ReviewerPolicyEvidence {
+        ReviewerPolicyEvidence {
+            route,
+            decision,
+            source_digest: "policy-source-digest".to_owned(),
+            baseline_version: "built-in-policy/v1".to_owned(),
+            bundle_version: None,
+            valid_until: None,
+        }
+    }
+
     fn execution_request() -> ExecutionReviewRequest {
         ExecutionReviewRequest {
-            action_digest: "digest".to_owned(),
-            redacted_evidence: serde_json::json!({"operation":"write"}),
-            bounded_context: serde_json::json!([]),
+            sealed_evidence: sealed_evidence(ToolInvocationRoute::Normal),
+            policy: policy_evidence(ToolInvocationRoute::Normal, PolicyDecisionRecord::Unmatched),
         }
     }
 
     fn escalation_request() -> EscalationReviewRequest {
         EscalationReviewRequest {
-            action_digest: "digest".to_owned(),
-            redacted_evidence: serde_json::json!({"operation":"write"}),
-            bounded_context: serde_json::json!([]),
+            sealed_evidence: sealed_evidence(ToolInvocationRoute::Elevated),
+            policy: policy_evidence(
+                ToolInvocationRoute::Elevated,
+                PolicyDecisionRecord::ElevatedPreflight,
+            ),
         }
     }
 
@@ -1437,6 +1657,239 @@ mod tests {
             .compile(),
             Err(ReviewerNotReady::InvalidBudget(_))
         ));
+    }
+
+    #[test]
+    fn reviewer_request_types_expose_only_sealed_action_and_policy_evidence() {
+        for request in [
+            serde_json::to_value(execution_request()).expect("execution request"),
+            serde_json::to_value(escalation_request()).expect("escalation request"),
+        ] {
+            let object = request.as_object().expect("review request object");
+            assert_eq!(
+                object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                BTreeSet::from(["policy", "sealed_evidence"])
+            );
+            assert_eq!(
+                object["sealed_evidence"]
+                    .as_object()
+                    .expect("sealed evidence")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    "identity",
+                    "provider_evidence_digest",
+                    "provider_descriptor",
+                    "provider_review_projection",
+                    "route",
+                    "schema_version",
+                ])
+            );
+            assert_eq!(
+                object["policy"]
+                    .as_object()
+                    .expect("policy evidence")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    "baseline_version",
+                    "bundle_version",
+                    "decision",
+                    "route",
+                    "source_digest",
+                    "valid_until",
+                ])
+            );
+            let encoded = serde_json::to_string(&request).expect("encoded review request");
+            for forbidden in [
+                "bounded_context",
+                "context_version",
+                "conversation",
+                "tenant_id",
+                "personality_agent_id",
+                "human_principal_id",
+                "execution_arguments",
+                "action_digest",
+                "proposal_digest",
+                "descriptor_digest",
+                "bound_evidence_digest",
+                "tool_call_id",
+                "execution_identity",
+            ] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "leaked request field: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_provider_wire_builder_omits_canonical_transcript_and_invite_code() {
+        const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        const ASSISTANT_SENTINEL: &str = "assistant-canonical-transcript-sentinel";
+        const CONTEXT_SENTINEL: &str = "canonical-context-v9";
+        assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
+        let canonical_transcript = json!({
+            "context_version": CONTEXT_SENTINEL,
+            "messages": [
+                {"role": "user", "text": INVITE_CODE_SENTINEL},
+                {"role": "assistant", "text": ASSISTANT_SENTINEL}
+            ]
+        });
+        let canonical_encoded = canonical_transcript.to_string();
+        assert!(canonical_encoded.contains(INVITE_CODE_SENTINEL));
+        assert!(canonical_encoded.contains(ASSISTANT_SENTINEL));
+        assert!(canonical_encoded.contains(CONTEXT_SENTINEL));
+
+        let bodies = execution_provider_wire_bodies_for_test(execution_request())
+            .into_iter()
+            .chain(escalation_provider_wire_bodies_for_test(
+                escalation_request(),
+            ))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies.len(),
+            16,
+            "four providers x initial/retry x two routes"
+        );
+        let mut invalid_json_retries = 0;
+        let mut schema_mismatch_retries = 0;
+        let mut retry_fields = 0;
+        for (_provider, body) in bodies {
+            let encoded = body.to_string();
+            invalid_json_retries += encoded.matches("invalid_json").count();
+            schema_mismatch_retries += encoded.matches("schema_mismatch").count();
+            retry_fields += encoded.matches("retry_validation_code").count();
+            for forbidden in [
+                INVITE_CODE_SENTINEL,
+                ASSISTANT_SENTINEL,
+                CONTEXT_SENTINEL,
+                "context_version",
+                "bounded_context",
+            ] {
+                assert_eq!(
+                    encoded.matches(forbidden).count(),
+                    0,
+                    "provider request leaked {forbidden}"
+                );
+            }
+        }
+        assert_eq!(invalid_json_retries, 4);
+        assert_eq!(schema_mismatch_retries, 4);
+        assert_eq!(retry_fields, 16);
+        assert_eq!(
+            retry_fields - invalid_json_retries - schema_mismatch_retries,
+            8,
+            "the other eight provider bodies are initial attempts"
+        );
+    }
+
+    #[test]
+    fn every_initial_and_retry_wire_omits_exact_bound_private_values_and_digests() {
+        const TOOL_CALL_ID_SENTINEL: &str = "private-tool-call-id-sentinel";
+        const FLOW_ID_SENTINEL: &str = "private-flow-id-sentinel";
+        const RESOURCE_ID_SENTINEL: &str = "arbitrary-private-resource-id-sentinel";
+        const PRIVATE_TEXT_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert_eq!(PRIVATE_TEXT_SENTINEL.chars().count(), 43);
+
+        let bound = BoundToolInvocation::test_fixture_with_private_values(
+            TOOL_CALL_ID_SENTINEL,
+            FLOW_ID_SENTINEL,
+            RESOURCE_ID_SENTINEL,
+            PRIVATE_TEXT_SENTINEL,
+            CapabilityClass::Mutate,
+        );
+        let local = serde_json::to_string(&bound).expect("exact local bound evidence");
+        for private in [
+            TOOL_CALL_ID_SENTINEL,
+            FLOW_ID_SENTINEL,
+            RESOURCE_ID_SENTINEL,
+            PRIVATE_TEXT_SENTINEL,
+        ] {
+            assert!(
+                local.contains(private),
+                "fixture must contain private marker {private} before projection"
+            );
+        }
+        let local_digests = [
+            bound.proposal_digest.to_hex(),
+            bound.descriptor_digest.to_hex(),
+            bound
+                .evidence_digest()
+                .expect("local evidence digest")
+                .to_hex(),
+        ];
+
+        let execution = ExecutionReviewRequest {
+            sealed_evidence: sealed_evidence_from_bound(&bound, ToolInvocationRoute::Normal),
+            policy: policy_evidence(ToolInvocationRoute::Normal, PolicyDecisionRecord::Unmatched),
+        };
+        let escalation = EscalationReviewRequest {
+            sealed_evidence: sealed_evidence_from_bound(&bound, ToolInvocationRoute::Elevated),
+            policy: policy_evidence(
+                ToolInvocationRoute::Elevated,
+                PolicyDecisionRecord::ElevatedPreflight,
+            ),
+        };
+        let bodies = execution_provider_wire_bodies_for_test(execution)
+            .into_iter()
+            .chain(escalation_provider_wire_bodies_for_test(escalation))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies.len(),
+            16,
+            "four providers x initial/retry x both reviewer kinds"
+        );
+
+        let mut providers = BTreeMap::<&str, usize>::new();
+        let mut initial = 0;
+        let mut execution_retries = 0;
+        let mut escalation_retries = 0;
+        for (provider, body) in bodies {
+            *providers.entry(provider).or_default() += 1;
+            let encoded = body.to_string();
+            initial += usize::from(
+                encoded.contains("retry_validation_code")
+                    && !encoded.contains("invalid_json")
+                    && !encoded.contains("schema_mismatch"),
+            );
+            execution_retries += encoded.matches("invalid_json").count();
+            escalation_retries += encoded.matches("schema_mismatch").count();
+            for private in [
+                TOOL_CALL_ID_SENTINEL,
+                FLOW_ID_SENTINEL,
+                RESOURCE_ID_SENTINEL,
+                PRIVATE_TEXT_SENTINEL,
+            ] {
+                assert_eq!(
+                    encoded.matches(private).count(),
+                    0,
+                    "{provider} leaked exact bound marker {private}"
+                );
+            }
+            for digest in &local_digests {
+                assert_eq!(
+                    encoded.matches(digest).count(),
+                    0,
+                    "{provider} leaked exact local digest"
+                );
+            }
+        }
+        assert_eq!(
+            providers,
+            BTreeMap::from([
+                ("anthropic", 4),
+                ("glm", 4),
+                ("kimi", 4),
+                ("openai-responses", 4),
+            ])
+        );
+        assert_eq!(initial, 8);
+        assert_eq!(execution_retries, 4);
+        assert_eq!(escalation_retries, 4);
     }
 
     #[test]
@@ -1602,7 +2055,7 @@ mod tests {
         )
         .unwrap();
         let mut request = execution_request();
-        request.bounded_context = serde_json::json!(["x".repeat(MAX_REVIEW_REQUEST_BYTES)]);
+        request.policy.source_digest = "x".repeat(MAX_REVIEW_REQUEST_BYTES);
 
         let ExecutionReviewResult::Block(evidence) =
             reviewer.review(request, CancellationToken::new()).await
@@ -1645,10 +2098,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
+        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V2);
+        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V2);
+        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V1);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
             assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v1());
+            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V2);
+            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V1);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -1705,10 +2163,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
+        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V2);
+        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V2);
+        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V1);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
             assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v1());
+            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V2);
+            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V1);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
