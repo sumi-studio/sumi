@@ -78,7 +78,11 @@ export interface WorkspaceControlClient {
   // Workspace and Participant owners share one operation; only the owner ref
   // differs, so no scope is ever inferred from the client's current Workspace.
   listInstallations(owner: AppOwnerRef): Promise<AppInstallation[]>;
-  installApp(owner: AppOwnerRef, appId: string): Promise<AppInstallation>;
+  installApp(
+    owner: AppOwnerRef,
+    appId: string,
+    operationId?: string,
+  ): Promise<AppInstallation>;
   setInstallationState(
     installationId: string,
     state: AppInstallationState,
@@ -281,11 +285,16 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
   async installApp(
     owner: AppOwnerRef,
     appId: string,
+    operationId?: string,
   ): Promise<AppInstallation> {
     return parseInstallation(
       await this.request("/app-installations", {
         method: "POST",
-        body: { owner: appOwnerToWire(owner), app_id: appId },
+        body: {
+          owner: appOwnerToWire(owner),
+          app_id: appId,
+          ...(operationId === undefined ? {} : { operation_id: operationId }),
+        },
       }),
     );
   }

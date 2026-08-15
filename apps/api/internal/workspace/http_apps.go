@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -49,8 +50,9 @@ func (s *Server) serveInstallApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Owner appOwnerWire `json:"owner"`
-		AppID string       `json:"app_id"`
+		Owner       appOwnerWire    `json:"owner"`
+		AppID       string          `json:"app_id"`
+		OperationID json.RawMessage `json:"operation_id"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
@@ -60,10 +62,24 @@ func (s *Server) serveInstallApp(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	operationID, operationPresent, operationValid := optionalNonEmptyString(request.OperationID)
+	if !operationValid ||
+		(operationPresent && applicationapps.ValidateInstallOperationID(operationID) != nil) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
 	var installation applicationapps.Installation
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var installErr error
-		installation, installErr = s.Apps.Install(r.Context(), owner, actor, request.AppID)
+		if operationPresent {
+			installation, installErr = s.Apps.InstallAtOperation(
+				r.Context(), owner, actor, request.AppID, operationID,
+			)
+		} else {
+			installation, installErr = s.Apps.Install(
+				r.Context(), owner, actor, request.AppID,
+			)
+		}
 		return installErr
 	})
 	if !done {
@@ -82,8 +98,8 @@ func (s *Server) serveSetAppEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		State                  string `json:"state"`
-		ExpectedAuthorityEpoch string `json:"expected_authority_epoch,omitempty"`
+		State                  string          `json:"state"`
+		ExpectedAuthorityEpoch json.RawMessage `json:"expected_authority_epoch"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
@@ -95,9 +111,14 @@ func (s *Server) serveSetAppEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 	var installation applicationapps.Installation
 	var expectedAuthorityEpoch *int64
-	if request.ExpectedAuthorityEpoch != "" {
-		parsed, parseErr := strconv.ParseInt(request.ExpectedAuthorityEpoch, 10, 64)
-		if parseErr != nil || parsed < 1 || strconv.FormatInt(parsed, 10) != request.ExpectedAuthorityEpoch {
+	epoch, epochPresent, epochValid := optionalNonEmptyString(request.ExpectedAuthorityEpoch)
+	if !epochValid {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if epochPresent {
+		parsed, parseErr := strconv.ParseInt(epoch, 10, 64)
+		if parseErr != nil || parsed < 1 || strconv.FormatInt(parsed, 10) != epoch {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
@@ -142,6 +163,17 @@ func (s *Server) serveUninstallApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func optionalNonEmptyString(raw json.RawMessage) (string, bool, bool) {
+	if raw == nil {
+		return "", false, true
+	}
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil || *value == "" {
+		return "", true, false
+	}
+	return *value, true, true
 }
 
 func writeInstallationList(w http.ResponseWriter, installations []applicationapps.Installation) {

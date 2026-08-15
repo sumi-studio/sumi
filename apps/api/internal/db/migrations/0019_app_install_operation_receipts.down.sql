@@ -1,0 +1,1 @@
+DROP TABLE app_install_operation_receipts;

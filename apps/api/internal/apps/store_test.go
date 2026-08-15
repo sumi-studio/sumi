@@ -388,6 +388,140 @@ func TestExactLifecycleReplaysSerializeAtDatabaseBoundaries(t *testing.T) {
 	}
 }
 
+func TestDurableInstallOperationReceiptSurvivesUninstall(t *testing.T) {
+	w := newAppWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	created, err := w.workspaces.CreateWorkspace(ctx, "install receipt", w.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := applicationapps.WorkspaceOwner(created.WorkspaceID)
+	const (
+		installedOperation  = "00000000-0000-4000-8000-000000000101"
+		conflictOperation   = "00000000-0000-4000-8000-000000000102"
+		reinstallOperation  = "00000000-0000-4000-8000-000000000103"
+		pendingOperation    = "00000000-0000-4000-8000-000000000104"
+		concurrentOperation = "00000000-0000-4000-8000-000000000105"
+	)
+
+	installed, err := w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", installedOperation,
+	)
+	if err != nil {
+		t.Fatalf("install at operation: %v", err)
+	}
+	historical, err := w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", installedOperation,
+	)
+	if err != nil || historical != installed {
+		t.Fatalf("installed receipt replay = %#v, %v; want %#v", historical, err, installed)
+	}
+	if _, err := w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", conflictOperation,
+	); !errors.Is(err, applicationapps.ErrInstallIntentAlreadyInstalled) {
+		t.Fatalf("existing install operation = %v", err)
+	}
+
+	if err := w.apps.UninstallByID(ctx, installed.InstallationID, w.owner); err != nil {
+		t.Fatalf("uninstall installed receipt result: %v", err)
+	}
+	historical, err = w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", installedOperation,
+	)
+	if err != nil || historical != installed {
+		t.Fatalf("post-uninstall installed receipt = %#v, %v", historical, err)
+	}
+	if _, err := w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", conflictOperation,
+	); !errors.Is(err, applicationapps.ErrInstallIntentAlreadyInstalled) {
+		t.Fatalf("post-uninstall conflict receipt = %v", err)
+	}
+	list, err := w.apps.Installations(ctx, owner, w.owner)
+	if err != nil || len(list) != 0 {
+		t.Fatalf("receipt replay resurrected installation = %#v, %v", list, err)
+	}
+
+	reinstalled, err := w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", reinstallOperation,
+	)
+	if err != nil {
+		t.Fatalf("intentional reinstall: %v", err)
+	}
+	if reinstalled.InstallationID == installed.InstallationID {
+		t.Fatalf("intentional reinstall reused installation id %s", reinstalled.InstallationID)
+	}
+
+	personalOwner := applicationapps.ParticipantOwner(w.member)
+	const mismatchOperation = "00000000-0000-4000-8000-000000000106"
+	if _, err := w.apps.InstallAtOperation(
+		ctx, personalOwner, w.member, "alarm", mismatchOperation,
+	); err != nil {
+		t.Fatalf("seed mismatched operation: %v", err)
+	}
+	if _, err := w.apps.InstallAtOperation(
+		ctx, personalOwner, w.member, "missing-app", mismatchOperation,
+	); !errors.Is(err, applicationapps.ErrInstallIntentMismatch) {
+		t.Fatalf("operation app mismatch = %v", err)
+	}
+	if _, err := w.apps.InstallAtOperation(
+		ctx, personalOwner, w.member, "life-log", "not-a-uuid",
+	); !errors.Is(err, applicationapps.ErrInstallOperationInvalid) {
+		t.Fatalf("invalid operation id = %v", err)
+	}
+
+	if _, err := w.pool.Exec(ctx, `
+		INSERT INTO app_install_operation_receipts
+			(owner_kind, owner_id, operation_id, app_id, status, created_at)
+		VALUES ('workspace', $1, $2, 'messaging', 'pending', now())`,
+		created.WorkspaceID, pendingOperation,
+	); err != nil {
+		t.Fatalf("seed committed pending receipt: %v", err)
+	}
+	if _, err := w.apps.InstallAtOperation(
+		ctx, owner, w.owner, "messaging", pendingOperation,
+	); !errors.Is(err, applicationapps.ErrInstallIntentIncomplete) {
+		t.Fatalf("committed pending receipt = %v", err)
+	}
+
+	type result struct {
+		installation applicationapps.Installation
+		err          error
+	}
+	concurrentOwner := applicationapps.ParticipantOwner(w.owner)
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			item, installErr := w.apps.InstallAtOperation(
+				ctx, concurrentOwner, w.owner, "life-log", concurrentOperation,
+			)
+			results <- result{installation: item, err: installErr}
+		}()
+	}
+	close(start)
+	first := <-results
+	second := <-results
+	if first.err != nil || second.err != nil || first.installation != second.installation {
+		t.Fatalf("concurrent operation replay = %#v/%v and %#v/%v",
+			first.installation, first.err, second.installation, second.err)
+	}
+
+	var receiptCount int
+	if err := w.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM app_install_operation_receipts
+		WHERE owner_kind = 'workspace' AND owner_id = $1`,
+		created.WorkspaceID,
+	).Scan(&receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if receiptCount != 4 {
+		t.Fatalf("workspace receipt count = %d, want 4", receiptCount)
+	}
+}
+
 func TestExactInstallationAdmissionRejectsOwnerAndAppSubstitution(t *testing.T) {
 	w := newAppWorld(t)
 	ctx := context.Background()

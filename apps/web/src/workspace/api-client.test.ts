@@ -533,6 +533,46 @@ describe("WorkspaceApiClient", () => {
       cause: transportFailure,
     } satisfies Partial<WorkspaceAPIUncertainError>);
   });
+
+  it("carries an exact durable operation id on Participant install", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      json(
+        {
+          installation_id: INSTALLATION_ID,
+          owner: {
+            kind: "participant",
+            participant: { kind: "human", human_id: HUMAN_A_ID },
+          },
+          app_id: APP_ID,
+          state: "enabled",
+          authority_epoch: "1",
+          installed_at: "2026-08-10T05:06:07.890Z",
+          updated_at: "2026-08-10T05:06:07.890Z",
+        },
+        201,
+      ),
+    );
+    const client = new WorkspaceApiClient(fetcher);
+    const operationId = "00000000-0000-4000-8000-000000000201";
+
+    await client.installApp(
+      {
+        kind: "participant",
+        participant: { kind: "human", humanId: HUMAN_A_ID },
+      },
+      APP_ID,
+      operationId,
+    );
+
+    expectRequest(fetcher, 0, "/app-installations", "POST", {
+      owner: {
+        kind: "participant",
+        participant: { kind: "human", human_id: HUMAN_A_ID },
+      },
+      app_id: APP_ID,
+      operation_id: operationId,
+    });
+  });
 });
 
 function fetchSequence(...responses: Response[]) {

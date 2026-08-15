@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/canonicalid"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
@@ -68,14 +69,28 @@ const (
 )
 
 var (
-	ErrForbidden            = errors.New("app lifecycle operation forbidden")
-	ErrAppNotFound          = errors.New("app not found")
-	ErrOwnerKindUnsupported = errors.New("app does not support this owner kind")
-	ErrAlreadyInstalled     = errors.New("app is already installed for this owner")
-	ErrInstallationNotFound = errors.New("app installation not found")
-	ErrAuthorityEpochStale  = errors.New("app installation authority epoch is stale")
-	ErrAppDisabled          = errors.New("app installation is disabled")
+	ErrForbidden                     = errors.New("app lifecycle operation forbidden")
+	ErrAppNotFound                   = errors.New("app not found")
+	ErrOwnerKindUnsupported          = errors.New("app does not support this owner kind")
+	ErrAlreadyInstalled              = errors.New("app is already installed for this owner")
+	ErrInstallIntentAlreadyInstalled = errors.New("app install intent previously found an existing installation")
+	ErrInstallIntentMismatch         = errors.New("app install operation was reused for a different intent")
+	ErrInstallIntentIncomplete       = errors.New("app install operation receipt is incomplete")
+	ErrInstallOperationInvalid       = errors.New("app install operation id is invalid")
+	ErrInstallationNotFound          = errors.New("app installation not found")
+	ErrAuthorityEpochStale           = errors.New("app installation authority epoch is stale")
+	ErrAppDisabled                   = errors.New("app installation is disabled")
 )
+
+// ValidateInstallOperationID accepts only the canonical UUIDv4 emitted by the
+// browser's durable lifecycle journal.
+func ValidateInstallOperationID(value string) error {
+	id, err := uuid.Parse(value)
+	if err != nil || id.String() != value || id.Version() != 4 || id.Variant() != uuid.RFC4122 {
+		return ErrInstallOperationInvalid
+	}
+	return nil
+}
 
 // ValidateInstallationID validates an opaque exact installation address.
 func ValidateInstallationID(value string) error {
