@@ -3,6 +3,7 @@ package agentevents
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -177,6 +178,7 @@ func TestEnvelopeRejectsMalformedEventBody(t *testing.T) {
 		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"retry_scheduled","attempt":1,"delay_ms":100,"retry_at":"tomorrow","error_message":"retry"}}`,
 		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":null}}`,
 		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_once","extra":1}}}}`,
+		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"rejected":{"decision":{"type":"deny_once"}}}}}`,
 	}
 	for _, raw := range cases {
 		var env Envelope
@@ -265,9 +267,28 @@ func TestObjectValuedFieldsRejectUnsafeNestedIntegers(t *testing.T) {
 		t.Fatal("tool_execution_start args accepted an unsafe nested integer")
 	}
 
-	toolCallEnd := `{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000003","event":{"type":"tool_call_end","content_index":0,"tool_call":{"id":"call-1","name":"read_file","arguments":{"overflow":9007199254740992}}}}`
+	toolCallEnd := `{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000003","event":{"type":"tool_call_end","content_index":0,"tool_call":{"id":"call-1","name":"read_file","route":"normal","arguments":{"overflow":9007199254740992}}}}`
 	if err := validateEvent([]byte(toolCallEnd)); err == nil {
 		t.Fatal("tool_call arguments accepted an unsafe nested integer")
 	}
 
+}
+
+func TestToolCallRouteIsRequiredAndExact(t *testing.T) {
+	for _, route := range []string{"normal", "elevated"} {
+		raw := fmt.Sprintf(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000003","event":{"type":"tool_call_end","content_index":0,"tool_call":{"id":"call-1","name":"read_file","route":%q,"arguments":{}}}}`, route)
+		if err := validateEvent([]byte(raw)); err != nil {
+			t.Fatalf("valid route %q rejected: %v", route, err)
+		}
+	}
+	for _, toolCall := range []string{
+		`{"id":"call-1","name":"read_file","arguments":{}}`,
+		`{"id":"call-1","name":"read_file","route":"automatic","arguments":{}}`,
+		`{"id":"call-1","name":"read_file","route":"normal","arguments":{},"extra":true}`,
+	} {
+		raw := fmt.Sprintf(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000003","event":{"type":"tool_call_end","content_index":0,"tool_call":%s}}`, toolCall)
+		if err := validateEvent([]byte(raw)); err == nil {
+			t.Fatalf("invalid tool call route accepted: %s", toolCall)
+		}
+	}
 }

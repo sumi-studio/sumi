@@ -20,6 +20,7 @@ function makeRun(status: AgentRun["status"]): AgentRun {
         type: "tool",
         id: "tool-1",
         name: "read_file",
+        route: "normal",
         label: "read_fileを完了",
         args: {},
         result: undefined,

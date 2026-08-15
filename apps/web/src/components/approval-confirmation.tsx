@@ -12,7 +12,7 @@ import {
 interface ApprovalConfirmationProps {
   summary: string;
   reason: string;
-  status?: "pending" | "allowed" | "denied" | "cancelled";
+  status?: "pending" | "allowed" | "denied" | "rejected" | "cancelled";
   sending?: boolean;
   onDecision?: (decision: ApprovalDecision) => void;
 }
@@ -30,7 +30,9 @@ export function ApprovalConfirmation({
       state={
         status === "pending"
           ? "approval-requested"
-          : status === "denied" || status === "cancelled"
+          : status === "denied" ||
+              status === "rejected" ||
+              status === "cancelled"
             ? "output-denied"
             : "approval-responded"
       }
@@ -41,7 +43,11 @@ export function ApprovalConfirmation({
       <ConfirmationRequest>{reason}</ConfirmationRequest>
       <ConfirmationAccepted>今回のみ許可しました</ConfirmationAccepted>
       <ConfirmationRejected>
-        {status === "cancelled" ? "キャンセルされました" : "拒否しました"}
+        {status === "cancelled"
+          ? "キャンセルされました"
+          : status === "rejected"
+            ? "承認内容を実行できませんでした"
+            : "拒否しました"}
       </ConfirmationRejected>
       <ConfirmationActions>
         {sending && (

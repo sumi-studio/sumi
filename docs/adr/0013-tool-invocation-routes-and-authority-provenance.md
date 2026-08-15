@@ -231,6 +231,11 @@ durability/recovery境界を維持する。Elevated pendingはsoft steer、abort
 消費して`running`へ進むtransactionとexecutor RPCの順序も、commit後にだけRPCを発火する
 既存規則を維持する。
 
+Normalのgrantがcommit時再認可でstaleになった場合は、同じsealed operationをboundedにpolicyへ
+戻す。再認可を繰り返してもdurable startへ到達できない場合は`policy_unavailable`として閉じ、
+Human promptへfallbackしない。`ToolExecutionStart`を発行した後にcontrolが競合した場合も、
+commit barrierの結果を受け取る前にmove-only execution authorityを破棄してはならない。
+
 ### 9. #134で使う語彙
 
 permission/approval surfaceでは、少なくとも次を別名で扱う。

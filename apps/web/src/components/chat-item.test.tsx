@@ -64,4 +64,35 @@ describe("ChatItemView", () => {
     fireEvent.click(screen.getByRole("button", { name: "拒否" }));
     expect(onApprovalDecision).not.toHaveBeenCalled();
   });
+
+  it("distinguishes foundation rejection after approval from Human denial", () => {
+    render(
+      <ChatItemView
+        item={{
+          kind: "approval",
+          id: "approval:rejected",
+          runId: null,
+          requestId: "approval-rejected",
+          request: {
+            id: "approval-rejected",
+            tool_call_id: "tool-rejected",
+            tool_name: "bash",
+            action: { reviewable: { command: "git status" } },
+            args_summary: { command: "git status" },
+          },
+          summary: "git status を実行します",
+          reason: "確認が必要です",
+          status: "rejected",
+          decision: { type: "approve_once" },
+          timestamp: null,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText("承認内容を実行できませんでした"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("拒否しました")).toBeNull();
+    expect(screen.queryByRole("button", { name: "今回のみ許可" })).toBeNull();
+  });
 });

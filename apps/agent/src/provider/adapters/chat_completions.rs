@@ -9,7 +9,10 @@ use crate::provider::{
     assembler::{
         FrozenToolSchemaRegistry, ResponseBudget, ToolArgumentAccumulator, ToolArgumentOutcome,
     },
-    model::{ChatCompat, MaxTokensField, ModelSpec, RequestOptions, ThinkingFormat},
+    model::{
+        ChatCompat, ChatStructuredOutputMode, MaxTokensField, ModelSpec, RequestOptions,
+        StructuredOutputSchema, ThinkingFormat,
+    },
     types::{
         ApiProtocol, AssistantContent, ContextMessage, MemoryLayer, Message, PromptContext,
         ProviderEvent, RawUsage, StopReason, ToolDefinition, ToolResultMessage, Usage, UserContent,
@@ -33,6 +36,8 @@ pub enum ChatAdapterError {
     InvalidReasoningEffort(String),
     #[error("tool_choice=\"required\" is unsupported by this provider preset")]
     RequiredToolChoiceUnsupported,
+    #[error("structured output is unsupported by this provider preset")]
+    StructuredOutputUnsupported,
     #[error("invalid Chat Completions chunk: {0}")]
     InvalidChunk(String),
     #[error("provider returned an error: {message}")]
@@ -111,11 +116,24 @@ pub fn build_request(
         }
     }
 
+    let system_prompt = match (&options.structured_output, compat.structured_output) {
+        (None, _) | (Some(_), ChatStructuredOutputMode::JsonSchema) => {
+            context.system_prompt.clone()
+        }
+        (Some(output), ChatStructuredOutputMode::JsonObjectWithPromptSchema)
+        | (Some(output), ChatStructuredOutputMode::PromptSchema) => {
+            system_prompt_with_schema(&context.system_prompt, output)
+        }
+        (Some(_), ChatStructuredOutputMode::Unsupported) => {
+            return Err(ChatAdapterError::StructuredOutputUnsupported);
+        }
+    };
+
     let mut request = Map::new();
     request.insert("model".to_owned(), json!(spec.id));
     request.insert(
         "messages".to_owned(),
-        Value::Array(convert_messages(spec, context)),
+        Value::Array(convert_messages(spec, context, &system_prompt)),
     );
     request.insert("stream".to_owned(), json!(true));
 
@@ -139,6 +157,28 @@ pub fn build_request(
     }
     if let Some(tool_choice) = &options.tool_choice {
         request.insert("tool_choice".to_owned(), tool_choice.clone());
+    }
+    if let Some(output) = &options.structured_output {
+        match compat.structured_output {
+            ChatStructuredOutputMode::JsonSchema => {
+                request.insert(
+                    "response_format".to_owned(),
+                    json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": output.name,
+                            "description": output.description,
+                            "schema": output.schema,
+                            "strict": true,
+                        }
+                    }),
+                );
+            }
+            ChatStructuredOutputMode::JsonObjectWithPromptSchema => {
+                request.insert("response_format".to_owned(), json!({"type":"json_object"}));
+            }
+            ChatStructuredOutputMode::PromptSchema | ChatStructuredOutputMode::Unsupported => {}
+        }
     }
 
     if context.tools.is_empty() {
@@ -226,18 +266,27 @@ pub fn requested_output_tokens(
     Ok(output_tokens)
 }
 
-fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
+fn system_prompt_with_schema(base: &str, output: &StructuredOutputSchema) -> String {
+    let schema = serde_json::to_string(&output.schema)
+        .expect("serde_json::Value is always serializable as JSON");
+    let separator = if base.is_empty() { "" } else { "\n\n" };
+    format!(
+        "{base}{separator}Return only one JSON object that conforms exactly to this JSON Schema:\n{schema}"
+    )
+}
+
+fn convert_messages(spec: &ModelSpec, context: &PromptContext, system_prompt: &str) -> Vec<Value> {
     let compat = spec
         .chat_compat()
         .expect("convert_messages is called only after protocol validation");
     let mut output = Vec::new();
-    if !context.system_prompt.is_empty() {
+    if !system_prompt.is_empty() {
         let role = if spec.reasoning && compat.supports_developer_role {
             "developer"
         } else {
             "system"
         };
-        output.push(json!({"role": role, "content": context.system_prompt}));
+        output.push(json!({"role": role, "content": system_prompt}));
     }
 
     for memory in &context.memory_blocks {
@@ -2054,6 +2103,79 @@ mod tests {
             tools,
             replay_provenance: None,
         }
+    }
+
+    fn review_output_schema() -> StructuredOutputSchema {
+        StructuredOutputSchema {
+            name: "sumi_execution_review_v1".to_owned(),
+            description: "execution review".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {"outcome": {"enum": ["allow", "block"]}},
+                "required": ["outcome"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    #[test]
+    fn structured_output_uses_only_each_verified_chat_capability() {
+        let output = review_output_schema();
+        let options = RequestOptions {
+            structured_output: Some(output.clone()),
+            ..RequestOptions::default()
+        };
+        let context = simple_context(vec![user_message("act")], Vec::new());
+        let encoded_schema = serde_json::to_string(&output.schema).unwrap();
+
+        let kimi = build_request(&ModelSpec::preset("kimi-k3").unwrap(), &context, &options)
+            .expect("Moonshot documents prompt-based format shaping");
+        assert!(kimi.get("response_format").is_none());
+        assert!(
+            kimi["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(&encoded_schema)
+        );
+
+        let glm = build_request(&ModelSpec::preset("glm-5.2").unwrap(), &context, &options)
+            .expect("Z.AI documents JSON object mode");
+        assert_eq!(glm["response_format"], json!({"type": "json_object"}));
+        assert!(
+            glm["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(&encoded_schema)
+        );
+
+        for preset in ["umans", "opencode-go"] {
+            assert!(matches!(
+                build_request(&ModelSpec::preset(preset).unwrap(), &context, &options),
+                Err(ChatAdapterError::StructuredOutputUnsupported)
+            ));
+        }
+
+        let mut openai_compatible = ModelSpec::preset("glm-5.2").unwrap();
+        let crate::provider::model::ProtocolCompat::Chat(compat) = &mut openai_compatible.compat
+        else {
+            unreachable!()
+        };
+        compat.structured_output = ChatStructuredOutputMode::JsonSchema;
+        let native = build_request(&openai_compatible, &context, &options)
+            .expect("explicit native Chat schema capability");
+        assert_eq!(
+            native["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": output.name,
+                    "description": output.description,
+                    "schema": output.schema,
+                    "strict": true
+                }
+            })
+        );
+        assert_eq!(native["messages"][0]["content"], "System.");
     }
 
     fn user_message(text: &str) -> Message {

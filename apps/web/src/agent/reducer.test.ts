@@ -96,6 +96,36 @@ test("durable message_end replaces volatile text and durable replay is ignored",
   );
 });
 
+test("tool call projections retain normal and elevated as distinct routes", () => {
+  let session = createAgentSession();
+  session = apply(session, { seq: 1, event: { type: "agent_start" } });
+  for (const [contentIndex, route] of (
+    ["normal", "elevated"] as const
+  ).entries()) {
+    session = apply(session, {
+      event: {
+        type: "message_update",
+        message_id: AssistantMessageId,
+        event: {
+          type: "tool_call_end",
+          content_index: contentIndex,
+          tool_call: {
+            id: `call-${route}`,
+            name: "read_file",
+            route,
+            arguments: { path: `${route}.txt` },
+          },
+        },
+      },
+    });
+  }
+
+  const routes = session.conversation.runs["run:1"].trace
+    .filter((trace) => trace.type === "tool")
+    .map((trace) => trace.route);
+  assert.deepEqual(routes, ["normal", "elevated"]);
+});
+
 test("late empty message_start preserves update-before-start prose until authoritative end", () => {
   let session = createAgentSession();
   session = apply(session, {
@@ -392,6 +422,35 @@ test("approval request and resolution preserve structured decision", () => {
   }
 });
 
+test("execution rejection preserves the Human's exact approval decision", () => {
+  let session = createAgentSession();
+  const request = approvalRequest("approval-rejected", "call-rejected");
+  session = apply(session, {
+    seq: 30,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    seq: 31,
+    event: { type: "approval_requested", request },
+  });
+  session = apply(session, {
+    seq: 32,
+    event: {
+      type: "approval_resolved",
+      request_id: request.id,
+      resolution: { rejected: { decision: { type: "approve_once" } } },
+    },
+  });
+
+  assert.equal(session.approval, null);
+  const entry = session.conversation.entries[`approval:${request.id}`];
+  assert.equal(entry?.kind, "approval");
+  if (entry?.kind === "approval") {
+    assert.equal(entry.status, "rejected");
+    assert.deepEqual(entry.decision, { type: "approve_once" });
+  }
+});
+
 test("cancelled approval closes its linked pending tool trace and durable replay is ignored", () => {
   let session = createAgentSession();
   const request = approvalRequest("approval-cancelled", "call-cancelled");
@@ -570,7 +629,7 @@ function assistantToolCall(toolCallId: string): PublicAssistantMessage {
     content: [
       {
         type: "tool_call",
-        tool_call: { id: toolCallId, name: "bash", arguments: {} },
+        tool_call: { id: toolCallId, name: "bash", route: "normal", arguments: {} },
         wire_item_index: 0,
       },
     ],

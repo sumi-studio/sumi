@@ -9,13 +9,15 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::{
-    ModelSpec, RequestOptions, stream,
+    ModelSpec, RequestOptions,
+    model::StructuredOutputSchema,
+    stream,
     types::{
         AssistantContent, ContextMessage, Message, PromptContext, ProviderEvent, StopReason,
         UserContent, UserMessage,
@@ -300,11 +302,66 @@ pub struct EscalationReviewRequest {
     pub bounded_context: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionReviewOutputSchema(StructuredOutputSchema);
+
+impl ExecutionReviewOutputSchema {
+    fn v1() -> Self {
+        Self(StructuredOutputSchema {
+            name: "sumi_execution_review_v1".to_owned(),
+            description: "Sumi Execution AutoReview decision".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {"type": "string", "enum": ["allow", "block"]},
+                    "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                    "rationale": {"type": "string"}
+                },
+                "required": ["outcome", "risk", "rationale"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    fn provider_schema(&self) -> &StructuredOutputSchema {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscalationReviewOutputSchema(StructuredOutputSchema);
+
+impl EscalationReviewOutputSchema {
+    fn v1() -> Self {
+        Self(StructuredOutputSchema {
+            name: "sumi_escalation_review_v1".to_owned(),
+            description: "Sumi Escalation AutoReview decision".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {"type": "string", "enum": ["ask_human", "block"]},
+                    "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                    "misunderstanding": {"type": ["string", "null"]},
+                    "rationale": {"type": "string"}
+                },
+                "required": ["outcome", "risk", "misunderstanding", "rationale"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    fn provider_schema(&self) -> &StructuredOutputSchema {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReviewerPrompt {
     #[serde(skip)]
     pub system: &'static str,
+    #[serde(skip)]
+    pub output_schema: ExecutionReviewOutputSchema,
     pub prompt_version: &'static str,
     pub schema_version: &'static str,
     pub request: ExecutionReviewRequest,
@@ -316,6 +373,8 @@ pub struct ExecutionReviewerPrompt {
 pub struct EscalationReviewerPrompt {
     #[serde(skip)]
     pub system: &'static str,
+    #[serde(skip)]
+    pub output_schema: EscalationReviewOutputSchema,
     pub prompt_version: &'static str,
     pub schema_version: &'static str,
     pub request: EscalationReviewRequest,
@@ -390,7 +449,14 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
         prompt: &ExecutionReviewerPrompt,
         cancel: CancellationToken,
     ) -> Result<String, ReviewerTransportError> {
-        complete_provider_review(&self.spec, prompt.system, prompt, cancel).await
+        complete_provider_review(
+            &self.spec,
+            prompt.system,
+            prompt.output_schema.provider_schema(),
+            prompt,
+            cancel,
+        )
+        .await
     }
 }
 
@@ -417,35 +483,25 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
         prompt: &EscalationReviewerPrompt,
         cancel: CancellationToken,
     ) -> Result<String, ReviewerTransportError> {
-        complete_provider_review(&self.spec, prompt.system, prompt, cancel).await
+        complete_provider_review(
+            &self.spec,
+            prompt.system,
+            prompt.output_schema.provider_schema(),
+            prompt,
+            cancel,
+        )
+        .await
     }
 }
 
 async fn complete_provider_review(
     spec: &ModelSpec,
     system: &str,
+    output_schema: &StructuredOutputSchema,
     prompt: &impl Serialize,
     cancel: CancellationToken,
 ) -> Result<String, ReviewerTransportError> {
-    let evidence = serde_json::to_string(prompt).map_err(|error| {
-        ReviewerTransportError::Fatal(format!("reviewer prompt serialization failed: {error}"))
-    })?;
-    let context = PromptContext::new(
-        system.to_owned(),
-        Vec::new(),
-        vec![ContextMessage::Synthetic {
-            message: Message::User(UserMessage {
-                content: vec![UserContent::Text { text: evidence }],
-                timestamp: Utc::now(),
-            }),
-        }],
-        Vec::new(),
-        Vec::new(),
-    );
-    let options = RequestOptions {
-        max_tokens: Some(spec.max_output_tokens.min(2_048)),
-        ..RequestOptions::default()
-    };
+    let (context, options) = build_provider_review_request(spec, system, output_schema, prompt)?;
     let mut events = stream(spec.clone(), context, options, cancel.clone());
     loop {
         let Some(event) = events.recv().await else {
@@ -489,6 +545,35 @@ async fn complete_provider_review(
             _ => {}
         }
     }
+}
+
+fn build_provider_review_request(
+    spec: &ModelSpec,
+    system: &str,
+    output_schema: &StructuredOutputSchema,
+    prompt: &impl Serialize,
+) -> Result<(PromptContext, RequestOptions), ReviewerTransportError> {
+    let evidence = serde_json::to_string(prompt).map_err(|error| {
+        ReviewerTransportError::Fatal(format!("reviewer prompt serialization failed: {error}"))
+    })?;
+    let context = PromptContext::new(
+        system.to_owned(),
+        Vec::new(),
+        vec![ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text { text: evidence }],
+                timestamp: Utc::now(),
+            }),
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    let options = RequestOptions {
+        max_tokens: Some(spec.max_output_tokens.min(2_048)),
+        structured_output: Some(output_schema.clone()),
+        ..RequestOptions::default()
+    };
+    Ok((context, options))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +653,7 @@ impl ExecutionReviewer {
             attempts += 1;
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
+                output_schema: ExecutionReviewOutputSchema::v1(),
                 prompt_version: EXECUTION_PROMPT_VERSION_V1,
                 schema_version: EXECUTION_SCHEMA_VERSION_V1,
                 request: request.clone(),
@@ -675,6 +761,7 @@ impl EscalationReviewer {
             attempts += 1;
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
+                output_schema: EscalationReviewOutputSchema::v1(),
                 prompt_version: ESCALATION_PROMPT_VERSION_V1,
                 schema_version: ESCALATION_SCHEMA_VERSION_V1,
                 request: request.clone(),
@@ -855,7 +942,16 @@ fn parse_execution_decision(raw: &str) -> Result<ExecutionReviewDecision, Review
 fn parse_escalation_decision(
     raw: &str,
 ) -> Result<EscalationReviewDecision, ReviewerValidationCode> {
-    let decision = parse_decision::<EscalationReviewDecision>(raw)?;
+    let value: Value =
+        serde_json::from_str(raw).map_err(|_| ReviewerValidationCode::InvalidJson)?;
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("misunderstanding"))
+    {
+        return Err(ReviewerValidationCode::SchemaMismatch);
+    }
+    let decision = serde_json::from_value::<EscalationReviewDecision>(value)
+        .map_err(|_| ReviewerValidationCode::SchemaMismatch)?;
     if !valid_rationale(&decision.rationale)
         || decision
             .misunderstanding
@@ -1036,6 +1132,56 @@ mod tests {
         }
     }
 
+    struct RecordingExecutionTransport {
+        responses: Mutex<VecDeque<Result<String, ReviewerTransportError>>>,
+        prompts: Mutex<Vec<ExecutionReviewerPrompt>>,
+    }
+
+    #[async_trait]
+    impl ExecutionReviewerTransport for RecordingExecutionTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            prompt: &ExecutionReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> Result<String, ReviewerTransportError> {
+            self.prompts.lock().unwrap().push(prompt.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fixture response")
+        }
+    }
+
+    struct RecordingEscalationTransport {
+        responses: Mutex<VecDeque<Result<String, ReviewerTransportError>>>,
+        prompts: Mutex<Vec<EscalationReviewerPrompt>>,
+    }
+
+    #[async_trait]
+    impl EscalationReviewerTransport for RecordingEscalationTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            prompt: &EscalationReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> Result<String, ReviewerTransportError> {
+            self.prompts.lock().unwrap().push(prompt.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fixture response")
+        }
+    }
+
     fn execution_request() -> ExecutionReviewRequest {
         ExecutionReviewRequest {
             action_digest: "digest".to_owned(),
@@ -1138,13 +1284,17 @@ mod tests {
     #[tokio::test]
     async fn execution_retries_only_malformed_or_transient_and_never_prompts_human() {
         let model = reviewer_model();
+        let transport = Arc::new(RecordingExecutionTransport {
+            responses: Mutex::new(VecDeque::from([
+                Ok("not-json".to_owned()),
+                Ok(r#"{"outcome":"allow","risk":"low","rationale":"bounded"}"#.to_owned()),
+            ])),
+            prompts: Mutex::new(Vec::new()),
+        });
         let reviewer = ExecutionReviewer::new(
             model.clone(),
             reviewer_trust(&model),
-            Arc::new(ExecutionTransport(Mutex::new(VecDeque::from([
-                Ok("not-json".to_owned()),
-                Ok(r#"{"outcome":"allow","risk":"low","rationale":"bounded"}"#.to_owned()),
-            ])))),
+            transport.clone(),
             ReviewerBudgetV1::execution(),
         )
         .unwrap();
@@ -1159,15 +1309,37 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
+        let prompts = transport.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v1());
+            assert_eq!(
+                prompt.retry_validation_code,
+                if index == 0 {
+                    None
+                } else {
+                    Some(ReviewerValidationCode::InvalidJson)
+                }
+            );
+            let (_, options) = build_provider_review_request(
+                &ModelSpec::preset("openai-responses").unwrap(),
+                prompt.system,
+                prompt.output_schema.provider_schema(),
+                prompt,
+            )
+            .unwrap();
+            assert_eq!(
+                options.structured_output.as_ref(),
+                Some(prompt.output_schema.provider_schema())
+            );
+        }
     }
 
     #[tokio::test]
     async fn semantic_schema_mismatch_uses_the_single_bounded_retry() {
         let model = reviewer_model();
-        let reviewer = EscalationReviewer::new(
-            model.clone(),
-            reviewer_trust(&model),
-            Arc::new(EscalationTransport(Mutex::new(VecDeque::from([
+        let transport = Arc::new(RecordingEscalationTransport {
+            responses: Mutex::new(VecDeque::from([
                 Ok(
                     r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":""}"#
                         .to_owned(),
@@ -1176,7 +1348,13 @@ mod tests {
                     r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":"request matches the exact action"}"#
                         .to_owned(),
                 ),
-            ])))),
+            ])),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let reviewer = EscalationReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            transport.clone(),
             ReviewerBudgetV1::escalation(),
         )
         .unwrap();
@@ -1190,6 +1368,44 @@ mod tests {
         assert_eq!(
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
+        );
+        let prompts = transport.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v1());
+            assert_eq!(
+                prompt.retry_validation_code,
+                if index == 0 {
+                    None
+                } else {
+                    Some(ReviewerValidationCode::SchemaMismatch)
+                }
+            );
+            let (_, options) = build_provider_review_request(
+                &ModelSpec::preset("anthropic").unwrap(),
+                prompt.system,
+                prompt.output_schema.provider_schema(),
+                prompt,
+            )
+            .unwrap();
+            assert_eq!(
+                options.structured_output.as_ref(),
+                Some(prompt.output_schema.provider_schema())
+            );
+        }
+        assert_ne!(
+            ExecutionReviewOutputSchema::v1().provider_schema().schema,
+            EscalationReviewOutputSchema::v1().provider_schema().schema
+        );
+    }
+
+    #[test]
+    fn escalation_schema_requires_the_nullable_misunderstanding_member() {
+        assert_eq!(
+            parse_escalation_decision(
+                r#"{"outcome":"block","risk":"low","rationale":"missing member"}"#
+            ),
+            Err(ReviewerValidationCode::SchemaMismatch)
         );
     }
 

@@ -1,5 +1,5 @@
 pub const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
-pub const SYSTEM_PROMPT_VERSION: &str = "2";
+pub const SYSTEM_PROMPT_VERSION: &str = "3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactPrompt {
@@ -30,7 +30,14 @@ fn without_trailing_newline(prompt: &'static str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::CompactPrompt;
+    use super::{CompactPrompt, SYSTEM_PROMPT};
+
+    #[test]
+    fn system_prompt_uses_target_tool_routes_not_a_permission_tool() {
+        assert!(!SYSTEM_PROMPT.contains("request_permission"));
+        assert!(SYSTEM_PROMPT.contains("対象ツール自身を `normal` として呼ぶ"));
+        assert!(SYSTEM_PROMPT.contains("対象ツール自身を `elevated` として提案する"));
+    }
 
     #[test]
     fn compact_prompts_are_stage_specific_and_self_contained() {

@@ -157,6 +157,20 @@ pub fn build_request(
     if let Some(tool_choice) = &options.tool_choice {
         request.insert("tool_choice".to_owned(), tool_choice.clone());
     }
+    if let Some(output) = &options.structured_output {
+        request.insert(
+            "text".to_owned(),
+            json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": output.name,
+                    "description": output.description,
+                    "schema": output.schema,
+                    "strict": true,
+                }
+            }),
+        );
+    }
     if !context.tools.is_empty() {
         request.insert(
             "tools".to_owned(),
@@ -3752,6 +3766,53 @@ mod tests {
         );
         assert_eq!(body["input"][1]["type"], "message");
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn request_carries_the_exact_structured_output_schema() {
+        let output = crate::provider::model::StructuredOutputSchema {
+            name: "sumi_execution_review_v1".to_owned(),
+            description: "execution review".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {"outcome": {"enum": ["allow", "block"]}},
+                "required": ["outcome"],
+                "additionalProperties": false
+            }),
+        };
+        let context = PromptContext::new(
+            "review".to_owned(),
+            Vec::new(),
+            vec![ContextMessage::Synthetic {
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text { text: "act".into() }],
+                    timestamp: Utc::now(),
+                }),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let body = build_request(
+            &spec(),
+            &context,
+            &RequestOptions {
+                structured_output: Some(output.clone()),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("structured request");
+
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], output.name);
+        assert_eq!(body["text"]["format"]["description"], output.description);
+        assert_eq!(body["text"]["format"]["schema"], output.schema);
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert!(
+            !body["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("properties")
+        );
     }
 
     #[test]

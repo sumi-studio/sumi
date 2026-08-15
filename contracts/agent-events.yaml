@@ -494,11 +494,12 @@ $defs:
 
   ToolCall:
     type: object
-    required: [id, name, arguments]
+    required: [id, name, route, arguments]
     additionalProperties: false
     properties:
       id: { type: string }
       name: { type: string }
+      route: { type: string, enum: [normal, elevated] }
       arguments:
         type: object
         description: JSON object validated against the tool schema at execution time
@@ -649,6 +650,21 @@ $defs:
         additionalProperties: false
         properties:
           decision: { $ref: '#/$defs/ApprovalDecision' }
+      - type: object
+        required: [rejected]
+        additionalProperties: false
+        properties:
+          rejected:
+            type: object
+            required: [decision]
+            additionalProperties: false
+            properties:
+              decision:
+                type: object
+                required: [type]
+                additionalProperties: false
+                properties:
+                  type: { const: approve_once }
 
   ApprovalDecision:
     oneOf:

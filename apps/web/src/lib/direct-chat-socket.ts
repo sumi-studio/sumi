@@ -15,9 +15,7 @@ export type DirectChatCommand =
   | {
       type: "approval_decision";
       request_id: string;
-      decision:
-        | { type: "approve_once" }
-        | { type: "deny_once" };
+      decision: { type: "approve_once" } | { type: "deny_once" };
     };
 
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
@@ -265,9 +263,10 @@ function isUserContent(value: unknown): boolean {
 function isToolCall(value: unknown): boolean {
   return (
     isRecord(value) &&
-    hasRequiredAndOnlyKeys(value, ["id", "name", "arguments"]) &&
+    hasRequiredAndOnlyKeys(value, ["id", "name", "route", "arguments"]) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
+    (value.route === "normal" || value.route === "elevated") &&
     isRecord(value.arguments) &&
     isSafeAnyJSON(value.arguments)
   );
@@ -560,7 +559,14 @@ function isApprovalResolution(value: unknown): boolean {
     value === "cancelled" ||
     (isRecord(value) &&
       hasRequiredAndOnlyKeys(value, ["decision"]) &&
-      isApprovalDecision(value.decision))
+      isApprovalDecision(value.decision)) ||
+    (isRecord(value) &&
+      hasRequiredAndOnlyKeys(value, ["rejected"]) &&
+      isRecord(value.rejected) &&
+      hasRequiredAndOnlyKeys(value.rejected, ["decision"]) &&
+      isRecord(value.rejected.decision) &&
+      hasRequiredAndOnlyKeys(value.rejected.decision, ["type"]) &&
+      value.rejected.decision.type === "approve_once")
   );
 }
 
