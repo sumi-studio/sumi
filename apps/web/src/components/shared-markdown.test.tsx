@@ -229,8 +229,12 @@ describe("@sumi/ui CompactMessageResponse", () => {
   it.each([
     ["Price $5, formula:$x$", "Price $5, formula:", "x"],
     ["Price $5,formula:$x$", "Price $5,formula:", "x"],
+    ["It costs $.99; formula:$x$", "It costs $.99; formula:", "x"],
+    ["Price $5 USD, formula:$x$", "Price $5 USD, formula:", "x"],
     ["価格は$5、式は$x+1$", "価格は$5、式は", "x+1"],
     ["価格は$5。式は$x$", "価格は$5。式は", "x"],
+    ["価格は$5円、式は$x$", "価格は$5円、式は", "x"],
+    ["価格は$5/個、式は$x$", "価格は$5/個、式は", "x"],
   ])("re-synchronizes a currency opener before adjacent math: %s", (source, expectedText, expectedTex) => {
     const { container } = render(
       <CompactMessageResponse>{source}</CompactMessageResponse>,
@@ -250,6 +254,8 @@ describe("@sumi/ui CompactMessageResponse", () => {
     [String.raw`result $5 \times x$then $y$`, [String.raw`5 \times x`, "y"]],
     ["result $5x$then $y$", ["5x", "y"]],
     ["result $5, x$then $y$", ["5, x", "y"]],
+    ["result $5/x$then $y$", ["5/x", "y"]],
+    ["result $.99 + x$then $y$", [".99 + x", "y"]],
   ])("keeps a structurally valid numeric formula before later math: %s", (source, expected) => {
     const { container } = render(
       <CompactMessageResponse>{source}</CompactMessageResponse>,
@@ -266,6 +272,9 @@ describe("@sumi/ui CompactMessageResponse", () => {
     "曖昧な値は$5 変数$x$",
     "Price $5, formula$x$",
     "価格は$5、式$x$",
+    "価格は$5/個 式$x$",
+    "価格は$5円 利益$x$",
+    "It costs $.99 today$x$",
   ])("leaves an ambiguous shared dollar sequence inert: %s", (source) => {
     const { container } = render(
       <CompactMessageResponse>{source}</CompactMessageResponse>,
@@ -482,6 +491,122 @@ describe("@sumi/ui CompactMessageResponse", () => {
     expect(
       container.querySelector("[data-math-fallback=tokens]"),
     ).toHaveTextContent(tex);
+  });
+
+  it("caps aggregate formula count across one message before KaTeX", () => {
+    const tex = String.raw`\frac{1}{2}`;
+    const source = Array.from({ length: 4_000 }, () => `$${tex}$`).join(" ");
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    const fallbacks = container.querySelectorAll(
+      "[data-math-fallback=aggregate]",
+    );
+    expect(new TextEncoder().encode(source)).toHaveLength(55_999);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(fallbacks).toHaveLength(4_000);
+    expect(fallbacks[0]).toHaveTextContent(tex);
+    expect(fallbacks[0]).toHaveAttribute("data-math-source", "budget");
+    expect(fallbacks[0]).toHaveAttribute(
+      "title",
+      "数式の量が多いため原文のまま表示しています",
+    );
+    expect(container.querySelector(".katex-error")).toBeNull();
+    expect(container.querySelectorAll("*").length).toBeLessThan(20_000);
+  });
+
+  it("renders the aggregate formula-count boundary as one coherent mode", () => {
+    const atBudget = Array.from({ length: 500 }, () => "$x$").join(" ");
+    const overBudget = `${atBudget} $x$`;
+
+    const accepted = render(
+      <CompactMessageResponse>{atBudget}</CompactMessageResponse>,
+    ).container;
+    expect(accepted.querySelectorAll(".katex")).toHaveLength(500);
+    expect(accepted.querySelector("[data-math-fallback=aggregate]")).toBeNull();
+
+    const rejected = render(
+      <CompactMessageResponse>{overBudget}</CompactMessageResponse>,
+    ).container;
+    expect(rejected.querySelector(".katex")).toBeNull();
+    expect(
+      rejected.querySelectorAll("[data-math-fallback=aggregate]"),
+    ).toHaveLength(501);
+  });
+
+  it("caps aggregate TeX source even when each formula is individually small", () => {
+    const tex = `x${" ".repeat(1_100)}+y`;
+    const source = Array.from({ length: 30 }, () => `$${tex}$`).join(" ");
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(
+      container.querySelectorAll("[data-math-fallback=aggregate]"),
+    ).toHaveLength(30);
+    expect(
+      container.querySelector("[data-math-fallback=aggregate]")?.textContent,
+    ).toBe(tex);
+  });
+
+  it("caps aggregate TeX tokens before rendering later formulae", () => {
+    const tex = "x+".repeat(1_024);
+    const source = Array.from({ length: 3 }, () => `$${tex}$`).join(" ");
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(tex).toHaveLength(2_048);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(
+      container.querySelectorAll("[data-math-fallback=aggregate]"),
+    ).toHaveLength(3);
+    expect(
+      container.querySelector("[data-math-fallback=aggregate]")?.textContent,
+    ).toBe(tex);
+  });
+
+  it("caps aggregate KaTeX output nodes after bounded individual renders", () => {
+    const tex = String.raw`\frac{1}{2}`.repeat(100);
+    const source = Array.from({ length: 4 }, () => `$${tex}$`).join(" ");
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(
+      container.querySelectorAll("[data-math-fallback=aggregate]"),
+    ).toHaveLength(4);
+    expect(
+      container.querySelector("[data-math-fallback=aggregate]"),
+    ).toHaveTextContent(tex);
+    expect(container.querySelectorAll("*").length).toBeLessThan(10_000);
+  });
+
+  it("preserves non-math Markdown when aggregate math stays source text", () => {
+    const formulae = Array.from({ length: 501 }, () => "$x$").join(" ");
+    const { container } = render(
+      <CompactMessageResponse>
+        {`**context** [reference](https://example.com) \`code\` ${formulae}`}
+      </CompactMessageResponse>,
+    );
+
+    expect(container.querySelector("strong")).toHaveTextContent("context");
+    expect(container.querySelector("a")).toHaveAttribute(
+      "href",
+      "https://example.com",
+    );
+    expect(container.querySelector("code")).toHaveTextContent("code");
+    expect(container.querySelector(".katex")).toBeNull();
+    const fallbacks = container.querySelectorAll(
+      "[data-math-fallback=aggregate]",
+    );
+    expect(fallbacks).toHaveLength(501);
+    expect(
+      [...fallbacks].every((fallback) => fallback.textContent === "x"),
+    ).toBe(true);
   });
 
   it.each([
