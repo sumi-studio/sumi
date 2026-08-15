@@ -5,12 +5,76 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 )
 
 type appendOutcome struct {
 	message Message
 	created bool
 	err     error
+}
+
+type placeOutcome struct {
+	place Place
+	err   error
+}
+
+func TestManageChannelsLockOrderIsWorkspaceThenInstallationThenAppRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	store := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	installationGate, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = installationGate.Rollback(context.Background()) }()
+	var lockedInstallation string
+	if err := installationGate.QueryRow(ctx, `
+		SELECT installation_id FROM app_installations
+		WHERE installation_id = $1 FOR UPDATE`, store.Scope.InstallationID,
+	).Scan(&lockedInstallation); err != nil {
+		t.Fatal(err)
+	}
+
+	createDone := make(chan placeOutcome, 1)
+	go func() {
+		place, err := store.CreateChannel(ctx, "ordered", "")
+		createDone <- placeOutcome{place: place, err: err}
+	}()
+	// Channel management must already hold Workspace FOR SHARE when it reaches
+	// the exact installation row and blocks behind this gate.
+	waitForBlockedDatabaseSessions(t, ctx, w, 1)
+
+	disableDone := make(chan error, 1)
+	go func() {
+		_, err := w.apps.SetEnabled(
+			ctx, applicationapps.WorkspaceOwner(workspace.WorkspaceID),
+			w.humanA, MessagingAppID, false,
+		)
+		disableDone <- err
+	}()
+	// The lifecycle mutation must wait at Workspace FOR UPDATE rather than
+	// overtaking the channel mutation and contending on the installation row.
+	waitForBlockedDatabaseSessions(t, ctx, w, 2)
+
+	if err := installationGate.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case outcome := <-createDone:
+		if outcome.err != nil || outcome.place.Name != "ordered" {
+			t.Fatalf("channel management outcome = %#v, %v", outcome.place, outcome.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel management did not complete")
+	}
+	if err := receiveError(t, disableDone, "disable after channel management"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWorkspaceFenceRemovalCommitsBeforeRevokedActorMutation(t *testing.T) {

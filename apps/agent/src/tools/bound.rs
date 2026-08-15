@@ -167,7 +167,10 @@ pub(crate) enum ProviderReviewIdentity {
     WorkspaceListV1,
     WorkspaceInvitationListV1,
     WorkspaceInvitationAcceptV1,
+    /// Durable recovery identity for seals emitted before authority epochs.
+    /// It is deliberately absent from `from_local`: new bindings are V2 only.
     MessagingV1,
+    MessagingV2,
     WorkspaceReadFileV1,
     WorkspaceListDirV1,
     WorkspaceGlobV1,
@@ -196,7 +199,7 @@ impl ProviderReviewIdentity {
             ("workspace_invitation_accept", "sumi.workspace.invitation.accept", 1) => {
                 Self::WorkspaceInvitationAcceptV1
             }
-            ("messaging", "sumi.messaging", 1) => Self::MessagingV1,
+            ("messaging", "sumi.messaging", 2) => Self::MessagingV2,
             ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
             ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
             ("glob", "sumi.foundation.workspace", 1) => Self::WorkspaceGlobV1,
@@ -374,13 +377,17 @@ fn provider_review_operation(
         (Identity::WorkspaceInvitationAcceptV1, "accept_invitation", Mutate) => {
             Operation::AcceptInvitation
         }
-        (Identity::MessagingV1, "overview", Read) => Operation::Overview,
-        (Identity::MessagingV1, "open", Read) => Operation::Open,
-        (Identity::MessagingV1, "write", Mutate) => Operation::Write,
-        (Identity::MessagingV1, "react", Mutate) => Operation::React,
-        (Identity::MessagingV1, "status", Mutate) => Operation::Status,
-        (Identity::MessagingV1, "reply_later", Mutate) => Operation::ReplyLater,
-        (Identity::MessagingV1, "resolve_reply_later", Mutate) => Operation::ResolveReplyLater,
+        (Identity::MessagingV1 | Identity::MessagingV2, "overview", Read) => Operation::Overview,
+        (Identity::MessagingV1 | Identity::MessagingV2, "open", Read) => Operation::Open,
+        (Identity::MessagingV1 | Identity::MessagingV2, "write", Mutate) => Operation::Write,
+        (Identity::MessagingV1 | Identity::MessagingV2, "react", Mutate) => Operation::React,
+        (Identity::MessagingV1 | Identity::MessagingV2, "status", Mutate) => Operation::Status,
+        (Identity::MessagingV1 | Identity::MessagingV2, "reply_later", Mutate) => {
+            Operation::ReplyLater
+        }
+        (Identity::MessagingV1 | Identity::MessagingV2, "resolve_reply_later", Mutate) => {
+            Operation::ResolveReplyLater
+        }
         (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
         (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
         (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
@@ -441,24 +448,27 @@ fn provider_review_scope(
         (Identity::WorkspaceInvitationAcceptV1, Resource, "workspace", "membership") => {
             (Resource, Namespace::Workspace, Kind::Membership)
         }
-        (Identity::MessagingV1, Resource, "workspace", "workspace") => {
+        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "workspace", "workspace") => {
             (Resource, Namespace::Workspace, Kind::Workspace)
         }
-        (Identity::MessagingV1, Collection, "messaging", "place") => {
+        (Identity::MessagingV1 | Identity::MessagingV2, Collection, "messaging", "place") => {
             (Collection, Namespace::Messaging, Kind::Place)
         }
-        (Identity::MessagingV1, Resource, "messaging", "place") => {
+        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "messaging", "place") => {
             (Resource, Namespace::Messaging, Kind::Place)
         }
-        (Identity::MessagingV1, Resource, "messaging", "message") => {
+        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "messaging", "message") => {
             (Resource, Namespace::Messaging, Kind::Message)
         }
-        (Identity::MessagingV1, Resource, "messaging", "participant") => {
+        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "messaging", "participant") => {
             (Resource, Namespace::Messaging, Kind::Participant)
         }
-        (Identity::MessagingV1, Resource, "messaging", "reply_later_marker") => {
-            (Resource, Namespace::Messaging, Kind::ReplyLaterMarker)
-        }
+        (
+            Identity::MessagingV1 | Identity::MessagingV2,
+            Resource,
+            "messaging",
+            "reply_later_marker",
+        ) => (Resource, Namespace::Messaging, Kind::ReplyLaterMarker),
         (
             Identity::WorkspaceReadFileV1
             | Identity::WorkspaceListDirV1
@@ -1506,6 +1516,39 @@ mod tests {
         uppercase["proposal_digest"] =
             Value::String(invocation.proposal_digest.to_hex().to_uppercase());
         assert!(serde_json::from_value::<BoundToolInvocation>(uppercase).is_err());
+    }
+
+    #[test]
+    fn messaging_v1_recovers_but_only_v2_can_be_newly_bound() {
+        assert_eq!(
+            serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v1\"").unwrap(),
+            ProviderReviewIdentity::MessagingV1,
+            "durable v1 evidence must remain decodable during recovery"
+        );
+        let v2 = AdapterIdentity::new("sumi.messaging", 2).unwrap();
+        assert_eq!(
+            ProviderReviewIdentity::from_local("messaging", &v2).unwrap(),
+            ProviderReviewIdentity::MessagingV2
+        );
+        let v1 = AdapterIdentity::new("sumi.messaging", 1).unwrap();
+        assert!(ProviderReviewIdentity::from_local("messaging", &v1).is_err());
+
+        for identity in [
+            ProviderReviewIdentity::MessagingV1,
+            ProviderReviewIdentity::MessagingV2,
+        ] {
+            assert!(
+                provider_review_operation(
+                    identity,
+                    &AppActionDescriptor::new("overview", CapabilityClass::Read, vec![]).unwrap(),
+                )
+                .is_ok()
+            );
+            assert!(
+                provider_review_scope(identity, &ResourceScope::collection("messaging", "place"),)
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

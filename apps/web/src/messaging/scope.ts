@@ -1,16 +1,20 @@
 export interface MessagingScope {
   workspaceId: string;
   installationId: string;
+  /** Canonical positive signed-int64 decimal authority generation. */
+  authorityEpoch: string;
 }
 
 const WORKSPACE_QUERY = "workspace_id";
 const INSTALLATION_QUERY = "installation_id";
+const AUTHORITY_EPOCH_QUERY = "authority_epoch";
+const MAX_AUTHORITY_EPOCH = 9_223_372_036_854_775_807n;
 
 let activeScope: MessagingScope | null = null;
 let activeScopeController = new AbortController();
 
 export function messagingScopeKey(scope: MessagingScope): string {
-  return `${scope.workspaceId}:${scope.installationId}`;
+  return `${scope.workspaceId}:${scope.installationId}:${scope.authorityEpoch}`;
 }
 
 export function sameMessagingScope(
@@ -22,15 +26,29 @@ export function sameMessagingScope(
     (left !== null &&
       right !== null &&
       left.workspaceId === right.workspaceId &&
-      left.installationId === right.installationId)
+      left.installationId === right.installationId &&
+      left.authorityEpoch === right.authorityEpoch)
   );
 }
 
 export function validateMessagingScope(scope: MessagingScope): MessagingScope {
-  if (!scope.workspaceId || !scope.installationId) {
+  if (
+    !scope.workspaceId ||
+    !scope.installationId ||
+    !isCanonicalAuthorityEpoch(scope.authorityEpoch)
+  ) {
     throw new Error("Messaging requires an exact Workspace and installation");
   }
   return { ...scope };
+}
+
+export function isCanonicalAuthorityEpoch(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9][0-9]*$/.test(value) &&
+    value.length <= 19 &&
+    BigInt(value) <= MAX_AUTHORITY_EPOCH
+  );
 }
 
 export function setActiveMessagingScope(scope: MessagingScope | null): void {
@@ -66,8 +84,8 @@ export function requireActiveMessagingBoundary(): {
 }
 
 /**
- * Adds one immutable scope pair to a Messaging path. Callers may not smuggle a
- * second pair into the input path; duplicate authority context fails closed.
+ * Adds one immutable scope tuple to a Messaging path. Callers may not smuggle
+ * a second authority field into the input path; duplicate context fails closed.
  */
 export function scopedMessagingPath(
   path: string,
@@ -82,13 +100,15 @@ export function scopedMessagingPath(
   }
   if (
     url.searchParams.has(WORKSPACE_QUERY) ||
-    url.searchParams.has(INSTALLATION_QUERY)
+    url.searchParams.has(INSTALLATION_QUERY) ||
+    url.searchParams.has(AUTHORITY_EPOCH_QUERY)
   ) {
     throw new Error("Messaging scope query is already present");
   }
   const exact = validateMessagingScope(scope);
   url.searchParams.append(WORKSPACE_QUERY, exact.workspaceId);
   url.searchParams.append(INSTALLATION_QUERY, exact.installationId);
+  url.searchParams.append(AUTHORITY_EPOCH_QUERY, exact.authorityEpoch);
   return `${url.pathname}?${url.searchParams.toString()}`;
 }
 

@@ -190,10 +190,50 @@ describe("MessagingScopeGate", () => {
     expect(getMessagingScope()).toEqual({
       workspaceId: "workspace-1",
       installationId: "installation-1",
+      authorityEpoch: "1",
     });
 
     view.unmount();
     expect(getMessagingScope()).toBeNull();
+  });
+
+  it("resets the bound transport and subtree when an enabled installation rolls epoch", () => {
+    const initialInstallation = {
+      installationId: "installation-1",
+      owner: { kind: "workspace" as const, workspaceId: "workspace-1" },
+      appId: "messaging",
+      state: "enabled" as const,
+      authorityEpoch: "1",
+      installedAt: 1,
+      updatedAt: 1,
+    };
+    mocks.state = workspaceState([initialInstallation]);
+    let mounts = 0;
+    function Child() {
+      mounts += 1;
+      return <div>epoch child</div>;
+    }
+    const view = render(
+      <MessagingScopeGate workspaceId="workspace-1">
+        <Child />
+      </MessagingScopeGate>,
+    );
+    expect(getMessagingScope()?.authorityEpoch).toBe("1");
+
+    mocks.state = workspaceState([
+      {
+        ...initialInstallation,
+        authorityEpoch: "2",
+      },
+    ]);
+    view.rerender(
+      <MessagingScopeGate workspaceId="workspace-1">
+        <Child />
+      </MessagingScopeGate>,
+    );
+
+    expect(getMessagingScope()?.authorityEpoch).toBe("2");
+    expect(mounts).toBe(2);
   });
 
   it("fails closed when duplicate app bindings are returned", () => {

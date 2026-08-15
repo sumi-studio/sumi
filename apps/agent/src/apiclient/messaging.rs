@@ -15,6 +15,8 @@ use super::apps::AppInstallationResolver;
 pub(crate) struct ExactMessagingScope {
     pub workspace_id: String,
     pub installation_id: String,
+    /// Canonical positive signed-int64 decimal wire value.
+    pub authority_epoch: String,
 }
 
 #[derive(Debug, Serialize)]

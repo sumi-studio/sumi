@@ -161,18 +161,20 @@ func (s *testMessagingStore) fixtureScopeForRequest(
 		return scoped, nil
 	}
 	var workspaceID, installationID string
+	var authorityEpoch int64
 	err := s.core.pool.QueryRow(ctx, `
-		SELECT ai.owner_id, ai.installation_id
+		SELECT ai.owner_id, ai.installation_id, ai.authority_epoch
 		FROM app_installations ai
 		JOIN workspaces w ON w.workspace_id = ai.owner_id
 		WHERE ai.owner_kind='workspace' AND ai.app_id=$1 AND ai.enabled
 		ORDER BY w.created_at DESC, ai.installation_id DESC
-		LIMIT 1`, MessagingAppID).Scan(&workspaceID, &installationID)
+		LIMIT 1`, MessagingAppID).Scan(&workspaceID, &installationID, &authorityEpoch)
 	if err != nil {
 		return nil, err
 	}
 	return s.core.Scoped(Scope{
-		WorkspaceID: workspaceID, InstallationID: installationID, Actor: actor,
+		WorkspaceID: workspaceID, InstallationID: installationID,
+		AuthorityEpoch: authorityEpoch, Actor: actor,
 	})
 }
 
@@ -182,13 +184,14 @@ func (s *testMessagingStore) scope(
 	actor ParticipantRef,
 ) (*ScopedStore, error) {
 	var installationID string
+	var authorityEpoch int64
 	err := s.core.pool.QueryRow(ctx, `
-		SELECT installation_id
+		SELECT installation_id, authority_epoch
 		FROM app_installations
 		WHERE owner_kind = 'workspace' AND owner_id = $1
 		  AND app_id = $2 AND enabled
 		ORDER BY installed_at, installation_id
-		LIMIT 1`, workspaceID, MessagingAppID).Scan(&installationID)
+		LIMIT 1`, workspaceID, MessagingAppID).Scan(&installationID, &authorityEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, applicationapps.ErrInstallationNotFound
 	}
@@ -196,7 +199,8 @@ func (s *testMessagingStore) scope(
 		return nil, err
 	}
 	return s.core.Scoped(Scope{
-		WorkspaceID: workspaceID, InstallationID: installationID, Actor: actor,
+		WorkspaceID: workspaceID, InstallationID: installationID,
+		AuthorityEpoch: authorityEpoch, Actor: actor,
 	})
 }
 

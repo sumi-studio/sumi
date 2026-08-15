@@ -11,6 +11,7 @@ import {
 const SCOPE = {
   workspaceId: "workspace-1",
   installationId: "installation-1",
+  authorityEpoch: "1",
 } as const;
 
 afterEach(() => setActiveMessagingScope(null));
@@ -30,6 +31,7 @@ describe("MessagingScope", () => {
     expect(url.searchParams.getAll("installation_id")).toEqual([
       "installation-1",
     ]);
+    expect(url.searchParams.getAll("authority_epoch")).toEqual(["1"]);
   });
 
   it("fails closed for an absent, partial, duplicate, or non-Messaging scope", () => {
@@ -38,6 +40,7 @@ describe("MessagingScope", () => {
       scopedMessagingPath("/messaging/bootstrap", {
         workspaceId: "workspace-1",
         installationId: "",
+        authorityEpoch: "1",
       }),
     ).toThrow(/exact Workspace and installation/);
     expect(() =>
@@ -52,6 +55,18 @@ describe("MessagingScope", () => {
         SCOPE,
       ),
     ).toThrow(/already present/);
+    expect(() =>
+      scopedMessagingPath("/messaging/bootstrap?authority_epoch=2", SCOPE),
+    ).toThrow(/already present/);
+    for (const authorityEpoch of ["", "0", "01", "+1", "9223372036854775808"]) {
+      expect(() =>
+        scopedMessagingPath("/messaging/bootstrap", {
+          workspaceId: "workspace-1",
+          installationId: "installation-1",
+          authorityEpoch,
+        }),
+      ).toThrow(/exact Workspace and installation/);
+    }
     expect(() => scopedMessagingPath("/workspaces", SCOPE)).toThrow(
       /only bind Messaging routes/,
     );
@@ -75,6 +90,7 @@ describe("MessagingScope", () => {
     expect(url.searchParams.getAll("installation_id")).toEqual([
       "installation-1",
     ]);
+    expect(url.searchParams.getAll("authority_epoch")).toEqual(["1"]);
   });
 
   it("aborts the previous scope lifetime before publishing a replacement", () => {
@@ -84,6 +100,7 @@ describe("MessagingScope", () => {
     setActiveMessagingScope({
       workspaceId: "workspace-2",
       installationId: "installation-2",
+      authorityEpoch: "2",
     });
 
     expect(previous.signal.aborted).toBe(true);
@@ -92,6 +109,7 @@ describe("MessagingScope", () => {
     expect(current.scope).toEqual({
       workspaceId: "workspace-2",
       installationId: "installation-2",
+      authorityEpoch: "2",
     });
   });
 });

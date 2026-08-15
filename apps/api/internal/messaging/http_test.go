@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,7 @@ func call(t *testing.T, ts *httptest.Server, method, path, cookie string, body a
 				query := parsed.Query()
 				query.Set("workspace_id", scoped.Scope.WorkspaceID)
 				query.Set("installation_id", scoped.Scope.InstallationID)
+				query.Set("authority_epoch", strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10))
 				parsed.RawQuery = query.Encode()
 				path = parsed.String()
 			}

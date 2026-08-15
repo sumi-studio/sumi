@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -732,7 +733,9 @@ func (s *Server) localAppInstallations(w http.ResponseWriter, r *http.Request, a
 // localResolveEnabledApp is the app-lifecycle-owned bind seam used by trusted
 // app adapters. The model selects a Workspace, while the adapter supplies its
 // own fixed app identity. The authenticated local-control authorization is the
-// only source of actor identity; this read neither installs nor enables an app.
+// only source of actor identity; the response returns the exact Workspace,
+// installation, and lifecycle epoch while this read neither installs nor
+// enables an app.
 func (s *Server) localResolveEnabledApp(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		WorkspaceID string `json:"workspace_id"`
@@ -771,8 +774,13 @@ func (s *Server) localResolveEnabledApp(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	writeJSON(w, http.StatusOK, struct {
+		WorkspaceID    string `json:"workspace_id"`
 		InstallationID string `json:"installation_id"`
-	}{InstallationID: installation.InstallationID})
+		AuthorityEpoch string `json:"authority_epoch"`
+	}{
+		WorkspaceID: request.WorkspaceID, InstallationID: installation.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(installation.AuthorityEpoch, 10),
+	})
 }
 
 func (s *Server) localInstallApp(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

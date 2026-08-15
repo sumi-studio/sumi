@@ -142,6 +142,7 @@ func TestProductionHubJoinAndFanoutHaveOneWorkspaceBoundary(t *testing.T) {
 		store, err := w.store.core.Scoped(Scope{
 			WorkspaceID:    ownerStore.Scope.WorkspaceID,
 			InstallationID: ownerStore.Scope.InstallationID,
+			AuthorityEpoch: ownerStore.Scope.AuthorityEpoch,
 			Actor:          actor,
 		})
 		if err != nil {
@@ -429,8 +430,8 @@ func TestLiveAuthorityLeaseRemovalHasBothCommitOrders(t *testing.T) {
 		if err := receiveError(t, disableDone, "disable before socket effect"); err != nil {
 			t.Fatal(err)
 		}
-		if err := receiveError(t, leaseDone, "socket effect after disable"); !errors.Is(err, applicationapps.ErrAppDisabled) {
-			t.Fatalf("socket effect error = %v, want ErrAppDisabled", err)
+		if err := receiveError(t, leaseDone, "socket effect after disable"); !errors.Is(err, applicationapps.ErrInstallationNotFound) {
+			t.Fatalf("socket effect error = %v, want ErrInstallationNotFound", err)
 		}
 		select {
 		case <-effectCalled:
@@ -484,6 +485,46 @@ func TestLiveAuthorityLeaseRemovalHasBothCommitOrders(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestDurableLiveDeliveryRejectsStaleAuthorityEpochAfterReenable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	stale := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	hub := NewHub(w.store.core)
+	staleSub := hub.subscribe(stale)
+	defer hub.unsubscribe(staleSub)
+
+	if _, err := w.apps.SetEnabledByID(ctx, stale.Scope.InstallationID, w.humanA, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.apps.SetEnabledByID(ctx, stale.Scope.InstallationID, w.humanA, true); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{Type: EventTyping, PlaceID: channel.PlaceID}
+	if err := hub.PublishScoped(ctx, stale, event); !errors.Is(
+		err, applicationapps.ErrInstallationNotFound,
+	) {
+		t.Fatalf("requireActor=false stale delivery = %v, want installation not found", err)
+	}
+	if got := len(staleSub.send); got != 0 {
+		t.Fatalf("stale delivery queued %d frames", got)
+	}
+
+	current := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	currentSub := hub.subscribe(current)
+	defer hub.unsubscribe(currentSub)
+	if err := hub.PublishScoped(ctx, current, event); err != nil {
+		t.Fatalf("current delivery: %v", err)
+	}
+	if got := len(currentSub.send); got != 1 {
+		t.Fatalf("current subscriber received %d frames, want one", got)
+	}
+	if got := len(staleSub.send); got != 0 {
+		t.Fatalf("current epoch event crossed into stale subscriber: %d frames", got)
+	}
 }
 
 // controlledSessionAdmission models the same shared-admission/exclusive-

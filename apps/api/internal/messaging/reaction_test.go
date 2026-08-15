@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ func callLocal(
 		if scoped, err := store.fixtureScopeForRequest(ctx, PersonalityAgent(authorization.PersonalityAgentID), path, body); err == nil {
 			body["workspace_id"] = scoped.Scope.WorkspaceID
 			body["installation_id"] = scoped.Scope.InstallationID
+			body["authority_epoch"] = strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10)
 		}
 	}
 	raw, err := json.Marshal(body)
