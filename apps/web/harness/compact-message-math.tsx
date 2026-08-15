@@ -2,6 +2,8 @@ import "@sumi/ui/globals.css";
 import { CompactMessageResponse } from "@sumi/ui/ai-elements/compact-message-response";
 import { createRoot } from "react-dom/client";
 
+const macroExpansionProbe = `\\def\\boom{${"x".repeat(200)}}${"\\boom".repeat(200)}`;
+
 function App() {
   return (
     <main className="space-y-6 p-4">
@@ -22,6 +24,17 @@ function App() {
         <CompactMessageResponse>
           {"Price $5, formula:$x$"}
         </CompactMessageResponse>
+      </section>
+      <section id="currency-japanese">
+        <CompactMessageResponse>{"価格は$5。式は$x$"}</CompactMessageResponse>
+      </section>
+      <section id="numeric-formula-adjacent">
+        <CompactMessageResponse>
+          {"結果は$5 + x$です。次は$y$"}
+        </CompactMessageResponse>
+      </section>
+      <section id="macro-expansion">
+        <CompactMessageResponse>{`$${macroExpansionProbe}$`}</CompactMessageResponse>
       </section>
       <section id="copy-mixed">
         <CompactMessageResponse>

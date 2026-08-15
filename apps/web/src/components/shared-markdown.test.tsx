@@ -230,6 +230,7 @@ describe("@sumi/ui CompactMessageResponse", () => {
     ["Price $5, formula:$x$", "Price $5, formula:", "x"],
     ["Price $5,formula:$x$", "Price $5,formula:", "x"],
     ["価格は$5、式は$x+1$", "価格は$5、式は", "x+1"],
+    ["価格は$5。式は$x$", "価格は$5。式は", "x"],
   ])("re-synchronizes a currency opener before adjacent math: %s", (source, expectedText, expectedTex) => {
     const { container } = render(
       <CompactMessageResponse>{source}</CompactMessageResponse>,
@@ -242,15 +243,36 @@ describe("@sumi/ui CompactMessageResponse", () => {
     ).toHaveTextContent(expectedTex);
   });
 
-  it("does not re-synchronize a valid numeric formula followed by adjacent prose", () => {
+  it.each([
+    ["result $5+x$then $y$", ["5+x", "y"]],
+    ["result $5 + x$then $y$", ["5 + x", "y"]],
+    ["結果は$5 + x$です。次は$y$", ["5 + x", "y"]],
+    [String.raw`result $5 \times x$then $y$`, [String.raw`5 \times x`, "y"]],
+    ["result $5x$then $y$", ["5x", "y"]],
+    ["result $5, x$then $y$", ["5, x", "y"]],
+  ])("keeps a structurally valid numeric formula before later math: %s", (source, expected) => {
     const { container } = render(
-      <CompactMessageResponse>{"result $5+x$then $y$"}</CompactMessageResponse>,
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
     );
 
     const annotations = [
       ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
     ].map((annotation) => annotation.textContent);
-    expect(annotations).toEqual(["5+x", "y"]);
+    expect(annotations).toEqual(expected);
+  });
+
+  it.each([
+    "ambiguous $5 words$x$",
+    "曖昧な値は$5 変数$x$",
+    "Price $5, formula$x$",
+    "価格は$5、式$x$",
+  ])("leaves an ambiguous shared dollar sequence inert: %s", (source) => {
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container).toHaveTextContent(source);
   });
 
   it.each([
@@ -459,6 +481,56 @@ describe("@sumi/ui CompactMessageResponse", () => {
     expect(container.querySelector(".katex")).toBeNull();
     expect(
       container.querySelector("[data-math-fallback=tokens]"),
+    ).toHaveTextContent(tex);
+  });
+
+  it.each([
+    String.raw`\def\foo{x}`,
+    String.raw`\gdef\foo{x}`,
+    String.raw`\edef\foo{x}`,
+    String.raw`\xdef\foo{x}`,
+    String.raw`\newcommand{\foo}{x}`,
+    String.raw`\renewcommand{\frac}{x}`,
+    String.raw`\providecommand{\foo}{x}`,
+    String.raw`\let\foo=x`,
+    String.raw`\futurelet\foo xy`,
+    String.raw`\global\def\foo{x}`,
+    String.raw`\long\def\foo{x}`,
+  ])("rejects author-defined TeX commands before KaTeX: %s", (tex) => {
+    const { container } = render(
+      <CompactMessageResponse>{`$${tex}$`}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(
+      container.querySelector("[data-math-fallback=macro]"),
+    ).toHaveTextContent(tex);
+  });
+
+  it("bounds a 200-by-200 macro expansion to one source fallback", () => {
+    const body = "x".repeat(200);
+    const tex = `\\def\\boom{${body}}${"\\boom".repeat(200)}`;
+    const { container } = render(
+      <CompactMessageResponse>{`$${tex}$`}</CompactMessageResponse>,
+    );
+
+    const fallback = container.querySelector("[data-math-fallback=macro]");
+    expect(tex.length).toBeLessThan(4_096);
+    expect(fallback).toHaveTextContent(tex);
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.querySelectorAll("*").length).toBeLessThan(10);
+  });
+
+  it("continues to render ordinary built-in TeX commands", () => {
+    const tex = String.raw`\frac{1}{2}+\sqrt{x}+\operatorname{rank}(A)+a\longrightarrow b`;
+    const { container } = render(
+      <CompactMessageResponse>{`$${tex}$`}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector("[data-math-fallback=macro]")).toBeNull();
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
     ).toHaveTextContent(tex);
   });
 
