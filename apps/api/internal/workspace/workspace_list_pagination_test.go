@@ -27,8 +27,7 @@ func TestWorkspaceListCursorIsOpaqueTamperEvidentAndActorBound(t *testing.T) {
 		PersonalityAgentID: testAgentA,
 	}
 	position := workspaceListCursorPosition{
-		JoinedAt:          time.Date(2026, 8, 15, 1, 2, 3, 456789123, time.FixedZone("fixture", 9*60*60)),
-		WorkspaceMemberID: "0198f0f4-9b72-7000-8000-000000000711",
+		WorkspaceID: "0198f0f4-9b72-7000-8000-000000000711",
 	}
 
 	cursor, err := encodeWorkspaceListCursor(position, authorization)
@@ -42,8 +41,7 @@ func TestWorkspaceListCursorIsOpaqueTamperEvidentAndActorBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.WorkspaceMemberID != position.WorkspaceMemberID ||
-		decoded.JoinedAt.UnixMicro() != position.JoinedAt.UnixMicro() {
+	if decoded.WorkspaceID != position.WorkspaceID {
 		t.Fatalf("cursor round trip = %#v, want %#v", decoded, position)
 	}
 
@@ -85,12 +83,21 @@ func TestWorkspaceListCursorIsOpaqueTamperEvidentAndActorBound(t *testing.T) {
 	}
 
 	wire[0] = workspaceListCursorVersion
+	wire[1] = 1
+	copy(wire[workspaceListCursorPayloadBytes:],
+		workspaceListCursorMAC(authorization, wire[:workspaceListCursorPayloadBytes]))
+	nonzeroReserved := base64.RawURLEncoding.EncodeToString(wire)
+	if _, err := decodeWorkspaceListCursor(nonzeroReserved, authorization); err == nil {
+		t.Fatal("cursor with nonzero reserved payload was accepted")
+	}
+
+	wire[1] = 0
 	clear(wire[9:workspaceListCursorPayloadBytes])
 	copy(wire[workspaceListCursorPayloadBytes:],
 		workspaceListCursorMAC(authorization, wire[:workspaceListCursorPayloadBytes]))
-	invalidTenure := base64.RawURLEncoding.EncodeToString(wire)
-	if _, err := decodeWorkspaceListCursor(invalidTenure, authorization); err == nil {
-		t.Fatal("cursor with a non-UUIDv7 tenure identity was accepted")
+	invalidWorkspace := base64.RawURLEncoding.EncodeToString(wire)
+	if _, err := decodeWorkspaceListCursor(invalidWorkspace, authorization); err == nil {
+		t.Fatal("cursor with a non-UUIDv7 Workspace identity was accepted")
 	}
 }
 
@@ -160,19 +167,28 @@ func TestLocalWorkspaceListPaginationIsBoundedStableAndActorScoped(t *testing.T)
 		t.Fatalf("empty page = %#v", empty)
 	}
 
+	// This Workspace predates the traversal but Agent A does not join it until
+	// after page 1. Its low logical key proves that live keyset pagination does
+	// not retroactively inject newly active lower identities into later pages.
+	earlyWorkspace, err := w.store.CreateWorkspace(ctx, "Early human Workspace", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	agentAWorkspaces := createMany(w.agentA, 65, func(i int) string {
 		return fmt.Sprintf("Agent A Workspace %03d", i)
 	})
-	// This active non-owner tenure is deliberately closed between page calls.
-	removableWorkspace, err := w.store.CreateWorkspace(ctx, "Human owner", w.humanA)
+	// This higher-key non-owner membership is active on page 1 and closes
+	// before later pages, proving that each page uses fresh active truth.
+	removableWorkspace, err := w.store.CreateWorkspace(ctx, "Removable human Workspace", w.humanA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	invite, err := w.store.CreateInvite(ctx, removableWorkspace.WorkspaceID, w.humanA)
+	removableInvite, err := w.store.CreateInvite(ctx, removableWorkspace.WorkspaceID, w.humanA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.store.RedeemInvite(ctx, invite.Code, w.agentA); err != nil {
+	if _, err := w.store.RedeemInvite(ctx, removableInvite.Code, w.agentA); err != nil {
 		t.Fatal(err)
 	}
 
@@ -186,20 +202,72 @@ func TestLocalWorkspaceListPaginationIsBoundedStableAndActorScoped(t *testing.T)
 		t.Fatal("unchanged first-page retry was not deterministic")
 	}
 
-	// Fresh reads may reflect both closure and admission after the first page.
+	decodedFirstCursor, err := decodeWorkspaceListCursor(first.NextCursor, authA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedFirstCursor.WorkspaceID != first.Workspaces[len(first.Workspaces)-1].WorkspaceID {
+		t.Fatalf("cursor Workspace = %s, want page boundary %s",
+			decodedFirstCursor.WorkspaceID, first.Workspaces[len(first.Workspaces)-1].WorkspaceID)
+	}
+	if earlyWorkspace.WorkspaceID >= decodedFirstCursor.WorkspaceID {
+		t.Fatalf("early Workspace key %s did not precede cursor %s",
+			earlyWorkspace.WorkspaceID, decodedFirstCursor.WorkspaceID)
+	}
+	if removableWorkspace.WorkspaceID <= decodedFirstCursor.WorkspaceID {
+		t.Fatalf("removable Workspace key %s did not follow cursor %s",
+			removableWorkspace.WorkspaceID, decodedFirstCursor.WorkspaceID)
+	}
+
+	// Recreate the membership tenure of a Workspace already emitted on page 1.
+	// The logical Workspace key is unchanged, so it must never reappear later.
+	duplicateTargetID := first.Workspaces[0].WorkspaceID
+	successorInvite, err := w.store.CreateInvite(ctx, duplicateTargetID, w.agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor, err := w.store.RedeemInvite(ctx, successorInvite.Code, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.TransferOwnership(ctx, duplicateTargetID,
+		successor.WorkspaceMemberID, w.agentA); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.Leave(ctx, duplicateTargetID, w.agentA); err != nil {
+		t.Fatal(err)
+	}
+	rejoinInvite, err := w.store.CreateInvite(ctx, duplicateTargetID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.RedeemInvite(ctx, rejoinInvite.Code, w.agentA); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.store.Leave(ctx, removableWorkspace.WorkspaceID, w.agentA); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh memberships sort according to their Workspace identity. A lower
+	// identity is visible only on restart; a newly-created higher identity is
+	// observed by the remainder of this traversal.
+	earlyInvite, err := w.store.CreateInvite(ctx, earlyWorkspace.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.RedeemInvite(ctx, earlyInvite.Code, w.agentA); err != nil {
 		t.Fatal(err)
 	}
 	newWorkspace, err := w.store.CreateWorkspace(ctx, "Agent A newly joined", w.agentA)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if newWorkspace.WorkspaceID <= decodedFirstCursor.WorkspaceID {
+		t.Fatalf("new Workspace key %s did not follow cursor %s",
+			newWorkspace.WorkspaceID, decodedFirstCursor.WorkspaceID)
+	}
 	agentAWorkspaces = append(agentAWorkspaces, newWorkspace)
 
-	decodedFirstCursor, err := decodeWorkspaceListCursor(first.NextCursor, authA)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, err := w.store.workspacePageFor(ctx, w.agentA, decodedFirstCursor); err != nil {
 		t.Fatalf("direct second-page store read: %v", err)
 	}
@@ -239,8 +307,38 @@ func TestLocalWorkspaceListPaginationIsBoundedStableAndActorScoped(t *testing.T)
 			t.Fatalf("active Workspace %s was omitted", item.WorkspaceID)
 		}
 	}
+	if _, injected := seen[earlyWorkspace.WorkspaceID]; injected {
+		t.Fatalf("new lower-key membership %s was retroactively injected", earlyWorkspace.WorkspaceID)
+	}
 	if _, leaked := seen[removableWorkspace.WorkspaceID]; leaked {
-		t.Fatalf("left membership %s remained visible", removableWorkspace.WorkspaceID)
+		t.Fatalf("closed membership %s remained visible", removableWorkspace.WorkspaceID)
+	}
+	if _, included := seen[newWorkspace.WorkspaceID]; !included {
+		t.Fatalf("new higher-key membership %s was omitted", newWorkspace.WorkspaceID)
+	}
+	duplicateCount := 0
+	for _, page := range [][]workspaceWire{first.Workspaces, second.Workspaces, third.Workspaces} {
+		for _, item := range page {
+			if item.WorkspaceID == duplicateTargetID {
+				duplicateCount++
+			}
+		}
+	}
+	if duplicateCount != 1 {
+		t.Fatalf("leave/rejoin Workspace %s appeared %d times, want once",
+			duplicateTargetID, duplicateCount)
+	}
+	fresh := decodePage(call(authA, `{}`))
+	freshHasEarly := false
+	for _, item := range fresh.Workspaces {
+		if item.WorkspaceID == earlyWorkspace.WorkspaceID {
+			freshHasEarly = true
+			break
+		}
+	}
+	if !freshHasEarly {
+		t.Fatalf("new lower-key membership %s was not visible after restart",
+			earlyWorkspace.WorkspaceID)
 	}
 
 	// Worst-case legal name escaping, including a continuation cursor, remains

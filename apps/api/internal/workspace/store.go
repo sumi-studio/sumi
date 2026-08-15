@@ -125,11 +125,13 @@ func (s *Store) WorkspacesFor(ctx context.Context, actor participant.Ref) ([]Wor
 	return workspaces, nil
 }
 
-// workspaceListCursorPosition is an ordering position, not authority. Every
-// page query re-applies the authenticated actor and active-tenure predicates.
+// workspaceListCursorPosition is a logical output position, not authority.
+// Keying by Workspace identity means that closing and recreating a membership
+// tenure cannot make an already-emitted Workspace reappear on a later page.
+// Every page query still re-applies the authenticated actor and active-tenure
+// predicates.
 type workspaceListCursorPosition struct {
-	JoinedAt          time.Time
-	WorkspaceMemberID string
+	WorkspaceID string
 }
 
 type workspaceListPageItem struct {
@@ -142,9 +144,12 @@ type workspaceListPage struct {
 	HasMore bool
 }
 
-// workspacePageFor returns one fixed-size keyset page of active membership
-// tenures. A membership created or closed between calls is observed according
-// to the fresh query; the cursor never substitutes for actor authorization.
+// workspacePageFor returns one fixed-size keyset page of active Workspace
+// memberships. A membership created or closed between calls is observed by the
+// fresh query when its Workspace identity sorts after the cursor. A newly
+// active lower identity is intentionally visible only after restarting from
+// the first page; this is live keyset pagination, not a snapshot. The cursor
+// never substitutes for actor authorization.
 func (s *Store) workspacePageFor(
 	ctx context.Context,
 	actor participant.Ref,
@@ -153,27 +158,25 @@ func (s *Store) workspacePageFor(
 	if err := actor.Validate(); err != nil {
 		return workspaceListPage{}, err
 	}
-	if after != nil && !isCanonicalUUIDv7(after.WorkspaceMemberID) {
+	if after != nil && !isCanonicalUUIDv7(after.WorkspaceID) {
 		return workspaceListPage{}, ErrInvalidWorkspaceListCursor
 	}
 
 	const firstPageQuery = `
-		SELECT w.workspace_id, w.name, w.owner_workspace_member_id, w.created_at,
-		       wm.joined_at, wm.workspace_member_id
+		SELECT w.workspace_id, w.name, w.owner_workspace_member_id, w.created_at
 		FROM workspace_members wm
 		JOIN workspaces w ON w.workspace_id = wm.workspace_id
 		WHERE wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
-		ORDER BY wm.joined_at, wm.workspace_member_id
+		ORDER BY wm.workspace_id
 		LIMIT $3`
 	const laterPageQuery = `
-		SELECT w.workspace_id, w.name, w.owner_workspace_member_id, w.created_at,
-		       wm.joined_at, wm.workspace_member_id
+		SELECT w.workspace_id, w.name, w.owner_workspace_member_id, w.created_at
 		FROM workspace_members wm
 		JOIN workspaces w ON w.workspace_id = wm.workspace_id
 		WHERE wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
-		  AND (wm.joined_at, wm.workspace_member_id) > ($3, $4::uuidv7)
-		ORDER BY wm.joined_at, wm.workspace_member_id
-		LIMIT $5`
+		  AND wm.workspace_id > $3::uuidv7
+		ORDER BY wm.workspace_id
+		LIMIT $4`
 
 	var (
 		rows pgx.Rows
@@ -184,7 +187,7 @@ func (s *Store) workspacePageFor(
 			localWorkspaceListPageSize+1)
 	} else {
 		rows, err = s.pool.Query(ctx, laterPageQuery, actor.Kind, actor.ID,
-			after.JoinedAt.UTC(), after.WorkspaceMemberID, localWorkspaceListPageSize+1)
+			after.WorkspaceID, localWorkspaceListPageSize+1)
 	}
 	if err != nil {
 		return workspaceListPage{}, fmt.Errorf("list Workspace membership page: %w", err)
@@ -199,11 +202,10 @@ func (s *Store) workspacePageFor(
 			&item.Workspace.Name,
 			&item.Workspace.OwnerWorkspaceMemberID,
 			&item.Workspace.CreatedAt,
-			&item.Position.JoinedAt,
-			&item.Position.WorkspaceMemberID,
 		); err != nil {
 			return workspaceListPage{}, fmt.Errorf("scan Workspace membership page: %w", err)
 		}
+		item.Position.WorkspaceID = item.Workspace.WorkspaceID
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
