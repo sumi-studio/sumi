@@ -580,7 +580,9 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/AppInstallConflict"
+        "503":
+          $ref: "#/components/responses/AppLifecycleUnavailable"
   /app-installations/{installation_id}/state:
     parameters:
       - name: installation_id
@@ -614,6 +616,10 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StaleAppAuthority"
+        "503":
+          $ref: "#/components/responses/AppLifecycleUnavailable"
   /app-installations/{installation_id}:
     parameters:
       - name: installation_id
@@ -635,6 +641,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/AppLifecycleUnavailable"
   /direct-chat/commands:
     post:
       operationId: createDirectChatCommand
@@ -842,6 +850,24 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/APIError"
+    AppInstallConflict:
+      description: Install intent conflicts with current or historical canonical state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AppInstallConflictError"
+    StaleAppAuthority:
+      description: Expected lifecycle authority epoch is no longer current
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/StaleAppAuthorityError"
+    AppLifecycleUnavailable:
+      description: Exact lifecycle intent cannot currently reach a terminal result
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AppLifecycleUnavailableError"
   schemas:
     UUIDv7:
       type: string
@@ -858,7 +884,29 @@ components:
       properties:
         error:
           type: string
-          enum: [invalid_request, invalid_session, missing_session, duplicate_session_cookies, origin_not_allowed, forbidden, owner_protected, membership_not_active, last_administrator, not_found, conflict, internal_error]
+          enum: [invalid_request, invalid_session, missing_session, duplicate_session_cookies, origin_not_allowed, forbidden, owner_protected, membership_not_active, last_administrator, not_found, conflict, install_intent_already_installed, idempotency_conflict, stale_authority, unavailable, internal_error]
+    AppInstallConflictError:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          enum: [conflict, install_intent_already_installed, idempotency_conflict]
+    StaleAppAuthorityError:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          const: stale_authority
+    AppLifecycleUnavailableError:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          const: unavailable
     Workspace:
       type: object
       required: [workspace_id, name, owner_workspace_member_id, created_at]

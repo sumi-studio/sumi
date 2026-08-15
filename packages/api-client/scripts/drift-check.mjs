@@ -48,6 +48,10 @@ try {
 
   const agentEvents = readFileSync(join(tmp, "agent-events.d.ts"), "utf8");
   const schemaTypes = readFileSync(join(tmp, "schema.d.ts"), "utf8");
+  const workspaceHTTP = readFileSync(
+    join(repoRoot, "apps", "api", "internal", "workspace", "http.go"),
+    "utf8",
+  );
   const envelopeMatch = agentEvents.match(/export type Envelope = ([^;]+);/s);
   if (!envelopeMatch || envelopeMatch[1].includes("[k: string]")) {
     failed = true;
@@ -90,6 +94,32 @@ try {
       message:
         "State mutation expected_authority_epoch must remain optional and lossless in generated types.",
     },
+    {
+      component: "APIError",
+      pattern:
+        /install_intent_already_installed[^\n]+idempotency_conflict[^\n]+stale_authority[^\n]+unavailable/,
+      message:
+        "Generated shared APIError must include every runtime app-lifecycle code.",
+    },
+    {
+      component: "AppInstallConflictError",
+      pattern:
+        /error: "conflict" \| "install_intent_already_installed" \| "idempotency_conflict";/,
+      message:
+        "Generated install 409 response must expose only the exact install conflict taxonomy.",
+    },
+    {
+      component: "StaleAppAuthorityError",
+      pattern: /error: "stale_authority";/,
+      message:
+        "Generated state 409 response must expose the exact stale_authority code.",
+    },
+    {
+      component: "AppLifecycleUnavailableError",
+      pattern: /error: "unavailable";/,
+      message:
+        "Generated lifecycle 503 response must expose the exact unavailable code.",
+    },
   ];
   for (const { component, pattern, message } of lifecycleTypeAssertions) {
     const definition = generatedSchemaComponent(schemaTypes, component);
@@ -111,6 +141,84 @@ try {
       failed = true;
       console.error(
         `Generated ${operation} operation must use ${requestComponent} as its canonical request body.`,
+      );
+    }
+  }
+
+  for (const { operation, status, response } of [
+    {
+      operation: "installApp",
+      status: 409,
+      response: "AppInstallConflict",
+    },
+    {
+      operation: "installApp",
+      status: 503,
+      response: "AppLifecycleUnavailable",
+    },
+    {
+      operation: "setAppInstallationState",
+      status: 409,
+      response: "StaleAppAuthority",
+    },
+    {
+      operation: "setAppInstallationState",
+      status: 503,
+      response: "AppLifecycleUnavailable",
+    },
+    {
+      operation: "uninstallApp",
+      status: 503,
+      response: "AppLifecycleUnavailable",
+    },
+  ]) {
+    const definition = generatedOperation(schemaTypes, operation);
+    const expected = `${status}: components["responses"]["${response}"];`;
+    if (definition === undefined || !definition.includes(expected)) {
+      failed = true;
+      console.error(
+        `Generated ${operation} ${status} response must use ${response}.`,
+      );
+    }
+  }
+
+  const writeDomainError = goFunctionBody(workspaceHTTP, "writeDomainError");
+  for (const { domainError, status, code } of [
+    {
+      domainError: "applicationapps.ErrAlreadyInstalled",
+      status: "http.StatusConflict",
+      code: "conflict",
+    },
+    {
+      domainError: "applicationapps.ErrInstallIntentAlreadyInstalled",
+      status: "http.StatusConflict",
+      code: "install_intent_already_installed",
+    },
+    {
+      domainError: "applicationapps.ErrInstallIntentMismatch",
+      status: "http.StatusConflict",
+      code: "idempotency_conflict",
+    },
+    {
+      domainError: "applicationapps.ErrAuthorityEpochStale",
+      status: "http.StatusConflict",
+      code: "stale_authority",
+    },
+    {
+      domainError: "applicationapps.ErrInstallIntentIncomplete",
+      status: "http.StatusServiceUnavailable",
+      code: "unavailable",
+    },
+    {
+      domainError: "directchat.ErrLifecycleFenceUnavailable",
+      status: "http.StatusServiceUnavailable",
+      code: "unavailable",
+    },
+  ]) {
+    if (!goSwitchCaseMaps(writeDomainError, domainError, status, code)) {
+      failed = true;
+      console.error(
+        `OpenAPI lifecycle taxonomy drifted from writeDomainError mapping ${domainError} -> ${status} ${code}.`,
       );
     }
   }
@@ -146,4 +254,30 @@ function generatedBlock(text, marker, indentation) {
       ? text.length
       : start + marker.length + nextLine.index;
   return text.slice(start, end);
+}
+
+function goFunctionBody(source, name) {
+  const start = source.indexOf(`func ${name}(`);
+  if (start === -1) return undefined;
+  const nextFunction = source.indexOf("\nfunc ", start + 1);
+  return source.slice(
+    start,
+    nextFunction === -1 ? source.length : nextFunction,
+  );
+}
+
+function goSwitchCaseMaps(functionBody, domainError, status, code) {
+  if (functionBody === undefined) return false;
+  const errorMarker = `errors.Is(err, ${domainError})`;
+  const errorIndex = functionBody.indexOf(errorMarker);
+  if (errorIndex === -1) return false;
+  const nextCase = functionBody.indexOf(
+    "\n\tcase ",
+    errorIndex + errorMarker.length,
+  );
+  const switchCase = functionBody.slice(
+    errorIndex,
+    nextCase === -1 ? functionBody.length : nextCase,
+  );
+  return switchCase.includes(`writeAPIError(w, ${status}, "${code}")`);
 }

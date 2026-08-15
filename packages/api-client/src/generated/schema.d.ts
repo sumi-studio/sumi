@@ -446,7 +446,19 @@ export interface components {
         UUIDv4: string;
         APIError: {
             /** @enum {string} */
-            error: "invalid_request" | "invalid_session" | "missing_session" | "duplicate_session_cookies" | "origin_not_allowed" | "forbidden" | "owner_protected" | "membership_not_active" | "last_administrator" | "not_found" | "conflict" | "internal_error";
+            error: "invalid_request" | "invalid_session" | "missing_session" | "duplicate_session_cookies" | "origin_not_allowed" | "forbidden" | "owner_protected" | "membership_not_active" | "last_administrator" | "not_found" | "conflict" | "install_intent_already_installed" | "idempotency_conflict" | "stale_authority" | "unavailable" | "internal_error";
+        };
+        AppInstallConflictError: {
+            /** @enum {string} */
+            error: "conflict" | "install_intent_already_installed" | "idempotency_conflict";
+        };
+        StaleAppAuthorityError: {
+            /** @constant */
+            error: "stale_authority";
+        };
+        AppLifecycleUnavailableError: {
+            /** @constant */
+            error: "unavailable";
         };
         Workspace: {
             workspace_id: components["schemas"]["UUIDv7"];
@@ -1183,6 +1195,33 @@ export interface components {
                 "application/json": components["schemas"]["APIError"];
             };
         };
+        /** @description Install intent conflicts with current or historical canonical state */
+        AppInstallConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AppInstallConflictError"];
+            };
+        };
+        /** @description Expected lifecycle authority epoch is no longer current */
+        StaleAppAuthority: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["StaleAppAuthorityError"];
+            };
+        };
+        /** @description Exact lifecycle intent cannot currently reach a terminal result */
+        AppLifecycleUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AppLifecycleUnavailableError"];
+            };
+        };
     };
     parameters: {
         WorkspaceId: components["schemas"]["UUIDv7"];
@@ -1916,7 +1955,8 @@ export interface operations {
             };
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
+            409: components["responses"]["AppInstallConflict"];
+            503: components["responses"]["AppLifecycleUnavailable"];
         };
     };
     setAppInstallationState: {
@@ -1953,6 +1993,8 @@ export interface operations {
             };
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["StaleAppAuthority"];
+            503: components["responses"]["AppLifecycleUnavailable"];
         };
     };
     uninstallApp: {
@@ -1982,6 +2024,7 @@ export interface operations {
             };
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            503: components["responses"]["AppLifecycleUnavailable"];
         };
     };
     createDirectChatCommand: {
