@@ -10,9 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::apiclient::workspace::{
-    WorkspaceApi, WorkspaceApiError, WorkspaceListPage, WorkspaceSummary,
-};
+use crate::apiclient::workspace::{WorkspaceApi, WorkspaceApiError, WorkspaceListPage};
 use crate::provider::types::{ToolDefinition, UserContent};
 
 use super::{
@@ -220,7 +218,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::apiclient::workspace::WorkspaceApiResult;
+    use crate::apiclient::workspace::{WorkspaceApiResult, WorkspaceSummary};
     use crate::provider::types::ValidatedToolArguments;
     use crate::tools::WorkspacePaths;
 

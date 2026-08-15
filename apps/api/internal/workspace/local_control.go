@@ -4,10 +4,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -15,14 +13,14 @@ import (
 )
 
 const (
-	workspaceListCursorVersion      = byte(1)
+	workspaceListCursorVersion      = byte(2)
 	workspaceListCursorPayloadBytes = 1 + 8 + 16
 	workspaceListCursorMACBytes     = sha256.Size
 	workspaceListCursorBytes        = workspaceListCursorPayloadBytes + workspaceListCursorMACBytes
 	// Raw base64url of the fixed 57-byte payload and MAC is exactly 76 bytes.
 	workspaceListCursorEncodedBytes = 76
 	localWorkspaceListResponseBytes = 64 * 1024
-	workspaceListCursorDomain       = "sumi-workspace-list-cursor-v1\x00"
+	workspaceListCursorDomain       = "sumi-workspace-list-cursor-v2\x00"
 )
 
 const (
@@ -149,17 +147,19 @@ func encodeWorkspaceListCursor(
 	position workspaceListCursorPosition,
 	authorization agentevents.LocalRuntimeAuthorization,
 ) (string, error) {
-	if len(authorization.BearerToken) < 32 || !isCanonicalUUIDv7(position.WorkspaceMemberID) {
+	if len(authorization.BearerToken) < 32 || !isCanonicalUUIDv7(position.WorkspaceID) {
 		return "", ErrInvalidWorkspaceListCursor
 	}
-	membershipID, err := uuid.Parse(position.WorkspaceMemberID)
+	workspaceID, err := uuid.Parse(position.WorkspaceID)
 	if err != nil {
 		return "", ErrInvalidWorkspaceListCursor
 	}
 	payload := make([]byte, workspaceListCursorPayloadBytes)
 	payload[0] = workspaceListCursorVersion
-	binary.BigEndian.PutUint64(payload[1:9], uint64(position.JoinedAt.UTC().UnixMicro()))
-	copy(payload[9:], membershipID[:])
+	// Bytes 1:9 are reserved and authenticated as zero. Retaining the original
+	// fixed payload width preserves the 76-character wire bound while version 2
+	// rejects cursors issued by the superseded membership-tenure ordering.
+	copy(payload[9:], workspaceID[:])
 
 	mac := workspaceListCursorMAC(authorization, payload)
 	wire := make([]byte, 0, workspaceListCursorBytes)
@@ -187,13 +187,17 @@ func decodeWorkspaceListCursor(
 	if payload[0] != workspaceListCursorVersion {
 		return nil, ErrInvalidWorkspaceListCursor
 	}
-	membershipID, err := uuid.FromBytes(payload[9:])
-	if err != nil || membershipID.Version() != 7 || membershipID.Variant() != uuid.RFC4122 {
+	for _, reserved := range payload[1:9] {
+		if reserved != 0 {
+			return nil, ErrInvalidWorkspaceListCursor
+		}
+	}
+	workspaceID, err := uuid.FromBytes(payload[9:])
+	if err != nil || workspaceID.Version() != 7 || workspaceID.Variant() != uuid.RFC4122 {
 		return nil, ErrInvalidWorkspaceListCursor
 	}
 	return &workspaceListCursorPosition{
-		JoinedAt:          time.UnixMicro(int64(binary.BigEndian.Uint64(payload[1:9]))).UTC(),
-		WorkspaceMemberID: membershipID.String(),
+		WorkspaceID: workspaceID.String(),
 	}, nil
 }
 
