@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Round-trip the shared `contracts/agent-events-fixtures.json` through
- * JavaScript's JSON parser. This is the TypeScript/Node leg of the T28
- * three-language contract round-trip harness.
+ * Round-trip canonical wire examples through JavaScript's JSON parser. This
+ * is the TypeScript/Node leg of the T28 three-language contract round-trip
+ * harness and also guards lossless app-lifecycle request fields.
  */
 
 import { readFileSync } from "node:fs";
@@ -36,19 +36,47 @@ for (const [name, fixture] of Object.entries(fixtures)) {
   if (wire === undefined) {
     throw new Error(`fixture '${name}' is missing 'wire'`);
   }
-
-  const original = normalize(wire);
-  assertAnyJSONRuntimeBounds(original, `fixture '${name}'`);
-  const json = JSON.stringify(wire);
-  const reparsed = normalize(JSON.parse(json));
-
-  if (JSON.stringify(original) !== JSON.stringify(reparsed)) {
-    console.error(`fixture '${name}' (${kind}) round-trip mismatch`);
-    console.error("original:", JSON.stringify(original, null, 2));
-    console.error("roundtrip:", JSON.stringify(reparsed, null, 2));
-    process.exit(1);
-  }
+  assertJSONRoundTrip(wire, `fixture '${name}' (${kind})`);
   passed += 1;
+}
+
+const appLifecycleFixtures = {
+  workspace_install_without_operation_id: {
+    owner: {
+      kind: "workspace",
+      workspace_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
+    },
+    app_id: "messaging",
+  },
+  participant_install_with_operation_id: {
+    owner: {
+      kind: "participant",
+      participant: {
+        kind: "human",
+        human_id: "018f1e72-6e9a-7c20-8e90-123456789abd",
+      },
+    },
+    app_id: "direct-chat",
+    operation_id: "00000000-0000-4000-8000-000000000101",
+  },
+  state_with_expected_authority_epoch: {
+    state: "disabled",
+    expected_authority_epoch: "9223372036854775807",
+  },
+};
+
+for (const [name, wire] of Object.entries(appLifecycleFixtures)) {
+  assertJSONRoundTrip(wire, `app lifecycle fixture '${name}'`);
+  passed += 1;
+}
+
+if (
+  typeof appLifecycleFixtures.state_with_expected_authority_epoch
+    .expected_authority_epoch !== "string"
+) {
+  throw new Error(
+    "expected_authority_epoch must remain a lossless wire string",
+  );
 }
 
 console.log(`contract round-trip: ${passed} fixtures passed`);
@@ -90,6 +118,19 @@ function normalize(value) {
     out[key] = normalize(value[key]);
   }
   return out;
+}
+
+function assertJSONRoundTrip(wire, name) {
+  const original = normalize(wire);
+  assertAnyJSONRuntimeBounds(original, name);
+  const reparsed = normalize(JSON.parse(JSON.stringify(wire)));
+
+  if (JSON.stringify(original) !== JSON.stringify(reparsed)) {
+    console.error(`${name} round-trip mismatch`);
+    console.error("original:", JSON.stringify(original, null, 2));
+    console.error("roundtrip:", JSON.stringify(reparsed, null, 2));
+    process.exit(1);
+  }
 }
 
 function assertAnyJSONRuntimeBounds(value, path) {
