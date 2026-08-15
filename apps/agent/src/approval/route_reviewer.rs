@@ -4,8 +4,6 @@
 //! decision, evidence, and result types. This module consumes only already
 //! redacted, app-owned evidence; it never receives raw execution arguments.
 
-#![allow(dead_code)]
-
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -626,6 +624,10 @@ impl ExecutionReviewer {
             }
         }
     }
+
+    pub fn block_without_call(&self, terminal: ReviewerTerminalClass) -> ExecutionReviewEvidence {
+        execution_synthetic_block(self, 0, terminal).into_evidence()
+    }
 }
 
 pub struct EscalationReviewer {
@@ -727,6 +729,26 @@ impl EscalationReviewer {
                     return escalation_synthetic_block(self, attempts, class);
                 }
             }
+        }
+    }
+
+    pub fn block_without_call(&self, terminal: ReviewerTerminalClass) -> EscalationReviewEvidence {
+        escalation_synthetic_block(self, 0, terminal).into_evidence()
+    }
+}
+
+impl ExecutionReviewResult {
+    fn into_evidence(self) -> ExecutionReviewEvidence {
+        match self {
+            Self::Allow(evidence) | Self::Block(evidence) => evidence,
+        }
+    }
+}
+
+impl EscalationReviewResult {
+    fn into_evidence(self) -> EscalationReviewEvidence {
+        match self {
+            Self::AskHuman(evidence) | Self::Block(evidence) => evidence,
         }
     }
 }

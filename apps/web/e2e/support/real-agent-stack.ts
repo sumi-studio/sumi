@@ -628,7 +628,6 @@ async function startRealAgentStackOnce(
     const fenceID = `fence-${randomIdentifier()}`;
     const wrappingKey = randomBytes(32).toString("hex");
     const wrappingKeyID = `e2e-${randomIdentifier()}`;
-    const approvalDigestKey = randomBytes(32).toString("hex");
     const executorSocket = join(paths.ipc, "executor.sock");
     const redactions = [
       agentTokenSecret,
@@ -636,7 +635,6 @@ async function startRealAgentStackOnce(
       localControlBearer,
       providerApiKey,
       wrappingKey,
-      approvalDigestKey,
       databaseURL,
     ];
     const baseEnvironment = environmentWithoutSumiConfiguration();
@@ -760,7 +758,6 @@ async function startRealAgentStackOnce(
           ),
           SUMI_AGENT_WRAPPING_KEY_ID: wrappingKeyID,
           SUMI_AGENT_WRAPPING_KEY: wrappingKey,
-          SUMI_APPROVAL_SECRET_DIGEST_KEY: approvalDigestKey,
           SUMI_MODEL_PRESET: "opencode-go",
           SUMI_MODEL_BASE_URL: provider.url,
           SUMI_MODEL_API_KEY_ENV: "SUMI_E2E_PROVIDER_API_KEY",

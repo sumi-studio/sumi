@@ -400,6 +400,7 @@ mod tests {
                     tool_call: ToolCall {
                         id: "private-tool-call-id".to_owned(),
                         name: "private-tool-name".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: serde_json::from_value::<ValidatedToolArguments>(json!({
                             "path": "/workspace/private-tool-argument.txt"
                         }))

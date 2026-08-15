@@ -658,21 +658,10 @@ $defs:
         properties:
           type: { const: approve_once }
       - type: object
-        required: [type, rule]
-        additionalProperties: false
-        properties:
-          type: { const: approve_always }
-          rule: { $ref: '#/$defs/DeferredApprovalRule' }
-      - type: object
         required: [type]
         additionalProperties: false
         properties:
-          type: { const: deny }
-
-  DeferredApprovalRule:
-    type: object
-    description: object boundary preserved for T22/T23; properties are intentionally open
-    additionalProperties: { $ref: '#/$defs/AnyJSON' }
+          type: { const: deny_once }
 
   SteerMode:
     type: string

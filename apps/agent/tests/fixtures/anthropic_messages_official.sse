@@ -29,10 +29,10 @@ event: content_block_start
 data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_01","name":"read_file","input":{}}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"route\":\"normal\",\"input\":{\"path\":"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"notes.txt\"}"}}
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"notes.txt\"}}"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":2}

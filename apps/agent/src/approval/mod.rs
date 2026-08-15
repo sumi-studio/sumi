@@ -1,28 +1,43 @@
 //! Tool execution approval broker and deterministic policy.
 
+#[cfg(test)]
 pub mod action;
+pub mod authority;
+#[cfg(test)]
 pub mod broker;
+#[cfg(test)]
 pub mod policy;
+#[cfg(test)]
 pub mod prompt;
+#[cfg(test)]
 pub mod reviewer;
+pub mod route_broker;
 pub mod route_policy;
 pub mod route_reviewer;
 
+#[cfg(test)]
 #[allow(unused_imports)]
 pub use action::{
     CanonicalAction, Permission, RedactedText, ReviewPath, ReviewPathComponent, ReviewProjection,
     ReviewToken, ReviewableAction, SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
 pub use broker::{ApprovalBroker, ApprovalOutcome, WaiterResult};
+#[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use broker::{ExecutableGrant, GrantLease, GrantRevalidation};
+#[cfg(test)]
 #[allow(unused_imports)]
 pub use policy::{
     ApprovalPolicyBundle, ApprovalPolicyCacheStatus, ApprovalPolicyTrustStore, ApprovalRule,
     LoadedApprovalPolicy, Policy, PolicyDecision, ResolvedDecision, RuleEffect,
     RuleValidationError, SignedApprovalPolicyBundle, UserDecision,
 };
+#[cfg(test)]
 #[allow(unused_imports)]
 pub use prompt::{PromptLimits, ReviewerMessage, ReviewerPrompt, ReviewerRole, TrustedEnvironment};
+#[cfg(test)]
 #[allow(unused_imports)]
 pub use reviewer::{
     AuditDecision, AuditOutcome, CircuitBreaker, CircuitState, ReviewOutcome, ReviewRequest,

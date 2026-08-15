@@ -252,7 +252,7 @@
       }
     }
   },
-  "approval_decision_always_command": {
+  "approval_decision_deny_command": {
     "kind": "command_envelope",
     "wire": {
       "seq": 4,
@@ -268,10 +268,7 @@
       "command": {
         "type": "approval_decision",
         "request_id": "req-2",
-        "decision": {
-          "type": "approve_always",
-          "rule": { "tool_name": "test", "literal_prefix": ["test"] }
-        }
+        "decision": { "type": "deny_once" }
       }
     }
   },

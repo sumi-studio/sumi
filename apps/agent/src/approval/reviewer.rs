@@ -1806,6 +1806,7 @@ mod tests {
                     tool_call: ToolCall {
                         id: "call-1".to_owned(),
                         name: "bash".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: serde_json::from_value(json!({"command": "echo safe"})).unwrap(),
                     },
                     wire_item_index: 0,

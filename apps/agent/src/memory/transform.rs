@@ -504,6 +504,7 @@ mod tests {
             tool_call: ToolCall {
                 id: id.to_owned(),
                 name: name.to_owned(),
+                route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: args(json!({"value": 1})),
             },
             wire_item_index: 0,

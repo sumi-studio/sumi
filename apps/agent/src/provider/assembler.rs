@@ -11,7 +11,7 @@ use super::{
     types::{
         AssistantContent, AssistantMessage, ProviderEvent, ProviderOrigin, RejectedToolCall,
         StopReason, ToolArgsPreview, ToolArgumentError, ToolCall, ToolDefinition,
-        ToolResultMessage, Usage, UserContent, ValidatedToolArguments,
+        ToolInvocationRoute, ToolResultMessage, Usage, UserContent, ValidatedToolArguments,
     },
 };
 
@@ -539,6 +539,7 @@ impl MessageAssembler {
                     .id
                     .len()
                     .checked_add(tool_call.name.len())
+                    .and_then(|bytes| bytes.checked_add(tool_call.route.as_str().len()))
                     .and_then(|bytes| {
                         serde_json::to_vec(tool_call.arguments.as_object())
                             .ok()
@@ -856,17 +857,18 @@ impl FrozenToolSchemaRegistry {
             if validators.contains_key(&tool.name) {
                 return Err(FrozenSchemaError::DuplicateTool(tool.name.clone()));
             }
-            if contains_external_ref(&tool.parameters) {
+            let provider_parameters = tool.provider_parameters();
+            if contains_external_ref(&provider_parameters) {
                 return Err(FrozenSchemaError::ExternalReference(tool.name.clone()));
             }
-            let validator = jsonschema::validator_for(&tool.parameters).map_err(|error| {
+            let validator = jsonschema::validator_for(&provider_parameters).map_err(|error| {
                 FrozenSchemaError::InvalidSchema {
                     tool: tool.name.clone(),
                     message: error.to_string(),
                 }
             })?;
             let mut property_names = HashSet::new();
-            collect_property_names(&tool.parameters, &mut property_names);
+            collect_property_names(&provider_parameters, &mut property_names);
             validators.insert(
                 tool.name.clone(),
                 FrozenToolSchema {
@@ -1004,7 +1006,15 @@ impl ToolArgumentAccumulator {
             return ToolArgsPreview::new(json!({}));
         }
         self.raw.push_str(delta);
-        parse_streaming(&self.raw)
+        let preview = parse_streaming(&self.raw);
+        ToolArgsPreview::new(
+            preview
+                .as_value()
+                .as_object()
+                .and_then(|envelope| envelope.get("input"))
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        )
     }
 
     pub fn raw_len(&self) -> usize {
@@ -1087,20 +1097,50 @@ impl ToolArgumentAccumulator {
                 tool_name,
                 RejectionDetail {
                     error: ToolArgumentError::SchemaViolation,
-                    instance_path: safe_instance_path(
+                    instance_path: app_facing_instance_path(safe_instance_path(
                         &error.instance_path().to_string(),
                         &schema.property_names,
-                    ),
+                    )),
                     constraint: pointer_tail(&schema_path),
                 },
                 timestamp,
             );
         }
 
+        let route = match arguments.get("route").and_then(Value::as_str) {
+            Some("normal") => ToolInvocationRoute::Normal,
+            Some("elevated") => ToolInvocationRoute::Elevated,
+            _ => {
+                return rejected_outcome(
+                    call_id,
+                    tool_name,
+                    RejectionDetail {
+                        error: ToolArgumentError::SchemaViolation,
+                        instance_path: "/route".to_owned(),
+                        constraint: "enum".to_owned(),
+                    },
+                    timestamp,
+                );
+            }
+        };
+        let Some(input) = arguments.get("input").and_then(Value::as_object).cloned() else {
+            return rejected_outcome(
+                call_id,
+                tool_name,
+                RejectionDetail {
+                    error: ToolArgumentError::SchemaViolation,
+                    instance_path: "/input".to_owned(),
+                    constraint: "type".to_owned(),
+                },
+                timestamp,
+            );
+        };
+
         ToolArgumentOutcome::Validated(ToolCall {
             id: call_id,
             name: tool_name,
-            arguments: ValidatedToolArguments::from_schema_validated(arguments),
+            route,
+            arguments: ValidatedToolArguments::from_schema_validated(input),
         })
     }
 
@@ -1268,6 +1308,14 @@ fn safe_instance_path(path: &str, property_names: &HashSet<String>) -> String {
     }
 }
 
+fn app_facing_instance_path(path: String) -> String {
+    match path.strip_prefix("/input") {
+        Some("") => String::new(),
+        Some(inner) => inner.to_owned(),
+        None => path,
+    }
+}
+
 fn unescape_pointer(segment: &str) -> String {
     segment.replace("~1", "/").replace("~0", "~")
 }
@@ -1415,7 +1463,7 @@ mod tests {
     fn tool_terminal_budget_counts_only_durable_identity_and_final_arguments() {
         let registry = schema_registry();
         let mut accumulator = ToolArgumentAccumulator::new();
-        accumulator.append(r#"{"path":"x"}"#);
+        accumulator.append(r#"{"route":"normal","input":{"path":"x"}}"#);
         let ToolArgumentOutcome::Validated(tool_call) =
             accumulator.finish("c", "read_file", &registry, timestamp())
         else {
@@ -1423,6 +1471,7 @@ mod tests {
         };
         let durable_bytes = tool_call.id.len()
             + tool_call.name.len()
+            + tool_call.route.as_str().len()
             + serde_json::to_vec(tool_call.arguments.as_object())
                 .expect("arguments serialize")
                 .len();
@@ -1438,7 +1487,7 @@ mod tests {
         exact
             .apply(&ProviderEvent::ToolCallDelta {
                 content_index: 0,
-                delta: r#"{"path":"x"}"#.to_owned(),
+                delta: r#"{"route":"normal","input":{"path":"x"}}"#.to_owned(),
             })
             .expect("raw arguments are not durable-byte charged");
         exact
@@ -1459,7 +1508,7 @@ mod tests {
         one_short
             .apply(&ProviderEvent::ToolCallDelta {
                 content_index: 0,
-                delta: r#"{"path":"x"}"#.to_owned(),
+                delta: r#"{"route":"normal","input":{"path":"x"}}"#.to_owned(),
             })
             .expect("raw arguments excluded");
         assert_eq!(
@@ -2268,7 +2317,7 @@ mod tests {
     fn preview_repair_never_becomes_validated_arguments() {
         let registry = schema_registry();
         let mut accumulator = ToolArgumentAccumulator::new();
-        let preview = accumulator.append(r#"{"path":"notes"#);
+        let preview = accumulator.append(r#"{"route":"normal","input":{"path":"notes"#);
         assert_eq!(preview, json!({"path": "notes"}));
         let outcome = accumulator.finish("call-1", "read_file", &registry, timestamp());
         assert_rejected(outcome, ToolArgumentError::InvalidJson);
@@ -2279,13 +2328,16 @@ mod tests {
         let registry = schema_registry();
         for (raw, expected) in [
             (r#"["notes.txt"]"#, ToolArgumentError::NonObject),
-            (r#"{"path":""}"#, ToolArgumentError::SchemaViolation),
             (
-                r#"{"path":"notes.txt","extra":true}"#,
+                r#"{"route":"normal","input":{"path":""}}"#,
                 ToolArgumentError::SchemaViolation,
             ),
             (
-                r#"{"path":"notes.txt","limit":0}"#,
+                r#"{"route":"normal","input":{"path":"notes.txt","extra":true}}"#,
+                ToolArgumentError::SchemaViolation,
+            ),
+            (
+                r#"{"route":"normal","input":{"path":"notes.txt","limit":0}}"#,
                 ToolArgumentError::SchemaViolation,
             ),
         ] {
@@ -2302,7 +2354,7 @@ mod tests {
     fn schema_rejection_preserves_known_constraint_and_normalizes_unknown_constraint() {
         let registry = schema_registry();
         let mut known = ToolArgumentAccumulator::new();
-        known.append(r#"{"path":""}"#);
+        known.append(r#"{"route":"normal","input":{"path":""}}"#);
         let known = known.finish("call-known", "read_file", &registry, timestamp());
         let ToolArgumentOutcome::Rejected {
             rejected,
@@ -2355,7 +2407,7 @@ mod tests {
     fn only_schema_valid_object_produces_validated_arguments() {
         let registry = schema_registry();
         let mut accumulator = ToolArgumentAccumulator::new();
-        accumulator.append(r#"{"path":"notes.txt","limit":2}"#);
+        accumulator.append(r#"{"route":"elevated","input":{"path":"notes.txt","limit":2}}"#);
         let ToolArgumentOutcome::Validated(tool_call) =
             accumulator.finish("call-1", "read_file", &registry, timestamp())
         else {
@@ -2367,6 +2419,34 @@ mod tests {
                 .as_object()
                 .expect("object")
         );
+        assert_eq!(tool_call.route, ToolInvocationRoute::Elevated);
+        assert_eq!(
+            tool_call.provider_arguments(),
+            json!({
+                "route": "elevated",
+                "input": {"path":"notes.txt","limit":2}
+            })
+        );
+    }
+
+    #[test]
+    fn route_envelope_is_required_exact_and_never_defaults() {
+        let registry = schema_registry();
+        for raw in [
+            r#"{"input":{"path":"notes.txt"}}"#,
+            r#"{"route":"future","input":{"path":"notes.txt"}}"#,
+            r#"{"route":"normal","input":{"path":"notes.txt"},"extra":true}"#,
+            r#"{"route":"normal","input":"notes.txt"}"#,
+            r#"{"route":"normal","path":"notes.txt"}"#,
+            r#"{"route":"normal","input":{"path":"notes.txt"},"requested_authority":"agent_own"}"#,
+        ] {
+            let mut accumulator = ToolArgumentAccumulator::new();
+            accumulator.append(raw);
+            assert_rejected(
+                accumulator.finish("call-route", "read_file", &registry, timestamp()),
+                ToolArgumentError::SchemaViolation,
+            );
+        }
     }
 
     #[test]

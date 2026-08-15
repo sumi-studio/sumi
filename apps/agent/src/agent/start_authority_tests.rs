@@ -231,7 +231,11 @@ async fn valid_hydrated_authority_starts_the_exact_bound_core() {
     let session_core = session.core.as_ref().expect("Session core");
     assert_eq!(session_core.ownership_id(), bound_core_id);
     assert!(Arc::ptr_eq(
-        session_core.approval.as_ref().expect("composed approval"),
+        session_core
+            .approval
+            .as_ref()
+            .and_then(super::ApprovalRuntime::legacy)
+            .expect("composed legacy approval"),
         &expected_approval
     ));
     assert_eq!(session.executor_generation, generation());

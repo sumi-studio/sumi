@@ -67,21 +67,24 @@ pub enum Command {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalDecision {
     ApproveOnce,
+    #[cfg(test)]
     /// T12 authenticates this closed decision shape but cannot apply it: the
     /// durable approval-rule/policy mutation is owned by T22/T23.
     ApproveAlways {
         rule: DeferredApprovalRule,
     },
-    Deny,
+    DenyOnce,
 }
 
 /// Authenticated, uninterpreted T22/T23 input. T12 requires an object so the
 /// decision cannot be confused with a scalar/null control value, and never
 /// applies or persists a policy from this payload.
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(transparent)]
 pub struct DeferredApprovalRule(serde_json::Value);
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for DeferredApprovalRule {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -501,7 +504,7 @@ mod tests {
 
         for decision in [
             json!({"type":"approve_once"}),
-            json!({"type":"deny"}),
+            json!({"type":"deny_once"}),
             json!({
                 "type":"approve_always",
                 "rule":{"tool_name":"test","literal_prefix":["test"]}

@@ -565,7 +565,7 @@ function applyApprovalResolved(
   const status =
     resolution === "cancelled"
       ? "cancelled"
-      : resolution.decision.type === "deny"
+      : resolution.decision.type === "deny_once"
         ? "denied"
         : "allowed";
   const approvalEntry = session.conversation.entries[`approval:${requestId}`];

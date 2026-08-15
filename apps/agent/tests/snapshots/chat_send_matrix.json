@@ -10,7 +10,7 @@
         "tool_calls": [
           {
             "function": {
-              "arguments": "{\"path\":\"a.txt\"}",
+              "arguments": "{\"input\":{\"path\":\"a.txt\"},\"route\":\"normal\"}",
               "name": "read_file"
             },
             "id": "call|with+noise",
@@ -35,8 +35,19 @@
           "name": "read_file",
           "parameters": {
             "additionalProperties": false,
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"],
+            "properties": {
+              "input": {
+                "additionalProperties": false,
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "type": "object"
+              },
+              "route": {
+                "enum": ["normal", "elevated"],
+                "type": "string"
+              }
+            },
+            "required": ["route", "input"],
             "type": "object"
           }
         },
@@ -132,8 +143,19 @@
           "name": "echo_value",
           "parameters": {
             "additionalProperties": false,
-            "properties": { "value": { "type": "string" } },
-            "required": ["value"],
+            "properties": {
+              "input": {
+                "additionalProperties": false,
+                "properties": { "value": { "type": "string" } },
+                "required": ["value"],
+                "type": "object"
+              },
+              "route": {
+                "enum": ["normal", "elevated"],
+                "type": "string"
+              }
+            },
+            "required": ["route", "input"],
             "type": "object"
           }
         },
@@ -153,7 +175,7 @@
         "tool_calls": [
           {
             "function": {
-              "arguments": "{\"path\":\"a.txt\"}",
+              "arguments": "{\"input\":{\"path\":\"a.txt\"},\"route\":\"normal\"}",
               "name": "read_file"
             },
             "id": "call|with+noise",
@@ -178,8 +200,19 @@
           "name": "read_file",
           "parameters": {
             "additionalProperties": false,
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"],
+            "properties": {
+              "input": {
+                "additionalProperties": false,
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "type": "object"
+              },
+              "route": {
+                "enum": ["normal", "elevated"],
+                "type": "string"
+              }
+            },
+            "required": ["route", "input"],
             "type": "object"
           }
         },
@@ -198,7 +231,7 @@
         "tool_calls": [
           {
             "function": {
-              "arguments": "{\"path\":\"a.txt\"}",
+              "arguments": "{\"input\":{\"path\":\"a.txt\"},\"route\":\"normal\"}",
               "name": "read_file"
             },
             "id": "call|with+noise",
@@ -223,8 +256,19 @@
           "name": "read_file",
           "parameters": {
             "additionalProperties": false,
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"],
+            "properties": {
+              "input": {
+                "additionalProperties": false,
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "type": "object"
+              },
+              "route": {
+                "enum": ["normal", "elevated"],
+                "type": "string"
+              }
+            },
+            "required": ["route", "input"],
             "type": "object"
           }
         },

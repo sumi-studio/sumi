@@ -410,12 +410,13 @@ fn convert_tool(tool: &ToolDefinition) -> Value {
     // OpenAI Responses attempts strict generation by default. Explicitly
     // disable it when the tool schema does not satisfy OpenAI's strict subset;
     // this keeps the provider's fallback behavior explicit in the request.
-    let strict = is_openai_strict_safe(&tool.parameters);
+    let parameters = tool.provider_parameters();
+    let strict = is_openai_strict_safe(&parameters);
     json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
-        "parameters": tool.parameters,
+        "parameters": parameters,
         "strict": strict,
     })
 }
@@ -1169,7 +1170,7 @@ fn convert_input(
                             "type":"function_call",
                             "call_id":tool_call.id,
                             "name":tool_call.name,
-                            "arguments":Value::Object(tool_call.arguments.as_object().clone()).to_string(),
+                            "arguments":tool_call.provider_arguments().to_string(),
                         })),
                         AssistantContent::Thinking { .. } => {}
                         AssistantContent::RejectedToolCall { .. } => {
@@ -4075,7 +4076,7 @@ mod tests {
                 ProviderEvent::ToolCallStart { content_index: 2 },
                 ProviderEvent::ToolCallDelta {
                     content_index: 2,
-                    delta: r#"{"city":"Tokyo"}"#.into(),
+                    delta: r#"{"route":"normal","input":{"city":"Tokyo"}}"#.into(),
                 },
                 ProviderEvent::ToolCallPreview {
                     content_index: 2,
@@ -4086,6 +4087,7 @@ mod tests {
                     tool_call: ToolCall {
                         id: "call_fixture".into(),
                         name: "weather".into(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: ValidatedToolArguments::from_schema_validated(
                             json!({"city":"Tokyo"}).as_object().unwrap().clone(),
                         ),
@@ -4559,14 +4561,14 @@ mod tests {
         let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         for payload in [
             r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":""}}"#,
-            r#"{"type":"response.function_call_arguments.delta","sequence_number":1,"item_id":"fc","output_index":0,"delta":"{\"city\":\"Tokyo\"}"}"#,
-            r#"{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","sequence_number":1,"item_id":"fc","output_index":0,"delta":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}"#,
+            r#"{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}}"#,
         ] {
             state.push_json(payload).expect("tool event");
         }
         let terminal = state
             .push_json(
-                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_incomplete","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#,
+                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_incomplete","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#,
             )
             .expect("incomplete terminal")
             .terminal
@@ -4584,14 +4586,14 @@ mod tests {
         let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         for payload in [
             r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":""}}"#,
-            r#"{"type":"response.function_call_arguments.delta","sequence_number":1,"item_id":"fc","output_index":0,"delta":"{\"city\":\"Tokyo\"}"}"#,
-            r#"{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","sequence_number":1,"item_id":"fc","output_index":0,"delta":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}"#,
+            r#"{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}}"#,
         ] {
             state.push_json(payload).expect("tool event");
         }
         let terminal = state
             .push_json(
-                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_filter","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"incomplete_details":{"reason":"content_filter","message":"blocked by policy"},"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#,
+                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_filter","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"route\":\"normal\",\"input\":{\"city\":\"Tokyo\"}}"}],"incomplete_details":{"reason":"content_filter","message":"blocked by policy"},"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#,
             )
             .expect("content-filter terminal")
             .terminal

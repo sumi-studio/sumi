@@ -1086,7 +1086,7 @@ mod tests {
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
-    use crate::provider::types::ToolCall;
+    use crate::provider::types::{ToolCall, ToolInvocationRoute};
     use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
@@ -1200,6 +1200,7 @@ mod tests {
         ToolCall {
             id: id.to_owned(),
             name: name.to_owned(),
+            route: ToolInvocationRoute::Normal,
             arguments: validated(arguments),
         }
     }

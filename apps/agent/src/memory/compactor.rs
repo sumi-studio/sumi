@@ -2511,6 +2511,7 @@ mod tests {
                     tool_call: ToolCall {
                         id: "call-1".to_owned(),
                         name: "read_file".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: args(Value::Object(serde_json::Map::from_iter([(
                             "path".to_owned(),
                             Value::String("notes.txt".to_owned()),
@@ -3007,6 +3008,7 @@ mod tests {
                 tool_call: ToolCall {
                     id: "call-1".to_owned(),
                     name: "read_file".to_owned(),
+                    route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments,
                 },
                 wire_item_index: 0,

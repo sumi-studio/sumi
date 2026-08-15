@@ -122,9 +122,7 @@ function TraceRow({ event }: { event: AgentTraceEvent }) {
             ? "拒否"
             : event.status === "cancelled"
               ? "キャンセル"
-              : event.decision?.type === "approve_always"
-                ? "常に許可"
-                : "許可";
+              : "許可";
       return (
         <TraceLine
           icon={Icon}

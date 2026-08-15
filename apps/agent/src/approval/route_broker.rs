@@ -1,0 +1,1330 @@
+//! Route-aware authorization over one already bound app operation.
+//!
+//! This broker deliberately receives no raw provider proposal and owns no app
+//! action vocabulary. The exact app adapter has already resolved the proposal
+//! to a sealed [`BoundToolInvocation`]. Policy, AutoReview, Human review, and
+//! the later durable start all bind to that same immutable identity.
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use serde_json::{Value, json};
+use tokio::sync::{RwLock, oneshot};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::{
+    agent::{ApprovalRequest, ReviewProjection},
+    approval::{
+        authority::{
+            AUTHORIZATION_EVIDENCE_VERSION_V1, ApprovalClock, AuthenticatedCurrentCallDecision,
+            CurrentCallDecision, DENIAL_EVIDENCE_VERSION_V1, ExecutableGrant,
+            ExecutionAuthorityProvenance, HumanAuthorizationContextV1, HumanDecisionEvidence,
+            PolicyDecisionRecord, ToolExecutionAuthorizationEvidence, ToolExecutionDenialEvidence,
+        },
+        route_policy::{
+            ElevatedPolicyEvaluation, NormalPolicyDecision, PolicyEvaluation, PolicySnapshot,
+            RoutePolicy,
+        },
+        route_reviewer::{
+            EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewRequest,
+            EscalationReviewResult, EscalationReviewer, ExecutionReviewEvidence,
+            ExecutionReviewOutcome, ExecutionReviewRequest, ExecutionReviewResult,
+            ExecutionReviewer, ReviewerTerminalClass,
+        },
+    },
+    provider::types::{PublicAssistantContent, PublicMessage, ToolInvocationRoute, UserContent},
+    store::Redactor,
+    tools::{BoundToolInvocation, SealedBoundToolInvocation},
+};
+
+const MAX_CONTEXT_MESSAGES: usize = 12;
+const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
+const MAX_CONTEXT_TOTAL_CHARS: usize = 24_000;
+
+#[derive(Debug)]
+pub(crate) enum RouteApprovalOutcome {
+    Allowed {
+        grant: ExecutableGrant,
+    },
+    Denied {
+        reason: String,
+        evidence: Box<ToolExecutionDenialEvidence>,
+        bound: BoundToolInvocation,
+    },
+    Pending {
+        pending: PendingApproval,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum CurrentCallResolution {
+    Approved {
+        grant: ExecutableGrant,
+        decision: HumanDecisionEvidence,
+    },
+    Denied {
+        decision: HumanDecisionEvidence,
+    },
+    Rejected {
+        decision: HumanDecisionEvidence,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaiterResult {
+    /// The authenticated command path owns the non-cloneable resolution.
+    /// This signal only wakes a waiter that did not observe that command.
+    Resolved,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingApprovalRequest {
+    pub id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub route: ToolInvocationRoute,
+    pub proposal_digest: String,
+    pub descriptor_digest: String,
+    pub bound_evidence_digest: String,
+    pub adapter_id: String,
+    pub adapter_version: u32,
+    pub descriptor: Value,
+    pub review_projection: Value,
+}
+
+impl PendingApprovalRequest {
+    /// Build the Human-facing request without exposing provider review
+    /// evidence or the private route/digest envelope. Exact binding stays in
+    /// the authenticated command context and durable private evidence.
+    pub(crate) fn public_request(&self) -> ApprovalRequest {
+        ApprovalRequest {
+            id: self.id.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            action: ReviewProjection::Reviewable(self.descriptor.clone()),
+            args_summary: self.review_projection.clone(),
+            reason: Some("This exact operation requires one-time approval.".to_owned()),
+            audit: None,
+        }
+    }
+}
+
+struct PendingEntry {
+    sealed: SealedBoundToolInvocation,
+    scope: ApprovalPrincipalScope,
+    run_id: String,
+    turn_id: String,
+    policy: PolicySnapshot,
+    escalation_review: EscalationReviewEvidence,
+    sender: oneshot::Sender<WaiterResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApprovalPrincipalScope {
+    pub tenant_id: String,
+    pub personality_agent_id: String,
+    pub human_principal_id: String,
+}
+
+impl ApprovalPrincipalScope {
+    fn validate(&self) -> Result<()> {
+        for (label, value) in [
+            ("tenant", self.tenant_id.as_str()),
+            ("personality agent", self.personality_agent_id.as_str()),
+            ("Human principal", self.human_principal_id.as_str()),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                anyhow::bail!("approval {label} identity is invalid");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSummary {
+    pub tool_call_id: String,
+    pub tool_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DurablePendingApprovalEvidence {
+    pub bound: BoundToolInvocation,
+    pub policy: PolicySnapshot,
+    pub escalation_review: EscalationReviewEvidence,
+}
+
+pub(crate) struct PendingApproval {
+    request: Box<PendingApprovalRequest>,
+    durable_evidence: DurablePendingApprovalEvidence,
+    receiver: oneshot::Receiver<WaiterResult>,
+    pending: Arc<Mutex<HashMap<String, PendingEntry>>>,
+}
+
+impl PendingApproval {
+    pub(crate) fn request(&self) -> &PendingApprovalRequest {
+        self.request.as_ref()
+    }
+
+    pub(crate) fn receiver_mut(&mut self) -> &mut oneshot::Receiver<WaiterResult> {
+        &mut self.receiver
+    }
+
+    pub(crate) fn durable_evidence(&self) -> &DurablePendingApprovalEvidence {
+        &self.durable_evidence
+    }
+}
+
+impl std::fmt::Debug for PendingApproval {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingApproval")
+            .field("request_id", &self.request.id)
+            .field("tool_call_id", &self.request.tool_call_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.request.id);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RouteApprovalBroker {
+    policy: Arc<RwLock<RoutePolicy>>,
+    clock: ApprovalClock,
+    redactor: Arc<Redactor>,
+    execution_reviewer: Arc<ExecutionReviewer>,
+    escalation_reviewer: Arc<EscalationReviewer>,
+    pending: Arc<Mutex<HashMap<String, PendingEntry>>>,
+    resolving: Arc<Mutex<HashSet<String>>>,
+}
+
+impl std::fmt::Debug for RouteApprovalBroker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteApprovalBroker")
+            .field(
+                "pending",
+                &self.pending.lock().map(|value| value.len()).ok(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RouteApprovalBroker {
+    pub(crate) fn new(
+        policy: RoutePolicy,
+        redactor: Redactor,
+        execution_reviewer: Arc<ExecutionReviewer>,
+        escalation_reviewer: Arc<EscalationReviewer>,
+    ) -> Self {
+        Self {
+            policy: Arc::new(RwLock::new(policy)),
+            clock: Arc::new(Utc::now),
+            redactor: Arc::new(redactor),
+            execution_reviewer,
+            escalation_reviewer,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            resolving: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        mut self,
+        clock: impl Fn() -> chrono::DateTime<Utc> + Send + Sync + 'static,
+    ) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    pub(crate) async fn replace_policy(&self, next: RoutePolicy) -> Result<()> {
+        let now = (self.clock)();
+        let mut current = self.policy.write().await;
+        current.validate_replacement(&next, now)?;
+        *current = next;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_request(
+        &self,
+        sealed: SealedBoundToolInvocation,
+        route: ToolInvocationRoute,
+        transcript: &[PublicMessage],
+        scope: ApprovalPrincipalScope,
+        run_id: &str,
+        turn_id: &str,
+        context_version: &str,
+        cancel: CancellationToken,
+    ) -> Result<RouteApprovalOutcome> {
+        scope.validate()?;
+        let bound = sealed.invocation();
+        let now = (self.clock)();
+
+        match route {
+            ToolInvocationRoute::Normal => {
+                match self.policy.read().await.evaluate_normal(bound, now) {
+                    PolicyEvaluation::Unavailable {
+                        snapshot, reason, ..
+                    } => self.deny(
+                        bound,
+                        route,
+                        snapshot,
+                        PolicyDecisionRecord::Unavailable,
+                        None,
+                        None,
+                        reason,
+                    ),
+                    PolicyEvaluation::Ready {
+                        snapshot,
+                        decision: NormalPolicyDecision::Deny { reason },
+                    } => self.deny(
+                        bound,
+                        route,
+                        snapshot,
+                        PolicyDecisionRecord::Deny,
+                        None,
+                        None,
+                        reason,
+                    ),
+                    PolicyEvaluation::Ready {
+                        snapshot,
+                        decision: NormalPolicyDecision::Allow,
+                    } => self.allow(
+                        sealed,
+                        route,
+                        run_id,
+                        turn_id,
+                        snapshot,
+                        PolicyDecisionRecord::Allow,
+                        ExecutionAuthorityProvenance::AgentOwn,
+                        None,
+                        None,
+                        None,
+                    ),
+                    PolicyEvaluation::Ready {
+                        snapshot,
+                        decision: NormalPolicyDecision::Unmatched,
+                    } => {
+                        let (evidence, bounded_context) = match review_inputs(
+                            bound,
+                            transcript,
+                            context_version,
+                            self.redactor.as_ref(),
+                        ) {
+                            Ok(inputs) => inputs,
+                            Err(_) => {
+                                let review = self.execution_reviewer.block_without_call(
+                                    ReviewerTerminalClass::InsufficientEvidence,
+                                );
+                                let reason = review.decision.rationale.clone();
+                                return self.deny(
+                                    bound,
+                                    route,
+                                    snapshot,
+                                    PolicyDecisionRecord::Unmatched,
+                                    Some(review),
+                                    None,
+                                    reason,
+                                );
+                            }
+                        };
+                        let review = self
+                            .execution_reviewer
+                            .review(
+                                ExecutionReviewRequest {
+                                    action_digest: bound.descriptor_digest.to_hex(),
+                                    redacted_evidence: evidence,
+                                    bounded_context,
+                                },
+                                cancel,
+                            )
+                            .await;
+                        match review {
+                            ExecutionReviewResult::Allow(review)
+                                if review.decision.outcome == ExecutionReviewOutcome::Allow =>
+                            {
+                                self.allow(
+                                    sealed,
+                                    route,
+                                    run_id,
+                                    turn_id,
+                                    snapshot,
+                                    PolicyDecisionRecord::Unmatched,
+                                    ExecutionAuthorityProvenance::AgentOwn,
+                                    Some(review),
+                                    None,
+                                    None,
+                                )
+                            }
+                            ExecutionReviewResult::Allow(review)
+                            | ExecutionReviewResult::Block(review) => {
+                                let reason = review.decision.rationale.clone();
+                                self.deny(
+                                    bound,
+                                    route,
+                                    snapshot,
+                                    PolicyDecisionRecord::Unmatched,
+                                    Some(review),
+                                    None,
+                                    reason,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            ToolInvocationRoute::Elevated => {
+                let snapshot = match self.policy.read().await.evaluate_elevated(bound, now) {
+                    ElevatedPolicyEvaluation::Unavailable {
+                        snapshot, reason, ..
+                    } => {
+                        return self.deny(
+                            bound,
+                            route,
+                            snapshot,
+                            PolicyDecisionRecord::Unavailable,
+                            None,
+                            None,
+                            reason,
+                        );
+                    }
+                    ElevatedPolicyEvaluation::Deny { snapshot, reason } => {
+                        return self.deny(
+                            bound,
+                            route,
+                            snapshot,
+                            PolicyDecisionRecord::Deny,
+                            None,
+                            None,
+                            reason,
+                        );
+                    }
+                    ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
+                };
+                let (evidence, bounded_context) =
+                    match review_inputs(bound, transcript, context_version, self.redactor.as_ref())
+                    {
+                        Ok(inputs) => inputs,
+                        Err(_) => {
+                            let review = self
+                                .escalation_reviewer
+                                .block_without_call(ReviewerTerminalClass::InsufficientEvidence);
+                            let reason = review.decision.rationale.clone();
+                            return self.deny(
+                                bound,
+                                route,
+                                snapshot,
+                                PolicyDecisionRecord::ElevatedPreflight,
+                                None,
+                                Some(review),
+                                reason,
+                            );
+                        }
+                    };
+                let review = self
+                    .escalation_reviewer
+                    .review(
+                        EscalationReviewRequest {
+                            action_digest: bound.descriptor_digest.to_hex(),
+                            redacted_evidence: evidence,
+                            bounded_context,
+                        },
+                        cancel,
+                    )
+                    .await;
+                match review {
+                    EscalationReviewResult::AskHuman(review)
+                        if review.decision.outcome == EscalationReviewOutcome::AskHuman =>
+                    {
+                        self.make_pending(sealed, route, scope, run_id, turn_id, snapshot, review)
+                    }
+                    EscalationReviewResult::AskHuman(review)
+                    | EscalationReviewResult::Block(review) => {
+                        let reason = review.decision.rationale.clone();
+                        self.deny(
+                            bound,
+                            route,
+                            snapshot,
+                            PolicyDecisionRecord::ElevatedPreflight,
+                            None,
+                            Some(review),
+                            reason,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allow(
+        &self,
+        sealed: SealedBoundToolInvocation,
+        route: ToolInvocationRoute,
+        run_id: &str,
+        turn_id: &str,
+        policy: PolicySnapshot,
+        policy_decision: PolicyDecisionRecord,
+        resolved_authority: ExecutionAuthorityProvenance,
+        execution_review: Option<ExecutionReviewEvidence>,
+        escalation_review: Option<EscalationReviewEvidence>,
+        human_decision: Option<HumanDecisionEvidence>,
+    ) -> Result<RouteApprovalOutcome> {
+        let bound = sealed.invocation();
+        let authorization = ToolExecutionAuthorizationEvidence {
+            evidence_version: AUTHORIZATION_EVIDENCE_VERSION_V1.to_owned(),
+            grant_id: Uuid::now_v7().to_string(),
+            tool_call_id: bound.tool_call_id.clone(),
+            route,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest()?.to_hex(),
+            policy,
+            policy_decision,
+            resolved_authority,
+            execution_review,
+            escalation_review,
+            human_decision,
+        };
+        authorization.validate(bound)?;
+        Ok(RouteApprovalOutcome::Allowed {
+            grant: ExecutableGrant::new(
+                self.policy.clone(),
+                self.clock.clone(),
+                sealed,
+                route,
+                run_id.to_owned(),
+                turn_id.to_owned(),
+                authorization,
+            )?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deny(
+        &self,
+        bound: &BoundToolInvocation,
+        route: ToolInvocationRoute,
+        policy: PolicySnapshot,
+        policy_decision: PolicyDecisionRecord,
+        execution_review: Option<ExecutionReviewEvidence>,
+        escalation_review: Option<EscalationReviewEvidence>,
+        reason: String,
+    ) -> Result<RouteApprovalOutcome> {
+        let denial = ToolExecutionDenialEvidence {
+            evidence_version: DENIAL_EVIDENCE_VERSION_V1.to_owned(),
+            tool_call_id: bound.tool_call_id.clone(),
+            route,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest()?.to_hex(),
+            policy,
+            policy_decision,
+            execution_review,
+            escalation_review,
+            reason: non_empty_reason(reason),
+        };
+        denial.validate(bound)?;
+        Ok(RouteApprovalOutcome::Denied {
+            reason: denial.reason.clone(),
+            evidence: Box::new(denial),
+            bound: bound.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_pending(
+        &self,
+        sealed: SealedBoundToolInvocation,
+        route: ToolInvocationRoute,
+        scope: ApprovalPrincipalScope,
+        run_id: &str,
+        turn_id: &str,
+        policy: PolicySnapshot,
+        escalation_review: EscalationReviewEvidence,
+    ) -> Result<RouteApprovalOutcome> {
+        let bound = sealed.invocation();
+        let durable_evidence = DurablePendingApprovalEvidence {
+            bound: bound.clone(),
+            policy: policy.clone(),
+            escalation_review: escalation_review.clone(),
+        };
+        let request_id = Uuid::now_v7().to_string();
+        let request = PendingApprovalRequest {
+            id: request_id.clone(),
+            tool_call_id: bound.tool_call_id.clone(),
+            tool_name: bound.tool_name.clone(),
+            route,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest()?.to_hex(),
+            adapter_id: bound.adapter.id.clone(),
+            adapter_version: bound.adapter.version,
+            descriptor: self.redactor.redact_value(
+                &serde_json::to_value(&bound.descriptor)
+                    .context("serialize approval descriptor")?,
+            )?,
+            review_projection: self
+                .redactor
+                .redact_value(&Value::Object(bound.review_projection.as_object().clone()))?,
+        };
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                request_id,
+                PendingEntry {
+                    sealed,
+                    scope,
+                    run_id: run_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    policy,
+                    escalation_review,
+                    sender,
+                },
+            );
+        Ok(RouteApprovalOutcome::Pending {
+            pending: PendingApproval {
+                request: Box::new(request),
+                durable_evidence,
+                receiver,
+                pending: self.pending.clone(),
+            },
+        })
+    }
+
+    pub(crate) async fn resolve(
+        &self,
+        request_id: &str,
+        command: AuthenticatedCurrentCallDecision,
+    ) -> Option<CurrentCallResolution> {
+        let entry = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(request_id)?;
+        self.resolving
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(request_id.to_owned());
+
+        let bound = entry.sealed.invocation();
+        let bound_evidence_digest = bound
+            .evidence_digest()
+            .map(|digest| digest.to_hex())
+            .unwrap_or_default();
+        let human_context = HumanAuthorizationContextV1 {
+            request_id,
+            command_id: &command.command_id,
+            command_seq: command.command_seq,
+            tenant_id: &command.tenant_id,
+            personality_agent_id: &command.personality_agent_id,
+            human_principal_id: &command.human_principal_id,
+            decision: command.decision,
+            received_at: command.received_at,
+            tool_call_id: &bound.tool_call_id,
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: &bound.proposal_digest.to_hex(),
+            descriptor_digest: &bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: &bound_evidence_digest,
+            policy_source_digest: &entry.policy.source_digest,
+            run_id: &entry.run_id,
+            turn_id: &entry.turn_id,
+        };
+        let human = HumanDecisionEvidence::from_context(human_context)
+            .expect("fixed Human authorization context must serialize");
+        let human_valid = command.tenant_id == entry.scope.tenant_id
+            && command.personality_agent_id == entry.scope.personality_agent_id
+            && command.human_principal_id == entry.scope.human_principal_id;
+        let resolution = if !human_valid {
+            CurrentCallResolution::Rejected {
+                decision: human,
+                reason: "Human decision evidence does not match the pending approval".to_owned(),
+            }
+        } else {
+            match command.decision {
+                CurrentCallDecision::DenyOnce => CurrentCallResolution::Denied { decision: human },
+                CurrentCallDecision::ApproveOnce => {
+                    let now = (self.clock)();
+                    if !self
+                        .policy
+                        .read()
+                        .await
+                        .snapshot_matches(&entry.policy, now)
+                    {
+                        CurrentCallResolution::Rejected {
+                            decision: human,
+                            reason: "authorization policy changed while approval was pending"
+                                .to_owned(),
+                        }
+                    } else {
+                        match self.allow(
+                            entry.sealed,
+                            ToolInvocationRoute::Elevated,
+                            &entry.run_id,
+                            &entry.turn_id,
+                            entry.policy,
+                            PolicyDecisionRecord::ElevatedPreflight,
+                            ExecutionAuthorityProvenance::AgentOwnWithHumanConsent,
+                            None,
+                            Some(entry.escalation_review),
+                            Some(human.clone()),
+                        ) {
+                            Ok(RouteApprovalOutcome::Allowed { grant }) => {
+                                CurrentCallResolution::Approved {
+                                    grant,
+                                    decision: human,
+                                }
+                            }
+                            Ok(_) => unreachable!("allow only returns Allowed"),
+                            Err(error) => CurrentCallResolution::Rejected {
+                                decision: human,
+                                reason: error.to_string(),
+                            },
+                        }
+                    }
+                }
+            }
+        };
+
+        let _ = entry.sender.send(WaiterResult::Resolved);
+        Some(resolution)
+    }
+
+    pub(crate) fn commit_resolution(&self, request_id: &str) {
+        self.resolving
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(request_id);
+    }
+
+    pub(crate) fn is_resolving(&self, request_id: &str) -> bool {
+        self.resolving
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(request_id)
+    }
+
+    pub(crate) fn cancel(&self, request_id: &str) -> bool {
+        let entry = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(request_id);
+        if let Some(entry) = entry {
+            let _ = entry.sender.send(WaiterResult::Cancelled);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn cancel_all(&self) -> Vec<(String, String)> {
+        let entries: Vec<_> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain()
+            .collect();
+        entries
+            .into_iter()
+            .map(|(request_id, entry)| {
+                let tool_call_id = entry.sealed.invocation().tool_call_id.clone();
+                let _ = entry.sender.send(WaiterResult::Cancelled);
+                (request_id, tool_call_id)
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_pending(&self, request_id: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(request_id)
+    }
+
+    pub(crate) fn any_pending(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    }
+
+    pub(crate) fn pending_tool_call_id(&self, request_id: &str) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(request_id)
+            .map(|entry| entry.sealed.invocation().tool_call_id.clone())
+    }
+
+    pub(crate) fn pending_summary(&self, request_id: &str) -> Option<PendingSummary> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(request_id)
+            .map(|entry| PendingSummary {
+                tool_call_id: entry.sealed.invocation().tool_call_id.clone(),
+                tool_name: entry.sealed.invocation().tool_name.clone(),
+            })
+    }
+}
+
+fn review_evidence(bound: &BoundToolInvocation, redactor: &Redactor) -> Result<Value> {
+    redactor.redact_value(&json!({
+        "adapter": &bound.adapter,
+        "descriptor": &bound.descriptor,
+        "review_projection": bound.review_projection.as_object(),
+    }))
+}
+
+fn review_inputs(
+    bound: &BoundToolInvocation,
+    transcript: &[PublicMessage],
+    context_version: &str,
+    redactor: &Redactor,
+) -> Result<(Value, Value)> {
+    Ok((
+        review_evidence(bound, redactor)?,
+        bounded_context(transcript, context_version, redactor)?,
+    ))
+}
+
+fn bounded_context(
+    transcript: &[PublicMessage],
+    context_version: &str,
+    redactor: &Redactor,
+) -> Result<Value> {
+    let mut remaining = MAX_CONTEXT_TOTAL_CHARS;
+    let mut reverse = Vec::new();
+    for message in transcript.iter().rev() {
+        if reverse.len() >= MAX_CONTEXT_MESSAGES || remaining == 0 {
+            break;
+        }
+        let (role, texts): (&str, Vec<&str>) = match message {
+            PublicMessage::User(message) => (
+                "user",
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::Text { text } => Some(text.as_str()),
+                        UserContent::Image { .. } => None,
+                    })
+                    .collect(),
+            ),
+            PublicMessage::Assistant(message) => (
+                "assistant",
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        PublicAssistantContent::Text { text, .. } => Some(text.as_str()),
+                        PublicAssistantContent::Thinking { .. }
+                        | PublicAssistantContent::ToolCall { .. }
+                        | PublicAssistantContent::RejectedToolCall { .. } => None,
+                    })
+                    .collect(),
+            ),
+            // Tool results may contain opaque app payloads. The bound review
+            // projection, not prior result bodies, is the review authority.
+            PublicMessage::ToolResult(_) => continue,
+        };
+        let joined = texts.join("\n");
+        if joined.is_empty() {
+            continue;
+        }
+        let limit = remaining.min(MAX_CONTEXT_TEXT_CHARS);
+        let text = truncate_chars(&joined, limit);
+        remaining = remaining.saturating_sub(text.chars().count());
+        reverse.push(json!({"role": role, "text": redactor.redact_text(&text)}));
+    }
+    reverse.reverse();
+    redactor.redact_value(&json!({
+        "context_version": context_version,
+        "messages": reverse,
+    }))
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn non_empty_reason(reason: String) -> String {
+    if reason.trim().is_empty() {
+        "AutoReview blocked without a rationale".to_owned()
+    } else {
+        reason
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        approval::{
+            authority::GrantRevalidation,
+            route_reviewer::{
+                EscalationReviewerPrompt, EscalationReviewerTransport, ExecutionReviewerPrompt,
+                ExecutionReviewerTransport, ReviewerBudgetV1, ReviewerModelSpec,
+                ReviewerTransportError, ReviewerTrustSet,
+            },
+        },
+        provider::types::{ToolCall, ToolDefinition, ValidatedToolArguments},
+        tools::{
+            AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
+            BoundToolCtx, BoundToolExecutionOutcome, CapabilityClass, DescribeError, ResourceScope,
+            ReviewProjection, Tool, ToolBindCtx, ToolBinding, ToolCtx, ToolError, ToolOutput,
+            ToolRegistryBuilder, ToolRisk, WorkspacePaths,
+        },
+    };
+
+    struct BindingTool {
+        capability: CapabilityClass,
+    }
+
+    #[async_trait]
+    impl Tool for BindingTool {
+        fn def(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "app_action".to_owned(),
+                description: "bound test operation".to_owned(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        fn risk(&self) -> ToolRisk {
+            ToolRisk::Mutating
+        }
+
+        fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+            Some(self)
+        }
+
+        async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+            unreachable!("route broker tests never use the raw execution path")
+        }
+    }
+
+    #[async_trait]
+    impl BoundToolAdapter for BindingTool {
+        fn identity(&self) -> AdapterIdentity {
+            AdapterIdentity::new("test.app", 1).expect("valid adapter")
+        }
+
+        async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+            Ok(ToolBinding::new(
+                AppActionDescriptor::new(
+                    "update_record",
+                    self.capability.clone(),
+                    vec![ResourceScope::resource("test", "record", "record-1")],
+                )?,
+                ReviewProjection::from_value(json!({
+                    "operation": "update_record",
+                    "target": "record-1",
+                    "summary": "replace title"
+                }))?,
+                BoundExecutionArguments::from_value(Value::Object(ctx.args.as_object().clone()))?,
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _ctx: BoundToolCtx<'_>,
+        ) -> Result<BoundToolExecutionOutcome, ToolError> {
+            unreachable!("route broker tests never execute the app operation")
+        }
+    }
+
+    struct ExecutionFake {
+        model: ReviewerModelSpec,
+        response: String,
+        calls: AtomicUsize,
+        prompts: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl ExecutionReviewerTransport for ExecutionFake {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &self.model
+        }
+
+        async fn complete(
+            &self,
+            prompt: &ExecutionReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> std::result::Result<String, ReviewerTransportError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.prompts
+                .lock()
+                .expect("execution prompts")
+                .push(serde_json::to_value(prompt).expect("serialize prompt"));
+            Ok(self.response.clone())
+        }
+    }
+
+    struct EscalationFake {
+        model: ReviewerModelSpec,
+        response: String,
+        calls: AtomicUsize,
+        prompts: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl EscalationReviewerTransport for EscalationFake {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &self.model
+        }
+
+        async fn complete(
+            &self,
+            prompt: &EscalationReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> std::result::Result<String, ReviewerTransportError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.prompts
+                .lock()
+                .expect("escalation prompts")
+                .push(serde_json::to_value(prompt).expect("serialize prompt"));
+            Ok(self.response.clone())
+        }
+    }
+
+    fn model() -> ReviewerModelSpec {
+        ReviewerModelSpec::new(
+            "reviewer-model",
+            "test-provider",
+            "https://reviewer.test/v1",
+            "test-account",
+            "test-trust-domain",
+            "test-processing-policy",
+        )
+    }
+
+    fn broker(
+        execution_response: Value,
+        escalation_response: Value,
+    ) -> (RouteApprovalBroker, Arc<ExecutionFake>, Arc<EscalationFake>) {
+        let execution_transport = Arc::new(ExecutionFake {
+            model: model(),
+            response: execution_response.to_string(),
+            calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let escalation_transport = Arc::new(EscalationFake {
+            model: model(),
+            response: escalation_response.to_string(),
+            calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let trust = ReviewerTrustSet::new(model(), Vec::new());
+        let execution = Arc::new(
+            ExecutionReviewer::new(
+                model(),
+                trust.clone(),
+                execution_transport.clone(),
+                ReviewerBudgetV1::execution(),
+            )
+            .expect("execution reviewer"),
+        );
+        let escalation = Arc::new(
+            EscalationReviewer::new(
+                model(),
+                trust,
+                escalation_transport.clone(),
+                ReviewerBudgetV1::escalation(),
+            )
+            .expect("escalation reviewer"),
+        );
+        (
+            RouteApprovalBroker::new(
+                RoutePolicy::baseline_only_v1(),
+                Redactor::v1(),
+                execution,
+                escalation,
+            ),
+            execution_transport,
+            escalation_transport,
+        )
+    }
+
+    fn scope() -> ApprovalPrincipalScope {
+        ApprovalPrincipalScope {
+            tenant_id: "tenant-1".to_owned(),
+            personality_agent_id: "agent-1".to_owned(),
+            human_principal_id: "human-1".to_owned(),
+        }
+    }
+
+    async fn sealed(
+        capability: CapabilityClass,
+        route: ToolInvocationRoute,
+    ) -> SealedBoundToolInvocation {
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(BindingTool { capability }))
+            .expect("register bound tool");
+        let registry = builder.build();
+        let call = ToolCall {
+            id: "tool-call-1".to_owned(),
+            name: "app_action".to_owned(),
+            route,
+            arguments: serde_json::from_value::<ValidatedToolArguments>(json!({
+                "title": "new title"
+            }))
+            .expect("validated arguments"),
+        };
+        registry
+            .bind(
+                &call,
+                "flow-1",
+                &WorkspacePaths::new("/workspace").expect("workspace"),
+            )
+            .await
+            .expect("bound invocation")
+    }
+
+    fn command(decision: CurrentCallDecision) -> AuthenticatedCurrentCallDecision {
+        AuthenticatedCurrentCallDecision {
+            command_id: Uuid::now_v7().to_string(),
+            command_seq: 7,
+            tenant_id: "tenant-1".to_owned(),
+            personality_agent_id: "agent-1".to_owned(),
+            human_principal_id: "human-1".to_owned(),
+            decision,
+            received_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_baseline_read_skips_both_reviewers() {
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"block",
+                "risk":"high",
+                "misunderstanding":null,
+                "rationale":"unused"
+            }),
+        );
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Read, ToolInvocationRoute::Normal).await,
+                ToolInvocationRoute::Normal,
+                &[],
+                scope(),
+                "run-1",
+                "turn-1",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("route decision");
+        let RouteApprovalOutcome::Allowed { grant } = outcome else {
+            panic!("read should use the baseline Allow fast path")
+        };
+        assert_eq!(
+            grant.evidence().policy_decision,
+            PolicyDecisionRecord::Allow
+        );
+        assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_unmatched_uses_execution_review_and_seals_one_effect() {
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"allow","risk":"medium","rationale":"bounded and intended"}),
+            json!({
+                "outcome":"block",
+                "risk":"high",
+                "misunderstanding":null,
+                "rationale":"unused"
+            }),
+        );
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Normal).await,
+                ToolInvocationRoute::Normal,
+                &[],
+                scope(),
+                "run-1",
+                "turn-1",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("route decision");
+        let RouteApprovalOutcome::Allowed { grant } = outcome else {
+            panic!("valid execution review should authorize Normal")
+        };
+        assert_eq!(execution.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            grant.evidence().policy_decision,
+            PolicyDecisionRecord::Unmatched
+        );
+        let (status, lease, _, _) = grant
+            .authorize(
+                "tool-call-1",
+                "app_action",
+                ToolInvocationRoute::Normal,
+                "run-1",
+                "turn-1",
+            )
+            .await
+            .expect("grant revalidation");
+        assert_eq!(status, GrantRevalidation::Valid);
+        drop(lease);
+        let authorized = grant.into_authorized_bound();
+        assert_eq!(authorized.tool_call_id(), "tool-call-1");
+        assert_eq!(
+            authorized.into_sealed().invocation().tool_call_id,
+            "tool-call-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevated_review_only_creates_exact_current_call_human_request() {
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"ask_human",
+                "risk":"medium",
+                "misunderstanding":null,
+                "rationale":"clear exact target"
+            }),
+        );
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[],
+                scope(),
+                "run-1",
+                "turn-1",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("route decision");
+        let RouteApprovalOutcome::Pending { mut pending } = outcome else {
+            panic!("Escalation AskHuman should create a pending current-call request")
+        };
+        let request = pending.request().clone();
+        assert_eq!(request.route, ToolInvocationRoute::Elevated);
+        assert_eq!(request.tool_call_id, "tool-call-1");
+        let public_request = request.public_request();
+        let public_json = serde_json::to_string(&public_request).expect("public approval request");
+        assert!(!public_json.contains("clear exact target"));
+        assert!(!public_json.contains(&request.proposal_digest));
+        assert!(!public_json.contains(&request.descriptor_digest));
+        assert!(!public_json.contains(&request.bound_evidence_digest));
+        assert!(!public_json.contains(&request.adapter_id));
+        assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 1);
+
+        let resolution = broker
+            .resolve(&request.id, command(CurrentCallDecision::ApproveOnce))
+            .await
+            .expect("pending resolution");
+        let CurrentCallResolution::Approved { grant, .. } = resolution else {
+            panic!("exact current-call approval should authorize")
+        };
+        assert_eq!(
+            grant.evidence().resolved_authority,
+            ExecutionAuthorityProvenance::AgentOwnWithHumanConsent
+        );
+        assert!(matches!(
+            pending.receiver_mut().await.expect("waiter result"),
+            WaiterResult::Resolved
+        ));
+    }
+
+    #[tokio::test]
+    async fn elevated_resolution_rejects_a_different_human_actor() {
+        let (broker, _, _) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"ask_human",
+                "risk":"medium",
+                "misunderstanding":null,
+                "rationale":"clear exact target"
+            }),
+        );
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[],
+                scope(),
+                "run-1",
+                "turn-1",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("route decision");
+        let RouteApprovalOutcome::Pending { pending } = outcome else {
+            panic!("Escalation AskHuman should create a pending current-call request")
+        };
+        let mut wrong_actor = command(CurrentCallDecision::ApproveOnce);
+        wrong_actor.human_principal_id = "human-2".to_owned();
+
+        let resolution = broker
+            .resolve(&pending.request().id, wrong_actor)
+            .await
+            .expect("pending resolution");
+        assert!(matches!(resolution, CurrentCallResolution::Rejected { .. }));
+    }
+
+    #[test]
+    fn reviewer_context_omits_thinking_tool_calls_results_and_redacts_text() {
+        let transcript: Vec<PublicMessage> = serde_json::from_value(json!([
+            {
+                "role":"user",
+                "content":[{"type":"text","text":"token sk-abcdefghijklmnop"}],
+                "timestamp":"2026-08-11T00:00:00Z"
+            },
+            {
+                "role":"tool_result",
+                "tool_call_id":"old-call",
+                "tool_name":"old-tool",
+                "content":[{"type":"text","text":"opaque result"}],
+                "details":{"secret":"must-not-appear"},
+                "is_error":false,
+                "timestamp":"2026-08-11T00:00:01Z"
+            }
+        ]))
+        .expect("public transcript");
+        let context =
+            bounded_context(&transcript, "v1", &Redactor::v1()).expect("bounded reviewer context");
+        let encoded = serde_json::to_string(&context).expect("encode context");
+        assert!(!encoded.contains("abcdefghijklmnop"));
+        assert!(!encoded.contains("opaque result"));
+        assert!(!encoded.contains("must-not-appear"));
+        assert!(encoded.contains("REDACTED"));
+    }
+}

@@ -160,11 +160,7 @@ export type ApprovalDecision =
       type: "approve_once";
     }
   | {
-      type: "approve_always";
-      rule: DeferredApprovalRule;
-    }
-  | {
-      type: "deny";
+      type: "deny_once";
     };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -630,15 +626,6 @@ export interface ApprovalResolvedEvent {
   type: "approval_resolved";
   request_id: string;
   resolution: ApprovalResolution;
-}
-/**
- * object boundary preserved for T22/T23; properties are intentionally open
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "DeferredApprovalRule".
- */
-export interface DeferredApprovalRule {
-  [k: string]: AnyJSON;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

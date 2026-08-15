@@ -91,9 +91,13 @@
   "kimi_toolcall": [
     { "type": "start" },
     { "content_index": 0, "type": "tool_call_start" },
-    { "content_index": 0, "delta": "{\"path\":", "type": "tool_call_delta" },
+    {
+      "content_index": 0,
+      "delta": "{\"route\":\"normal\",\"input\":{\"path\":",
+      "type": "tool_call_delta"
+    },
     { "content_index": 0, "preview": {}, "type": "tool_call_preview" },
-    { "content_index": 0, "delta": "\"a.txt\"}", "type": "tool_call_delta" },
+    { "content_index": 0, "delta": "\"a.txt\"}}", "type": "tool_call_delta" },
     {
       "content_index": 0,
       "preview": { "path": "a.txt" },
@@ -104,7 +108,8 @@
       "tool_call": {
         "arguments": { "path": "a.txt" },
         "id": "call-1",
-        "name": "read_file"
+        "name": "read_file",
+        "route": "normal"
       },
       "type": "tool_call_end"
     },
@@ -116,7 +121,8 @@
               "tool_call": {
                 "arguments": { "path": "a.txt" },
                 "id": "call-1",
-                "name": "read_file"
+                "name": "read_file",
+                "route": "normal"
               },
               "type": "tool_call",
               "wire_item_index": 0
@@ -160,7 +166,7 @@
     { "content_index": 1, "type": "tool_call_start" },
     {
       "content_index": 1,
-      "delta": "{\"command\":\"pwd\"}",
+      "delta": "{\"route\":\"normal\",\"input\":{\"command\":\"pwd\"}}",
       "type": "tool_call_delta"
     },
     {
@@ -174,7 +180,8 @@
       "tool_call": {
         "arguments": { "command": "pwd" },
         "id": "call-2",
-        "name": "bash"
+        "name": "bash",
+        "route": "normal"
       },
       "type": "tool_call_end"
     },
@@ -192,7 +199,8 @@
               "tool_call": {
                 "arguments": { "command": "pwd" },
                 "id": "call-2",
-                "name": "bash"
+                "name": "bash",
+                "route": "normal"
               },
               "type": "tool_call",
               "wire_item_index": 1

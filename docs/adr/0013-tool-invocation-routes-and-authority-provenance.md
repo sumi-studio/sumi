@@ -49,9 +49,21 @@ routeはpolicy評価、review、Human approval、実行開始、audit、recovery
 各tool callごとにrouteを選ぶ。deploymentや人格agent全体へ設定するproduct-wide
 `ReviewerMode`は置かない。
 
-routeを各providerのtool-call表現へどう載せるかは本ADRでは確定しない。ただしrouteを欠いた
-実行可能callを暗黙にNormalと解釈しない。provider-neutral encodingを凍結する実装まで、
-route欠落はfail-closedにする。
+providerへ提示する全tool schemaは、app-owned input schemaを次のfoundation-owned envelopeで
+包む。provider固有adapterはこの同じJSON shapeを各providerのtool-call argumentsへ載せ、
+providerから戻った値を共通assemblerがstrictに検証してから`ToolCall`へ分離する。
+
+```json
+{
+  "route": "normal | elevated",
+  "input": { "...": "app-owned tool input" }
+}
+```
+
+outer objectの必須fieldは`route`と`input`だけで、未知field、未知route、非objectの`input`、
+route欠落を拒否する。欠落を暗黙にNormalと解釈せず、provider adapterごとの別語彙や
+途中変換を作らない。requested authority provenanceはこのprovider-facing envelopeへ載せず、
+route確定後の認証済みauthority経路で別に束縛する。
 
 ### 2. NormalはHumanへpromptしない経路である
 
@@ -245,12 +257,10 @@ compatibility branchを作らない。
    既存のNormal callを途中変換・replayしたり、Deny / BlockをHuman promptへ
    fallbackしたりせず、別のexplicit Elevated ToolCall proposalとして型付ける。
 2. Normalのexplicit `Deny`を観測した後、同じactionをElevatedで提案できる条件。
-3. Normal/Elevatedおよび要求authority provenanceを各providerのtool-call表現へ載せる
-   provider-neutral encoding。
-4. reviewerのretry回数、timeout、circuit breakerの具体値。
-5. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
-6. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
-7. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
+3. reviewerのretry回数、timeout、circuit breakerの具体値。
+4. `StrictAutoReview`という名称・機構をshadow instrumentationとして残すか。
+5. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
+6. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
 
 これらが未決でも、non-positive reviewをHumanへfallbackしないこと、routeとauthority sourceを
 同一視しないこと、Human-account one-shotをstanding policyへ変換しないこと、hard deny・

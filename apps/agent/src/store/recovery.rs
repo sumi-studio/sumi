@@ -10,7 +10,7 @@ use sqlx::Row;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, ApprovalResolution};
 use crate::gateway::Command;
 use crate::memory::{HydratedMemoryRuntime, estimate::ProviderContextItemWithFootprint};
 use crate::provider::types::{
@@ -35,6 +35,9 @@ const RECOVERY_GROUP_MAX_COMMANDS: usize = 16;
 const RECOVERY_GROUP_MAX_BYTES: usize = 1024 * 1024;
 const PROCESS_RESTARTED_ERROR_CODE: &str = "process_restarted";
 const PROCESS_RESTARTED_TOOL_RESULT: &str = "process restarted before tool execution";
+const APPROVAL_CANCELLED_ERROR_CODE: &str = "approval_cancelled";
+const APPROVAL_CANCELLED_TOOL_RESULT: &str =
+    "approval was cancelled after process restart before tool execution";
 
 /// Typed identity for one durably pending approval whose prepared tool must be
 /// closed during logical suffix recovery.
@@ -129,12 +132,13 @@ pub(crate) enum RecoveryStep {
 
 /// Store-owned consumer for the narrow, authenticated ToolUse restart seam.
 ///
-/// This executor intentionally supports only a complete single-step
-/// `ResumeAssistantFromDurableEvents` plan. Every other logical-recovery shape
-/// remains NotReady until its own canonical consumer is implemented. The
-/// supported path never calls a provider or tool: calls with terminal durable
-/// rows reuse their exact result, and rowless calls receive a synthetic error
-/// result plus an eventless `ToolExecutionMutation::Skip`.
+/// This executor intentionally supports only a complete single-step assistant
+/// suffix: either `ResumeAssistantFromDurableEvents` or
+/// `CancelPendingApproval`. Every other logical-recovery shape remains NotReady
+/// until its own canonical consumer is implemented. The supported paths never
+/// call a provider or tool: terminal calls reuse their exact durable result,
+/// rowless calls receive a synthetic pre-execution error, and a typed pending
+/// approval atomically becomes a cancelled prepared tool plus its error result.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LogicalRecoveryExecutor;
 
@@ -145,6 +149,18 @@ struct MissingToolResult {
     result: ToolResultMessage,
 }
 
+struct CancelledPendingApproval {
+    request_id: String,
+    call: ToolCall,
+    message_id: String,
+    result: ToolResultMessage,
+}
+
+enum MissingToolDisposition {
+    ProcessRestarted(MissingToolResult),
+    ApprovalCancelled(CancelledPendingApproval),
+}
+
 struct ToolUseRecoverySnapshot {
     command_id: String,
     command_seq: u64,
@@ -152,7 +168,7 @@ struct ToolUseRecoverySnapshot {
     turn_id: String,
     assistant: PublicMessage,
     tool_results: Vec<ToolResultMessage>,
-    missing_results: Vec<MissingToolResult>,
+    missing_dispositions: Vec<MissingToolDisposition>,
 }
 
 impl LogicalRecoveryExecutor {
@@ -163,31 +179,56 @@ impl LogicalRecoveryExecutor {
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
     ) -> Result<()> {
-        let [
-            RecoveryStep::ResumeAssistantFromDurableEvents {
-                command_id,
-                run_id,
-                turn_id,
-                pending_error_context,
-            },
-        ] = steps
-        else {
+        let [step] = steps else {
             bail!(
-                "Store LogicalRecoveryExecutor only supports one ResumeAssistantFromDurableEvents step; received {} ordered step(s)",
+                "Store LogicalRecoveryExecutor only supports one assistant logical-recovery step; received {} ordered step(s)",
                 steps.len()
             );
         };
-        if pending_error_context.is_some() {
-            bail!(
-                "Store LogicalRecoveryExecutor does not support an undisposed Error provider context"
-            );
-        }
+        let (command_id, run_id, expected_owner_turn_id, expected_pending, planned_active_turn_id) =
+            match step {
+                RecoveryStep::ResumeAssistantFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                    pending_error_context,
+                } => {
+                    if pending_error_context.is_some() {
+                        bail!(
+                            "Store LogicalRecoveryExecutor does not support an undisposed Error provider context"
+                        );
+                    }
+                    (command_id, run_id, Some(turn_id.as_str()), None, None)
+                }
+                RecoveryStep::CancelPendingApproval {
+                    command_id,
+                    run_id,
+                    turn_id,
+                    request_id,
+                    tool_call_id,
+                } => (
+                    command_id,
+                    run_id,
+                    None,
+                    Some(PendingApprovalRecovery {
+                        request_id: request_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                    }),
+                    Some(turn_id.as_str()),
+                ),
+                _ => bail!(
+                    "Store LogicalRecoveryExecutor does not support this assistant logical-recovery step"
+                ),
+            };
 
         // The guard authenticates the current lifecycle checkpoint and keeps
         // this recovery writer exclusive through the final atomic batch.
         let writer = EventWriter::new(Arc::new(store.clone()));
         let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
         let active_turn_id = recovery.authenticated_open_turn(run_id)?.to_owned();
+        if planned_active_turn_id.is_some_and(|planned| planned != active_turn_id) {
+            bail!("pending approval recovery turn does not match the authenticated open turn");
+        }
         let mut transaction = store
             .pool()
             .begin()
@@ -205,8 +246,9 @@ impl LogicalRecoveryExecutor {
             &messages,
             command_id,
             run_id,
-            turn_id,
+            expected_owner_turn_id,
             &active_turn_id,
+            expected_pending.as_ref(),
         )
         .await?;
         transaction
@@ -217,7 +259,7 @@ impl LogicalRecoveryExecutor {
         recovery
             .apply_recovery_batch(snapshot.into_batch(lease.generation())?)
             .await
-            .context("failed to atomically close rowless ToolUse restart seam")?;
+            .context("failed to atomically close ToolUse restart seam")?;
         Ok(())
     }
 }
@@ -228,8 +270,9 @@ impl ToolUseRecoverySnapshot {
         messages: &[ContextMessage],
         command_id: &str,
         run_id: &str,
-        owner_turn_id: &str,
+        expected_owner_turn_id: Option<&str>,
         active_turn_id: &str,
+        expected_pending: Option<&PendingApprovalRecovery>,
     ) -> Result<Self> {
         let command = sqlx::query(
             "SELECT seq, command_kind, status, application_kind, run_id, turn_id, run_phase
@@ -248,15 +291,23 @@ impl ToolUseRecoverySnapshot {
         let stored_run_id: Option<String> = command.try_get("run_id")?;
         let stored_turn_id: Option<String> = command.try_get("turn_id")?;
         let run_phase: String = command.try_get("run_phase")?;
+        let stored_owner_turn_id = stored_turn_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("logical-recovery command {command_id} has no durable owner turn")
+        })?;
+        let application_kind = application_kind.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("logical-recovery command {command_id} has no application kind")
+        })?;
+        ApplicationKind::parse(application_kind).with_context(|| {
+            format!("logical-recovery command {command_id} has an invalid application kind")
+        })?;
         if command_kind != "user_message"
             || status != "applying"
-            || application_kind.as_deref() != Some("idle_run")
             || stored_run_id.as_deref() != Some(run_id)
-            || stored_turn_id.as_deref() != Some(owner_turn_id)
+            || expected_owner_turn_id.is_some_and(|expected| stored_owner_turn_id != expected)
             || run_phase != "assistant_started"
         {
             bail!(
-                "logical-recovery command {command_id} is not the exact live assistant_started idle-run owner"
+                "logical-recovery command {command_id} is not the exact live assistant_started owner"
             );
         }
 
@@ -364,7 +415,9 @@ impl ToolUseRecoverySnapshot {
         }
 
         let mut tool_results = Vec::with_capacity(calls.len());
-        let mut missing_results = Vec::new();
+        let mut missing_dispositions = Vec::new();
+        let mut saw_cancelled_approval = false;
+        let mut saw_unsettled_gap = false;
         for call in calls {
             let tool_row = sqlx::query(
                 "SELECT command_id, run_id, state, error_code
@@ -375,13 +428,23 @@ impl ToolUseRecoverySnapshot {
             .await
             .with_context(|| format!("failed to inspect ToolCall {}", call.id))?;
             let approval_row = sqlx::query(
-                "SELECT run_id, turn_id, state FROM approval_log
+                "SELECT id, run_id, turn_id, state FROM approval_log
                  WHERE tool_call_id = ? LIMIT 1",
             )
             .bind(&call.id)
             .fetch_optional(&mut **transaction)
             .await
             .with_context(|| format!("failed to inspect ToolCall {} approval", call.id))?;
+            if saw_unsettled_gap
+                && (tool_row.is_some()
+                    || approval_row.is_some()
+                    || persisted_results.contains_key(call.id.as_str()))
+            {
+                bail!(
+                    "ToolCall {} has durable execution evidence after an earlier rowless or pending call",
+                    call.id
+                );
+            }
             if let Some(approval) = approval_row.as_ref() {
                 let approval_run: String = approval.try_get("run_id")?;
                 let approval_turn: String = approval.try_get("turn_id")?;
@@ -393,10 +456,64 @@ impl ToolUseRecoverySnapshot {
                 }
                 let approval_state: String = approval.try_get("state")?;
                 if approval_state == "pending" {
-                    bail!(
-                        "Store LogicalRecoveryExecutor does not support pending approval for ToolCall {}",
-                        call.id
-                    );
+                    let approval_id: String = approval.try_get("id")?;
+                    let Some(expected) = expected_pending else {
+                        bail!(
+                            "Store LogicalRecoveryExecutor does not support unplanned pending approval for ToolCall {}",
+                            call.id
+                        );
+                    };
+                    if approval_id != expected.request_id || call.id != expected.tool_call_id {
+                        bail!("pending approval does not match the typed recovery step");
+                    }
+                    if saw_cancelled_approval {
+                        bail!("assistant logical recovery contains multiple pending approvals");
+                    }
+                    let tool = tool_row.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pending approval ToolCall {} has no prepared tool execution",
+                            call.id
+                        )
+                    })?;
+                    let owner_command: String = tool.try_get("command_id")?;
+                    let owner_run: String = tool.try_get("run_id")?;
+                    let state: String = tool.try_get("state")?;
+                    if owner_command != command_id || owner_run != run_id || state != "prepared" {
+                        bail!(
+                            "pending approval ToolCall {} is not the exact prepared durable owner",
+                            call.id
+                        );
+                    }
+                    if persisted_results.contains_key(call.id.as_str()) {
+                        bail!(
+                            "pending approval ToolCall {} already has a durable result",
+                            call.id
+                        );
+                    }
+                    let message_id =
+                        tool_result_message_id(&assistant_message_id, call.id.as_str());
+                    let result = ToolResultMessage {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        content: vec![UserContent::Text {
+                            text: APPROVAL_CANCELLED_TOOL_RESULT.to_owned(),
+                        }],
+                        details: json!({ "error": APPROVAL_CANCELLED_ERROR_CODE }),
+                        is_error: true,
+                        timestamp: Utc::now(),
+                    };
+                    tool_results.push(result.clone());
+                    missing_dispositions.push(MissingToolDisposition::ApprovalCancelled(
+                        CancelledPendingApproval {
+                            request_id: approval_id,
+                            call,
+                            message_id,
+                            result,
+                        },
+                    ));
+                    saw_cancelled_approval = true;
+                    saw_unsettled_gap = true;
+                    continue;
                 }
             }
 
@@ -467,16 +584,22 @@ impl ToolUseRecoverySnapshot {
                         timestamp: Utc::now(),
                     };
                     tool_results.push(result.clone());
-                    missing_results.push(MissingToolResult {
-                        call,
-                        message_id: expected_message_id,
-                        result,
-                    });
+                    missing_dispositions.push(MissingToolDisposition::ProcessRestarted(
+                        MissingToolResult {
+                            call,
+                            message_id: expected_message_id,
+                            result,
+                        },
+                    ));
+                    saw_unsettled_gap = true;
                 }
             }
         }
         if !persisted_results.is_empty() {
             bail!("authenticated transcript contains unowned results for current ToolCalls");
+        }
+        if expected_pending.is_some() && !saw_cancelled_approval {
+            bail!("typed pending approval recovery target is absent from the active turn");
         }
 
         Ok(Self {
@@ -486,7 +609,7 @@ impl ToolUseRecoverySnapshot {
             turn_id: active_turn_id.to_owned(),
             assistant,
             tool_results,
-            missing_results,
+            missing_dispositions,
         })
     }
 
@@ -494,48 +617,110 @@ impl ToolUseRecoverySnapshot {
         self,
         executor_generation: crate::runtime::contracts::ProcessGeneration,
     ) -> Result<EventBatch> {
-        let mut writes = Vec::with_capacity(
-            self.missing_results
-                .len()
-                .saturating_mul(2)
-                .saturating_add(2),
-        );
-        for missing in self.missing_results {
-            let message = PublicMessage::ToolResult(missing.result);
-            writes.push(EventWrite {
-                event: Some(super::DurableEvent::message(
-                    "message_start",
-                    &missing.message_id,
-                    &message,
-                )?),
-                projections: Vec::new(),
-            });
-            writes.push(EventWrite {
-                event: Some(super::DurableEvent::message(
-                    "message_end",
-                    &missing.message_id,
-                    &message,
-                )?),
-                projections: vec![
-                    Projection::MessageEnd {
-                        message_id: missing.message_id,
-                        role: "tool_result",
-                        message,
-                        append_to_l0: true,
-                        provider_context: Vec::new(),
-                        eviction_footprint_tokens: 0,
-                    },
-                    Projection::ToolExecution(super::ToolExecutionMutation::Skip {
-                        tool_call_id: missing.call.id.clone(),
-                        command_id: self.command_id.clone(),
-                        run_id: self.run_id.clone(),
-                        turn_id: self.turn_id.clone(),
-                        executor_generation,
-                        idempotency_key: format!("{}/{}", self.command_id, missing.call.id),
-                        error_code: PROCESS_RESTARTED_ERROR_CODE,
-                    }),
-                ],
-            });
+        let disposition_writes = self
+            .missing_dispositions
+            .iter()
+            .map(|disposition| match disposition {
+                MissingToolDisposition::ProcessRestarted(_) => 2usize,
+                MissingToolDisposition::ApprovalCancelled(_) => 4usize,
+            })
+            .sum::<usize>();
+        let mut writes = Vec::with_capacity(disposition_writes.saturating_add(2));
+        for disposition in self.missing_dispositions {
+            match disposition {
+                MissingToolDisposition::ApprovalCancelled(cancelled) => {
+                    writes.push(EventWrite {
+                        event: Some(super::DurableEvent::approval_resolved(
+                            cancelled.request_id.clone(),
+                            ApprovalResolution::Cancelled,
+                            "runtime".to_owned(),
+                        )?),
+                        projections: vec![Projection::Approval(super::ApprovalMutation::Resolve {
+                            request_id: cancelled.request_id,
+                            state: "cancelled",
+                            actor: "runtime".to_owned(),
+                        })],
+                    });
+                    writes.push(EventWrite {
+                        event: Some(super::DurableEvent::tool_execution_end(
+                            cancelled.call.id.clone(),
+                            serde_json::to_value(&cancelled.result)?,
+                            true,
+                            "cancelled".to_owned(),
+                            Some(APPROVAL_CANCELLED_ERROR_CODE.to_owned()),
+                        )?),
+                        projections: vec![Projection::ToolExecution(
+                            super::ToolExecutionMutation::Finish {
+                                tool_call_id: cancelled.call.id,
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some(APPROVAL_CANCELLED_ERROR_CODE),
+                            },
+                        )],
+                    });
+                    let message = PublicMessage::ToolResult(cancelled.result);
+                    writes.push(EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_start",
+                            &cancelled.message_id,
+                            &message,
+                        )?),
+                        projections: Vec::new(),
+                    });
+                    writes.push(EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_end",
+                            &cancelled.message_id,
+                            &message,
+                        )?),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: cancelled.message_id,
+                            role: "tool_result",
+                            message,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    });
+                }
+                MissingToolDisposition::ProcessRestarted(missing) => {
+                    let message = PublicMessage::ToolResult(missing.result);
+                    writes.push(EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_start",
+                            &missing.message_id,
+                            &message,
+                        )?),
+                        projections: Vec::new(),
+                    });
+                    writes.push(EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_end",
+                            &missing.message_id,
+                            &message,
+                        )?),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: missing.message_id,
+                                role: "tool_result",
+                                message,
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::ToolExecution(super::ToolExecutionMutation::Skip {
+                                tool_call_id: missing.call.id.clone(),
+                                command_id: self.command_id.clone(),
+                                run_id: self.run_id.clone(),
+                                turn_id: self.turn_id.clone(),
+                                executor_generation,
+                                idempotency_key: format!("{}/{}", self.command_id, missing.call.id),
+                                error_code: PROCESS_RESTARTED_ERROR_CODE,
+                            }),
+                        ],
+                    });
+                }
+            }
         }
         writes.push(EventWrite {
             event: Some(super::DurableEvent::turn_end(
@@ -747,7 +932,10 @@ impl SuffixRecovery {
         dead_code,
         reason = "T17 hydration boundary consumed by T16/T26 runtime startup"
     )]
-    pub(crate) async fn plan_full_suffix(store: &Store) -> Result<Vec<RecoveryStep>> {
+    pub(crate) async fn plan_full_suffix(
+        store: &Store,
+        recovery: &super::event_writer::BootstrapRecoveryGuard<'_>,
+    ) -> Result<Vec<RecoveryStep>> {
         validate_pending_window(store).await?;
         let commands = all_pending_commands(store).await?;
         if commands.is_empty() {
@@ -764,16 +952,22 @@ impl SuffixRecovery {
                 RecoveryStep::ResumeAssistantFromDurableEvents {
                     command_id,
                     run_id,
-                    turn_id,
+                    turn_id: _,
                     ..
                 } => {
-                    if let Some(pending) =
-                        pending_approval_for_recovery(store, run_id, turn_id).await?
+                    if let Some((pending_turn_id, pending)) =
+                        pending_approval_for_recovery(store, recovery, run_id).await?
                     {
+                        let active_turn_id = recovery.authenticated_open_turn(run_id)?.to_owned();
+                        if pending_turn_id != active_turn_id {
+                            bail!(
+                                "run {run_id} has a pending approval outside its authenticated open turn {active_turn_id}"
+                            );
+                        }
                         step = RecoveryStep::CancelPendingApproval {
                             command_id: command_id.clone(),
                             run_id: run_id.clone(),
-                            turn_id: turn_id.clone(),
+                            turn_id: active_turn_id,
                             request_id: pending.request_id,
                             tool_call_id: pending.tool_call_id,
                         };
@@ -786,12 +980,20 @@ impl SuffixRecovery {
                     ..
                 } => {
                     let pending_approval =
-                        pending_approval_for_recovery(store, run_id, turn_id).await?;
+                        pending_approval_for_recovery(store, recovery, run_id).await?;
+                    if pending_approval
+                        .as_ref()
+                        .is_some_and(|(pending_turn_id, _)| pending_turn_id != turn_id)
+                    {
+                        bail!(
+                            "run {run_id} cancellation turn {turn_id} does not own its authenticated pending approval"
+                        );
+                    }
                     step = RecoveryStep::ResumeCancellationFromDurableEvents {
                         command_id: command_id.clone(),
                         run_id: run_id.clone(),
                         turn_id: turn_id.clone(),
-                        pending_approval,
+                        pending_approval: pending_approval.map(|(_, pending)| pending),
                     };
                 }
                 _ => {}
@@ -858,41 +1060,66 @@ impl SuffixRecovery {
 
 async fn pending_approval_for_recovery(
     store: &Store,
+    recovery: &super::event_writer::BootstrapRecoveryGuard<'_>,
     run_id: &str,
-    turn_id: &str,
-) -> Result<Option<PendingApprovalRecovery>> {
+) -> Result<Option<(String, PendingApprovalRecovery)>> {
+    let authenticated = recovery.authenticated_pending_approval_for_run(run_id)?;
     let rows = sqlx::query(
-        "SELECT a.id, a.tool_call_id, t.state
+        "SELECT a.id, a.tool_call_id, a.turn_id, t.state AS tool_state,
+                t.run_id AS tool_run_id
          FROM approval_log a
-         JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
-         WHERE a.run_id = ? AND a.turn_id = ? AND a.state = 'pending'
+         LEFT JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+         WHERE a.run_id = ? AND a.state = 'pending'
          ORDER BY a.created_at, a.id",
     )
     .bind(run_id)
-    .bind(turn_id)
     .fetch_all(store.pool())
     .await
     .context("failed to inspect pending approval recovery state")?;
     if rows.len() > 1 {
         bail!(
-            "run {run_id}/{turn_id} has multiple pending approvals despite sequential one-at-a-time execution"
+            "run {run_id} has multiple projected pending approvals despite sequential one-at-a-time execution"
         );
     }
-    let Some(row) = rows.first() else {
-        return Ok(None);
+    let projected = if let Some(row) = rows.first() {
+        let request_id: String = row.try_get("id")?;
+        let tool_call_id: String = row.try_get("tool_call_id")?;
+        let turn_id: String = row.try_get("turn_id")?;
+        let tool_state: Option<String> = row.try_get("tool_state")?;
+        let tool_run_id: Option<String> = row.try_get("tool_run_id")?;
+        if tool_state.as_deref() != Some("prepared") || tool_run_id.as_deref() != Some(run_id) {
+            bail!(
+                "pending approval {request_id} recovery requires its exact prepared tool {tool_call_id} in run {run_id}"
+            );
+        }
+        Some((request_id, tool_call_id, turn_id))
+    } else {
+        None
     };
-    let request_id: String = row.try_get("id")?;
-    let tool_call_id: String = row.try_get("tool_call_id")?;
-    let tool_state: String = row.try_get("state")?;
-    if tool_state != "prepared" {
-        bail!(
-            "pending approval {request_id} recovery requires prepared tool {tool_call_id}, found {tool_state}"
-        );
+
+    match (authenticated, projected) {
+        (None, None) => Ok(None),
+        (Some((request_id, tool_call_id, turn_id)), Some(projected))
+            if projected == (request_id.clone(), tool_call_id.clone(), turn_id.clone()) =>
+        {
+            Ok(Some((
+                turn_id,
+                PendingApprovalRecovery {
+                    request_id,
+                    tool_call_id,
+                },
+            )))
+        }
+        (Some((request_id, tool_call_id, turn_id)), None) => bail!(
+            "authenticated pending approval {request_id}/{tool_call_id} for {run_id}/{turn_id} is missing its exact projections"
+        ),
+        (None, Some((request_id, tool_call_id, turn_id))) => bail!(
+            "projected pending approval {request_id}/{tool_call_id} for {run_id}/{turn_id} has no authenticated lifecycle owner"
+        ),
+        (Some(authenticated), Some(projected)) => bail!(
+            "authenticated pending approval {authenticated:?} disagrees with projected pending approval {projected:?}"
+        ),
     }
-    Ok(Some(PendingApprovalRecovery {
-        request_id,
-        tool_call_id,
-    }))
 }
 
 async fn plan_one_command(
@@ -1599,6 +1826,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        agent::{ApprovalRequest, ReviewProjection},
         gateway::{
             ApprovalDecision, Command, CommandEnvelope, DeferredApprovalRule, InboundCommand,
         },
@@ -1610,6 +1838,7 @@ mod tests {
             AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand,
             Projection, ToolExecutionMutation,
             crypto::{DATA_KEY_BYTES, WrappingKey},
+            event_writer::ApprovalMutation,
             user_message_id,
         },
     };
@@ -1620,6 +1849,7 @@ mod tests {
     const TOOL_USE_RECOVERY_CONTINUATION_TURN_ID: &str = "turn-tool-use-recovery-continuation";
     const TOOL_USE_RECOVERY_INITIAL_ASSISTANT_ID: &str = "assistant-tool-use-recovery-initial";
     const TOOL_USE_RECOVERY_ASSISTANT_ID: &str = "assistant-tool-use-recovery";
+    const TOOL_USE_RECOVERY_APPROVAL_ID: &str = "approval-tool-use-recovery";
 
     fn test_personality_agent_id() -> PersonalityAgentId {
         "0198f0f4-9b72-7000-8000-000000000001"
@@ -1670,23 +1900,27 @@ mod tests {
     }
 
     fn tool_use_recovery_assistant() -> PublicMessage {
-        let calls = [
+        tool_use_recovery_assistant_with_calls(&[
             ("tool-terminal-success", "read_file", 0_u32),
             ("tool-terminal-failure", "write_file", 1_u32),
             ("tool-rowless-messaging", "messaging", 2_u32),
-        ];
+        ])
+    }
+
+    fn tool_use_recovery_assistant_with_calls(calls: &[(&str, &str, u32)]) -> PublicMessage {
         PublicMessage::Assistant(PublicAssistantMessage {
             content: calls
-                .into_iter()
+                .iter()
                 .map(
                     |(id, name, wire_item_index)| PublicAssistantContent::ToolCall {
                         tool_call: ToolCall {
-                            id: id.to_owned(),
-                            name: name.to_owned(),
-                            arguments: serde_json::from_value(json!({ "slot": wire_item_index }))
+                            id: (*id).to_owned(),
+                            name: (*name).to_owned(),
+                            arguments: serde_json::from_value(json!({ "slot": *wire_item_index }))
                                 .expect("object tool arguments"),
+                            route: crate::provider::types::ToolInvocationRoute::Normal,
                         },
-                        wire_item_index,
+                        wire_item_index: *wire_item_index,
                     },
                 )
                 .collect(),
@@ -1848,6 +2082,24 @@ mod tests {
     }
 
     async fn seed_tool_use_restart_seam(writer: &EventWriter, continuation_turn: bool) {
+        seed_tool_use_restart_seam_with_assistant(
+            writer,
+            continuation_turn,
+            tool_use_recovery_assistant(),
+            &[
+                ("tool-terminal-success", "read_file", 0, false),
+                ("tool-terminal-failure", "write_file", 1, true),
+            ],
+        )
+        .await;
+    }
+
+    async fn seed_tool_use_restart_seam_with_assistant(
+        writer: &EventWriter,
+        continuation_turn: bool,
+        assistant: PublicMessage,
+        terminal_tools: &[(&str, &str, u32, bool)],
+    ) {
         persist_user(writer, 1, TOOL_USE_RECOVERY_COMMAND_ID).await;
         writer
             .apply(EventBatch {
@@ -2031,7 +2283,6 @@ mod tests {
                 .expect("open continuation turn");
         }
 
-        let assistant = tool_use_recovery_assistant();
         let active_turn_id = if continuation_turn {
             TOOL_USE_RECOVERY_CONTINUATION_TURN_ID
         } else {
@@ -2088,8 +2339,50 @@ mod tests {
             .await
             .expect("persist ToolUse restart seam");
 
-        persist_terminal_tool(writer, "tool-terminal-success", "read_file", 0, false).await;
-        persist_terminal_tool(writer, "tool-terminal-failure", "write_file", 1, true).await;
+        for (tool_call_id, tool_name, slot, is_error) in terminal_tools {
+            persist_terminal_tool(writer, tool_call_id, tool_name, *slot, *is_error).await;
+        }
+    }
+
+    async fn seed_pending_messaging_approval(writer: &EventWriter, turn_id: &str) {
+        let request = ApprovalRequest {
+            id: TOOL_USE_RECOVERY_APPROVAL_ID.to_owned(),
+            tool_call_id: "tool-rowless-messaging".to_owned(),
+            tool_name: "messaging".to_owned(),
+            action: ReviewProjection::Reviewable(json!({ "operation": "write" })),
+            args_summary: json!({ "operation": "write", "place": "general" }),
+            reason: None,
+            audit: None,
+        };
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::approval_requested(request)
+                            .expect("pending approval request event"),
+                    ),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: "tool-rowless-messaging".to_owned(),
+                            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            executor_generation: test_generation(),
+                            idempotency_key: format!(
+                                "{TOOL_USE_RECOVERY_COMMAND_ID}/tool-rowless-messaging"
+                            ),
+                        }),
+                        Projection::Approval(ApprovalMutation::Pending {
+                            request_id: TOOL_USE_RECOVERY_APPROVAL_ID.to_owned(),
+                            tool_call_id: "tool-rowless-messaging".to_owned(),
+                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                        }),
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist pending messaging approval");
     }
 
     #[tokio::test]
@@ -2312,9 +2605,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_tool_use_recovery_closes_the_authenticated_continuation_turn() {
+    async fn pending_approval_recovery_closes_the_authenticated_continuation_turn() {
         let (store, writer) = setup().await;
         seed_tool_use_restart_seam(&writer, true).await;
+        seed_pending_messaging_approval(&writer, TOOL_USE_RECOVERY_CONTINUATION_TURN_ID).await;
         let lease = ProcessGenerationLease::new(
             test_personality_agent_id(),
             test_generation(),
@@ -2332,29 +2626,46 @@ mod tests {
         };
         assert!(matches!(
             steps.as_slice(),
-            [RecoveryStep::ResumeAssistantFromDurableEvents {
+            [RecoveryStep::CancelPendingApproval {
                 command_id,
                 run_id,
                 turn_id,
-                pending_error_context: None,
+                request_id,
+                tool_call_id,
             }] if command_id == TOOL_USE_RECOVERY_COMMAND_ID
                 && run_id == TOOL_USE_RECOVERY_RUN_ID
-                && turn_id == TOOL_USE_RECOVERY_TURN_ID
+                && turn_id == TOOL_USE_RECOVERY_CONTINUATION_TURN_ID
+                && request_id == TOOL_USE_RECOVERY_APPROVAL_ID
+                && tool_call_id == "tool-rowless-messaging"
         ));
 
         LogicalRecoveryExecutor
             .execute(&store, &steps, &lease, &fence)
             .await
-            .expect("close authenticated continuation ToolUse seam");
+            .expect("cancel authenticated continuation approval seam");
 
         assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM tool_executions WHERE tool_call_id='tool-rowless-messaging'",
+            sqlx::query_as::<_, (String, Option<String>, String, i64)>(
+                "SELECT
+                   t.state,
+                   t.error_code,
+                   a.state,
+                   (SELECT COUNT(*) FROM agent_events
+                    WHERE event_type='tool_execution_start'
+                      AND json_extract(envelope, '$.tool_call_id')='tool-rowless-messaging')
+                 FROM tool_executions AS t
+                 JOIN approval_log AS a ON a.tool_call_id=t.tool_call_id
+                 WHERE t.tool_call_id='tool-rowless-messaging'",
             )
             .fetch_one(store.pool())
             .await
-            .expect("continuation synthetic tool disposition"),
-            "not_started"
+            .expect("continuation approval disposition"),
+            (
+                "cancelled".to_owned(),
+                Some(APPROVAL_CANCELLED_ERROR_CODE.to_owned()),
+                "cancelled".to_owned(),
+                0,
+            )
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, i64, i64)>(
@@ -2382,6 +2693,306 @@ mod tests {
             .await
             .expect("continuation owner terminal state"),
             ("applied".to_owned(), "finished".to_owned())
+        );
+
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count after approval recovery");
+        assert!(matches!(
+            store
+                .hydrate(&lease, &fence)
+                .await
+                .expect("rehydrate recovered approval seam"),
+            HydrationOutcome::Complete(_)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("event count after fixed-point hydration"),
+            event_count,
+            "fixed-point hydration must not duplicate the cancellation suffix"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_recovery_rejects_rowless_call_before_pending_without_mutation() {
+        let (store, writer) = setup().await;
+        let assistant = tool_use_recovery_assistant_with_calls(&[
+            ("tool-rowless-before-pending", "read_file", 0),
+            ("tool-rowless-messaging", "messaging", 1),
+        ]);
+        seed_tool_use_restart_seam_with_assistant(&writer, true, assistant, &[]).await;
+        seed_pending_messaging_approval(&writer, TOOL_USE_RECOVERY_CONTINUATION_TURN_ID).await;
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-result-order-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence = GenerationRecoveryFence::new(&lease, "logical-recovery-result-order-fence")
+            .expect("logical-recovery fence");
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate rowless-before-pending restart")
+        else {
+            panic!("rowless-before-pending restart must require logical recovery")
+        };
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count before rejected recovery");
+
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect_err("a later pending call cannot follow an earlier rowless call");
+
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64, String, String)>(
+                "SELECT
+                   (SELECT COUNT(*) FROM agent_events),
+                   (SELECT COUNT(*) FROM messages WHERE role='tool_result'),
+                   (SELECT COUNT(*) FROM tool_executions
+                    WHERE tool_call_id='tool-rowless-before-pending'),
+                   (SELECT state FROM tool_executions
+                    WHERE tool_call_id='tool-rowless-messaging'),
+                   (SELECT state FROM approval_log WHERE id=?)",
+            )
+            .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("durable state after rejected out-of-order recovery"),
+            (
+                event_count,
+                0,
+                0,
+                "prepared".to_owned(),
+                "pending".to_owned()
+            ),
+            "rejection must not append events, synthesize results, or disposition either call"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_recovery_rejects_a_mismatched_request_without_mutation() {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam(&writer, true).await;
+        seed_pending_messaging_approval(&writer, TOOL_USE_RECOVERY_CONTINUATION_TURN_ID).await;
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-wrong-approval-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence = GenerationRecoveryFence::new(&lease, "logical-recovery-wrong-approval-fence")
+            .expect("logical-recovery fence");
+        let HydrationOutcome::LogicalRecoveryRequired { mut steps } = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate pending approval restart")
+        else {
+            panic!("pending approval restart must require logical recovery")
+        };
+        let RecoveryStep::CancelPendingApproval { request_id, .. } = &mut steps[0] else {
+            panic!("pending approval restart must plan cancellation")
+        };
+        *request_id = "different-approval-request".to_owned();
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count before rejected cancellation");
+
+        let error = LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect_err("mismatched approval request must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("pending approval does not match the typed recovery step"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, String, String)>(
+                "SELECT
+                   (SELECT COUNT(*) FROM agent_events),
+                   (SELECT state FROM approval_log WHERE id=?),
+                   (SELECT state FROM tool_executions WHERE tool_call_id='tool-rowless-messaging')",
+            )
+            .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("durable state after rejected cancellation"),
+            (event_count, "pending".to_owned(), "prepared".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_recovery_rejects_missing_projection_rows_without_mutation() {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam(&writer, true).await;
+        seed_pending_messaging_approval(&writer, TOOL_USE_RECOVERY_CONTINUATION_TURN_ID).await;
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin missing approval projection fixture");
+        sqlx::query("DELETE FROM approval_log WHERE id=?")
+            .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete pending approval projection");
+        sqlx::query("DELETE FROM tool_executions WHERE tool_call_id='tool-rowless-messaging'")
+            .execute(&mut *transaction)
+            .await
+            .expect("delete prepared tool projection");
+        transaction
+            .commit()
+            .await
+            .expect("commit missing approval projection fixture");
+
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-missing-approval-projection-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence = GenerationRecoveryFence::new(
+            &lease,
+            "logical-recovery-missing-approval-projection-fence",
+        )
+        .expect("logical-recovery fence");
+        let state_before = sqlx::query_as::<_, (i64, i64, i64, i64, String)>(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_events),
+               (SELECT COUNT(*) FROM messages WHERE role='tool_result'),
+               (SELECT COUNT(*) FROM approval_log WHERE id=?),
+               (SELECT COUNT(*) FROM tool_executions
+                WHERE tool_call_id='tool-rowless-messaging'),
+               (SELECT status FROM inbound_commands WHERE command_id=?)",
+        )
+        .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+        .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+        .fetch_one(store.pool())
+        .await
+        .expect("state before missing approval projection recovery");
+
+        let rejected = match store.hydrate(&lease, &fence).await {
+            Err(_) => true,
+            Ok(HydrationOutcome::LogicalRecoveryRequired { steps }) => LogicalRecoveryExecutor
+                .execute(&store, &steps, &lease, &fence)
+                .await
+                .is_err(),
+            Ok(_) => false,
+        };
+        let state_after = sqlx::query_as::<_, (i64, i64, i64, i64, String)>(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_events),
+               (SELECT COUNT(*) FROM messages WHERE role='tool_result'),
+               (SELECT COUNT(*) FROM approval_log WHERE id=?),
+               (SELECT COUNT(*) FROM tool_executions
+                WHERE tool_call_id='tool-rowless-messaging'),
+               (SELECT status FROM inbound_commands WHERE command_id=?)",
+        )
+        .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+        .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+        .fetch_one(store.pool())
+        .await
+        .expect("state after missing approval projection recovery");
+
+        assert_eq!(
+            state_after, state_before,
+            "missing projections must not let recovery replace authenticated pending approval evidence with a rowless result"
+        );
+        assert!(
+            rejected,
+            "authenticated unresolved ApprovalRequested evidence must fail closed when both mutable projection rows are missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_recovery_rejects_forged_orphan_projection_without_mutation() {
+        const FORGED_REQUEST_ID: &str = "approval-forged-orphan-recovery";
+        const FORGED_TOOL_CALL_ID: &str = "tool-forged-orphan-recovery";
+
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam(&writer, true).await;
+        seed_pending_messaging_approval(&writer, TOOL_USE_RECOVERY_CONTINUATION_TURN_ID).await;
+        sqlx::query(
+            "INSERT INTO approval_log
+             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
+             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        )
+        .bind(FORGED_REQUEST_ID)
+        .bind(FORGED_TOOL_CALL_ID)
+        .bind(TOOL_USE_RECOVERY_RUN_ID)
+        .bind(TOOL_USE_RECOVERY_CONTINUATION_TURN_ID)
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("insert forged orphan pending approval projection");
+
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-forged-orphan-approval-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence =
+            GenerationRecoveryFence::new(&lease, "logical-recovery-forged-orphan-approval-fence")
+                .expect("logical-recovery fence");
+        let state_before = sqlx::query_as::<_, (i64, i64, String, String, String, String)>(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_events),
+               (SELECT COUNT(*) FROM messages WHERE role='tool_result'),
+               (SELECT state FROM approval_log WHERE id=?),
+               (SELECT state FROM tool_executions
+                WHERE tool_call_id='tool-rowless-messaging'),
+               (SELECT state FROM approval_log WHERE id=?),
+               (SELECT status FROM inbound_commands WHERE command_id=?)",
+        )
+        .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+        .bind(FORGED_REQUEST_ID)
+        .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+        .fetch_one(store.pool())
+        .await
+        .expect("state before forged orphan approval recovery");
+
+        let rejected = match store.hydrate(&lease, &fence).await {
+            Err(_) => true,
+            Ok(HydrationOutcome::LogicalRecoveryRequired { steps }) => LogicalRecoveryExecutor
+                .execute(&store, &steps, &lease, &fence)
+                .await
+                .is_err(),
+            Ok(_) => false,
+        };
+        let state_after = sqlx::query_as::<_, (i64, i64, String, String, String, String)>(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_events),
+               (SELECT COUNT(*) FROM messages WHERE role='tool_result'),
+               (SELECT state FROM approval_log WHERE id=?),
+               (SELECT state FROM tool_executions
+                WHERE tool_call_id='tool-rowless-messaging'),
+               (SELECT state FROM approval_log WHERE id=?),
+               (SELECT status FROM inbound_commands WHERE command_id=?)",
+        )
+        .bind(TOOL_USE_RECOVERY_APPROVAL_ID)
+        .bind(FORGED_REQUEST_ID)
+        .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+        .fetch_one(store.pool())
+        .await
+        .expect("state after forged orphan approval recovery");
+
+        assert_eq!(
+            state_after, state_before,
+            "an orphan pending approval projection must not survive while recovery closes its run"
+        );
+        assert!(
+            rejected,
+            "pending approval projections must exactly match authenticated lifecycle request/tool evidence"
         );
     }
 
@@ -2926,7 +3537,7 @@ mod tests {
                 provenance: test_provenance(),
                 command: Command::ApprovalDecision {
                     request_id: "unknown-request".to_owned(),
-                    decision: ApprovalDecision::Deny,
+                    decision: ApprovalDecision::DenyOnce,
                 },
             }))
             .await
@@ -3379,7 +3990,19 @@ mod tests {
         persist_run_started(&store, &writer).await;
         persist_user(&writer, 2, "00000000-0000-4000-8000-000000000002").await;
 
-        let steps = SuffixRecovery::plan_full_suffix(&store)
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "full-suffix-plan-lease",
+        )
+        .expect("full suffix plan lease");
+        let fence = GenerationRecoveryFence::new(&lease, "full-suffix-plan-fence")
+            .expect("full suffix plan fence");
+        let recovery = writer
+            .begin_bootstrap_recovery(&lease, &fence)
+            .await
+            .expect("authenticate full suffix lifecycle");
+        let steps = SuffixRecovery::plan_full_suffix(&store, &recovery)
             .await
             .expect("full suffix plan");
 

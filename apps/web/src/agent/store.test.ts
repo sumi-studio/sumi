@@ -384,7 +384,7 @@ test("authority reset releases approval latches from the previous principal", ()
     envelope: { seq: 1, event: { type: "approval_requested", request } },
   } as unknown as DirectChatServerFrame);
   assert.equal(
-    store.getState().decideApproval(request.id, { type: "deny" }),
+    store.getState().decideApproval(request.id, { type: "deny_once" }),
     true,
   );
   assert.deepEqual(
@@ -398,7 +398,7 @@ test("authority reset releases approval latches from the previous principal", ()
       {
         type: "approval_decision",
         request_id: request.id,
-        decision: { type: "deny" },
+        decision: { type: "deny_once" },
       },
     ],
   );
@@ -1164,7 +1164,7 @@ test("approval decision is synchronously latched until durable resolution", () =
   );
   assert.equal(store.getState().sendingApprovalRequestId, request.id);
   assert.equal(
-    store.getState().decideApproval(request.id, { type: "deny" }),
+    store.getState().decideApproval(request.id, { type: "deny_once" }),
     false,
   );
   assert.deepEqual(transport.sent, [
@@ -1214,7 +1214,7 @@ test("a local approval queue failure releases only that request latch", () => {
   assert.equal(store.getState().sendingApprovalRequestId, null);
   transport.sendResult = true;
   assert.equal(
-    store.getState().decideApproval(request.id, { type: "deny" }),
+    store.getState().decideApproval(request.id, { type: "deny_once" }),
     true,
   );
   assert.deepEqual(
@@ -1228,7 +1228,7 @@ test("a local approval queue failure releases only that request latch", () => {
       {
         type: "approval_decision",
         request_id: request.id,
-        decision: { type: "deny" },
+        decision: { type: "deny_once" },
       },
     ],
   );

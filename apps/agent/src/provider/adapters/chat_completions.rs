@@ -306,7 +306,11 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                                 "function": {
                                     "name": tool_call.name,
                                     "arguments": Value::Object(
-                                        tool_call.arguments.as_object().clone()
+                                        tool_call
+                                            .provider_arguments()
+                                            .as_object()
+                                            .expect("provider tool envelope is an object")
+                                            .clone()
                                     ).to_string(),
                                 },
                             }));
@@ -446,10 +450,11 @@ fn convert_tool_result(message: &ToolResultMessage, supports_images: bool) -> Va
 }
 
 fn convert_tool(tool: &ToolDefinition, spec: &ModelSpec, compat: &ChatCompat) -> Value {
+    let provider_parameters = tool.provider_parameters();
     let parameters = if spec.id.to_lowercase().contains("kimi") {
-        sanitize_kimi_tool_parameters(&tool.parameters)
+        sanitize_kimi_tool_parameters(&provider_parameters)
     } else {
-        tool.parameters.clone()
+        provider_parameters
     };
     let disable_strict = compat.supports_strict_mode && !is_mfjs_strict_safe(&parameters);
     let mut function = Map::new();
@@ -1981,6 +1986,7 @@ mod tests {
                             tool_call: ToolCall {
                                 id: "call|with+noise".to_owned(),
                                 name: "read_file".to_owned(),
+                                route: crate::provider::types::ToolInvocationRoute::Normal,
                                 arguments: ValidatedToolArguments::from_schema_validated(
                                     json!({"path":"a.txt"}).as_object().expect("object").clone(),
                                 ),
@@ -2475,7 +2481,7 @@ mod tests {
         .expect("OpenCode request");
 
         assert_eq!(
-            request["tools"][0]["function"]["parameters"]["properties"]["node"],
+            request["tools"][0]["function"]["parameters"]["properties"]["input"]["properties"]["node"],
             json!({"$ref":"#/$defs/node"})
         );
     }
@@ -2505,7 +2511,8 @@ mod tests {
             &RequestOptions::default(),
         )
         .expect("OpenCode request");
-        let properties = &request["tools"][0]["function"]["parameters"]["properties"];
+        let properties =
+            &request["tools"][0]["function"]["parameters"]["properties"]["input"]["properties"];
 
         assert_eq!(
             properties["non_empty"]["items"],
@@ -2577,6 +2584,7 @@ mod tests {
                 tool_call: ToolCall {
                     id: "call-1".to_owned(),
                     name: "read_file".to_owned(),
+                    route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments: ValidatedToolArguments::from_schema_validated(
                         json!({"path":"a.txt"}).as_object().expect("object").clone(),
                     ),
@@ -3513,7 +3521,7 @@ mod tests {
         let mut receive = ChatReceiveState::new(registry);
         let first = receive
             .push_json(
-                r#"{"id":"r1","model":"kimi-k3","choices":[{"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                r#"{"id":"r1","model":"kimi-k3","choices":[{"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\"route\":\"normal\",\"input\":{\"path\":"}}]}}]}"#,
             )
             .expect("first");
         assert!(matches!(
@@ -3530,7 +3538,7 @@ mod tests {
         )));
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]},"finish_reason":"tool_calls","usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1}}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}}"}}]},"finish_reason":"tool_calls","usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1}}}]}"#,
             )
             .expect("second");
         let terminal = receive.finish(Utc::now()).expect("terminal");
@@ -3788,12 +3796,12 @@ mod tests {
         let mut receive = ChatReceiveState::new(registry);
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"path\":"}},{"index":1,"id":"call-b","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"route\":\"normal\",\"input\":{\"path\":"}},{"index":1,"id":"call-b","function":{"name":"read_file","arguments":"{\"route\":\"normal\",\"input\":{\"path\":"}}]}}]}"#,
             )
             .expect("initial tools");
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"id":"call-b","function":{"arguments":"\"b.txt\"}"}},{"id":"call-a","function":{"arguments":"\"a.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"id":"call-b","function":{"arguments":"\"b.txt\"}}"}},{"id":"call-a","function":{"arguments":"\"a.txt\"}}"}}]},"finish_reason":"tool_calls"}]}"#,
             )
             .expect("id-only continuations");
         let terminal = receive.finish(Utc::now()).expect("terminal");
@@ -3894,7 +3902,7 @@ mod tests {
         let mut receive = ChatReceiveState::new(registry);
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"route\":\"normal\",\"input\":{\"path\":"}}]}}]}"#,
             )
             .expect("initial tool");
         let before = (
@@ -3940,7 +3948,7 @@ mod tests {
         let mut receive = ChatReceiveState::new(registry);
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"route\":\"normal\",\"input\":{\"path\":"}}]}}]}"#,
             )
             .expect("initial indexed tool");
         receive
@@ -3950,7 +3958,7 @@ mod tests {
             .expect("index-only continuation");
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"id":"call-a","function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"id":"call-a","function":{"arguments":"}}"}}]},"finish_reason":"tool_calls"}]}"#,
             )
             .expect("id-only continuation");
 
@@ -4015,7 +4023,7 @@ mod tests {
         let mut receive = ChatReceiveState::new(registry);
         receive
             .push_json(
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{\"route\":\"normal\",\"input\":{\"path\":\"a.txt\"}}"}}]}}]}"#,
             )
             .expect("first");
         receive
@@ -4043,7 +4051,8 @@ mod tests {
         for (index, name) in chunks.iter().enumerate() {
             let mut function = json!({"name": name});
             if index == 0 {
-                function["arguments"] = json!("{\"path\":\"a.txt\"}");
+                function["arguments"] =
+                    json!("{\"route\":\"normal\",\"input\":{\"path\":\"a.txt\"}}");
             }
             receive
                 .push_json(

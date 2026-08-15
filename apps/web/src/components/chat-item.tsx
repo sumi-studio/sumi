@@ -104,7 +104,6 @@ export function ChatItemView({
             summary={item.summary}
             reason={item.reason ?? "この操作には明示的な承認が必要です。"}
             status={item.status}
-            decision={item.decision}
             sending={sendingApprovalRequestId === item.requestId}
             onDecision={
               item.status === "pending" && onApprovalDecision

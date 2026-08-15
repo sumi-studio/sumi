@@ -459,7 +459,7 @@ test("denied approval closes its linked running tool trace", () => {
     event: {
       type: "approval_resolved",
       request_id: request.id,
-      resolution: { decision: { type: "deny" } },
+      resolution: { decision: { type: "deny_once" } },
     },
   });
 

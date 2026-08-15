@@ -416,6 +416,7 @@ fn call(id: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
         name: format!("tool-{id}"),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value::<ValidatedToolArguments>(json!({"id": id}))
             .expect("arguments"),
     }
@@ -706,6 +707,7 @@ async fn tool_evaluation_without_broker_fails_closed() {
     let call = ToolCall {
         id: "call-no-broker".to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
             .expect("validated arguments"),
     };
@@ -785,6 +787,7 @@ async fn abort_is_processed_while_reviewer_start_request_is_awaited() {
     let call = ToolCall {
         id: "call-review-wait".to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
             .expect("validated arguments"),
     };
@@ -3589,6 +3592,7 @@ async fn approval_wait_preserves_pending_across_failed_control_authorization(abo
     let call = ToolCall {
         id: "approval-authorization-failure".to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
             .expect("validated arguments"),
     };
@@ -4298,6 +4302,7 @@ async fn runtime_shutdown_interrupts_pending_approval_phase() {
     let call = ToolCall {
         id: "runtime-shutdown-approval".to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
             .expect("validated arguments"),
     };
@@ -5672,6 +5677,7 @@ fn bash_call(id: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
         name: "bash".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value::<ValidatedToolArguments>(
             json!({"command": "git status"}),
         )

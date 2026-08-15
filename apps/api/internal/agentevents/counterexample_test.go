@@ -15,7 +15,9 @@ func TestValidateCommandCounterexamples(t *testing.T) {
 		shouldErr bool
 	}{
 		{"approval_decision_missing_decision", `{"type":"approval_decision","request_id":"req-1"}`, true},
-		{"approval_decision_non_object_rule", `{"type":"approval_decision","request_id":"req-1","decision":{"type":"approve_always","rule":"notanobject"}}`, true},
+		{"approval_decision_legacy_approve_always", `{"type":"approval_decision","request_id":"req-1","decision":{"type":"approve_always","rule":{}}}`, true},
+		{"approval_decision_legacy_deny", `{"type":"approval_decision","request_id":"req-1","decision":{"type":"deny"}}`, true},
+		{"approval_decision_deny_once", `{"type":"approval_decision","request_id":"req-1","decision":{"type":"deny_once"}}`, false},
 		{"approval_decision_unknown_field_in_decision", `{"type":"approval_decision","request_id":"req-1","decision":{"type":"approve_once","extra":1}}`, true},
 		{"abort_unknown_field", `{"type":"abort","extra":true}`, true},
 		{"user_message_null_attachments", `{"type":"user_message","text":"hi","attachments":null}`, true},
@@ -226,7 +228,7 @@ func TestAnyJSONRejectsDuplicateKeysInNestedPayloads(t *testing.T) {
 		`{"type":"tool_execution_update","tool_call_id":"call-1","partial":{"text":"a","text":"b"}}`,
 		`{"type":"tool_execution_end","tool_call_id":"call-1","result":{"foo":1,"foo":2},"is_error":false}`,
 		`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read","args":{"path":"/a","path":"/b"}}`,
-		`{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_always","rule":{"x":1,"x":2}}}}`,
+		`{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"deny_once","type":"deny_once"}}}`,
 		`{"type":"tool_result","tool_call_id":"call-1","tool_name":"read","content":[],"details":{"key":"a","key":"b"},"is_error":false,"timestamp":"2026-07-25T20:00:00Z"}`,
 	}
 	for _, raw := range cases {
@@ -268,8 +270,4 @@ func TestObjectValuedFieldsRejectUnsafeNestedIntegers(t *testing.T) {
 		t.Fatal("tool_call arguments accepted an unsafe nested integer")
 	}
 
-	approvalRule := `{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":{"overflow":9007199254740992}}}`
-	if err := ValidateCommand(json.RawMessage(approvalRule)); err == nil {
-		t.Fatal("deferred approval rule accepted an unsafe nested integer")
-	}
 }

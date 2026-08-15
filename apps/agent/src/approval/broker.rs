@@ -23,10 +23,7 @@ use crate::{
     agent::events::{self, ApprovalRequest},
     approval::{
         action::{CanonicalAction, SandboxSummary, SecretAwareActionProjector},
-        policy::{
-            ApprovalRule, Policy, PolicyDecision, ResolvedDecision, RuleValidationError,
-            UserDecision,
-        },
+        policy::{Policy, PolicyDecision, ResolvedDecision, RuleValidationError, UserDecision},
         prompt::TrustedEnvironment,
         reviewer::{
             AuditDecision, ReviewOutcome, ReviewRequest, Reviewer, ReviewerMode, RiskLevel,
@@ -36,6 +33,9 @@ use crate::{
     gateway::ApprovalDecision as GatewayApprovalDecision,
     provider::types::{PublicMessage, ToolCall},
 };
+
+#[cfg(test)]
+use crate::approval::policy::ApprovalRule;
 
 /// Result of asking the broker whether a tool may start.
 #[derive(Debug)]
@@ -911,18 +911,19 @@ fn to_events_audit(decision: &AuditDecision) -> events::AuditDecision {
 }
 
 fn user_decision_from_gateway(
-    request_id: &str,
+    _request_id: &str,
     decision: &GatewayApprovalDecision,
 ) -> Result<UserDecision> {
     match decision {
         GatewayApprovalDecision::ApproveOnce => Ok(UserDecision::ApproveOnce),
-        GatewayApprovalDecision::Deny => Ok(UserDecision::Deny),
+        GatewayApprovalDecision::DenyOnce => Ok(UserDecision::Deny),
+        #[cfg(test)]
         GatewayApprovalDecision::ApproveAlways { rule } => {
             let value = serde_json::to_value(rule).context("serialize deferred rule")?;
             let mut rule: ApprovalRule =
                 serde_json::from_value(value).context("parse deferred approval rule")?;
             if rule.id.is_empty() {
-                rule.id = request_id.to_owned();
+                rule.id = _request_id.to_owned();
             }
             Ok(UserDecision::ApproveAlways { rule })
         }
@@ -984,6 +985,7 @@ mod tests {
         ToolCall {
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value(json!({"path": path})).unwrap(),
         }
     }
@@ -992,6 +994,7 @@ mod tests {
         ToolCall {
             id: "call-2".to_owned(),
             name: "bash".to_owned(),
+            route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value(json!({"command": command})).unwrap(),
         }
     }
@@ -1633,6 +1636,7 @@ mod tests {
                 &serde_json::from_value::<ToolCall>(json!({
                     "id": "call-3",
                     "name": "write_file",
+                    "route": "normal",
                     "arguments": {"path": "/etc/passwd", "content": "x"}
                 }))
                 .unwrap(),

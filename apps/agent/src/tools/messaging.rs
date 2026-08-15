@@ -1901,7 +1901,7 @@ mod tests {
         apiclient::apps::{
             AppInstallationResolutionResult, AppInstallationResolver, ResolvedAppInstallation,
         },
-        provider::types::{ToolCall, ValidatedToolArguments},
+        provider::types::{ToolCall, ToolInvocationRoute, ValidatedToolArguments},
         tools::{
             BoundExecutionError, BoundToolInvocation, ToolRegistry, ToolRegistryBuilder,
             WorkspacePaths,
@@ -2228,6 +2228,7 @@ mod tests {
         ToolCall {
             id: id.to_owned(),
             name: TOOL_NAME.to_owned(),
+            route: ToolInvocationRoute::Normal,
             arguments: serde_json::from_value(with_default_workspace(action))
                 .expect("object-shaped arguments"),
         }
@@ -2459,6 +2460,7 @@ mod tests {
         let call = |id: &str, value: Value| ToolCall {
             id: id.to_owned(),
             name: TOOL_NAME.to_owned(),
+            route: ToolInvocationRoute::Normal,
             arguments: serde_json::from_value(value).expect("object-shaped arguments"),
         };
 

@@ -479,37 +479,12 @@ func validateApprovalDecision(raw json.RawMessage) error {
 		return fmt.Errorf("approval decision discriminator: %w", err)
 	}
 	switch d.Type {
-	case "approve_once", "deny":
+	case "approve_once", "deny_once":
 		var v struct {
 			Type string `json:"type"`
 		}
 		if err := unmarshalStrict(raw, &v); err != nil {
 			return fmt.Errorf("approval decision %q: %w", d.Type, err)
-		}
-	case "approve_always":
-		var v struct {
-			Type string          `json:"type"`
-			Rule json.RawMessage `json:"rule"`
-		}
-		if err := unmarshalStrict(raw, &v); err != nil {
-			return fmt.Errorf("approval decision %q: %w", d.Type, err)
-		}
-		if len(v.Rule) == 0 {
-			return fmt.Errorf("approve_always requires rule")
-		}
-		if string(v.Rule) == "null" {
-			return fmt.Errorf("approve_always rule must be an object")
-		}
-		// DeferredApprovalRule must be a JSON object with open properties.
-		var rule map[string]json.RawMessage
-		if err := json.Unmarshal(v.Rule, &rule); err != nil {
-			return fmt.Errorf("rule must be an object: %w", err)
-		}
-		if rule == nil {
-			return fmt.Errorf("approve_always rule must be an object")
-		}
-		if err := validateAnyJSON(v.Rule); err != nil {
-			return fmt.Errorf("approve_always rule: %w", err)
 		}
 	default:
 		return fmt.Errorf("unknown approval decision type: %q", d.Type)

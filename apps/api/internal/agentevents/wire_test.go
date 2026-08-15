@@ -233,15 +233,21 @@ func normalizeValue(v any) any {
 	}
 }
 
-func TestValidateApprovalDecisionRejectsNullRule(t *testing.T) {
-	raw := []byte(`{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":null}}`)
-	if err := ValidateCommand(raw); err == nil {
-		t.Fatal("expected approve_always with rule:null to be rejected")
+func TestValidateApprovalDecisionUsesCurrentCallVocabularyOnly(t *testing.T) {
+	for _, decision := range []string{"approve_once", "deny_once"} {
+		raw := []byte(fmt.Sprintf(`{"type":"approval_decision","request_id":"r-1","decision":{"type":%q}}`, decision))
+		if err := ValidateCommand(raw); err != nil {
+			t.Fatalf("expected %s to be accepted, got %v", decision, err)
+		}
 	}
 
-	raw = []byte(`{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":{}}}`)
-	if err := ValidateCommand(raw); err != nil {
-		t.Fatalf("expected empty object rule to be accepted, got %v", err)
+	for _, legacy := range []string{
+		`{"type":"approval_decision","request_id":"r-1","decision":{"type":"deny"}}`,
+		`{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":{}}}`,
+	} {
+		if err := ValidateCommand([]byte(legacy)); err == nil {
+			t.Fatalf("expected legacy approval decision to be rejected: %s", legacy)
+		}
 	}
 }
 
