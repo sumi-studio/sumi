@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,75 +39,213 @@ func callLocalWithoutFixtureInference(
 	return response.Code, decoded
 }
 
-func TestLocalWritePreservesBoundedReceiptUnderExactScope(t *testing.T) {
+func TestLocalWriteBoundaryThroughAuthenticatedUnixControlRoute(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
 	workspace, channel := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	messagingServer := NewServer(w.store.core, nil)
 
-	post := func(content, nonce string) (int, map[string]any) {
+	commandStore, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open command store: %v", err)
+	}
+	t.Cleanup(func() { _ = commandStore.Close() })
+	gateway, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), commandStore)
+	if err != nil {
+		t.Fatalf("open durable gateway: %v", err)
+	}
+	const bearer = "messaging-write-boundary-bearer-generation-one"
+	control, err := agentevents.NewLocalControlServer(
+		gateway,
+		[]byte("messaging-write-boundary-signing-secret"),
+		[]agentevents.LocalRuntimeAuthorization{{
+			BearerToken: bearer, TenantID: "messaging-write-boundary",
+			PersonalityAgentID: w.agent.ID, Generation: 1,
+			RPCBootNonce:          "messaging-write-boundary-boot-1",
+			Audience:              agentevents.DefaultAgentAudience(),
+			DeliveryAuthorization: agentevents.LocalDeliveryRaw,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("new local control: %v", err)
+	}
+	if err := messagingServer.RegisterLocalControlRoutes(control); err != nil {
+		t.Fatalf("register messaging routes: %v", err)
+	}
+	handler, err := control.HandlerForLocalRuntime(w.agent.ID)
+	if err != nil {
+		t.Fatalf("bind local runtime handler: %v", err)
+	}
+	socketPath := filepath.Join(t.TempDir(), "local-control.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen on local-control Unix socket: %v", err)
+	}
+	httpServer := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- httpServer.Serve(listener) }()
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+	}
+	client := &http.Client{Transport: transport}
+	t.Cleanup(func() {
+		transport.CloseIdleConnections()
+		if err := httpServer.Close(); err != nil {
+			t.Errorf("close Unix local-control server: %v", err)
+		}
+		if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve Unix local-control route: %v", err)
+		}
+	})
+
+	type durableState struct {
+		messages int64
+		lastSeq  int64
+		intents  int64
+	}
+	snapshot := func() durableState {
 		t.Helper()
-		return callLocal(t, ctx, server.localWrite, LocalWritePath, map[string]any{
+		var state durableState
+		if err := w.store.core.pool.QueryRow(ctx, `
+			SELECT count(*) FROM messages
+			WHERE workspace_id=$1 AND place_id=$2`,
+			workspace.WorkspaceID, channel.PlaceID).Scan(&state.messages); err != nil {
+			t.Fatalf("count messages: %v", err)
+		}
+		if err := w.store.core.pool.QueryRow(ctx, `
+			SELECT last_seq FROM places
+			WHERE workspace_id=$1 AND place_id=$2`,
+			workspace.WorkspaceID, channel.PlaceID).Scan(&state.lastSeq); err != nil {
+			t.Fatalf("read place sequence: %v", err)
+		}
+		if err := w.store.core.pool.QueryRow(ctx, `
+			SELECT count(*) FROM message_notification_intents i
+			JOIN messages m ON m.message_id=i.message_id
+			WHERE m.workspace_id=$1 AND m.place_id=$2`,
+			workspace.WorkspaceID, channel.PlaceID).Scan(&state.intents); err != nil {
+			t.Fatalf("count notification intents: %v", err)
+		}
+		return state
+	}
+
+	type postResult struct {
+		status  int
+		body    map[string]any
+		raw     []byte
+		request []byte
+	}
+	post := func(content, nonce, authorization string) postResult {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{
 			"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
 			"place_id": channel.PlaceID, "content": content, "urgency": "normal", "client_nonce": nonce,
-		}, authorization)
+		})
+		if err != nil {
+			t.Fatalf("marshal local write: %v", err)
+		}
+		request, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, "http://local-control.invalid"+LocalWritePath, bytes.NewReader(payload),
+		)
+		if err != nil {
+			t.Fatalf("new local write request: %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if authorization != "" {
+			request.Header.Set("Authorization", "Bearer "+authorization)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatalf("post local write: %v", err)
+		}
+		defer response.Body.Close()
+		raw, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read local write response: %v", err)
+		}
+		body := map[string]any{}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode local write response %q: %v", raw, err)
+		}
+		return postResult{status: response.StatusCode, body: body, raw: raw, request: payload}
 	}
+
+	initial := snapshot()
+	unauthorized := post("must not commit", "nonce-unauthorized", "wrong-bearer-token-with-32-bytes")
+	if unauthorized.status != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer write = %d %v, want 401", unauthorized.status, unauthorized.body)
+	}
+	if got := snapshot(); got != initial {
+		t.Fatalf("unauthorized write mutated durable state: before %#v after %#v", initial, got)
+	}
+
 	for name, content := range map[string]string{
 		"over-limit": strings.Repeat("x", MaxContentBytes+1),
 		"nul":        strings.Repeat("\x00", MaxContentBytes),
 	} {
-		status, body := post(content, "invalid-"+name)
-		if status != http.StatusBadRequest || body["error"] != "invalid_content" {
-			t.Fatalf("%s write = %d %v, want 400 invalid_content", name, status, body)
+		result := post(content, "nonce-invalid-"+name, bearer)
+		if result.status != http.StatusBadRequest || result.body["error"] != "invalid_content" {
+			t.Fatalf("%s write = %d %v, want 400 invalid_content", name, result.status, result.body)
+		}
+		if got := snapshot(); got != initial {
+			t.Fatalf("%s write mutated durable state: before %#v after %#v", name, initial, got)
 		}
 	}
 
-	const quotedNonce = "nonce-\"quoted\"-\\slash"
-	maxContent := "@Yohaku " + strings.Repeat("a", MaxContentBytes-len("@Yohaku "))
-	status, created := post(maxContent, quotedNonce)
-	if status != http.StatusCreated || created["created"] != true ||
-		created["client_nonce"] != quotedNonce || len(created) != 4 || created["message"] != nil {
-		t.Fatalf("max write receipt = %d %v", status, created)
+	// Both content and nonce use the legal byte whose JSON representation has
+	// the largest six-byte escape. The request is much larger than 64 KiB, but
+	// its receipt must stay inside the unchanged generic response bound.
+	maxContent := strings.Repeat("\x01", MaxContentBytes)
+	worstEscapedNonce := strings.Repeat("\x01", 126) + "\"\\"
+	if len(worstEscapedNonce) != 128 {
+		t.Fatalf("worst escaped nonce = %d bytes, want 128", len(worstEscapedNonce))
 	}
-	createdJSON, err := json.Marshal(created)
-	if err != nil {
-		t.Fatal(err)
+	created := post(maxContent, worstEscapedNonce, bearer)
+	if created.status != http.StatusCreated || created.body["created"] != true ||
+		created.body["client_nonce"] != worstEscapedNonce || len(created.body) != 4 ||
+		created.body["message"] != nil {
+		t.Fatalf("max escaped write receipt = %d %v", created.status, created.body)
 	}
-	if len(createdJSON) >= 1024 || !bytes.Contains(createdJSON, []byte(`\"quoted\"-\\slash`)) {
-		t.Fatalf("receipt is not compact or escaped correctly: %d bytes %q", len(createdJSON), createdJSON)
+	if len(created.request) <= 2*MaxContentBytes || len(created.request) > maxRequestBytes {
+		t.Fatalf("escaped request = %d bytes, cap %d", len(created.request), maxRequestBytes)
+	}
+	if len(created.raw) >= 1024 ||
+		!bytes.Contains(created.raw, []byte(`\u0001`)) ||
+		!bytes.Contains(created.raw, []byte(`\"\\`)) {
+		t.Fatalf("receipt is not compact or escaped correctly: %d bytes %q", len(created.raw), created.raw)
 	}
 
-	messageID := created["message_id"]
-	seq := created["seq"]
-	status, replayed := post(maxContent, quotedNonce)
-	if status != http.StatusOK || replayed["created"] != false ||
-		replayed["message_id"] != messageID || replayed["seq"] != seq ||
-		replayed["client_nonce"] != quotedNonce {
-		t.Fatalf("same-nonce replay = %d %v, first %v", status, replayed, created)
+	messageID, messageIDOK := created.body["message_id"].(string)
+	seq, seqOK := created.body["seq"].(float64)
+	if !messageIDOK || messageID == "" || !seqOK || seq != 1 {
+		t.Fatalf("first receipt identity = message_id %#v seq %#v", created.body["message_id"], created.body["seq"])
+	}
+	createdState := snapshot()
+	if createdState.messages != 1 || createdState.lastSeq != 1 || createdState.intents == 0 {
+		t.Fatalf("first durable write state = %#v, want one message at seq 1 with intents", createdState)
+	}
+	replayed := post(maxContent, worstEscapedNonce, bearer)
+	if replayed.status != http.StatusOK || replayed.body["created"] != false ||
+		replayed.body["message_id"] != messageID || replayed.body["seq"] != seq ||
+		replayed.body["client_nonce"] != worstEscapedNonce || len(replayed.body) != 4 {
+		t.Fatalf("same-nonce replay = %d %v, first %v", replayed.status, replayed.body, created.body)
+	}
+	if got := snapshot(); got != createdState {
+		t.Fatalf("same-nonce replay mutated durable state: before %#v after %#v", createdState, got)
 	}
 
-	status, fresh := post(maxContent, "nonce-new-call")
-	if status != http.StatusCreated || fresh["created"] != true ||
-		fresh["message_id"] == messageID || fresh["seq"] == seq {
-		t.Fatalf("new-nonce write = %d %v, first %v", status, fresh, created)
+	fresh := post("fresh write", "nonce-new-call", bearer)
+	if fresh.status != http.StatusCreated || fresh.body["created"] != true ||
+		fresh.body["message_id"] == messageID || fresh.body["seq"] == seq {
+		t.Fatalf("new-nonce write = %d %v, first %v", fresh.status, fresh.body, created.body)
 	}
-	var messages, intents int
-	if err := w.store.core.pool.QueryRow(ctx,
-		"SELECT count(*) FROM messages WHERE workspace_id=$1 AND place_id=$2",
-		workspace.WorkspaceID, channel.PlaceID).Scan(&messages); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.store.core.pool.QueryRow(ctx, `
-		SELECT count(*) FROM message_notification_intents i
-		JOIN messages m ON m.message_id=i.message_id
-		WHERE m.workspace_id=$1 AND m.place_id=$2`, workspace.WorkspaceID, channel.PlaceID).Scan(&intents); err != nil {
-		t.Fatal(err)
-	}
-	if messages != 2 || intents == 0 {
-		t.Fatalf("durable writes/intents = %d/%d, want two messages and transactional intents", messages, intents)
+	final := snapshot()
+	if final.messages != 2 || final.lastSeq != 2 || final.intents <= createdState.intents {
+		t.Fatalf("fresh durable write state = %#v, first %#v", final, createdState)
 	}
 }
 
