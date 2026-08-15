@@ -420,6 +420,21 @@ func (s *Store) SetEnabled(ctx context.Context, owner OwnerRef, actor participan
 // installation id addresses the binding; its owner is loaded server-side and
 // then authorized by the same owner-domain rule used at installation.
 func (s *Store) SetEnabledByID(ctx context.Context, installationID string, actor participant.Ref, enabled bool) (Installation, error) {
+	return s.setEnabledByID(ctx, installationID, actor, enabled, nil)
+}
+
+// SetEnabledByIDAtEpoch applies an exact desired state only while the
+// installation still has the authority epoch observed by the caller. This
+// makes a replay of an interrupted browser intent converge without allowing a
+// stale intent to overwrite a later disable/re-enable lifecycle.
+func (s *Store) SetEnabledByIDAtEpoch(ctx context.Context, installationID string, actor participant.Ref, enabled bool, expectedAuthorityEpoch int64) (Installation, error) {
+	if expectedAuthorityEpoch < 1 {
+		return Installation{}, ErrAuthorityEpochStale
+	}
+	return s.setEnabledByID(ctx, installationID, actor, enabled, &expectedAuthorityEpoch)
+}
+
+func (s *Store) setEnabledByID(ctx context.Context, installationID string, actor participant.Ref, enabled bool, expectedAuthorityEpoch *int64) (Installation, error) {
 	owner, appID, err := s.installationAddress(ctx, installationID)
 	if err != nil {
 		return Installation{}, err
@@ -449,14 +464,34 @@ func (s *Store) SetEnabledByID(ctx context.Context, installationID string, actor
 		        ELSE authority_epoch
 		    END,
 		    enabled = $2,
-		    updated_at = $3
+		    updated_at = CASE
+		        WHEN $7::bigint IS NOT NULL AND enabled = $2 THEN updated_at
+		        ELSE $3
+		    END
 		WHERE installation_id = $1 AND owner_kind = $4 AND owner_id = $5 AND app_id = $6
+		  AND ($7::bigint IS NULL OR authority_epoch = $7)
 		RETURNING installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 		          installed_at, updated_at`, installationID, enabled, now,
-		storageKind, storageID, appID)
+		storageKind, storageID, appID, expectedAuthorityEpoch)
 	installation, err := scanInstallation(row)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Installation{}, ErrInstallationNotFound
+		if expectedAuthorityEpoch == nil {
+			return Installation{}, ErrInstallationNotFound
+		}
+		var currentEpoch int64
+		err = tx.QueryRow(ctx, `
+			SELECT authority_epoch
+			FROM app_installations
+			WHERE installation_id = $1 AND owner_kind = $2 AND owner_id = $3 AND app_id = $4`,
+			installationID, storageKind, storageID, appID,
+		).Scan(&currentEpoch)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Installation{}, ErrInstallationNotFound
+		}
+		if err != nil {
+			return Installation{}, fmt.Errorf("classify stale app authority: %w", err)
+		}
+		return Installation{}, ErrAuthorityEpochStale
 	}
 	if err != nil {
 		return Installation{}, fmt.Errorf("change app state: %w", err)

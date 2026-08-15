@@ -73,6 +73,7 @@ var (
 	ErrOwnerKindUnsupported = errors.New("app does not support this owner kind")
 	ErrAlreadyInstalled     = errors.New("app is already installed for this owner")
 	ErrInstallationNotFound = errors.New("app installation not found")
+	ErrAuthorityEpochStale  = errors.New("app installation authority epoch is stale")
 	ErrAppDisabled          = errors.New("app installation is disabled")
 )
 

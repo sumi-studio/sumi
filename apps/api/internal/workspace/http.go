@@ -393,6 +393,8 @@ func writeDomainError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrAlreadyMember), errors.Is(err, ErrRoleNameTaken),
 		errors.Is(err, applicationapps.ErrAlreadyInstalled):
 		writeAPIError(w, http.StatusConflict, "conflict")
+	case errors.Is(err, applicationapps.ErrAuthorityEpochStale):
+		writeAPIError(w, http.StatusConflict, "stale_authority")
 	case errors.Is(err, ErrInvalidName), errors.Is(err, ErrInvalidColor),
 		errors.Is(err, ErrInvalidPosition), errors.Is(err, ErrInvalidPermission),
 		errors.Is(err, ErrInvalidInvite), errors.Is(err, ErrInvalidWorkspaceListCursor),

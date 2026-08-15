@@ -37,6 +37,7 @@ func TestWorkspaceDomainErrorsExposeCanonicalCodes(t *testing.T) {
 		{"last administrator", ErrLastAdministrator, http.StatusConflict, "last_administrator"},
 		{"generic conflict", ErrRoleNameTaken, http.StatusConflict, "conflict"},
 		{"invalid Workspace list cursor", ErrInvalidWorkspaceListCursor, http.StatusBadRequest, "invalid_request"},
+		{"stale app authority", applicationapps.ErrAuthorityEpochStale, http.StatusConflict, "stale_authority"},
 		{"direct-chat lifecycle unavailable", directchat.ErrLifecycleFenceUnavailable, http.StatusServiceUnavailable, "unavailable"},
 	}
 	for _, test := range tests {
@@ -513,9 +514,17 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 	}
 	humanDisable := browserCall(mux, http.MethodPut,
 		"/app-installations/"+installations["Human"].InstallationID+"/state",
-		`{"state":"disabled"}`)
+		`{"state":"disabled","expected_authority_epoch":"1"}`)
 	if humanDisable.Code != http.StatusOK {
 		t.Fatalf("Human app disable status = %d, body=%s", humanDisable.Code, humanDisable.Body.String())
+	}
+	humanDisableReplay := browserCall(mux, http.MethodPut,
+		"/app-installations/"+installations["Human"].InstallationID+"/state",
+		`{"state":"disabled","expected_authority_epoch":"1"}`)
+	if humanDisableReplay.Code != http.StatusConflict ||
+		!strings.Contains(humanDisableReplay.Body.String(), `"stale_authority"`) {
+		t.Fatalf("stale Human app replay status = %d, body=%s",
+			humanDisableReplay.Code, humanDisableReplay.Body.String())
 	}
 	agentDisable := invokeLocal(server.localSetAppEnabled, fmt.Sprintf(
 		`{"installation_id":%q,"enabled":false}`, installations["Agent"].InstallationID),
