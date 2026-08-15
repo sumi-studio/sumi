@@ -335,6 +335,8 @@ runtime_secret_snapshot() {
     sumi_agent_wrapping_key
     sumi_approval_secret_digest_key
     sumi_provider_api_key
+    sumi_execution_reviewer_api_key
+    sumi_escalation_reviewer_api_key
   )
   validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}"
   validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
@@ -360,6 +362,8 @@ materialize_runtime_secrets() {
     'SUMI_AGENT_WRAPPING_KEY:sumi_agent_wrapping_key'
     'SUMI_APPROVAL_SECRET_DIGEST_KEY:sumi_approval_secret_digest_key'
     'SUMI_PROVIDER_API_KEY:sumi_provider_api_key'
+    'SUMI_EXECUTION_REVIEWER_API_KEY:sumi_execution_reviewer_api_key'
+    'SUMI_ESCALATION_REVIEWER_API_KEY:sumi_escalation_reviewer_api_key'
   )
   ensure_runtime_secret_root
   [[ ! -e "${paid_root}" && ! -L "${paid_root}" ]] ||
@@ -401,7 +405,11 @@ require_launch_environment() {
     SUMI_AGENT_WRAPPING_KEY \
     SUMI_AGENT_WRAPPING_KEY_ID \
     SUMI_APPROVAL_SECRET_DIGEST_KEY \
-    SUMI_PROVIDER_API_KEY
+    SUMI_PROVIDER_API_KEY \
+    SUMI_EXECUTION_REVIEWER_API_KEY \
+    SUMI_EXECUTION_REVIEWER_MODEL_PRESET \
+    SUMI_ESCALATION_REVIEWER_API_KEY \
+    SUMI_ESCALATION_REVIEWER_MODEL_PRESET
   do
     [[ -n "${!name:-}" ]] || fail "${name} is required"
   done
@@ -409,7 +417,9 @@ require_launch_environment() {
     SUMI_LOCAL_CONTROL_BEARER \
     SUMI_AGENT_WRAPPING_KEY \
     SUMI_APPROVAL_SECRET_DIGEST_KEY \
-    SUMI_PROVIDER_API_KEY
+    SUMI_PROVIDER_API_KEY \
+    SUMI_EXECUTION_REVIEWER_API_KEY \
+    SUMI_ESCALATION_REVIEWER_API_KEY
   do
     [[ "${!name}" != *$'\n'* && "${!name}" != *$'\r'* ]] ||
       fail "${name} must not contain newline or carriage return"
@@ -421,6 +431,18 @@ require_launch_environment() {
   if [[ -v SUMI_MODEL_ID && -z "${SUMI_MODEL_ID}" ]]; then
     fail "SUMI_MODEL_ID must not be empty when set"
   fi
+  for name in \
+    SUMI_EXECUTION_REVIEWER_MODEL_ID \
+    SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL \
+    SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE \
+    SUMI_ESCALATION_REVIEWER_MODEL_ID \
+    SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL \
+    SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE
+  do
+    if [[ -v "${name}" && -z "${!name}" ]]; then
+      fail "${name} must not be empty when set"
+    fi
+  done
   validate_local_control_socket
 }
 
@@ -624,6 +646,8 @@ redact_activation_diagnostic_stream() {
     SUMI_AGENT_WRAPPING_KEY
     SUMI_APPROVAL_SECRET_DIGEST_KEY
     SUMI_PROVIDER_API_KEY
+    SUMI_EXECUTION_REVIEWER_API_KEY
+    SUMI_ESCALATION_REVIEWER_API_KEY
     SUMI_EXPECTED_RPC_NONCE
   )
   while IFS= read -r line || [[ -n "${line}" ]]; do

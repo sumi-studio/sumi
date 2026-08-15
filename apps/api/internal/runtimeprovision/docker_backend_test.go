@@ -71,6 +71,12 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 		"SUMI_EXPECTED_RPC_GENERATION=7",
 		"SUMI_EXPECTED_RPC_NONCE=boot-7",
 		"SUMI_GATEWAY_URL=wss://gateway.invalid",
+		"SUMI_EXECUTION_REVIEWER_API_KEY=execution-reviewer-key",
+		"SUMI_EXECUTION_REVIEWER_MODEL_PRESET=kimi-k3",
+		"SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV=SUMI_EXECUTION_REVIEWER_API_KEY",
+		"SUMI_ESCALATION_REVIEWER_API_KEY=escalation-reviewer-key",
+		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET=glm-5.2",
+		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV=SUMI_ESCALATION_REVIEWER_API_KEY",
 	} {
 		if !strings.Contains(joinedEnvironment, expected) {
 			t.Fatalf("activation environment omitted %s: %s", expected, joinedEnvironment)

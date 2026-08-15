@@ -97,6 +97,16 @@ OPENCODE_GO_API_KEY=<real credential>
 
 The launcher never prints Firebase or provider credentials.
 
+Production AutoReview has no conversation-model fallback. Before spawning a
+PersonalityAgent, configure both `SUMI_EXECUTION_REVIEWER_MODEL_*` and
+`SUMI_ESCALATION_REVIEWER_MODEL_*`, and provide
+`SUMI_EXECUTION_REVIEWER_API_KEY` and `SUMI_ESCALATION_REVIEWER_API_KEY` from
+separate secret sources. The resolved reviewer origins and credential variable
+names must be distinct from the conversation model and from each other. This
+repository deliberately does not select those providers for dogfood. A
+declared `account_scope` remains part of the trust identity, but its text alone
+does not prove that two credentials belong to separate provider accounts.
+
 ### Codex OAuth bridge provider
 
 The existing development-only Codex Responses bridge can provide a real model

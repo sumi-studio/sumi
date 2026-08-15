@@ -27,6 +27,14 @@ pub struct Config {
     pub database_path: PathBuf,
     pub system_prompt: String,
     pub model: ModelConfig,
+    pub reviewers: ReviewerModelsConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewerModelsConfig {
+    pub execution: Option<ModelConfig>,
+    pub escalation: Option<ModelConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -80,6 +88,7 @@ struct FileConfig {
     system_prompt: Option<String>,
     system_prompt_file: Option<PathBuf>,
     model: ModelConfig,
+    reviewers: ReviewerModelsConfig,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +102,17 @@ struct EnvOverrides {
     model_id: Option<String>,
     model_base_url: Option<String>,
     model_api_key_env: Option<String>,
+    execution_reviewer: ModelEnvOverrides,
+    escalation_reviewer: ModelEnvOverrides,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ModelEnvOverrides {
+    preset: Option<String>,
+    id: Option<String>,
+    base_url: Option<String>,
+    account_scope: Option<String>,
+    api_key_env: Option<String>,
 }
 
 impl Config {
@@ -122,108 +142,29 @@ impl Config {
     }
 
     pub fn model_spec(&self) -> Result<ModelSpec> {
-        let preset = self.model.preset.as_deref().unwrap_or(DEFAULT_MODEL_PRESET);
-        let mut spec =
-            ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
-        if let Some(id) = &self.model.id {
-            spec.set_model_id(id);
-        }
-        if let Some(base_url) = &self.model.base_url {
-            spec.base_url.clone_from(base_url);
-        }
-        if let Some(account_scope) = &self.model.account_scope {
-            spec.account_scope.clone_from(account_scope);
-        }
-        if let Some(api_key_env) = &self.model.api_key_env {
-            spec.api_key_env.clone_from(api_key_env);
-        }
-        if let Some(context_window) = self.model.context_window {
-            spec.context_window = context_window;
-        }
-        if let Some(max_output_tokens) = self.model.max_output_tokens {
-            spec.max_output_tokens = max_output_tokens;
-            if self.model.default_output_tokens.is_none() {
-                spec.default_output_tokens = spec.default_output_tokens.min(max_output_tokens);
-            }
-        }
-        if let Some(default_output_tokens) = self.model.default_output_tokens {
-            spec.default_output_tokens = default_output_tokens;
-        }
-        if let Some(reasoning) = self.model.reasoning {
-            spec.reasoning = reasoning;
-        }
-        if let Some(supports_images) = self.model.supports_images {
-            spec.supports_images = supports_images;
-        }
+        resolve_model_spec(
+            &self.model,
+            Some(DEFAULT_MODEL_PRESET),
+            "conversation model",
+        )
+    }
 
-        let compat_config = &self.model.compat;
-        if let ProtocolCompat::Chat(compat) = &mut spec.compat {
-            if let Some(field) = compat_config.max_tokens_field.as_deref() {
-                compat.max_tokens_field = match field {
-                    "max_tokens" => MaxTokensField::MaxTokens,
-                    "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
-                    other => anyhow::bail!("unknown max_tokens_field {other}"),
-                };
-            }
-            if let Some(format) = compat_config.thinking_format.as_deref() {
-                compat.thinking_format = match format {
-                    "off" => ThinkingFormat::Off,
-                    "deepseek" => ThinkingFormat::Deepseek,
-                    "zai" => ThinkingFormat::Zai,
-                    "openai_effort" => ThinkingFormat::OpenAiEffort,
-                    "provider_default" => ThinkingFormat::ProviderDefault,
-                    other => anyhow::bail!("unknown thinking_format {other}"),
-                };
-            }
-            if let Some(value) = compat_config.supports_usage_in_streaming {
-                compat.supports_usage_in_streaming = value;
-            }
-            if let Some(value) = compat_config.requires_reasoning_content_on_assistant {
-                compat.requires_reasoning_content_on_assistant = value;
-            }
-            if let Some(value) = compat_config.zai_tool_stream {
-                compat.zai_tool_stream = value;
-            }
-            if let Some(value) = compat_config.supports_strict_mode {
-                compat.supports_strict_mode = value;
-            }
-            if let Some(value) = compat_config.supports_required_tool_choice {
-                compat.supports_required_tool_choice = value;
-            }
-            if let Some(value) = compat_config.supports_store {
-                compat.supports_store = value;
-            }
-            if let Some(value) = compat_config.supports_developer_role {
-                compat.supports_developer_role = value;
-            }
-            if let Some(value) = compat_config.allows_sampling_parameters {
-                compat.allows_sampling_parameters = value;
-            }
-        } else if *compat_config != CompatConfig::default() {
-            anyhow::bail!("Chat compatibility overrides require a Chat protocol preset");
-        }
-        match (&spec.protocol, &spec.compat) {
-            (ApiProtocol::OpenAiChatCompletions, ProtocolCompat::Chat(_))
-            | (ApiProtocol::OpenAiResponses, ProtocolCompat::Responses(_))
-            | (ApiProtocol::AnthropicMessages, ProtocolCompat::Anthropic(_)) => {}
-            _ => anyhow::bail!("model protocol/compat variant mismatch"),
-        }
-        validate_model_base_url(&spec.base_url)?;
-        if spec.context_window == 0 {
-            anyhow::bail!("context_window must be greater than zero");
-        }
-        if spec.default_output_tokens == 0 || spec.default_output_tokens > spec.max_output_tokens {
-            anyhow::bail!(
-                "default_output_tokens must be within 1..={}",
-                spec.max_output_tokens
-            );
-        }
-        if ResponseBudget::for_output_tokens(spec.max_output_tokens).is_none() {
-            anyhow::bail!(
-                "max_output_tokens cannot be represented by the provider response budget"
-            );
-        }
-        Ok(spec)
+    pub fn execution_reviewer_model_spec(&self) -> Result<ModelSpec> {
+        let config = self.reviewers.execution.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Execution reviewer model must be configured explicitly under [reviewers.execution] or SUMI_EXECUTION_REVIEWER_MODEL_*"
+            )
+        })?;
+        resolve_model_spec(config, None, "Execution reviewer")
+    }
+
+    pub fn escalation_reviewer_model_spec(&self) -> Result<ModelSpec> {
+        let config = self.reviewers.escalation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Escalation reviewer model must be configured explicitly under [reviewers.escalation] or SUMI_ESCALATION_REVIEWER_MODEL_*"
+            )
+        })?;
+        resolve_model_spec(config, None, "Escalation reviewer")
     }
 
     fn resolve(file: FileConfig, overrides: EnvOverrides) -> Result<Self> {
@@ -263,6 +204,12 @@ impl Config {
         if let Some(value) = overrides.model_api_key_env {
             file.model.api_key_env = Some(value);
         }
+        overrides
+            .execution_reviewer
+            .apply_to(&mut file.reviewers.execution);
+        overrides
+            .escalation_reviewer
+            .apply_to(&mut file.reviewers.escalation);
 
         Ok(Self {
             personality_agent_id: overrides
@@ -280,7 +227,158 @@ impl Config {
                 .or(file.system_prompt)
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
             model: file.model,
+            reviewers: file.reviewers,
         })
+    }
+}
+
+fn resolve_model_spec(
+    model: &ModelConfig,
+    default_preset: Option<&str>,
+    label: &str,
+) -> Result<ModelSpec> {
+    let preset = model
+        .preset
+        .as_deref()
+        .or(default_preset)
+        .ok_or_else(|| anyhow::anyhow!("{label} preset must be configured explicitly"))?;
+    let mut spec =
+        ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
+    if let Some(id) = &model.id {
+        spec.set_model_id(id);
+    }
+    if let Some(base_url) = &model.base_url {
+        spec.base_url.clone_from(base_url);
+    }
+    if let Some(account_scope) = &model.account_scope {
+        spec.account_scope.clone_from(account_scope);
+    }
+    if let Some(api_key_env) = &model.api_key_env {
+        spec.api_key_env.clone_from(api_key_env);
+    }
+    if let Some(context_window) = model.context_window {
+        spec.context_window = context_window;
+    }
+    if let Some(max_output_tokens) = model.max_output_tokens {
+        spec.max_output_tokens = max_output_tokens;
+        if model.default_output_tokens.is_none() {
+            spec.default_output_tokens = spec.default_output_tokens.min(max_output_tokens);
+        }
+    }
+    if let Some(default_output_tokens) = model.default_output_tokens {
+        spec.default_output_tokens = default_output_tokens;
+    }
+    if let Some(reasoning) = model.reasoning {
+        spec.reasoning = reasoning;
+    }
+    if let Some(supports_images) = model.supports_images {
+        spec.supports_images = supports_images;
+    }
+
+    let compat_config = &model.compat;
+    if let ProtocolCompat::Chat(compat) = &mut spec.compat {
+        if let Some(field) = compat_config.max_tokens_field.as_deref() {
+            compat.max_tokens_field = match field {
+                "max_tokens" => MaxTokensField::MaxTokens,
+                "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
+                other => anyhow::bail!("unknown max_tokens_field {other}"),
+            };
+        }
+        if let Some(format) = compat_config.thinking_format.as_deref() {
+            compat.thinking_format = match format {
+                "off" => ThinkingFormat::Off,
+                "deepseek" => ThinkingFormat::Deepseek,
+                "zai" => ThinkingFormat::Zai,
+                "openai_effort" => ThinkingFormat::OpenAiEffort,
+                "provider_default" => ThinkingFormat::ProviderDefault,
+                other => anyhow::bail!("unknown thinking_format {other}"),
+            };
+        }
+        if let Some(value) = compat_config.supports_usage_in_streaming {
+            compat.supports_usage_in_streaming = value;
+        }
+        if let Some(value) = compat_config.requires_reasoning_content_on_assistant {
+            compat.requires_reasoning_content_on_assistant = value;
+        }
+        if let Some(value) = compat_config.zai_tool_stream {
+            compat.zai_tool_stream = value;
+        }
+        if let Some(value) = compat_config.supports_strict_mode {
+            compat.supports_strict_mode = value;
+        }
+        if let Some(value) = compat_config.supports_required_tool_choice {
+            compat.supports_required_tool_choice = value;
+        }
+        if let Some(value) = compat_config.supports_store {
+            compat.supports_store = value;
+        }
+        if let Some(value) = compat_config.supports_developer_role {
+            compat.supports_developer_role = value;
+        }
+        if let Some(value) = compat_config.allows_sampling_parameters {
+            compat.allows_sampling_parameters = value;
+        }
+    } else if *compat_config != CompatConfig::default() {
+        anyhow::bail!("Chat compatibility overrides require a Chat protocol preset");
+    }
+    match (&spec.protocol, &spec.compat) {
+        (ApiProtocol::OpenAiChatCompletions, ProtocolCompat::Chat(_))
+        | (ApiProtocol::OpenAiResponses, ProtocolCompat::Responses(_))
+        | (ApiProtocol::AnthropicMessages, ProtocolCompat::Anthropic(_)) => {}
+        _ => anyhow::bail!("model protocol/compat variant mismatch"),
+    }
+    validate_model_base_url(&spec.base_url)?;
+    if spec.context_window == 0 {
+        anyhow::bail!("context_window must be greater than zero");
+    }
+    if spec.default_output_tokens == 0 || spec.default_output_tokens > spec.max_output_tokens {
+        anyhow::bail!(
+            "default_output_tokens must be within 1..={}",
+            spec.max_output_tokens
+        );
+    }
+    if ResponseBudget::for_output_tokens(spec.max_output_tokens).is_none() {
+        anyhow::bail!("max_output_tokens cannot be represented by the provider response budget");
+    }
+    Ok(spec)
+}
+
+impl ModelEnvOverrides {
+    fn from_env(prefix: &str) -> Self {
+        let optional = |suffix: &str| {
+            env::var(format!("{prefix}_{suffix}"))
+                .ok()
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            preset: optional("PRESET"),
+            id: optional("ID"),
+            base_url: optional("BASE_URL"),
+            account_scope: optional("ACCOUNT_SCOPE"),
+            api_key_env: optional("API_KEY_ENV"),
+        }
+    }
+
+    fn apply_to(self, target: &mut Option<ModelConfig>) {
+        if self == Self::default() {
+            return;
+        }
+        let target = target.get_or_insert_with(ModelConfig::default);
+        if let Some(value) = self.preset {
+            target.preset = Some(value);
+        }
+        if let Some(value) = self.id {
+            target.id = Some(value);
+        }
+        if let Some(value) = self.base_url {
+            target.base_url = Some(value);
+        }
+        if let Some(value) = self.account_scope {
+            target.account_scope = Some(value);
+        }
+        if let Some(value) = self.api_key_env {
+            target.api_key_env = Some(value);
+        }
     }
 }
 
@@ -432,6 +530,8 @@ impl EnvOverrides {
             model_id: env::var("SUMI_MODEL_ID").ok(),
             model_base_url: env::var("SUMI_MODEL_BASE_URL").ok(),
             model_api_key_env: env::var("SUMI_MODEL_API_KEY_ENV").ok(),
+            execution_reviewer: ModelEnvOverrides::from_env("SUMI_EXECUTION_REVIEWER_MODEL"),
+            escalation_reviewer: ModelEnvOverrides::from_env("SUMI_ESCALATION_REVIEWER_MODEL"),
         })
     }
 }
@@ -1083,6 +1183,75 @@ default_output_tokens = 16000
     }
 
     #[test]
+    fn reviewer_models_require_explicit_presets_and_support_independent_overrides() {
+        let mut file = FileConfig {
+            reviewers: ReviewerModelsConfig {
+                execution: Some(ModelConfig {
+                    preset: Some("kimi-k3".to_owned()),
+                    id: Some("execution-reviewer".to_owned()),
+                    account_scope: Some("execution-account".to_owned()),
+                    ..ModelConfig::default()
+                }),
+                escalation: Some(ModelConfig {
+                    preset: Some("kimi-k3".to_owned()),
+                    id: Some("escalation-reviewer".to_owned()),
+                    account_scope: Some("escalation-account".to_owned()),
+                    ..ModelConfig::default()
+                }),
+            },
+            ..FileConfig::default()
+        };
+        let overrides = EnvOverrides {
+            personality_agent_id: Some(paid()),
+            execution_reviewer: ModelEnvOverrides {
+                base_url: Some("https://execution.example/v1".to_owned()),
+                api_key_env: Some("EXECUTION_REVIEWER_KEY".to_owned()),
+                ..ModelEnvOverrides::default()
+            },
+            escalation_reviewer: ModelEnvOverrides {
+                base_url: Some("https://escalation.example/v1".to_owned()),
+                api_key_env: Some("ESCALATION_REVIEWER_KEY".to_owned()),
+                ..ModelEnvOverrides::default()
+            },
+            ..EnvOverrides::default()
+        };
+        let config = Config::resolve(std::mem::take(&mut file), overrides).expect("resolved");
+
+        let execution = config
+            .execution_reviewer_model_spec()
+            .expect("Execution reviewer spec");
+        let escalation = config
+            .escalation_reviewer_model_spec()
+            .expect("Escalation reviewer spec");
+        assert_eq!(execution.id, "execution-reviewer");
+        assert_eq!(execution.base_url, "https://execution.example/v1");
+        assert_eq!(execution.api_key_env, "EXECUTION_REVIEWER_KEY");
+        assert_eq!(escalation.id, "escalation-reviewer");
+        assert_eq!(escalation.base_url, "https://escalation.example/v1");
+        assert_eq!(escalation.api_key_env, "ESCALATION_REVIEWER_KEY");
+
+        let missing = Config::resolve(FileConfig::default(), identity_overrides())
+            .expect("ordinary config remains loadable");
+        assert!(missing.execution_reviewer_model_spec().is_err());
+        assert!(missing.escalation_reviewer_model_spec().is_err());
+
+        let missing_preset = Config {
+            reviewers: ReviewerModelsConfig {
+                execution: Some(ModelConfig::default()),
+                escalation: None,
+            },
+            ..missing
+        };
+        assert_eq!(
+            missing_preset
+                .execution_reviewer_model_spec()
+                .expect_err("reviewer must not inherit the conversation preset")
+                .to_string(),
+            "Execution reviewer preset must be configured explicitly"
+        );
+    }
+
+    #[test]
     fn model_base_url_rejects_credentials_queries_and_non_http_schemes() {
         for base_url in [
             "https://user:secret@example.test/v1",
@@ -1101,6 +1270,7 @@ default_output_tokens = 16000
                     base_url: Some(base_url.to_owned()),
                     ..ModelConfig::default()
                 },
+                reviewers: ReviewerModelsConfig::default(),
             };
             assert!(config.model_spec().is_err(), "{base_url}");
         }

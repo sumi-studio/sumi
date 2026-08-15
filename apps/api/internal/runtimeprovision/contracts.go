@@ -70,6 +70,16 @@ type ActivationConfig struct {
 	ProviderAPIKey                  string `json:"provider_api_key"`
 	ModelPreset                     string `json:"model_preset,omitempty"`
 	ModelID                         string `json:"model_id,omitempty"`
+	ExecutionReviewerAPIKey         string `json:"execution_reviewer_api_key"`
+	ExecutionReviewerModelPreset    string `json:"execution_reviewer_model_preset"`
+	ExecutionReviewerModelID        string `json:"execution_reviewer_model_id,omitempty"`
+	ExecutionReviewerModelBaseURL   string `json:"execution_reviewer_model_base_url,omitempty"`
+	ExecutionReviewerAccountScope   string `json:"execution_reviewer_account_scope,omitempty"`
+	EscalationReviewerAPIKey        string `json:"escalation_reviewer_api_key"`
+	EscalationReviewerModelPreset   string `json:"escalation_reviewer_model_preset"`
+	EscalationReviewerModelID       string `json:"escalation_reviewer_model_id,omitempty"`
+	EscalationReviewerModelBaseURL  string `json:"escalation_reviewer_model_base_url,omitempty"`
+	EscalationReviewerAccountScope  string `json:"escalation_reviewer_account_scope,omitempty"`
 	AllowInsecureLoopbackGateway    bool   `json:"allow_insecure_loopback_gateway,omitempty"`
 	LogFilter                       string `json:"log_filter,omitempty"`
 }
@@ -211,12 +221,16 @@ func (request ActivateRequest) Validate() error {
 
 func (config ActivationConfig) Validate() error {
 	for name, value := range map[string]string{
-		"gateway_url":                config.GatewayURL,
-		"local_control_bearer":       config.LocalControlBearer,
-		"agent_wrapping_key":         config.AgentWrappingKey,
-		"agent_wrapping_key_id":      config.AgentWrappingKeyID,
-		"approval_secret_digest_key": config.ApprovalSecretDigestKey,
-		"provider_api_key":           config.ProviderAPIKey,
+		"gateway_url":                      config.GatewayURL,
+		"local_control_bearer":             config.LocalControlBearer,
+		"agent_wrapping_key":               config.AgentWrappingKey,
+		"agent_wrapping_key_id":            config.AgentWrappingKeyID,
+		"approval_secret_digest_key":       config.ApprovalSecretDigestKey,
+		"provider_api_key":                 config.ProviderAPIKey,
+		"execution_reviewer_api_key":       config.ExecutionReviewerAPIKey,
+		"escalation_reviewer_api_key":      config.EscalationReviewerAPIKey,
+		"execution_reviewer_model_preset":  config.ExecutionReviewerModelPreset,
+		"escalation_reviewer_model_preset": config.EscalationReviewerModelPreset,
 	} {
 		if err := validateOpaque(name, value); err != nil {
 			return err
@@ -244,9 +258,15 @@ func (config ActivationConfig) Validate() error {
 		return errors.New("local_control_socket_gid must be nonzero")
 	}
 	for name, value := range map[string]string{
-		"model_preset": config.ModelPreset,
-		"model_id":     config.ModelID,
-		"log_filter":   config.LogFilter,
+		"model_preset":                       config.ModelPreset,
+		"model_id":                           config.ModelID,
+		"execution_reviewer_model_id":        config.ExecutionReviewerModelID,
+		"execution_reviewer_model_base_url":  config.ExecutionReviewerModelBaseURL,
+		"execution_reviewer_account_scope":   config.ExecutionReviewerAccountScope,
+		"escalation_reviewer_model_id":       config.EscalationReviewerModelID,
+		"escalation_reviewer_model_base_url": config.EscalationReviewerModelBaseURL,
+		"escalation_reviewer_account_scope":  config.EscalationReviewerAccountScope,
+		"log_filter":                         config.LogFilter,
 	} {
 		if len(value) > MaxOpaqueBytes || strings.ContainsAny(value, "\x00\r\n") {
 			return fmt.Errorf("%s is not a valid activation value", name)

@@ -447,6 +447,28 @@ if [[ "${SUMI_PROVIDER_API_KEY}" == "dummy" ]]; then
   log "warning: SUMI_PROVIDER_API_KEY is unset; model provider calls will fail"
 fi
 
+for reviewer in EXECUTION ESCALATION; do
+  preset_name="SUMI_${reviewer}_REVIEWER_MODEL_PRESET"
+  key_env_name="SUMI_${reviewer}_REVIEWER_MODEL_API_KEY_ENV"
+  activation_key_name="SUMI_${reviewer}_REVIEWER_API_KEY"
+  if [[ "${ACTION}" == "down" && -z "${!preset_name:-}" ]]; then
+    export "${preset_name}=unconfigured-cleanup-only"
+    export "${activation_key_name}=cleanup-only"
+    continue
+  fi
+  require_value "${preset_name}"
+  require_value "${key_env_name}"
+  credential_name="${!key_env_name}"
+  [[ "${credential_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    fail "${key_env_name} must name one environment variable"
+  reviewer_api_key="${!credential_name:-}"
+  [[ -n "${reviewer_api_key}" ]] ||
+    fail "${credential_name} is required by the configured reviewer provider"
+  [[ "${reviewer_api_key}" != *$'\n'* && "${reviewer_api_key}" != *$'\r'* ]] ||
+    fail "${credential_name} must be one line"
+  export "${activation_key_name}=${reviewer_api_key}"
+done
+
 case "${ACTION}" in
   up)
     configure_local_apparmor_fallback

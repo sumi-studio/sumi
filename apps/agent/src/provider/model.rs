@@ -304,6 +304,15 @@ impl ModelSpec {
         )
     }
 
+    /// Stable non-secret configured provider base endpoint. Unlike
+    /// `provider_instance_id`, this deliberately excludes provider/account
+    /// labels and protocol so callers cannot manufacture independence by
+    /// renaming one physical endpoint in configuration.
+    pub fn provider_origin_id(&self) -> String {
+        let endpoint = provider_instance_endpoint(&self.base_url);
+        format!("v1|{}", identity_part(&endpoint))
+    }
+
     pub fn set_model_id(&mut self, id: impl Into<String>) {
         self.id = id.into();
     }

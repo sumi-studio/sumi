@@ -108,6 +108,16 @@ services:
       # Config.Env when unset; the entrypoint does not invent a model ID.
       SUMI_MODEL_ID:
       SUMI_MODEL_API_KEY_ENV: SUMI_PROVIDER_API_KEY
+      SUMI_EXECUTION_REVIEWER_MODEL_PRESET: ${SUMI_EXECUTION_REVIEWER_MODEL_PRESET:?SUMI_EXECUTION_REVIEWER_MODEL_PRESET is required}
+      SUMI_EXECUTION_REVIEWER_MODEL_ID:
+      SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL:
+      SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE:
+      SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV: SUMI_EXECUTION_REVIEWER_API_KEY
+      SUMI_ESCALATION_REVIEWER_MODEL_PRESET: ${SUMI_ESCALATION_REVIEWER_MODEL_PRESET:?SUMI_ESCALATION_REVIEWER_MODEL_PRESET is required}
+      SUMI_ESCALATION_REVIEWER_MODEL_ID:
+      SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL:
+      SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE:
+      SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV: SUMI_ESCALATION_REVIEWER_API_KEY
       SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: ${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}
       SUMI_LOG: ${SUMI_LOG:-sumi_agent=info}
     depends_on:
@@ -179,6 +189,18 @@ services:
       - type: bind
         source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_provider_api_key
         target: /run/secrets/sumi_provider_api_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_execution_reviewer_api_key
+        target: /run/secrets/sumi_execution_reviewer_api_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_escalation_reviewer_api_key
+        target: /run/secrets/sumi_escalation_reviewer_api_key
         read_only: true
         bind:
           create_host_path: false

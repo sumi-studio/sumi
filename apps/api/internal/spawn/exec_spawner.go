@@ -163,15 +163,31 @@ func SharedAgentEnvFromOS() map[string]string {
 		"SUMI_MODEL_API_KEY_ENV",
 		"SUMI_MODEL_ID",
 		"SUMI_MODEL_BASE_URL",
+		"SUMI_EXECUTION_REVIEWER_MODEL_PRESET",
+		"SUMI_EXECUTION_REVIEWER_MODEL_ID",
+		"SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL",
+		"SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE",
+		"SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV",
+		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET",
+		"SUMI_ESCALATION_REVIEWER_MODEL_ID",
+		"SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL",
+		"SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE",
+		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV",
 	} {
 		if v := os.Getenv(name); v != "" {
 			shared[name] = v
 		}
 	}
 	// Propagate the provider API key env itself.
-	if keyEnv := os.Getenv("SUMI_MODEL_API_KEY_ENV"); keyEnv != "" {
-		if v := os.Getenv(keyEnv); v != "" {
-			shared[keyEnv] = v
+	for _, keyEnvName := range []string{
+		"SUMI_MODEL_API_KEY_ENV",
+		"SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV",
+		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV",
+	} {
+		if keyEnv := os.Getenv(keyEnvName); keyEnv != "" {
+			if v := os.Getenv(keyEnv); v != "" {
+				shared[keyEnv] = v
+			}
 		}
 	}
 	return shared

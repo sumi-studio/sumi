@@ -1989,7 +1989,11 @@ impl Runner {
                                         decision: current,
                                         received_at: command.received_at(),
                                     };
-                                    return Ok(match broker.resolve(rid, authenticated).await {
+                                    let resolution = broker.resolve(rid, authenticated).await;
+                                    if matches!(resolution, Some(CurrentCallResolution::Ignored)) {
+                                        continue;
+                                    }
+                                    return Ok(match resolution {
                                         Some(CurrentCallResolution::Approved {
                                             grant,
                                             decision,
@@ -2014,6 +2018,9 @@ impl Runner {
                                             reason,
                                             command: Box::new(command),
                                         },
+                                        Some(CurrentCallResolution::Ignored) => unreachable!(
+                                            "ignored resolutions continue without projection"
+                                        ),
                                         None => RouteApprovalWaitOutcome::Cancelled,
                                     });
                                 }

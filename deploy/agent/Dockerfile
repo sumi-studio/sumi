@@ -38,7 +38,9 @@ RUN apt-get update \
        /run/secrets/sumi_local_control_bearer \
        /run/secrets/sumi_agent_wrapping_key \
        /run/secrets/sumi_approval_secret_digest_key \
-       /run/secrets/sumi_provider_api_key; do \
+       /run/secrets/sumi_provider_api_key \
+       /run/secrets/sumi_execution_reviewer_api_key \
+       /run/secrets/sumi_escalation_reviewer_api_key; do \
          install -m 000 /dev/null "${path}"; \
        done
 

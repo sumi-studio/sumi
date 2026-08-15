@@ -68,6 +68,10 @@ pub(crate) enum RouteApprovalOutcome {
 
 #[derive(Debug)]
 pub(crate) enum CurrentCallResolution {
+    /// An authenticated command named this request but did not own its exact
+    /// tenant/PA/Human scope. It must neither consume nor project the pending
+    /// approval.
+    Ignored,
     Approved {
         grant: ExecutableGrant,
         decision: HumanDecisionEvidence,
@@ -651,21 +655,29 @@ impl RouteApprovalBroker {
         request_id: &str,
         command: AuthenticatedCurrentCallDecision,
     ) -> Option<CurrentCallResolution> {
-        let entry = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(request_id)?;
+        let entry = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let entry = pending.get(request_id)?;
+            if command.tenant_id != entry.scope.tenant_id
+                || command.personality_agent_id != entry.scope.personality_agent_id
+                || command.human_principal_id != entry.scope.human_principal_id
+            {
+                return Some(CurrentCallResolution::Ignored);
+            }
+            pending
+                .remove(request_id)
+                .expect("pending entry observed under the same lock")
+        };
         self.resolving
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(request_id.to_owned());
 
+        let bound_evidence_digest = entry.sealed.evidence_digest().to_hex();
         let bound = entry.sealed.invocation();
-        let bound_evidence_digest = bound
-            .evidence_digest()
-            .map(|digest| digest.to_hex())
-            .unwrap_or_default();
         let human_context = HumanAuthorizationContextV1 {
             request_id,
             command_id: &command.command_id,
@@ -686,55 +698,45 @@ impl RouteApprovalBroker {
         };
         let human = HumanDecisionEvidence::from_context(human_context)
             .expect("fixed Human authorization context must serialize");
-        let human_valid = command.tenant_id == entry.scope.tenant_id
-            && command.personality_agent_id == entry.scope.personality_agent_id
-            && command.human_principal_id == entry.scope.human_principal_id;
-        let resolution = if !human_valid {
-            CurrentCallResolution::Rejected {
-                decision: human,
-                reason: "Human decision evidence does not match the pending approval".to_owned(),
-            }
-        } else {
-            match command.decision {
-                CurrentCallDecision::DenyOnce => CurrentCallResolution::Denied { decision: human },
-                CurrentCallDecision::ApproveOnce => {
-                    let now = (self.clock)();
-                    if !self
-                        .policy
-                        .read()
-                        .await
-                        .snapshot_matches(&entry.policy, now)
-                    {
-                        CurrentCallResolution::Rejected {
-                            decision: human,
-                            reason: "authorization policy changed while approval was pending"
-                                .to_owned(),
-                        }
-                    } else {
-                        match self.allow(
-                            entry.sealed,
-                            ToolInvocationRoute::Elevated,
-                            &entry.run_id,
-                            &entry.turn_id,
-                            entry.policy,
-                            PolicyDecisionRecord::ElevatedPreflight,
-                            ExecutionAuthorityProvenance::AgentOwnWithHumanConsent,
-                            None,
-                            Some(entry.escalation_review),
-                            Some(human.clone()),
-                        ) {
-                            Ok(RouteApprovalOutcome::Allowed { grant }) => {
-                                CurrentCallResolution::Approved {
-                                    grant,
-                                    decision: human,
-                                }
-                            }
-                            Ok(_) => unreachable!("allow only returns Allowed"),
-                            Err(error) => CurrentCallResolution::Rejected {
+        let resolution = match command.decision {
+            CurrentCallDecision::DenyOnce => CurrentCallResolution::Denied { decision: human },
+            CurrentCallDecision::ApproveOnce => {
+                let now = (self.clock)();
+                if !self
+                    .policy
+                    .read()
+                    .await
+                    .snapshot_matches(&entry.policy, now)
+                {
+                    CurrentCallResolution::Rejected {
+                        decision: human,
+                        reason: "authorization policy changed while approval was pending"
+                            .to_owned(),
+                    }
+                } else {
+                    match self.allow(
+                        entry.sealed,
+                        ToolInvocationRoute::Elevated,
+                        &entry.run_id,
+                        &entry.turn_id,
+                        entry.policy,
+                        PolicyDecisionRecord::ElevatedPreflight,
+                        ExecutionAuthorityProvenance::AgentOwnWithHumanConsent,
+                        None,
+                        Some(entry.escalation_review),
+                        Some(human.clone()),
+                    ) {
+                        Ok(RouteApprovalOutcome::Allowed { grant }) => {
+                            CurrentCallResolution::Approved {
+                                grant,
                                 decision: human,
-                                reason: error.to_string(),
-                            },
+                            }
                         }
+                        Ok(_) => unreachable!("allow only returns Allowed"),
+                        Err(error) => CurrentCallResolution::Rejected {
+                            decision: human,
+                            reason: error.to_string(),
+                        },
                     }
                 }
             }
@@ -742,6 +744,24 @@ impl RouteApprovalBroker {
 
         let _ = entry.sender.send(WaiterResult::Resolved);
         Some(resolution)
+    }
+
+    pub(crate) fn pending_scope_matches(
+        &self,
+        request_id: &str,
+        tenant_id: &str,
+        personality_agent_id: &str,
+        human_principal_id: &str,
+    ) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(request_id)
+            .is_some_and(|entry| {
+                tenant_id == entry.scope.tenant_id
+                    && personality_agent_id == entry.scope.personality_agent_id
+                    && human_principal_id == entry.scope.human_principal_id
+            })
     }
 
     pub(crate) fn commit_resolution(&self, request_id: &str) {
@@ -1080,7 +1100,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             prompts: Mutex::new(Vec::new()),
         });
-        let trust = ReviewerTrustSet::new(model(), Vec::new());
+        let trust = ReviewerTrustSet::new(vec![model()]);
         let execution = Arc::new(
             ExecutionReviewer::new(
                 model(),
@@ -1411,7 +1431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elevated_resolution_rejects_a_different_human_actor() {
+    async fn elevated_resolution_ignores_a_different_human_without_consuming_pending() {
         let (broker, _, _) = broker(
             json!({"outcome":"block","risk":"high","rationale":"unused"}),
             json!({
@@ -1434,17 +1454,48 @@ mod tests {
             )
             .await
             .expect("route decision");
-        let RouteApprovalOutcome::Pending { pending } = outcome else {
+        let RouteApprovalOutcome::Pending { mut pending } = outcome else {
             panic!("Escalation AskHuman should create a pending current-call request")
         };
         let mut wrong_actor = command(CurrentCallDecision::ApproveOnce);
         wrong_actor.human_principal_id = "human-2".to_owned();
+        assert!(!broker.pending_scope_matches(
+            &pending.request().id,
+            &wrong_actor.tenant_id,
+            &wrong_actor.personality_agent_id,
+            &wrong_actor.human_principal_id,
+        ));
 
         let resolution = broker
             .resolve(&pending.request().id, wrong_actor)
             .await
             .expect("pending resolution");
-        assert!(matches!(resolution, CurrentCallResolution::Rejected { .. }));
+        assert!(matches!(resolution, CurrentCallResolution::Ignored));
+        assert!(broker.has_pending(&pending.request().id));
+        assert!(broker.pending_scope_matches(
+            &pending.request().id,
+            "tenant-1",
+            "agent-1",
+            "human-1",
+        ));
+        assert!(matches!(
+            pending.receiver_mut().try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let resolution = broker
+            .resolve(
+                &pending.request().id,
+                command(CurrentCallDecision::ApproveOnce),
+            )
+            .await
+            .expect("owning principal still resolves pending approval");
+        assert!(matches!(resolution, CurrentCallResolution::Approved { .. }));
+        assert!(!broker.has_pending(&pending.request().id));
+        assert!(matches!(
+            pending.receiver_mut().await.expect("waiter result"),
+            WaiterResult::Resolved
+        ));
     }
 
     #[test]
