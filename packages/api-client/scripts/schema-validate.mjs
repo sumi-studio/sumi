@@ -349,6 +349,124 @@ for (const { name, definition, valid, invalid } of appLifecycleRequestCases) {
   }
 }
 
+const lifecycleErrorSchemaCases = [
+  {
+    name: "app install conflict response",
+    definition: "AppInstallConflictError",
+    valid: [
+      { error: "conflict" },
+      { error: "install_intent_already_installed" },
+      { error: "idempotency_conflict" },
+    ],
+    invalid: [
+      { error: "stale_authority" },
+      { error: "unavailable" },
+      { error: "idempotency_conflict", detail: "different app" },
+      {},
+    ],
+  },
+  {
+    name: "stale app authority response",
+    definition: "StaleAppAuthorityError",
+    valid: [{ error: "stale_authority" }],
+    invalid: [
+      { error: "conflict" },
+      { error: "unavailable" },
+      { error: "stale_authority", authority_epoch: "2" },
+      {},
+    ],
+  },
+  {
+    name: "app lifecycle unavailable response",
+    definition: "AppLifecycleUnavailableError",
+    valid: [{ error: "unavailable" }],
+    invalid: [
+      { error: "stale_authority" },
+      { error: "internal_error" },
+      { error: "unavailable", retry_after: 1 },
+      {},
+    ],
+  },
+];
+
+for (const { name, definition, valid, invalid } of lifecycleErrorSchemaCases) {
+  const validate = getOpenApiSchemaValidator(definition);
+  for (const value of valid) {
+    if (!validate(value)) {
+      console.error(
+        `${name} rejected valid wire value ${JSON.stringify(value)}: ${describeErrors(validate.errors)}`,
+      );
+      failed = true;
+    }
+  }
+  for (const value of invalid) {
+    if (validate(value)) {
+      console.error(
+        `${name} accepted invalid wire value: ${JSON.stringify(value)}`,
+      );
+      failed = true;
+    }
+  }
+}
+
+for (const code of [
+  "install_intent_already_installed",
+  "idempotency_conflict",
+  "stale_authority",
+  "unavailable",
+]) {
+  if (
+    !openApi.components?.schemas?.APIError?.properties?.error?.enum?.includes(
+      code,
+    )
+  ) {
+    console.error(`Shared APIError omits runtime lifecycle code ${code}`);
+    failed = true;
+  }
+}
+
+for (const { path, method, status, response } of [
+  {
+    path: "/app-installations",
+    method: "post",
+    status: "409",
+    response: "AppInstallConflict",
+  },
+  {
+    path: "/app-installations",
+    method: "post",
+    status: "503",
+    response: "AppLifecycleUnavailable",
+  },
+  {
+    path: "/app-installations/{installation_id}/state",
+    method: "put",
+    status: "409",
+    response: "StaleAppAuthority",
+  },
+  {
+    path: "/app-installations/{installation_id}/state",
+    method: "put",
+    status: "503",
+    response: "AppLifecycleUnavailable",
+  },
+  {
+    path: "/app-installations/{installation_id}",
+    method: "delete",
+    status: "503",
+    response: "AppLifecycleUnavailable",
+  },
+]) {
+  const actual = openApi.paths?.[path]?.[method]?.responses?.[status]?.$ref;
+  const expected = `#/components/responses/${response}`;
+  if (actual !== expected) {
+    console.error(
+      `${method.toUpperCase()} ${path} ${status} must reference ${response}; got ${actual ?? "nothing"}`,
+    );
+    failed = true;
+  }
+}
+
 const httpRejectionCases = [
   {
     name: "HTTP pre-sequence rejection",
@@ -746,5 +864,5 @@ if (failed) {
 }
 
 console.log(
-  "All contract fixtures, app-lifecycle requests, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
+  "All contract fixtures, app-lifecycle requests and responses, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
 );

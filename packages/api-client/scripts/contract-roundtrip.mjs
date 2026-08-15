@@ -63,6 +63,12 @@ const appLifecycleFixtures = {
     state: "disabled",
     expected_authority_epoch: "9223372036854775807",
   },
+  install_existing_intent_conflict: {
+    error: "install_intent_already_installed",
+  },
+  install_idempotency_conflict: { error: "idempotency_conflict" },
+  stale_authority_conflict: { error: "stale_authority" },
+  lifecycle_unavailable: { error: "unavailable" },
 };
 
 for (const [name, wire] of Object.entries(appLifecycleFixtures)) {
