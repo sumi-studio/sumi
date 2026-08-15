@@ -69,17 +69,14 @@ func run(ctx context.Context, output io.Writer) error {
 }
 
 // provisionE2EIdentity is an opt-in test fixture seam for browser journeys
-// that use the production app control plane. Production auth creates the Human
-// and Secretary through Koseki before issuing a browser session; the preissued
-// E2E path must establish the same prerequisite explicitly instead of
-// weakening participant or Direct Chat authorization in the application.
+// that use the production app control plane. Every database-backed journey
+// needs a Human. Direct Chat additionally opts into the Secretary and current
+// employment that production Koseki would create before issuing a session.
+// App installations remain production UI/API operations exercised by the
+// journey.
 func provisionE2EIdentity(ctx context.Context, userID, personalityAgentID string) error {
 	databaseURL := strings.TrimSpace(os.Getenv("SUMI_E2E_SESSION_DATABASE_URL"))
-	directChatInstallationID := strings.TrimSpace(os.Getenv("SUMI_E2E_SESSION_DIRECT_CHAT_INSTALLATION_ID"))
 	if databaseURL == "" {
-		if directChatInstallationID != "" {
-			return errors.New("SUMI_E2E_SESSION_DATABASE_URL is required to provision Direct Chat")
-		}
 		return nil
 	}
 	displayName := strings.TrimSpace(os.Getenv("SUMI_E2E_SESSION_DISPLAY_NAME"))
@@ -97,68 +94,56 @@ func provisionE2EIdentity(ctx context.Context, userID, personalityAgentID string
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO humans (human_id, display_name)
-		VALUES ($1, $2)
-		ON CONFLICT (human_id) DO NOTHING`, userID, displayName); err != nil {
+			INSERT INTO humans (human_id, display_name)
+			VALUES ($1, $2)
+			ON CONFLICT (human_id) DO NOTHING`, userID, displayName); err != nil {
 		return fmt.Errorf("provision E2E Human: %w", err)
 	}
-	if directChatInstallationID != "" {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO agents (personality_agent_id, human_id, display_name)
+	provisionSecretary := strings.TrimSpace(os.Getenv("SUMI_E2E_SESSION_PROVISION_SECRETARY"))
+	if provisionSecretary == "" {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit E2E Human provisioning: %w", err)
+		}
+		return nil
+	}
+	if provisionSecretary != "1" {
+		return errors.New("SUMI_E2E_SESSION_PROVISION_SECRETARY must be 1 when set")
+	}
+	if _, err := tx.Exec(ctx, `
+				INSERT INTO agents (personality_agent_id, human_id, display_name)
 			VALUES ($1, $2, 'Sumi')
 			ON CONFLICT (personality_agent_id) DO NOTHING`, personalityAgentID, userID); err != nil {
-			return fmt.Errorf("provision E2E PersonalityAgent: %w", err)
-		}
-		var agentHumanID string
-		if err := tx.QueryRow(ctx,
-			"SELECT human_id FROM agents WHERE personality_agent_id = $1",
-			personalityAgentID,
-		).Scan(&agentHumanID); err != nil {
-			return fmt.Errorf("verify E2E PersonalityAgent: %w", err)
-		}
-		if agentHumanID != userID {
-			return errors.New("E2E PersonalityAgent belongs to a different Human")
-		}
-		if _, err := tx.Exec(ctx, `
+		return fmt.Errorf("provision E2E PersonalityAgent: %w", err)
+	}
+	var agentHumanID string
+	if err := tx.QueryRow(ctx,
+		"SELECT human_id FROM agents WHERE personality_agent_id = $1",
+		personalityAgentID,
+	).Scan(&agentHumanID); err != nil {
+		return fmt.Errorf("verify E2E PersonalityAgent: %w", err)
+	}
+	if agentHumanID != userID {
+		return errors.New("E2E PersonalityAgent belongs to a different Human")
+	}
+	if _, err := tx.Exec(ctx, `
 			INSERT INTO employments (agent_id, employer_type, employer_id)
 			SELECT $1::uuidv7, 'human', $2::uuidv7
 			WHERE NOT EXISTS (
 				SELECT 1 FROM employments
 				WHERE agent_id = $1::uuidv7 AND ended_at IS NULL
 			)`, personalityAgentID, userID); err != nil {
-			return fmt.Errorf("provision E2E employment: %w", err)
-		}
-		var employerType, employerID string
-		if err := tx.QueryRow(ctx, `
+		return fmt.Errorf("provision E2E employment: %w", err)
+	}
+	var employerType, employerID string
+	if err := tx.QueryRow(ctx, `
 			SELECT employer_type, employer_id
 			FROM employments
 			WHERE agent_id = $1 AND ended_at IS NULL`, personalityAgentID,
-		).Scan(&employerType, &employerID); err != nil {
-			return fmt.Errorf("verify E2E employment: %w", err)
-		}
-		if employerType != "human" || employerID != userID {
-			return errors.New("E2E PersonalityAgent has a different current Employer")
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO app_installations
-				(installation_id, owner_kind, owner_id, app_id, enabled)
-			VALUES ($1, 'human', $2, 'direct-chat', true)
-			ON CONFLICT DO NOTHING`, directChatInstallationID, userID); err != nil {
-			return fmt.Errorf("provision E2E Direct Chat installation: %w", err)
-		}
-		var ownerKind, ownerID, appID string
-		var enabled bool
-		var authorityEpoch int64
-		if err := tx.QueryRow(ctx, `
-			SELECT owner_kind, owner_id, app_id, enabled, authority_epoch
-			FROM app_installations
-			WHERE installation_id = $1`, directChatInstallationID,
-		).Scan(&ownerKind, &ownerID, &appID, &enabled, &authorityEpoch); err != nil {
-			return fmt.Errorf("verify E2E Direct Chat installation: %w", err)
-		}
-		if ownerKind != "human" || ownerID != userID || appID != "direct-chat" || !enabled || authorityEpoch != 1 {
-			return errors.New("E2E Direct Chat installation has an unexpected authority binding")
-		}
+	).Scan(&employerType, &employerID); err != nil {
+		return fmt.Errorf("verify E2E employment: %w", err)
+	}
+	if employerType != "human" || employerID != userID {
+		return errors.New("E2E PersonalityAgent has a different current Employer")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit E2E identity provisioning: %w", err)

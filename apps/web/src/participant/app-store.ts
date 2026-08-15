@@ -43,9 +43,17 @@ export interface ParticipantAppState {
   uninstallApp(installationId: string): Promise<void>;
 }
 
-interface OwnerScopeToken {
+interface OwnerAuthorityToken {
   ownerKey: string;
-  generation: number;
+  authorityGeneration: number;
+}
+
+interface LoadToken extends OwnerAuthorityToken {
+  loadSequence: number;
+}
+
+interface MutationToken extends OwnerAuthorityToken {
+  mutationSequence: number;
 }
 
 /**
@@ -66,70 +74,131 @@ export function participantInstallation(
 }
 
 export function createParticipantAppStore(client: WorkspaceControlClient) {
-  let generation = 0;
-  let load: { ownerKey: string; promise: Promise<void> } | null = null;
+  let authorityGeneration = 0;
+  let loadSequence = 0;
+  let mutationSequence = 0;
+  let activeMutationSequence: number | null = null;
+  let load: { token: LoadToken; promise: Promise<void> } | null = null;
+  let ownerOperations: {
+    authorityGeneration: number;
+    tail: Promise<void>;
+  } | null = null;
 
   return create<ParticipantAppState>((set, get) => {
-    const currentScope = (): OwnerScopeToken => {
+    const currentAuthority = (): OwnerAuthorityToken => {
       const owner = get().owner;
       if (!owner) throw new Error("Participant app owner is not bound");
-      return { ownerKey: appOwnerKey(owner), generation };
+      return {
+        ownerKey: appOwnerKey(owner),
+        authorityGeneration,
+      };
     };
 
-    const isCurrentScope = (token: OwnerScopeToken): boolean => {
+    const isCurrentAuthority = (token: OwnerAuthorityToken): boolean => {
       const owner = get().owner;
       return (
         owner !== null &&
         appOwnerKey(owner) === token.ownerKey &&
-        generation === token.generation
+        authorityGeneration === token.authorityGeneration
       );
     };
 
-    const beginMutation = (name: string): OwnerScopeToken => {
-      const token = currentScope();
+    const enqueueOwnerOperation = <T>(
+      token: OwnerAuthorityToken,
+      operation: () => Promise<T>,
+    ): Promise<T> => {
+      if (
+        !ownerOperations ||
+        ownerOperations.authorityGeneration !== token.authorityGeneration
+      ) {
+        ownerOperations = {
+          authorityGeneration: token.authorityGeneration,
+          tail: Promise.resolve(),
+        };
+      }
+      const queue = ownerOperations;
+      const result = queue.tail.then(operation, operation);
+      queue.tail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    };
+
+    const beginMutation = (name: string): MutationToken => {
+      const authority = currentAuthority();
       if (get().mutation) {
         throw new Error("Participant app mutation is already running");
       }
+      const token: MutationToken = {
+        ...authority,
+        mutationSequence: ++mutationSequence,
+      };
+      activeMutationSequence = token.mutationSequence;
       set({ mutation: name, errorCode: null });
       return token;
     };
 
-    const endMutation = (token: OwnerScopeToken, error?: unknown): void => {
-      if (!isCurrentScope(token)) return;
+    const endMutation = (token: MutationToken, error?: unknown): void => {
+      if (
+        !isCurrentAuthority(token) ||
+        activeMutationSequence !== token.mutationSequence
+      ) {
+        return;
+      }
+      activeMutationSequence = null;
       set({ mutation: null, errorCode: error ? errorCode(error) : null });
     };
 
     const loadOwner = async (owner: AppOwnerRef): Promise<void> => {
       const ownerKey = appOwnerKey(owner);
-      if (load?.ownerKey === ownerKey && get().status === "loading") {
+      if (
+        load?.token.ownerKey === ownerKey &&
+        load.token.authorityGeneration === authorityGeneration
+      ) {
         return load.promise;
       }
-      const token: OwnerScopeToken = { ownerKey, generation: ++generation };
-      set({ status: "loading", errorCode: null, mutation: null });
+      const token: LoadToken = {
+        ownerKey,
+        authorityGeneration,
+        loadSequence: ++loadSequence,
+      };
+      set({ status: "loading", errorCode: null });
 
-      const promise = Promise.all([
-        client.listAppCatalog(),
-        client.listInstallations(owner),
-      ])
-        .then(([catalog, installations]) => {
-          if (!isCurrentScope(token)) return;
-          validateOwnedSnapshot(owner, catalog, installations);
-          set({
-            status: "ready",
-            catalog,
-            installations,
-            errorCode: null,
-          });
-        })
+      const promise = enqueueOwnerOperation(token, async () => {
+        if (!isCurrentAuthority(token)) return;
+        const [catalog, installations] = await Promise.all([
+          client.listAppCatalog(),
+          client.listInstallations(owner),
+        ]);
+        if (
+          !isCurrentAuthority(token) ||
+          load?.token.loadSequence !== token.loadSequence
+        ) {
+          return;
+        }
+        validateOwnedSnapshot(owner, catalog, installations);
+        set({
+          status: "ready",
+          catalog,
+          installations,
+          errorCode: null,
+        });
+      })
         .catch((error: unknown) => {
-          if (!isCurrentScope(token)) return;
+          if (
+            !isCurrentAuthority(token) ||
+            load?.token.loadSequence !== token.loadSequence
+          ) {
+            return;
+          }
           set({ status: "error", errorCode: errorCode(error) });
         })
         .finally(() => {
-          if (load?.ownerKey === ownerKey) load = null;
+          if (load?.token.loadSequence === token.loadSequence) load = null;
         });
 
-      load = { ownerKey, promise };
+      load = { token, promise };
       return promise;
     };
 
@@ -143,8 +212,10 @@ export function createParticipantAppStore(client: WorkspaceControlClient) {
 
       async bindParticipant(participant) {
         if (!participant) {
-          generation += 1;
+          authorityGeneration += 1;
+          activeMutationSequence = null;
           load = null;
+          ownerOperations = null;
           set({
             owner: null,
             status: "idle",
@@ -163,8 +234,10 @@ export function createParticipantAppStore(client: WorkspaceControlClient) {
           if (get().status === "idle") await loadOwner(owner);
           return;
         }
-        generation += 1;
+        authorityGeneration += 1;
+        activeMutationSequence = null;
         load = null;
+        ownerOperations = null;
         set({
           owner,
           status: "idle",
@@ -184,26 +257,27 @@ export function createParticipantAppStore(client: WorkspaceControlClient) {
 
       async installApp(appId) {
         const token = beginMutation("install_app");
-        const owner = get().owner;
-        if (!owner) throw new Error("Participant app owner is not bound");
-        const descriptor = get().catalog.find((app) => app.appId === appId);
-        if (!descriptor?.participantOwnerAllowed) {
-          const error = new Error("App does not allow a Participant owner");
-          endMutation(token, error);
-          throw error;
-        }
-        if (participantInstallation(get().installations, appId) !== null) {
-          const error = new Error("App is already installed");
-          endMutation(token, error);
-          throw error;
-        }
         try {
-          const installation = await client.installApp(owner, appId);
-          if (!isCurrentScope(token)) return installation;
-          validateInstallation(owner, installation, appId);
-          set((state) => ({
-            installations: [...state.installations, installation],
-          }));
+          const installation = await enqueueOwnerOperation(token, async () => {
+            const owner = get().owner;
+            if (!owner || !isCurrentAuthority(token)) {
+              throw new Error("Participant app owner changed");
+            }
+            const descriptor = get().catalog.find((app) => app.appId === appId);
+            if (!descriptor?.participantOwnerAllowed) {
+              throw new Error("App does not allow a Participant owner");
+            }
+            if (participantInstallation(get().installations, appId) !== null) {
+              throw new Error("App is already installed");
+            }
+            const response = await client.installApp(owner, appId);
+            if (!isCurrentAuthority(token)) return response;
+            validateInstallation(owner, response, appId);
+            set((state) => ({
+              installations: [...state.installations, response],
+            }));
+            return response;
+          });
           endMutation(token);
           return installation;
         } catch (error) {
@@ -214,33 +288,34 @@ export function createParticipantAppStore(client: WorkspaceControlClient) {
 
       async setInstallationState(installationId, state) {
         const token = beginMutation(`set_installation_${state}`);
-        const owner = get().owner;
-        const current = get().installations.find(
-          (installation) => installation.installationId === installationId,
-        );
-        if (!owner || !current) {
-          const error = new Error("App installation is not active");
-          endMutation(token, error);
-          throw error;
-        }
         try {
-          const installation = await client.setInstallationState(
-            installationId,
-            state,
-          );
-          if (!isCurrentScope(token)) return installation;
-          validateInstallation(owner, installation, current.appId);
-          if (
-            installation.installationId !== installationId ||
-            installation.state !== state
-          ) {
-            throw new Error("App lifecycle response does not match intent");
-          }
-          set((ownerState) => ({
-            installations: ownerState.installations.map((entry) =>
-              entry.installationId === installationId ? installation : entry,
-            ),
-          }));
+          const installation = await enqueueOwnerOperation(token, async () => {
+            const owner = get().owner;
+            const current = get().installations.find(
+              (entry) => entry.installationId === installationId,
+            );
+            if (!owner || !current || !isCurrentAuthority(token)) {
+              throw new Error("App installation is not active");
+            }
+            const response = await client.setInstallationState(
+              installationId,
+              state,
+            );
+            if (!isCurrentAuthority(token)) return response;
+            validateInstallation(owner, response, current.appId);
+            if (
+              response.installationId !== installationId ||
+              response.state !== state
+            ) {
+              throw new Error("App lifecycle response does not match intent");
+            }
+            set((ownerState) => ({
+              installations: ownerState.installations.map((entry) =>
+                entry.installationId === installationId ? response : entry,
+              ),
+            }));
+            return response;
+          });
           endMutation(token);
           return installation;
         } catch (error) {
@@ -251,25 +326,29 @@ export function createParticipantAppStore(client: WorkspaceControlClient) {
 
       async uninstallApp(installationId) {
         const token = beginMutation("uninstall_app");
-        if (
-          !get().installations.some(
-            (installation) => installation.installationId === installationId,
-          )
-        ) {
-          const error = new Error("App installation is not active");
-          endMutation(token, error);
-          throw error;
-        }
         try {
-          await client.uninstallApp(installationId);
-          if (!isCurrentScope(token)) return;
-          // Uninstall removes only the owner binding. App-owned data, grants,
-          // and credentials are separate app operations and are not cascaded.
-          set((state) => ({
-            installations: state.installations.filter(
-              (installation) => installation.installationId !== installationId,
-            ),
-          }));
+          await enqueueOwnerOperation(token, async () => {
+            if (
+              !isCurrentAuthority(token) ||
+              !get().installations.some(
+                (installation) =>
+                  installation.installationId === installationId,
+              )
+            ) {
+              throw new Error("App installation is not active");
+            }
+            await client.uninstallApp(installationId);
+            if (!isCurrentAuthority(token)) return;
+            // Uninstall removes only the owner binding. App-owned data,
+            // grants, and credentials are separate app operations and are not
+            // cascaded.
+            set((state) => ({
+              installations: state.installations.filter(
+                (installation) =>
+                  installation.installationId !== installationId,
+              ),
+            }));
+          });
           endMutation(token);
         } catch (error) {
           endMutation(token, error);
