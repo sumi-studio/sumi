@@ -1,0 +1,41 @@
+name: Web edge contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  web-edge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/api/go.mod
+          cache: false
+
+      - name: Install locked dependencies
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Install managed Chromium for the edge runtime contract
+        run: corepack pnpm --filter @sumi/web exec playwright install --with-deps chromium
+
+      - name: Verify WebApp edge contracts and real local runtime
+        run: corepack pnpm --filter @sumi/web test:edge

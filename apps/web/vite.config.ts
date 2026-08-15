@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { isAbsolute } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
@@ -9,6 +10,17 @@ export const SUMI_DEV_PORT = 5173;
 export const SUMI_DEV_ORIGIN = `http://${SUMI_DEV_HOST}:${SUMI_DEV_PORT}`;
 export const SUMI_DEV_API_ORIGIN = "http://127.0.0.1:8080";
 export const SUMI_COMPOSE_API_ORIGIN = "http://api:8080";
+
+function productionOutputDirectory(): string {
+  const configured = process.env.SUMI_WEB_DIST_DIR;
+  if (configured === undefined) return "dist";
+  if (configured.trim() !== configured || !isAbsolute(configured)) {
+    throw new Error(
+      "SUMI_WEB_DIST_DIR must be an exact absolute path when provided",
+    );
+  }
+  return configured;
+}
 
 function apiProxy(target: string, websocket = false): ProxyOptions {
   return {
@@ -52,6 +64,7 @@ export function createDevServerConfig(
 }
 
 export default defineConfig({
+  build: { outDir: productionOutputDirectory() },
   plugins: [
     tanstackRouter({ target: "react", autoCodeSplitting: true }),
     react(),
