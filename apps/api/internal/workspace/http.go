@@ -392,7 +392,7 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		writeAPIError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, ErrInvalidName), errors.Is(err, ErrInvalidColor),
 		errors.Is(err, ErrInvalidPosition), errors.Is(err, ErrInvalidPermission),
-		errors.Is(err, ErrInvalidInvite),
+		errors.Is(err, ErrInvalidInvite), errors.Is(err, ErrInvalidWorkspaceListCursor),
 		errors.Is(err, applicationapps.ErrOwnerKindUnsupported):
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 	default:

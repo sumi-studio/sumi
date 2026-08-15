@@ -56,6 +56,8 @@ var (
 	ErrInvalidInvite     = errors.New("invalid workspace invite settings")
 )
 
+var ErrInvalidWorkspaceListCursor = errors.New("invalid workspace list cursor")
+
 type PermissionSet map[string]bool
 
 func (p PermissionSet) Can(permission string) bool { return p[permission] }

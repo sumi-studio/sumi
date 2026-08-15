@@ -34,6 +34,7 @@ func TestWorkspaceDomainErrorsExposeCanonicalCodes(t *testing.T) {
 		{"closed membership tenure", ErrMemberNotFound, http.StatusNotFound, "membership_not_active"},
 		{"last administrator", ErrLastAdministrator, http.StatusConflict, "last_administrator"},
 		{"generic conflict", ErrRoleNameTaken, http.StatusConflict, "conflict"},
+		{"invalid Workspace list cursor", ErrInvalidWorkspaceListCursor, http.StatusBadRequest, "invalid_request"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -41,7 +41,7 @@ use crate::apiclient::messaging::{
     SetMessagingStatusRequest, WriteMessagingMessageRequest,
 };
 use crate::apiclient::workspace::{
-    WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceSummary,
+    WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceListPage, WorkspaceSummary,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -49,6 +49,7 @@ use crate::store::HydrationReceiptIdentity;
 
 pub(crate) const LOCAL_AGENT_AUDIENCE: &str = "sumi:agent:events";
 const MAX_LOCAL_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_WORKSPACE_LIST_PAGE_ITEMS: usize = 32;
 // A messaging screen may contain up to fifty full messages plus its member
 // list. Keep that cohesive response bounded independently without widening the
 // credential and runtime-state control-plane boundary above.
@@ -566,6 +567,8 @@ impl MessagingApi for LocalControlHttpClient {
 #[serde(deny_unknown_fields)]
 struct WorkspaceListWire {
     workspaces: Vec<WorkspaceSummaryWire>,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -579,11 +582,22 @@ struct WorkspaceSummaryWire {
 
 #[async_trait]
 impl WorkspaceApi for LocalControlHttpClient {
-    async fn list_memberships(&self) -> WorkspaceApiResult<Vec<WorkspaceSummary>> {
+    async fn list_memberships(
+        &self,
+        cursor: Option<&str>,
+    ) -> WorkspaceApiResult<WorkspaceListPage> {
+        if cursor.is_some_and(|value| !is_workspace_list_cursor_shape(value)) {
+            return Err(WorkspaceApiError::InvalidRequest);
+        }
+        #[derive(Serialize)]
+        struct Request<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cursor: Option<&'a str>,
+        }
         let (status, body) = self
             .post_json_bounded_raw(
                 "/local-control/v1/workspace:list",
-                &serde_json::json!({}),
+                &Request { cursor },
                 MAX_LOCAL_CONTROL_RESPONSE_BYTES,
             )
             .await
@@ -593,6 +607,12 @@ impl WorkspaceApi for LocalControlHttpClient {
         }
         let wire: WorkspaceListWire =
             serde_json::from_slice(body.as_slice()).map_err(|_| WorkspaceApiError::Protocol)?;
+        if wire.workspaces.len() > MAX_WORKSPACE_LIST_PAGE_ITEMS
+            || (wire.next_cursor.is_some()
+                && wire.workspaces.len() != MAX_WORKSPACE_LIST_PAGE_ITEMS)
+        {
+            return Err(WorkspaceApiError::Protocol);
+        }
         let mut seen = BTreeSet::new();
         let mut workspaces = Vec::with_capacity(wire.workspaces.len());
         for item in wire.workspaces {
@@ -610,8 +630,25 @@ impl WorkspaceApi for LocalControlHttpClient {
                 name: item.name,
             });
         }
-        Ok(workspaces)
+        if wire
+            .next_cursor
+            .as_deref()
+            .is_some_and(|value| !is_workspace_list_cursor_shape(value))
+        {
+            return Err(WorkspaceApiError::Protocol);
+        }
+        Ok(WorkspaceListPage {
+            workspaces,
+            next_cursor: wire.next_cursor,
+        })
     }
+}
+
+fn is_workspace_list_cursor_shape(value: &str) -> bool {
+    value.len() == 76
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn workspace_status_error(status: reqwest::StatusCode) -> WorkspaceApiError {
@@ -2824,7 +2861,8 @@ mod tests {
     #[derive(Clone)]
     struct WorkspaceListFixtureState {
         expected_authorization: String,
-        request_body: Arc<StdMutex<Option<serde_json::Value>>>,
+        request_bodies: Arc<StdMutex<Vec<serde_json::Value>>>,
+        next_cursor: String,
     }
 
     async fn workspace_list_http_fixture(
@@ -2841,14 +2879,26 @@ mod tests {
         }
         let request: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
-        *state.request_body.lock().unwrap() = Some(request);
+        state.request_bodies.lock().unwrap().push(request);
+        let workspaces = (0..MAX_WORKSPACE_LIST_PAGE_ITEMS)
+            .map(|index| {
+                serde_json::json!({
+                    "workspace_id": format!(
+                        "0198f0f4-9b72-7000-8000-{:012x}",
+                        index + 0x11
+                    ),
+                    "name": format!("Runtime team {index}"),
+                    "owner_workspace_member_id": format!(
+                        "0198f0f4-9b72-7000-8001-{:012x}",
+                        index + 0x11
+                    ),
+                    "created_at": "2026-08-15T00:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(Json(serde_json::json!({
-            "workspaces": [{
-                "workspace_id": "0198f0f4-9b72-7000-8000-000000000011",
-                "name": "Runtime team",
-                "owner_workspace_member_id": "0198f0f4-9b72-7000-8000-000000000012",
-                "created_at": "2026-08-15T00:00:00Z"
-            }]
+            "workspaces": workspaces,
+            "next_cursor": state.next_cursor
         })))
     }
 
@@ -2858,7 +2908,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let state = WorkspaceListFixtureState {
             expected_authorization: "Bearer control-secret".to_owned(),
-            request_body: Arc::new(StdMutex::new(None)),
+            request_bodies: Arc::new(StdMutex::new(Vec::new())),
+            next_cursor:
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    .to_owned(),
         };
         let app = Router::new()
             .route(
@@ -2883,23 +2936,44 @@ mod tests {
         )
         .unwrap();
 
-        let workspaces = WorkspaceApi::list_memberships(&client)
+        let page = WorkspaceApi::list_memberships(&client, None)
             .await
             .expect("list authenticated memberships");
 
         assert_eq!(
-            *state.request_body.lock().unwrap(),
-            Some(serde_json::json!({})),
+            *state.request_bodies.lock().unwrap(),
+            vec![serde_json::json!({})],
             "the model cannot supply actor, PAID, current Workspace, or default scope"
         );
+        assert_eq!(page.workspaces.len(), MAX_WORKSPACE_LIST_PAGE_ITEMS);
         assert_eq!(
-            workspaces,
-            vec![WorkspaceSummary {
+            page.workspaces[0],
+            WorkspaceSummary {
                 workspace_id: "0198f0f4-9b72-7000-8000-000000000011".to_owned(),
-                name: "Runtime team".to_owned(),
-            }]
+                name: "Runtime team 0".to_owned(),
+            }
+        );
+        let cursor = page.next_cursor.expect("bounded page cursor");
+        let _ = WorkspaceApi::list_memberships(&client, Some(&cursor))
+            .await
+            .expect("continue with exact opaque cursor");
+        assert_eq!(
+            *state.request_bodies.lock().unwrap(),
+            vec![serde_json::json!({}), serde_json::json!({"cursor": cursor})]
         );
         server.abort();
+    }
+
+    #[test]
+    fn workspace_list_cursor_shape_is_fixed_and_url_safe() {
+        let valid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(is_workspace_list_cursor_shape(valid));
+        assert!(!is_workspace_list_cursor_shape("short"));
+        assert!(!is_workspace_list_cursor_shape(&format!(
+            "{}!",
+            &valid[..75]
+        )));
+        assert!(!is_workspace_list_cursor_shape(&format!("{valid}A")));
     }
 
     async fn issue_http_fixture(

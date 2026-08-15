@@ -23,6 +23,10 @@ const (
 	maxWorkspaceNameChars = 200
 	defaultInviteTTL      = 24 * time.Hour
 	inviteEntropyBytes    = 32
+	// A local-control Workspace page contains at most 32 domain-validated
+	// names. Even when every one of the 200 legal runes needs Go's longest
+	// six-byte JSON escape, the complete response remains below 64 KiB.
+	localWorkspaceListPageSize = 32
 )
 
 type Store struct {
@@ -119,6 +123,98 @@ func (s *Store) WorkspacesFor(ctx context.Context, actor participant.Ref) ([]Wor
 		return nil, fmt.Errorf("iterate workspaces: %w", err)
 	}
 	return workspaces, nil
+}
+
+// workspaceListCursorPosition is an ordering position, not authority. Every
+// page query re-applies the authenticated actor and active-tenure predicates.
+type workspaceListCursorPosition struct {
+	JoinedAt          time.Time
+	WorkspaceMemberID string
+}
+
+type workspaceListPageItem struct {
+	Workspace Workspace
+	Position  workspaceListCursorPosition
+}
+
+type workspaceListPage struct {
+	Items   []workspaceListPageItem
+	HasMore bool
+}
+
+// workspacePageFor returns one fixed-size keyset page of active membership
+// tenures. A membership created or closed between calls is observed according
+// to the fresh query; the cursor never substitutes for actor authorization.
+func (s *Store) workspacePageFor(
+	ctx context.Context,
+	actor participant.Ref,
+	after *workspaceListCursorPosition,
+) (workspaceListPage, error) {
+	if err := actor.Validate(); err != nil {
+		return workspaceListPage{}, err
+	}
+	if after != nil && !isCanonicalUUIDv7(after.WorkspaceMemberID) {
+		return workspaceListPage{}, ErrInvalidWorkspaceListCursor
+	}
+
+	const firstPageQuery = `
+		SELECT w.workspace_id, w.name, w.owner_workspace_member_id, w.created_at,
+		       wm.joined_at, wm.workspace_member_id
+		FROM workspace_members wm
+		JOIN workspaces w ON w.workspace_id = wm.workspace_id
+		WHERE wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
+		ORDER BY wm.joined_at, wm.workspace_member_id
+		LIMIT $3`
+	const laterPageQuery = `
+		SELECT w.workspace_id, w.name, w.owner_workspace_member_id, w.created_at,
+		       wm.joined_at, wm.workspace_member_id
+		FROM workspace_members wm
+		JOIN workspaces w ON w.workspace_id = wm.workspace_id
+		WHERE wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
+		  AND (wm.joined_at, wm.workspace_member_id) > ($3, $4::uuidv7)
+		ORDER BY wm.joined_at, wm.workspace_member_id
+		LIMIT $5`
+
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if after == nil {
+		rows, err = s.pool.Query(ctx, firstPageQuery, actor.Kind, actor.ID,
+			localWorkspaceListPageSize+1)
+	} else {
+		rows, err = s.pool.Query(ctx, laterPageQuery, actor.Kind, actor.ID,
+			after.JoinedAt.UTC(), after.WorkspaceMemberID, localWorkspaceListPageSize+1)
+	}
+	if err != nil {
+		return workspaceListPage{}, fmt.Errorf("list Workspace membership page: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]workspaceListPageItem, 0, localWorkspaceListPageSize+1)
+	for rows.Next() {
+		var item workspaceListPageItem
+		if err := rows.Scan(
+			&item.Workspace.WorkspaceID,
+			&item.Workspace.Name,
+			&item.Workspace.OwnerWorkspaceMemberID,
+			&item.Workspace.CreatedAt,
+			&item.Position.JoinedAt,
+			&item.Position.WorkspaceMemberID,
+		); err != nil {
+			return workspaceListPage{}, fmt.Errorf("scan Workspace membership page: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return workspaceListPage{}, fmt.Errorf("iterate Workspace membership page: %w", err)
+	}
+
+	hasMore := len(items) > localWorkspaceListPageSize
+	if hasMore {
+		items = items[:localWorkspaceListPageSize]
+	}
+	return workspaceListPage{Items: items, HasMore: hasMore}, nil
 }
 
 // WorkspaceFor intentionally uses the same ErrNotFound for a nonexistent
