@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "sumi-web",
+  "main": "./cloudflare/worker.ts",
+  "compatibility_date": "2026-08-11",
+  "compatibility_flags": [
+    "global_fetch_private_origin",
+    "enable_request_signal",
+    "request_signal_passthrough"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  }
+}

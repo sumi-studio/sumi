@@ -12,5 +12,5 @@
     "noUnusedParameters": true,
     "skipLibCheck": true
   },
-  "include": ["route-policy.ts"]
+  "include": ["route-policy.ts", "worker.ts"]
 }
