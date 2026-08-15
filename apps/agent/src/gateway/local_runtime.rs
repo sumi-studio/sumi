@@ -40,6 +40,9 @@ use crate::apiclient::messaging::{
     ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
     SetMessagingStatusRequest, WriteMessagingMessageRequest,
 };
+use crate::apiclient::workspace::{
+    WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceSummary,
+};
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 use crate::store::HydrationReceiptIdentity;
@@ -295,6 +298,24 @@ impl LocalControlHttpClient {
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
     {
+        let (status, body) = self
+            .post_json_bounded_raw(path, body, max_response_bytes)
+            .await?;
+        if !status.is_success() {
+            bail!("local control request was rejected with status {status}");
+        }
+        serde_json::from_slice(body.as_slice()).context("decode strict local control response")
+    }
+
+    async fn post_json_bounded_raw<Request>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+    ) -> Result<(reqwest::StatusCode, Zeroizing<Vec<u8>>)>
+    where
+        Request: Serialize + Sync,
+    {
         self.credential
             .validate_at(&self.authority, SystemTime::now())?;
         let (http, unix_endpoint) = match &self.transport {
@@ -327,12 +348,7 @@ impl LocalControlHttpClient {
             .execute(request)
             .await
             .context("local control request failed")?;
-        if !response.status().is_success() {
-            bail!(
-                "local control request was rejected with status {}",
-                response.status()
-            );
-        }
+        let status = response.status();
         if response
             .content_length()
             .is_some_and(|length| length > max_response_bytes as u64)
@@ -348,7 +364,7 @@ impl LocalControlHttpClient {
             }
             body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(body.as_slice()).context("decode strict local control response")
+        Ok((status, body))
     }
 
     async fn post_runtime_state(
@@ -544,6 +560,79 @@ impl MessagingApi for LocalControlHttpClient {
         self.post_json("/local-control/v1/messaging:read-through", &request)
             .await
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceListWire {
+    workspaces: Vec<WorkspaceSummaryWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSummaryWire {
+    workspace_id: String,
+    name: String,
+    owner_workspace_member_id: String,
+    created_at: String,
+}
+
+#[async_trait]
+impl WorkspaceApi for LocalControlHttpClient {
+    async fn list_memberships(&self) -> WorkspaceApiResult<Vec<WorkspaceSummary>> {
+        let (status, body) = self
+            .post_json_bounded_raw(
+                "/local-control/v1/workspace:list",
+                &serde_json::json!({}),
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+            )
+            .await
+            .map_err(|_| WorkspaceApiError::Transport)?;
+        if !status.is_success() {
+            return Err(workspace_status_error(status));
+        }
+        let wire: WorkspaceListWire =
+            serde_json::from_slice(body.as_slice()).map_err(|_| WorkspaceApiError::Protocol)?;
+        let mut seen = BTreeSet::new();
+        let mut workspaces = Vec::with_capacity(wire.workspaces.len());
+        for item in wire.workspaces {
+            if !is_canonical_uuid_v7(&item.workspace_id)
+                || !is_canonical_uuid_v7(&item.owner_workspace_member_id)
+                || item.name.trim() != item.name
+                || !(1..=200).contains(&item.name.chars().count())
+                || item.created_at.is_empty()
+                || !seen.insert(item.workspace_id.clone())
+            {
+                return Err(WorkspaceApiError::Protocol);
+            }
+            workspaces.push(WorkspaceSummary {
+                workspace_id: item.workspace_id,
+                name: item.name,
+            });
+        }
+        Ok(workspaces)
+    }
+}
+
+fn workspace_status_error(status: reqwest::StatusCode) -> WorkspaceApiError {
+    match status {
+        reqwest::StatusCode::BAD_REQUEST => WorkspaceApiError::InvalidRequest,
+        reqwest::StatusCode::UNAUTHORIZED => WorkspaceApiError::Unauthenticated,
+        reqwest::StatusCode::FORBIDDEN => WorkspaceApiError::Forbidden,
+        reqwest::StatusCode::NOT_FOUND => WorkspaceApiError::NotFound,
+        reqwest::StatusCode::CONFLICT => WorkspaceApiError::Conflict,
+        status if status.is_server_error() => WorkspaceApiError::ServiceUnavailable,
+        _ => WorkspaceApiError::Protocol,
+    }
+}
+
+fn is_canonical_uuid_v7(value: &str) -> bool {
+    let Ok(uuid) = Uuid::parse_str(value) else {
+        return false;
+    };
+    uuid.get_version() == Some(uuid::Version::SortRand)
+        && uuid.get_variant() == uuid::Variant::RFC4122
+        && uuid.hyphenated().to_string() == value
 }
 
 fn validate_wire_epoch(
@@ -2729,6 +2818,87 @@ mod tests {
             .await
             .expect_err("messaging responses must remain bounded");
         assert!(error.to_string().contains("exceeds bounded size"));
+        server.abort();
+    }
+
+    #[derive(Clone)]
+    struct WorkspaceListFixtureState {
+        expected_authorization: String,
+        request_body: Arc<StdMutex<Option<serde_json::Value>>>,
+    }
+
+    async fn workspace_list_http_fixture(
+        State(state): State<WorkspaceListFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some(state.expected_authorization.as_str())
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        *state.request_body.lock().unwrap() = Some(request);
+        Ok(Json(serde_json::json!({
+            "workspaces": [{
+                "workspace_id": "0198f0f4-9b72-7000-8000-000000000011",
+                "name": "Runtime team",
+                "owner_workspace_member_id": "0198f0f4-9b72-7000-8000-000000000012",
+                "created_at": "2026-08-15T00:00:00Z"
+            }]
+        })))
+    }
+
+    #[tokio::test]
+    async fn workspace_list_uses_only_authenticated_actor_and_validates_canonical_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = WorkspaceListFixtureState {
+            expected_authorization: "Bearer control-secret".to_owned(),
+            request_body: Arc::new(StdMutex::new(None)),
+        };
+        let app = Router::new()
+            .route(
+                "/local-control/v1/workspace:list",
+                post(workspace_list_http_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+
+        let workspaces = WorkspaceApi::list_memberships(&client)
+            .await
+            .expect("list authenticated memberships");
+
+        assert_eq!(
+            *state.request_body.lock().unwrap(),
+            Some(serde_json::json!({})),
+            "the model cannot supply actor, PAID, current Workspace, or default scope"
+        );
+        assert_eq!(
+            workspaces,
+            vec![WorkspaceSummary {
+                workspace_id: "0198f0f4-9b72-7000-8000-000000000011".to_owned(),
+                name: "Runtime team".to_owned(),
+            }]
+        );
         server.abort();
     }
 

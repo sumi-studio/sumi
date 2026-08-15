@@ -24,6 +24,7 @@ pub mod shell_capture;
 pub mod truncate;
 #[cfg(unix)]
 mod unix_pipe;
+pub(crate) mod workspace;
 
 use std::{
     collections::BTreeMap,
