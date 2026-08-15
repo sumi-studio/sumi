@@ -1084,7 +1084,7 @@ mod duration_millis {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeSet, VecDeque},
         sync::{LazyLock, Mutex},
     };
 
@@ -1407,6 +1407,65 @@ mod tests {
             ),
             Err(ReviewerValidationCode::SchemaMismatch)
         );
+    }
+
+    #[test]
+    fn auto_review_schemas_stay_inside_the_kimi_mfjs_strict_subset_we_use() {
+        for schema in [
+            ExecutionReviewOutputSchema::v1()
+                .provider_schema()
+                .schema
+                .clone(),
+            EscalationReviewOutputSchema::v1()
+                .provider_schema()
+                .schema
+                .clone(),
+        ] {
+            let root = schema.as_object().expect("review schema root is an object");
+            assert_eq!(
+                root.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                BTreeSet::from(["additionalProperties", "properties", "required", "type"])
+            );
+            assert_eq!(root.get("type"), Some(&json!("object")));
+            assert_eq!(root.get("additionalProperties"), Some(&json!(false)));
+
+            let properties = root["properties"]
+                .as_object()
+                .expect("review object properties");
+            let required = root["required"]
+                .as_array()
+                .expect("review object required fields")
+                .iter()
+                .map(|field| field.as_str().expect("required field name"))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                required,
+                properties
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+            );
+
+            for property in properties.values() {
+                let property = property.as_object().expect("review scalar property");
+                assert!(property.keys().all(|key| key == "type" || key == "enum"));
+                assert!(
+                    matches!(
+                        property.get("type"),
+                        Some(Value::String(kind)) if kind == "string"
+                    ) || matches!(
+                        property.get("type"),
+                        Some(Value::Array(kinds))
+                            if kinds == &vec![json!("string"), json!("null")]
+                    )
+                );
+                if let Some(values) = property.get("enum") {
+                    let values = values.as_array().expect("review string enum");
+                    assert!(!values.is_empty());
+                    assert!(values.iter().all(Value::is_string));
+                }
+            }
+        }
     }
 
     #[tokio::test]
