@@ -215,12 +215,22 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    use chrono::Utc;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::apiclient::workspace::{WorkspaceApiResult, WorkspaceSummary};
-    use crate::provider::types::ValidatedToolArguments;
-    use crate::tools::WorkspacePaths;
+    use crate::{
+        apiclient::workspace::{WorkspaceApiResult, WorkspaceSummary},
+        approval::{
+            authority::PolicyDecisionRecord,
+            route_broker::{PendingApprovalRequest, provider_review_inputs_for_test},
+            route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
+            route_reviewer::{EscalationReviewRequest, escalation_provider_wire_bodies_for_test},
+        },
+        provider::types::{ToolCall, ToolInvocationRoute, ValidatedToolArguments},
+        store::Redactor,
+        tools::{ToolRegistryBuilder, WorkspacePaths},
+    };
 
     const WORKSPACE_ID: &str = "0198f0f4-9b72-7000-8000-000000000011";
     const CURSOR: &str =
@@ -442,6 +452,99 @@ mod tests {
 
         assert_eq!(*api.cursors.lock().unwrap(), vec![Some(CURSOR.to_owned())]);
         assert_eq!(outcome.output.details["next_cursor"], CURSOR);
+    }
+
+    #[tokio::test]
+    async fn opaque_cursor_stays_exact_for_human_and_execution_but_never_reaches_reviewer_wire() {
+        let api = Arc::new(FakeWorkspaceApi {
+            calls: AtomicUsize::new(0),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(Vec::new(), None)),
+        });
+        let tool = Arc::new(WorkspaceListTool::new(api));
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(tool)
+            .expect("register Workspace list tool");
+        let registry = builder.build();
+        let workspace = workspace_paths();
+        let call = ToolCall {
+            id: "cursor-review".to_owned(),
+            name: LIST_TOOL_NAME.to_owned(),
+            route: ToolInvocationRoute::Elevated,
+            arguments: arguments(json!({"cursor": CURSOR})),
+        };
+        let sealed = registry
+            .bind(&call, "flow-cursor-review", &workspace)
+            .await
+            .expect("bind real Workspace cursor");
+        let bound = registry
+            .validate_bound(&sealed)
+            .expect("validate Workspace binding");
+
+        assert_eq!(bound.review_projection.as_object()["cursor"], CURSOR);
+        assert_eq!(bound.execution_arguments.as_object()["cursor"], CURSOR);
+        assert_eq!(
+            serde_json::to_string(&bound.provider_review_projection)
+                .expect("provider-safe cursor projection")
+                .matches(CURSOR)
+                .count(),
+            0
+        );
+
+        let human_request = PendingApprovalRequest::from_bound(
+            "approval-cursor".to_owned(),
+            ToolInvocationRoute::Elevated,
+            bound,
+            &Redactor::v1(),
+        )
+        .expect("Human cursor request")
+        .public_request();
+        assert!(
+            serde_json::to_string(&human_request)
+                .expect("encoded Human cursor request")
+                .contains(CURSOR)
+        );
+
+        let policy = RoutePolicy::baseline_only_v1();
+        let snapshot = match policy.evaluate_elevated(bound, Utc::now()) {
+            ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
+            other => panic!("Workspace cursor expected Elevated/Ready, got {other:?}"),
+        };
+        let (sealed_evidence, policy_evidence) = provider_review_inputs_for_test(
+            bound,
+            ToolInvocationRoute::Elevated,
+            PolicyDecisionRecord::ElevatedPreflight,
+            &snapshot,
+        )
+        .expect("Workspace cursor reviewer inputs");
+        let request = EscalationReviewRequest {
+            sealed_evidence,
+            policy: policy_evidence,
+        };
+        let local_digests = [
+            bound.proposal_digest.to_hex(),
+            bound.descriptor_digest.to_hex(),
+            bound
+                .evidence_digest()
+                .expect("local evidence digest")
+                .to_hex(),
+        ];
+        for (provider, body) in escalation_provider_wire_bodies_for_test(request) {
+            let encoded = body.to_string();
+            assert_eq!(
+                encoded.matches(CURSOR).count(),
+                0,
+                "Workspace cursor leaked through {provider}"
+            );
+            for digest in &local_digests {
+                assert_eq!(
+                    encoded.matches(digest).count(),
+                    0,
+                    "Workspace exact digest leaked through {provider}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

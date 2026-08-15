@@ -6,7 +6,7 @@
 //! that metadata around this value, but must not reinterpret the app-owned
 //! operation or resource identities recorded here.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
@@ -18,7 +18,9 @@ const DESCRIPTOR_DIGEST_DOMAIN: &[u8] = b"sumi-bound-tool-descriptor/v1\0";
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-bound-tool-evidence/v1\0";
 const WORKSPACE_IDENTITY_DOMAIN: &[u8] = b"sumi-workspace-identity/v1\0";
 
-pub(crate) const BOUND_TOOL_INVOCATION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const BOUND_TOOL_INVOCATION_SCHEMA_VERSION: u32 = 2;
+const PROVIDER_REVIEW_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_REVIEW_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 /// Coarse capability selected by trusted app adapter code.
 ///
@@ -156,6 +158,325 @@ impl AppActionDescriptor {
     }
 }
 
+/// Closed provider-visible identity for a production tool registration and
+/// bound adapter pair. Local tool and adapter identities remain exact strings;
+/// only an explicitly audited pair can cross the external review boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderReviewIdentity {
+    WorkspaceListV1,
+    MessagingV1,
+    WorkspaceReadFileV1,
+    WorkspaceListDirV1,
+    WorkspaceGlobV1,
+    WorkspaceGrepV1,
+    #[cfg(test)]
+    FixtureV1,
+    #[cfg(test)]
+    ExampleV1,
+    #[cfg(test)]
+    ExampleV2,
+    #[cfg(test)]
+    OtherExampleV1,
+    #[cfg(test)]
+    InspectFixtureV1,
+    #[cfg(test)]
+    AppActionFixtureV1,
+}
+
+impl ProviderReviewIdentity {
+    fn from_local(tool_name: &str, adapter: &AdapterIdentity) -> Result<Self, DescribeError> {
+        let identity = match (tool_name, adapter.id.as_str(), adapter.version) {
+            ("workspace_list", "sumi.workspace.list", 1) => Self::WorkspaceListV1,
+            ("messaging", "sumi.messaging", 1) => Self::MessagingV1,
+            ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
+            ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
+            ("glob", "sumi.foundation.workspace", 1) => Self::WorkspaceGlobV1,
+            ("grep", "sumi.foundation.workspace", 1) => Self::WorkspaceGrepV1,
+            #[cfg(test)]
+            ("fixture_tool", "sumi.fixture", 1) => Self::FixtureV1,
+            #[cfg(test)]
+            ("example", "sumi.example", 1) => Self::ExampleV1,
+            #[cfg(test)]
+            ("example", "sumi.example", 2) => Self::ExampleV2,
+            #[cfg(test)]
+            ("other_example", "sumi.example", 1) => Self::OtherExampleV1,
+            #[cfg(test)]
+            ("inspect", "test.binding", 1) => Self::InspectFixtureV1,
+            #[cfg(test)]
+            ("app_action", "test.app", 1) => Self::AppActionFixtureV1,
+            _ => {
+                return Err(DescribeError::InvalidDescriptor {
+                    reason: "tool/adapter pair has no closed provider review identity".to_owned(),
+                });
+            }
+        };
+        Ok(identity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderReviewOperation {
+    ListMemberships,
+    Overview,
+    Open,
+    Write,
+    React,
+    Status,
+    ReplyLater,
+    ResolveReplyLater,
+    ReadFile,
+    ListDir,
+    Glob,
+    Grep,
+    #[cfg(test)]
+    Fixture,
+    #[cfg(test)]
+    Update,
+    #[cfg(test)]
+    Inspect,
+    #[cfg(test)]
+    UpdateRecord,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderReviewNamespace {
+    Workspace,
+    Messaging,
+    FoundationWorkspace,
+    #[cfg(test)]
+    Fixture,
+    #[cfg(test)]
+    Example,
+    #[cfg(test)]
+    Test,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderReviewResourceKind {
+    Membership,
+    Workspace,
+    Place,
+    Message,
+    Participant,
+    ReplyLaterMarker,
+    Path,
+    GlobSelector,
+    #[cfg(test)]
+    Record,
+    #[cfg(test)]
+    Item,
+}
+
+/// Provider-visible shape of an exact local app action descriptor.
+///
+/// Every textual vocabulary member is converted through the closed production
+/// mapping above. Exact resource identifiers remain local because paths,
+/// patterns, opaque tokens, and other caller-controlled strings may appear in
+/// that position. The external reviewer sees only whether each closed scope
+/// class names a collection or concrete resource and how many distinct scopes
+/// of that class were bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderReviewDescriptor {
+    pub schema_version: u32,
+    pub operation: ProviderReviewOperation,
+    pub capability: CapabilityClass,
+    pub resource_scopes: Vec<ProviderReviewResourceScope>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderReviewScopeType {
+    Collection,
+    Resource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderReviewResourceScope {
+    pub scope_type: ProviderReviewScopeType,
+    pub namespace: ProviderReviewNamespace,
+    pub kind: ProviderReviewResourceKind,
+    pub count: u64,
+}
+
+impl ProviderReviewDescriptor {
+    fn from_exact(
+        identity: ProviderReviewIdentity,
+        exact: &AppActionDescriptor,
+    ) -> Result<Self, DescribeError> {
+        let operation = provider_review_operation(identity, exact)?;
+        let mut grouped = BTreeMap::<
+            (
+                ProviderReviewScopeType,
+                ProviderReviewNamespace,
+                ProviderReviewResourceKind,
+            ),
+            u64,
+        >::new();
+        for scope in &exact.resource_scopes {
+            let (scope_type, namespace, kind) = provider_review_scope(identity, scope)?;
+            let count = grouped.entry((scope_type, namespace, kind)).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| DescribeError::InvalidDescriptor {
+                    reason: "provider review resource scope count overflowed".to_owned(),
+                })?;
+        }
+
+        Ok(Self {
+            schema_version: PROVIDER_REVIEW_DESCRIPTOR_SCHEMA_VERSION,
+            operation,
+            capability: exact.capability.clone(),
+            resource_scopes: grouped
+                .into_iter()
+                .map(
+                    |((scope_type, namespace, kind), count)| ProviderReviewResourceScope {
+                        scope_type,
+                        namespace,
+                        kind,
+                        count,
+                    },
+                )
+                .collect(),
+        })
+    }
+}
+
+fn provider_review_operation(
+    identity: ProviderReviewIdentity,
+    exact: &AppActionDescriptor,
+) -> Result<ProviderReviewOperation, DescribeError> {
+    use CapabilityClass::{Mutate, Read};
+    use ProviderReviewIdentity as Identity;
+    use ProviderReviewOperation as Operation;
+
+    let operation = match (identity, exact.operation.as_str(), &exact.capability) {
+        (Identity::WorkspaceListV1, "list_memberships", Read) => Operation::ListMemberships,
+        (Identity::MessagingV1, "overview", Read) => Operation::Overview,
+        (Identity::MessagingV1, "open", Read) => Operation::Open,
+        (Identity::MessagingV1, "write", Mutate) => Operation::Write,
+        (Identity::MessagingV1, "react", Mutate) => Operation::React,
+        (Identity::MessagingV1, "status", Mutate) => Operation::Status,
+        (Identity::MessagingV1, "reply_later", Mutate) => Operation::ReplyLater,
+        (Identity::MessagingV1, "resolve_reply_later", Mutate) => Operation::ResolveReplyLater,
+        (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
+        (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
+        (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
+        (Identity::WorkspaceGrepV1, "grep", Read) => Operation::Grep,
+        #[cfg(test)]
+        (Identity::FixtureV1, "fixture.operation", _) => Operation::Fixture,
+        #[cfg(test)]
+        (Identity::ExampleV1 | Identity::ExampleV2 | Identity::OtherExampleV1, "update", _) => {
+            Operation::Update
+        }
+        #[cfg(test)]
+        (Identity::InspectFixtureV1, "inspect", _) => Operation::Inspect,
+        #[cfg(test)]
+        (Identity::AppActionFixtureV1, "update_record", _) => Operation::UpdateRecord,
+        _ => {
+            return Err(DescribeError::InvalidDescriptor {
+                reason: "operation/capability has no closed provider review vocabulary".to_owned(),
+            });
+        }
+    };
+    Ok(operation)
+}
+
+fn provider_review_scope(
+    identity: ProviderReviewIdentity,
+    exact: &ResourceScope,
+) -> Result<
+    (
+        ProviderReviewScopeType,
+        ProviderReviewNamespace,
+        ProviderReviewResourceKind,
+    ),
+    DescribeError,
+> {
+    use ProviderReviewIdentity as Identity;
+    use ProviderReviewNamespace as Namespace;
+    use ProviderReviewResourceKind as Kind;
+    use ProviderReviewScopeType::{Collection, Resource};
+
+    let (scope_type, namespace, kind) = match exact {
+        ResourceScope::Collection { namespace, kind } => {
+            (Collection, namespace.as_str(), kind.as_str())
+        }
+        ResourceScope::Resource {
+            namespace, kind, ..
+        } => (Resource, namespace.as_str(), kind.as_str()),
+    };
+    let safe = match (identity, scope_type, namespace, kind) {
+        (Identity::WorkspaceListV1, Collection, "workspace", "membership") => {
+            (Collection, Namespace::Workspace, Kind::Membership)
+        }
+        (Identity::MessagingV1, Resource, "workspace", "workspace") => {
+            (Resource, Namespace::Workspace, Kind::Workspace)
+        }
+        (Identity::MessagingV1, Collection, "messaging", "place") => {
+            (Collection, Namespace::Messaging, Kind::Place)
+        }
+        (Identity::MessagingV1, Resource, "messaging", "place") => {
+            (Resource, Namespace::Messaging, Kind::Place)
+        }
+        (Identity::MessagingV1, Resource, "messaging", "message") => {
+            (Resource, Namespace::Messaging, Kind::Message)
+        }
+        (Identity::MessagingV1, Resource, "messaging", "participant") => {
+            (Resource, Namespace::Messaging, Kind::Participant)
+        }
+        (Identity::MessagingV1, Resource, "messaging", "reply_later_marker") => {
+            (Resource, Namespace::Messaging, Kind::ReplyLaterMarker)
+        }
+        (
+            Identity::WorkspaceReadFileV1
+            | Identity::WorkspaceListDirV1
+            | Identity::WorkspaceGrepV1,
+            Resource,
+            "sumi.foundation.workspace",
+            "path",
+        ) => (Resource, Namespace::FoundationWorkspace, Kind::Path),
+        (Identity::WorkspaceGlobV1, Resource, "sumi.foundation.workspace", "glob_selector") => {
+            (Resource, Namespace::FoundationWorkspace, Kind::GlobSelector)
+        }
+        #[cfg(test)]
+        (Identity::FixtureV1, Resource, "fixture", "record") => {
+            (Resource, Namespace::Fixture, Kind::Record)
+        }
+        #[cfg(test)]
+        (
+            Identity::ExampleV1 | Identity::ExampleV2 | Identity::OtherExampleV1,
+            Resource,
+            "example",
+            "record",
+        ) => (Resource, Namespace::Example, Kind::Record),
+        #[cfg(test)]
+        (Identity::ExampleV1 | Identity::ExampleV2, Collection, "example", "record") => {
+            (Collection, Namespace::Example, Kind::Record)
+        }
+        #[cfg(test)]
+        (Identity::InspectFixtureV1, Collection, "test", "item") => {
+            (Collection, Namespace::Test, Kind::Item)
+        }
+        #[cfg(test)]
+        (Identity::AppActionFixtureV1, Resource, "test", "record") => {
+            (Resource, Namespace::Test, Kind::Record)
+        }
+        _ => {
+            return Err(DescribeError::InvalidDescriptor {
+                reason: "resource namespace/kind has no closed provider review vocabulary"
+                    .to_owned(),
+            });
+        }
+    };
+    Ok(safe)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct BoundExecutionArguments(Map<String, Value>);
@@ -175,11 +496,11 @@ impl BoundExecutionArguments {
     }
 }
 
-/// App-owned, deliberately bounded details suitable for later review UIs and
-/// reviewers. This value is explicit rather than generically derived from
-/// execution arguments: an app must retain the operation's meaning, target,
-/// and reviewable payload while omitting credentials, opaque blobs, and other
-/// fields that are neither safe nor useful to review.
+/// App-owned, deliberately bounded details suitable for authenticated Human
+/// review and local durable binding. This value is explicit rather than
+/// generically derived from execution arguments: an app must retain the
+/// operation's meaning, target, and consent payload. External reviewers receive
+/// only [`ProviderReviewProjection`], never this exact local value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ReviewProjection(Map<String, Value>);
@@ -196,6 +517,98 @@ impl ReviewProjection {
 
     pub(crate) fn as_object(&self) -> &Map<String, Value> {
         &self.0
+    }
+}
+
+/// A provider-safe structural summary of the exact local Human projection.
+///
+/// The exact projection remains in [`BoundToolInvocation::review_projection`]
+/// for authenticated Human consent and local durable evidence. This separate
+/// value deliberately contains no keys or scalar strings from that projection,
+/// and no digest derived from its hidden values. A separately reduced
+/// [`ProviderReviewDescriptor`] carries only trusted adapter vocabulary and
+/// resource-shape counts; exact resource identifiers also remain local.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderReviewProjection {
+    pub schema_version: u32,
+    pub top_level_fields: u64,
+    pub object_fields: u64,
+    pub array_items: u64,
+    pub text_values: u64,
+    pub text_bytes: u64,
+    pub text_characters: u64,
+    pub number_values: u64,
+    pub boolean_values: u64,
+    pub null_values: u64,
+}
+
+impl ProviderReviewProjection {
+    fn from_exact(exact: &ReviewProjection) -> Result<Self, DescribeError> {
+        let mut projection = Self {
+            schema_version: PROVIDER_REVIEW_PROJECTION_SCHEMA_VERSION,
+            top_level_fields: u64::try_from(exact.as_object().len()).map_err(|_| {
+                DescribeError::InvalidReviewProjection {
+                    reason: "review projection field count exceeds u64".to_owned(),
+                }
+            })?,
+            object_fields: 0,
+            array_items: 0,
+            text_values: 0,
+            text_bytes: 0,
+            text_characters: 0,
+            number_values: 0,
+            boolean_values: 0,
+            null_values: 0,
+        };
+        summarize_provider_review_value(
+            &Value::Object(exact.as_object().clone()),
+            &mut projection,
+        )?;
+        Ok(projection)
+    }
+}
+
+fn summarize_provider_review_value(
+    value: &Value,
+    summary: &mut ProviderReviewProjection,
+) -> Result<(), DescribeError> {
+    fn add(target: &mut u64, value: usize) -> Result<(), DescribeError> {
+        let value = u64::try_from(value).map_err(|_| DescribeError::InvalidReviewProjection {
+            reason: "review projection size exceeds u64".to_owned(),
+        })?;
+        *target =
+            target
+                .checked_add(value)
+                .ok_or_else(|| DescribeError::InvalidReviewProjection {
+                    reason: "review projection summary overflowed".to_owned(),
+                })?;
+        Ok(())
+    }
+
+    match value {
+        Value::Null => add(&mut summary.null_values, 1),
+        Value::Bool(_) => add(&mut summary.boolean_values, 1),
+        Value::Number(_) => add(&mut summary.number_values, 1),
+        Value::String(text) => {
+            add(&mut summary.text_values, 1)?;
+            add(&mut summary.text_bytes, text.len())?;
+            add(&mut summary.text_characters, text.chars().count())
+        }
+        Value::Array(values) => {
+            add(&mut summary.array_items, values.len())?;
+            for value in values {
+                summarize_provider_review_value(value, summary)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            add(&mut summary.object_fields, object.len())?;
+            for value in object.values() {
+                summarize_provider_review_value(value, summary)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -334,7 +747,10 @@ pub(crate) struct BoundToolInvocation {
     pub descriptor_digest: InvocationDigest,
     pub execution_identity: BoundExecutionIdentity,
     pub descriptor: AppActionDescriptor,
+    pub provider_review_identity: ProviderReviewIdentity,
+    pub provider_review_descriptor: ProviderReviewDescriptor,
     pub review_projection: ReviewProjection,
+    pub provider_review_projection: ProviderReviewProjection,
     pub execution_arguments: BoundExecutionArguments,
 }
 
@@ -351,6 +767,11 @@ impl BoundToolInvocation {
         validate_proposal_label(tool_name, "tool name")?;
         adapter.validate()?;
         binding.descriptor.normalize_and_validate()?;
+        let provider_review_identity = ProviderReviewIdentity::from_local(tool_name, &adapter)?;
+        let provider_review_descriptor =
+            ProviderReviewDescriptor::from_exact(provider_review_identity, &binding.descriptor)?;
+        let provider_review_projection =
+            ProviderReviewProjection::from_exact(&binding.review_projection)?;
 
         let proposal_digest = digest_json(
             PROPOSAL_DIGEST_DOMAIN,
@@ -368,7 +789,10 @@ impl BoundToolInvocation {
                 "adapter": &adapter,
                 "execution_identity": &execution_identity,
                 "descriptor": &binding.descriptor,
+                "provider_review_identity": &provider_review_identity,
+                "provider_review_descriptor": &provider_review_descriptor,
                 "review_projection": &binding.review_projection,
+                "provider_review_projection": &provider_review_projection,
                 "execution_arguments": &binding.execution_arguments,
             }),
         )?;
@@ -382,7 +806,10 @@ impl BoundToolInvocation {
             descriptor_digest,
             execution_identity,
             descriptor: binding.descriptor,
+            provider_review_identity,
+            provider_review_descriptor,
             review_projection: binding.review_projection,
+            provider_review_projection,
             execution_arguments: binding.execution_arguments,
         })
     }
@@ -396,7 +823,10 @@ impl BoundToolInvocation {
                 "adapter": &self.adapter,
                 "execution_identity": &self.execution_identity,
                 "descriptor": &self.descriptor,
+                "provider_review_identity": &self.provider_review_identity,
+                "provider_review_descriptor": &self.provider_review_descriptor,
                 "review_projection": &self.review_projection,
+                "provider_review_projection": &self.provider_review_projection,
                 "execution_arguments": &self.execution_arguments,
             }),
         )
@@ -440,6 +870,46 @@ impl BoundToolInvocation {
                 ReviewProjection::from_value(serde_json::json!({
                     "operation":"fixture.operation",
                     "target":"fixture-record"
+                }))
+                .expect("fixture review projection"),
+                BoundExecutionArguments::from_value(proposal.clone())
+                    .expect("fixture execution arguments"),
+            ),
+        )
+        .expect("fixture bound invocation")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture_with_private_values(
+        tool_call_id: &str,
+        flow_id: &str,
+        resource_id: &str,
+        private_text: &str,
+        capability: CapabilityClass,
+    ) -> Self {
+        let proposal = serde_json::json!({
+            "resource_id": resource_id,
+            "private_text": private_text,
+        });
+        let proposal_arguments = proposal.as_object().expect("fixture proposal is an object");
+        Self::seal(
+            tool_call_id,
+            "fixture_tool",
+            proposal_arguments,
+            AdapterIdentity::new("sumi.fixture", 1).expect("fixture adapter"),
+            BoundExecutionIdentity::seal(flow_id, Path::new("/workspace"))
+                .expect("fixture execution identity"),
+            ToolBinding::new(
+                AppActionDescriptor::new(
+                    "fixture.operation",
+                    capability,
+                    vec![ResourceScope::resource("fixture", "record", resource_id)],
+                )
+                .expect("fixture descriptor"),
+                ReviewProjection::from_value(serde_json::json!({
+                    "operation": "fixture.operation",
+                    "resource_id": resource_id,
+                    "private_text": private_text,
                 }))
                 .expect("fixture review projection"),
                 BoundExecutionArguments::from_value(proposal.clone())
@@ -649,6 +1119,186 @@ mod tests {
             .clone()
     }
 
+    fn seal_with_vocabulary(
+        tool_name: &str,
+        adapter_id: &str,
+        operation: &str,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<BoundToolInvocation, DescribeError> {
+        let proposal = json!({"value": "fixture"});
+        BoundToolInvocation::seal(
+            "vocabulary-call",
+            tool_name,
+            proposal.as_object().unwrap(),
+            AdapterIdentity::new(adapter_id, 1)?,
+            execution_identity("vocabulary-flow", "/workspace"),
+            ToolBinding::new(
+                AppActionDescriptor::new(
+                    operation,
+                    CapabilityClass::Mutate,
+                    vec![ResourceScope::resource(namespace, kind, "local-id")],
+                )?,
+                ReviewProjection::from_value(json!({"value":"fixture"}))?,
+                BoundExecutionArguments::from_value(proposal.clone())?,
+            ),
+        )
+    }
+
+    #[test]
+    fn provider_review_vocabulary_rejects_arbitrary_tool_adapter_operation_and_scope_labels() {
+        const SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert_eq!(SENTINEL.chars().count(), 43);
+        assert!(
+            AppActionDescriptor::new(
+                SENTINEL,
+                CapabilityClass::Mutate,
+                vec![ResourceScope::resource(SENTINEL, SENTINEL, "local-id")],
+            )
+            .is_ok(),
+            "the exact local descriptor remains flexible"
+        );
+
+        for (label, result) in [
+            (
+                "tool name",
+                seal_with_vocabulary(
+                    SENTINEL,
+                    "sumi.fixture",
+                    "fixture.operation",
+                    "fixture",
+                    "record",
+                ),
+            ),
+            (
+                "adapter id",
+                seal_with_vocabulary(
+                    "fixture_tool",
+                    SENTINEL,
+                    "fixture.operation",
+                    "fixture",
+                    "record",
+                ),
+            ),
+            (
+                "operation",
+                seal_with_vocabulary(
+                    "fixture_tool",
+                    "sumi.fixture",
+                    SENTINEL,
+                    "fixture",
+                    "record",
+                ),
+            ),
+            (
+                "namespace",
+                seal_with_vocabulary(
+                    "fixture_tool",
+                    "sumi.fixture",
+                    "fixture.operation",
+                    SENTINEL,
+                    "record",
+                ),
+            ),
+            (
+                "resource kind",
+                seal_with_vocabulary(
+                    "fixture_tool",
+                    "sumi.fixture",
+                    "fixture.operation",
+                    "fixture",
+                    SENTINEL,
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(DescribeError::InvalidDescriptor { .. })),
+                "arbitrary {label} crossed the provider vocabulary boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_projection_summarizes_exact_text_without_copying_keys_values_or_hashes() {
+        const SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        let proposal = json!({"content": SENTINEL});
+        let invocation = BoundToolInvocation::seal(
+            "call-safe-review",
+            "example",
+            proposal.as_object().unwrap(),
+            AdapterIdentity::new("sumi.example", 1).unwrap(),
+            execution_identity("flow-safe-review", "/workspace"),
+            ToolBinding::new(
+                AppActionDescriptor::new(
+                    "update",
+                    CapabilityClass::Mutate,
+                    vec![
+                        ResourceScope::resource("example", "record", SENTINEL),
+                        ResourceScope::resource("example", "record", "record-b"),
+                        ResourceScope::collection("example", "record"),
+                    ],
+                )
+                .unwrap(),
+                ReviewProjection::from_value(json!({
+                    "action": "update",
+                    "content": SENTINEL,
+                    "has_content": true
+                }))
+                .unwrap(),
+                BoundExecutionArguments::from_value(proposal.clone()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let exact = serde_json::to_string(&invocation.review_projection).unwrap();
+        assert!(exact.contains(SENTINEL));
+        assert!(exact.contains("content"));
+        let exact_descriptor = serde_json::to_string(&invocation.descriptor).unwrap();
+        assert!(exact_descriptor.contains(SENTINEL));
+        let provider_descriptor =
+            serde_json::to_string(&invocation.provider_review_descriptor).unwrap();
+        assert_eq!(provider_descriptor.matches(SENTINEL).count(), 0);
+        assert!(!provider_descriptor.contains("record-b"));
+        assert_eq!(
+            invocation.provider_review_descriptor.resource_scopes.len(),
+            2
+        );
+        assert_eq!(
+            invocation
+                .provider_review_descriptor
+                .resource_scopes
+                .iter()
+                .find(|scope| scope.scope_type == ProviderReviewScopeType::Resource)
+                .expect("resource scope summary")
+                .count,
+            2
+        );
+        let provider = serde_json::to_string(&invocation.provider_review_projection).unwrap();
+        assert_eq!(provider.matches(SENTINEL).count(), 0);
+        assert!(!provider.contains("content"));
+        assert!(!provider.contains("action"));
+        assert!(!provider.contains(&invocation.proposal_digest.to_hex()));
+        assert!(!provider.contains(&invocation.descriptor_digest.to_hex()));
+        assert_eq!(invocation.provider_review_projection.text_values, 2);
+        assert_eq!(invocation.provider_review_projection.boolean_values, 1);
+
+        let mut tampered = invocation.clone();
+        tampered.provider_review_projection.text_characters += 1;
+        assert_ne!(
+            tampered.recompute_descriptor_digest().unwrap(),
+            invocation.descriptor_digest,
+            "the local descriptor/evidence identity must bind the safe external summary"
+        );
+
+        let mut tampered = invocation.clone();
+        tampered.provider_review_descriptor.resource_scopes[0].count += 1;
+        assert_ne!(
+            tampered.recompute_descriptor_digest().unwrap(),
+            invocation.descriptor_digest,
+            "the local descriptor/evidence identity must bind the safe external descriptor"
+        );
+    }
+
     #[test]
     fn differently_ordered_raw_json_has_one_versioned_domain_digest() {
         let left_raw = r#"{"action":"update","content":"hello","options":{"z":1,"a":2}}"#;
@@ -754,13 +1404,13 @@ mod tests {
         );
         assert_eq!(
             left.proposal_digest.to_hex(),
-            "fe6b65eb17a39149a8fdee722c6b4c4d32bd22022413bf02ef0d332f747bf4d2"
+            "8fd9e0ce15dab3a10c9d0d1bf0211fafe94bef24ec565bb42c696462301c71f4"
         );
         assert_eq!(
             left.descriptor_digest.to_hex(),
-            "dd27183f568277f033835831ecee12fcaa18f924e6d76b954a0adb49a19aaa3c"
+            "1260d135657fd045cecca256facb272f57557ef50c98db11d4adf24f17fab9f5"
         );
-        assert_eq!(left.proposal_digest.as_bytes()[0], 0xfe);
+        assert_eq!(left.proposal_digest.as_bytes()[0], 0x8f);
 
         let later_call = BoundToolInvocation::seal(
             "call-2",

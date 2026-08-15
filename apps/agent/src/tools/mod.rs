@@ -47,7 +47,8 @@ use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 
 pub(crate) use bound::{
     AdapterIdentity, AppActionDescriptor, AppPrecondition, BoundExecutionArguments,
-    BoundExecutionIdentity, BoundToolInvocation, CapabilityClass, DescribeError, ResourceScope,
+    BoundExecutionIdentity, BoundToolInvocation, CapabilityClass, DescribeError,
+    ProviderReviewDescriptor, ProviderReviewIdentity, ProviderReviewProjection, ResourceScope,
     ReviewProjection, ToolBinding,
 };
 

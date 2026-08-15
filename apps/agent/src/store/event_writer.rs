@@ -14902,7 +14902,7 @@ mod tests {
             },
             route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
             route_reviewer::{
-                ESCALATION_PROMPT_VERSION_V1, ESCALATION_REVIEWER_VERSION_V1,
+                ESCALATION_PROMPT_VERSION_V2, ESCALATION_REVIEWER_VERSION_V2,
                 ESCALATION_SCHEMA_VERSION_V1, EscalationReviewDecision, EscalationReviewEvidence,
                 EscalationReviewOutcome, ReviewerBudgetV1, ReviewerTerminalClass, RiskLevel,
             },
@@ -15335,8 +15335,8 @@ mod tests {
 
     fn escalation_ask_human_evidence() -> EscalationReviewEvidence {
         EscalationReviewEvidence {
-            reviewer_version: ESCALATION_REVIEWER_VERSION_V1.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V1.to_owned(),
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V2.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V2.to_owned(),
             schema_version: ESCALATION_SCHEMA_VERSION_V1.to_owned(),
             model_id: "fixture-reviewer".to_owned(),
             model_binding_digest: "fixture-model-binding".to_owned(),

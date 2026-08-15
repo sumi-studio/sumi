@@ -1473,8 +1473,10 @@ impl Runner {
             .as_ref()
             .and_then(super::ApprovalRuntime::route)
             .cloned();
+        #[cfg(not(test))]
+        let _ = assistant_message;
         if let Some(broker) = route_broker {
-            self.execute_route_calls(assistant_message_id, assistant_message, calls, broker)
+            self.execute_route_calls(assistant_message_id, calls, broker)
                 .await
         } else {
             #[cfg(test)]
@@ -1495,17 +1497,9 @@ impl Runner {
     async fn execute_route_calls(
         &mut self,
         assistant_message_id: &str,
-        assistant_message: &PublicMessage,
         calls: &[ToolCall],
         broker: Arc<RouteApprovalBroker>,
     ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
-        let base_epoch = self.core.mutation_epoch();
-        let mut transcript: Vec<PublicMessage> = self
-            .context
-            .iter()
-            .map(|ctx| message_to_public(context_message(ctx).clone()))
-            .collect();
-        transcript.push(assistant_message.clone());
         let mut results = Vec::with_capacity(calls.len());
         let mut receipts = Vec::with_capacity(calls.len());
         let mut cancel_reason: Option<String> = None;
@@ -1532,32 +1526,20 @@ impl Runner {
                         call,
                         &format!("App could not bind this operation: {error}"),
                     );
-                    let result_message = PublicMessage::ToolResult(result.clone());
                     let waiter = self
                         .emit_result_message(assistant_message_id, &result, None, None)
                         .await?;
                     receipts.push(self.await_message_receipt(waiter).await?);
                     results.push(result);
-                    transcript.push(result_message);
                     continue;
                 }
             };
-            let context_version = base_epoch
-                .saturating_add(index as u64)
-                .saturating_add(1)
-                .to_string();
             let mut authorization_attempts = 0_usize;
 
             'authorize: loop {
                 authorization_attempts = authorization_attempts.saturating_add(1);
                 match self
-                    .evaluate_route_call(
-                        broker.clone(),
-                        sealed,
-                        call.route,
-                        &transcript,
-                        &context_version,
-                    )
+                    .evaluate_route_call(broker.clone(), sealed, call.route)
                     .await?
                 {
                     RouteCallDisposition::Allowed { grant } => {
@@ -1566,19 +1548,16 @@ impl Runner {
                             .await?
                         {
                             RouteExecutionDisposition::Completed { result, receipt } => {
-                                transcript.push(PublicMessage::ToolResult(result.clone()));
                                 receipts.push(receipt);
                                 results.push(result);
                             }
                             RouteExecutionDisposition::Preempted { reason } => {
                                 let result = error_tool_result(call, &reason);
-                                let result_message = PublicMessage::ToolResult(result.clone());
                                 let waiter = self
                                     .emit_result_message(assistant_message_id, &result, None, None)
                                     .await?;
                                 receipts.push(self.await_message_receipt(waiter).await?);
                                 results.push(result);
-                                transcript.push(result_message);
                                 cancel_reason = Some(reason);
                             }
                             RouteExecutionDisposition::Reauthorize { sealed: next } => {
@@ -1609,7 +1588,6 @@ impl Runner {
                                         evidence.error_code(),
                                         &reason,
                                     );
-                                    let result_message = PublicMessage::ToolResult(result.clone());
                                     let waiter = self
                                         .emit_route_denied_result_message(
                                             assistant_message_id,
@@ -1620,7 +1598,6 @@ impl Runner {
                                         .await?;
                                     receipts.push(self.await_message_receipt(waiter).await?);
                                     results.push(result);
-                                    transcript.push(result_message);
                                 } else {
                                     sealed = next;
                                     continue 'authorize;
@@ -1634,7 +1611,6 @@ impl Runner {
                         bound,
                     } => {
                         let result = route_denial_tool_result(call, evidence.error_code(), &reason);
-                        let result_message = PublicMessage::ToolResult(result.clone());
                         let waiter = self
                             .emit_route_denied_result_message(
                                 assistant_message_id,
@@ -1645,7 +1621,6 @@ impl Runner {
                             .await?;
                         receipts.push(self.await_message_receipt(waiter).await?);
                         results.push(result);
-                        transcript.push(result_message);
                     }
                     RouteCallDisposition::Pending { mut pending } => {
                         let request = pending.request().clone();
@@ -1682,7 +1657,6 @@ impl Runner {
                                     .await?
                                 {
                                     RouteExecutionDisposition::Completed { result, receipt } => {
-                                        transcript.push(PublicMessage::ToolResult(result.clone()));
                                         receipts.push(receipt);
                                         results.push(result);
                                     }
@@ -1694,8 +1668,6 @@ impl Runner {
                                         })
                                         .await?;
                                         let result = error_tool_result(call, &reason);
-                                        let result_message =
-                                            PublicMessage::ToolResult(result.clone());
                                         let waiter = self
                                             .emit_result_message(
                                                 assistant_message_id,
@@ -1706,7 +1678,6 @@ impl Runner {
                                             .await?;
                                         receipts.push(self.await_message_receipt(waiter).await?);
                                         results.push(result);
-                                        transcript.push(result_message);
                                         cancel_reason = Some(reason);
                                     }
                                     RouteExecutionDisposition::Reauthorize { .. } => {
@@ -1722,8 +1693,6 @@ impl Runner {
                                         .await?;
                                         let reason = "The approved operation was rejected because its authority changed before execution";
                                         let result = error_tool_result(call, reason);
-                                        let result_message =
-                                            PublicMessage::ToolResult(result.clone());
                                         let waiter = self
                                             .emit_human_rejected_result_message(
                                                 assistant_message_id,
@@ -1732,7 +1701,6 @@ impl Runner {
                                             .await?;
                                         receipts.push(self.await_message_receipt(waiter).await?);
                                         results.push(result);
-                                        transcript.push(result_message);
                                     }
                                 }
                             }
@@ -1747,7 +1715,6 @@ impl Runner {
                                 )
                                 .await?;
                                 let result = error_tool_result(call, "Approval denied");
-                                let result_message = PublicMessage::ToolResult(result.clone());
                                 let waiter = self
                                     .emit_result_message(
                                         assistant_message_id,
@@ -1758,7 +1725,6 @@ impl Runner {
                                     .await?;
                                 receipts.push(self.await_message_receipt(waiter).await?);
                                 results.push(result);
-                                transcript.push(result_message);
                             }
                             RouteApprovalWaitOutcome::Rejected {
                                 decision,
@@ -1773,7 +1739,6 @@ impl Runner {
                                 )
                                 .await?;
                                 let result = error_tool_result(call, &reason);
-                                let result_message = PublicMessage::ToolResult(result.clone());
                                 let waiter = self
                                     .emit_result_message(
                                         assistant_message_id,
@@ -1784,7 +1749,6 @@ impl Runner {
                                     .await?;
                                 receipts.push(self.await_message_receipt(waiter).await?);
                                 results.push(result);
-                                transcript.push(result_message);
                             }
                             RouteApprovalWaitOutcome::Cancelled => {
                                 self.emit(AgentEvent::ApprovalResolved {
@@ -1794,7 +1758,6 @@ impl Runner {
                                 .await?;
                                 let reason = "Tool execution cancelled".to_owned();
                                 let result = error_tool_result(call, &reason);
-                                let result_message = PublicMessage::ToolResult(result.clone());
                                 let waiter = self
                                     .emit_result_message(
                                         assistant_message_id,
@@ -1805,7 +1768,6 @@ impl Runner {
                                     .await?;
                                 receipts.push(self.await_message_receipt(waiter).await?);
                                 results.push(result);
-                                transcript.push(result_message);
                                 cancel_reason = Some(reason);
                             }
                         }
@@ -1841,8 +1803,6 @@ impl Runner {
         broker: Arc<RouteApprovalBroker>,
         sealed: SealedBoundToolInvocation,
         route: crate::provider::types::ToolInvocationRoute,
-        transcript: &[PublicMessage],
-        context_version: &str,
     ) -> Result<RouteCallDisposition, WorkerFailure> {
         let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
@@ -1858,11 +1818,9 @@ impl Runner {
         let request = broker.start_request(
             sealed,
             route,
-            transcript,
             scope,
             &run_id,
             &turn_id,
-            context_version,
             review_cancel.clone(),
         );
         tokio::pin!(request);

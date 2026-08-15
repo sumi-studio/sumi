@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -34,17 +34,14 @@ use crate::{
             EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewRequest,
             EscalationReviewResult, EscalationReviewer, ExecutionReviewEvidence,
             ExecutionReviewOutcome, ExecutionReviewRequest, ExecutionReviewResult,
-            ExecutionReviewer, ReviewerTerminalClass,
+            ExecutionReviewer, ReviewerPolicyEvidence, ReviewerTerminalClass, SealedReviewEvidence,
         },
     },
-    provider::types::{PublicAssistantContent, PublicMessage, ToolInvocationRoute, UserContent},
+    provider::types::ToolInvocationRoute,
     store::Redactor,
     tools::{BoundToolInvocation, SealedBoundToolInvocation},
 };
 
-const MAX_CONTEXT_MESSAGES: usize = 12;
-const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
-const MAX_CONTEXT_TOTAL_CHARS: usize = 24_000;
 pub(crate) const MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS: usize = 3;
 
 pub(crate) const fn normal_reauthorization_exhausted(attempts: usize) -> bool {
@@ -109,6 +106,31 @@ pub(crate) struct PendingApprovalRequest {
 }
 
 impl PendingApprovalRequest {
+    pub(crate) fn from_bound(
+        id: String,
+        route: ToolInvocationRoute,
+        bound: &BoundToolInvocation,
+        redactor: &Redactor,
+    ) -> Result<Self> {
+        Ok(Self {
+            id,
+            tool_call_id: bound.tool_call_id.clone(),
+            tool_name: bound.tool_name.clone(),
+            route,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest()?.to_hex(),
+            adapter_id: bound.adapter.id.clone(),
+            adapter_version: bound.adapter.version,
+            descriptor: redactor.redact_value(
+                &serde_json::to_value(&bound.descriptor)
+                    .context("serialize approval descriptor")?,
+            )?,
+            review_projection: redactor
+                .redact_value(&Value::Object(bound.review_projection.as_object().clone()))?,
+        })
+    }
+
     /// Build the Human-facing request without exposing provider review
     /// evidence or the private route/digest envelope. Exact binding stays in
     /// the authenticated command context and durable private evidence.
@@ -305,11 +327,9 @@ impl RouteApprovalBroker {
         &self,
         sealed: SealedBoundToolInvocation,
         route: ToolInvocationRoute,
-        transcript: &[PublicMessage],
         scope: ApprovalPrincipalScope,
         run_id: &str,
         turn_id: &str,
-        context_version: &str,
         cancel: CancellationToken,
     ) -> Result<RouteApprovalOutcome> {
         scope.validate()?;
@@ -361,11 +381,11 @@ impl RouteApprovalBroker {
                         snapshot,
                         decision: NormalPolicyDecision::Unmatched,
                     } => {
-                        let (evidence, bounded_context) = match review_inputs(
+                        let (sealed_evidence, policy) = match review_inputs(
                             bound,
-                            transcript,
-                            context_version,
-                            self.redactor.as_ref(),
+                            route,
+                            PolicyDecisionRecord::Unmatched,
+                            &snapshot,
                         ) {
                             Ok(inputs) => inputs,
                             Err(_) => {
@@ -388,9 +408,8 @@ impl RouteApprovalBroker {
                             .execution_reviewer
                             .review(
                                 ExecutionReviewRequest {
-                                    action_digest: bound.descriptor_digest.to_hex(),
-                                    redacted_evidence: evidence,
-                                    bounded_context,
+                                    sealed_evidence,
+                                    policy,
                                 },
                                 cancel,
                             )
@@ -457,33 +476,35 @@ impl RouteApprovalBroker {
                     }
                     ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
                 };
-                let (evidence, bounded_context) =
-                    match review_inputs(bound, transcript, context_version, self.redactor.as_ref())
-                    {
-                        Ok(inputs) => inputs,
-                        Err(_) => {
-                            let review = self
-                                .escalation_reviewer
-                                .block_without_call(ReviewerTerminalClass::InsufficientEvidence);
-                            let reason = review.decision.rationale.clone();
-                            return self.deny(
-                                bound,
-                                route,
-                                snapshot,
-                                PolicyDecisionRecord::ElevatedPreflight,
-                                None,
-                                Some(review),
-                                reason,
-                            );
-                        }
-                    };
+                let (sealed_evidence, policy) = match review_inputs(
+                    bound,
+                    route,
+                    PolicyDecisionRecord::ElevatedPreflight,
+                    &snapshot,
+                ) {
+                    Ok(inputs) => inputs,
+                    Err(_) => {
+                        let review = self
+                            .escalation_reviewer
+                            .block_without_call(ReviewerTerminalClass::InsufficientEvidence);
+                        let reason = review.decision.rationale.clone();
+                        return self.deny(
+                            bound,
+                            route,
+                            snapshot,
+                            PolicyDecisionRecord::ElevatedPreflight,
+                            None,
+                            Some(review),
+                            reason,
+                        );
+                    }
+                };
                 let review = self
                     .escalation_reviewer
                     .review(
                         EscalationReviewRequest {
-                            action_digest: bound.descriptor_digest.to_hex(),
-                            redacted_evidence: evidence,
-                            bounded_context,
+                            sealed_evidence,
+                            policy,
                         },
                         cancel,
                     )
@@ -606,24 +627,12 @@ impl RouteApprovalBroker {
             escalation_review: escalation_review.clone(),
         };
         let request_id = Uuid::now_v7().to_string();
-        let request = PendingApprovalRequest {
-            id: request_id.clone(),
-            tool_call_id: bound.tool_call_id.clone(),
-            tool_name: bound.tool_name.clone(),
+        let request = PendingApprovalRequest::from_bound(
+            request_id.clone(),
             route,
-            proposal_digest: bound.proposal_digest.to_hex(),
-            descriptor_digest: bound.descriptor_digest.to_hex(),
-            bound_evidence_digest: bound.evidence_digest()?.to_hex(),
-            adapter_id: bound.adapter.id.clone(),
-            adapter_version: bound.adapter.version,
-            descriptor: self.redactor.redact_value(
-                &serde_json::to_value(&bound.descriptor)
-                    .context("serialize approval descriptor")?,
-            )?,
-            review_projection: self
-                .redactor
-                .redact_value(&Value::Object(bound.review_projection.as_object().clone()))?,
-        };
+            bound,
+            self.redactor.as_ref(),
+        )?;
         let (sender, receiver) = oneshot::channel();
         self.pending
             .lock()
@@ -844,84 +853,32 @@ impl RouteApprovalBroker {
     }
 }
 
-fn review_evidence(bound: &BoundToolInvocation, redactor: &Redactor) -> Result<Value> {
-    redactor.redact_value(&json!({
-        "adapter": &bound.adapter,
-        "descriptor": &bound.descriptor,
-        "review_projection": bound.review_projection.as_object(),
-    }))
-}
-
 fn review_inputs(
     bound: &BoundToolInvocation,
-    transcript: &[PublicMessage],
-    context_version: &str,
-    redactor: &Redactor,
-) -> Result<(Value, Value)> {
+    route: ToolInvocationRoute,
+    decision: PolicyDecisionRecord,
+    snapshot: &PolicySnapshot,
+) -> Result<(SealedReviewEvidence, ReviewerPolicyEvidence)> {
     Ok((
-        review_evidence(bound, redactor)?,
-        bounded_context(transcript, context_version, redactor)?,
+        SealedReviewEvidence::new(
+            bound.schema_version,
+            route,
+            bound.provider_review_identity,
+            bound.provider_review_descriptor.clone(),
+            bound.provider_review_projection.clone(),
+        )?,
+        ReviewerPolicyEvidence::from_snapshot(route, decision, snapshot),
     ))
 }
 
-fn bounded_context(
-    transcript: &[PublicMessage],
-    context_version: &str,
-    redactor: &Redactor,
-) -> Result<Value> {
-    let mut remaining = MAX_CONTEXT_TOTAL_CHARS;
-    let mut reverse = Vec::new();
-    for message in transcript.iter().rev() {
-        if reverse.len() >= MAX_CONTEXT_MESSAGES || remaining == 0 {
-            break;
-        }
-        let (role, texts): (&str, Vec<&str>) = match message {
-            PublicMessage::User(message) => (
-                "user",
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        UserContent::Text { text } => Some(text.as_str()),
-                        UserContent::Image { .. } => None,
-                    })
-                    .collect(),
-            ),
-            PublicMessage::Assistant(message) => (
-                "assistant",
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        PublicAssistantContent::Text { text, .. } => Some(text.as_str()),
-                        PublicAssistantContent::Thinking { .. }
-                        | PublicAssistantContent::ToolCall { .. }
-                        | PublicAssistantContent::RejectedToolCall { .. } => None,
-                    })
-                    .collect(),
-            ),
-            // Tool results may contain opaque app payloads. The bound review
-            // projection, not prior result bodies, is the review authority.
-            PublicMessage::ToolResult(_) => continue,
-        };
-        let joined = texts.join("\n");
-        if joined.is_empty() {
-            continue;
-        }
-        let limit = remaining.min(MAX_CONTEXT_TEXT_CHARS);
-        let text = truncate_chars(&joined, limit);
-        remaining = remaining.saturating_sub(text.chars().count());
-        reverse.push(json!({"role": role, "text": redactor.redact_text(&text)}));
-    }
-    reverse.reverse();
-    redactor.redact_value(&json!({
-        "context_version": context_version,
-        "messages": reverse,
-    }))
-}
-
-fn truncate_chars(value: &str, limit: usize) -> String {
-    value.chars().take(limit).collect()
+#[cfg(test)]
+pub(crate) fn provider_review_inputs_for_test(
+    bound: &BoundToolInvocation,
+    route: ToolInvocationRoute,
+    decision: PolicyDecisionRecord,
+    snapshot: &PolicySnapshot,
+) -> Result<(SealedReviewEvidence, ReviewerPolicyEvidence)> {
+    review_inputs(bound, route, decision, snapshot)
 }
 
 fn non_empty_reason(reason: String) -> String {
@@ -996,16 +953,23 @@ mod tests {
         }
 
         async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+            let title = ctx
+                .args
+                .as_object()
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or(DescribeError::InvalidArguments)?;
             Ok(ToolBinding::new(
                 AppActionDescriptor::new(
                     "update_record",
                     self.capability.clone(),
-                    vec![ResourceScope::resource("test", "record", "record-1")],
+                    vec![ResourceScope::resource("test", "record", title)],
                 )?,
                 ReviewProjection::from_value(json!({
                     "operation": "update_record",
                     "target": "record-1",
-                    "summary": "replace title"
+                    "summary": "replace title",
+                    "title": title
                 }))?,
                 BoundExecutionArguments::from_value(Value::Object(ctx.args.as_object().clone()))?,
             ))
@@ -1143,6 +1107,14 @@ mod tests {
         capability: CapabilityClass,
         route: ToolInvocationRoute,
     ) -> SealedBoundToolInvocation {
+        sealed_with_title(capability, route, "new title").await
+    }
+
+    async fn sealed_with_title(
+        capability: CapabilityClass,
+        route: ToolInvocationRoute,
+        title: &str,
+    ) -> SealedBoundToolInvocation {
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register(Arc::new(BindingTool { capability }))
@@ -1153,7 +1125,7 @@ mod tests {
             name: "app_action".to_owned(),
             route,
             arguments: serde_json::from_value::<ValidatedToolArguments>(json!({
-                "title": "new title"
+                "title": title
             }))
             .expect("validated arguments"),
         };
@@ -1194,11 +1166,9 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Read, ToolInvocationRoute::Normal).await,
                 ToolInvocationRoute::Normal,
-                &[],
                 scope(),
                 "run-1",
                 "turn-1",
-                "context-1",
                 CancellationToken::new(),
             )
             .await
@@ -1263,11 +1233,9 @@ mod tests {
                 .start_request(
                     sealed,
                     ToolInvocationRoute::Normal,
-                    &[],
                     scope(),
                     "run-1",
                     "turn-1",
-                    "context-1",
                     CancellationToken::new(),
                 )
                 .await
@@ -1335,11 +1303,9 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Mutate, ToolInvocationRoute::Normal).await,
                 ToolInvocationRoute::Normal,
-                &[],
                 scope(),
                 "run-1",
                 "turn-1",
-                "context-1",
                 CancellationToken::new(),
             )
             .await
@@ -1388,11 +1354,9 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
                 ToolInvocationRoute::Elevated,
-                &[],
                 scope(),
                 "run-1",
                 "turn-1",
-                "context-1",
                 CancellationToken::new(),
             )
             .await
@@ -1445,11 +1409,9 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
                 ToolInvocationRoute::Elevated,
-                &[],
                 scope(),
                 "run-1",
                 "turn-1",
-                "context-1",
                 CancellationToken::new(),
             )
             .await
@@ -1498,31 +1460,81 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reviewer_context_omits_thinking_tool_calls_results_and_redacts_text() {
-        let transcript: Vec<PublicMessage> = serde_json::from_value(json!([
-            {
-                "role":"user",
-                "content":[{"type":"text","text":"token sk-abcdefghijklmnop"}],
-                "timestamp":"2026-08-11T00:00:00Z"
-            },
-            {
-                "role":"tool_result",
-                "tool_call_id":"old-call",
-                "tool_name":"old-tool",
-                "content":[{"type":"text","text":"opaque result"}],
-                "details":{"secret":"must-not-appear"},
-                "is_error":false,
-                "timestamp":"2026-08-11T00:00:01Z"
+    #[tokio::test]
+    async fn route_reviewers_receive_no_raw_proposal_or_authenticated_principal_ids() {
+        const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
+
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"allow","risk":"medium","rationale":"intrinsically safe"}),
+            json!({
+                "outcome":"ask_human",
+                "risk":"medium",
+                "misunderstanding":null,
+                "rationale":"clear exact target"
+            }),
+        );
+        let normal = broker
+            .start_request(
+                sealed_with_title(
+                    CapabilityClass::Mutate,
+                    ToolInvocationRoute::Normal,
+                    INVITE_CODE_SENTINEL,
+                )
+                .await,
+                ToolInvocationRoute::Normal,
+                scope(),
+                "run-1",
+                "turn-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("normal review");
+        assert!(matches!(normal, RouteApprovalOutcome::Allowed { .. }));
+
+        let elevated = broker
+            .start_request(
+                sealed_with_title(
+                    CapabilityClass::Mutate,
+                    ToolInvocationRoute::Elevated,
+                    INVITE_CODE_SENTINEL,
+                )
+                .await,
+                ToolInvocationRoute::Elevated,
+                scope(),
+                "run-2",
+                "turn-2",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("elevated review");
+        let RouteApprovalOutcome::Pending { pending } = elevated else {
+            panic!("Escalation reviewer should create the Human request")
+        };
+        let human_request = serde_json::to_string(&pending.request().public_request())
+            .expect("Human approval request");
+        assert!(
+            human_request.contains(INVITE_CODE_SENTINEL),
+            "the authenticated Human must retain the exact local projection"
+        );
+
+        let execution_prompts = execution.prompts.lock().expect("execution prompts");
+        let escalation_prompts = escalation.prompts.lock().expect("escalation prompts");
+        for prompt in execution_prompts.iter().chain(escalation_prompts.iter()) {
+            let encoded = serde_json::to_string(prompt).expect("encode reviewer prompt");
+            assert_eq!(encoded.matches(INVITE_CODE_SENTINEL).count(), 0);
+            for forbidden in [
+                "bounded_context",
+                "context_version",
+                "tenant-1",
+                "agent-1",
+                "human-1",
+            ] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "leaked reviewer field: {forbidden}"
+                );
             }
-        ]))
-        .expect("public transcript");
-        let context =
-            bounded_context(&transcript, "v1", &Redactor::v1()).expect("bounded reviewer context");
-        let encoded = serde_json::to_string(&context).expect("encode context");
-        assert!(!encoded.contains("abcdefghijklmnop"));
-        assert!(!encoded.contains("opaque result"));
-        assert!(!encoded.contains("must-not-appear"));
-        assert!(encoded.contains("REDACTED"));
+        }
     }
 }
