@@ -93,7 +93,8 @@ for (const legacyRoute of [
 
 const directChatPost = openApi.paths?.["/direct-chat/commands"]?.post;
 const idempotencyParameter = directChatPost?.parameters?.find(
-  (parameter) => parameter.in === "header" && parameter.name === "Idempotency-Key",
+  (parameter) =>
+    parameter.in === "header" && parameter.name === "Idempotency-Key",
 );
 if (
   !idempotencyParameter?.required ||
@@ -108,7 +109,8 @@ if (
   failed = true;
 }
 
-const directChatRequest = openApi.components?.schemas?.DirectChatUserMessageCommand;
+const directChatRequest =
+  openApi.components?.schemas?.DirectChatUserMessageCommand;
 if (
   directChatRequest?.type !== "object" ||
   directChatRequest?.additionalProperties !== false ||
@@ -116,7 +118,9 @@ if (
   directChatRequest?.properties?.text?.type !== "string" ||
   directChatRequest?.properties?.attachments?.maxItems !== 0
 ) {
-  console.error("Direct-chat HTTP admission must preserve the strict structured user-message command body.");
+  console.error(
+    "Direct-chat HTTP admission must preserve the strict structured user-message command body.",
+  );
   failed = true;
 }
 
@@ -161,6 +165,189 @@ const schemaOnlyAjv = new Ajv2020({
   logger: false,
   validateFormats: false,
 });
+schemaOnlyAjv.addSchema(schema, "agent-events.yaml");
+
+function getOpenApiSchemaValidator(definition) {
+  return schemaOnlyAjv.compile({
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    $ref: `#/components/schemas/${definition}`,
+    components: openApi.components,
+  });
+}
+
+const workspaceId = "018f1e72-6e9a-7c20-8e90-123456789abc";
+const humanId = "018f1e72-6e9a-7c20-8e90-123456789abd";
+const operationId = "00000000-0000-4000-8000-000000000101";
+
+const appLifecycleRequestCases = [
+  {
+    name: "app install request",
+    definition: "AppInstallRequest",
+    valid: [
+      {
+        owner: { kind: "workspace", workspace_id: workspaceId },
+        app_id: "messaging",
+      },
+      {
+        owner: { kind: "workspace", workspace_id: workspaceId },
+        app_id: "messaging",
+        operation_id: operationId,
+      },
+      {
+        owner: {
+          kind: "participant",
+          participant: { kind: "human", human_id: humanId },
+        },
+        app_id: "direct-chat",
+        operation_id: operationId,
+      },
+    ],
+    invalid: [
+      {
+        name: "Participant operation identity is omitted",
+        value: {
+          owner: {
+            kind: "participant",
+            participant: { kind: "human", human_id: humanId },
+          },
+          app_id: "direct-chat",
+        },
+      },
+      {
+        name: "Participant operation identity is null",
+        value: {
+          owner: {
+            kind: "participant",
+            participant: { kind: "human", human_id: humanId },
+          },
+          app_id: "direct-chat",
+          operation_id: null,
+        },
+      },
+      {
+        name: "Participant operation identity is empty",
+        value: {
+          owner: {
+            kind: "participant",
+            participant: { kind: "human", human_id: humanId },
+          },
+          app_id: "direct-chat",
+          operation_id: "",
+        },
+      },
+      {
+        name: "Participant operation identity is UUIDv7",
+        value: {
+          owner: {
+            kind: "participant",
+            participant: { kind: "human", human_id: humanId },
+          },
+          app_id: "direct-chat",
+          operation_id: workspaceId,
+        },
+      },
+      {
+        name: "Participant operation identity is noncanonical uppercase",
+        value: {
+          owner: {
+            kind: "participant",
+            participant: { kind: "human", human_id: humanId },
+          },
+          app_id: "direct-chat",
+          operation_id: "00000000-0000-4000-8000-00000000010A",
+        },
+      },
+      {
+        name: "Workspace operation identity is invalid when present",
+        value: {
+          owner: { kind: "workspace", workspace_id: workspaceId },
+          app_id: "messaging",
+          operation_id: "",
+        },
+      },
+      {
+        name: "Owner discriminants cannot be combined",
+        value: {
+          owner: {
+            kind: "workspace",
+            workspace_id: workspaceId,
+            participant: { kind: "human", human_id: humanId },
+          },
+          app_id: "messaging",
+        },
+      },
+      {
+        name: "Unknown body properties are rejected",
+        value: {
+          owner: { kind: "workspace", workspace_id: workspaceId },
+          app_id: "messaging",
+          operation: operationId,
+        },
+      },
+    ],
+  },
+  {
+    name: "app installation state request",
+    definition: "AppInstallationStateRequest",
+    valid: [
+      { state: "disabled" },
+      { state: "enabled", expected_authority_epoch: "1" },
+      {
+        state: "disabled",
+        expected_authority_epoch: "9223372036854775807",
+      },
+    ],
+    invalid: [
+      {
+        name: "Expected authority epoch is null",
+        value: { state: "disabled", expected_authority_epoch: null },
+      },
+      {
+        name: "Expected authority epoch is empty",
+        value: { state: "disabled", expected_authority_epoch: "" },
+      },
+      {
+        name: "Expected authority epoch is zero",
+        value: { state: "disabled", expected_authority_epoch: "0" },
+      },
+      {
+        name: "Expected authority epoch has a leading zero",
+        value: { state: "disabled", expected_authority_epoch: "01" },
+      },
+      {
+        name: "Expected authority epoch overflows signed 64-bit",
+        value: {
+          state: "disabled",
+          expected_authority_epoch: "9223372036854775808",
+        },
+      },
+      {
+        name: "Unknown state properties are rejected",
+        value: { state: "disabled", authority_epoch: "1" },
+      },
+    ],
+  },
+];
+
+for (const { name, definition, valid, invalid } of appLifecycleRequestCases) {
+  const validate = getOpenApiSchemaValidator(definition);
+  for (const value of valid) {
+    if (!validate(value)) {
+      console.error(
+        `${name} rejected valid wire value ${JSON.stringify(value)}: ${describeErrors(validate.errors)}`,
+      );
+      failed = true;
+    }
+  }
+  for (const { name: caseName, value } of invalid) {
+    if (validate(value)) {
+      console.error(
+        `${name} accepted invalid ${caseName}: ${JSON.stringify(value)}`,
+      );
+      failed = true;
+    }
+  }
+}
 
 const httpRejectionCases = [
   {
@@ -205,16 +392,22 @@ const httpRejectionCases = [
 ];
 
 for (const { name, definition, valid, invalid } of httpRejectionCases) {
-  const validate = schemaOnlyAjv.compile(openApi.components.schemas[definition]);
+  const validate = schemaOnlyAjv.compile(
+    openApi.components.schemas[definition],
+  );
   for (const value of valid) {
     if (!validate(value)) {
-      console.error(`${name} rejected valid response: ${describeErrors(validate.errors)}`);
+      console.error(
+        `${name} rejected valid response: ${describeErrors(validate.errors)}`,
+      );
       failed = true;
     }
   }
   for (const value of invalid) {
     if (validate(value)) {
-      console.error(`${name} accepted invalid response: ${JSON.stringify(value)}`);
+      console.error(
+        `${name} accepted invalid response: ${JSON.stringify(value)}`,
+      );
       failed = true;
     }
   }
@@ -553,5 +746,5 @@ if (failed) {
 }
 
 console.log(
-  "All contract fixtures, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
+  "All contract fixtures, app-lifecycle requests, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
 );

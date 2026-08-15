@@ -442,6 +442,8 @@ export interface components {
     schemas: {
         /** Format: uuid */
         UUIDv7: string;
+        /** Format: uuid */
+        UUIDv4: string;
         APIError: {
             /** @enum {string} */
             error: "invalid_request" | "invalid_session" | "missing_session" | "duplicate_session_cookies" | "origin_not_allowed" | "forbidden" | "owner_protected" | "membership_not_active" | "last_administrator" | "not_found" | "conflict" | "internal_error";
@@ -539,15 +541,35 @@ export interface components {
         AppId: string;
         /** @enum {string} */
         AppOwnerKind: "workspace" | "participant";
-        AppOwnerRef: {
-            /** @constant */
+        WorkspaceAppOwnerRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             kind: "workspace";
             workspace_id: components["schemas"]["UUIDv7"];
-        } | {
-            /** @constant */
+        };
+        ParticipantAppOwnerRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             kind: "participant";
             participant: components["schemas"]["ParticipantRef"];
         };
+        AppOwnerRef: components["schemas"]["WorkspaceAppOwnerRef"] | components["schemas"]["ParticipantAppOwnerRef"];
+        WorkspaceAppInstallRequest: {
+            owner: components["schemas"]["WorkspaceAppOwnerRef"];
+            app_id: components["schemas"]["AppId"];
+            operation_id?: components["schemas"]["UUIDv4"];
+        };
+        ParticipantAppInstallRequest: {
+            owner: components["schemas"]["ParticipantAppOwnerRef"];
+            app_id: components["schemas"]["AppId"];
+            operation_id: components["schemas"]["UUIDv4"];
+        };
+        /** @description Strict owner-discriminated install intent. Participant installs require a durable UUIDv4 operation identity; Workspace installs may omit it for the legacy flow. */
+        AppInstallRequest: components["schemas"]["WorkspaceAppInstallRequest"] | components["schemas"]["ParticipantAppInstallRequest"];
         AppDescriptor: {
             app_id: components["schemas"]["AppId"];
             display_name: string;
@@ -567,6 +589,10 @@ export interface components {
          * @description positive canonical decimal lifecycle authority epoch; encoded as a string to preserve it losslessly in JavaScript
          */
         AppInstallationAuthorityEpoch: string;
+        AppInstallationStateRequest: {
+            state: components["schemas"]["AppInstallationState"];
+            expected_authority_epoch?: components["schemas"]["AppInstallationAuthorityEpoch"];
+        };
         AppInstallation: {
             installation_id: components["schemas"]["UUIDv7"];
             owner: components["schemas"]["AppOwnerRef"];
@@ -1867,10 +1893,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": {
-                    owner: components["schemas"]["AppOwnerRef"];
-                    app_id: components["schemas"]["AppId"];
-                };
+                "application/json": components["schemas"]["AppInstallRequest"];
             };
         };
         responses: {
@@ -1907,9 +1930,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": {
-                    state: components["schemas"]["AppInstallationState"];
-                };
+                "application/json": components["schemas"]["AppInstallationStateRequest"];
             };
         };
         responses: {

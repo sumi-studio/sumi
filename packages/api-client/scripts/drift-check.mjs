@@ -47,6 +47,7 @@ try {
   }
 
   const agentEvents = readFileSync(join(tmp, "agent-events.d.ts"), "utf8");
+  const schemaTypes = readFileSync(join(tmp, "schema.d.ts"), "utf8");
   const envelopeMatch = agentEvents.match(/export type Envelope = ([^;]+);/s);
   if (!envelopeMatch || envelopeMatch[1].includes("[k: string]")) {
     failed = true;
@@ -63,6 +64,57 @@ try {
     }
   }
 
+  const lifecycleTypeAssertions = [
+    {
+      component: "WorkspaceAppInstallRequest",
+      pattern: /operation_id\?: components\["schemas"\]\["UUIDv4"\];/,
+      message:
+        "Workspace install operation_id must remain an optional canonical UUIDv4 in generated types.",
+    },
+    {
+      component: "ParticipantAppInstallRequest",
+      pattern: /operation_id: components\["schemas"\]\["UUIDv4"\];/,
+      message:
+        "Participant install operation_id must remain a required canonical UUIDv4 in generated types.",
+    },
+    {
+      component: "AppInstallRequest",
+      pattern: /WorkspaceAppInstallRequest[^\n]+ParticipantAppInstallRequest/,
+      message:
+        "Generated install request must remain an owner-discriminated Workspace/Participant union.",
+    },
+    {
+      component: "AppInstallationStateRequest",
+      pattern:
+        /expected_authority_epoch\?: components\["schemas"\]\["AppInstallationAuthorityEpoch"\];/,
+      message:
+        "State mutation expected_authority_epoch must remain optional and lossless in generated types.",
+    },
+  ];
+  for (const { component, pattern, message } of lifecycleTypeAssertions) {
+    const definition = generatedSchemaComponent(schemaTypes, component);
+    if (definition === undefined || !pattern.test(definition)) {
+      failed = true;
+      console.error(message);
+    }
+  }
+
+  for (const [operation, requestComponent] of [
+    ["installApp", "AppInstallRequest"],
+    ["setAppInstallationState", "AppInstallationStateRequest"],
+  ]) {
+    const definition = generatedOperation(schemaTypes, operation);
+    if (
+      definition === undefined ||
+      !definition.includes(`components["schemas"]["${requestComponent}"]`)
+    ) {
+      failed = true;
+      console.error(
+        `Generated ${operation} operation must use ${requestComponent} as its canonical request body.`,
+      );
+    }
+  }
+
   if (failed) {
     process.exit(1);
   }
@@ -74,4 +126,24 @@ try {
 
 function hash(s) {
   return createHash("sha256").update(s).digest("hex");
+}
+
+function generatedSchemaComponent(text, name) {
+  return generatedBlock(text, `        ${name}:`, "        ");
+}
+
+function generatedOperation(text, name) {
+  return generatedBlock(text, `    ${name}:`, "    ");
+}
+
+function generatedBlock(text, marker, indentation) {
+  const start = text.indexOf(marker);
+  if (start === -1) return undefined;
+  const remainder = text.slice(start + marker.length);
+  const nextLine = remainder.match(new RegExp(`^${indentation}\\S`, "m"));
+  const end =
+    nextLine?.index === undefined
+      ? text.length
+      : start + marker.length + nextLine.index;
+  return text.slice(start, end);
 }
