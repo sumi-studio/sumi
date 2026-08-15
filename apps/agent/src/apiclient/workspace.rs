@@ -12,6 +12,12 @@ pub(crate) struct WorkspaceSummary {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceListPage {
+    pub workspaces: Vec<WorkspaceSummary>,
+    pub next_cursor: Option<String>,
+}
+
 /// Sanitized local-control failure classes. None of these variants contains
 /// request or response bodies or transport credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -38,7 +44,9 @@ pub(crate) type WorkspaceApiResult<T> = Result<T, WorkspaceApiError>;
 
 #[async_trait]
 pub(crate) trait WorkspaceApi: Send + Sync + 'static {
-    /// Return every active Sumi Workspace membership for the authenticated
-    /// actor. An empty list is valid; it never creates or selects a Workspace.
-    async fn list_memberships(&self) -> WorkspaceApiResult<Vec<WorkspaceSummary>>;
+    /// Return one bounded page of active Sumi Workspace memberships for the
+    /// authenticated actor. The cursor is opaque ordering state, not actor or
+    /// Workspace authority. An empty page is valid.
+    async fn list_memberships(&self, cursor: Option<&str>)
+    -> WorkspaceApiResult<WorkspaceListPage>;
 }

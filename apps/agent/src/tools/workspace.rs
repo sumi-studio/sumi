@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::apiclient::workspace::{WorkspaceApi, WorkspaceApiError, WorkspaceSummary};
+use crate::apiclient::workspace::{
+    WorkspaceApi, WorkspaceApiError, WorkspaceListPage, WorkspaceSummary,
+};
 use crate::provider::types::{ToolDefinition, UserContent};
 
 use super::{
@@ -22,10 +24,14 @@ use super::{
 const LIST_TOOL_NAME: &str = "workspace_list";
 const LIST_ADAPTER_ID: &str = "sumi.workspace.list";
 const LIST_ADAPTER_VERSION: u32 = 1;
+const LIST_CURSOR_BYTES: usize = 76;
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct EmptyArguments {}
+struct ListArguments {
+    #[serde(default)]
+    cursor: Option<String>,
+}
 
 pub(crate) struct WorkspaceListTool {
     api: Arc<dyn WorkspaceApi>,
@@ -38,14 +44,15 @@ impl WorkspaceListTool {
 
     async fn execute_list(
         &self,
+        arguments: &ListArguments,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let workspaces = tokio::select! {
+        let page = tokio::select! {
             _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-            result = self.api.list_memberships() => result,
+            result = self.api.list_memberships(arguments.cursor.as_deref()) => result,
         }
         .map_err(map_list_error)?;
-        render_workspace_list(workspaces)
+        render_workspace_list(page)
     }
 }
 
@@ -56,13 +63,22 @@ impl Tool for WorkspaceListTool {
             name: LIST_TOOL_NAME.to_owned(),
             description: concat!(
                 "List the Sumi Workspaces where you currently have an active membership. ",
-                "Returns canonical Workspace IDs and names. An empty result is valid. This ",
+                "Returns one bounded page of canonical Workspace IDs and names. An empty ",
+                "page is valid. If next_cursor is present, call again with that exact opaque ",
+                "cursor to continue. This ",
                 "does not choose a current/default Workspace or install or enable anything."
             )
             .to_owned(),
             parameters: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "cursor": {
+                        "type": "string",
+                        "description": "Opaque next_cursor returned by an earlier workspace_list page.",
+                        "minLength": LIST_CURSOR_BYTES,
+                        "maxLength": LIST_CURSOR_BYTES
+                    }
+                },
                 "additionalProperties": false
             }),
         }
@@ -77,8 +93,10 @@ impl Tool for WorkspaceListTool {
     }
 
     async fn execute(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
-        decode_empty(ctx.args.as_object()).map_err(|_| ToolError::InvalidArguments)?;
-        self.execute_list(&ctx.cancel).await
+        let arguments =
+            decode_list(ctx.args.as_object()).map_err(|_| ToolError::InvalidArguments)?;
+        validate_list_arguments(&arguments).map_err(|_| ToolError::InvalidArguments)?;
+        self.execute_list(&arguments, &ctx.cancel).await
     }
 }
 
@@ -90,42 +108,74 @@ impl BoundToolAdapter for WorkspaceListTool {
     }
 
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
-        decode_empty(ctx.args.as_object()).map_err(|_| DescribeError::InvalidArguments)?;
+        let arguments =
+            decode_list(ctx.args.as_object()).map_err(|_| DescribeError::InvalidArguments)?;
+        validate_list_arguments(&arguments).map_err(|_| DescribeError::InvalidArguments)?;
+        let execution_arguments = list_execution_arguments(&arguments);
+        let mut review = json!({
+            "operation": "list_memberships",
+            "actor": "self",
+            "membership_state": "active"
+        });
+        if let Some(cursor) = &arguments.cursor {
+            review
+                .as_object_mut()
+                .expect("static review projection is an object")
+                .insert("cursor".to_owned(), Value::String(cursor.clone()));
+        }
         Ok(ToolBinding::new(
             AppActionDescriptor::new(
                 "list_memberships",
                 CapabilityClass::Read,
                 vec![ResourceScope::collection("workspace", "membership")],
             )?,
-            ReviewProjection::from_value(json!({
-                "operation": "list_memberships",
-                "actor": "self",
-                "membership_state": "active"
-            }))?,
-            BoundExecutionArguments::from_value(json!({}))?,
+            ReviewProjection::from_value(review)?,
+            BoundExecutionArguments::from_value(execution_arguments)?,
         ))
     }
 
     async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError> {
-        decode_empty(ctx.args.as_object()).map_err(|_| ToolError::InvalidArguments)?;
+        let arguments =
+            decode_list(ctx.args.as_object()).map_err(|_| ToolError::InvalidArguments)?;
+        validate_list_arguments(&arguments).map_err(|_| ToolError::InvalidArguments)?;
         Ok(BoundToolExecutionOutcome::without_live_post_commit(
-            self.execute_list(&ctx.cancel).await?,
+            self.execute_list(&arguments, &ctx.cancel).await?,
         ))
     }
 }
 
-fn decode_empty(arguments: &Map<String, Value>) -> Result<EmptyArguments, serde_json::Error> {
+fn decode_list(arguments: &Map<String, Value>) -> Result<ListArguments, serde_json::Error> {
     serde_json::from_value(Value::Object(arguments.clone()))
+}
+
+fn validate_list_arguments(arguments: &ListArguments) -> Result<(), ()> {
+    if arguments.cursor.as_deref().is_some_and(|cursor| {
+        cursor.len() != LIST_CURSOR_BYTES
+            || !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    }) {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn list_execution_arguments(arguments: &ListArguments) -> Value {
+    let mut value = Map::new();
+    if let Some(cursor) = &arguments.cursor {
+        value.insert("cursor".to_owned(), Value::String(cursor.clone()));
+    }
+    Value::Object(value)
 }
 
 fn map_list_error(error: WorkspaceApiError) -> ToolError {
     match error {
-        WorkspaceApiError::InvalidRequest
-        | WorkspaceApiError::NotFound
-        | WorkspaceApiError::Conflict
-        | WorkspaceApiError::Protocol => ToolError::Protocol(
-            "Workspace membership list response violated its typed contract".to_owned(),
-        ),
+        WorkspaceApiError::InvalidRequest => ToolError::InvalidArguments,
+        WorkspaceApiError::NotFound | WorkspaceApiError::Conflict | WorkspaceApiError::Protocol => {
+            ToolError::Protocol(
+                "Workspace membership list response violated its typed contract".to_owned(),
+            )
+        }
         WorkspaceApiError::Unauthenticated | WorkspaceApiError::Forbidden => {
             ToolError::Rpc("Workspace membership list authorization was rejected".to_owned())
         }
@@ -135,9 +185,9 @@ fn map_list_error(error: WorkspaceApiError) -> ToolError {
     }
 }
 
-fn render_workspace_list(workspaces: Vec<WorkspaceSummary>) -> Result<ToolOutput, ToolError> {
-    let value = json!({
-        "workspaces": workspaces
+fn render_workspace_list(page: WorkspaceListPage) -> Result<ToolOutput, ToolError> {
+    let mut value = json!({
+        "workspaces": page.workspaces
             .into_iter()
             .map(|workspace| json!({
                 "workspace_id": workspace.workspace_id,
@@ -145,6 +195,12 @@ fn render_workspace_list(workspaces: Vec<WorkspaceSummary>) -> Result<ToolOutput
             }))
             .collect::<Vec<_>>()
     });
+    if let Some(cursor) = page.next_cursor {
+        value
+            .as_object_mut()
+            .expect("static Workspace page output is an object")
+            .insert("next_cursor".to_owned(), Value::String(cursor));
+    }
     let text = serde_json::to_string_pretty(&value)
         .map_err(|error| ToolError::Protocol(error.to_string()))?;
     Ok(ToolOutput {
@@ -156,7 +212,10 @@ fn render_workspace_list(workspaces: Vec<WorkspaceSummary>) -> Result<ToolOutput
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use tokio_util::sync::CancellationToken;
 
@@ -166,17 +225,31 @@ mod tests {
     use crate::tools::WorkspacePaths;
 
     const WORKSPACE_ID: &str = "0198f0f4-9b72-7000-8000-000000000011";
+    const CURSOR: &str =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     struct FakeWorkspaceApi {
         calls: AtomicUsize,
-        result: WorkspaceApiResult<Vec<WorkspaceSummary>>,
+        cursors: Mutex<Vec<Option<String>>>,
+        result: WorkspaceApiResult<WorkspaceListPage>,
     }
 
     #[async_trait]
     impl WorkspaceApi for FakeWorkspaceApi {
-        async fn list_memberships(&self) -> WorkspaceApiResult<Vec<WorkspaceSummary>> {
+        async fn list_memberships(
+            &self,
+            cursor: Option<&str>,
+        ) -> WorkspaceApiResult<WorkspaceListPage> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.cursors.lock().unwrap().push(cursor.map(str::to_owned));
             self.result.clone()
+        }
+    }
+
+    fn page(workspaces: Vec<WorkspaceSummary>, next_cursor: Option<&str>) -> WorkspaceListPage {
+        WorkspaceListPage {
+            workspaces,
+            next_cursor: next_cursor.map(str::to_owned),
         }
     }
 
@@ -192,10 +265,14 @@ mod tests {
     async fn list_binding_is_read_only_side_effect_free_and_has_no_actor_argument() {
         let api = Arc::new(FakeWorkspaceApi {
             calls: AtomicUsize::new(0),
-            result: Ok(vec![WorkspaceSummary {
-                workspace_id: WORKSPACE_ID.to_owned(),
-                name: "Canonical team".to_owned(),
-            }]),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(
+                vec![WorkspaceSummary {
+                    workspace_id: WORKSPACE_ID.to_owned(),
+                    name: "Canonical team".to_owned(),
+                }],
+                None,
+            )),
         });
         let tool = WorkspaceListTool::new(api.clone());
         let args = arguments(json!({}));
@@ -204,11 +281,13 @@ mod tests {
         let definition = tool.def();
         assert_eq!(definition.name, "workspace_list");
         assert_eq!(tool.risk(), ToolRisk::ReadOnly);
-        assert!(
+        assert_eq!(
             definition.parameters["properties"]
                 .as_object()
                 .unwrap()
-                .is_empty()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["cursor"]
         );
 
         let binding = BoundToolAdapter::bind(
@@ -246,6 +325,7 @@ mod tests {
         .expect("execute exact list");
 
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*api.cursors.lock().unwrap(), vec![None]);
         assert_eq!(
             outcome.output.details["workspaces"][0]["workspace_id"],
             WORKSPACE_ID
@@ -268,7 +348,8 @@ mod tests {
     async fn list_accepts_empty_membership_set_without_creating_a_default() {
         let api = Arc::new(FakeWorkspaceApi {
             calls: AtomicUsize::new(0),
-            result: Ok(Vec::new()),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(Vec::new(), None)),
         });
         let tool = WorkspaceListTool::new(api.clone());
         let args = arguments(json!({}));
@@ -296,7 +377,8 @@ mod tests {
     async fn list_rejects_every_model_supplied_identity_or_scope_field() {
         let api = Arc::new(FakeWorkspaceApi {
             calls: AtomicUsize::new(0),
-            result: Ok(Vec::new()),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(Vec::new(), None)),
         });
         let tool = WorkspaceListTool::new(api.clone());
         let args = arguments(json!({
@@ -321,5 +403,128 @@ mod tests {
 
         assert!(matches!(error, ToolError::InvalidArguments));
         assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn list_seals_the_exact_optional_cursor_for_review_and_execution() {
+        let api = Arc::new(FakeWorkspaceApi {
+            calls: AtomicUsize::new(0),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(Vec::new(), Some(CURSOR))),
+        });
+        let tool = WorkspaceListTool::new(api.clone());
+        let args = arguments(json!({"cursor": CURSOR}));
+        let workspace = workspace_paths();
+
+        let binding = BoundToolAdapter::bind(
+            &tool,
+            ToolBindCtx {
+                args: &args,
+                workspace: &workspace,
+            },
+        )
+        .await
+        .expect("bind cursor page");
+
+        assert_eq!(binding.review_projection.as_object()["cursor"], CURSOR);
+        assert_eq!(binding.execution_arguments.as_object()["cursor"], CURSOR);
+        let outcome = BoundToolAdapter::execute(
+            &tool,
+            BoundToolCtx {
+                flow_id: "flow-page",
+                call_id: "call-page",
+                args: &binding.execution_arguments,
+                cancel: CancellationToken::new(),
+                on_update: Arc::new(|_| {}),
+                workspace: &workspace,
+            },
+        )
+        .await
+        .expect("execute cursor page");
+
+        assert_eq!(*api.cursors.lock().unwrap(), vec![Some(CURSOR.to_owned())]);
+        assert_eq!(outcome.output.details["next_cursor"], CURSOR);
+    }
+
+    #[tokio::test]
+    async fn list_rejects_invalid_cursor_shape_before_api_io() {
+        let api = Arc::new(FakeWorkspaceApi {
+            calls: AtomicUsize::new(0),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(Vec::new(), None)),
+        });
+        let tool = WorkspaceListTool::new(api.clone());
+        let workspace = workspace_paths();
+
+        for value in ["short".to_owned(), format!("{}!", &CURSOR[..75])] {
+            let args = arguments(json!({"cursor": value}));
+            let error = Tool::execute(
+                &tool,
+                ToolCtx {
+                    flow_id: "flow-invalid-cursor",
+                    call_id: "call-invalid-cursor",
+                    args: &args,
+                    cancel: CancellationToken::new(),
+                    on_update: Arc::new(|_| {}),
+                    workspace: &workspace,
+                },
+            )
+            .await
+            .expect_err("invalid cursor must fail before API I/O");
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn server_cursor_rejection_is_invalid_model_input() {
+        let api = Arc::new(FakeWorkspaceApi {
+            calls: AtomicUsize::new(0),
+            cursors: Mutex::new(Vec::new()),
+            result: Err(WorkspaceApiError::InvalidRequest),
+        });
+        let tool = WorkspaceListTool::new(api.clone());
+        let args = arguments(json!({"cursor": CURSOR}));
+        let workspace = workspace_paths();
+
+        let error = Tool::execute(
+            &tool,
+            ToolCtx {
+                flow_id: "flow-tampered-cursor",
+                call_id: "call-tampered-cursor",
+                args: &args,
+                cancel: CancellationToken::new(),
+                on_update: Arc::new(|_| {}),
+                workspace: &workspace,
+            },
+        )
+        .await
+        .expect_err("server-rejected cursor is invalid input");
+
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn maximum_page_stays_below_the_local_control_output_budget() {
+        let workspaces = (0..32)
+            .map(|index| WorkspaceSummary {
+                workspace_id: format!("0198f0f4-9b72-7000-8000-{index:012x}"),
+                // A control rune takes serde_json's longest six-byte escape.
+                name: "\u{1}".repeat(200),
+            })
+            .collect();
+        let output = render_workspace_list(page(workspaces, Some(CURSOR)))
+            .expect("render maximum Workspace page");
+        let UserContent::Text { text } = &output.content[0] else {
+            panic!("Workspace page output must be text");
+        };
+        assert!(
+            text.len() < 64 * 1024,
+            "rendered page was {} bytes",
+            text.len()
+        );
+        assert_eq!(output.details["workspaces"].as_array().unwrap().len(), 32);
+        assert_eq!(output.details["next_cursor"], CURSOR);
     }
 }

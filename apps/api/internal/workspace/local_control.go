@@ -1,10 +1,28 @@
 package workspace
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"net/http"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
+)
+
+const (
+	workspaceListCursorVersion      = byte(1)
+	workspaceListCursorPayloadBytes = 1 + 8 + 16
+	workspaceListCursorMACBytes     = sha256.Size
+	workspaceListCursorBytes        = workspaceListCursorPayloadBytes + workspaceListCursorMACBytes
+	// Raw base64url of the fixed 57-byte payload and MAC is exactly 76 bytes.
+	workspaceListCursorEncodedBytes = 76
+	localWorkspaceListResponseBytes = 64 * 1024
+	workspaceListCursorDomain       = "sumi-workspace-list-cursor-v1\x00"
 )
 
 const (
@@ -78,22 +96,117 @@ func localActor(authorization agentevents.LocalRuntimeAuthorization) participant
 }
 
 func (s *Server) localWorkspaces(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
-	var request struct{}
+	var request struct {
+		// RawMessage distinguishes an omitted cursor from JSON null. The public
+		// contract accepts only an optional string, never a nullable field.
+		Cursor json.RawMessage `json:"cursor"`
+	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
-	items, err := s.Store.WorkspacesFor(r.Context(), localActor(authorization))
+	var after *workspaceListCursorPosition
+	if request.Cursor != nil {
+		var rawCursor string
+		if err := json.Unmarshal(request.Cursor, &rawCursor); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		var err error
+		after, err = decodeWorkspaceListCursor(rawCursor, authorization)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+	}
+	page, err := s.Store.workspacePageFor(r.Context(), localActor(authorization), after)
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	wires := make([]workspaceWire, len(items))
-	for i, item := range items {
-		wires[i] = workspaceToWire(item)
+	wires := make([]workspaceWire, len(page.Items))
+	for i, item := range page.Items {
+		wires[i] = workspaceToWire(item.Workspace)
+	}
+	var nextCursor *string
+	if page.HasMore {
+		encoded, encodeErr := encodeWorkspaceListCursor(
+			page.Items[len(page.Items)-1].Position,
+			authorization,
+		)
+		if encodeErr != nil {
+			writeDomainError(w, encodeErr)
+			return
+		}
+		nextCursor = &encoded
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Workspaces []workspaceWire `json:"workspaces"`
-	}{Workspaces: wires})
+		NextCursor *string         `json:"next_cursor,omitempty"`
+	}{Workspaces: wires, NextCursor: nextCursor})
+}
+
+func encodeWorkspaceListCursor(
+	position workspaceListCursorPosition,
+	authorization agentevents.LocalRuntimeAuthorization,
+) (string, error) {
+	if len(authorization.BearerToken) < 32 || !isCanonicalUUIDv7(position.WorkspaceMemberID) {
+		return "", ErrInvalidWorkspaceListCursor
+	}
+	membershipID, err := uuid.Parse(position.WorkspaceMemberID)
+	if err != nil {
+		return "", ErrInvalidWorkspaceListCursor
+	}
+	payload := make([]byte, workspaceListCursorPayloadBytes)
+	payload[0] = workspaceListCursorVersion
+	binary.BigEndian.PutUint64(payload[1:9], uint64(position.JoinedAt.UTC().UnixMicro()))
+	copy(payload[9:], membershipID[:])
+
+	mac := workspaceListCursorMAC(authorization, payload)
+	wire := make([]byte, 0, workspaceListCursorBytes)
+	wire = append(wire, payload...)
+	wire = append(wire, mac...)
+	return base64.RawURLEncoding.EncodeToString(wire), nil
+}
+
+func decodeWorkspaceListCursor(
+	raw string,
+	authorization agentevents.LocalRuntimeAuthorization,
+) (*workspaceListCursorPosition, error) {
+	if len(authorization.BearerToken) < 32 || len(raw) != workspaceListCursorEncodedBytes {
+		return nil, ErrInvalidWorkspaceListCursor
+	}
+	wire, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || len(wire) != workspaceListCursorBytes {
+		return nil, ErrInvalidWorkspaceListCursor
+	}
+	payload := wire[:workspaceListCursorPayloadBytes]
+	wantMAC := workspaceListCursorMAC(authorization, payload)
+	if !hmac.Equal(wire[workspaceListCursorPayloadBytes:], wantMAC) {
+		return nil, ErrInvalidWorkspaceListCursor
+	}
+	if payload[0] != workspaceListCursorVersion {
+		return nil, ErrInvalidWorkspaceListCursor
+	}
+	membershipID, err := uuid.FromBytes(payload[9:])
+	if err != nil || membershipID.Version() != 7 || membershipID.Variant() != uuid.RFC4122 {
+		return nil, ErrInvalidWorkspaceListCursor
+	}
+	return &workspaceListCursorPosition{
+		JoinedAt:          time.UnixMicro(int64(binary.BigEndian.Uint64(payload[1:9]))).UTC(),
+		WorkspaceMemberID: membershipID.String(),
+	}, nil
+}
+
+func workspaceListCursorMAC(
+	authorization agentevents.LocalRuntimeAuthorization,
+	payload []byte,
+) []byte {
+	mac := hmac.New(sha256.New, []byte(authorization.BearerToken))
+	_, _ = mac.Write([]byte(workspaceListCursorDomain))
+	_, _ = mac.Write([]byte(authorization.PersonalityAgentID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(payload)
+	return mac.Sum(nil)
 }
 
 func (s *Server) localCreateWorkspace(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
