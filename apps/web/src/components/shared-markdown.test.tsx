@@ -227,6 +227,33 @@ describe("@sumi/ui CompactMessageResponse", () => {
   });
 
   it.each([
+    ["Price $5, formula:$x$", "Price $5, formula:", "x"],
+    ["Price $5,formula:$x$", "Price $5,formula:", "x"],
+    ["価格は$5、式は$x+1$", "価格は$5、式は", "x+1"],
+  ])("re-synchronizes a currency opener before adjacent math: %s", (source, expectedText, expectedTex) => {
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    expect(container).toHaveTextContent(expectedText);
+    expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent(expectedTex);
+  });
+
+  it("does not re-synchronize a valid numeric formula followed by adjacent prose", () => {
+    const { container } = render(
+      <CompactMessageResponse>{"result $5+x$then $y$"}</CompactMessageResponse>,
+    );
+
+    const annotations = [
+      ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
+    ].map((annotation) => annotation.textContent);
+    expect(annotations).toEqual(["5+x", "y"]);
+  });
+
+  it.each([
     "価格は $5、式は $x+1$",
     "$5 **bold** $x+1$",
     "$5 [link](https://example.com) $x+1$",
@@ -275,6 +302,76 @@ describe("@sumi/ui CompactMessageResponse", () => {
       ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
     ].map((annotation) => annotation.textContent);
     expect(annotations).toEqual(expected);
+  });
+
+  it.each([
+    ["0085", "\u0085"],
+    ["00A0", "\u00a0"],
+    ["1680", "\u1680"],
+    ["202F", "\u202f"],
+    ["3000", "\u3000"],
+  ])("treats Unicode whitespace U+%s as a delimiter boundary", (_, space) => {
+    const source = `opening $${space}x$ and closing $x${space}$; later $y$`;
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    const annotations = [
+      ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
+    ].map((annotation) => annotation.textContent);
+    expect(annotations).toEqual(["y"]);
+    expect(container.textContent).toContain(`$${space}x$`);
+    expect(container.textContent).toContain(`$x${space}$`);
+  });
+
+  it("keeps escaped delimiters inert across a soft break", () => {
+    const source = `${String.raw`escaped \$x$`}\nlater $y$`;
+    const { container } = render(
+      <CompactMessageResponse>{source}</CompactMessageResponse>,
+    );
+
+    const annotations = [
+      ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
+    ].map((annotation) => annotation.textContent);
+    expect(annotations).toEqual(["y"]);
+    expect(container).toHaveTextContent("escaped $x$");
+    expect(container.querySelector("br")).not.toBeNull();
+  });
+
+  it("preserves TeX escapes from the Markdown source", () => {
+    const { container } = render(
+      <CompactMessageResponse>{String.raw`literal $a\_b$`}</CompactMessageResponse>,
+    );
+
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent(String.raw`a\_b`);
+    expect(container.querySelector("msub")).toBeNull();
+  });
+
+  it("keeps an escaped dollar inside TeX without treating it as a closer", () => {
+    const { container } = render(
+      <CompactMessageResponse>
+        {String.raw`literal $x+\$5$ then $y$`}
+      </CompactMessageResponse>,
+    );
+
+    const annotations = [
+      ...container.querySelectorAll('annotation[encoding="application/x-tex"]'),
+    ].map((annotation) => annotation.textContent);
+    expect(annotations).toEqual([String.raw`x+\$5`, "y"]);
+  });
+
+  it("uses backslash parity when deciding whether a dollar is escaped", () => {
+    const { container } = render(
+      <CompactMessageResponse>{String.raw`prefix \\$x$`}</CompactMessageResponse>,
+    );
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(
+      container.querySelector('annotation[encoding="application/x-tex"]'),
+    ).toHaveTextContent("x");
+    expect(container).toHaveTextContent("prefix \\");
   });
 
   it("respects escaped delimiters and leaves unclosed math readable", () => {
@@ -396,6 +493,7 @@ describe("@sumi/ui CompactMessageResponse", () => {
   it.each([
     ["$E=mc^2$", "E=mc^2"],
     [String.raw`$$\frac{1}{2}$$`, String.raw`\frac{1}{2}`],
+    [String.raw`$a\_b$`, String.raw`a\_b`],
   ])("copies one TeX source instead of duplicate KaTeX text: %s", (source, tex) => {
     const { container } = render(
       <CompactMessageResponse>{source}</CompactMessageResponse>,

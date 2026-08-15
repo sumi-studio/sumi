@@ -361,11 +361,12 @@ const STANDARD_REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [
   remarkGfm,
   remarkCjkFriendly,
   remarkCjkFriendlyGfmStrikethrough,
-  remarkBreaks,
   [remarkMath, REMARK_MATH_OPTIONS],
   // Single-dollar math is admitted only after native Markdown constructs have
-  // established safe plain-text boundaries.
+  // established safe plain-text boundaries, but before line-break transforms
+  // discard the source positions needed to distinguish escaped dollars.
   remarkSafeSingleDollar,
+  remarkBreaks,
   remarkCompactMath,
 ];
 

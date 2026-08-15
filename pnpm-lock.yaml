@@ -191,26 +191,14 @@ importers:
         specifier: ^2.1.1
         version: 2.1.1
       katex:
-        specifier: ^0.17.0
-        version: 0.17.0
+        specifier: 0.16.47
+        version: 0.16.47
       lucide-react:
         specifier: ^1.24.0
         version: 1.27.0(react@19.2.7)
       micromark:
         specifier: ^4.0.2
         version: 4.0.2(supports-color@10.2.2)
-      micromark-extension-math:
-        specifier: ^3.1.0
-        version: 3.1.0
-      micromark-util-character:
-        specifier: ^2.1.1
-        version: 2.1.1
-      micromark-util-symbol:
-        specifier: ^2.0.1
-        version: 2.0.1
-      micromark-util-types:
-        specifier: ^2.0.2
-        version: 2.0.2
       react:
         specifier: ^19.2.7
         version: 19.2.7
@@ -250,9 +238,6 @@ importers:
       tw-animate-css:
         specifier: ^1.4.0
         version: 1.4.0
-      unified:
-        specifier: ^11.0.5
-        version: 11.0.5
     devDependencies:
       '@sumi/typescript-config':
         specifier: workspace:*
@@ -2963,10 +2948,6 @@ packages:
 
   katex@0.16.47:
     resolution: {integrity: sha512-Eeo8Ys1doU1z+x8AZsPpQu+p/QcZBI5PeOo7QGQdy2x2m0MU/hYagBbGOmXwr5KVbEfVuWv9LpnQWeehogurjg==}
-    hasBin: true
-
-  katex@0.17.0:
-    resolution: {integrity: sha512-Vdw0ATsQ9V+LuegM/BTwQqV/6cTl5lbGcIrU+BCgLxyf6bo38ybOr372tuSIxir3CN720flu1meYR6XzNMwQnw==}
     hasBin: true
 
   khroma@2.1.0:
@@ -7224,10 +7205,6 @@ snapshots:
       graceful-fs: 4.2.11
 
   katex@0.16.47:
-    dependencies:
-      commander: 8.3.0
-
-  katex@0.17.0:
     dependencies:
       commander: 8.3.0
 

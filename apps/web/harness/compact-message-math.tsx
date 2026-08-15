@@ -13,6 +13,16 @@ function App() {
           {String.raw`$$\frac{1}{2}$$`}
         </CompactMessageResponse>
       </section>
+      <section id="copy-escaped-tex">
+        <CompactMessageResponse>
+          {String.raw`literal $a\_b$`}
+        </CompactMessageResponse>
+      </section>
+      <section id="currency-adjacent">
+        <CompactMessageResponse>
+          {"Price $5, formula:$x$"}
+        </CompactMessageResponse>
+      </section>
       <section id="copy-mixed">
         <CompactMessageResponse>
           {"Start $E=mc^2$ tail\nnext line\n\nSecond $\\frac{1}{2}$ end"}

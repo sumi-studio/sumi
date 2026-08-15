@@ -50,6 +50,24 @@ test("math stays locally scrollable and copies one TeX source", async ({
       .poll(() => page.evaluate(() => navigator.clipboard.readText()))
       .toBe(String.raw`\frac{1}{2}`);
 
+    await copyFormula(page, "#copy-escaped-tex [data-math-inline]");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(String.raw`a\_b`);
+
+    const adjacentCurrency = await page
+      .locator("#currency-adjacent")
+      .evaluate((message) => ({
+        text: message.textContent ?? "",
+        sources: [
+          ...message.querySelectorAll(
+            'annotation[encoding="application/x-tex"]',
+          ),
+        ].map((annotation) => annotation.textContent),
+      }));
+    expect(adjacentCurrency.text).toContain("Price $5, formula:");
+    expect(adjacentCurrency.sources).toEqual(["x"]);
+
     const mixed = String.raw`E=mc^2 tail
 next line
 Second \frac{1}{2}`;
