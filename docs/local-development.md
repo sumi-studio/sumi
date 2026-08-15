@@ -246,6 +246,22 @@ The Ready gate observes the integrity-protected local-control state produced
 after the runtime authenticates to the control plane and completes the
 executor Health exchange. Vite is not started if any earlier gate fails.
 
+The launcher also generates one ephemeral Ed25519 call-authority pair for the
+disposable generation. Only the private seed is passed to the runtime; only
+the corresponding public key is passed to the executor. Neither key is read
+from the developer env file, and the broker receives neither half. The
+production supervisor follows the same role split with allocator-owned,
+per-generation identities.
+
+The real-browser agent fixture goes beyond the Health gate. Its first provider
+request returns a Normal `list_dir` call, the built-in Normal policy
+deterministically allows that bounded read without invoking the external
+Execution AutoReviewer, and the post-COMMIT runtime permit is signed and
+verified by the executor. The next provider request must contain the exact
+directory result for a fixture-owned probe file before it returns the first
+assistant text; a third request then verifies that the second Human turn
+retained the complete tool/result and conversation context.
+
 Human credential-gated smoke:
 
 1. Sign in with the enabled Google or GitHub provider.
@@ -254,8 +270,9 @@ Human credential-gated smoke:
 4. Press Ctrl-C and confirm the API, relay, executor, runtime, and Vite stop.
 
 The automated checks validate configuration, proxying, identity equality,
-workspace propagation, and startup gates. They do not perform the final
-third-party Firebase/provider login and billing-bearing model request.
+workspace propagation, startup gates, and the local exact-call executor path.
+They do not perform the final third-party Firebase/provider login and
+billing-bearing model request.
 
 ## Disposable generation boundary
 

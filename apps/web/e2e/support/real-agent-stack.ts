@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { chmod, lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
@@ -26,6 +26,7 @@ export const firstUserMessage = "real browser turn one";
 export const secondUserMessage = "real browser turn two";
 export const firstProviderResponse = "real-agent-turn-one";
 export const secondProviderResponse = "real-agent-turn-two-context-ok";
+export const executorAuthorityProbeFile = "executor-authority-probe.txt";
 
 const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001";
 const realAgentHumanID = "0198f0f4-9b72-7000-8000-000000000002";
@@ -34,6 +35,8 @@ const generation = "7";
 const firebaseProjectID = "sumi-studio";
 const firebaseWebAPIKey = "sumi-direct-chat-e2e-public-key";
 const firebaseWebAppID = "1:000000000000:web:0000000000000000000000";
+const executorToolCallID = "call-real-agent-list-dir";
+const executorAuthorityProbeContents = "exact executor authority probe\n";
 
 export interface RealAgentBuild {
   directory: string;
@@ -57,6 +60,7 @@ export class LoopbackChatProvider {
   readonly requests: ProviderRequest[] = [];
   requestCount = 0;
   contextVerified = false;
+  executorToolVerified = false;
   url = "";
 
   private readonly apiKey: string;
@@ -124,15 +128,29 @@ export class LoopbackChatProvider {
         if (
           !hasExactConversation(messages, [
             { role: "user", text: firstUserMessage },
-          ])
+          ]) ||
+          !hasProviderTool(raw.tools, "list_dir")
         ) {
-          respondJSON(response, 422, { error: "turn_one_user_missing" });
+          respondJSON(response, 422, {
+            error: "turn_one_user_or_list_dir_missing",
+          });
           return;
         }
-        respondSSE(response, turn, firstProviderResponse);
+        respondToolCallSSE(response, turn);
         return;
       }
       if (turn === 2) {
+        if (!hasExactExecutorRoundTrip(messages)) {
+          respondJSON(response, 422, {
+            error: "exact_executor_result_missing",
+          });
+          return;
+        }
+        this.executorToolVerified = true;
+        respondSSE(response, turn, firstProviderResponse);
+        return;
+      }
+      if (turn === 3) {
         if (
           !hasExactConversation(messages, [
             { role: "user", text: firstUserMessage },
@@ -158,6 +176,76 @@ export class LoopbackChatProvider {
   }
 }
 
+class LoopbackReviewerProvider {
+  requestCount = 0;
+  url = "";
+
+  private readonly server = createServer((request, response) => {
+    void this.handle(request, response);
+  });
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly model: string,
+    private readonly responseText: string,
+    private readonly expectedResponseFormat: "json_schema" | "json_object",
+  ) {}
+
+  async start(): Promise<void> {
+    this.server.listen(0, "127.0.0.1");
+    await once(this.server, "listening");
+    const address = this.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("loopback reviewer did not expose a TCP address");
+    }
+    this.url = `http://127.0.0.1:${address.port}`;
+  }
+
+  async stop(): Promise<void> {
+    if (!this.server.listening) return;
+    const closed = once(this.server, "close");
+    this.server.close();
+    this.server.closeAllConnections();
+    await closed;
+  }
+
+  private async handle(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    try {
+      if (request.method !== "POST" || request.url !== "/chat/completions") {
+        respondJSON(response, 404, { error: "not_found" });
+        return;
+      }
+      if (request.headers.authorization !== `Bearer ${this.apiKey}`) {
+        respondJSON(response, 401, { error: "invalid_authorization" });
+        return;
+      }
+      const raw = await readBoundedJSON(request);
+      const responseFormat = raw.response_format;
+      if (
+        raw.stream !== true ||
+        raw.model !== this.model ||
+        !Array.isArray(raw.messages) ||
+        !isRecord(responseFormat) ||
+        responseFormat.type !== this.expectedResponseFormat
+      ) {
+        respondJSON(response, 422, { error: "invalid_reviewer_request" });
+        return;
+      }
+      this.requestCount++;
+      respondSSE(response, this.requestCount, this.responseText, this.model);
+    } catch {
+      if (!response.headersSent) {
+        respondJSON(response, 400, { error: "invalid_request" });
+      } else {
+        response.destroy();
+      }
+    }
+  }
+}
+
 export class RealAgentStack {
   readonly apiURL: string;
   readonly webURL: string;
@@ -166,7 +254,8 @@ export class RealAgentStack {
   private readonly runtimeDirectory: string;
   private readonly sessionCookie: string;
   private readonly children: ManagedProcess[];
-  private readonly reviewerProviders: LoopbackChatProvider[];
+  private readonly executionReviewerProvider: LoopbackReviewerProvider;
+  private readonly reviewerProviders: LoopbackReviewerProvider[];
   private stopped = false;
 
   constructor({
@@ -176,6 +265,7 @@ export class RealAgentStack {
     runtimeDirectory,
     sessionCookie,
     children,
+    executionReviewerProvider,
     reviewerProviders,
   }: {
     apiURL: string;
@@ -184,7 +274,8 @@ export class RealAgentStack {
     runtimeDirectory: string;
     sessionCookie: string;
     children: ManagedProcess[];
-    reviewerProviders: LoopbackChatProvider[];
+    executionReviewerProvider: LoopbackReviewerProvider;
+    reviewerProviders: LoopbackReviewerProvider[];
   }) {
     this.apiURL = apiURL;
     this.webURL = webURL;
@@ -192,7 +283,12 @@ export class RealAgentStack {
     this.runtimeDirectory = runtimeDirectory;
     this.sessionCookie = sessionCookie;
     this.children = children;
+    this.executionReviewerProvider = executionReviewerProvider;
     this.reviewerProviders = reviewerProviders;
+  }
+
+  get executionReviewCount(): number {
+    return this.executionReviewerProvider.requestCount;
   }
 
   async installSession(context: BrowserContext): Promise<void> {
@@ -217,6 +313,8 @@ export class RealAgentStack {
       [
         "Loopback provider:",
         `request_count=${this.provider.requestCount}`,
+        `executor_tool_verified=${this.provider.executorToolVerified}`,
+        `execution_review_count=${this.executionReviewCount}`,
         `context_verified=${this.provider.contextVerified}`,
       ].join("\n"),
     );
@@ -600,12 +698,27 @@ async function startRealAgentStackOnce(
   const providerApiKey = randomToken();
   const provider = new LoopbackChatProvider(providerApiKey);
   const executionReviewerApiKey = randomToken();
-  const executionReviewerProvider = new LoopbackChatProvider(
+  const executionReviewerProvider = new LoopbackReviewerProvider(
     executionReviewerApiKey,
+    "e2e-execution-reviewer",
+    JSON.stringify({
+      outcome: "allow",
+      risk: "low",
+      rationale: "bounded read-only workspace directory listing",
+    }),
+    "json_schema",
   );
   const escalationReviewerApiKey = randomToken();
-  const escalationReviewerProvider = new LoopbackChatProvider(
+  const escalationReviewerProvider = new LoopbackReviewerProvider(
     escalationReviewerApiKey,
+    "e2e-escalation-reviewer",
+    JSON.stringify({
+      outcome: "block",
+      risk: "low",
+      misunderstanding: null,
+      rationale: "unexpected elevated review",
+    }),
+    "json_object",
   );
   const reviewerProviders = [
     executionReviewerProvider,
@@ -625,6 +738,11 @@ async function startRealAgentStackOnce(
       ),
     );
     await Promise.all(Object.values(paths).map((path) => chmod(path, 0o700)));
+    await writeFile(
+      join(paths.workspace, executorAuthorityProbeFile),
+      executorAuthorityProbeContents,
+      { encoding: "utf8", mode: 0o600 },
+    );
 
     const executorServerUID = process.getuid?.();
     if (executorServerUID === undefined || executorServerUID === 0) {
@@ -652,6 +770,7 @@ async function startRealAgentStackOnce(
     const wrappingKey = randomBytes(32).toString("hex");
     const wrappingKeyID = `e2e-${randomIdentifier()}`;
     const executorSocket = join(paths.ipc, "executor.sock");
+    const executorAuthorityKeyPair = generateExecutorAuthorityKeyPair();
     const redactions = [
       agentTokenSecret,
       browserSessionSecret,
@@ -660,6 +779,7 @@ async function startRealAgentStackOnce(
       executionReviewerApiKey,
       escalationReviewerApiKey,
       wrappingKey,
+      executorAuthorityKeyPair.privateKeyHex,
       databaseURL,
     ];
     const baseEnvironment = environmentWithoutSumiConfiguration();
@@ -753,6 +873,8 @@ async function startRealAgentStackOnce(
         env: {
           ...baseEnvironment,
           ...commonIdentityEnvironment,
+          SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY:
+            executorAuthorityKeyPair.publicKeyHex,
           SUMI_WORKSPACE: paths.workspace,
           SUMI_EXECUTOR_SOCKET: executorSocket,
           SUMI_LOG: "sumi_agent=info",
@@ -772,6 +894,8 @@ async function startRealAgentStackOnce(
         env: {
           ...baseEnvironment,
           ...commonIdentityEnvironment,
+          SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY:
+            executorAuthorityKeyPair.privateKeyHex,
           SUMI_PROCESS_GENERATION_LEASE_ID: leaseID,
           SUMI_GENERATION_RECOVERY_FENCE_ID: fenceID,
           SUMI_STATE_DIR: paths.agentState,
@@ -853,6 +977,7 @@ async function startRealAgentStackOnce(
       runtimeDirectory,
       sessionCookie,
       children,
+      executionReviewerProvider,
       reviewerProviders,
     });
   } catch (error) {
@@ -1198,7 +1323,15 @@ function hasExactConversation(
     ) {
       return [];
     }
-    return [{ role: message.role, text: messageText(message.content) }];
+    const text = messageText(message.content);
+    if (
+      message.role === "assistant" &&
+      Array.isArray(message.tool_calls) &&
+      !text
+    ) {
+      return [];
+    }
+    return [{ role: message.role, text }];
   });
   if (conversation.length !== expected.length) return false;
   return expected.every(
@@ -1206,6 +1339,83 @@ function hasExactConversation(
       conversation[index]?.role === entry.role &&
       conversation[index]?.text === entry.text,
   );
+}
+
+function hasProviderTool(tools: unknown, name: string): boolean {
+  if (!Array.isArray(tools)) return false;
+  return tools.some((tool) => {
+    if (
+      !isRecord(tool) ||
+      tool.type !== "function" ||
+      !isRecord(tool.function)
+    ) {
+      return false;
+    }
+    const parameters = tool.function.parameters;
+    if (tool.function.name !== name || !isRecord(parameters)) return false;
+    const properties = parameters.properties;
+    if (!isRecord(properties)) return false;
+    const route = properties.route;
+    const input = properties.input;
+    return (
+      isRecord(route) &&
+      Array.isArray(route.enum) &&
+      route.enum.includes("normal") &&
+      isRecord(input)
+    );
+  });
+}
+
+function hasExactExecutorRoundTrip(messages: unknown[]): boolean {
+  const applicationMessages = messages.filter(
+    (message): message is Record<string, unknown> =>
+      isRecord(message) &&
+      (message.role === "user" ||
+        message.role === "assistant" ||
+        message.role === "tool"),
+  );
+  if (applicationMessages.length !== 3) return false;
+  const [user, assistant, toolResult] = applicationMessages;
+  if (
+    user?.role !== "user" ||
+    messageText(user.content) !== firstUserMessage ||
+    assistant?.role !== "assistant" ||
+    toolResult?.role !== "tool" ||
+    toolResult.tool_call_id !== executorToolCallID ||
+    toolResult.content !== executorAuthorityProbeFile
+  ) {
+    return false;
+  }
+  if (
+    !Array.isArray(assistant.tool_calls) ||
+    assistant.tool_calls.length !== 1
+  ) {
+    return false;
+  }
+  const toolCall = assistant.tool_calls[0];
+  if (
+    !isRecord(toolCall) ||
+    toolCall.id !== executorToolCallID ||
+    toolCall.type !== "function" ||
+    !isRecord(toolCall.function) ||
+    toolCall.function.name !== "list_dir" ||
+    typeof toolCall.function.arguments !== "string"
+  ) {
+    return false;
+  }
+  try {
+    const args: unknown = JSON.parse(toolCall.function.arguments);
+    return (
+      isRecord(args) &&
+      args.route === "normal" &&
+      isRecord(args.input) &&
+      args.input.path === "." &&
+      Object.keys(args).length === 2 &&
+      Object.keys(args.input).length === 1
+    );
+  } catch {
+    return false;
+  }
 }
 
 function messageText(content: unknown): string {
@@ -1227,6 +1437,7 @@ function respondSSE(
   response: ServerResponse,
   turn: number,
   text: string,
+  model = "kimi-k2.7-code",
 ): void {
   response.writeHead(200, {
     "cache-control": "no-store",
@@ -1236,7 +1447,7 @@ function respondSSE(
   response.write(
     `data: ${JSON.stringify({
       id,
-      model: "kimi-k2.7-code",
+      model,
       choices: [
         {
           index: 0,
@@ -1249,12 +1460,62 @@ function respondSSE(
   response.write(
     `data: ${JSON.stringify({
       id,
-      model: "kimi-k2.7-code",
+      model,
       choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
       usage: {
         prompt_tokens: turn * 10,
         completion_tokens: 4,
         total_tokens: turn * 10 + 4,
+      },
+    })}\n\n`,
+  );
+  response.end("data: [DONE]\n\n");
+}
+
+function respondToolCallSSE(response: ServerResponse, turn: number): void {
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    "content-type": "text/event-stream",
+  });
+  const id = `real-agent-e2e-${turn}`;
+  response.write(
+    `data: ${JSON.stringify({
+      id,
+      model: "kimi-k2.7-code",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: executorToolCallID,
+                type: "function",
+                function: {
+                  name: "list_dir",
+                  arguments: JSON.stringify({
+                    route: "normal",
+                    input: { path: "." },
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    })}\n\n`,
+  );
+  response.write(
+    `data: ${JSON.stringify({
+      id,
+      model: "kimi-k2.7-code",
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 4,
+        total_tokens: 14,
       },
     })}\n\n`,
   );
@@ -1275,6 +1536,47 @@ function respondJSON(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function generateExecutorAuthorityKeyPair(): {
+  privateKeyHex: string;
+  publicKeyHex: string;
+} {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const privateJwk = privateKey.export({ format: "jwk" });
+  const publicJwk = publicKey.export({ format: "jwk" });
+  if (
+    privateJwk.kty !== "OKP" ||
+    privateJwk.crv !== "Ed25519" ||
+    typeof privateJwk.d !== "string" ||
+    typeof privateJwk.x !== "string" ||
+    publicJwk.kty !== "OKP" ||
+    publicJwk.crv !== "Ed25519" ||
+    typeof publicJwk.x !== "string"
+  ) {
+    throw new Error("Node returned an invalid Ed25519 JWK pair");
+  }
+  const privateSeed = Buffer.from(privateJwk.d, "base64url");
+  const embeddedPublic = Buffer.from(privateJwk.x, "base64url");
+  const publicBytes = Buffer.from(publicJwk.x, "base64url");
+  try {
+    if (
+      privateSeed.length !== 32 ||
+      embeddedPublic.length !== 32 ||
+      publicBytes.length !== 32 ||
+      !embeddedPublic.equals(publicBytes)
+    ) {
+      throw new Error("Node returned a non-corresponding Ed25519 JWK pair");
+    }
+    return {
+      privateKeyHex: privateSeed.toString("hex"),
+      publicKeyHex: publicBytes.toString("hex"),
+    };
+  } finally {
+    privateSeed.fill(0);
+    embeddedPublic.fill(0);
+    publicBytes.fill(0);
+  }
 }
 
 function randomToken(): string {

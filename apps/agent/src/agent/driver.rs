@@ -584,7 +584,7 @@ impl RunDriver for InjectedRunDriver {
         let tool_name = authorized.tool_name().to_owned();
         let outcome = self
             .registry
-            .execute_bound(authorized.into_sealed(), cancel, on_update)
+            .execute_bound(authorized, cancel, on_update)
             .await?;
         Ok(BoundToolResult {
             result: ToolResultMessage {

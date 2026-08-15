@@ -12,6 +12,7 @@ use std::{
     process::{Child, Command, Output, Stdio},
 };
 
+use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use uuid::{Uuid, Variant, Version};
 
@@ -266,6 +267,39 @@ fn parse_identity(value: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn decode_lower_hex_32(value: &str) -> [u8; 32] {
+    assert_eq!(value.len(), 64, "authority key must be exactly 32 bytes");
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => panic!("authority key must be lowercase hex"),
+    };
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    decoded
+}
+
+fn assert_authority_pair(fixture: &Fixture) {
+    let runtime = fixture.identity("runtime");
+    let executor = fixture.identity("executor");
+    let broker = fixture.identity("broker");
+    let private_key = decode_lower_hex_32(&runtime["SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"]);
+    let public_key = decode_lower_hex_32(&executor["SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"]);
+    assert_eq!(
+        SigningKey::from_bytes(&private_key)
+            .verifying_key()
+            .to_bytes(),
+        public_key,
+        "runtime and Executor identities must carry one corresponding Ed25519 pair"
+    );
+    assert!(!runtime.contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"));
+    assert!(!executor.contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"));
+    assert!(!broker.contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"));
+    assert!(!broker.contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"));
+}
+
 fn successful_generation(output: &Output) -> u64 {
     assert!(
         output.status.success(),
@@ -305,15 +339,24 @@ fn concurrent_processes_issue_each_generation_exactly_once() {
         runtime["SUMI_RPC_GENERATION"],
         generations.last().unwrap().to_string()
     );
+    assert_eq!(
+        executor.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY",
+            "SUMI_PERSONALITY_AGENT_ID",
+            "SUMI_RPC_GENERATION",
+            "SUMI_RPC_NONCE",
+        ])
+    );
+    assert_eq!(
+        broker.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "SUMI_PERSONALITY_AGENT_ID",
+            "SUMI_RPC_GENERATION",
+            "SUMI_RPC_NONCE",
+        ])
+    );
     for sidecar in [&executor, &broker] {
-        assert_eq!(
-            sidecar.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "SUMI_PERSONALITY_AGENT_ID",
-                "SUMI_RPC_GENERATION",
-                "SUMI_RPC_NONCE",
-            ])
-        );
         for key in [
             "SUMI_PERSONALITY_AGENT_ID",
             "SUMI_RPC_GENERATION",
@@ -322,6 +365,7 @@ fn concurrent_processes_issue_each_generation_exactly_once() {
             assert_eq!(sidecar[key], runtime[key]);
         }
     }
+    assert_authority_pair(&fixture);
 }
 
 #[test]
@@ -333,6 +377,10 @@ fn restart_rotates_all_secrets_and_never_leaks_runtime_only_fields() {
     let second = fixture.identity("runtime");
 
     assert_ne!(first["SUMI_RPC_NONCE"], second["SUMI_RPC_NONCE"]);
+    assert_ne!(
+        first["SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"],
+        second["SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"]
+    );
     assert_ne!(
         first["SUMI_PROCESS_GENERATION_LEASE_ID"],
         second["SUMI_PROCESS_GENERATION_LEASE_ID"]
@@ -356,12 +404,20 @@ fn restart_rotates_all_secrets_and_never_leaks_runtime_only_fields() {
         second.keys().map(String::as_str).collect::<BTreeSet<_>>(),
         BTreeSet::from([
             "SUMI_GENERATION_RECOVERY_FENCE_ID",
+            "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY",
             "SUMI_PERSONALITY_AGENT_ID",
             "SUMI_PROCESS_GENERATION_LEASE_ID",
             "SUMI_RPC_GENERATION",
             "SUMI_RPC_NONCE",
         ])
     );
+    let executor = fixture.identity("executor");
+    assert_eq!(
+        executor["SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"].len(),
+        64
+    );
+    assert!(!executor.contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"));
+    assert_authority_pair(&fixture);
     for role in ["executor", "broker"] {
         let identity = fixture.identity(role);
         assert!(!identity.keys().any(|key| {
@@ -687,6 +743,7 @@ fn first_allocation_recovers_when_output_binding_precedes_ledger_commit() {
 
     assert_eq!(successful_generation(&fixture.allocate()), 0);
     fixture.assert_handoff();
+    assert_authority_pair(&fixture);
     assert_no_strict_temps(&fixture);
 }
 
@@ -742,6 +799,7 @@ fn sigkill_at_every_output_binding_stage_recovers_first_allocation() {
             assert_eq!(fixture.identity(role)["SUMI_RPC_GENERATION"], "0");
         }
         fixture.assert_handoff();
+        assert_authority_pair(&fixture);
         fixture.assert_output_binding_inodes();
         assert_no_strict_temps(&fixture);
         if let Some(expected_inode) = committed_binding_inode {
@@ -790,6 +848,7 @@ fn sigkill_at_every_ledger_and_role_write_stage_recovers_without_generation_reus
                 );
             }
             fixture.assert_handoff();
+            assert_authority_pair(&fixture);
             assert_no_strict_temps(&fixture);
         }
     }

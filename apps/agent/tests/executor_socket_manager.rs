@@ -4,10 +4,12 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -17,10 +19,12 @@ use tokio::{
 use uuid::Uuid;
 
 const GENERATION: u64 = 29;
+const RESTARTED_GENERATION: u64 = 30;
 const NONCE: &str = "executor-manager-boot-a";
 const RESTARTED_NONCE: &str = "executor-manager-boot-b";
 const PERSONALITY_AGENT_ID: &str = "018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e";
 const OTHER_PERSONALITY_AGENT_ID: &str = "018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6f";
+const CALL_AUTHORITY_KEY_ID: &str = "sumi.executor.call-authority.ed25519.v1";
 
 struct Fixture {
     root: PathBuf,
@@ -58,6 +62,9 @@ impl Fixture {
         let mut executor = self.executor.take().expect("executor is running");
         executor.kill().await.expect("kill executor");
         executor.wait().await.expect("wait executor");
+        // Production supervisor preparation removes the old generation's
+        // socket before activating newly allocated nonce/key material.
+        std::fs::remove_file(&self.executor_socket).expect("remove prior generation socket");
         self.start(nonce).await;
     }
 }
@@ -72,12 +79,14 @@ impl Drop for Fixture {
 }
 
 fn spawn_executor(workspace: &Path, executor_socket: &Path, nonce: &str) -> Child {
+    let public_key = signing_key(nonce).verifying_key().to_bytes();
     Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
         .arg("--tool-executor-socket")
         .env_clear()
         .env("SUMI_PERSONALITY_AGENT_ID", PERSONALITY_AGENT_ID)
-        .env("SUMI_RPC_GENERATION", GENERATION.to_string())
+        .env("SUMI_RPC_GENERATION", generation(nonce).to_string())
         .env("SUMI_RPC_NONCE", nonce)
+        .env("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY", hex(&public_key))
         .env("SUMI_WORKSPACE", workspace)
         .env("SUMI_EXECUTOR_SOCKET", executor_socket)
         .stdin(Stdio::null())
@@ -101,13 +110,113 @@ async fn wait_for_socket(socket: &Path) {
 }
 
 fn request(nonce: &str, request_id: &str, operation: Value) -> Value {
-    json!({
+    let call_authority = (operation["type"] != "health")
+        .then(|| signed_call_authority(nonce, request_id, &operation));
+    let mut request = json!({
         "personality_agent_id": PERSONALITY_AGENT_ID,
-        "generation": GENERATION,
+        "generation": generation(nonce),
         "nonce": nonce,
         "request_id": request_id,
         "operation": operation,
+    });
+    if let Some(call_authority) = call_authority {
+        request["call_authority"] = call_authority;
+    }
+    request
+}
+
+fn generation(nonce: &str) -> u64 {
+    if nonce == RESTARTED_NONCE {
+        RESTARTED_GENERATION
+    } else {
+        GENERATION
+    }
+}
+
+fn signing_key(nonce: &str) -> SigningKey {
+    let byte = if nonce == RESTARTED_NONCE { 9 } else { 7 };
+    SigningKey::from_bytes(&[byte; 32])
+}
+
+fn signed_call_authority(nonce: &str, request_id: &str, operation: &Value) -> Value {
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let claims = json!({
+        "version": 1,
+        "authority_id": Uuid::now_v7().hyphenated().to_string(),
+        "audience": "sumi.tool-executor.read.v1",
+        "generation": generation(nonce),
+        "boot_nonce_digest": domain_digest(b"sumi.executor.boot-nonce-digest.v1\0", nonce.as_bytes()),
+        "request_id": request_id,
+        "execution_id": operation["execution_id"].as_str().unwrap_or("control"),
+        "operation_digest": domain_digest(
+            b"sumi.executor.operation-digest.v1\0",
+            &serde_json::to_vec(operation).unwrap(),
+        ),
+        "permit": {
+            "grant_digest": domain_digest(
+                b"sumi.executor.test-grant.v1\0",
+                request_id.as_bytes(),
+            ),
+            "bound_evidence_digest": "11".repeat(32),
+            "action_digest": "33".repeat(32),
+            "authorization_projection_digest": "22".repeat(32),
+            "route": "normal",
+            "resolved_authority": "agent_own",
+        },
+        "issued_at_unix_ms": now,
+        "expires_at_unix_ms": now + 30_000,
+    });
+    let encoded = canonical_json(&json!({
+        "key_id": CALL_AUTHORITY_KEY_ID,
+        "claims": claims.clone(),
+    }));
+    let mut payload = b"sumi.executor.call-authority.signature.v1\0".to_vec();
+    payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    let signature = signing_key(nonce).sign(&payload);
+    json!({
+        "key_id": CALL_AUTHORITY_KEY_ID,
+        "claims": claims,
+        "signature": hex(&signature.to_bytes()),
     })
+}
+
+fn canonical_json(value: &Value) -> Vec<u8> {
+    fn normalize(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), normalize(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.iter().map(normalize).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_vec(&normalize(value)).unwrap()
+}
+
+fn domain_digest(domain: &[u8], value: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+    hex(&digest.finalize())
+}
+
+fn hex(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn read_file_request(nonce: &str, request_id: &str, execution_id: &str, path: &str) -> Value {
@@ -185,10 +294,10 @@ async fn production_manager_runs_concurrent_read_file_and_fences_identity() {
             .is_empty()
     );
     let duplicate_request = read_file_request(NONCE, "request-beta", "execution-new", "alpha.txt");
-    assert!(
-        exchange(&fixture.executor_socket, &duplicate_request)
-            .await
-            .is_empty()
+    let duplicate_request_frames = exchange(&fixture.executor_socket, &duplicate_request).await;
+    assert_eq!(
+        duplicate_request_frames[0]["result"]["Err"]["code"],
+        "executor_call_authority_replay"
     );
 
     for stale in [
@@ -215,6 +324,51 @@ async fn production_manager_runs_concurrent_read_file_and_fences_identity() {
 }
 
 #[tokio::test]
+async fn exact_call_authority_rejects_missing_tampered_and_effect_replay() {
+    let mut fixture = Fixture::new().await;
+    std::fs::write(fixture.workspace.join("alpha.txt"), "alpha").unwrap();
+    std::fs::write(fixture.workspace.join("beta.txt"), "beta").unwrap();
+    fixture.start(NONCE).await;
+
+    let authorized = read_file_request(
+        NONCE,
+        "authority-request",
+        "authority-execution",
+        "alpha.txt",
+    );
+    assert_eq!(
+        terminal_content(&exchange(&fixture.executor_socket, &authorized).await),
+        "alpha"
+    );
+    // Transport retry may retrieve the retained terminal, but cannot execute
+    // the operation a second time or widen the authority.
+    assert_eq!(
+        terminal_content(&exchange(&fixture.executor_socket, &authorized).await),
+        "alpha"
+    );
+
+    let mut missing = read_file_request(
+        NONCE,
+        "missing-authority",
+        "missing-authority-execution",
+        "alpha.txt",
+    );
+    missing.as_object_mut().unwrap().remove("call_authority");
+    let frames = exchange(&fixture.executor_socket, &missing).await;
+    assert_eq!(frames[0]["result"]["Err"]["code"], "protocol");
+
+    let mut widened = read_file_request(
+        NONCE,
+        "widened-authority",
+        "widened-authority-execution",
+        "alpha.txt",
+    );
+    widened["operation"]["path"] = json!("beta.txt");
+    let frames = exchange(&fixture.executor_socket, &widened).await;
+    assert_eq!(frames[0]["result"]["Err"]["code"], "protocol");
+}
+
+#[tokio::test]
 async fn manager_restart_rotates_nonce_and_rebinds_stale_socket() {
     let mut fixture = Fixture::new().await;
     std::fs::write(fixture.workspace.join("source.txt"), "source").unwrap();
@@ -235,9 +389,25 @@ async fn manager_restart_rotates_nonce_and_rebinds_stale_socket() {
         .unwrap();
     assert!(!status.success(), "a second manager stole the live socket");
 
+    let consumed_before_restart = read_file_request(
+        NONCE,
+        "request-consumed-before-restart",
+        "execution-consumed-before-restart",
+        "source.txt",
+    );
+    assert_eq!(
+        terminal_content(&exchange(&fixture.executor_socket, &consumed_before_restart).await),
+        "source"
+    );
+
     fixture.restart(RESTARTED_NONCE).await;
     let stale = read_file_request(NONCE, "request-stale", "execution-stale", "source.txt");
     assert!(exchange(&fixture.executor_socket, &stale).await.is_empty());
+    let mut old_authority_in_new_envelope = consumed_before_restart;
+    old_authority_in_new_envelope["generation"] = json!(RESTARTED_GENERATION);
+    old_authority_in_new_envelope["nonce"] = json!(RESTARTED_NONCE);
+    let frames = exchange(&fixture.executor_socket, &old_authority_in_new_envelope).await;
+    assert_eq!(frames[0]["result"]["Err"]["code"], "protocol");
     let fresh = read_file_request(
         RESTARTED_NONCE,
         "request-fresh",
@@ -247,6 +417,26 @@ async fn manager_restart_rotates_nonce_and_rebinds_stale_socket() {
     assert_eq!(
         terminal_content(&exchange(&fixture.executor_socket, &fresh).await),
         "source"
+    );
+}
+
+#[tokio::test]
+async fn executor_process_recreation_without_generation_preparation_fails_closed() {
+    let mut fixture = Fixture::new().await;
+    fixture.start(NONCE).await;
+
+    let mut executor = fixture.executor.take().expect("executor is running");
+    executor.kill().await.expect("kill executor");
+    executor.wait().await.expect("wait executor");
+
+    let mut recreated = spawn_executor(&fixture.workspace, &fixture.executor_socket, NONCE);
+    let status = timeout(Duration::from_secs(5), recreated.wait())
+        .await
+        .expect("same-generation executor recreation did not fail closed")
+        .expect("wait recreated executor");
+    assert!(
+        !status.success(),
+        "executor recreated an empty replay ledger under retained nonce/key material"
     );
 }
 

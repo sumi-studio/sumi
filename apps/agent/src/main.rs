@@ -38,6 +38,7 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(
 }
 
 fn main() -> Result<()> {
+    runtime::process_security::disable_dumps_and_core_files()?;
     let mut arguments = env::args();
     let _program = arguments.next();
     let mode = arguments.next();

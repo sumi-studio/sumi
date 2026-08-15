@@ -357,7 +357,7 @@ impl ToolStartCommitBarrier {
     fn reauthorize(self) {
         let result = match self.grant {
             Some(ToolStartGrant::Route(grant)) => {
-                ToolStartCommitResult::RouteReauthorize(grant.into_authorized_bound().into_sealed())
+                ToolStartCommitResult::RouteReauthorize(grant.into_sealed_for_reauthorization())
             }
             #[cfg(test)]
             Some(ToolStartGrant::Legacy(_)) | None => ToolStartCommitResult::Reauthorize,

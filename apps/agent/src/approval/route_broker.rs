@@ -903,7 +903,9 @@ mod tests {
     use super::*;
     use crate::{
         approval::{
-            authority::GrantRevalidation,
+            authority::{
+                GrantRevalidation, executor_authorization_projection_digest, executor_grant_digest,
+            },
             route_reviewer::{
                 EscalationReviewerPrompt, EscalationReviewerTransport, ExecutionReviewerPrompt,
                 ExecutionReviewerTransport, ReviewerBudgetV1, ReviewerModelSpec,
@@ -1255,7 +1257,7 @@ mod tests {
                 .expect("grant revalidation");
             assert_eq!(status, GrantRevalidation::Reauthorize);
             drop(lease);
-            sealed = grant.into_authorized_bound().into_sealed();
+            sealed = grant.into_sealed_for_reauthorization();
             if normal_reauthorization_exhausted(attempt) {
                 terminal = Some(
                     broker
@@ -1319,7 +1321,7 @@ mod tests {
             grant.evidence().policy_decision,
             PolicyDecisionRecord::Unmatched
         );
-        let (status, lease, _, _) = grant
+        let (status, lease, bound, authorization) = grant
             .authorize(
                 "tool-call-1",
                 "app_action",
@@ -1330,13 +1332,34 @@ mod tests {
             .await
             .expect("grant revalidation");
         assert_eq!(status, GrantRevalidation::Valid);
+        let expected_authorization_digest =
+            executor_authorization_projection_digest(&authorization, &bound)
+                .expect("Executor-safe authorization projection digest");
         drop(lease);
         let authorized = grant.into_authorized_bound();
         assert_eq!(authorized.tool_call_id(), "tool-call-1");
+        let (sealed, permit) = authorized
+            .into_validated_parts_for_test()
+            .expect("permit matches sealed invocation");
         assert_eq!(
-            authorized.into_sealed().invocation().tool_call_id,
-            "tool-call-1"
+            permit.grant_digest,
+            executor_grant_digest(&authorization.grant_id).expect("opaque grant digest")
         );
+        assert_eq!(
+            permit.bound_evidence_digest,
+            authorization.bound_evidence_digest
+        );
+        assert_eq!(permit.action_digest, authorization.descriptor_digest);
+        assert_eq!(
+            permit.authorization_projection_digest,
+            expected_authorization_digest
+        );
+        assert_eq!(permit.route, ToolInvocationRoute::Normal);
+        assert_eq!(
+            permit.resolved_authority,
+            ExecutionAuthorityProvenance::AgentOwn
+        );
+        assert_eq!(sealed.invocation().tool_call_id, "tool-call-1");
     }
 
     #[tokio::test]
@@ -1386,6 +1409,27 @@ mod tests {
         };
         assert_eq!(
             grant.evidence().resolved_authority,
+            ExecutionAuthorityProvenance::AgentOwnWithHumanConsent
+        );
+        let (status, lease, _, _) = grant
+            .authorize(
+                "tool-call-1",
+                "app_action",
+                ToolInvocationRoute::Elevated,
+                "run-1",
+                "turn-1",
+            )
+            .await
+            .expect("approved elevated grant revalidation");
+        assert_eq!(status, GrantRevalidation::Valid);
+        drop(lease);
+        let (_, permit) = grant
+            .into_authorized_bound()
+            .into_validated_parts_for_test()
+            .expect("permit matches sealed invocation");
+        assert_eq!(permit.route, ToolInvocationRoute::Elevated);
+        assert_eq!(
+            permit.resolved_authority,
             ExecutionAuthorityProvenance::AgentOwnWithHumanConsent
         );
         assert!(matches!(

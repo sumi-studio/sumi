@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{ResourceLimit, ToolError};
-use super::ArtifactResponse;
+use super::{ArtifactResponse, SignedCallAuthority, VerifiedCallAuthority};
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::TruncationResult};
 
@@ -42,6 +42,20 @@ pub struct RpcRequest<T> {
     pub nonce: String,
     pub request_id: String,
     pub operation: T,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorRpcRequest {
+    pub personality_agent_id: PersonalityAgentId,
+    pub generation: u64,
+    pub nonce: String,
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_authority: Option<SignedCallAuthority>,
+    #[serde(skip)]
+    pub verified_call_authority: Option<VerifiedCallAuthority>,
+    pub operation: ExecutorOperation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -369,6 +383,30 @@ pub fn decode_rpc_line<T: DeserializeOwned + RpcOperationValidation>(
         ));
     }
     let request = serde_json::from_slice::<RpcRequest<T>>(line)
+        .map_err(|error| ToolError::Protocol(format!("invalid RPC JSON: {error}")))?;
+    identity.validate_wire(
+        request.personality_agent_id.as_str(),
+        request.generation,
+        &request.nonce,
+    )?;
+    validate_rpc_id(&request.request_id, "request_id")?;
+    request.operation.validate()?;
+    Ok(request)
+}
+
+pub fn decode_executor_rpc_line(
+    line: &[u8],
+    identity: &RpcIdentity,
+) -> Result<ExecutorRpcRequest, ToolError> {
+    if framed_rpc_len(line.len()).is_none() {
+        return Err(ToolError::Protocol("RPC line exceeds 1MiB".to_owned()));
+    }
+    if line.iter().any(|byte| *byte == b'\n' || *byte == b'\r') {
+        return Err(ToolError::Protocol(
+            "RPC decoder expects exactly one unframed JSON line".to_owned(),
+        ));
+    }
+    let request = serde_json::from_slice::<ExecutorRpcRequest>(line)
         .map_err(|error| ToolError::Protocol(format!("invalid RPC JSON: {error}")))?;
     identity.validate_wire(
         request.personality_agent_id.as_str(),

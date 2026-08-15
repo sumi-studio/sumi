@@ -42,6 +42,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::authority::{
+    AuthorizedBoundInvocation, CommittedEffectReceipt, CommittedExecutionPermit,
+};
 use crate::provider::types::{ToolCall, ToolDefinition, UserContent, ValidatedToolArguments};
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 
@@ -162,21 +165,40 @@ impl LiveAppPostCommit {
     }
 }
 
-/// Exact tool output plus optional process-local app maintenance that becomes
-/// eligible only after the route durably commits that output.
-pub(crate) struct BoundToolExecutionOutcome {
-    pub output: ToolOutput,
-    pub live_post_commit: Option<LiveAppPostCommit>,
-}
+mod bound_outcome {
+    use super::{CommittedEffectReceipt, LiveAppPostCommit, ToolOutput};
 
-impl BoundToolExecutionOutcome {
-    pub(crate) fn without_live_post_commit(output: ToolOutput) -> Self {
-        Self {
-            output,
-            live_post_commit: None,
+    /// Exact tool output plus optional process-local app maintenance that
+    /// becomes eligible only after the route durably commits that output.
+    /// Construction requires a successful effect receipt, so a bound adapter
+    /// cannot ignore its post-COMMIT permit and still return success.
+    pub(crate) struct BoundToolExecutionOutcome {
+        pub output: ToolOutput,
+        pub live_post_commit: Option<LiveAppPostCommit>,
+        _effect_receipt: CommittedEffectReceipt<()>,
+    }
+
+    impl BoundToolExecutionOutcome {
+        pub(crate) fn new(
+            effect_receipt: CommittedEffectReceipt<(ToolOutput, Option<LiveAppPostCommit>)>,
+        ) -> Self {
+            let ((output, live_post_commit), effect_receipt) = effect_receipt.into_parts();
+            Self {
+                output,
+                live_post_commit,
+                _effect_receipt: effect_receipt,
+            }
+        }
+
+        pub(crate) fn without_live_post_commit(
+            effect_receipt: CommittedEffectReceipt<ToolOutput>,
+        ) -> Self {
+            Self::new(effect_receipt.map(|output| (output, None)))
         }
     }
 }
+
+pub(crate) use bound_outcome::BoundToolExecutionOutcome;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspacePaths {
@@ -223,10 +245,24 @@ pub(crate) struct BoundToolCtx<'a> {
     pub flow_id: &'a str,
     pub call_id: &'a str,
     pub args: &'a BoundExecutionArguments,
+    /// Move-only post-COMMIT authority for this exact sealed invocation.
+    ///
+    /// Local-control adapters retain it while parsing arguments and waiting on
+    /// view locks, recheck cancellation, then call `begin_local_effect()`
+    /// immediately before the network or filesystem effect. Executor adapters
+    /// derive the complete `ExecutorOperation` from `args` first and pass this
+    /// permit to the client, which calls `begin_executor_effect()` immediately
+    /// before signing. Only the successful result-coupled receipt can construct
+    /// a `BoundToolExecutionOutcome`.
+    pub committed_effect_permit: CommittedExecutionPermit,
     pub cancel: CancellationToken,
     pub on_update: Arc<dyn Fn(Value) + Send + Sync>,
     pub workspace: &'a WorkspacePaths,
 }
+
+/// Unforgeable outside the registry module. Opening a post-COMMIT authorized
+/// pair therefore cannot become a general crate-internal transport API.
+pub(crate) struct AuthorizedBoundRegistryAccess(());
 
 /// One complete app-owned binding/execution package.
 ///
@@ -314,6 +350,7 @@ impl BoundToolAdapter for GuardedBoundToolAdapter {
                 flow_id: ctx.flow_id,
                 call_id: ctx.call_id,
                 args: ctx.args,
+                committed_effect_permit: ctx.committed_effect_permit,
                 cancel: ctx.cancel,
                 on_update: Arc::new(move |value| guarded_update.emit(value)),
                 workspace: ctx.workspace,
@@ -602,11 +639,14 @@ impl ToolRegistry {
     /// still enforce the exactly-one committed start/effect barrier.
     pub(crate) async fn execute_bound(
         &self,
-        sealed: SealedBoundToolInvocation,
+        authorized: AuthorizedBoundInvocation,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<BoundToolExecutionOutcome, BoundExecutionError> {
-        let invocation = self.validate_bound(&sealed)?;
+        self.validate_bound(authorized.sealed())?;
+        let (sealed, committed_execution_permit) =
+            authorized.into_registry_parts(AuthorizedBoundRegistryAccess(()))?;
+        let invocation = sealed.invocation();
         let registered = self
             .tools
             .get(&invocation.tool_name)
@@ -621,6 +661,7 @@ impl ToolRegistry {
                 flow_id: &sealed.flow_id,
                 call_id: &invocation.tool_call_id,
                 args: &invocation.execution_arguments,
+                committed_effect_permit: committed_execution_permit,
                 cancel,
                 on_update,
                 workspace: &sealed.workspace,
@@ -886,16 +927,22 @@ mod tests {
             ctx: BoundToolCtx<'_>,
         ) -> Result<BoundToolExecutionOutcome, ToolError> {
             let arguments = Value::Object(ctx.args.as_object().clone());
-            self.bound_executions
-                .lock()
-                .expect("bound executions lock")
-                .push(json!({
-                    "arguments": arguments.clone(),
-                    "flow_id": ctx.flow_id,
-                    "workspace": ctx.workspace.root(),
-                }));
+            let effect_start = ctx.committed_effect_permit.begin_local_effect();
+            let effect_receipt = effect_start
+                .complete(|| async {
+                    self.bound_executions
+                        .lock()
+                        .expect("bound executions lock")
+                        .push(json!({
+                            "arguments": arguments.clone(),
+                            "flow_id": ctx.flow_id,
+                            "workspace": ctx.workspace.root(),
+                        }));
+                    Ok::<_, ToolError>(text_output("bound", arguments))
+                })
+                .await?;
             Ok(BoundToolExecutionOutcome::without_live_post_commit(
-                text_output("bound", arguments),
+                effect_receipt,
             ))
         }
     }
@@ -1362,8 +1409,9 @@ mod tests {
             .expect("bind invocation");
         assert_eq!(bind_count.load(Ordering::Relaxed), 1);
 
+        let authorized = AuthorizedBoundInvocation::for_test(sealed);
         let output = registry
-            .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
             .await
             .expect("execute sealed invocation");
         assert_eq!(output.output.details, json!({"path": "alpha"}));
@@ -1390,8 +1438,9 @@ mod tests {
             .await
             .expect("bind altered invocation");
         altered.invocation.descriptor.operation = "replace".to_owned();
+        let authorized = AuthorizedBoundInvocation::for_test(altered);
         let rejected = registry
-            .execute_bound(altered, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
             .await;
         assert!(matches!(
             rejected,
@@ -1405,6 +1454,62 @@ mod tests {
                 .expect("bound executions lock")
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_bound_rejects_crossed_permits_from_two_valid_calls_before_adapter_effect() {
+        let bind_count = Arc::new(AtomicUsize::new(0));
+        let bound_executions = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(BindingTool {
+                name: "inspect",
+                bind_count,
+                bound_executions: bound_executions.clone(),
+            }))
+            .expect("register binding tool");
+        let registry = builder.build();
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let first = registry
+            .bind(
+                &call("call-a", "inspect", json!({"path": "alpha"})),
+                "flow-a",
+                &workspace,
+            )
+            .await
+            .expect("bind first valid call");
+        let second = registry
+            .bind(
+                &call("call-b", "inspect", json!({"path": "beta"})),
+                "flow-b",
+                &workspace,
+            )
+            .await
+            .expect("bind second valid call");
+        let first = crate::approval::authority::ExecutableGrant::for_test(first, "grant-a")
+            .into_authorized_bound();
+        let second = crate::approval::authority::ExecutableGrant::for_test(second, "grant-b")
+            .into_authorized_bound();
+        let (crossed_first, crossed_second) =
+            AuthorizedBoundInvocation::swap_permits_for_test(first, second);
+
+        for crossed in [crossed_first, crossed_second] {
+            assert!(matches!(
+                registry
+                    .execute_bound(crossed, CancellationToken::new(), Arc::new(|_| {}))
+                    .await,
+                Err(BoundExecutionError::InvalidInvocation(
+                    DescribeError::ExecutionPermitMismatch
+                ))
+            ));
+        }
+        assert!(
+            bound_executions
+                .lock()
+                .expect("bound executions lock")
+                .is_empty(),
+            "a crossed permit reached the app adapter"
         );
     }
 
@@ -1456,8 +1561,9 @@ mod tests {
             registration_seal: Arc::new(()),
         };
 
+        let authorized = AuthorizedBoundInvocation::for_test(fabricated);
         let result = restarted
-            .execute_bound(fabricated, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
             .await;
         assert!(matches!(
             result,

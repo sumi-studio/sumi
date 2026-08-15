@@ -26,7 +26,7 @@ set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
   *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
-    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=prepare-phase-nonce\nSUMI_PROCESS_GENERATION_LEASE_ID=prepare-lease\nSUMI_GENERATION_RECOVERY_FENCE_ID=prepare-fence\n' "$SUMI_PERSONALITY_AGENT_ID"
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=prepare-phase-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
 esac
 `

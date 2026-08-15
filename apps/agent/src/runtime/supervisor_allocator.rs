@@ -22,9 +22,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use ed25519_dalek::SigningKey;
 use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Variant, Version};
+use zeroize::Zeroizing;
 
 use super::contracts::{MAX_PROCESS_GENERATION, PersonalityAgentId, ProcessGeneration};
 
@@ -425,11 +427,12 @@ fn is_strict_descendant(path: &Path, root: &Path) -> bool {
     path != root && path.starts_with(root)
 }
 
-#[derive(Debug)]
 struct FreshAllocation {
     nonce: String,
     lease_id: String,
     fence_id: String,
+    call_authority_private_key: Zeroizing<[u8; 32]>,
+    call_authority_public_key: [u8; 32],
 }
 
 impl FreshAllocation {
@@ -438,10 +441,19 @@ impl FreshAllocation {
         rand::rngs::OsRng
             .try_fill_bytes(&mut nonce)
             .map_err(|error| anyhow!("operating-system random source failed: {error}"))?;
+        let mut call_authority_private_key = Zeroizing::new([0_u8; 32]);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut *call_authority_private_key)
+            .map_err(|error| anyhow!("operating-system random source failed: {error}"))?;
+        let call_authority_public_key = SigningKey::from_bytes(&call_authority_private_key)
+            .verifying_key()
+            .to_bytes();
         Ok(Self {
             nonce: hex(&nonce),
             lease_id: canonical_uuid_v7(Uuid::now_v7(), "lease UUID")?,
             fence_id: canonical_uuid_v7(Uuid::now_v7(), "recovery-fence UUID")?,
+            call_authority_private_key,
+            call_authority_public_key,
         })
     }
 }
@@ -456,6 +468,16 @@ fn canonical_uuid_v7(uuid: Uuid, kind: &str) -> Result<String> {
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn secret_hex(bytes: &[u8]) -> Zeroizing<String> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = Zeroizing::new(String::with_capacity(bytes.len() * 2));
     for &byte in bytes {
         encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
         encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
@@ -844,10 +866,13 @@ fn materialize_role_identities(
         paid.as_str(),
         allocation.nonce
     );
-    let runtime_env = format!(
-        "{common}SUMI_PROCESS_GENERATION_LEASE_ID={}\nSUMI_GENERATION_RECOVERY_FENCE_ID={}\n",
-        allocation.lease_id, allocation.fence_id
-    );
+    let call_authority_private_key = secret_hex(&*allocation.call_authority_private_key);
+    let runtime_env = Zeroizing::new(format!(
+        "{common}SUMI_PROCESS_GENERATION_LEASE_ID={}\nSUMI_GENERATION_RECOVERY_FENCE_ID={}\nSUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY={}\n",
+        allocation.lease_id,
+        allocation.fence_id,
+        call_authority_private_key.as_str(),
+    ));
     atomic_replace_bytes(
         &role_dirs.runtime,
         "identity.env",
@@ -863,7 +888,11 @@ fn materialize_role_identities(
         &role_dirs.executor,
         "identity.env",
         AtomicFileSpec::identity(role_dirs.gids.executor),
-        common.as_bytes(),
+        format!(
+            "{common}SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY={}\n",
+            hex(&allocation.call_authority_public_key),
+        )
+        .as_bytes(),
         Some(DurableTarget::Executor),
         crash_failpoint,
     )?;

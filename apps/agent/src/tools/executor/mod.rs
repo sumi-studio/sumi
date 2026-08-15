@@ -3,6 +3,7 @@
 #![cfg(target_os = "linux")]
 
 mod artifact_broker;
+mod call_authority;
 mod client;
 mod executor_client;
 mod manager;
@@ -13,15 +14,20 @@ mod service;
 // The service and broker slices consume these stable contracts later in T13.
 #[allow(unused_imports)]
 pub use artifact_broker::{ArtifactBroker, ArtifactGrepMatch, ArtifactResponse};
+pub(crate) use call_authority::{
+    Ed25519CallAuthorityIssuer, ExecutorCallAuthorityVerifier, SignedCallAuthority,
+    VerifiedCallAuthority, call_authority_key_id, decode_hex_32,
+};
 pub use client::ArtifactBrokerClient;
 #[allow(unused_imports)]
 pub use executor_client::{ExecutorClient, ExecutorErrorClassification, classify_executor_error};
 #[allow(unused_imports)]
 pub use protocol::{
-    ArtifactOperation, ExecutorOperation, ExecutorResponse, ExecutorServiceRole, InputRoute,
-    MAX_ATTACHMENT_CHUNK_BYTES, MAX_RPC_LINE_BYTES, MAX_RPC_READ_BYTES, RpcError, RpcFrame,
-    RpcLifecycleTracker, RpcOperationValidation, RpcRequest, decode_rpc_frame, decode_rpc_line,
-    encode_rpc_frame, resolve_input,
+    ArtifactOperation, ExecutorOperation, ExecutorResponse, ExecutorRpcRequest,
+    ExecutorServiceRole, InputRoute, MAX_ATTACHMENT_CHUNK_BYTES, MAX_RPC_LINE_BYTES,
+    MAX_RPC_READ_BYTES, RpcError, RpcFrame, RpcLifecycleTracker, RpcOperationValidation,
+    RpcRequest, decode_executor_rpc_line, decode_rpc_frame, decode_rpc_line, encode_rpc_frame,
+    resolve_input,
 };
 #[allow(unused_imports)]
 pub use remote::remote_executor_registry;

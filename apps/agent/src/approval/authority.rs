@@ -1,6 +1,6 @@
 //! Exact-call execution authority sealed around an app-owned bound operation.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -10,14 +10,17 @@ use tokio::sync::{RwLock, RwLockReadGuard};
 
 use crate::{
     approval::{
-        route_policy::{PolicySnapshot, RoutePolicy},
+        route_policy::{PolicySnapshot, PolicySourceState, RoutePolicy},
         route_reviewer::{
             EscalationReviewEvidence, EscalationReviewOutcome, ExecutionReviewEvidence,
-            ExecutionReviewOutcome,
+            ExecutionReviewOutcome, RiskLevel,
         },
     },
     provider::types::ToolInvocationRoute,
-    tools::{BoundToolInvocation, SealedBoundToolInvocation},
+    tools::{
+        AuthorizedBoundRegistryAccess, BoundToolInvocation, DescribeError,
+        SealedBoundToolInvocation,
+    },
 };
 
 pub const AUTHORIZATION_EVIDENCE_VERSION_V1: &str = "tool-execution-authorization-evidence/v1";
@@ -25,6 +28,10 @@ pub const DENIAL_EVIDENCE_VERSION_V1: &str = "tool-execution-denial-evidence/v1"
 pub const HUMAN_DECISION_PROVENANCE_VERSION_V1: u8 = 1;
 const AUTHORIZATION_DIGEST_DOMAIN: &[u8] = b"sumi-tool-authorization-evidence/v1\0";
 const DENIAL_DIGEST_DOMAIN: &[u8] = b"sumi-tool-denial-evidence/v1\0";
+const EXECUTOR_AUTHORIZATION_PROJECTION_DIGEST_DOMAIN: &[u8] =
+    b"sumi-executor-authorization-projection/v1\0";
+const EXECUTOR_GRANT_DIGEST_DOMAIN: &[u8] = b"sumi-executor-grant/v1\0";
+const EXECUTOR_AUTHORIZATION_PROJECTION_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +347,110 @@ pub fn authorization_evidence_digest(
     Ok(digest(AUTHORIZATION_DIGEST_DOMAIN, &encoded))
 }
 
+/// Deliberately narrow authorization evidence that may influence an Executor
+/// token. Exact arguments, resource identifiers, principals, Human command
+/// identities, reviewer free-form text, and digests derived from those hidden
+/// values stay inside the runtime's already-validated grant.
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutorAuthorizationProjection {
+    version: u8,
+    route: ToolInvocationRoute,
+    policy_source: ExecutorPolicySourceProjection,
+    policy_decision: PolicyDecisionRecord,
+    resolved_authority: ExecutionAuthorityProvenance,
+    execution_review: Option<ExecutorExecutionReviewProjection>,
+    escalation_review: Option<ExecutorEscalationReviewProjection>,
+    human_decision: Option<ExecutorHumanDecisionProjection>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutorPolicySourceProjection {
+    BaselineOnly,
+    VerifiedOverlay,
+    RequiredUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutorExecutionReviewProjection {
+    outcome: ExecutionReviewOutcome,
+    risk: RiskLevel,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutorEscalationReviewProjection {
+    outcome: EscalationReviewOutcome,
+    risk: RiskLevel,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutorHumanDecisionProjection {
+    provenance_version: u8,
+    decision: CurrentCallDecision,
+}
+
+fn executor_authorization_projection(
+    evidence: &ToolExecutionAuthorizationEvidence,
+) -> ExecutorAuthorizationProjection {
+    ExecutorAuthorizationProjection {
+        version: EXECUTOR_AUTHORIZATION_PROJECTION_VERSION,
+        route: evidence.route,
+        policy_source: match &evidence.policy.source {
+            PolicySourceState::BaselineOnly { .. } => ExecutorPolicySourceProjection::BaselineOnly,
+            PolicySourceState::VerifiedOverlay { .. } => {
+                ExecutorPolicySourceProjection::VerifiedOverlay
+            }
+            PolicySourceState::RequiredUnavailable { .. } => {
+                ExecutorPolicySourceProjection::RequiredUnavailable
+            }
+        },
+        policy_decision: evidence.policy_decision,
+        resolved_authority: evidence.resolved_authority,
+        execution_review: evidence.execution_review.as_ref().map(|review| {
+            ExecutorExecutionReviewProjection {
+                outcome: review.decision.outcome,
+                risk: review.decision.risk,
+            }
+        }),
+        escalation_review: evidence.escalation_review.as_ref().map(|review| {
+            ExecutorEscalationReviewProjection {
+                outcome: review.decision.outcome,
+                risk: review.decision.risk,
+            }
+        }),
+        human_decision: evidence.human_decision.as_ref().map(|decision| {
+            ExecutorHumanDecisionProjection {
+                provenance_version: decision.provenance_version,
+                decision: decision.decision,
+            }
+        }),
+    }
+}
+
+pub(crate) fn executor_authorization_projection_digest(
+    evidence: &ToolExecutionAuthorizationEvidence,
+    bound: &BoundToolInvocation,
+) -> Result<String> {
+    evidence.validate(bound)?;
+    let encoded = serde_json::to_vec(&executor_authorization_projection(evidence))
+        .context("serialize Executor-safe authorization projection")?;
+    Ok(digest(
+        EXECUTOR_AUTHORIZATION_PROJECTION_DIGEST_DOMAIN,
+        &encoded,
+    ))
+}
+
+pub(crate) fn executor_grant_digest(grant_id: &str) -> Result<String> {
+    if grant_id.trim().is_empty() {
+        bail!("tool authorization evidence has an empty grant identity");
+    }
+    Ok(digest(EXECUTOR_GRANT_DIGEST_DOMAIN, grant_id.as_bytes()))
+}
+
 pub fn denial_evidence_digest(
     evidence: &ToolExecutionDenialEvidence,
     bound: &BoundToolInvocation,
@@ -374,6 +485,7 @@ pub(crate) struct ExecutableGrant {
     run_id: String,
     turn_id: String,
     evidence: ToolExecutionAuthorizationEvidence,
+    executor_authorization_projection_digest: String,
 }
 
 impl std::fmt::Debug for ExecutableGrant {
@@ -411,6 +523,8 @@ impl ExecutableGrant {
         evidence: ToolExecutionAuthorizationEvidence,
     ) -> Result<Self> {
         evidence.validate(sealed.invocation())?;
+        let executor_authorization_projection_digest =
+            executor_authorization_projection_digest(&evidence, sealed.invocation())?;
         Ok(Self {
             policy,
             clock,
@@ -419,7 +533,52 @@ impl ExecutableGrant {
             run_id,
             turn_id,
             evidence,
+            executor_authorization_projection_digest,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sealed: SealedBoundToolInvocation, grant_id: impl Into<String>) -> Self {
+        use crate::approval::route_policy::{NormalPolicyDecision, PolicyEvaluation};
+
+        let policy = RoutePolicy::baseline_only_v1();
+        let now = Utc::now();
+        let policy_snapshot = match policy.evaluate_normal(sealed.invocation(), now) {
+            PolicyEvaluation::Ready {
+                snapshot,
+                decision: NormalPolicyDecision::Allow,
+            } => snapshot,
+            _ => panic!("test execution grant requires baseline-readable bound authority"),
+        };
+        let bound = sealed.invocation();
+        let evidence = ToolExecutionAuthorizationEvidence {
+            evidence_version: AUTHORIZATION_EVIDENCE_VERSION_V1.to_owned(),
+            grant_id: grant_id.into(),
+            tool_call_id: bound.tool_call_id.clone(),
+            route: ToolInvocationRoute::Normal,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound
+                .evidence_digest()
+                .expect("test bound evidence digest")
+                .to_hex(),
+            policy: policy_snapshot,
+            policy_decision: PolicyDecisionRecord::Allow,
+            resolved_authority: ExecutionAuthorityProvenance::AgentOwn,
+            execution_review: None,
+            escalation_review: None,
+            human_decision: None,
+        };
+        Self::new(
+            Arc::new(RwLock::new(policy)),
+            Arc::new(Utc::now),
+            sealed,
+            ToolInvocationRoute::Normal,
+            "test-run".to_owned(),
+            "test-turn".to_owned(),
+            evidence,
+        )
+        .expect("valid test execution grant")
     }
 
     pub(crate) async fn authorize(
@@ -469,9 +628,28 @@ impl ExecutableGrant {
     }
 
     pub(crate) fn into_authorized_bound(self) -> AuthorizedBoundInvocation {
-        AuthorizedBoundInvocation {
-            sealed: self.sealed,
-        }
+        let Self {
+            sealed,
+            evidence,
+            executor_authorization_projection_digest,
+            ..
+        } = self;
+        let permit = CommittedExecutionPermit {
+            grant_digest: executor_grant_digest(&evidence.grant_id)
+                .expect("validated grant identity must remain digestible"),
+            bound_evidence_digest: evidence.bound_evidence_digest,
+            action_digest: evidence.descriptor_digest,
+            authorization_projection_digest: executor_authorization_projection_digest,
+            route: evidence.route,
+            resolved_authority: evidence.resolved_authority,
+        };
+        AuthorizedBoundInvocation { sealed, permit }
+    }
+
+    /// Reauthorization consumes the stale grant without manufacturing a
+    /// post-COMMIT execution permit.
+    pub(crate) fn into_sealed_for_reauthorization(self) -> SealedBoundToolInvocation {
+        self.sealed
     }
 
     #[cfg(test)]
@@ -485,11 +663,30 @@ impl ExecutableGrant {
 /// once; serializable evidence cannot recreate this value.
 pub(crate) struct AuthorizedBoundInvocation {
     sealed: SealedBoundToolInvocation,
+    permit: CommittedExecutionPermit,
 }
 
 impl AuthorizedBoundInvocation {
-    pub(crate) fn into_sealed(self) -> SealedBoundToolInvocation {
-        self.sealed
+    pub(crate) fn sealed(&self) -> &SealedBoundToolInvocation {
+        &self.sealed
+    }
+
+    /// Open the opaque pair only at the registry execution seam, after proving
+    /// that the post-COMMIT permit still names this exact sealed invocation.
+    pub(crate) fn into_registry_parts(
+        self,
+        _access: AuthorizedBoundRegistryAccess,
+    ) -> Result<(SealedBoundToolInvocation, CommittedExecutionPermit), DescribeError> {
+        self.permit.validate_for(self.sealed.invocation())?;
+        Ok((self.sealed, self.permit))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_validated_parts_for_test(
+        self,
+    ) -> Result<(SealedBoundToolInvocation, CommittedExecutionPermitParts), DescribeError> {
+        self.permit.validate_for(self.sealed.invocation())?;
+        Ok((self.sealed, self.permit.into_executor_parts_for_test()))
     }
 
     pub(crate) fn tool_call_id(&self) -> &str {
@@ -498,5 +695,425 @@ impl AuthorizedBoundInvocation {
 
     pub(crate) fn tool_name(&self) -> &str {
         &self.sealed.invocation().tool_name
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sealed: SealedBoundToolInvocation) -> Self {
+        let permit = CommittedExecutionPermit::for_test(sealed.invocation());
+        Self { sealed, permit }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_permits_for_test(left: Self, right: Self) -> (Self, Self) {
+        let Self {
+            sealed: left_sealed,
+            permit: left_permit,
+        } = left;
+        let Self {
+            sealed: right_sealed,
+            permit: right_permit,
+        } = right;
+        (
+            Self {
+                sealed: left_sealed,
+                permit: right_permit,
+            },
+            Self {
+                sealed: right_sealed,
+                permit: left_permit,
+            },
+        )
+    }
+}
+
+/// Move-only, process-local authority released only by the durable start
+/// commit barrier. Durable evidence can be audited after restart, but cannot
+/// recreate this value or mint another executor token.
+pub(crate) struct CommittedExecutionPermit {
+    grant_digest: String,
+    bound_evidence_digest: String,
+    action_digest: String,
+    authorization_projection_digest: String,
+    route: ToolInvocationRoute,
+    resolved_authority: ExecutionAuthorityProvenance,
+}
+
+/// One begun effect. It must survive the effect attempt and can produce at
+/// most one success receipt.
+pub(crate) struct CommittedEffectStart {
+    _private: (),
+}
+
+/// A successful begun effect together with its result. This receipt is neither
+/// cloneable nor constructible outside this authority module. Keeping the
+/// result inside the receipt prevents an adapter from constructing a successful
+/// bound outcome after a failed or cancelled effect future.
+pub(crate) struct CommittedEffectReceipt<T> {
+    value: T,
+}
+
+/// Executor-only continuation after one effect start. It cannot be converted
+/// back into a local permit or begun a second time.
+pub(crate) struct ExecutorCommittedExecutionPermit {
+    permit: CommittedExecutionPermit,
+}
+
+/// Opaque executor effect start. The signing continuation is released only to
+/// the exact result-producing future supplied to `complete`, so it cannot be
+/// split from the receipt path and paired with another operation's result.
+pub(crate) struct ExecutorCommittedEffectStart {
+    permit: CommittedExecutionPermit,
+}
+
+pub(crate) struct CommittedExecutionPermitParts {
+    pub grant_digest: String,
+    pub bound_evidence_digest: String,
+    pub action_digest: String,
+    pub authorization_projection_digest: String,
+    pub route: ToolInvocationRoute,
+    pub resolved_authority: ExecutionAuthorityProvenance,
+}
+
+impl CommittedExecutionPermit {
+    fn validate_for(&self, bound: &BoundToolInvocation) -> Result<(), DescribeError> {
+        let bound_evidence_digest = bound
+            .evidence_digest()
+            .map_err(|_| DescribeError::ExecutionPermitMismatch)?
+            .to_hex();
+        if self.bound_evidence_digest != bound_evidence_digest
+            || self.action_digest != bound.descriptor_digest.to_hex()
+        {
+            return Err(DescribeError::ExecutionPermitMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_local_effect(self) -> CommittedEffectStart {
+        CommittedEffectStart { _private: () }
+    }
+
+    pub(crate) fn begin_executor_effect(self) -> ExecutorCommittedEffectStart {
+        ExecutorCommittedEffectStart { permit: self }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_executor_parts_for_test(self) -> CommittedExecutionPermitParts {
+        self.begin_executor_effect()
+            .into_permit_for_test()
+            .into_executor_parts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(bound: &BoundToolInvocation) -> Self {
+        Self {
+            grant_digest: digest(
+                EXECUTOR_GRANT_DIGEST_DOMAIN,
+                format!("test-grant-{}", bound.tool_call_id).as_bytes(),
+            ),
+            bound_evidence_digest: bound
+                .evidence_digest()
+                .expect("test bound invocation digest")
+                .to_hex(),
+            action_digest: bound.descriptor_digest.to_hex(),
+            authorization_projection_digest: "00".repeat(32),
+            route: ToolInvocationRoute::Normal,
+            resolved_authority: ExecutionAuthorityProvenance::AgentOwn,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn executor_fixture(
+        grant_id: &str,
+        route: ToolInvocationRoute,
+        resolved_authority: ExecutionAuthorityProvenance,
+    ) -> Self {
+        Self {
+            grant_digest: digest(EXECUTOR_GRANT_DIGEST_DOMAIN, grant_id.as_bytes()),
+            bound_evidence_digest: "11".repeat(32),
+            action_digest: "33".repeat(32),
+            authorization_projection_digest: "22".repeat(32),
+            route,
+            resolved_authority,
+        }
+    }
+}
+
+impl ExecutorCommittedExecutionPermit {
+    pub(crate) fn into_executor_parts(self) -> CommittedExecutionPermitParts {
+        let CommittedExecutionPermit {
+            grant_digest,
+            bound_evidence_digest,
+            action_digest,
+            authorization_projection_digest,
+            route,
+            resolved_authority,
+        } = self.permit;
+        CommittedExecutionPermitParts {
+            grant_digest,
+            bound_evidence_digest,
+            action_digest,
+            authorization_projection_digest,
+            route,
+            resolved_authority,
+        }
+    }
+}
+
+impl ExecutorCommittedEffectStart {
+    /// Give the executor-only continuation to exactly one effect future and
+    /// mint a receipt only when that same future succeeds.
+    pub(crate) async fn complete<F, Fut, T, E>(
+        self,
+        effect: F,
+    ) -> Result<CommittedEffectReceipt<T>, E>
+    where
+        F: FnOnce(ExecutorCommittedExecutionPermit) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        effect(ExecutorCommittedExecutionPermit {
+            permit: self.permit,
+        })
+        .await
+        .map(|value| CommittedEffectReceipt { value })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_permit_for_test(self) -> ExecutorCommittedExecutionPermit {
+        ExecutorCommittedExecutionPermit {
+            permit: self.permit,
+        }
+    }
+}
+
+impl CommittedEffectStart {
+    /// Run the effect future and mint a receipt only for its successful result.
+    /// An error consumes both this start and the underlying permit authority.
+    pub(crate) async fn complete<F, Fut, T, E>(
+        self,
+        effect: F,
+    ) -> Result<CommittedEffectReceipt<T>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        effect().await.map(|value| CommittedEffectReceipt { value })
+    }
+}
+
+impl<T> CommittedEffectReceipt<T> {
+    pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> CommittedEffectReceipt<U> {
+        CommittedEffectReceipt {
+            value: map(self.value),
+        }
+    }
+
+    pub(crate) fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<CommittedEffectReceipt<U>, E> {
+        map(self.value).map(|value| CommittedEffectReceipt { value })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_inner(self) -> T {
+        self.value
+    }
+
+    pub(crate) fn into_parts(self) -> (T, CommittedEffectReceipt<()>) {
+        (self.value, CommittedEffectReceipt { value: () })
+    }
+}
+
+#[cfg(test)]
+mod executor_projection_tests {
+    use super::*;
+    use crate::approval::{
+        route_policy::PolicySourceState,
+        route_reviewer::{EscalationReviewDecision, ReviewerBudgetEvidence, ReviewerTerminalClass},
+    };
+
+    fn hidden_elevated_evidence(hidden: &str) -> ToolExecutionAuthorizationEvidence {
+        ToolExecutionAuthorizationEvidence {
+            evidence_version: AUTHORIZATION_EVIDENCE_VERSION_V1.to_owned(),
+            grant_id: format!("grant-{hidden}"),
+            tool_call_id: format!("call-{hidden}"),
+            route: ToolInvocationRoute::Elevated,
+            proposal_digest: format!("proposal-{hidden}"),
+            descriptor_digest: format!("descriptor-{hidden}"),
+            bound_evidence_digest: format!("bound-{hidden}"),
+            policy: PolicySnapshot {
+                source: PolicySourceState::RequiredUnavailable {
+                    baseline_version: format!("baseline-{hidden}"),
+                    reason: format!("private-policy-{hidden}"),
+                    minimum_version: 7,
+                },
+                source_digest: format!("private-source-digest-{hidden}"),
+                evaluated_at: Utc::now(),
+                valid_until: None,
+                bundle_version: Some(7),
+            },
+            policy_decision: PolicyDecisionRecord::ElevatedPreflight,
+            resolved_authority: ExecutionAuthorityProvenance::AgentOwnWithHumanConsent,
+            execution_review: None,
+            escalation_review: Some(EscalationReviewEvidence {
+                reviewer_version: format!("private-reviewer-{hidden}"),
+                prompt_version: format!("private-prompt-{hidden}"),
+                schema_version: format!("private-schema-{hidden}"),
+                model_id: format!("private-model-{hidden}"),
+                model_binding_digest: format!("private-model-binding-digest-{hidden}"),
+                budget: ReviewerBudgetEvidence {
+                    version: format!("private-budget-{hidden}"),
+                    digest: format!("private-budget-digest-{hidden}"),
+                    attempts: u8::try_from(hidden.len()).unwrap(),
+                    terminal: ReviewerTerminalClass::ValidDecision,
+                },
+                decision: EscalationReviewDecision {
+                    outcome: EscalationReviewOutcome::AskHuman,
+                    risk: RiskLevel::High,
+                    misunderstanding: Some(format!("private-misunderstanding-{hidden}")),
+                    rationale: format!("private-rationale-{hidden}"),
+                },
+            }),
+            human_decision: Some(HumanDecisionEvidence {
+                request_id: format!("request-{hidden}"),
+                command_id: format!("command-{hidden}"),
+                command_seq: 41,
+                tenant_id: format!("tenant-{hidden}"),
+                personality_agent_id: format!("agent-{hidden}"),
+                human_principal_id: format!("human-{hidden}"),
+                provenance_version: HUMAN_DECISION_PROVENANCE_VERSION_V1,
+                decision: CurrentCallDecision::ApproveOnce,
+                received_at: Utc::now(),
+                authorization_context_digest: format!("context-{hidden}"),
+            }),
+        }
+    }
+
+    #[test]
+    fn executor_projection_excludes_principals_raw_evidence_and_free_form_review_text() {
+        let first = hidden_elevated_evidence("hidden-alpha");
+        let second = hidden_elevated_evidence("hidden-beta-longer");
+
+        let first_projection =
+            serde_json::to_value(executor_authorization_projection(&first)).unwrap();
+        let second_projection =
+            serde_json::to_value(executor_authorization_projection(&second)).unwrap();
+        assert_eq!(
+            first_projection, second_projection,
+            "excluded private values must not influence Executor authorization"
+        );
+        let serialized = serde_json::to_string(&first_projection).unwrap();
+        for forbidden in [
+            "hidden-alpha",
+            "grant_id",
+            "tool_call_id",
+            "proposal_digest",
+            "descriptor_digest",
+            "bound_evidence_digest",
+            "source_digest",
+            "evaluated_at",
+            "valid_until",
+            "bundle_version",
+            "baseline_version",
+            "private-policy",
+            "reviewer_version",
+            "prompt_version",
+            "schema_version",
+            "model_id",
+            "model_binding_digest",
+            "budget",
+            "rationale",
+            "misunderstanding",
+            "request_id",
+            "command_id",
+            "tenant_id",
+            "personality_agent_id",
+            "human_principal_id",
+            "authorization_context_digest",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "Executor projection leaked {forbidden}"
+            );
+        }
+
+        let mut different_safe_facts = first.clone();
+        different_safe_facts
+            .escalation_review
+            .as_mut()
+            .expect("fixture escalation review")
+            .decision
+            .risk = RiskLevel::Low;
+        assert_ne!(
+            first_projection,
+            serde_json::to_value(executor_authorization_projection(&different_safe_facts)).unwrap(),
+            "typed authorization facts must remain bound into the projection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod effect_type_tests {
+    use super::{
+        CommittedEffectReceipt, CommittedEffectStart, CommittedExecutionPermit,
+        ExecutorCommittedEffectStart, ExecutorCommittedExecutionPermit,
+    };
+
+    // These assignments lock the ownership boundary at compile time. Changing
+    // either receiver to a borrow would make it possible to begin both routes
+    // or begin one route twice from the same post-COMMIT permit.
+    const _: fn(CommittedExecutionPermit) -> CommittedEffectStart =
+        CommittedExecutionPermit::begin_local_effect;
+    const _: fn(CommittedExecutionPermit) -> ExecutorCommittedEffectStart =
+        CommittedExecutionPermit::begin_executor_effect;
+
+    trait AmbiguousIfClone<A> {
+        fn marker() {}
+    }
+    struct CloneImplemented;
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: ?Sized + Clone> AmbiguousIfClone<CloneImplemented> for T {}
+
+    trait AmbiguousIfSerialize<A> {
+        fn marker() {}
+    }
+    struct SerializeImplemented;
+    impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+    impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<SerializeImplemented> for T {}
+
+    const _: fn() = || {
+        let _ = <CommittedExecutionPermit as AmbiguousIfClone<_>>::marker;
+        let _ = <CommittedEffectStart as AmbiguousIfClone<_>>::marker;
+        let _ = <CommittedEffectReceipt<()> as AmbiguousIfClone<_>>::marker;
+        let _ = <ExecutorCommittedEffectStart as AmbiguousIfClone<_>>::marker;
+        let _ = <ExecutorCommittedExecutionPermit as AmbiguousIfClone<_>>::marker;
+        let _ = <CommittedExecutionPermit as AmbiguousIfSerialize<_>>::marker;
+        let _ = <ExecutorCommittedEffectStart as AmbiguousIfSerialize<_>>::marker;
+        let _ = <ExecutorCommittedExecutionPermit as AmbiguousIfSerialize<_>>::marker;
+    };
+
+    // A successful receipt is only available through the result-coupled
+    // completion future. This helper is compiled (but need not run) so a
+    // signature regression cannot silently decouple receipt creation from the
+    // effect result.
+    #[allow(dead_code)]
+    async fn receipt_requires_success(
+        start: CommittedEffectStart,
+        result: Result<(), ()>,
+    ) -> Result<CommittedEffectReceipt<()>, ()> {
+        start.complete(|| std::future::ready(result)).await
+    }
+
+    #[tokio::test]
+    async fn failed_effect_consumes_start_without_minting_a_receipt() {
+        let permit = CommittedExecutionPermit::executor_fixture(
+            "grant-failed-effect",
+            crate::provider::types::ToolInvocationRoute::Normal,
+            super::ExecutionAuthorityProvenance::AgentOwn,
+        );
+        let start = permit.begin_local_effect();
+        let result: Result<CommittedEffectReceipt<()>, &'static str> =
+            start.complete(|| std::future::ready(Err("failed"))).await;
+        assert_eq!(result.err(), Some("failed"));
     }
 }
