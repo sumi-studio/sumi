@@ -1,4 +1,11 @@
-import { expect, type Page, type Response, test } from "@playwright/test";
+import {
+  expect,
+  type Page,
+  type Request,
+  type Response,
+  type Route,
+  test,
+} from "@playwright/test";
 import {
   buildRealAgentStack,
   firstProviderResponse,
@@ -153,19 +160,8 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     );
     expect(installed.installationID).toMatch(UUIDv7Pattern);
     await expect(railButton(page)).toBeVisible();
-    await expect(railButton(secondPage)).toHaveCount(0);
+    await expect(railButton(secondPage)).toBeVisible({ timeout: 30_000 });
     await closePopovers(page);
-
-    const secondRefreshResponse = secondPage.waitForResponse(
-      isParticipantInstallationListResponse,
-    );
-    const secondMenu = await openParticipantApps(secondPage);
-    await secondMenu
-      .getByRole("button", { name: "個人用アプリを更新" })
-      .click();
-    expect((await secondRefreshResponse).status()).toBe(200);
-    await expect(railButton(secondPage)).toBeVisible();
-    await closePopovers(secondPage);
 
     await Promise.all([openDirectChat(page), openDirectChat(secondPage)]);
     await expectSocketScope(
@@ -205,11 +201,39 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     );
     expect(stack.provider.requestCount).toBe(1);
 
+    const delayedSecondPageList =
+      await holdNextParticipantInstallationList(secondPage);
+    const delayedRefreshResponse = secondPage.waitForResponse(
+      isParticipantInstallationListResponse,
+    );
+    const secondRefreshMenu = await openParticipantApps(secondPage);
+    await secondRefreshMenu
+      .getByRole("button", { name: "個人用アプリを更新" })
+      .click();
+    await delayedSecondPageList.reached;
+
+    let disableRequestSeen = false;
+    const observeDisableRequest = (request: Request) => {
+      if (
+        request.method() === "PUT" &&
+        /^\/app-installations\/[^/]+\/state$/.test(
+          new URL(request.url()).pathname,
+        )
+      ) {
+        disableRequestSeen = true;
+      }
+    };
+    page.on("request", observeDisableRequest);
     const disableResponse = page.waitForResponse(isLifecycleStateResponse);
     const disableMenu = await openParticipantApps(page);
     await directChatRow(disableMenu)
       .getByRole("button", { name: "無効化" })
       .click();
+    await page.waitForTimeout(200);
+    expect(disableRequestSeen).toBe(false);
+
+    delayedSecondPageList.release();
+    expect((await delayedRefreshResponse).status()).toBe(200);
     const disabled = expectInstallation(
       await responseJSON(await disableResponse, 200, webOrigin),
       sessionUserID,
@@ -217,8 +241,14 @@ test("two real Chrome pages own Direct Chat through the production Participant l
       "2",
       installed.installationID,
     );
+    page.off("request", observeDisableRequest);
+    await expect
+      .poll(delayedSecondPageList.requestCount)
+      .toBeGreaterThanOrEqual(2);
+    await delayedSecondPageList.dispose();
     expect(disabled.installationID).toBe(installed.installationID);
     await closePopovers(page);
+    await closePopovers(secondPage);
     await expectLifecycle(page, "直通は無効になっています");
     await expectLifecycle(secondPage, "直通は無効になっています");
     await expect(railButton(page)).toHaveCount(0);
@@ -254,18 +284,8 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     expect(
       await probeDirectChatScope(page, enabled.installationID, "1"),
     ).toEqual({ opened: false, ready: false });
-
-    const firstRefreshResponse = page.waitForResponse(
-      isParticipantInstallationListResponse,
-    );
-    const firstRefreshMenu = await openParticipantApps(page);
-    await firstRefreshMenu
-      .getByRole("button", { name: "個人用アプリを更新" })
-      .click();
-    expect((await firstRefreshResponse).status()).toBe(200);
-    await closePopovers(page);
     await expectChatReady(page);
-    await expect(railButton(page)).toBeVisible();
+    await expect(railButton(page)).toBeVisible({ timeout: 30_000 });
     await expectSocketScope(
       socketObservations,
       "first",
@@ -313,17 +333,8 @@ test("two real Chrome pages own Direct Chat through the production Participant l
       reinstalled.installationID,
       "1",
     );
-
-    const reinstalledRefreshResponse = page.waitForResponse(
-      isParticipantInstallationListResponse,
-    );
-    const reinstalledMenu = await openParticipantApps(page);
-    await reinstalledMenu
-      .getByRole("button", { name: "個人用アプリを更新" })
-      .click();
-    expect((await reinstalledRefreshResponse).status()).toBe(200);
-    await closePopovers(page);
     await expectChatReady(page);
+    await expect(railButton(page)).toBeVisible({ timeout: 30_000 });
     await expectSocketScope(
       socketObservations,
       "first",
@@ -679,6 +690,42 @@ async function probeDirectChatScope(
   );
 }
 
+async function holdNextParticipantInstallationList(page: Page): Promise<{
+  reached: Promise<void>;
+  release: () => void;
+  requestCount: () => number;
+  dispose: () => Promise<void>;
+}> {
+  const pattern = "**/app-installations?**";
+  const reached = deferred<void>();
+  const release = deferred<void>();
+  let requestCount = 0;
+  let held = false;
+  const handler = async (route: Route) => {
+    if (!isParticipantInstallationListRequest(route.request())) {
+      await route.continue();
+      return;
+    }
+    requestCount += 1;
+    if (held) {
+      await route.continue();
+      return;
+    }
+    held = true;
+    const response = await route.fetch();
+    reached.resolve(undefined);
+    await release.promise;
+    await route.fulfill({ response });
+  };
+  await page.route(pattern, handler);
+  return {
+    reached: reached.promise,
+    release: () => release.resolve(undefined),
+    requestCount: () => requestCount,
+    dispose: () => page.unroute(pattern, handler),
+  };
+}
+
 function isInstallResponse(response: Response) {
   return (
     response.request().method() === "POST" &&
@@ -701,9 +748,20 @@ function isUninstallResponse(response: Response) {
 }
 
 function isParticipantInstallationListResponse(response: Response) {
-  const url = new URL(response.url());
+  return isParticipantInstallationList(
+    response.request().method(),
+    response.url(),
+  );
+}
+
+function isParticipantInstallationListRequest(request: Request) {
+  return isParticipantInstallationList(request.method(), request.url());
+}
+
+function isParticipantInstallationList(method: string, rawURL: string) {
+  const url = new URL(rawURL);
   return (
-    response.request().method() === "GET" &&
+    method === "GET" &&
     url.pathname === "/app-installations" &&
     url.searchParams.get("owner_kind") === "participant" &&
     url.searchParams.get("participant_kind") === "human"
@@ -755,4 +813,12 @@ function asString(value: unknown): string {
     throw new Error("expected non-empty string");
   }
   return value;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
 }

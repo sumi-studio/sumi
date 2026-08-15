@@ -6,8 +6,10 @@ import type {
   AppOwnerRef,
   ParticipantRef,
 } from "../workspace/model";
+import { appOwnerKey } from "../workspace/model";
 import {
   createParticipantAppStore,
+  type ParticipantAppLifecycleCoordinator,
   participantInstallation,
 } from "./app-store";
 
@@ -230,6 +232,192 @@ describe("Participant app lifecycle store", () => {
     });
   });
 
+  it("holds one owner lock across documents and refreshes the other store after commit", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const disabledEpoch2 = {
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+      updatedAt: 3,
+    };
+    let serverSnapshot = [enabledEpoch1];
+    const delayedRefresh = deferred<AppInstallation[]>();
+    const coordinators = lifecycleCoordinatorPair();
+    const setInstallationState = vi.fn(async () => {
+      serverSnapshot = [disabledEpoch2];
+      return disabledEpoch2;
+    });
+    const firstStore = createParticipantAppStore(
+      participantClient({
+        listInstallations: vi.fn(async () => serverSnapshot),
+        setInstallationState,
+      }),
+      coordinators[0],
+    );
+    const secondList = vi
+      .fn<() => Promise<AppInstallation[]>>()
+      .mockResolvedValueOnce([enabledEpoch1])
+      .mockImplementationOnce(() => delayedRefresh.promise)
+      .mockImplementation(async () => serverSnapshot);
+    const secondStore = createParticipantAppStore(
+      participantClient({ listInstallations: secondList }),
+      coordinators[1],
+    );
+    await Promise.all([
+      firstStore.getState().bindParticipant(HUMAN_A),
+      secondStore.getState().bindParticipant(HUMAN_A),
+    ]);
+
+    const refreshing = secondStore.getState().refresh();
+    await vi.waitFor(() => expect(secondList).toHaveBeenCalledTimes(2));
+    const disabling = firstStore
+      .getState()
+      .setInstallationState(enabledEpoch1.installationId, "disabled");
+    expect(firstStore.getState().mutation).toBe("set_installation_disabled");
+    await Promise.resolve();
+    expect(setInstallationState).not.toHaveBeenCalled();
+
+    delayedRefresh.resolve([enabledEpoch1]);
+    await refreshing;
+    await disabling;
+    await vi.waitFor(() => expect(secondList).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() =>
+      expect(secondStore.getState()).toMatchObject({
+        status: "ready",
+        installations: [disabledEpoch2],
+      }),
+    );
+    expect(firstStore.getState().installations).toEqual([disabledEpoch2]);
+  });
+
+  it("discards an in-flight snapshot when another document announces a commit", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const disabledEpoch2 = {
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+      updatedAt: 3,
+    };
+    const staleResponse = deferred<AppInstallation[]>();
+    const currentResponse = deferred<AppInstallation[]>();
+    const coordinators = lifecycleCoordinatorPair();
+    const listInstallations = vi
+      .fn<() => Promise<AppInstallation[]>>()
+      .mockResolvedValueOnce([enabledEpoch1])
+      .mockImplementationOnce(() => staleResponse.promise)
+      .mockImplementationOnce(() => currentResponse.promise);
+    const store = createParticipantAppStore(
+      participantClient({ listInstallations }),
+      coordinators[1],
+    );
+    await store.getState().bindParticipant(HUMAN_A);
+
+    const readySnapshots: AppInstallation[][] = [];
+    let observeReadySnapshots = false;
+    store.subscribe((state) => {
+      if (observeReadySnapshots && state.status === "ready") {
+        readySnapshots.push(state.installations);
+      }
+    });
+    const staleRefresh = store.getState().refresh();
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(2));
+    observeReadySnapshots = true;
+    coordinators[0].publishMutation(appOwnerKey(OWNER_A));
+    staleResponse.resolve([enabledEpoch1]);
+    await staleRefresh;
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(3));
+
+    expect(store.getState()).toMatchObject({
+      status: "loading",
+      installations: [enabledEpoch1],
+    });
+    expect(readySnapshots).toEqual([]);
+
+    currentResponse.resolve([disabledEpoch2]);
+    await vi.waitFor(() =>
+      expect(store.getState()).toMatchObject({
+        status: "ready",
+        installations: [disabledEpoch2],
+      }),
+    );
+    expect(readySnapshots).toEqual([[disabledEpoch2]]);
+  });
+
+  it("propagates uninstall and reinstall as a new installation at epoch one", async () => {
+    const original = installation(OWNER_A);
+    const replacement = installation(
+      OWNER_A,
+      "0198f0f4-9b72-7000-8000-000000000052",
+    );
+    let serverSnapshot = [original];
+    const coordinators = lifecycleCoordinatorPair();
+    const firstStore = createParticipantAppStore(
+      participantClient({
+        listInstallations: vi.fn(async () => serverSnapshot),
+        uninstallApp: vi.fn(async () => {
+          serverSnapshot = [];
+        }),
+        installApp: vi.fn(async () => {
+          serverSnapshot = [replacement];
+          return replacement;
+        }),
+      }),
+      coordinators[0],
+    );
+    const secondStore = createParticipantAppStore(
+      participantClient({
+        listInstallations: vi.fn(async () => serverSnapshot),
+      }),
+      coordinators[1],
+    );
+    await Promise.all([
+      firstStore.getState().bindParticipant(HUMAN_A),
+      secondStore.getState().bindParticipant(HUMAN_A),
+    ]);
+
+    await firstStore.getState().uninstallApp(original.installationId);
+    await vi.waitFor(() =>
+      expect(secondStore.getState().installations).toEqual([]),
+    );
+
+    await firstStore.getState().installApp("direct-chat");
+    await vi.waitFor(() =>
+      expect(secondStore.getState().installations).toEqual([replacement]),
+    );
+    expect(replacement.installationId).not.toBe(original.installationId);
+    expect(replacement.authorityEpoch).toBe("1");
+  });
+
+  it("forces an authoritative refresh when a document resumes", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const disabledEpoch2 = {
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+      updatedAt: 3,
+    };
+    const coordinators = lifecycleCoordinatorPair();
+    const listInstallations = vi
+      .fn<() => Promise<AppInstallation[]>>()
+      .mockResolvedValueOnce([enabledEpoch1])
+      .mockResolvedValueOnce([disabledEpoch2]);
+    const store = createParticipantAppStore(
+      participantClient({ listInstallations }),
+      coordinators[1],
+    );
+    await store.getState().bindParticipant(HUMAN_A);
+
+    coordinators[1].emitResume();
+
+    await vi.waitFor(() =>
+      expect(store.getState()).toMatchObject({
+        status: "ready",
+        installations: [disabledEpoch2],
+      }),
+    );
+    expect(listInstallations).toHaveBeenCalledTimes(2);
+  });
+
   it("never publishes a late snapshot from the previously authenticated Human", async () => {
     const ownerAResponse = deferred<AppInstallation[]>();
     const ownerBResponse = deferred<AppInstallation[]>();
@@ -329,4 +517,56 @@ function deferred<T>() {
     resolve = settle;
   });
   return { promise, resolve };
+}
+
+interface TestLifecycleCoordinator extends ParticipantAppLifecycleCoordinator {
+  emitResume(): void;
+}
+
+function lifecycleCoordinatorPair(): [
+  TestLifecycleCoordinator,
+  TestLifecycleCoordinator,
+] {
+  const tails = new Map<string, Promise<void>>();
+  const endpoints: Array<{
+    listeners: Set<(ownerKey: string) => void>;
+    resumeListeners: Set<() => void>;
+  }> = [];
+  const createEndpoint = (): TestLifecycleCoordinator => {
+    const endpoint = {
+      listeners: new Set<(ownerKey: string) => void>(),
+      resumeListeners: new Set<() => void>(),
+    };
+    endpoints.push(endpoint);
+    return {
+      runExclusive<T>(ownerKey: string, operation: () => Promise<T>) {
+        const previous = tails.get(ownerKey) ?? Promise.resolve();
+        const result = previous.then(operation, operation);
+        const tail = result.then(
+          () => undefined,
+          () => undefined,
+        );
+        tails.set(ownerKey, tail);
+        return result;
+      },
+      publishMutation(ownerKey: string) {
+        for (const candidate of endpoints) {
+          if (candidate === endpoint) continue;
+          for (const listener of candidate.listeners) listener(ownerKey);
+        }
+      },
+      subscribeMutations(listener: (ownerKey: string) => void) {
+        endpoint.listeners.add(listener);
+        return () => endpoint.listeners.delete(listener);
+      },
+      subscribeResume(listener: () => void) {
+        endpoint.resumeListeners.add(listener);
+        return () => endpoint.resumeListeners.delete(listener);
+      },
+      emitResume() {
+        for (const listener of endpoint.resumeListeners) listener();
+      },
+    };
+  };
+  return [createEndpoint(), createEndpoint()];
 }
