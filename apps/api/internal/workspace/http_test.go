@@ -669,6 +669,28 @@ func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *t
 	var created workspaceWire
 	decodeRecorder(t, createdResponse, &created)
 	assertOwnerParticipant(t, w, created, w.agentA)
+	humanOnly, err := w.store.CreateWorkspace(context.Background(), "Human-only Workspace", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalid := call(LocalWorkspacesPath, authorization.BearerToken,
+		fmt.Sprintf(`{"personality_agent_id":%q}`, otherAuthorization.PersonalityAgentID)); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("registered list accepted caller actor = %d: %s", invalid.Code, invalid.Body.String())
+	}
+	listedResponse := call(LocalWorkspacesPath, authorization.BearerToken, `{}`)
+	if listedResponse.Code != http.StatusOK {
+		t.Fatalf("registered list route = %d: %s", listedResponse.Code, listedResponse.Body.String())
+	}
+	var listed struct {
+		Workspaces []workspaceWire `json:"workspaces"`
+	}
+	decodeRecorder(t, listedResponse, &listed)
+	if len(listed.Workspaces) != 1 || listed.Workspaces[0].WorkspaceID != created.WorkspaceID {
+		t.Fatalf("authenticated actor Workspace list = %#v, want only %s", listed.Workspaces, created.WorkspaceID)
+	}
+	if listed.Workspaces[0].WorkspaceID == humanOnly.WorkspaceID {
+		t.Fatalf("authenticated actor list exposed Human-only Workspace %s", humanOnly.WorkspaceID)
+	}
 	roleCreateOmitted := call(LocalRoleCreatePath, authorization.BearerToken, fmt.Sprintf(
 		`{"workspace_id":%q,"name":"Registered omitted position","permissions":[]}`,
 		created.WorkspaceID))
