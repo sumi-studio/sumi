@@ -91,14 +91,27 @@ export type ParticipantAppLifecycleNotice =
   | ParticipantAppLifecycleUnsettledNotice
   | ParticipantAppLifecycleSettledNotice;
 
+export type ParticipantAppLifecyclePending =
+  | { state: "absent" }
+  | {
+      state: "unsettled";
+      notice: ParticipantAppLifecycleUnsettledNotice;
+    }
+  | { state: "invalid" };
+
+export type ParticipantAppLifecycleSignal =
+  | ParticipantAppLifecycleNotice
+  | {
+      ownerKey: string;
+      phase: "journal_invalid" | "journal_cleared";
+    };
+
 export interface ParticipantAppLifecycleCoordinator {
   runExclusive<T>(ownerKey: string, operation: () => Promise<T>): Promise<T>;
   publishMutation(notice: ParticipantAppLifecycleNotice): void;
-  pendingMutation(
-    ownerKey: string,
-  ): ParticipantAppLifecycleUnsettledNotice | null;
+  pendingMutation(ownerKey: string): ParticipantAppLifecyclePending;
   subscribeMutations(
-    listener: (notice: ParticipantAppLifecycleNotice) => void,
+    listener: (signal: ParticipantAppLifecycleSignal) => void,
   ): () => void;
   subscribeResume(listener: () => void): () => void;
 }
@@ -127,7 +140,7 @@ function createIsolatedLifecycleCoordinator(): ParticipantAppLifecycleCoordinato
     },
     publishMutation() {},
     pendingMutation() {
-      return null;
+      return { state: "absent" };
     },
     subscribeMutations() {
       return () => undefined;
@@ -140,7 +153,7 @@ function createIsolatedLifecycleCoordinator(): ParticipantAppLifecycleCoordinato
 
 function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator {
   const mutationListeners = new Set<
-    (notice: ParticipantAppLifecycleNotice) => void
+    (signal: ParticipantAppLifecycleSignal) => void
   >();
   const resumeListeners = new Set<() => void>();
   const deliveredNoticeKeys = new Set<string>();
@@ -150,8 +163,15 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
       ? new globalThis.BroadcastChannel(participantAppLifecycleChannel)
       : null;
 
-  const emitMutation = (notice: ParticipantAppLifecycleNotice) => {
-    const key = `${notice.operationId}:${notice.phase}`;
+  const emitMutation = (signal: ParticipantAppLifecycleSignal) => {
+    if (!("operationId" in signal)) {
+      // Invalid/cleared evidence is exceptional state, not a replayable
+      // operation notice. Never suppress a later invalid transition after an
+      // explicit recovery cleared an earlier entry.
+      for (const listener of mutationListeners) listener(signal);
+      return;
+    }
+    const key = `${signal.ownerKey}:${signal.operationId}:${signal.phase}`;
     if (deliveredNoticeKeys.has(key)) return;
     deliveredNoticeKeys.add(key);
     deliveredNoticeOrder.push(key);
@@ -159,7 +179,7 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
       const expired = deliveredNoticeOrder.shift();
       if (expired) deliveredNoticeKeys.delete(expired);
     }
-    for (const listener of mutationListeners) listener(notice);
+    for (const listener of mutationListeners) listener(signal);
   };
 
   channel?.addEventListener("message", (event: MessageEvent<unknown>) => {
@@ -168,18 +188,33 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
   });
 
   globalThis.window?.addEventListener("storage", (event: StorageEvent) => {
-    if (!event.key?.startsWith(participantAppLifecycleStoragePrefix)) return;
-    const unsettled = mutationNotice(event.newValue ?? event.oldValue);
-    if (unsettled?.phase !== "unsettled") return;
+    const ownerKey = lifecycleStorageOwnerKey(event.key);
+    if (!ownerKey) return;
+    if (event.newValue === null) {
+      const previous = inspectParticipantAppLifecycleJournal(
+        ownerKey,
+        event.oldValue,
+      );
+      emitMutation(
+        previous.state === "unsettled"
+          ? {
+              version: 2,
+              ownerKey,
+              operationId: previous.notice.operationId,
+              phase: "settled",
+            }
+          : { ownerKey, phase: "journal_cleared" },
+      );
+      return;
+    }
+    const current = inspectParticipantAppLifecycleJournal(
+      ownerKey,
+      event.newValue,
+    );
     emitMutation(
-      event.newValue === null
-        ? {
-            version: 2,
-            ownerKey: unsettled.ownerKey,
-            operationId: unsettled.operationId,
-            phase: "settled",
-          }
-        : unsettled,
+      current.state === "unsettled"
+        ? current.notice
+        : { ownerKey, phase: "journal_invalid" },
     );
   });
 
@@ -223,16 +258,23 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
       const { channel: availableChannel, storage } = requireCoordination();
       const key = storageKey(notice.ownerKey);
       if (notice.phase === "unsettled") {
+        const current = readLifecycleJournal(storage, notice.ownerKey, key);
+        if (current.state !== "absent") {
+          throw lifecycleJournalInvalidError();
+        }
         // This synchronous journal write is the durable hand-off point. A
         // renderer may die after it returns; another same-origin document can
         // still take over the exact idempotent intent under the owner lock.
         storage.setItem(key, JSON.stringify(notice));
       } else {
-        const pending = mutationNotice(storage.getItem(key));
-        if (
-          pending?.phase === "unsettled" &&
-          pending.operationId === notice.operationId
-        ) {
+        const current = readLifecycleJournal(storage, notice.ownerKey, key);
+        if (current.state === "invalid") {
+          throw lifecycleJournalInvalidError();
+        }
+        if (current.state === "unsettled") {
+          if (current.notice.operationId !== notice.operationId) {
+            throw lifecycleJournalInvalidError();
+          }
           storage.removeItem(key);
         }
       }
@@ -240,13 +282,10 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
     },
     pendingMutation(ownerKey: string) {
       const { storage } = requireCoordination();
-      const notice = mutationNotice(storage.getItem(storageKey(ownerKey)));
-      return notice?.phase === "unsettled" && notice.ownerKey === ownerKey
-        ? notice
-        : null;
+      return readLifecycleJournal(storage, ownerKey, storageKey(ownerKey));
     },
     subscribeMutations(
-      listener: (notice: ParticipantAppLifecycleNotice) => void,
+      listener: (signal: ParticipantAppLifecycleSignal) => void,
     ) {
       mutationListeners.add(listener);
       return () => mutationListeners.delete(listener);
@@ -256,6 +295,57 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
       return () => resumeListeners.delete(listener);
     },
   };
+}
+
+function lifecycleStorageOwnerKey(key: string | null): string | null {
+  if (!key?.startsWith(participantAppLifecycleStoragePrefix)) return null;
+  try {
+    const ownerKey = decodeURIComponent(
+      key.slice(participantAppLifecycleStoragePrefix.length),
+    );
+    return ownerKey.length > 0 && ownerKey.length <= 512 ? ownerKey : null;
+  } catch {
+    return null;
+  }
+}
+
+function readLifecycleJournal(
+  storage: Storage,
+  ownerKey: string,
+  key: string,
+): ParticipantAppLifecyclePending {
+  let raw: string | null;
+  try {
+    raw = storage.getItem(key);
+  } catch (cause) {
+    throw new Error(
+      "Participant app lifecycle recovery evidence cannot be read",
+      { cause },
+    );
+  }
+  return inspectParticipantAppLifecycleJournal(ownerKey, raw);
+}
+
+/** @internal Exported so the durable wire parser can be regression-tested. */
+export function inspectParticipantAppLifecycleJournal(
+  ownerKey: string,
+  raw: string | null,
+): ParticipantAppLifecyclePending {
+  if (raw === null) return { state: "absent" };
+  const notice = mutationNotice(raw);
+  if (notice?.phase !== "unsettled" || notice.ownerKey !== ownerKey) {
+    // Presence is evidence that a renderer may have issued an effect. Invalid
+    // evidence is never absence: do not delete or overwrite it, and do not
+    // publish a plain read. A different signed-in Participant addresses a
+    // different owner-keyed journal. Same-owner cleanup must be an explicit
+    // out-of-band action after establishing that no effect remains in flight.
+    return { state: "invalid" };
+  }
+  return { state: "unsettled", notice };
+}
+
+function lifecycleJournalInvalidError(): Error {
+  return new Error("Participant app lifecycle recovery evidence is invalid");
 }
 
 function mutationNotice(value: unknown): ParticipantAppLifecycleNotice | null {
@@ -284,12 +374,28 @@ function mutationNotice(value: unknown): ParticipantAppLifecycleNotice | null {
     return null;
   }
   if (notice.phase === "settled") {
+    if (
+      !hasExactKeys(notice, ["version", "ownerKey", "operationId", "phase"])
+    ) {
+      return null;
+    }
     return {
       version: 2,
       ownerKey: notice.ownerKey,
       operationId: notice.operationId,
       phase: "settled",
     };
+  }
+  if (
+    !hasExactKeys(notice, [
+      "version",
+      "ownerKey",
+      "operationId",
+      "phase",
+      "intent",
+    ])
+  ) {
+    return null;
   }
   const intent = lifecycleIntent(notice.intent);
   if (!intent) return null;
@@ -307,15 +413,25 @@ function lifecycleIntent(value: unknown): ParticipantAppLifecycleIntent | null {
     return null;
   }
   const intent = value as Record<string, unknown>;
-  if (intent.kind === "install" && validAppID(intent.appId)) {
+  if (
+    intent.kind === "install" &&
+    hasExactKeys(intent, ["kind", "appId"]) &&
+    validAppID(intent.appId)
+  ) {
     return { kind: "install", appId: intent.appId };
   }
   if (
     intent.kind === "set_state" &&
+    hasExactKeys(intent, [
+      "kind",
+      "installationId",
+      "appId",
+      "expectedAuthorityEpoch",
+      "state",
+    ]) &&
     validInstallationID(intent.installationId) &&
     validAppID(intent.appId) &&
-    typeof intent.expectedAuthorityEpoch === "string" &&
-    /^[1-9][0-9]{0,18}$/.test(intent.expectedAuthorityEpoch) &&
+    validAuthorityEpoch(intent.expectedAuthorityEpoch) &&
     (intent.state === "enabled" || intent.state === "disabled")
   ) {
     return {
@@ -328,11 +444,23 @@ function lifecycleIntent(value: unknown): ParticipantAppLifecycleIntent | null {
   }
   if (
     intent.kind === "uninstall" &&
+    hasExactKeys(intent, ["kind", "installationId"]) &&
     validInstallationID(intent.installationId)
   ) {
     return { kind: "uninstall", installationId: intent.installationId };
   }
   return null;
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const keys = Object.keys(value);
+  return (
+    keys.length === expected.length &&
+    expected.every((key) => Object.hasOwn(value, key))
+  );
 }
 
 function validAppID(value: unknown): value is string {
@@ -350,6 +478,14 @@ function validInstallationID(value: unknown): value is string {
     /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
       value,
     )
+  );
+}
+
+function validAuthorityEpoch(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9][0-9]{0,18}$/.test(value) &&
+    BigInt(value) <= 9_223_372_036_854_775_807n
   );
 }
 
@@ -478,10 +614,10 @@ export function createParticipantAppStore(
       set((state) => ({
         mutation: null,
         errorCode:
-          error !== undefined
-            ? errorCode(error)
-            : state.status === "error"
-              ? state.errorCode
+          state.status === "error"
+            ? state.errorCode
+            : error !== undefined
+              ? errorCode(error)
               : null,
       }));
     };
@@ -497,7 +633,7 @@ export function createParticipantAppStore(
         phase: "unsettled",
         intent,
       };
-      rememberUnsettledOperation(notice.operationId);
+      rememberUnsettledOperation(notice.ownerKey, notice.operationId);
       // Record the exact intent before the synchronous durable announcement.
       // If publishing partly succeeds and then throws, reconciliation still
       // takes over this operation instead of performing an unsafe plain read.
@@ -526,7 +662,11 @@ export function createParticipantAppStore(
       try {
         switch (intent.kind) {
           case "install": {
-            const response = await client.installApp(owner, intent.appId);
+            const response = await client.installApp(
+              owner,
+              intent.appId,
+              notice.operationId,
+            );
             validateInstallation(owner, response, intent.appId);
             break;
           }
@@ -560,15 +700,29 @@ export function createParticipantAppStore(
       ownerKey: string,
     ): Promise<boolean> => {
       const pending = lifecycleCoordinator.pendingMutation(ownerKey);
-      if (!pending) return false;
-      await replayLifecycleIntent(owner, pending);
+      if (pending.state === "absent") return false;
+      if (pending.state === "invalid") {
+        throw lifecycleJournalInvalidError();
+      }
+      await replayLifecycleIntent(owner, pending.notice);
       return true;
     };
 
-    function rememberUnsettledOperation(operationId: string): void {
-      if (observedUnsettledOperations.has(operationId)) return;
-      observedUnsettledOperations.add(operationId);
-      observedUnsettledOperationOrder.push(operationId);
+    function observedUnsettledOperationKey(
+      ownerKey: string,
+      operationId: string,
+    ): string {
+      return `${ownerKey}:${operationId}`;
+    }
+
+    function rememberUnsettledOperation(
+      ownerKey: string,
+      operationId: string,
+    ): void {
+      const key = observedUnsettledOperationKey(ownerKey, operationId);
+      if (observedUnsettledOperations.has(key)) return;
+      observedUnsettledOperations.add(key);
+      observedUnsettledOperationOrder.push(key);
       if (observedUnsettledOperationOrder.length > 256) {
         const expired = observedUnsettledOperationOrder.shift();
         if (expired) observedUnsettledOperations.delete(expired);
@@ -672,18 +826,32 @@ export function createParticipantAppStore(
         ? undefined
         : error;
 
-    lifecycleCoordinator.subscribeMutations((notice) => {
-      if (notice.phase === "unsettled") {
-        if (observedUnsettledOperations.has(notice.operationId)) return;
-        rememberUnsettledOperation(notice.operationId);
-        void invalidateSnapshotAndRefresh(notice.ownerKey);
+    lifecycleCoordinator.subscribeMutations((signal) => {
+      if (!("operationId" in signal)) {
+        void invalidateSnapshotAndRefresh(signal.ownerKey);
+        return;
+      }
+      if (signal.phase === "unsettled") {
+        const operationKey = observedUnsettledOperationKey(
+          signal.ownerKey,
+          signal.operationId,
+        );
+        if (observedUnsettledOperations.has(operationKey)) return;
+        rememberUnsettledOperation(signal.ownerKey, signal.operationId);
+        void invalidateSnapshotAndRefresh(signal.ownerKey);
         return;
       }
       // The unsettled event already queued a load behind the owner lock. Its
       // settled counterpart only removes the durable journal; queuing another
       // read here would create a duplicate refresh storm.
-      if (observedUnsettledOperations.has(notice.operationId)) return;
-      void invalidateSnapshotAndRefresh(notice.ownerKey);
+      if (
+        observedUnsettledOperations.has(
+          observedUnsettledOperationKey(signal.ownerKey, signal.operationId),
+        )
+      ) {
+        return;
+      }
+      void invalidateSnapshotAndRefresh(signal.ownerKey);
     });
     lifecycleCoordinator.subscribeResume(() => {
       void invalidateSnapshotAndRefresh();
@@ -772,7 +940,11 @@ export function createParticipantAppStore(
             });
             let response: AppInstallation;
             try {
-              response = await client.installApp(owner, appId);
+              response = await client.installApp(
+                owner,
+                appId,
+                notice.operationId,
+              );
             } catch (error) {
               if (definitiveLifecycleRejection(error)) {
                 settleLifecycleIntent(notice);
@@ -989,10 +1161,13 @@ function replayConverged(
   if (!(error instanceof WorkspaceAPIError)) return false;
   switch (intent.kind) {
     case "install":
-      // PostgreSQL's exact owner/app uniqueness check waits for a competing
-      // insert to finish. Conflict therefore proves some replay/orphan has
-      // committed the desired installed truth.
-      return error.status === 409 && error.code === "conflict";
+      // Only this exact operation's durable terminal receipt is convergence.
+      // A generic owner/app conflict can disappear before a delayed orphan
+      // reaches the server and therefore cannot settle this journal.
+      return (
+        error.status === 409 &&
+        error.code === "install_intent_already_installed"
+      );
     case "set_state":
       // A stale epoch is checked by the row update after it serializes against
       // any orphan update. Not-found proves the exact binding cannot later be

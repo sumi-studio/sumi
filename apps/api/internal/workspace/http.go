@@ -393,14 +393,20 @@ func writeDomainError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrAlreadyMember), errors.Is(err, ErrRoleNameTaken),
 		errors.Is(err, applicationapps.ErrAlreadyInstalled):
 		writeAPIError(w, http.StatusConflict, "conflict")
+	case errors.Is(err, applicationapps.ErrInstallIntentAlreadyInstalled):
+		writeAPIError(w, http.StatusConflict, "install_intent_already_installed")
+	case errors.Is(err, applicationapps.ErrInstallIntentMismatch):
+		writeAPIError(w, http.StatusConflict, "idempotency_conflict")
 	case errors.Is(err, applicationapps.ErrAuthorityEpochStale):
 		writeAPIError(w, http.StatusConflict, "stale_authority")
 	case errors.Is(err, ErrInvalidName), errors.Is(err, ErrInvalidColor),
 		errors.Is(err, ErrInvalidPosition), errors.Is(err, ErrInvalidPermission),
 		errors.Is(err, ErrInvalidInvite), errors.Is(err, ErrInvalidWorkspaceListCursor),
-		errors.Is(err, applicationapps.ErrOwnerKindUnsupported):
+		errors.Is(err, applicationapps.ErrOwnerKindUnsupported),
+		errors.Is(err, applicationapps.ErrInstallOperationInvalid):
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
-	case errors.Is(err, directchat.ErrLifecycleFenceUnavailable):
+	case errors.Is(err, directchat.ErrLifecycleFenceUnavailable),
+		errors.Is(err, applicationapps.ErrInstallIntentIncomplete):
 		writeAPIError(w, http.StatusServiceUnavailable, "unavailable")
 	default:
 		writeAPIError(w, http.StatusInternalServerError, "internal_error")

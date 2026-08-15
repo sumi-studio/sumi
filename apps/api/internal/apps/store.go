@@ -9,13 +9,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/canonicalid"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
-const workspaceManageAppsPermission = "manage_apps"
+const (
+	workspaceManageAppsPermission     = "manage_apps"
+	appInstallationOwnerAppConstraint = "app_installations_owner_kind_owner_id_app_id_key"
+)
 
 // WorkspaceAuthorizer keeps app lifecycle dependent on Workspace's canonical
 // commit-time authorization without moving app vocabulary into Workspace.
@@ -332,6 +336,21 @@ func (s *Store) Installations(ctx context.Context, owner OwnerRef, actor partici
 }
 
 func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.Ref, appID string) (Installation, error) {
+	return s.install(ctx, owner, actor, appID, "")
+}
+
+// InstallAtOperation applies one durable browser install intent. Its receipt
+// survives uninstall, so a delayed request with the same operation id can
+// return only the historical terminal outcome and can never recreate a
+// removed installation.
+func (s *Store) InstallAtOperation(ctx context.Context, owner OwnerRef, actor participant.Ref, appID, operationID string) (Installation, error) {
+	if err := ValidateInstallOperationID(operationID); err != nil {
+		return Installation{}, err
+	}
+	return s.install(ctx, owner, actor, appID, operationID)
+}
+
+func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.Ref, appID, operationID string) (Installation, error) {
 	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
 	if err != nil {
 		return Installation{}, err
@@ -344,6 +363,21 @@ func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.R
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if err := s.authorizeMutation(ctx, tx, owner, actor); err != nil {
 		return Installation{}, err
+	}
+	if operationID != "" {
+		// A terminal receipt is the historical truth for this exact operation,
+		// even if the catalog has changed since the original request. Read it
+		// before current descriptor validation. If no receipt exists, the later
+		// atomic claim still resolves a concurrent first request.
+		historical, receiptErr := readInstallOperationReceipt(
+			ctx, tx, owner, appID, operationID,
+		)
+		if receiptErr == nil {
+			return historical, nil
+		}
+		if !errors.Is(receiptErr, pgx.ErrNoRows) {
+			return Installation{}, receiptErr
+		}
 	}
 	descriptor, err := descriptorByID(ctx, tx, appID)
 	if err != nil {
@@ -358,22 +392,218 @@ func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.R
 		State: StateEnabled, AuthorityEpoch: 1, InstalledAt: now, UpdatedAt: now,
 	}
 	storageKind, storageID := ownerStorageKey(owner)
-	_, err = tx.Exec(ctx, `
+	if operationID == "" {
+		_, err = tx.Exec(ctx, `
 		INSERT INTO app_installations
 			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
 			 installed_at, updated_at)
 		VALUES ($1, $2, $3, $4, true, 1, $5, $5)`,
-		installation.InstallationID, storageKind, storageID, appID, now)
-	if err != nil {
-		if isUniqueViolation(err) {
-			return Installation{}, ErrAlreadyInstalled
+			installation.InstallationID, storageKind, storageID, appID, now)
+		if err != nil {
+			if isUniqueConstraint(err, appInstallationOwnerAppConstraint) {
+				return Installation{}, ErrAlreadyInstalled
+			}
+			return Installation{}, fmt.Errorf("insert app installation: %w", err)
 		}
-		return Installation{}, fmt.Errorf("insert app installation: %w", err)
+		if err := tx.Commit(ctx); err != nil {
+			return Installation{}, fmt.Errorf("commit install app: %w", err)
+		}
+		return installation, nil
+	}
+
+	claimed, historical, err := claimInstallOperation(ctx, tx, owner, appID, operationID, now)
+	if err != nil {
+		return Installation{}, err
+	}
+	if !claimed {
+		return historical, nil
+	}
+
+	row := tx.QueryRow(ctx, `
+		INSERT INTO app_installations
+			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
+			 installed_at, updated_at)
+		VALUES ($1, $2, $3, $4, true, 1, $5, $5)
+		ON CONFLICT ON CONSTRAINT app_installations_owner_kind_owner_id_app_id_key
+		DO NOTHING
+		RETURNING installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
+		          installed_at, updated_at`,
+		installation.InstallationID, storageKind, storageID, appID, now)
+	installation, err = scanInstallation(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := completeInstallOperationAlreadyInstalled(
+			ctx, tx, storageKind, storageID, operationID, now,
+		); err != nil {
+			return Installation{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Installation{}, fmt.Errorf("commit existing app install intent: %w", err)
+		}
+		return Installation{}, ErrInstallIntentAlreadyInstalled
+	}
+	if err != nil {
+		// In particular, an installation_id primary-key collision is not the
+		// owner/app convergence condition and rolls the receipt back with this
+		// transaction instead of being mislabeled AlreadyInstalled.
+		return Installation{}, fmt.Errorf("insert exact app installation: %w", err)
+	}
+	if err := completeInstallOperationInstalled(
+		ctx, tx, storageKind, storageID, operationID, installation, now,
+	); err != nil {
+		return Installation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Installation{}, fmt.Errorf("commit install app: %w", err)
+		return Installation{}, fmt.Errorf("commit exact app install intent: %w", err)
 	}
 	return installation, nil
+}
+
+func claimInstallOperation(
+	ctx context.Context,
+	tx pgx.Tx,
+	owner OwnerRef,
+	appID string,
+	operationID string,
+	now time.Time,
+) (bool, Installation, error) {
+	storageKind, storageID := ownerStorageKey(owner)
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO app_install_operation_receipts
+			(owner_kind, owner_id, operation_id, app_id, status, created_at)
+		VALUES ($1, $2, $3, $4, 'pending', $5)
+		ON CONFLICT (owner_kind, owner_id, operation_id) DO NOTHING`,
+		storageKind, storageID, operationID, appID, now)
+	if err != nil {
+		return false, Installation{}, fmt.Errorf("claim app install operation: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return true, Installation{}, nil
+	}
+	installation, err := readInstallOperationReceipt(
+		ctx, tx, owner, appID, operationID,
+	)
+	return false, installation, err
+}
+
+func readInstallOperationReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	owner OwnerRef,
+	appID string,
+	operationID string,
+) (Installation, error) {
+	storageKind, storageID := ownerStorageKey(owner)
+	var (
+		receiptAppID   string
+		status         string
+		installationID pgtype.Text
+		enabled        pgtype.Bool
+		authorityEpoch pgtype.Int8
+		installedAt    pgtype.Timestamptz
+		updatedAt      pgtype.Timestamptz
+		completedAt    pgtype.Timestamptz
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT app_id, status, installation_id::text, enabled, authority_epoch,
+		       installed_at, updated_at, completed_at
+		FROM app_install_operation_receipts
+		WHERE owner_kind = $1 AND owner_id = $2 AND operation_id = $3`,
+		storageKind, storageID, operationID,
+	).Scan(
+		&receiptAppID, &status, &installationID, &enabled, &authorityEpoch,
+		&installedAt, &updatedAt, &completedAt,
+	)
+	if err != nil {
+		return Installation{}, fmt.Errorf("read app install operation receipt: %w", err)
+	}
+	if receiptAppID != appID {
+		return Installation{}, ErrInstallIntentMismatch
+	}
+	resultPresent := installationID.Valid || enabled.Valid || authorityEpoch.Valid ||
+		installedAt.Valid || updatedAt.Valid
+	switch status {
+	case "pending":
+		if resultPresent || completedAt.Valid {
+			return Installation{}, fmt.Errorf("%w: malformed pending receipt", ErrInstallIntentIncomplete)
+		}
+		return Installation{}, ErrInstallIntentIncomplete
+	case "already_installed":
+		if resultPresent || !completedAt.Valid {
+			return Installation{}, fmt.Errorf("%w: malformed existing receipt", ErrInstallIntentIncomplete)
+		}
+		return Installation{}, ErrInstallIntentAlreadyInstalled
+	case "installed":
+		if !installationID.Valid || !isCanonicalUUIDv7(installationID.String) ||
+			!enabled.Valid || !enabled.Bool ||
+			!authorityEpoch.Valid || authorityEpoch.Int64 != 1 ||
+			!installedAt.Valid || !updatedAt.Valid || !completedAt.Valid ||
+			!updatedAt.Time.Equal(installedAt.Time) {
+			return Installation{}, fmt.Errorf("%w: malformed installed receipt", ErrInstallIntentIncomplete)
+		}
+		return Installation{
+			InstallationID: installationID.String,
+			Owner:          owner,
+			AppID:          appID,
+			State:          StateEnabled,
+			AuthorityEpoch: authorityEpoch.Int64,
+			InstalledAt:    installedAt.Time,
+			UpdatedAt:      updatedAt.Time,
+		}, nil
+	default:
+		return Installation{}, fmt.Errorf("%w: unknown receipt status", ErrInstallIntentIncomplete)
+	}
+}
+
+func completeInstallOperationAlreadyInstalled(
+	ctx context.Context,
+	tx pgx.Tx,
+	storageKind string,
+	storageID string,
+	operationID string,
+	now time.Time,
+) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE app_install_operation_receipts
+		SET status = 'already_installed', completed_at = $4
+		WHERE owner_kind = $1 AND owner_id = $2 AND operation_id = $3
+		  AND status = 'pending'`,
+		storageKind, storageID, operationID, now)
+	if err != nil {
+		return fmt.Errorf("complete existing app install operation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: pending receipt disappeared", ErrInstallIntentIncomplete)
+	}
+	return nil
+}
+
+func completeInstallOperationInstalled(
+	ctx context.Context,
+	tx pgx.Tx,
+	storageKind string,
+	storageID string,
+	operationID string,
+	installation Installation,
+	completedAt time.Time,
+) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE app_install_operation_receipts
+		SET status = 'installed', installation_id = $4, enabled = $5,
+		    authority_epoch = $6, installed_at = $7, updated_at = $8,
+		    completed_at = $9
+		WHERE owner_kind = $1 AND owner_id = $2 AND operation_id = $3
+		  AND status = 'pending'`,
+		storageKind, storageID, operationID,
+		installation.InstallationID, installation.State == StateEnabled,
+		installation.AuthorityEpoch, installation.InstalledAt, installation.UpdatedAt,
+		completedAt)
+	if err != nil {
+		return fmt.Errorf("complete app install operation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: pending receipt disappeared", ErrInstallIntentIncomplete)
+	}
+	return nil
 }
 
 func (s *Store) SetEnabled(ctx context.Context, owner OwnerRef, actor participant.Ref, appID string, enabled bool) (Installation, error) {
@@ -737,7 +967,8 @@ func isCanonicalUUIDv7(value string) bool {
 	return canonicalid.IsUUIDv7(value)
 }
 
-func isUniqueViolation(err error) bool {
+func isUniqueConstraint(err error, constraint string) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		pgErr.ConstraintName == constraint
 }

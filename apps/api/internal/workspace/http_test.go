@@ -37,6 +37,10 @@ func TestWorkspaceDomainErrorsExposeCanonicalCodes(t *testing.T) {
 		{"last administrator", ErrLastAdministrator, http.StatusConflict, "last_administrator"},
 		{"generic conflict", ErrRoleNameTaken, http.StatusConflict, "conflict"},
 		{"invalid Workspace list cursor", ErrInvalidWorkspaceListCursor, http.StatusBadRequest, "invalid_request"},
+		{"install intent existing", applicationapps.ErrInstallIntentAlreadyInstalled, http.StatusConflict, "install_intent_already_installed"},
+		{"install intent mismatch", applicationapps.ErrInstallIntentMismatch, http.StatusConflict, "idempotency_conflict"},
+		{"install intent incomplete", applicationapps.ErrInstallIntentIncomplete, http.StatusServiceUnavailable, "unavailable"},
+		{"invalid install operation", applicationapps.ErrInstallOperationInvalid, http.StatusBadRequest, "invalid_request"},
 		{"stale app authority", applicationapps.ErrAuthorityEpochStale, http.StatusConflict, "stale_authority"},
 		{"direct-chat lifecycle unavailable", directchat.ErrLifecycleFenceUnavailable, http.StatusServiceUnavailable, "unavailable"},
 	}
@@ -489,11 +493,40 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		t.Fatalf("oversized Agent role position = %d: %s", invalid.Code, invalid.Body.String())
 	}
 
+	for label, operation := range map[string]string{
+		"empty": `""`,
+		"null":  `null`,
+	} {
+		invalid := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
+			`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":%s}`,
+			humanWorkspace.WorkspaceID, operation))
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("%s install operation id = %d, body=%s",
+				label, invalid.Code, invalid.Body.String())
+		}
+	}
+	const humanInstallOperation = "00000000-0000-4000-8000-000000000201"
 	humanInstall := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
-		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
-		humanWorkspace.WorkspaceID))
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":%q}`,
+		humanWorkspace.WorkspaceID, humanInstallOperation))
 	if humanInstall.Code != http.StatusCreated {
 		t.Fatalf("Human app install status = %d, body=%s", humanInstall.Code, humanInstall.Body.String())
+	}
+	humanInstallReplay := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":%q}`,
+		humanWorkspace.WorkspaceID, humanInstallOperation))
+	if humanInstallReplay.Code != http.StatusCreated ||
+		humanInstallReplay.Body.String() != humanInstall.Body.String() {
+		t.Fatalf("Human app install replay = %d, body=%s; original=%s",
+			humanInstallReplay.Code, humanInstallReplay.Body.String(), humanInstall.Body.String())
+	}
+	humanInstallMismatch := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"missing-app","operation_id":%q}`,
+		humanWorkspace.WorkspaceID, humanInstallOperation))
+	if humanInstallMismatch.Code != http.StatusConflict ||
+		!strings.Contains(humanInstallMismatch.Body.String(), `"idempotency_conflict"`) {
+		t.Fatalf("Human app install operation mismatch = %d, body=%s",
+			humanInstallMismatch.Code, humanInstallMismatch.Body.String())
 	}
 	agentInstall := invokeLocal(server.localInstallApp, fmt.Sprintf(
 		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
@@ -512,6 +545,18 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		}
 		installations[label] = installation
 	}
+	for label, epoch := range map[string]string{
+		"empty": `""`,
+		"null":  `null`,
+	} {
+		invalid := browserCall(mux, http.MethodPut,
+			"/app-installations/"+installations["Human"].InstallationID+"/state",
+			fmt.Sprintf(`{"state":"disabled","expected_authority_epoch":%s}`, epoch))
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("%s authority epoch = %d, body=%s",
+				label, invalid.Code, invalid.Body.String())
+		}
+	}
 	humanDisable := browserCall(mux, http.MethodPut,
 		"/app-installations/"+installations["Human"].InstallationID+"/state",
 		`{"state":"disabled","expected_authority_epoch":"1"}`)
@@ -525,6 +570,14 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		!strings.Contains(humanDisableReplay.Body.String(), `"stale_authority"`) {
 		t.Fatalf("stale Human app replay status = %d, body=%s",
 			humanDisableReplay.Code, humanDisableReplay.Body.String())
+	}
+	humanLegacyEnable := browserCall(mux, http.MethodPut,
+		"/app-installations/"+installations["Human"].InstallationID+"/state",
+		`{"state":"enabled"}`)
+	if humanLegacyEnable.Code != http.StatusOK ||
+		!strings.Contains(humanLegacyEnable.Body.String(), `"state":"enabled"`) {
+		t.Fatalf("omitted Human authority epoch status = %d, body=%s",
+			humanLegacyEnable.Code, humanLegacyEnable.Body.String())
 	}
 	agentDisable := invokeLocal(server.localSetAppEnabled, fmt.Sprintf(
 		`{"installation_id":%q,"enabled":false}`, installations["Agent"].InstallationID),
