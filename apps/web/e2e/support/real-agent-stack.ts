@@ -35,6 +35,9 @@ const generation = "7";
 const firebaseProjectID = "sumi-studio";
 const firebaseWebAPIKey = "sumi-direct-chat-e2e-public-key";
 const firebaseWebAppID = "1:000000000000:web:0000000000000000000000";
+const invitationListToolCallID = "call-real-agent-invitation-list";
+const invitationAcceptToolCallID = "call-real-agent-invitation-accept";
+const workspaceListToolCallID = "call-real-agent-workspace-list";
 const executorToolCallID = "call-real-agent-list-dir";
 const executorAuthorityProbeContents = "exact executor authority probe\n";
 
@@ -61,6 +64,12 @@ export class LoopbackChatProvider {
   requestCount = 0;
   contextVerified = false;
   executorToolVerified = false;
+  invitationListVerified = false;
+  invitationAcceptVerified = false;
+  workspaceMembershipVerified = false;
+  invitationID: string | undefined;
+  workspaceID: string | undefined;
+  workspaceName: string | undefined;
   url = "";
 
   private readonly apiKey: string;
@@ -129,18 +138,118 @@ export class LoopbackChatProvider {
           !hasExactConversation(messages, [
             { role: "user", text: firstUserMessage },
           ]) ||
+          !hasProviderTool(raw.tools, "workspace_invitation_list") ||
+          !hasProviderTool(raw.tools, "workspace_invitation_accept") ||
+          !hasProviderTool(raw.tools, "workspace_list") ||
           !hasProviderTool(raw.tools, "list_dir")
         ) {
           respondJSON(response, 422, {
-            error: "turn_one_user_or_list_dir_missing",
+            error: "turn_one_user_or_workspace_tools_missing",
           });
           return;
         }
-        respondToolCallSSE(response, turn);
+        respondToolCallSSE(
+          response,
+          turn,
+          invitationListToolCallID,
+          "workspace_invitation_list",
+          {},
+        );
         return;
       }
       if (turn === 2) {
-        if (!hasExactExecutorRoundTrip(messages)) {
+        const listResult = exactToolResultJSON(
+          messages,
+          invitationListToolCallID,
+          "workspace_invitation_list",
+          {},
+        );
+        const invitation = exactSingleInvitation(listResult);
+        if (
+          !hasExactConversation(messages, [
+            { role: "user", text: firstUserMessage },
+          ]) ||
+          !invitation
+        ) {
+          respondJSON(response, 422, {
+            error: "exact_targeted_invitation_list_result_missing",
+          });
+          return;
+        }
+        this.invitationID = invitation.invitationID;
+        this.workspaceID = invitation.workspaceID;
+        this.workspaceName = invitation.workspaceName;
+        this.invitationListVerified = true;
+        respondToolCallSSE(
+          response,
+          turn,
+          invitationAcceptToolCallID,
+          "workspace_invitation_accept",
+          { invitation_id: invitation.invitationID },
+        );
+        return;
+      }
+      if (turn === 3) {
+        const acceptResult = exactToolResultJSON(
+          messages,
+          invitationAcceptToolCallID,
+          "workspace_invitation_accept",
+          { invitation_id: this.invitationID },
+        );
+        if (
+          !this.workspaceID ||
+          !exactAcceptedMembership(acceptResult, this.workspaceID)
+        ) {
+          respondJSON(response, 422, {
+            error: "exact_targeted_invitation_accept_result_missing",
+          });
+          return;
+        }
+        this.invitationAcceptVerified = true;
+        respondToolCallSSE(
+          response,
+          turn,
+          workspaceListToolCallID,
+          "workspace_list",
+          {},
+        );
+        return;
+      }
+      if (turn === 4) {
+        const workspaceListResult = exactToolResultJSON(
+          messages,
+          workspaceListToolCallID,
+          "workspace_list",
+          {},
+        );
+        if (
+          !this.workspaceID ||
+          !this.workspaceName ||
+          !exactWorkspaceMembershipList(
+            workspaceListResult,
+            this.workspaceID,
+            this.workspaceName,
+          )
+        ) {
+          respondJSON(response, 422, {
+            error: "exact_workspace_membership_list_result_missing",
+          });
+          return;
+        }
+        this.workspaceMembershipVerified = true;
+        respondToolCallSSE(response, turn, executorToolCallID, "list_dir", {
+          path: ".",
+        });
+        return;
+      }
+      if (turn === 5) {
+        const executorResult = exactToolResultContent(
+          messages,
+          executorToolCallID,
+          "list_dir",
+          { path: "." },
+        );
+        if (executorResult !== executorAuthorityProbeFile) {
           respondJSON(response, 422, {
             error: "exact_executor_result_missing",
           });
@@ -150,7 +259,7 @@ export class LoopbackChatProvider {
         respondSSE(response, turn, firstProviderResponse);
         return;
       }
-      if (turn === 3) {
+      if (turn === 6) {
         if (
           !hasExactConversation(messages, [
             { role: "user", text: firstUserMessage },
@@ -177,6 +286,7 @@ export class LoopbackChatProvider {
 }
 
 class LoopbackReviewerProvider {
+  readonly requests: Record<string, unknown>[] = [];
   requestCount = 0;
   url = "";
 
@@ -234,6 +344,7 @@ class LoopbackReviewerProvider {
         respondJSON(response, 422, { error: "invalid_reviewer_request" });
         return;
       }
+      this.requests.push(raw);
       this.requestCount++;
       respondSSE(response, this.requestCount, this.responseText, this.model);
     } catch {
@@ -255,6 +366,7 @@ export class RealAgentStack {
   private readonly sessionCookie: string;
   private readonly children: ManagedProcess[];
   private readonly executionReviewerProvider: LoopbackReviewerProvider;
+  private readonly escalationReviewerProvider: LoopbackReviewerProvider;
   private readonly reviewerProviders: LoopbackReviewerProvider[];
   private stopped = false;
 
@@ -266,6 +378,7 @@ export class RealAgentStack {
     sessionCookie,
     children,
     executionReviewerProvider,
+    escalationReviewerProvider,
     reviewerProviders,
   }: {
     apiURL: string;
@@ -275,6 +388,7 @@ export class RealAgentStack {
     sessionCookie: string;
     children: ManagedProcess[];
     executionReviewerProvider: LoopbackReviewerProvider;
+    escalationReviewerProvider: LoopbackReviewerProvider;
     reviewerProviders: LoopbackReviewerProvider[];
   }) {
     this.apiURL = apiURL;
@@ -284,11 +398,20 @@ export class RealAgentStack {
     this.sessionCookie = sessionCookie;
     this.children = children;
     this.executionReviewerProvider = executionReviewerProvider;
+    this.escalationReviewerProvider = escalationReviewerProvider;
     this.reviewerProviders = reviewerProviders;
   }
 
   get executionReviewCount(): number {
     return this.executionReviewerProvider.requestCount;
+  }
+
+  get escalationReviewCount(): number {
+    return this.escalationReviewerProvider.requestCount;
+  }
+
+  get executionReviewRequests(): readonly Record<string, unknown>[] {
+    return this.executionReviewerProvider.requests;
   }
 
   async installSession(context: BrowserContext): Promise<void> {
@@ -315,6 +438,7 @@ export class RealAgentStack {
         `request_count=${this.provider.requestCount}`,
         `executor_tool_verified=${this.provider.executorToolVerified}`,
         `execution_review_count=${this.executionReviewCount}`,
+        `escalation_review_count=${this.escalationReviewCount}`,
         `context_verified=${this.provider.contextVerified}`,
       ].join("\n"),
     );
@@ -732,13 +856,18 @@ async function startRealAgentStackOnce(
       agentState: join(runtimeDirectory, "agent-state"),
       workspace: join(runtimeDirectory, "workspace"),
       ipc: join(runtimeDirectory, "ipc"),
+      localControl: join(runtimeDirectory, "local-control"),
     };
     await Promise.all(
       Object.values(paths).map((path) =>
         mkdir(path, { recursive: true, mode: 0o700 }),
       ),
     );
-    await Promise.all(Object.values(paths).map((path) => chmod(path, 0o700)));
+    await Promise.all(
+      Object.entries(paths).map(([name, path]) =>
+        chmod(path, name === "localControl" ? 0o750 : 0o700),
+      ),
+    );
     await writeFile(
       join(paths.workspace, executorAuthorityProbeFile),
       executorAuthorityProbeContents,
@@ -746,19 +875,22 @@ async function startRealAgentStackOnce(
     );
 
     const executorServerUID = process.getuid?.();
-    if (executorServerUID === undefined || executorServerUID === 0) {
+    const localControlSocketGID = process.getgid?.();
+    if (
+      executorServerUID === undefined ||
+      executorServerUID === 0 ||
+      localControlSocketGID === undefined
+    ) {
       throw new Error(
-        "the real-agent fixture requires a non-root Unix UID for its executor",
+        "the real-agent fixture requires a non-root Unix identity",
       );
     }
 
-    const [publicPort, localControlPort, webPort] = await Promise.all([
-      ephemeralPort(),
+    const [publicPort, webPort] = await Promise.all([
       ephemeralPort(),
       ephemeralPort(),
     ]);
     const apiURL = `http://127.0.0.1:${publicPort}`;
-    const localControlURL = `http://127.0.0.1:${localControlPort}`;
     const webURL = `http://127.0.0.1:${webPort}`;
     const agentTokenSecret = randomBytes(48).toString("base64");
     const browserSessionSecret = randomBytes(48).toString("base64");
@@ -771,6 +903,7 @@ async function startRealAgentStackOnce(
     const wrappingKey = randomBytes(32).toString("hex");
     const wrappingKeyID = `e2e-${randomIdentifier()}`;
     const executorSocket = join(paths.ipc, "executor.sock");
+    const localControlSocket = join(paths.localControl, "control.sock");
     const executorAuthorityKeyPair = generateExecutorAuthorityKeyPair();
     const redactions = [
       agentTokenSecret,
@@ -824,12 +957,19 @@ async function startRealAgentStackOnce(
         SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE: rpcNonce,
         SUMI_LOCAL_CONTROL_AUDIENCE: "sumi:agent:events",
         SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION: "raw",
-        SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN: `127.0.0.1:${localControlPort}`,
+        SUMI_LOCAL_CONTROL_UNIX_SOCKET: localControlSocket,
+        SUMI_LOCAL_CONTROL_SOCKET_GID: String(localControlSocketGID),
       },
       redactions,
     });
     children.push(api);
     await waitForHTTP(`${apiURL}/health`, api, 20_000);
+    await waitForSocket(
+      localControlSocket,
+      api,
+      20_000,
+      "local-control Unix socket",
+    );
     await delay(100);
     api.assertRunning();
 
@@ -884,7 +1024,7 @@ async function startRealAgentStackOnce(
       },
     );
     children.push(executor);
-    await waitForSocket(executorSocket, executor, 20_000);
+    await waitForSocket(executorSocket, executor, 20_000, "executor socket");
 
     const agent = ManagedProcess.start(
       "Rust production personality agent",
@@ -905,7 +1045,9 @@ async function startRealAgentStackOnce(
           SUMI_EXECUTOR_SERVER_UID: String(executorServerUID),
           SUMI_GATEWAY_URL: `ws://127.0.0.1:${publicPort}/agent/ws`,
           SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: "true",
-          SUMI_LOCAL_CONTROL_URL: localControlURL,
+          SUMI_LOCAL_CONTROL_UNIX_SOCKET: localControlSocket,
+          SUMI_LOCAL_CONTROL_SERVER_UID: String(executorServerUID),
+          SUMI_LOCAL_CONTROL_SOCKET_GID: String(localControlSocketGID),
           SUMI_LOCAL_CONTROL_BEARER: localControlBearer,
           SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: String(
             Math.floor(Date.now() / 1_000) + 30 * 60,
@@ -979,6 +1121,7 @@ async function startRealAgentStackOnce(
       sessionCookie,
       children,
       executionReviewerProvider,
+      escalationReviewerProvider,
       reviewerProviders,
     });
   } catch (error) {
@@ -1278,6 +1421,7 @@ async function waitForSocket(
   socket: string,
   process_: ManagedProcess,
   timeoutMilliseconds: number,
+  label: string,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMilliseconds;
   while (Date.now() < deadline) {
@@ -1290,9 +1434,7 @@ async function waitForSocket(
     await delay(100);
   }
   process_.assertRunning();
-  throw new Error(
-    `timed out waiting for executor socket${process_.diagnostics()}`,
-  );
+  throw new Error(`timed out waiting for ${label}${process_.diagnostics()}`);
 }
 
 async function readBoundedJSON(
@@ -1367,7 +1509,12 @@ function hasProviderTool(tools: unknown, name: string): boolean {
   });
 }
 
-function hasExactExecutorRoundTrip(messages: unknown[]): boolean {
+function exactToolResultContent(
+  messages: unknown[],
+  callID: string,
+  toolName: string,
+  expectedInput: Record<string, unknown>,
+): string | undefined {
   const applicationMessages = messages.filter(
     (message): message is Record<string, unknown> =>
       isRecord(message) &&
@@ -1375,48 +1522,187 @@ function hasExactExecutorRoundTrip(messages: unknown[]): boolean {
         message.role === "assistant" ||
         message.role === "tool"),
   );
-  if (applicationMessages.length !== 3) return false;
-  const [user, assistant, toolResult] = applicationMessages;
+  const matchingIndices = applicationMessages.flatMap((message, index) => {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+      return [];
+    }
+    return message.tool_calls.some(
+      (toolCall) => isRecord(toolCall) && toolCall.id === callID,
+    )
+      ? [index]
+      : [];
+  });
+  if (matchingIndices.length !== 1) return undefined;
+  const assistantIndex = matchingIndices[0];
+  const assistant = applicationMessages[assistantIndex];
+  const toolResult = applicationMessages[assistantIndex + 1];
   if (
-    user?.role !== "user" ||
-    messageText(user.content) !== firstUserMessage ||
     assistant?.role !== "assistant" ||
     toolResult?.role !== "tool" ||
-    toolResult.tool_call_id !== executorToolCallID ||
-    toolResult.content !== executorAuthorityProbeFile
+    toolResult.tool_call_id !== callID ||
+    typeof toolResult.content !== "string"
   ) {
-    return false;
+    return undefined;
   }
   if (
     !Array.isArray(assistant.tool_calls) ||
     assistant.tool_calls.length !== 1
   ) {
-    return false;
+    return undefined;
   }
   const toolCall = assistant.tool_calls[0];
   if (
     !isRecord(toolCall) ||
-    toolCall.id !== executorToolCallID ||
+    toolCall.id !== callID ||
     toolCall.type !== "function" ||
     !isRecord(toolCall.function) ||
-    toolCall.function.name !== "list_dir" ||
+    toolCall.function.name !== toolName ||
     typeof toolCall.function.arguments !== "string"
   ) {
-    return false;
+    return undefined;
   }
   try {
     const args: unknown = JSON.parse(toolCall.function.arguments);
-    return (
-      isRecord(args) &&
-      args.route === "normal" &&
-      isRecord(args.input) &&
-      args.input.path === "." &&
-      Object.keys(args).length === 2 &&
-      Object.keys(args.input).length === 1
-    );
+    if (
+      !isRecord(args) ||
+      args.route !== "normal" ||
+      !isRecord(args.input) ||
+      Object.keys(args).sort().join("\0") !== "input\0route" ||
+      !exactShallowObject(args.input, expectedInput)
+    ) {
+      return undefined;
+    }
+    return toolResult.content;
   } catch {
+    return undefined;
+  }
+}
+
+function exactToolResultJSON(
+  messages: unknown[],
+  callID: string,
+  toolName: string,
+  expectedInput: Record<string, unknown>,
+): unknown {
+  const content = exactToolResultContent(
+    messages,
+    callID,
+    toolName,
+    expectedInput,
+  );
+  if (content === undefined) return undefined;
+  try {
+    return JSON.parse(content) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function exactShallowObject(
+  actual: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  const keys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return (
+    keys.length === expectedKeys.length &&
+    keys.every(
+      (key, index) =>
+        key === expectedKeys[index] && actual[key] === expected[key],
+    )
+  );
+}
+
+function exactSingleInvitation(value: unknown):
+  | {
+      invitationID: string;
+      workspaceID: string;
+      workspaceName: string;
+    }
+  | undefined {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).join("\0") !== "invitations" ||
+    !Array.isArray(value.invitations) ||
+    value.invitations.length !== 1
+  ) {
+    return undefined;
+  }
+  const invitation = value.invitations[0];
+  if (
+    !isRecord(invitation) ||
+    Object.keys(invitation).sort().join("\0") !==
+      "created_at\0expires_at\0invitation_id\0workspace_id\0workspace_name" ||
+    !isCanonicalUUIDv7(invitation.invitation_id) ||
+    !isCanonicalUUIDv7(invitation.workspace_id) ||
+    typeof invitation.workspace_name !== "string" ||
+    invitation.workspace_name.length === 0 ||
+    !isRFC3339Timestamp(invitation.created_at) ||
+    !isRFC3339Timestamp(invitation.expires_at)
+  ) {
+    return undefined;
+  }
+  return {
+    invitationID: invitation.invitation_id,
+    workspaceID: invitation.workspace_id,
+    workspaceName: invitation.workspace_name,
+  };
+}
+
+function exactAcceptedMembership(value: unknown, workspaceID: string): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    Object.keys(value).sort().join("\0") ===
+      "display_name\0joined_at\0left_at\0owner\0role_ids\0workspace_id\0workspace_member_id" &&
+    isCanonicalUUIDv7(value.workspace_member_id) &&
+    value.workspace_id === workspaceID &&
+    typeof value.display_name === "string" &&
+    value.display_name.length > 0 &&
+    value.owner === false &&
+    Array.isArray(value.role_ids) &&
+    value.role_ids.length === 0 &&
+    isRFC3339Timestamp(value.joined_at) &&
+    value.left_at === null
+  );
+}
+
+function exactWorkspaceMembershipList(
+  value: unknown,
+  workspaceID: string,
+  workspaceName: string,
+): boolean {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).join("\0") !== "workspaces" ||
+    !Array.isArray(value.workspaces) ||
+    value.workspaces.length !== 1
+  ) {
     return false;
   }
+  const workspace = value.workspaces[0];
+  return (
+    isRecord(workspace) &&
+    Object.keys(workspace).sort().join("\0") === "name\0workspace_id" &&
+    workspace.workspace_id === workspaceID &&
+    workspace.name === workspaceName
+  );
+}
+
+function isCanonicalUUIDv7(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      value,
+    )
+  );
+}
+
+function isRFC3339Timestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
 
 function messageText(content: unknown): string {
@@ -1473,7 +1759,13 @@ function respondSSE(
   response.end("data: [DONE]\n\n");
 }
 
-function respondToolCallSSE(response: ServerResponse, turn: number): void {
+function respondToolCallSSE(
+  response: ServerResponse,
+  turn: number,
+  callID: string,
+  toolName: string,
+  input: Record<string, unknown>,
+): void {
   response.writeHead(200, {
     "cache-control": "no-store",
     "content-type": "text/event-stream",
@@ -1491,13 +1783,13 @@ function respondToolCallSSE(response: ServerResponse, turn: number): void {
             tool_calls: [
               {
                 index: 0,
-                id: executorToolCallID,
+                id: callID,
                 type: "function",
                 function: {
-                  name: "list_dir",
+                  name: toolName,
                   arguments: JSON.stringify({
                     route: "normal",
-                    input: { path: "." },
+                    input,
                   }),
                 },
               },

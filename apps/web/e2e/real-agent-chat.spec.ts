@@ -142,6 +142,30 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     await expect(railButton(page)).toHaveCount(0);
     await expect(railButton(secondPage)).toHaveCount(0);
 
+    await expect(
+      page.getByText("まだWorkspaceに参加していません"),
+    ).toBeVisible();
+    const workspaceName = "Agent Join E2E Workspace";
+    const workspaceID = await createWorkspace(page, workspaceName);
+    await page.getByRole("button", { name: "参加者と招待" }).click();
+    const currentInvitePath = `/workspaces/${workspaceID}/invites/current-agent`;
+    const inviteResponsePromise = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === currentInvitePath,
+    );
+    await page.getByRole("button", { name: "招待する" }).click();
+    const inviteResponse = await inviteResponsePromise;
+    expect(inviteResponse.status()).toBe(201);
+    expect(inviteResponse.request().postData()).toBe("{}");
+    const browserInviteID = assertTargetedInvitationResponse(
+      await inviteResponse.json(),
+      workspaceID,
+    );
+    await expect(
+      page.getByText("招待済み・承諾待ち", { exact: true }),
+    ).toBeVisible();
+
     const installResponse = page.waitForResponse(isInstallResponse);
     const firstMenu = await openParticipantApps(page);
     await directChatRow(firstMenu)
@@ -194,11 +218,62 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     await expect(page.getByText(firstUserMessage, { exact: true })).toHaveCount(
       1,
     );
-    expect(stack.provider.requestCount).toBe(2);
+    expect(stack.provider.requestCount).toBe(5);
+    expect(stack.provider.invitationListVerified).toBe(true);
+    expect(stack.provider.invitationAcceptVerified).toBe(true);
+    expect(stack.provider.workspaceMembershipVerified).toBe(true);
+    expect(stack.provider.invitationID).toBe(browserInviteID);
+    expect(stack.provider.workspaceID).toBe(workspaceID);
+    expect(stack.provider.workspaceName).toBe(workspaceName);
     expect(stack.provider.executorToolVerified).toBe(true);
-    // The accepted built-in policy evaluates CapabilityClass::Read directly;
-    // Normal list_dir must not be silently rerouted through a reviewer model.
-    expect(stack.executionReviewCount).toBe(0);
+    // Both list operations and list_dir take the accepted Read fast path. The
+    // one exact Normal Mutate accept is reviewed once; nothing is escalated.
+    expect(stack.executionReviewCount).toBe(1);
+    expect(stack.escalationReviewCount).toBe(0);
+    expect(stack.executionReviewRequests).toHaveLength(1);
+    const reviewerWire = JSON.stringify(stack.executionReviewRequests[0]);
+    expect(reviewerWire).toContain("workspace_invitation_accept_v1");
+    expect(reviewerWire).toContain("accept_invitation");
+    for (const forbidden of [
+      browserInviteID,
+      workspaceID,
+      workspaceName,
+      "invitation_id",
+      "workspace_id",
+      "workspace_name",
+      "execution_arguments",
+      "proposal_digest",
+      "descriptor_digest",
+      "bound_evidence_digest",
+    ]) {
+      expect(reviewerWire).not.toContain(forbidden);
+    }
+
+    const membersResponse = await page.request.get(
+      `${stack.apiURL}/workspaces/${workspaceID}/members`,
+    );
+    expect(membersResponse.status()).toBe(200);
+    const activeAgent = asArray(asRecord(await membersResponse.json()).members)
+      .map(asRecord)
+      .find((member) => {
+        const participant = asRecord(member.participant);
+        return (
+          participant.kind === "personality_agent" &&
+          participant.personality_agent_id ===
+            "0198f0f4-9b72-7000-8000-000000000001" &&
+          member.workspace_id === workspaceID &&
+          member.left_at === null
+        );
+      });
+    expect(activeAgent).toBeDefined();
+
+    await page.goto(`${stack.webURL}/w/${workspaceID}`);
+    await expect(page.getByRole("heading", { name: "概要" })).toBeVisible();
+    await page.getByRole("button", { name: "参加者と招待" }).click();
+    await expect(
+      page.getByText("PersonalityAgent · 00000001", { exact: true }),
+    ).toBeVisible();
+    await openDirectChat(page);
 
     const delayedSecondPageList =
       await holdNextParticipantInstallationList(secondPage);
@@ -409,10 +484,11 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     await expect
       .poll(() => assistantMessageEndSequence.get(secondProviderResponse))
       .toBeGreaterThan(0);
-    expect(stack.provider.requestCount).toBe(3);
-    expect(stack.provider.requests).toHaveLength(3);
+    expect(stack.provider.requestCount).toBe(6);
+    expect(stack.provider.requests).toHaveLength(6);
     expect(stack.provider.executorToolVerified).toBe(true);
-    expect(stack.executionReviewCount).toBe(0);
+    expect(stack.executionReviewCount).toBe(1);
+    expect(stack.escalationReviewCount).toBe(0);
     expect(stack.provider.contextVerified).toBe(true);
     expect(
       assistantMessageEndSequence.get(secondProviderResponse),
@@ -914,6 +990,47 @@ async function responseJSON(
   return response.json();
 }
 
+async function createWorkspace(page: Page, name: string): Promise<string> {
+  await page.getByRole("textbox", { name: "新しいWorkspaceの名前" }).fill(name);
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/workspaces",
+  );
+  await page.getByRole("button", { name: "作成して開く" }).click();
+  const response = await responsePromise;
+  expect(response.status()).toBe(201);
+  return asString(asRecord(await response.json()).workspace_id);
+}
+
+function assertTargetedInvitationResponse(
+  value: unknown,
+  workspaceID: string,
+): string {
+  const invitation = asRecord(value);
+  expect(Object.keys(invitation).sort()).toEqual([
+    "created_at",
+    "expires_at",
+    "invite_id",
+    "kind",
+    "workspace_id",
+  ]);
+  expect(invitation.kind).toBe("targeted_personality_agent");
+  expect(invitation.workspace_id).toBe(workspaceID);
+  for (const forbidden of [
+    "personality_agent_id",
+    "target_id",
+    "target_kind",
+    "code",
+    "code_hash",
+  ]) {
+    expect(invitation).not.toHaveProperty(forbidden);
+  }
+  const invitationID = asString(invitation.invite_id);
+  expect(invitationID).toMatch(UUIDv7Pattern);
+  return invitationID;
+}
+
 function expectInstallation(
   value: unknown,
   humanID: string,
@@ -948,6 +1065,11 @@ function asString(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error("expected non-empty string");
   }
+  return value;
+}
+
+function asArray(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error("expected JSON array");
   return value;
 }
 

@@ -28,7 +28,10 @@ use crate::{
         InjectedRunDriver, RunWorker, SequentialRunWorker, Session, SessionResult,
         SessionStartAuthority,
     },
-    apiclient::{messaging::MessagingApi, workspace::WorkspaceApi},
+    apiclient::{
+        messaging::MessagingApi,
+        workspace::{WorkspaceApi, WorkspaceInvitationApi},
+    },
     approval::{
         route_broker::RouteApprovalBroker,
         route_policy::RoutePolicy,
@@ -64,6 +67,7 @@ use crate::{
         executor::{ExecutorClient, decode_hex_32, remote_executor_registry_with_tools},
         messaging::MessagingTool,
         workspace::WorkspaceListTool,
+        workspace_invitation::{WorkspaceInvitationAcceptTool, WorkspaceInvitationListTool},
     },
 };
 
@@ -945,6 +949,8 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
     .context("construct local-control HTTP client")?;
     let messaging_api: Arc<dyn MessagingApi> = Arc::new(control_client.clone());
     let workspace_api: Arc<dyn WorkspaceApi> = Arc::new(control_client.clone());
+    let workspace_invitation_api: Arc<dyn WorkspaceInvitationApi> =
+        Arc::new(control_client.clone());
     let control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane> =
         Arc::new(control_client);
     let publisher = LocalRuntimePublisher::new(context.authority.clone(), control.clone());
@@ -963,6 +969,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         control,
         messaging_api,
         workspace_api,
+        workspace_invitation_api,
         executor_call_authority_private_key,
         &publisher,
     )
@@ -974,6 +981,7 @@ async fn run_after_not_ready(
     control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane>,
     messaging_api: Arc<dyn MessagingApi>,
     workspace_api: Arc<dyn WorkspaceApi>,
+    workspace_invitation_api: Arc<dyn WorkspaceInvitationApi>,
     executor_call_authority_private_key: Zeroizing<[u8; 32]>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
@@ -1090,11 +1098,21 @@ async fn run_after_not_ready(
         .await?;
         let messaging_tool: Arc<dyn Tool> = Arc::new(MessagingTool::new(messaging_api));
         let workspace_list_tool: Arc<dyn Tool> = Arc::new(WorkspaceListTool::new(workspace_api));
+        let workspace_invitation_list_tool: Arc<dyn Tool> = Arc::new(
+            WorkspaceInvitationListTool::new(workspace_invitation_api.clone()),
+        );
+        let workspace_invitation_accept_tool: Arc<dyn Tool> =
+            Arc::new(WorkspaceInvitationAcceptTool::new(workspace_invitation_api));
         let registry = remote_executor_registry_with_tools(
             executor_client.clone(),
-            [messaging_tool, workspace_list_tool],
+            [
+                messaging_tool,
+                workspace_list_tool,
+                workspace_invitation_list_tool,
+                workspace_invitation_accept_tool,
+            ],
         )
-        .context("build exact remote executor, messaging, and Workspace registry")?;
+        .context("build exact remote executor, messaging, Workspace, and invitation registry")?;
         let prompt = PromptContext {
             system_prompt: config.system_prompt.clone(),
             memory_blocks: Vec::new(),

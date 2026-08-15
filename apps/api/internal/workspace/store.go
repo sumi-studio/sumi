@@ -27,7 +27,8 @@ const (
 	// A local-control Workspace page contains at most 32 domain-validated
 	// names. Even when every one of the 200 legal runes needs Go's longest
 	// six-byte JSON escape, the complete response remains below 64 KiB.
-	localWorkspaceListPageSize = 32
+	localWorkspaceListPageSize           = 32
+	localWorkspaceInvitationListPageSize = 32
 )
 
 type Store struct {
@@ -158,6 +159,23 @@ type workspaceListPage struct {
 	HasMore bool
 }
 
+// workspaceInvitationListCursorPosition is live keyset ordering state only.
+// The local-control transport authenticates it separately for one exact PA
+// and runtime bearer; every page re-applies current target and issuer truth.
+type workspaceInvitationListCursorPosition struct {
+	InvitationID string
+}
+
+type workspaceInvitationListPageItem struct {
+	Invitation TargetedInvitation
+	Position   workspaceInvitationListCursorPosition
+}
+
+type workspaceInvitationListPage struct {
+	Items   []workspaceInvitationListPageItem
+	HasMore bool
+}
+
 // workspacePageFor returns one fixed-size keyset page of active Workspace
 // memberships. A membership created or closed between calls is observed by the
 // fresh query when its Workspace identity sorts after the cursor. A newly
@@ -231,6 +249,107 @@ func (s *Store) workspacePageFor(
 		items = items[:localWorkspaceListPageSize]
 	}
 	return workspaceListPage{Items: items, HasMore: hasMore}, nil
+}
+
+// targetedInvitationPageFor returns one bounded live keyset page for the
+// exact PersonalityAgent authenticated by local-control.  The query filters
+// invalidated issuer tenures and authority in the same statement, excludes a
+// target that already has an active membership, and never treats the cursor
+// as target or Workspace authority.
+func (s *Store) targetedInvitationPageFor(
+	ctx context.Context,
+	target participant.Ref,
+	after *workspaceInvitationListCursorPosition,
+) (workspaceInvitationListPage, error) {
+	if target.Kind != participant.KindPersonalityAgent || target.Validate() != nil {
+		return workspaceInvitationListPage{}, ErrInviteUnavailable
+	}
+	if after != nil && !isCanonicalUUIDv7(after.InvitationID) {
+		return workspaceInvitationListPage{}, ErrInvalidWorkspaceInvitationListCursor
+	}
+
+	const selectPage = `
+		SELECT wi.invite_id, wi.workspace_id, w.name, wi.expires_at, wi.created_at
+		FROM workspace_invites wi
+		JOIN workspaces w ON w.workspace_id = wi.workspace_id
+		JOIN workspace_members issuer
+		  ON issuer.workspace_id = wi.workspace_id
+		 AND issuer.workspace_member_id = wi.created_by_workspace_member_id
+		 AND issuer.left_at IS NULL
+		WHERE wi.invite_kind = 'targeted_personality_agent'
+		  AND wi.target_kind = 'personality_agent'
+		  AND wi.target_id = $1
+		  AND wi.revoked_at IS NULL
+		  AND wi.redeemed_at IS NULL
+		  AND wi.expires_at > $2
+		  AND ($3::uuidv7 IS NULL OR wi.invite_id > $3::uuidv7)
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM workspace_members target_membership
+		      WHERE target_membership.workspace_id = wi.workspace_id
+		        AND target_membership.member_kind = 'personality_agent'
+		        AND target_membership.member_id = wi.target_id
+		        AND target_membership.left_at IS NULL
+		  )
+		  AND (
+		      issuer.workspace_member_id = w.owner_workspace_member_id
+		      OR EXISTS (
+		          SELECT 1
+		          FROM workspace_role_assignments assignment
+		          JOIN workspace_roles role
+		            ON role.workspace_id = assignment.workspace_id
+		           AND role.role_id = assignment.role_id
+		          WHERE assignment.workspace_id = issuer.workspace_id
+		            AND assignment.workspace_member_id = issuer.workspace_member_id
+		            AND role.permissions @> '{"manage_members": true}'::jsonb
+		      )
+		  )
+		ORDER BY wi.invite_id
+		LIMIT $4`
+
+	var afterID any
+	if after != nil {
+		afterID = after.InvitationID
+	}
+	rows, err := s.pool.Query(
+		ctx,
+		selectPage,
+		target.ID,
+		s.now().UTC(),
+		afterID,
+		localWorkspaceInvitationListPageSize+1,
+	)
+	if err != nil {
+		return workspaceInvitationListPage{}, fmt.Errorf("list targeted Workspace invitation page: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]workspaceInvitationListPageItem, 0, localWorkspaceInvitationListPageSize+1)
+	for rows.Next() {
+		var item workspaceInvitationListPageItem
+		if err := rows.Scan(
+			&item.Invitation.InvitationID,
+			&item.Invitation.WorkspaceID,
+			&item.Invitation.WorkspaceName,
+			&item.Invitation.ExpiresAt,
+			&item.Invitation.CreatedAt,
+		); err != nil {
+			return workspaceInvitationListPage{}, fmt.Errorf("scan targeted Workspace invitation page: %w", err)
+		}
+		item.Invitation.ExpiresAt = item.Invitation.ExpiresAt.UTC().Truncate(time.Microsecond)
+		item.Invitation.CreatedAt = item.Invitation.CreatedAt.UTC().Truncate(time.Microsecond)
+		item.Position.InvitationID = item.Invitation.InvitationID
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return workspaceInvitationListPage{}, fmt.Errorf("iterate targeted Workspace invitation page: %w", err)
+	}
+
+	hasMore := len(items) > localWorkspaceInvitationListPageSize
+	if hasMore {
+		items = items[:localWorkspaceInvitationListPageSize]
+	}
+	return workspaceInvitationListPage{Items: items, HasMore: hasMore}, nil
 }
 
 // WorkspaceFor intentionally uses the same ErrNotFound for a nonexistent
@@ -924,6 +1043,199 @@ func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Membership{}, fmt.Errorf("commit invite redemption: %w", err)
+	}
+	return membership, nil
+}
+
+// AcceptTargetedInvitation consumes one invitation addressed to the exact
+// PersonalityAgent authenticated by local-control.  The initial target-scoped
+// lookup intentionally collapses malformed, absent, wrong-target, and wrong-
+// variant identities to ErrInviteUnavailable.  Admission then follows the
+// canonical Workspace -> invitation lock order and rechecks every predicate
+// inside that transaction.
+func (s *Store) AcceptTargetedInvitation(
+	ctx context.Context,
+	invitationID string,
+	target participant.Ref,
+) (Membership, error) {
+	if !isCanonicalUUIDv7(invitationID) ||
+		target.Kind != participant.KindPersonalityAgent || target.Validate() != nil {
+		return Membership{}, ErrInviteUnavailable
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Membership{}, fmt.Errorf("begin targeted Workspace invitation acceptance: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// This is resolution only, not authority.  Do not lock the invitation before
+	// its Workspace lock root, and do not reveal whether another target owns it.
+	var workspaceID string
+	err = tx.QueryRow(ctx, `
+		SELECT workspace_id
+		FROM workspace_invites
+		WHERE invite_id = $1
+		  AND invite_kind = 'targeted_personality_agent'
+		  AND target_kind = 'personality_agent'
+		  AND target_id = $2`, invitationID, target.ID).Scan(&workspaceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Membership{}, ErrInviteUnavailable
+	}
+	if err != nil {
+		return Membership{}, fmt.Errorf("resolve targeted Workspace invitation: %w", err)
+	}
+	if err := lockWorkspace(ctx, tx, workspaceID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return Membership{}, ErrInviteUnavailable
+		}
+		return Membership{}, err
+	}
+
+	var (
+		inviteKind           string
+		targetKind           *string
+		lockedTargetID       *string
+		issuerMembershipID   string
+		expiresAt            time.Time
+		revokedAt            *time.Time
+		redeemedKind         *string
+		redeemedID           *string
+		redeemedMembershipID *string
+		redeemedAt           *time.Time
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT invite_kind, target_kind, target_id,
+		       created_by_workspace_member_id, expires_at, revoked_at,
+		       redeemed_by_kind, redeemed_by_id,
+		       redeemed_workspace_member_id, redeemed_at
+		FROM workspace_invites
+		WHERE workspace_id = $1 AND invite_id = $2
+		FOR UPDATE`, workspaceID, invitationID).Scan(
+		&inviteKind,
+		&targetKind,
+		&lockedTargetID,
+		&issuerMembershipID,
+		&expiresAt,
+		&revokedAt,
+		&redeemedKind,
+		&redeemedID,
+		&redeemedMembershipID,
+		&redeemedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Membership{}, ErrInviteUnavailable
+	}
+	if err != nil {
+		return Membership{}, fmt.Errorf("lock targeted Workspace invitation: %w", err)
+	}
+	if inviteKind != string(InviteKindTargetedPersonalityAgent) ||
+		targetKind == nil || *targetKind != string(participant.KindPersonalityAgent) ||
+		lockedTargetID == nil || *lockedTargetID != target.ID {
+		return Membership{}, ErrInviteUnavailable
+	}
+
+	// A completed same-target retry is a read of the exact recorded tenure. It
+	// neither reopens a closed tenure nor rechecks authority that was required
+	// only for the already-committed admission.
+	if redeemedAt != nil {
+		if redeemedKind == nil || redeemedID == nil || redeemedMembershipID == nil ||
+			*redeemedKind != string(target.Kind) || *redeemedID != target.ID {
+			return Membership{}, ErrInviteUnavailable
+		}
+		membership, err := membershipByID(ctx, tx, workspaceID, *redeemedMembershipID, false)
+		if err != nil {
+			return Membership{}, fmt.Errorf("load prior targeted invitation acceptance: %w", err)
+		}
+		if membership.Participant != target {
+			return Membership{}, ErrInviteUnavailable
+		}
+		membership.DisplayName, err = resolveParticipantDisplayName(ctx, tx, target)
+		if err != nil {
+			return Membership{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Membership{}, fmt.Errorf("commit targeted invitation acceptance replay: %w", err)
+		}
+		return membership, nil
+	}
+
+	// The schema requires all redemption columns to move together. Keep the
+	// application check explicit so a future schema change cannot reinterpret a
+	// partially consumed row as pending.
+	now := s.now().UTC().Truncate(time.Microsecond)
+	if redeemedKind != nil || redeemedID != nil || redeemedMembershipID != nil ||
+		revokedAt != nil || !expiresAt.After(now) {
+		return Membership{}, ErrInviteUnavailable
+	}
+	if err := requireInviteIssuerAuthority(ctx, tx, workspaceID, issuerMembershipID); err != nil {
+		return Membership{}, err
+	}
+	already, err := activeMembershipExists(ctx, tx, workspaceID, target)
+	if err != nil {
+		return Membership{}, err
+	}
+	if already {
+		return Membership{}, ErrAlreadyMember
+	}
+
+	membership := Membership{
+		WorkspaceMemberID: newUUIDv7(),
+		WorkspaceID:       workspaceID,
+		Participant:       target,
+		RoleIDs:           []string{},
+		JoinedAt:          now,
+	}
+	membership.DisplayName, err = resolveParticipantDisplayName(ctx, tx, target)
+	if err != nil {
+		return Membership{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspace_members
+			(workspace_member_id, workspace_id, member_kind, member_id, joined_at)
+		VALUES ($1, $2, $3, $4, $5)`,
+		membership.WorkspaceMemberID,
+		membership.WorkspaceID,
+		membership.Participant.Kind,
+		membership.Participant.ID,
+		membership.JoinedAt,
+	); err != nil {
+		if isUniqueViolation(err) {
+			return Membership{}, ErrAlreadyMember
+		}
+		return Membership{}, fmt.Errorf("insert targeted invitation membership: %w", err)
+	}
+	if err := closePendingTargetedInvitesForParticipant(
+		ctx,
+		tx,
+		workspaceID,
+		target,
+		now,
+		&invitationID,
+	); err != nil {
+		return Membership{}, err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE workspace_invites
+		SET redeemed_by_kind = $2, redeemed_by_id = $3,
+		    redeemed_workspace_member_id = $4, redeemed_at = $5
+		WHERE invite_id = $1
+		  AND revoked_at IS NULL
+		  AND redeemed_at IS NULL`,
+		invitationID,
+		target.Kind,
+		target.ID,
+		membership.WorkspaceMemberID,
+		now,
+	)
+	if err != nil {
+		return Membership{}, fmt.Errorf("consume targeted Workspace invitation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return Membership{}, ErrInviteUnavailable
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Membership{}, fmt.Errorf("commit targeted Workspace invitation acceptance: %w", err)
 	}
 	return membership, nil
 }

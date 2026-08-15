@@ -25,6 +25,7 @@ pub mod truncate;
 #[cfg(unix)]
 mod unix_pipe;
 pub(crate) mod workspace;
+pub(crate) mod workspace_invitation;
 
 use std::{
     collections::BTreeMap,
