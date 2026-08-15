@@ -1,9 +1,9 @@
 # MCP App sandbox deployment contract
 
-`mcp-app-sandbox.html` is inert source for a future MCP Apps renderer. Do not
-serve it from the Sumi web origin. Rendering must remain unavailable until both
-the authenticated backend projection and this separate-origin deployment
-exist.
+`mcp-app-sandbox.html` is an inert E2E fixture for a future MCP Apps renderer.
+It is deliberately outside `public/` and must not be included in the Sumi web
+artifact. Rendering remains unavailable until both the authenticated backend
+projection and a separate-origin deployment exist.
 
 Deploy the file at a dedicated HTTPS origin that serves no Sumi credentials,
 application APIs, or user-controlled files. At build time, replace

@@ -331,7 +331,7 @@ describe("exact-origin postMessage transport", () => {
 });
 
 describe("MCP App sandbox artifact", () => {
-  const sandboxHtml = readFileSync("public/mcp-app-sandbox.html", "utf8");
+  const sandboxHtml = readFileSync("e2e/fixtures/mcp-app-sandbox.html", "utf8");
 
   it("places the deployment CSP before executable content and preserves View HTML bytes around the injected policy", () => {
     expect(
