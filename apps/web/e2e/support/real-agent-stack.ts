@@ -547,6 +547,7 @@ export async function startWorkspaceBrowserStack(
             SUMI_E2E_SESSION_TENANT_ID: tenantID,
             SUMI_E2E_SESSION_USER_ID: userID,
             SUMI_E2E_SESSION_PERSONALITY_AGENT_ID: personalityAgentID,
+            SUMI_E2E_SESSION_PROVISION_SECRETARY: "1",
             SUMI_E2E_SESSION_DATABASE_URL: databaseURL,
             SUMI_E2E_SESSION_DISPLAY_NAME: "Workspace E2E Human",
           },

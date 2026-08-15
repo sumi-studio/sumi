@@ -328,11 +328,17 @@ function MembersSection({
   const members = useWorkspaceControl((state) => state.members);
   const roles = useWorkspaceControl((state) => state.roles);
   const invites = useWorkspaceControl((state) => state.invites);
+  const currentAgentInvite = useWorkspaceControl(
+    (state) => state.currentAgentInvite,
+  );
   const inviteSecret = useWorkspaceControl(
     (state) => state.createdInviteSecret,
   );
   const mutation = useWorkspaceControl((state) => state.mutation);
   const createInvite = useWorkspaceControl((state) => state.createInvite);
+  const createCurrentAgentInvite = useWorkspaceControl(
+    (state) => state.createCurrentAgentInvite,
+  );
   const revokeInvite = useWorkspaceControl((state) => state.revokeInvite);
   const clearCreatedInviteSecret = useWorkspaceControl(
     (state) => state.clearCreatedInviteSecret,
@@ -345,6 +351,14 @@ function MembersSection({
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState("");
   const [failed, setFailed] = useState("");
+  const targetedInvite =
+    currentAgentInvite.status === "pending" ? currentAgentInvite.invite : null;
+  const shareInvites = invites.filter((invite) => invite.kind === "share_code");
+  const anonymousTargetedInvites = invites.filter(
+    (invite) =>
+      invite.kind === "targeted_personality_agent" &&
+      invite.inviteId !== targetedInvite?.inviteId,
+  );
 
   useEffect(() => () => clearCreatedInviteSecret(), [clearCreatedInviteSecret]);
 
@@ -377,8 +391,107 @@ function MembersSection({
   return (
     <div className="space-y-8">
       <section className="rounded-xl border border-border p-5">
+        <div className="border-border border-b pb-5">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <MessageCircle className="size-4" />
+                <h3 className="font-semibold text-sm">
+                  Direct Chatの相手を招待
+                </h3>
+              </div>
+              <p className="mt-1 text-muted-foreground text-xs leading-5">
+                今話している人格エージェント本人へ、このWorkspaceへの招待を送ります。参加は本人の承諾後です。
+              </p>
+            </div>
+            {currentAgentInvite.status === "none" ? (
+              <Button
+                size="sm"
+                disabled={!canManage || mutation !== null}
+                onClick={() => void run(createCurrentAgentInvite)}
+              >
+                <Plus className="size-3.5" />
+                招待する
+              </Button>
+            ) : null}
+          </div>
+          {currentAgentInvite.status === "member" ? (
+            <div className="mt-4 rounded-lg border border-border bg-muted/20 p-3">
+              <p className="font-medium text-xs">このWorkspaceに参加済みです</p>
+            </div>
+          ) : targetedInvite ? (
+            <div className="mt-4 flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/20 p-3">
+              <div>
+                <p className="font-medium text-xs">招待済み・承諾待ち</p>
+                <p className="mt-1 text-muted-foreground text-[11px]">
+                  有効期限
+                  {new Date(targetedInvite.expiresAt).toLocaleString("ja-JP")}
+                </p>
+                <p className="mt-1 text-muted-foreground text-[11px]">
+                  Direct Chatで招待を確認してもらってください。
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={mutation !== null}
+                aria-label="Direct Chatの相手への招待を取り消す"
+                onClick={() =>
+                  void run(() => revokeInvite(targetedInvite.inviteId))
+                }
+              >
+                取り消す
+              </Button>
+            </div>
+          ) : currentAgentInvite.status === "unavailable" ? (
+            <p className="mt-3 text-muted-foreground text-xs">
+              現在のDirect Chatとの関係では、この招待を操作できません。
+            </p>
+          ) : currentAgentInvite.status === "error" ? (
+            <p role="alert" className="mt-3 text-red-600 text-xs">
+              現在のDirect Chatの招待状態を確認できませんでした。
+            </p>
+          ) : !canManage ? (
+            <p className="mt-3 text-muted-foreground text-xs">
+              この招待を作成する権限がありません。
+            </p>
+          ) : null}
+          {anonymousTargetedInvites.length > 0 ? (
+            <div className="mt-5 space-y-2">
+              <p className="font-medium text-muted-foreground text-[11px]">
+                対象を表示しない人格エージェントへの招待
+              </p>
+              {anonymousTargetedInvites.map((invite) => (
+                <div
+                  key={invite.inviteId}
+                  className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/20 p-3"
+                >
+                  <div>
+                    <p className="font-medium text-xs">承諾待ち</p>
+                    <p className="mt-1 text-muted-foreground text-[11px]">
+                      招待 {invite.inviteId.slice(-8)} · 有効期限
+                      {new Date(invite.expiresAt).toLocaleString("ja-JP")}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={mutation !== null}
+                    aria-label={`人格エージェントへの招待 ${invite.inviteId.slice(-8)} を取り消す`}
+                    onClick={() =>
+                      void run(() => revokeInvite(invite.inviteId))
+                    }
+                  >
+                    取り消す
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
         <div className="flex items-start justify-between gap-4">
-          <div>
+          <div className="pt-5">
             <div className="flex items-center gap-2">
               <KeyRound className="size-4" />
               <h3 className="font-semibold text-sm">招待</h3>
@@ -388,6 +501,7 @@ function MembersSection({
             </p>
           </div>
           <Button
+            className="mt-5"
             size="sm"
             disabled={!canManage || mutation !== null}
             onClick={() => void run(createInvite)}
@@ -396,14 +510,14 @@ function MembersSection({
             招待を作成
           </Button>
         </div>
-        {canManage && invites.length === 0 ? (
+        {canManage && shareInvites.length === 0 ? (
           <p className="mt-4 text-muted-foreground text-xs">
             有効な招待はありません。
           </p>
         ) : null}
-        {invites.length > 0 ? (
+        {shareInvites.length > 0 ? (
           <div className="mt-4 space-y-2">
-            {invites.map((invite) => {
+            {shareInvites.map((invite) => {
               const secret =
                 inviteSecret?.inviteId === invite.inviteId
                   ? inviteSecret.code

@@ -228,6 +228,70 @@ func (s *Server) serveInvites(w http.ResponseWriter, r *http.Request) {
 	}{Invites: wires})
 }
 
+func (s *Server) serveCurrentAgentInvite(w http.ResponseWriter, r *http.Request) {
+	actor, claims, ok := s.browserActor(w, r)
+	if !ok {
+		return
+	}
+	target := participant.PersonalityAgent(claims.PersonalityAgentID)
+	if err := target.Validate(); err != nil {
+		writeAPIError(w, http.StatusUnauthorized, "invalid_session")
+		return
+	}
+	item, err := s.Store.CurrentAgentInvite(
+		r.Context(),
+		r.PathValue("workspace_id"),
+		actor,
+		target,
+		s.CurrentEmployerAuthority,
+	)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, inviteRecordToWire(item))
+}
+
+func (s *Server) serveCreateCurrentAgentInvite(w http.ResponseWriter, r *http.Request) {
+	actor, claims, ok := s.browserActor(w, r)
+	if !ok {
+		return
+	}
+	if !decodeExactEmptyJSONObject(w, r) {
+		return
+	}
+	target := participant.PersonalityAgent(claims.PersonalityAgentID)
+	if err := target.Validate(); err != nil {
+		writeAPIError(w, http.StatusUnauthorized, "invalid_session")
+		return
+	}
+	var item InviteRecord
+	var created bool
+	done, err := s.browserMutation(w, r, claims, func() error {
+		var createErr error
+		item, created, createErr = s.Store.CreateCurrentAgentInvite(
+			r.Context(),
+			r.PathValue("workspace_id"),
+			actor,
+			target,
+			s.CurrentEmployerAuthority,
+		)
+		return createErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, inviteRecordToWire(item))
+}
+
 func (s *Server) serveRevokeInvite(w http.ResponseWriter, r *http.Request) {
 	actor, claims, ok := s.browserActor(w, r)
 	if !ok {

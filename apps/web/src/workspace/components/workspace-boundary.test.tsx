@@ -46,6 +46,7 @@ function workspaceState(
 ): WorkspaceControlState {
   return {
     sessionIdentity: "human-1",
+    sessionScopeKey: "binding-1",
     listStatus,
     selectionStatus,
     workspaces: [],
@@ -56,6 +57,7 @@ function workspaceState(
     catalog: [],
     installations: [],
     invites: [],
+    currentAgentInvite: { status: "none" },
     createdInviteSecret: null,
     errorCode: null,
     mutation: null,
@@ -71,6 +73,7 @@ function workspaceState(
     leaveWorkspace: vi.fn(),
     removeMember: vi.fn(),
     createInvite: vi.fn(),
+    createCurrentAgentInvite: vi.fn(),
     revokeInvite: vi.fn(),
     clearCreatedInviteSecret: vi.fn(),
     previewInvite: vi.fn(),

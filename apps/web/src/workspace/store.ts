@@ -9,6 +9,7 @@ import type {
   AppInstallation,
   AppInstallationState,
   Workspace,
+  WorkspaceCurrentAgentInviteState,
   WorkspaceInvite,
   WorkspaceInvitePreview,
   WorkspaceInviteRecord,
@@ -17,6 +18,7 @@ import type {
   WorkspaceRole,
   WorkspaceRoleCapabilityRef,
   WorkspaceRoleInput,
+  WorkspaceTargetedPersonalityAgentInviteRecord,
 } from "./model";
 import {
   isWorkspaceInstallation,
@@ -36,6 +38,7 @@ export type WorkspaceSelectionStatus =
 
 export interface WorkspaceControlState {
   sessionIdentity: string | null;
+  sessionScopeKey: string | null;
   listStatus: WorkspaceListStatus;
   selectionStatus: WorkspaceSelectionStatus;
   workspaces: Workspace[];
@@ -46,11 +49,12 @@ export interface WorkspaceControlState {
   catalog: AppDescriptor[];
   installations: AppInstallation[];
   invites: WorkspaceInviteRecord[];
+  currentAgentInvite: WorkspaceCurrentAgentInviteState;
   createdInviteSecret: WorkspaceInviteSecret | null;
   errorCode: string | null;
   mutation: string | null;
 
-  resetSession(identity: string | null): void;
+  resetSession(identity: string | null, scopeKey: string | null): void;
   init(): Promise<void>;
   refreshWorkspaces(): Promise<void>;
   createWorkspace(name: string): Promise<Workspace>;
@@ -62,6 +66,7 @@ export interface WorkspaceControlState {
   leaveWorkspace(): Promise<void>;
   removeMember(workspaceMemberId: string): Promise<void>;
   createInvite(): Promise<WorkspaceInvite>;
+  createCurrentAgentInvite(): Promise<WorkspaceTargetedPersonalityAgentInviteRecord>;
   clearCreatedInviteSecret(): void;
   revokeInvite(inviteId: string): Promise<void>;
   previewInvite(code: string): Promise<WorkspaceInvitePreview>;
@@ -80,6 +85,7 @@ export interface WorkspaceControlState {
 
 interface ScopeToken {
   sessionIdentity: string;
+  sessionScopeKey: string;
   workspaceId: string;
   generation: number;
 }
@@ -94,6 +100,7 @@ function emptySelection(): Pick<
   | "catalog"
   | "installations"
   | "invites"
+  | "currentAgentInvite"
   | "createdInviteSecret"
 > {
   return {
@@ -105,6 +112,7 @@ function emptySelection(): Pick<
     catalog: [],
     installations: [],
     invites: [],
+    currentAgentInvite: { status: "none" },
     createdInviteSecret: null,
   };
 }
@@ -119,11 +127,16 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
   return create<WorkspaceControlState>((set, get) => {
     const currentScope = (): ScopeToken => {
       const state = get();
-      if (!state.sessionIdentity || !state.selectedWorkspaceId) {
+      if (
+        !state.sessionIdentity ||
+        !state.sessionScopeKey ||
+        !state.selectedWorkspaceId
+      ) {
         throw new Error("Workspace scope is not selected");
       }
       return {
         sessionIdentity: state.sessionIdentity,
+        sessionScopeKey: state.sessionScopeKey,
         workspaceId: state.selectedWorkspaceId,
         generation: selectionGeneration,
       };
@@ -133,6 +146,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
       const state = get();
       return (
         state.sessionIdentity === token.sessionIdentity &&
+        state.sessionScopeKey === token.sessionScopeKey &&
         state.selectedWorkspaceId === token.workspaceId &&
         selectionGeneration === token.generation
       );
@@ -159,7 +173,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
       clear: boolean,
     ): Promise<void> => {
       const state = get();
-      if (!state.sessionIdentity) return;
+      if (!state.sessionIdentity || !state.sessionScopeKey) return;
       const known = state.workspaces.find(
         (workspace) => workspace.workspaceId === workspaceId,
       );
@@ -186,6 +200,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
       const generation = ++selectionGeneration;
       const token: ScopeToken = {
         sessionIdentity: identity,
+        sessionScopeKey: state.sessionScopeKey,
         workspaceId,
         generation,
       };
@@ -198,6 +213,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
               catalog: [],
               installations: [],
               invites: [],
+              currentAgentInvite: { status: "none" },
               createdInviteSecret: null,
             }
           : {}),
@@ -240,6 +256,10 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
               roles,
             ).has("manage_members");
             let invites: WorkspaceInviteRecord[] = [];
+            let currentAgentInvite: WorkspaceCurrentAgentInviteState = {
+              status: "none",
+            };
+            let mayManageInvites = canManageMembers;
             if (canManageMembers) {
               try {
                 invites = await client.listInvites(workspaceId);
@@ -272,6 +292,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
                   refreshedMembership,
                   roles,
                 ).has("manage_members");
+                mayManageInvites = stillCanManageMembers;
                 if (stillCanManageMembers) {
                   try {
                     invites = await client.listInvites(workspaceId);
@@ -284,6 +305,24 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
                   }
                 }
               }
+              if (mayManageInvites) {
+                try {
+                  const exact = await client.getCurrentAgentInvite(workspaceId);
+                  if (
+                    exact.status === "pending" &&
+                    exact.invite.workspaceId !== workspaceId
+                  ) {
+                    throw new Error(
+                      "Current-agent invite crossed Workspace scope",
+                    );
+                  }
+                  currentAgentInvite = exact;
+                } catch (error) {
+                  currentAgentInvite = isWorkspaceForbidden(error)
+                    ? { status: "unavailable" }
+                    : { status: "error" };
+                }
+              }
             }
             if (!isCurrentScope(token)) return;
             set({
@@ -293,6 +332,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
               catalog,
               installations,
               invites,
+              currentAgentInvite,
               selectionStatus: "ready",
               errorCode: null,
             });
@@ -306,6 +346,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           ) {
             set({
               invites: [],
+              currentAgentInvite: { status: "none" },
               createdInviteSecret: null,
               selectionStatus: "error",
               errorCode: INVITE_AUTHORITY_CONTRADICTION,
@@ -342,10 +383,11 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
 
     const loadWorkspaces = async (force: boolean): Promise<void> => {
       const state = get();
-      if (!state.sessionIdentity) return;
+      if (!state.sessionIdentity || !state.sessionScopeKey) return;
       if (!force && state.listStatus === "ready") return;
       if (!force && listPromise) return listPromise;
       const identity = state.sessionIdentity;
+      const scopeKey = state.sessionScopeKey;
       const generation = sessionGeneration;
       set({ listStatus: "loading", errorCode: null });
       const promise = client
@@ -353,7 +395,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         .then((workspaces) => {
           if (
             sessionGeneration !== generation ||
-            get().sessionIdentity !== identity
+            get().sessionIdentity !== identity ||
+            get().sessionScopeKey !== scopeKey
           ) {
             return;
           }
@@ -380,7 +423,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         .catch((error: unknown) => {
           if (
             sessionGeneration !== generation ||
-            get().sessionIdentity !== identity
+            get().sessionIdentity !== identity ||
+            get().sessionScopeKey !== scopeKey
           ) {
             return;
           }
@@ -395,20 +439,27 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
 
     return {
       sessionIdentity: null,
+      sessionScopeKey: null,
       listStatus: "idle",
       workspaces: [],
       ...emptySelection(),
       errorCode: null,
       mutation: null,
 
-      resetSession(identity) {
-        if (identity === get().sessionIdentity) return;
+      resetSession(identity, scopeKey) {
+        if (
+          identity === get().sessionIdentity &&
+          scopeKey === get().sessionScopeKey
+        ) {
+          return;
+        }
         sessionGeneration += 1;
         selectionGeneration += 1;
         listPromise = null;
         selectedLoad = null;
         set({
           sessionIdentity: identity,
+          sessionScopeKey: scopeKey,
           listStatus: "idle",
           workspaces: [],
           ...emptySelection(),
@@ -427,8 +478,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
 
       async createWorkspace(name) {
         const trimmed = name.trim();
-        const identity = get().sessionIdentity;
-        if (!identity || !trimmed)
+        const { sessionIdentity: identity, sessionScopeKey: scopeKey } = get();
+        if (!identity || !scopeKey || !trimmed)
           throw new Error("Workspace name is required");
         if (get().mutation) {
           throw new Error("Workspace mutation is already running");
@@ -439,7 +490,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           const workspace = await client.createWorkspace(trimmed);
           if (
             sessionGeneration !== generation ||
-            get().sessionIdentity !== identity
+            get().sessionIdentity !== identity ||
+            get().sessionScopeKey !== scopeKey
           ) {
             throw new Error("Workspace session changed during creation");
           }
@@ -460,7 +512,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         } catch (error) {
           if (
             sessionGeneration === generation &&
-            get().sessionIdentity === identity
+            get().sessionIdentity === identity &&
+            get().sessionScopeKey === scopeKey
           ) {
             set({ mutation: null, errorCode: errorCode(error) });
           }
@@ -596,14 +649,45 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
             throw new Error("Invite belongs to a different Workspace");
           }
           const { code, ...record } = invite;
+          const shareRecord: WorkspaceInviteRecord = {
+            ...record,
+            kind: "share_code",
+          };
           set((state) => ({
             invites: [
               ...state.invites.filter(
-                (candidate) => candidate.inviteId !== record.inviteId,
+                (candidate) => candidate.inviteId !== shareRecord.inviteId,
               ),
-              record,
+              shareRecord,
             ],
-            createdInviteSecret: { inviteId: record.inviteId, code },
+            createdInviteSecret: { inviteId: shareRecord.inviteId, code },
+          }));
+          endMutation(token);
+          return invite;
+        } catch (error) {
+          endMutation(token, error);
+          throw error;
+        }
+      },
+
+      async createCurrentAgentInvite() {
+        const token = beginMutation("create_current_agent_invite");
+        try {
+          const invite = await client.createCurrentAgentInvite(
+            token.workspaceId,
+          );
+          if (!isCurrentScope(token)) return invite;
+          if (invite.workspaceId !== token.workspaceId) {
+            throw new Error("Invite belongs to a different Workspace");
+          }
+          set((state) => ({
+            invites: [
+              ...state.invites.filter(
+                (candidate) => candidate.inviteId !== invite.inviteId,
+              ),
+              invite,
+            ],
+            currentAgentInvite: { status: "pending", invite },
           }));
           endMutation(token);
           return invite;
@@ -622,6 +706,11 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
             invites: state.invites.filter(
               (candidate) => candidate.inviteId !== inviteId,
             ),
+            currentAgentInvite:
+              state.currentAgentInvite.status === "pending" &&
+              state.currentAgentInvite.invite.inviteId === inviteId
+                ? { status: "none" }
+                : state.currentAgentInvite,
             createdInviteSecret:
               state.createdInviteSecret?.inviteId === inviteId
                 ? null
@@ -639,7 +728,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
       },
 
       previewInvite(code) {
-        if (!get().sessionIdentity) {
+        if (!get().sessionIdentity || !get().sessionScopeKey) {
           return Promise.reject(new Error("Workspace session is not bound"));
         }
         const trimmed = code.trim();
@@ -649,9 +738,11 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
       },
 
       async redeemInvite(code) {
-        const identity = get().sessionIdentity;
+        const { sessionIdentity: identity, sessionScopeKey: scopeKey } = get();
         const generation = sessionGeneration;
-        if (!identity) throw new Error("Workspace session is not bound");
+        if (!identity || !scopeKey) {
+          throw new Error("Workspace session is not bound");
+        }
         const trimmed = code.trim();
         if (!trimmed) throw new Error("Invite code is required");
         if (get().mutation) {
@@ -662,7 +753,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           const membership = await client.redeemInvite(trimmed);
           if (
             sessionGeneration !== generation ||
-            get().sessionIdentity !== identity
+            get().sessionIdentity !== identity ||
+            get().sessionScopeKey !== scopeKey
           ) {
             throw new Error(
               "Workspace session changed during invite redemption",
@@ -671,7 +763,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           await loadWorkspaces(true);
           if (
             sessionGeneration === generation &&
-            get().sessionIdentity === identity
+            get().sessionIdentity === identity &&
+            get().sessionScopeKey === scopeKey
           ) {
             set({ mutation: null, errorCode: null });
           }
@@ -679,7 +772,8 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         } catch (error) {
           if (
             sessionGeneration === generation &&
-            get().sessionIdentity === identity
+            get().sessionIdentity === identity &&
+            get().sessionScopeKey === scopeKey
           ) {
             set({ mutation: null, errorCode: errorCode(error) });
           }
@@ -1045,10 +1139,17 @@ export const useWorkspaceControl = createWorkspaceControlStore(
   new WorkspaceApiClient(),
 );
 
-export function bindWorkspaceSessionIdentity(identity: string | null): void {
-  useWorkspaceControl.getState().resetSession(identity);
+export function bindWorkspaceSessionIdentity(
+  identity: string | null,
+  scopeKey: string | null,
+): void {
+  useWorkspaceControl.getState().resetSession(identity, scopeKey);
 }
 
 export function getWorkspaceSessionIdentity(): string | null {
   return useWorkspaceControl.getState().sessionIdentity;
+}
+
+export function getWorkspaceSessionScopeKey(): string | null {
+  return useWorkspaceControl.getState().sessionScopeKey;
 }

@@ -120,6 +120,31 @@ try {
       message:
         "Generated lifecycle 503 response must expose the exact unavailable code.",
     },
+    {
+      component: "WorkspaceCurrentAgentInviteRequest",
+      pattern: /Record<string, never>/,
+      message:
+        "Current-agent Workspace invitation issuance must remain an exact empty-object request.",
+    },
+    {
+      component: "WorkspaceInviteRecord",
+      pattern:
+        /WorkspaceShareCodeInviteRecord[^\n]+WorkspaceTargetedPersonalityAgentInviteRecord/,
+      message:
+        "Workspace invite records must remain the explicit share-code/targeted-PA union.",
+    },
+    {
+      component: "WorkspaceShareCodeInviteRecord",
+      pattern: /kind: "share_code";/,
+      message:
+        "Share-code Workspace invite records must keep their exact wire discriminator.",
+    },
+    {
+      component: "WorkspaceTargetedPersonalityAgentInviteRecord",
+      pattern: /kind: "targeted_personality_agent";/,
+      message:
+        "Targeted PA Workspace invite records must keep their durable wire discriminator.",
+    },
   ];
   for (const { component, pattern, message } of lifecycleTypeAssertions) {
     const definition = generatedSchemaComponent(schemaTypes, component);

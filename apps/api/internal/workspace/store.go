@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
@@ -34,6 +35,19 @@ type Store struct {
 	now       func() time.Time
 	random    io.Reader
 	inviteTTL time.Duration
+}
+
+// CurrentEmployerAuthority is the canonical Koseki seam used to compose an
+// employment snapshot with Workspace authority in one database transaction.
+// Implementations must acquire the shared employment-authority lease before
+// returning successfully.
+type CurrentEmployerAuthority interface {
+	RequireCurrentHumanEmployerInTx(
+		context.Context,
+		pgx.Tx,
+		string,
+		string,
+	) error
 }
 
 func New(pool *pgxpool.Pool) *Store {
@@ -434,6 +448,266 @@ func (s *Store) CreateInvite(ctx context.Context, workspaceID string, actor part
 	return invite, nil
 }
 
+// CreateCurrentAgentInvite creates, or returns, the one active pending invite
+// for the exact PersonalityAgent bound to the authenticated Human session. The
+// Koseki Employer proof is deliberately acquired before the Workspace row so
+// employment transfer and Workspace authority compose in one lock order.
+func (s *Store) CreateCurrentAgentInvite(
+	ctx context.Context,
+	workspaceID string,
+	actor participant.Ref,
+	target participant.Ref,
+	authority CurrentEmployerAuthority,
+) (InviteRecord, bool, error) {
+	if actor.Kind != participant.KindHuman || target.Kind != participant.KindPersonalityAgent ||
+		actor.Validate() != nil || target.Validate() != nil {
+		return InviteRecord{}, false, ErrInvalidInvite
+	}
+	if authority == nil {
+		return InviteRecord{}, false, ErrInviteAuthorityUnavailable
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return InviteRecord{}, false, fmt.Errorf("begin current-agent invite: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := authority.RequireCurrentHumanEmployerInTx(ctx, tx, actor.ID, target.ID); err != nil {
+		if errors.Is(err, koseki.ErrNotCurrentEmployer) {
+			return InviteRecord{}, false, ErrForbidden
+		}
+		return InviteRecord{}, false, fmt.Errorf("%w: require current Human Employer: %v", ErrInviteAuthorityUnavailable, err)
+	}
+	actorMembershipID, err := s.lockAndRequirePermission(
+		ctx,
+		tx,
+		workspaceID,
+		actor,
+		PermissionManageMembers,
+	)
+	if err != nil {
+		return InviteRecord{}, false, err
+	}
+	already, err := activeMembershipExists(ctx, tx, workspaceID, target)
+	if err != nil {
+		return InviteRecord{}, false, err
+	}
+	if already {
+		return InviteRecord{}, false, ErrAlreadyMember
+	}
+
+	now := s.now().UTC().Truncate(time.Microsecond)
+	if _, err := tx.Exec(ctx, `
+		UPDATE workspace_invites
+		SET revoked_at = $4
+		WHERE workspace_id = $1
+		  AND invite_kind = 'targeted_personality_agent'
+		  AND target_id = $2
+		  AND revoked_at IS NULL
+		  AND redeemed_at IS NULL
+		  AND expires_at <= $3`, workspaceID, target.ID, now, now); err != nil {
+		return InviteRecord{}, false, fmt.Errorf("close expired current-agent invite: %w", err)
+	}
+
+	var existing InviteRecord
+	var issuerMembershipID string
+	err = tx.QueryRow(ctx, `
+		SELECT invite_id, workspace_id, created_by_workspace_member_id,
+		       expires_at, created_at
+		FROM workspace_invites
+		WHERE workspace_id = $1
+		  AND invite_kind = 'targeted_personality_agent'
+		  AND target_id = $2
+		  AND revoked_at IS NULL
+		  AND redeemed_at IS NULL
+		FOR UPDATE`, workspaceID, target.ID).Scan(
+		&existing.InviteID,
+		&existing.WorkspaceID,
+		&issuerMembershipID,
+		&existing.ExpiresAt,
+		&existing.CreatedAt,
+	)
+	if err == nil {
+		existing.Kind = InviteKindTargetedPersonalityAgent
+		canonicalizeInviteRecordTimes(&existing)
+		issuerErr := requireInviteIssuerAuthority(ctx, tx, workspaceID, issuerMembershipID)
+		if issuerErr == nil {
+			if err := tx.Commit(ctx); err != nil {
+				return InviteRecord{}, false, fmt.Errorf("commit current-agent invite replay: %w", err)
+			}
+			return existing, false, nil
+		}
+		if !errors.Is(issuerErr, ErrInviteUnavailable) {
+			return InviteRecord{}, false, issuerErr
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE workspace_invites
+			SET revoked_at = $2
+			WHERE invite_id = $1`, existing.InviteID, now); err != nil {
+			return InviteRecord{}, false, fmt.Errorf("close unauthorized current-agent invite: %w", err)
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return InviteRecord{}, false, fmt.Errorf("resolve current-agent invite: %w", err)
+	}
+
+	created := InviteRecord{
+		InviteID:    newUUIDv7(),
+		WorkspaceID: workspaceID,
+		Kind:        InviteKindTargetedPersonalityAgent,
+		ExpiresAt:   now.Add(s.inviteTTL),
+		CreatedAt:   now,
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at, created_at)
+		VALUES ($1, $2, $3, 'targeted_personality_agent', 'personality_agent', $4, $5, $6)
+		ON CONFLICT (workspace_id, target_id)
+		WHERE invite_kind = 'targeted_personality_agent'
+		  AND revoked_at IS NULL
+		  AND redeemed_at IS NULL
+		DO NOTHING`,
+		created.InviteID,
+		workspaceID,
+		actorMembershipID,
+		target.ID,
+		created.ExpiresAt,
+		created.CreatedAt,
+	)
+	if err != nil {
+		return InviteRecord{}, false, fmt.Errorf("insert current-agent invite: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// The Workspace row lock serializes every canonical issuer, so this is a
+		// defense-in-depth path for a concurrent writer that reached the unique
+		// ledger index without following that lock order. Never surface the
+		// uniqueness race as an ambiguous failure: return its committed record.
+		var issuerMembershipID string
+		err := tx.QueryRow(ctx, `
+			SELECT invite_id, workspace_id, created_by_workspace_member_id,
+			       expires_at, created_at
+			FROM workspace_invites
+			WHERE workspace_id = $1
+			  AND invite_kind = 'targeted_personality_agent'
+			  AND target_id = $2
+			  AND revoked_at IS NULL
+			  AND redeemed_at IS NULL
+			FOR UPDATE`, workspaceID, target.ID).Scan(
+			&created.InviteID,
+			&created.WorkspaceID,
+			&issuerMembershipID,
+			&created.ExpiresAt,
+			&created.CreatedAt,
+		)
+		if err != nil {
+			return InviteRecord{}, false, fmt.Errorf("resolve concurrent current-agent invite: %w", err)
+		}
+		if err := requireInviteIssuerAuthority(ctx, tx, workspaceID, issuerMembershipID); err != nil {
+			return InviteRecord{}, false, err
+		}
+		canonicalizeInviteRecordTimes(&created)
+		if err := tx.Commit(ctx); err != nil {
+			return InviteRecord{}, false, fmt.Errorf("commit concurrent current-agent invite replay: %w", err)
+		}
+		return created, false, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return InviteRecord{}, false, fmt.Errorf("commit current-agent invite: %w", err)
+	}
+	return created, true, nil
+}
+
+// CurrentAgentInvite returns the active pending invitation for the session's
+// exact PA without exposing that target identity in the result.
+func (s *Store) CurrentAgentInvite(
+	ctx context.Context,
+	workspaceID string,
+	actor participant.Ref,
+	target participant.Ref,
+	authority CurrentEmployerAuthority,
+) (InviteRecord, error) {
+	if actor.Kind != participant.KindHuman || target.Kind != participant.KindPersonalityAgent ||
+		actor.Validate() != nil || target.Validate() != nil {
+		return InviteRecord{}, ErrInvalidInvite
+	}
+	if authority == nil {
+		return InviteRecord{}, ErrInviteAuthorityUnavailable
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return InviteRecord{}, fmt.Errorf("begin read current-agent invite: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := authority.RequireCurrentHumanEmployerInTx(ctx, tx, actor.ID, target.ID); err != nil {
+		if errors.Is(err, koseki.ErrNotCurrentEmployer) {
+			return InviteRecord{}, ErrForbidden
+		}
+		return InviteRecord{}, fmt.Errorf("%w: require current Human Employer: %v", ErrInviteAuthorityUnavailable, err)
+	}
+	if _, err := s.lockSharedAndRequirePermission(ctx, tx, workspaceID, actor, PermissionManageMembers); err != nil {
+		return InviteRecord{}, err
+	}
+	already, err := activeMembershipExists(ctx, tx, workspaceID, target)
+	if err != nil {
+		return InviteRecord{}, err
+	}
+	if already {
+		return InviteRecord{}, ErrAlreadyMember
+	}
+	var item InviteRecord
+	var issuerMembershipID string
+	err = tx.QueryRow(ctx, `
+		SELECT invite_id, workspace_id, created_by_workspace_member_id,
+		       expires_at, created_at
+		FROM workspace_invites
+		WHERE workspace_id = $1
+		  AND invite_kind = 'targeted_personality_agent'
+		  AND target_id = $2
+		  AND revoked_at IS NULL
+		  AND redeemed_at IS NULL
+		  AND expires_at > $3`, workspaceID, target.ID, s.now().UTC()).Scan(
+		&item.InviteID,
+		&item.WorkspaceID,
+		&issuerMembershipID,
+		&item.ExpiresAt,
+		&item.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return InviteRecord{}, ErrInviteUnavailable
+	}
+	if err != nil {
+		return InviteRecord{}, fmt.Errorf("read current-agent invite: %w", err)
+	}
+	if err := requireInviteIssuerAuthority(ctx, tx, workspaceID, issuerMembershipID); err != nil {
+		return InviteRecord{}, err
+	}
+	item.Kind = InviteKindTargetedPersonalityAgent
+	canonicalizeInviteRecordTimes(&item)
+	if err := tx.Commit(ctx); err != nil {
+		return InviteRecord{}, fmt.Errorf("commit read current-agent invite: %w", err)
+	}
+	return item, nil
+}
+
+func activeMembershipExists(
+	ctx context.Context,
+	tx pgx.Tx,
+	workspaceID string,
+	ref participant.Ref,
+) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM workspace_members
+			WHERE workspace_id = $1
+			  AND member_kind = $2
+			  AND member_id = $3
+			  AND left_at IS NULL
+		)`, workspaceID, ref.Kind, ref.ID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check active Workspace membership: %w", err)
+	}
+	return exists, nil
+}
+
 // Invites returns only currently redeemable, non-secret invite records. The
 // Workspace lock keeps the caller's exact tenure and manage_members authority,
 // issuer authority, redemption, and revocation stable through this read.
@@ -451,7 +725,8 @@ func (s *Store) Invites(ctx context.Context, workspaceID string, actor participa
 		issuerMembershipID string
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT invite_id, workspace_id, created_by_workspace_member_id, expires_at, created_at
+		SELECT invite_id, workspace_id, created_by_workspace_member_id,
+		       invite_kind, expires_at, created_at
 		FROM workspace_invites
 		WHERE workspace_id = $1
 		  AND revoked_at IS NULL
@@ -464,11 +739,13 @@ func (s *Store) Invites(ctx context.Context, workspaceID string, actor participa
 	var candidates []candidate
 	for rows.Next() {
 		var item candidate
+		var kind string
 		if err := rows.Scan(&item.record.InviteID, &item.record.WorkspaceID,
-			&item.issuerMembershipID, &item.record.ExpiresAt, &item.record.CreatedAt); err != nil {
+			&item.issuerMembershipID, &kind, &item.record.ExpiresAt, &item.record.CreatedAt); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan workspace invite: %w", err)
 		}
+		item.record.Kind = InviteKind(kind)
 		candidates = append(candidates, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -627,6 +904,16 @@ func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant
 		}
 		return Membership{}, fmt.Errorf("insert workspace membership: %w", err)
 	}
+	// Joining through a legacy share code makes every still-pending targeted
+	// invitation for this exact participant obsolete. Close those ledger rows
+	// in the same Workspace transaction so a later leave cannot revive a stale
+	// pre-membership invitation. The targeted acceptance path reuses this helper
+	// while excluding its own invitation after recording redemption.
+	if err := closePendingTargetedInvitesForParticipant(
+		ctx, tx, workspaceID, actor, now, nil,
+	); err != nil {
+		return Membership{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE workspace_invites
 		SET redeemed_by_kind = $2, redeemed_by_id = $3,
@@ -639,6 +926,36 @@ func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant
 		return Membership{}, fmt.Errorf("commit invite redemption: %w", err)
 	}
 	return membership, nil
+}
+
+func closePendingTargetedInvitesForParticipant(
+	ctx context.Context,
+	tx pgx.Tx,
+	workspaceID string,
+	target participant.Ref,
+	closedAt time.Time,
+	exceptInviteID *string,
+) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE workspace_invites
+		SET revoked_at = COALESCE(revoked_at, $4)
+		WHERE workspace_id = $1
+		  AND invite_kind = 'targeted_personality_agent'
+		  AND target_kind = $2
+		  AND target_id = $3
+		  AND revoked_at IS NULL
+		  AND redeemed_at IS NULL
+		  AND ($5::uuidv7 IS NULL OR invite_id <> $5::uuidv7)`,
+		workspaceID, target.Kind, target.ID, closedAt, exceptInviteID,
+	); err != nil {
+		return fmt.Errorf("close superseded targeted invites: %w", err)
+	}
+	return nil
+}
+
+func canonicalizeInviteRecordTimes(item *InviteRecord) {
+	item.ExpiresAt = item.ExpiresAt.UTC().Truncate(time.Microsecond)
+	item.CreatedAt = item.CreatedAt.UTC().Truncate(time.Microsecond)
 }
 
 // requireInviteIssuerAuthority revalidates the exact membership tenure that
@@ -833,6 +1150,16 @@ func (s *Store) lockAndRequirePermission(ctx context.Context, tx pgx.Tx, workspa
 		return "", ErrInvalidPermission
 	}
 	return s.lockAndRequireEffectiveCapability(ctx, tx, workspaceID, actor, permission)
+}
+
+func (s *Store) lockSharedAndRequirePermission(ctx context.Context, tx pgx.Tx, workspaceID string, actor participant.Ref, permission string) (string, error) {
+	if !isKnownPermission(permission) {
+		return "", ErrInvalidPermission
+	}
+	if err := lockWorkspaceShared(ctx, tx, workspaceID); err != nil {
+		return "", err
+	}
+	return s.requireEffectiveCapabilityAfterWorkspaceLock(ctx, tx, workspaceID, actor, permission)
 }
 
 // LockAndRequireAppCapability evaluates one app-owned, catalog-backed role

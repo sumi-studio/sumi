@@ -171,6 +171,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/{workspace_id}/invites/current-agent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read the pending invitation for the signed session's exact PersonalityAgent
+         * @description The target is derived only from the signed Human session and is never returned. This operation composes current Human Employer and manage_members authority before reading the pending ledger record.
+         */
+        get: operations["getCurrentAgentWorkspaceInvite"];
+        put?: never;
+        /**
+         * Invite the signed session's exact PersonalityAgent to one exact Workspace
+         * @description The request is exactly an empty object. Neither a PersonalityAgentId nor a selector is accepted or returned. Replays return the same active pending record; the PersonalityAgent must later accept as itself.
+         */
+        post: operations["createCurrentAgentWorkspaceInvite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/workspaces/{workspace_id}/invites/{invite_id}": {
         parameters: {
             query?: never;
@@ -506,7 +532,21 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
-        WorkspaceInviteRecord: {
+        WorkspaceCurrentAgentInviteRequest: Record<string, never>;
+        WorkspaceInviteRecord: components["schemas"]["WorkspaceShareCodeInviteRecord"] | components["schemas"]["WorkspaceTargetedPersonalityAgentInviteRecord"];
+        WorkspaceShareCodeInviteRecord: {
+            /** @constant */
+            kind: "share_code";
+            invite_id: components["schemas"]["UUIDv7"];
+            workspace_id: components["schemas"]["UUIDv7"];
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: date-time */
+            created_at: string;
+        };
+        WorkspaceTargetedPersonalityAgentInviteRecord: {
+            /** @constant */
+            kind: "targeted_personality_agent";
             invite_id: components["schemas"]["UUIDv7"];
             workspace_id: components["schemas"]["UUIDv7"];
             /** Format: date-time */
@@ -1589,6 +1629,86 @@ export interface operations {
             };
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+        };
+    };
+    getCurrentAgentWorkspaceInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active pending invitation for the session-bound PersonalityAgent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceTargetedPersonalityAgentInviteRecord"];
+                };
+            };
+            /** @description Missing or invalid browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["AppLifecycleUnavailable"];
+        };
+    };
+    createCurrentAgentWorkspaceInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceCurrentAgentInviteRequest"];
+            };
+        };
+        responses: {
+            /** @description Existing active pending invitation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceTargetedPersonalityAgentInviteRecord"];
+                };
+            };
+            /** @description New pending invitation created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceTargetedPersonalityAgentInviteRecord"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            /** @description Missing, invalid, or concurrently revoked browser session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["AppLifecycleUnavailable"];
         };
     };
     revokeWorkspaceInvite: {

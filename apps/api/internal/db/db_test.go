@@ -693,6 +693,251 @@ func TestAgentWrappingKeyIdentityMigrationRejectsUnknownMaterialAtomically(t *te
 	}
 }
 
+func TestWorkspaceCurrentAgentInviteMigrationUpgradeDownAndReupgrade(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 19)
+
+	const (
+		humanID            = "0198f0f4-9b72-7000-8000-000000000301"
+		agentID            = "0198f0f4-9b72-7000-8000-000000000302"
+		workspaceID        = "0198f0f4-9b72-7000-8000-000000000303"
+		membershipID       = "0198f0f4-9b72-7000-8000-000000000304"
+		shareID            = "0198f0f4-9b72-7000-8000-000000000305"
+		targetedID         = "0198f0f4-9b72-7000-8000-000000000306"
+		agentBID           = "0198f0f4-9b72-7000-8000-000000000307"
+		agentMembershipID  = "0198f0f4-9b72-7000-8000-000000000308"
+		agentBMembershipID = "0198f0f4-9b72-7000-8000-000000000309"
+		postRedemptionID   = "0198f0f4-9b72-7000-8000-000000000310"
+		postRevocationID   = "0198f0f4-9b72-7000-8000-000000000311"
+		nonexistentAgentID = "0198f0f4-9b72-7000-8000-000000000399"
+	)
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agents (personality_agent_id, human_id)
+		VALUES ($1, $3), ($2, $3)`, agentID, agentBID, humanID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspaces (workspace_id, name, owner_workspace_member_id)
+		VALUES ($1, 'migration fixture', $2)`, workspaceID, membershipID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspace_members
+			(workspace_member_id, workspace_id, member_kind, member_id)
+		VALUES ($1, $2, 'human', $3)`, membershipID, workspaceID, humanID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workspace_members
+			(workspace_member_id, workspace_id, member_kind, member_id)
+		VALUES ($1, $3, 'personality_agent', $4),
+		       ($2, $3, 'personality_agent', $5)`,
+		agentMembershipID, agentBMembershipID, workspaceID, agentID, agentBID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id, code_hash,
+			 redeemed_by_kind, redeemed_by_id, redeemed_workspace_member_id,
+			 redeemed_at, expires_at)
+		VALUES ($1, $2, $3, decode(repeat('ab', 32), 'hex'),
+		        'human', $4, $3, now(), now() + interval '1 hour')`,
+		shareID, workspaceID, membershipID, humanID); err != nil {
+		t.Fatal(err)
+	}
+
+	readMigration := func(name string) string {
+		t.Helper()
+		content, err := migrationFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(content)
+	}
+	up := readMigration("0020_workspace_current_agent_invites.up.sql")
+	down := readMigration("0020_workspace_current_agent_invites.down.sql")
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	var kind string
+	var codeHash []byte
+	if err := pool.QueryRow(ctx,
+		"SELECT invite_kind, code_hash FROM workspace_invites WHERE invite_id=$1",
+		shareID).Scan(&kind, &codeHash); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "share_code" || len(codeHash) != 32 {
+		t.Fatalf("legacy share invite changed: kind=%q hash=%d bytes", kind, len(codeHash))
+	}
+	assertRedeemedShare := func(phase string) {
+		t.Helper()
+		var redeemerKind, redeemerID, redeemedMembershipID string
+		var redeemedAt *time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT redeemed_by_kind, redeemed_by_id,
+			       redeemed_workspace_member_id, redeemed_at
+			FROM workspace_invites WHERE invite_id=$1`, shareID).Scan(
+			&redeemerKind, &redeemerID, &redeemedMembershipID, &redeemedAt,
+		); err != nil {
+			t.Fatalf("%s read redeemed share tuple: %v", phase, err)
+		}
+		if redeemerKind != "human" || redeemerID != humanID ||
+			redeemedMembershipID != membershipID || redeemedAt == nil {
+			t.Fatalf("%s changed redeemed share tuple: %s %s %s %v",
+				phase, redeemerKind, redeemerID, redeemedMembershipID, redeemedAt)
+		}
+	}
+	assertRedeemedShare("upgrade")
+
+	assertRejected := func(name, statement string, arguments ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, statement, arguments...); err == nil {
+			t.Fatalf("migration admitted %s", name)
+		}
+	}
+	assertRejected("a share-code variant without a code hash", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000320', $1, $2,
+		        now() + interval '1 hour')`, workspaceID, membershipID)
+	assertRejected("a targeted variant without a target", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000321', $1, $2,
+		        'targeted_personality_agent', now() + interval '1 hour')`,
+		workspaceID, membershipID)
+	assertRejected("an unknown invite kind", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 code_hash, invite_kind, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000322', $1, $2,
+		        decode(repeat('bc', 32), 'hex'), 'unknown',
+		        now() + interval '1 hour')`, workspaceID, membershipID)
+	assertRejected("a targeted variant with the wrong target kind", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000323', $1, $2,
+		        'targeted_personality_agent', 'human', $3,
+		        now() + interval '1 hour')`, workspaceID, membershipID, agentID)
+	assertRejected("a targeted variant for a nonexistent PersonalityAgent", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000324', $1, $2,
+		        'targeted_personality_agent', 'personality_agent', $3,
+		        now() + interval '1 hour')`,
+		workspaceID, membershipID, nonexistentAgentID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at)
+		VALUES ($1, $2, $3, 'targeted_personality_agent', 'personality_agent', $4,
+		        now() + interval '1 hour')`, targetedID, workspaceID, membershipID, agentID); err != nil {
+		t.Fatalf("insert targeted variant: %v", err)
+	}
+	assertRejected("a strict variant with both a code hash and PA target", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 code_hash, invite_kind, target_kind, target_id, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000325', $1, $2,
+		        decode(repeat('cd', 32), 'hex'), 'targeted_personality_agent',
+		        'personality_agent', $3, now() + interval '1 hour')`,
+		workspaceID, membershipID, agentID)
+	assertRejected("a second pending intent for the same Workspace and target", `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at)
+		VALUES ('0198f0f4-9b72-7000-8000-000000000326', $1, $2,
+		        'targeted_personality_agent', 'personality_agent', $3,
+		        now() + interval '1 hour')`, workspaceID, membershipID, agentID)
+	assertRejected("redemption by a different PersonalityAgent", `
+		UPDATE workspace_invites
+		SET redeemed_by_kind='personality_agent', redeemed_by_id=$2,
+		    redeemed_workspace_member_id=$3, redeemed_at=now()
+		WHERE invite_id=$1`, targetedID, agentBID, agentBMembershipID)
+	if _, err := pool.Exec(ctx, `
+		UPDATE workspace_invites
+		SET redeemed_by_kind='personality_agent', redeemed_by_id=$2,
+		    redeemed_workspace_member_id=$3, redeemed_at=now()
+		WHERE invite_id=$1`, targetedID, agentID, agentMembershipID); err != nil {
+		t.Fatalf("record exact targeted redemption: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at)
+		VALUES ($1, $2, $3, 'targeted_personality_agent',
+		        'personality_agent', $4, now() + interval '1 hour')`,
+		postRedemptionID, workspaceID, membershipID, agentID); err != nil {
+		t.Fatalf("new intent after exact redemption: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE workspace_invites SET revoked_at=now() WHERE invite_id=$1",
+		postRedemptionID); err != nil {
+		t.Fatalf("revoke pending targeted intent: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO workspace_invites
+			(invite_id, workspace_id, created_by_workspace_member_id,
+			 invite_kind, target_kind, target_id, expires_at)
+		VALUES ($1, $2, $3, 'targeted_personality_agent',
+		        'personality_agent', $4, now() + interval '1 hour')`,
+		postRevocationID, workspaceID, membershipID, agentID); err != nil {
+		t.Fatalf("new intent after revocation: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, down); err != nil {
+		t.Fatalf("downgrade: %v", err)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM workspace_invites WHERE invite_id=$1 AND octet_length(code_hash)=32",
+		shareID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatal("downgrade did not preserve the historical share-code invite")
+	}
+	assertRedeemedShare("downgrade")
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM workspace_invites WHERE invite_id=$1", targetedID,
+	).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatal("downgrade retained a variant the old schema cannot represent")
+	}
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("re-upgrade: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT invite_kind FROM workspace_invites WHERE invite_id=$1", shareID,
+	).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "share_code" {
+		t.Fatalf("re-upgraded share invite kind = %q", kind)
+	}
+	assertRedeemedShare("re-upgrade")
+}
+
 func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maxVersion int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {

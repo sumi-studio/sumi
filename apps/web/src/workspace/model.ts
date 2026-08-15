@@ -51,7 +51,33 @@ export interface WorkspaceInvite {
   createdAt: number;
 }
 
-export type WorkspaceInviteRecord = Omit<WorkspaceInvite, "code">;
+interface WorkspaceInviteRecordBase {
+  inviteId: string;
+  workspaceId: string;
+  expiresAt: number;
+  createdAt: number;
+}
+
+export type WorkspaceInviteRecord =
+  | (WorkspaceInviteRecordBase & { kind: "share_code" })
+  | (WorkspaceInviteRecordBase & {
+      kind: "targeted_personality_agent";
+    });
+
+export type WorkspaceTargetedPersonalityAgentInviteRecord = Extract<
+  WorkspaceInviteRecord,
+  { kind: "targeted_personality_agent" }
+>;
+
+export type WorkspaceCurrentAgentInviteState =
+  | { status: "none" }
+  | { status: "member" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | {
+      status: "pending";
+      invite: WorkspaceTargetedPersonalityAgentInviteRecord;
+    };
 
 export interface WorkspaceInviteSecret {
   inviteId: string;

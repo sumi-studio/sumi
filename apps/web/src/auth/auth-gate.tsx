@@ -7,12 +7,14 @@ import {
 import {
   bindWorkspaceSessionIdentity,
   getWorkspaceSessionIdentity,
+  getWorkspaceSessionScopeKey,
 } from "../workspace/store";
 import { useAuth } from "./auth-context";
 import { LoginScreen } from "./login-screen";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const {
+    authorityBindingId,
     canUseDirectChat,
     emailLinkCallbackPending,
     loading,
@@ -20,24 +22,34 @@ export function AuthGate({ children }: { children: ReactNode }) {
     refreshSession,
     user,
   } = useAuth();
-  const identity = canUseDirectChat ? (user?.id ?? "preissued") : null;
+  const identity = canUseDirectChat
+    ? (user?.id ?? (sessionState === "preissued" ? "preissued" : null))
+    : null;
+  const workspaceScopeKey = canUseDirectChat
+    ? sessionState === "preissued"
+      ? "preissued"
+      : (authorityBindingId ?? null)
+    : null;
+  const sessionScopeReady =
+    !canUseDirectChat || (identity !== null && workspaceScopeKey !== null);
   const identityMatches =
     getMessagingSessionIdentity() === identity &&
-    getWorkspaceSessionIdentity() === identity;
+    getWorkspaceSessionIdentity() === identity &&
+    getWorkspaceSessionScopeKey() === workspaceScopeKey;
   const [, rerender] = useReducer((value: number) => value + 1, 0);
 
   useLayoutEffect(() => {
     if (identityMatches) return;
-    bindWorkspaceSessionIdentity(identity);
+    bindWorkspaceSessionIdentity(identity, workspaceScopeKey);
     bindMessagingSessionIdentity(identity);
     rerender();
-  }, [identity, identityMatches]);
+  }, [identity, identityMatches, workspaceScopeKey]);
 
   if (emailLinkCallbackPending) {
     return <LoginScreen />;
   }
   if (canUseDirectChat) {
-    if (!identityMatches) {
+    if (!sessionScopeReady || !identityMatches) {
       return <AuthStatus title="セッションを切り替えています…" />;
     }
     return children;
