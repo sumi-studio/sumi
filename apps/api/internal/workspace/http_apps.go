@@ -64,6 +64,7 @@ func (s *Server) serveInstallApp(w http.ResponseWriter, r *http.Request) {
 	}
 	operationID, operationPresent, operationValid := optionalNonEmptyString(request.OperationID)
 	if !operationValid ||
+		(owner.Kind == applicationapps.OwnerParticipant && !operationPresent) ||
 		(operationPresent && applicationapps.ValidateInstallOperationID(operationID) != nil) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
