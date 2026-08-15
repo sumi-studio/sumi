@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "check-types": "tsc -b --noEmit",
+    "check-types": "tsc -b --noEmit && pnpm run check-types:edge",
+    "check-types:edge": "tsc -p cloudflare/tsconfig.json --noEmit",
     "test": "pnpm run test:ui && pnpm run test:runtime && pnpm run test:socket && pnpm run test:config",
+    "test:edge:contracts": "tsx --test scripts/cloudflare-edge.test.ts",
     "test:unit": "pnpm run test:ui && pnpm run test:runtime",
     "test:ui": "vitest run",
     "test:runtime": "tsx --test src/agent/reducer.test.ts src/agent/store.test.ts",
