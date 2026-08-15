@@ -138,6 +138,10 @@ function hasLaterCloser(
  */
 type SharedNumericDelimiter = "formula" | "currency" | "ambiguous";
 
+const CURRENCY_AMOUNT = /^(?:[0-9]+(?:[.,][0-9]+)*|[.,][0-9]+)/u;
+const CURRENCY_UNIT =
+  /^(?:\p{White_Space}|\uFEFF)*(?:(?:円|ドル|ユーロ|ポンド|元|ウォン|セント|USD|JPY|EUR|GBP|CNY|KRW|CAD|AUD)|(?:[/／](?:個|人|件|本|枚|台|回|時間|時|日|週|月|年|kg|g)))/iu;
+
 function currencyTransition(suffix: string): boolean {
   const englishLabel =
     /^[,.;!?]\s*[A-Za-z]+(?:\s+[A-Za-z]+)*\s*[:：]\s*$/u.test(suffix);
@@ -149,7 +153,24 @@ function currencyTransition(suffix: string): boolean {
 }
 
 function numericFormula(suffix: string): boolean {
-  if (/\\(?:[A-Za-z]+|[^A-Za-z\s])/u.test(suffix)) return true;
+  // A shared delimiter is not enough evidence when its complete left-hand
+  // candidate contains prose. Keep ambiguous currency/unit text inert rather
+  // than letting one operator (notably `/個`) turn the prose into TeX.
+  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(suffix)) {
+    return false;
+  }
+  const withoutCommands = suffix.replace(/\\(?:[A-Za-z@]+|[^A-Za-z\s])/gu, "");
+  if (
+    !/^(?:\p{White_Space}|\uFEFF|[A-Za-z\u0370-\u03ff0-9+\-*/=^_<>{}()[\]|,.±∓×÷·⋅≤≥≈≠]|\\(?:[A-Za-z@]+|[^A-Za-z\s]))*$/u.test(
+      suffix,
+    ) ||
+    /[A-Za-z\u0370-\u03ff](?:\p{White_Space}|\uFEFF)+[A-Za-z\u0370-\u03ff]/u.test(
+      withoutCommands,
+    )
+  ) {
+    return false;
+  }
+  if (/\\(?:[A-Za-z@]+|[^A-Za-z\s])/u.test(suffix)) return true;
   if (/[+\-*/=^_<>{}()[\]|±∓×÷·⋅≤≥≈≠]/u.test(suffix)) return true;
 
   const compactVariable =
@@ -164,16 +185,33 @@ function numericFormula(suffix: string): boolean {
   return compactVariable || commaSeparatedVariable;
 }
 
+function currencyCandidate(body: string): boolean {
+  const amount = body.match(CURRENCY_AMOUNT)?.[0];
+  if (!amount) return false;
+  const suffix = body.slice(amount.length);
+  if (currencyTransition(suffix)) return true;
+  const unit = suffix.match(CURRENCY_UNIT)?.[0];
+  return unit !== undefined && currencyTransition(suffix.slice(unit.length));
+}
+
+function currencyAmountStart(value: string, opener: number): boolean {
+  const first = value[opener + 1];
+  return (
+    digit(first) ||
+    ((first === "." || first === ",") && digit(value[opener + 2]))
+  );
+}
+
 function sharedNumericDelimiter(
   value: string,
   opener: number,
   candidate: number,
 ): SharedNumericDelimiter {
   const body = value.slice(opener + 1, candidate);
-  const amount = body.match(/^[0-9]+(?:[.,][0-9]+)*/u)?.[0] ?? "";
-  if (amount === "") return "ambiguous";
+  if (currencyCandidate(body)) return "currency";
+  const amount = body.match(CURRENCY_AMOUNT)?.[0] ?? "";
+  if (!amount) return "ambiguous";
   const suffix = body.slice(amount.length);
-  if (currencyTransition(suffix)) return "currency";
   if (numericFormula(suffix)) return "formula";
   return "ambiguous";
 }
@@ -202,7 +240,7 @@ function splitSingleDollarMath(value: string, raw: string): MdNode[] | null {
       if (canClose(value, dollars, closer)) {
         if (
           canOpen(value, dollars, closer) &&
-          digit(value[opener + 1]) &&
+          currencyAmountStart(value, opener) &&
           hasLaterCloser(value, dollars, closer)
         ) {
           const decision = sharedNumericDelimiter(value, opener, closer);

@@ -69,7 +69,7 @@ test("math stays locally scrollable and copies one TeX source", async ({
     expect(adjacentCurrency.sources).toEqual(["x"]);
 
     const japaneseCurrency = await mathSources(page, "#currency-japanese");
-    expect(japaneseCurrency.text).toContain("価格は$5。式は");
+    expect(japaneseCurrency.text).toContain("価格は$5/個、式は");
     expect(japaneseCurrency.sources).toEqual(["x"]);
 
     const numericFormula = await mathSources(page, "#numeric-formula-adjacent");
@@ -91,6 +91,38 @@ test("math stays locally scrollable and copies one TeX source", async ({
       fallback: macroSource,
       katex: false,
     });
+
+    const aggregate = await page
+      .locator("#aggregate-math")
+      .evaluate((message) => ({
+        descendants: message.querySelectorAll("*").length,
+        firstFallback:
+          message.querySelector<HTMLElement>("[data-math-fallback=aggregate]")
+            ?.textContent ?? null,
+        fallbacks: message.querySelectorAll("[data-math-fallback=aggregate]")
+          .length,
+        formulae: message.querySelectorAll(".katex").length,
+      }));
+    expect(aggregate.formulae).toBe(0);
+    expect(aggregate.fallbacks).toBe(4_000);
+    expect(aggregate.firstFallback).toBe(String.raw`\frac{1}{2}`);
+    expect(aggregate.descendants).toBeLessThan(20_000);
+
+    await copyFormula(page, "#aggregate-math [data-math-fallback=aggregate]");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(String.raw`\frac{1}{2}`);
+
+    await page.reload();
+    await page.waitForFunction(() => "__compactMathReady" in window);
+    const aggregateAfterReload = await page
+      .locator("#aggregate-math")
+      .evaluate((message) => ({
+        fallbacks: message.querySelectorAll("[data-math-fallback=aggregate]")
+          .length,
+        formulae: message.querySelectorAll(".katex").length,
+      }));
+    expect(aggregateAfterReload).toEqual({ fallbacks: 4_000, formulae: 0 });
 
     const mixed = String.raw`E=mc^2 tail
 next line
@@ -132,15 +164,18 @@ async function copyFormula(
   },
   selector: string,
 ) {
-  const copied = await page.locator(selector).evaluate((node) => {
-    const selection = window.getSelection();
-    const range = document.createRange();
-    if (!selection) return false;
-    range.selectNodeContents(node);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    return document.execCommand("copy");
-  });
+  const copied = await page
+    .locator(selector)
+    .first()
+    .evaluate((node) => {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      if (!selection) return false;
+      range.selectNodeContents(node);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return document.execCommand("copy");
+    });
   expect(copied).toBe(true);
 }
 

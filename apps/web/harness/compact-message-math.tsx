@@ -3,6 +3,10 @@ import { CompactMessageResponse } from "@sumi/ui/ai-elements/compact-message-res
 import { createRoot } from "react-dom/client";
 
 const macroExpansionProbe = `\\def\\boom{${"x".repeat(200)}}${"\\boom".repeat(200)}`;
+const aggregateMathProbe = Array.from(
+  { length: 4_000 },
+  () => String.raw`$\frac{1}{2}$`,
+).join(" ");
 
 function App() {
   return (
@@ -26,7 +30,9 @@ function App() {
         </CompactMessageResponse>
       </section>
       <section id="currency-japanese">
-        <CompactMessageResponse>{"価格は$5。式は$x$"}</CompactMessageResponse>
+        <CompactMessageResponse>
+          {"価格は$5/個、式は$x$"}
+        </CompactMessageResponse>
       </section>
       <section id="numeric-formula-adjacent">
         <CompactMessageResponse>
@@ -35,6 +41,9 @@ function App() {
       </section>
       <section id="macro-expansion">
         <CompactMessageResponse>{`$${macroExpansionProbe}$`}</CompactMessageResponse>
+      </section>
+      <section id="aggregate-math">
+        <CompactMessageResponse>{aggregateMathProbe}</CompactMessageResponse>
       </section>
       <section id="copy-mixed">
         <CompactMessageResponse>
