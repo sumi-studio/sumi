@@ -458,6 +458,7 @@ function applyToolStart(
       type: "tool",
       id: toolCallId,
       name: toolName,
+      route: existing?.type === "tool" ? existing.route : null,
       label: existing?.type === "tool" ? existing.label : `${toolName}を実行中`,
       args,
       result: existing?.type === "tool" ? existing.result : undefined,
@@ -482,6 +483,7 @@ function applyToolEnd(
           type: "tool" as const,
           id: toolCallId,
           name: toolCallId,
+          route: null,
           args: {},
           result: undefined,
           label: toolCallId,
@@ -559,15 +561,25 @@ function applyApprovalRequested(
 function applyApprovalResolved(
   session: AgentSession,
   requestId: string,
-  resolution: "cancelled" | { decision: ApprovalDecision },
+  resolution:
+    | "cancelled"
+    | { decision: ApprovalDecision }
+    | { rejected: { decision: ApprovalDecision } },
 ): AgentSession {
-  const decision = resolution === "cancelled" ? null : resolution.decision;
+  const decision =
+    resolution === "cancelled"
+      ? null
+      : "rejected" in resolution
+        ? resolution.rejected.decision
+        : resolution.decision;
   const status =
     resolution === "cancelled"
       ? "cancelled"
-      : resolution.decision.type === "deny_once"
-        ? "denied"
-        : "allowed";
+      : "rejected" in resolution
+        ? "rejected"
+        : resolution.decision.type === "deny_once"
+          ? "denied"
+          : "allowed";
   const approvalEntry = session.conversation.entries[`approval:${requestId}`];
   const runId =
     session.approvalRunIds[requestId] ??
@@ -659,6 +671,7 @@ function upsertToolCall(
       type: "tool",
       id: toolCall.id,
       name: toolCall.name,
+      route: toolCall.route,
       label:
         existing?.type === "tool" ? existing.label : `${toolCall.name}を準備中`,
       args: toolCall.arguments,

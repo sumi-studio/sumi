@@ -955,7 +955,12 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
             event: {
               type: "tool_call_end",
               content_index: 0,
-              tool_call: { id: "call-1", name: "read_file", arguments: opaque },
+              tool_call: {
+                id: "call-1",
+                name: "read_file",
+                route: "normal",
+                arguments: opaque,
+              },
             },
           },
         },
@@ -964,6 +969,34 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
     )?.type,
     "event",
   );
+  for (const toolCall of [
+    { id: "call-1", name: "read_file", arguments: opaque },
+    { id: "call-1", name: "read_file", route: "automatic", arguments: opaque },
+    {
+      id: "call-1",
+      name: "read_file",
+      route: "normal",
+      arguments: opaque,
+      extra: true,
+    },
+  ]) {
+    assert.equal(
+      parseDirectChatServerFrame(
+        {
+          type: "event",
+          envelope: {
+            event: {
+              type: "message_update",
+              message_id: "00000000-0000-4000-8000-000000000001",
+              event: { type: "tool_call_end", content_index: 0, tool_call: toolCall },
+            },
+          },
+        },
+        0,
+      ),
+      undefined,
+    );
+  }
   assert.equal(
     parseDirectChatServerFrame(
       event(1, {
@@ -974,6 +1007,28 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
       0,
     )?.type,
     "event",
+  );
+  assert.equal(
+    parseDirectChatServerFrame(
+      event(1, {
+        type: "approval_resolved",
+        request_id: "request-1",
+        resolution: { rejected: { decision: { type: "approve_once" } } },
+      }),
+      0,
+    )?.type,
+    "event",
+  );
+  assert.equal(
+    parseDirectChatServerFrame(
+      event(1, {
+        type: "approval_resolved",
+        request_id: "request-1",
+        resolution: { rejected: { decision: { type: "deny_once" } } },
+      }),
+      0,
+    ),
+    undefined,
   );
   assert.equal(
     parseDirectChatServerFrame(

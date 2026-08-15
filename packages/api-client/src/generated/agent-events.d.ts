@@ -150,6 +150,13 @@ export type ApprovalResolution =
   | "cancelled"
   | {
       decision: ApprovalDecision;
+    }
+  | {
+      rejected: {
+        decision: {
+          type: "approve_once";
+        };
+      };
     };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -470,6 +477,7 @@ export interface PublicAssistantMessage {
 export interface ToolCall {
   id: string;
   name: string;
+  route: "normal" | "elevated";
   /**
    * JSON object validated against the tool schema at execution time
    */

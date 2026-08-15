@@ -110,7 +110,7 @@ function TraceRow({ event }: { event: AgentTraceEvent }) {
       const Icon =
         event.status === "pending"
           ? ShieldAlert
-          : event.status === "denied"
+          : event.status === "denied" || event.status === "rejected"
             ? ShieldX
             : event.status === "cancelled"
               ? ShieldX
@@ -120,13 +120,19 @@ function TraceRow({ event }: { event: AgentTraceEvent }) {
           ? "承認待ち"
           : event.status === "denied"
             ? "拒否"
-            : event.status === "cancelled"
-              ? "キャンセル"
-              : "許可";
+            : event.status === "rejected"
+              ? "実行されず"
+              : event.status === "cancelled"
+                ? "キャンセル"
+                : "許可";
       return (
         <TraceLine
           icon={Icon}
-          tone={event.status === "denied" ? "error" : "default"}
+          tone={
+            event.status === "denied" || event.status === "rejected"
+              ? "error"
+              : "default"
+          }
           muted={event.status === "cancelled"}
         >
           <span>{event.summary}</span>

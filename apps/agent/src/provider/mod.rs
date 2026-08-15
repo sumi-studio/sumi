@@ -2474,7 +2474,8 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         | ChatAdapterError::InvalidTemperature(_)
         | ChatAdapterError::ReasoningRequired
         | ChatAdapterError::InvalidReasoningEffort(_)
-        | ChatAdapterError::RequiredToolChoiceUnsupported => {
+        | ChatAdapterError::RequiredToolChoiceUnsupported
+        | ChatAdapterError::StructuredOutputUnsupported => {
             (error.to_string(), "invalid_provider_request".to_owned())
         }
     }

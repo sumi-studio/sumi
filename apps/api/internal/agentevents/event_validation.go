@@ -496,7 +496,7 @@ func validateToolCall(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := requireAndAllow(obj, []string{"id", "name", "arguments"}, []string{"id", "name", "arguments"}); err != nil {
+	if err := requireAndAllow(obj, []string{"id", "name", "route", "arguments"}, []string{"id", "name", "route", "arguments"}); err != nil {
 		return err
 	}
 	if err := validateString(obj["id"]); err != nil {
@@ -504,6 +504,9 @@ func validateToolCall(raw json.RawMessage) error {
 	}
 	if err := validateString(obj["name"]); err != nil {
 		return fmt.Errorf("tool call name: %w", err)
+	}
+	if err := validateEnumString(obj["route"], map[string]bool{"normal": true, "elevated": true}); err != nil {
+		return fmt.Errorf("tool call route: %w", err)
 	}
 	if err := validateObjectNotNull(obj["arguments"]); err != nil {
 		return fmt.Errorf("tool call arguments: %w", err)
@@ -707,10 +710,39 @@ func validateApprovalResolution(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := requireAndAllow(obj, []string{"decision"}, []string{"decision"}); err != nil {
-		return err
+	if decision, ok := obj["decision"]; ok {
+		if err := requireAndAllow(obj, []string{"decision"}, []string{"decision"}); err != nil {
+			return err
+		}
+		return validateApprovalDecision(decision)
 	}
-	return validateApprovalDecision(obj["decision"])
+	if rejected, ok := obj["rejected"]; ok {
+		if err := requireAndAllow(obj, []string{"rejected"}, []string{"rejected"}); err != nil {
+			return err
+		}
+		rejectedObj, err := asObject(rejected, "rejected approval resolution")
+		if err != nil {
+			return err
+		}
+		if err := requireAndAllow(rejectedObj, []string{"decision"}, []string{"decision"}); err != nil {
+			return err
+		}
+		decision := rejectedObj["decision"]
+		if err := validateApprovalDecision(decision); err != nil {
+			return err
+		}
+		var discriminator struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(decision, &discriminator); err != nil {
+			return fmt.Errorf("rejected approval decision discriminator: %w", err)
+		}
+		if discriminator.Type != "approve_once" {
+			return fmt.Errorf("rejected approval resolution must preserve approve_once")
+		}
+		return nil
+	}
+	return fmt.Errorf("approval resolution object must contain decision or rejected")
 }
 
 func validateUsage(raw json.RawMessage) error {

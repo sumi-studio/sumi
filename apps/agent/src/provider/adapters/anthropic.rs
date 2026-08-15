@@ -154,6 +154,17 @@ pub fn build_request(
             normalize_tool_choice(choice, spec.reasoning)?,
         );
     }
+    if let Some(output) = &options.structured_output {
+        request.insert(
+            "output_config".into(),
+            json!({
+                "format": {
+                    "type": "json_schema",
+                    "schema": output.schema,
+                }
+            }),
+        );
+    }
     Ok(Value::Object(request))
 }
 
@@ -2254,6 +2265,39 @@ mod tests {
         assert_eq!(value["messages"][0]["content"].as_array().unwrap().len(), 2);
         assert_eq!(value["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(value["messages"][2]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn request_carries_the_exact_structured_output_schema() {
+        let output = crate::provider::model::StructuredOutputSchema {
+            name: "sumi_escalation_review_v1".to_owned(),
+            description: "escalation review".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {"outcome": {"enum": ["ask_human", "block"]}},
+                "required": ["outcome"],
+                "additionalProperties": false
+            }),
+        };
+        let request = build_request(
+            &spec(),
+            &context(vec![synthetic(Message::User(UserMessage {
+                content: vec![UserContent::Text { text: "act".into() }],
+                timestamp: timestamp(),
+            }))]),
+            &RequestOptions {
+                structured_output: Some(output.clone()),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("structured request");
+
+        assert_eq!(
+            request["output_config"]["format"],
+            json!({"type": "json_schema", "schema": output.schema})
+        );
+        assert!(request["output_config"]["format"].get("name").is_none());
+        assert!(!request["system"].to_string().contains("properties"));
     }
 
     #[test]

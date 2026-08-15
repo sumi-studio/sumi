@@ -3,6 +3,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   SteerMode,
+  ToolCall,
 } from "@sumi/api-client";
 import type { SduiNode } from "@sumi/sdui";
 
@@ -19,6 +20,8 @@ export type AgentTraceEvent =
       type: "tool";
       id: string;
       name: string;
+      /** Known once the canonical ToolCall projection arrives. */
+      route: ToolCall["route"] | null;
       label: string;
       args: Record<string, AnyJSON>;
       result: AnyJSON | undefined;
@@ -29,7 +32,7 @@ export type AgentTraceEvent =
       id: string;
       toolCallId: string;
       summary: string;
-      status: "pending" | "allowed" | "denied" | "cancelled";
+      status: "pending" | "allowed" | "denied" | "rejected" | "cancelled";
       decision: ApprovalDecision | null;
     }
   | { type: "artifact"; id: string; label: string }
@@ -101,7 +104,7 @@ export type ConversationEntry =
       request: ApprovalRequest;
       summary: string;
       reason: string | null;
-      status: "pending" | "allowed" | "denied" | "cancelled";
+      status: "pending" | "allowed" | "denied" | "rejected" | "cancelled";
       decision: ApprovalDecision | null;
       timestamp: null;
     }

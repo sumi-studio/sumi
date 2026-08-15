@@ -21,6 +21,21 @@ pub enum ThinkingFormat {
     ProviderDefault,
 }
 
+/// How an OpenAI Chat Completions-compatible endpoint accepts a requested
+/// structured response. Compatibility is endpoint-specific: an endpoint using
+/// the Chat wire shape does not thereby support OpenAI's `json_schema` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatStructuredOutputMode {
+    /// Native OpenAI `response_format.type=json_schema` constrained decoding.
+    JsonSchema,
+    /// Provider-native JSON mode plus the exact schema in the system message.
+    JsonObjectWithPromptSchema,
+    /// The provider documents prompt-based output shaping only.
+    PromptSchema,
+    /// No structured-output contract has been verified for this endpoint.
+    Unsupported,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatCompat {
     pub max_tokens_field: MaxTokensField,
@@ -34,6 +49,7 @@ pub struct ChatCompat {
     pub supports_store: bool,
     pub supports_developer_role: bool,
     pub allows_sampling_parameters: bool,
+    pub structured_output: ChatStructuredOutputMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +168,7 @@ impl ModelSpec {
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: false,
+                    structured_output: ChatStructuredOutputMode::PromptSchema,
                 },
             ),
             "glm-5.2" => (
@@ -174,6 +191,7 @@ impl ModelSpec {
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
+                    structured_output: ChatStructuredOutputMode::JsonObjectWithPromptSchema,
                 },
             ),
             "umans" | "umans-kimi-k2.7" => (
@@ -196,6 +214,7 @@ impl ModelSpec {
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
+                    structured_output: ChatStructuredOutputMode::Unsupported,
                 },
             ),
             "opencode-go" | "opencode-zen-go" => (
@@ -218,6 +237,7 @@ impl ModelSpec {
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: false,
+                    structured_output: ChatStructuredOutputMode::Unsupported,
                 },
             ),
             _ => return None,
@@ -338,12 +358,23 @@ const fn protocol_tag(protocol: ApiProtocol) -> &'static str {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructuredOutputSchema {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RequestOptions {
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     pub tool_choice: Option<Value>,
     pub reasoning_effort: Option<String>,
+    /// Provider-neutral constrained response contract. Adapters must either
+    /// carry this through a verified native field, apply the endpoint's
+    /// documented fallback, or reject the request before transport.
+    pub structured_output: Option<StructuredOutputSchema>,
     /// Opt in to provider-native compaction. The canonical default remains
     /// `sumi_three_layer`; T17 will wire the durable conversation mode into
     /// this request option.

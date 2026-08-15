@@ -39,8 +39,8 @@ use crate::agent::{
 };
 use crate::provider::types::{
     ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-    RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
-    UserContent, UserMessage,
+    RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolInvocationRoute,
+    ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
 
@@ -836,6 +836,7 @@ pub enum WirePublicAssistantContent {
 pub struct WireToolCall {
     pub id: String,
     pub name: String,
+    pub route: ToolInvocationRoute,
     pub arguments: Map<String, Value>,
 }
 
@@ -1339,6 +1340,7 @@ impl TryFrom<ToolCall> for WireToolCall {
         Ok(Self {
             id: tool_call.id,
             name: tool_call.name,
+            route: tool_call.route,
             arguments: tool_call.arguments.as_object().clone(),
         })
     }
@@ -2563,6 +2565,22 @@ mod tests {
             content_index: 0,
             content: "summary".to_owned(),
         });
+    }
+
+    #[test]
+    fn tool_call_projection_preserves_route_as_a_wire_distinction() {
+        let normal = WireToolCall::try_from(tool_call()).expect("normal projection");
+        let mut elevated_call = tool_call();
+        elevated_call.route = ToolInvocationRoute::Elevated;
+        let elevated = WireToolCall::try_from(elevated_call).expect("elevated projection");
+
+        let normal_json = serde_json::to_value(normal).unwrap();
+        let elevated_json = serde_json::to_value(elevated).unwrap();
+        assert_eq!(normal_json["route"], "normal");
+        assert_eq!(elevated_json["route"], "elevated");
+        assert_ne!(normal_json, elevated_json);
+        assert_canonical_contract("ToolCall", &normal_json);
+        assert_canonical_contract("ToolCall", &elevated_json);
     }
 
     fn round_trip_stream_event(event: PublicStreamEvent) {

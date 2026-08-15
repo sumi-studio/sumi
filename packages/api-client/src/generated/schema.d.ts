@@ -779,6 +779,8 @@ export interface components {
         ToolCall: {
             id: string;
             name: string;
+            /** @enum {string} */
+            route: "normal" | "elevated";
             /** @description JSON object validated against the tool schema at execution time */
             arguments: {
                 [key: string]: components["schemas"]["AnyJSON"];
@@ -946,6 +948,13 @@ export interface components {
         };
         ApprovalResolution: "cancelled" | {
             decision: components["schemas"]["ApprovalDecision"];
+        } | {
+            rejected: {
+                decision: {
+                    /** @constant */
+                    type: "approve_once";
+                };
+            };
         };
         ApprovalResolvedEvent: {
             /** @constant */
