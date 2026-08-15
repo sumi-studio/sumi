@@ -12,7 +12,7 @@ test("declared resources load and host-open JSON-RPC remains available", async (
 }) => {
   let resourceRequests = 0;
   const sandboxArtifact = (
-    await readFile("public/mcp-app-sandbox.html", "utf8")
+    await readFile("e2e/fixtures/mcp-app-sandbox.html", "utf8")
   ).replace("__SUMI_MCP_SANDBOX_DEPLOYMENT__", deploymentId);
 
   await page.route(`${hostOrigin}/**`, async (route) => {
@@ -80,7 +80,7 @@ test("an undeclared View self-navigation is blocked and loses bridge trust", asy
 }) => {
   let undeclaredRequests = 0;
   const sandboxArtifact = (
-    await readFile("public/mcp-app-sandbox.html", "utf8")
+    await readFile("e2e/fixtures/mcp-app-sandbox.html", "utf8")
   ).replace("__SUMI_MCP_SANDBOX_DEPLOYMENT__", deploymentId);
 
   await page.route(`${hostOrigin}/**`, async (route) => {
@@ -136,7 +136,7 @@ test("an undeclared View self-navigation is blocked and loses bridge trust", asy
 for (const scheme of ["data", "blob", "about"] as const) {
   test(`a ${scheme}: View replacement loses bridge trust`, async ({ page }) => {
     const sandboxArtifact = (
-      await readFile("public/mcp-app-sandbox.html", "utf8")
+      await readFile("e2e/fixtures/mcp-app-sandbox.html", "utf8")
     ).replace("__SUMI_MCP_SANDBOX_DEPLOYMENT__", deploymentId);
 
     await page.route(`${hostOrigin}/**`, async (route) => {

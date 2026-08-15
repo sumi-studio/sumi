@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!--
-      This source artifact is deliberately inert. A dedicated HTTPS sandbox
+      This E2E fixture is deliberately inert. A dedicated HTTPS sandbox
       deployment must replace the marker below and serve the CSP in this meta
       element as an HTTP response header, plus an exact frame-ancestors host.
       The broad source directives permit a resource-specific policy boundary
@@ -12,7 +12,7 @@
       CSP is inherited by the View and limits every replacement navigation;
       the same policy is also injected before any View HTML. Tightening this
       deployment policy would silently break validly declared domains. See
-      mcp-app-sandbox-deployment.md next to this file.
+      mcp-app-sandbox-deployment.md next to this fixture.
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -239,8 +239,6 @@
         }
 
         function resourceBoundaryMain() {
-          "use strict";
-
           const RESOURCE_BOOTSTRAP = "sumi/mcp/resource-bootstrap";
           const MAX_HTML_BYTES = 512 * 1024;
           const MAX_MESSAGE_BYTES = 256 * 1024;
