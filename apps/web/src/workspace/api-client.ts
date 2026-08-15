@@ -28,6 +28,18 @@ export class WorkspaceAPIError extends Error {
   }
 }
 
+/**
+ * No HTTP response was received, so the caller cannot know whether a mutation
+ * reached the server or committed. Lifecycle callers must resolve this by
+ * replaying an idempotent exact intent; an ordinary refresh is not sufficient.
+ */
+export class WorkspaceAPIUncertainError extends Error {
+  constructor(cause: unknown) {
+    super("workspace_request_outcome_uncertain", { cause });
+    this.name = "WorkspaceAPIUncertainError";
+  }
+}
+
 export interface WorkspaceControlClient {
   listWorkspaces(): Promise<Workspace[]>;
   createWorkspace(name: string): Promise<Workspace>;
@@ -70,6 +82,7 @@ export interface WorkspaceControlClient {
   setInstallationState(
     installationId: string,
     state: AppInstallationState,
+    expectedAuthorityEpoch?: string,
   ): Promise<AppInstallation>;
   uninstallApp(installationId: string): Promise<void>;
 }
@@ -280,11 +293,20 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
   async setInstallationState(
     installationId: string,
     state: AppInstallationState,
+    expectedAuthorityEpoch?: string,
   ): Promise<AppInstallation> {
     return parseInstallation(
       await this.request(
         `/app-installations/${encodeURIComponent(installationId)}/state`,
-        { method: "PUT", body: { state } },
+        {
+          method: "PUT",
+          body: {
+            state,
+            ...(expectedAuthorityEpoch === undefined
+              ? {}
+              : { expected_authority_epoch: expectedAuthorityEpoch }),
+          },
+        },
       ),
     );
   }
@@ -300,20 +322,25 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
     path: string,
     options: { method?: string; body?: unknown } = {},
   ): Promise<unknown> {
-    const response = await this.fetcher(path, {
-      method: options.method ?? "GET",
-      credentials: "include",
-      cache: "no-store",
-      headers: {
-        Accept: "application/json",
-        ...(options.body === undefined
-          ? {}
-          : { "Content-Type": "application/json" }),
-      },
-      body:
-        options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await this.fetcher(path, {
+        method: options.method ?? "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          ...(options.body === undefined
+            ? {}
+            : { "Content-Type": "application/json" }),
+        },
+        body:
+          options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      throw new WorkspaceAPIUncertainError(error);
+    }
     if (!response.ok) {
       let code = "workspace_request_failed";
       try {

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"net/http"
+	"strconv"
 
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 )
@@ -81,7 +82,8 @@ func (s *Server) serveSetAppEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		State string `json:"state"`
+		State                  string `json:"state"`
+		ExpectedAuthorityEpoch string `json:"expected_authority_epoch,omitempty"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
@@ -92,11 +94,26 @@ func (s *Server) serveSetAppEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var installation applicationapps.Installation
+	var expectedAuthorityEpoch *int64
+	if request.ExpectedAuthorityEpoch != "" {
+		parsed, parseErr := strconv.ParseInt(request.ExpectedAuthorityEpoch, 10, 64)
+		if parseErr != nil || parsed < 1 || strconv.FormatInt(parsed, 10) != request.ExpectedAuthorityEpoch {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		expectedAuthorityEpoch = &parsed
+	}
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var stateErr error
-		installation, stateErr = s.Apps.SetEnabledByID(r.Context(),
-			r.PathValue("installation_id"), actor,
-			request.State == string(applicationapps.StateEnabled))
+		if expectedAuthorityEpoch == nil {
+			installation, stateErr = s.Apps.SetEnabledByID(r.Context(),
+				r.PathValue("installation_id"), actor,
+				request.State == string(applicationapps.StateEnabled))
+		} else {
+			installation, stateErr = s.Apps.SetEnabledByIDAtEpoch(r.Context(),
+				r.PathValue("installation_id"), actor,
+				request.State == string(applicationapps.StateEnabled), *expectedAuthorityEpoch)
+		}
 		return stateErr
 	})
 	if !done {

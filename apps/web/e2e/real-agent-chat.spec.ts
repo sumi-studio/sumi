@@ -131,16 +131,10 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     const firstSession = waitForSessionBootstrap(page);
     const secondSession = waitForSessionBootstrap(secondPage);
     await Promise.all([page.goto(stack.webURL), secondPage.goto(stack.webURL)]);
-    const [firstSessionResponse, secondSessionResponse] = await Promise.all([
-      firstSession,
-      secondSession,
-    ]);
+    await Promise.all([firstSession, secondSession]);
     const webOrigin = new URL(stack.webURL).origin;
-    const sessionUserID = await expectNormalSession(
-      firstSessionResponse,
-      webOrigin,
-    );
-    expect(await expectNormalSession(secondSessionResponse, webOrigin)).toBe(
+    const sessionUserID = await expectNormalSession(page, webOrigin);
+    expect(await expectNormalSession(secondPage, webOrigin)).toBe(
       sessionUserID,
     );
     expect(new URL(stack.apiURL).origin).not.toBe(webOrigin);
@@ -225,7 +219,7 @@ test("two real Chrome pages own Direct Chat through the production Participant l
       }
     };
     page.on("request", observeDisableRequest);
-    const lostDisableResponse = await loseNextLifecycleStateResponse(page);
+    const orphanDisable = await captureNextLifecycleStateRequest(page);
     const disableMenu = await openParticipantApps(page);
     await directChatRow(disableMenu)
       .getByRole("button", { name: "無効化" })
@@ -235,31 +229,83 @@ test("two real Chrome pages own Direct Chat through the production Participant l
 
     delayedSecondPageList.release();
     expect((await delayedRefreshResponse).status()).toBe(200);
-    const disabled = expectInstallation(
-      await responseJSON(await lostDisableResponse.committed, 200, webOrigin),
-      sessionUserID,
-      "disabled",
-      "2",
-      installed.installationID,
-    );
-    await lostDisableResponse.dispose();
-    page.off("request", observeDisableRequest);
+    const capturedDisable = await orphanDisable.reached;
+    const heldPeerReplay = await holdNextLifecycleStateRequest(secondPage);
+    await page.close();
+    // Playwright does not always deliver per-WebSocket close callbacks after
+    // abrupt renderer destruction; the renderer boundary itself proves those
+    // client sockets no longer exist.
+    for (const observation of socketObservations) {
+      if (observation.page === "first") observation.closed = true;
+    }
+    const peerReplayRequest = await heldPeerReplay.reached;
+    expect(peerReplayRequest.postData()).toBe(capturedDisable.body);
+    // The surviving renderer has inherited the exact durable intent and owns
+    // the Web Lock, but no final installation read may run until its replay
+    // serializes against the orphan request.
+    expect(delayedSecondPageList.requestCount()).toBe(1);
+
+    const committedResponse = await context.request.fetch(capturedDisable.url, {
+      method: capturedDisable.method,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Origin: webOrigin,
+      },
+      data: capturedDisable.body,
+      failOnStatusCode: false,
+    });
+    let disabled: { installationID: string };
+    if (committedResponse.status() === 200) {
+      disabled = expectInstallation(
+        await responseJSON(committedResponse, 200, webOrigin),
+        sessionUserID,
+        "disabled",
+        "2",
+        installed.installationID,
+      );
+    } else {
+      // Chromium may let the already-issued routed request outlive renderer
+      // teardown. In that exact crash ordering, the independent same-intent
+      // request must serialize after it and report the epoch conflict.
+      expect(committedResponse.status()).toBe(409);
+      expect(asRecord(await committedResponse.json()).error).toBe(
+        "stale_authority",
+      );
+      disabled = { installationID: installed.installationID };
+    }
+    const replayResponse = secondPage.waitForResponse(isLifecycleStateResponse);
+    heldPeerReplay.release();
+    expect((await replayResponse).status()).toBe(409);
+    await heldPeerReplay.dispose();
+    await orphanDisable.dispose();
     await expect
       .poll(delayedSecondPageList.requestCount)
       .toBeGreaterThanOrEqual(2);
     await delayedSecondPageList.dispose();
     expect(disabled.installationID).toBe(installed.installationID);
-    await closePopovers(page);
     await closePopovers(secondPage);
-    await expectLifecycle(page, "直通は無効になっています");
     await expectLifecycle(secondPage, "直通は無効になっています");
-    await expect(railButton(page)).toHaveCount(0);
     await expect(railButton(secondPage)).toHaveCount(0);
     await expectScopeSocketsClosed(
       socketObservations,
       installed.installationID,
       "1",
     );
+    page = await context.newPage();
+    observeDirectChat(
+      page,
+      "first",
+      socketObservations,
+      assistantMessageEndSequence,
+      recordDiagnostic,
+    );
+    const restoredSession = waitForSessionBootstrap(page);
+    await page.goto(new URL("/direct", stack.webURL).toString());
+    await restoredSession;
+    expect(await expectNormalSession(page, webOrigin)).toBe(sessionUserID);
+    await expectLifecycle(page, "直通は無効になっています");
+    await expect(railButton(page)).toHaveCount(0);
     expect(
       await probeDirectChatScope(page, installed.installationID, "1"),
     ).toEqual({ opened: false, ready: false });
@@ -521,12 +567,23 @@ function waitForSessionBootstrap(page: Page): Promise<Response> {
 }
 
 async function expectNormalSession(
-  response: Response,
+  page: Page,
   webOrigin: string,
 ): Promise<string> {
-  expect(response.status()).toBe(200);
-  expect(new URL(response.url()).origin).toBe(webOrigin);
-  const body = asRecord(await response.json());
+  const session = await page.evaluate(async () => {
+    const response = await fetch("/auth/session", {
+      credentials: "include",
+      cache: "no-store",
+    });
+    return {
+      status: response.status,
+      url: response.url,
+      body: await response.json(),
+    };
+  });
+  expect(session.status).toBe(200);
+  expect(new URL(session.url).origin).toBe(webOrigin);
+  const body = asRecord(session.body);
   expect(body.authenticated).toBe(true);
   expect(typeof body.authority_binding_id).toBe("string");
   return asString(asRecord(body.user).id);
@@ -728,12 +785,52 @@ async function holdNextParticipantInstallationList(page: Page): Promise<{
   };
 }
 
-async function loseNextLifecycleStateResponse(page: Page): Promise<{
-  committed: Promise<APIResponse>;
+async function captureNextLifecycleStateRequest(page: Page): Promise<{
+  reached: Promise<{ url: string; method: string; body: string }>;
   dispose: () => Promise<void>;
 }> {
   const pattern = "**/app-installations/*/state";
-  const committed = deferred<APIResponse>();
+  const reached = deferred<{ url: string; method: string; body: string }>();
+  let intercepted = false;
+  const handler = async (route: Route) => {
+    if (
+      route.request().method() !== "PUT" ||
+      !/^\/app-installations\/[^/]+\/state$/.test(
+        new URL(route.request().url()).pathname,
+      )
+    ) {
+      await route.continue();
+      return;
+    }
+    if (!intercepted) {
+      intercepted = true;
+      reached.resolve({
+        url: route.request().url(),
+        method: route.request().method(),
+        body: route.request().postData() ?? "",
+      });
+    }
+    // The route remains unresolved until its renderer is destroyed. The test
+    // then issues the captured exact request independently, reproducing an
+    // HTTP effect that outlives the renderer and its auto-released Web Lock.
+    await new Promise<void>(() => undefined);
+  };
+  await page.route(pattern, handler);
+  return {
+    reached: reached.promise,
+    dispose: () =>
+      page.isClosed() ? Promise.resolve() : page.unroute(pattern, handler),
+  };
+}
+
+async function holdNextLifecycleStateRequest(page: Page): Promise<{
+  reached: Promise<Request>;
+  release: () => void;
+  dispose: () => Promise<void>;
+}> {
+  const pattern = "**/app-installations/*/state";
+  const reached = deferred<Request>();
+  const gate = deferred<void>();
   let intercepted = false;
   const handler = async (route: Route) => {
     if (
@@ -747,16 +844,14 @@ async function loseNextLifecycleStateResponse(page: Page): Promise<{
       return;
     }
     intercepted = true;
-    // The production API receives and commits the exact request. Only the
-    // response leg is then lost, reproducing the ambiguous browser outcome
-    // that cross-document invalidation must survive.
-    const response = await route.fetch();
-    committed.resolve(response);
-    await route.abort("failed");
+    reached.resolve(route.request());
+    await gate.promise;
+    await route.continue();
   };
   await page.route(pattern, handler);
   return {
-    committed: committed.promise,
+    reached: reached.promise,
+    release: () => gate.resolve(),
     dispose: () => page.unroute(pattern, handler),
   };
 }

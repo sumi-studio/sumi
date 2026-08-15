@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { WorkspaceApiClient } from "./api-client";
+import {
+  type WorkspaceAPIUncertainError,
+  WorkspaceApiClient,
+} from "./api-client";
 
 const WORKSPACE_A_ID = "0198f0f4-9b72-7000-8000-000000000001";
 const WORKSPACE_B_ID = "0198f0f4-9b72-7000-8000-000000000002";
@@ -407,7 +410,7 @@ describe("WorkspaceApiClient", () => {
       updatedAt: Date.parse("2026-08-10T05:06:07.890Z"),
     });
     await expect(
-      client.setInstallationState(INSTALLATION_ID, "disabled"),
+      client.setInstallationState(INSTALLATION_ID, "disabled", "1"),
     ).resolves.toMatchObject({
       installationId: INSTALLATION_ID,
       state: "disabled",
@@ -415,7 +418,7 @@ describe("WorkspaceApiClient", () => {
       updatedAt: Date.parse("2026-08-10T05:07:08.901Z"),
     });
     await expect(
-      client.setInstallationState(INSTALLATION_ID, "enabled"),
+      client.setInstallationState(INSTALLATION_ID, "enabled", "2"),
     ).resolves.toMatchObject({
       installationId: INSTALLATION_ID,
       state: "enabled",
@@ -440,14 +443,14 @@ describe("WorkspaceApiClient", () => {
       3,
       `/app-installations/${INSTALLATION_ID}/state`,
       "PUT",
-      { state: "disabled" },
+      { state: "disabled", expected_authority_epoch: "1" },
     );
     expectRequest(
       fetcher,
       4,
       `/app-installations/${INSTALLATION_ID}/state`,
       "PUT",
-      { state: "enabled" },
+      { state: "enabled", expected_authority_epoch: "2" },
     );
     expectRequest(
       fetcher,
@@ -515,6 +518,20 @@ describe("WorkspaceApiClient", () => {
       },
       app_id: "direct-chat",
     });
+  });
+
+  it("marks a request without an HTTP response as outcome-uncertain", async () => {
+    const transportFailure = new TypeError("response channel closed");
+    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(transportFailure);
+    const client = new WorkspaceApiClient(fetcher);
+
+    await expect(
+      client.setInstallationState(INSTALLATION_ID, "disabled", "1"),
+    ).rejects.toMatchObject({
+      name: "WorkspaceAPIUncertainError",
+      message: "workspace_request_outcome_uncertain",
+      cause: transportFailure,
+    } satisfies Partial<WorkspaceAPIUncertainError>);
   });
 });
 

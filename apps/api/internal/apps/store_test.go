@@ -188,6 +188,10 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if disabledAgain.AuthorityEpoch != 2 {
 		t.Fatalf("idempotent disable churned authority epoch to %d", disabledAgain.AuthorityEpoch)
 	}
+	if _, err := w.apps.SetEnabledByIDAtEpoch(ctx, installed.InstallationID,
+		w.owner, false, 1); !errors.Is(err, applicationapps.ErrAuthorityEpochStale) {
+		t.Fatalf("stale lifecycle replay = %v, want stale authority", err)
+	}
 	list, err := w.apps.Installations(ctx, workspaceOwner, w.owner)
 	if err != nil || len(list) != 1 || list[0].State != applicationapps.StateDisabled {
 		t.Fatalf("disabled list = %#v, %v", list, err)
@@ -206,7 +210,8 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 		"messaging"); !errors.Is(err, applicationapps.ErrAppDisabled) {
 		t.Fatalf("disabled bind-time resolution = %v", err)
 	}
-	reenabled, err := w.apps.SetEnabledByID(ctx, installed.InstallationID, w.owner, true)
+	reenabled, err := w.apps.SetEnabledByIDAtEpoch(ctx,
+		installed.InstallationID, w.owner, true, 2)
 	if err != nil {
 		t.Fatalf("re-enable Messaging: %v", err)
 	}
@@ -273,6 +278,113 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if exact, err := w.apps.RequireEnabledInstallation(ctx,
 		reinstalled.InstallationID, workspaceOwner, "messaging"); err != nil || exact.InstallationID != reinstalled.InstallationID {
 		t.Fatalf("reinstalled exact admission = %#v, %v", exact, err)
+	}
+}
+
+func TestExactLifecycleReplaysSerializeAtDatabaseBoundaries(t *testing.T) {
+	w := newAppWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	created, err := w.workspaces.CreateWorkspace(ctx, "replay", w.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := applicationapps.WorkspaceOwner(created.WorkspaceID)
+	installed, err := w.apps.Install(ctx, owner, w.owner, "messaging")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		installation applicationapps.Installation
+		err          error
+	}
+	disableResults := make(chan result, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			item, setErr := w.apps.SetEnabledByIDAtEpoch(
+				ctx, installed.InstallationID, w.owner, false, 1,
+			)
+			disableResults <- result{installation: item, err: setErr}
+		}()
+	}
+	close(start)
+	var committed, stale int
+	for range 2 {
+		item := <-disableResults
+		switch {
+		case item.err == nil:
+			committed++
+			if item.installation.State != applicationapps.StateDisabled ||
+				item.installation.AuthorityEpoch != 2 {
+				t.Fatalf("committed replay = %#v", item.installation)
+			}
+		case errors.Is(item.err, applicationapps.ErrAuthorityEpochStale):
+			stale++
+		default:
+			t.Fatalf("disable replay = %v", item.err)
+		}
+	}
+	if committed != 1 || stale != 1 {
+		t.Fatalf("disable replay outcomes: committed=%d stale=%d", committed, stale)
+	}
+
+	// Enabling does not churn the authority epoch. Two exact replays therefore
+	// both succeed, but the row lock still makes their shared desired truth
+	// stable before either caller can perform its final read.
+	enableResults := make(chan result, 2)
+	start = make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			item, setErr := w.apps.SetEnabledByIDAtEpoch(
+				ctx, installed.InstallationID, w.owner, true, 2,
+			)
+			enableResults <- result{installation: item, err: setErr}
+		}()
+	}
+	close(start)
+	var enableUpdatedAt time.Time
+	for range 2 {
+		item := <-enableResults
+		if item.err != nil || item.installation.State != applicationapps.StateEnabled ||
+			item.installation.AuthorityEpoch != 2 {
+			t.Fatalf("enable replay = %#v, %v", item.installation, item.err)
+		}
+		if enableUpdatedAt.IsZero() {
+			enableUpdatedAt = item.installation.UpdatedAt
+		} else if !item.installation.UpdatedAt.Equal(enableUpdatedAt) {
+			t.Fatalf("idempotent enable replay churned updated_at: %s != %s",
+				item.installation.UpdatedAt, enableUpdatedAt)
+		}
+	}
+
+	uninstallResults := make(chan error, 2)
+	start = make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			uninstallResults <- w.apps.UninstallByID(
+				ctx, installed.InstallationID, w.owner,
+			)
+		}()
+	}
+	close(start)
+	var removed, absent int
+	for range 2 {
+		switch uninstallErr := <-uninstallResults; {
+		case uninstallErr == nil:
+			removed++
+		case errors.Is(uninstallErr, applicationapps.ErrInstallationNotFound):
+			absent++
+		default:
+			t.Fatalf("uninstall replay = %v", uninstallErr)
+		}
+	}
+	if removed != 1 || absent != 1 {
+		t.Fatalf("uninstall replay outcomes: removed=%d absent=%d", removed, absent)
 	}
 }
 
