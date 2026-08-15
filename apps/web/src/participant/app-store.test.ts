@@ -114,6 +114,122 @@ describe("Participant app lifecycle store", () => {
     expect(store.getState().installations).toEqual([]);
   });
 
+  it("queues same-owner refresh behind every lifecycle commit without clearing its mutation", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const disabledEpoch2 = {
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+      updatedAt: 3,
+    };
+    const enabledEpoch2 = {
+      ...disabledEpoch2,
+      state: "enabled" as const,
+      updatedAt: 4,
+    };
+    const reinstalled = installation(
+      OWNER_A,
+      "0198f0f4-9b72-7000-8000-000000000052",
+    );
+    const refreshResponses: Array<
+      ReturnType<typeof deferred<AppInstallation[]>>
+    > = [];
+    const listInstallations = vi
+      .fn<(owner: AppOwnerRef) => Promise<AppInstallation[]>>()
+      .mockResolvedValueOnce([enabledEpoch1])
+      .mockImplementation(() => {
+        const response = deferred<AppInstallation[]>();
+        refreshResponses.push(response);
+        return response.promise;
+      });
+    const disable = deferred<AppInstallation>();
+    const enable = deferred<AppInstallation>();
+    const uninstall = deferred<void>();
+    const reinstall = deferred<AppInstallation>();
+    const setInstallationState = vi
+      .fn<
+        (
+          installationId: string,
+          state: "enabled" | "disabled",
+        ) => Promise<AppInstallation>
+      >()
+      .mockImplementationOnce(() => disable.promise)
+      .mockImplementationOnce(() => enable.promise);
+    const uninstallApp = vi.fn(() => uninstall.promise);
+    const installApp = vi.fn(() => reinstall.promise);
+    const store = createParticipantAppStore(
+      participantClient({
+        listInstallations,
+        setInstallationState,
+        uninstallApp,
+        installApp,
+      }),
+    );
+    await store.getState().bindParticipant(HUMAN_A);
+
+    const disabling = store
+      .getState()
+      .setInstallationState(enabledEpoch1.installationId, "disabled");
+    const refreshAfterDisable = store.getState().refresh();
+    expect(listInstallations).toHaveBeenCalledTimes(1);
+    expect(store.getState()).toMatchObject({
+      status: "loading",
+      mutation: "set_installation_disabled",
+      installations: [enabledEpoch1],
+    });
+    disable.resolve(disabledEpoch2);
+    await disabling;
+    expect(store.getState()).toMatchObject({
+      mutation: null,
+      installations: [disabledEpoch2],
+    });
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(2));
+    refreshResponses[0]?.resolve([disabledEpoch2]);
+    await refreshAfterDisable;
+    expect(store.getState().installations).toEqual([disabledEpoch2]);
+
+    const enabling = store
+      .getState()
+      .setInstallationState(enabledEpoch1.installationId, "enabled");
+    const refreshAfterEnable = store.getState().refresh();
+    expect(listInstallations).toHaveBeenCalledTimes(2);
+    expect(store.getState().mutation).toBe("set_installation_enabled");
+    enable.resolve(enabledEpoch2);
+    await enabling;
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(3));
+    refreshResponses[1]?.resolve([enabledEpoch2]);
+    await refreshAfterEnable;
+    expect(store.getState().installations).toEqual([enabledEpoch2]);
+
+    const uninstalling = store
+      .getState()
+      .uninstallApp(enabledEpoch1.installationId);
+    const refreshAfterUninstall = store.getState().refresh();
+    expect(listInstallations).toHaveBeenCalledTimes(3);
+    expect(store.getState().mutation).toBe("uninstall_app");
+    uninstall.resolve();
+    await uninstalling;
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(4));
+    refreshResponses[2]?.resolve([]);
+    await refreshAfterUninstall;
+    expect(store.getState().installations).toEqual([]);
+
+    const reinstalling = store.getState().installApp("direct-chat");
+    const refreshAfterReinstall = store.getState().refresh();
+    expect(listInstallations).toHaveBeenCalledTimes(4);
+    expect(store.getState().mutation).toBe("install_app");
+    reinstall.resolve(reinstalled);
+    await reinstalling;
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(5));
+    refreshResponses[3]?.resolve([reinstalled]);
+    await refreshAfterReinstall;
+    expect(store.getState()).toMatchObject({
+      status: "ready",
+      mutation: null,
+      installations: [reinstalled],
+    });
+  });
+
   it("never publishes a late snapshot from the previously authenticated Human", async () => {
     const ownerAResponse = deferred<AppInstallation[]>();
     const ownerBResponse = deferred<AppInstallation[]>();

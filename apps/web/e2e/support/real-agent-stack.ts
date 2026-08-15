@@ -29,9 +29,11 @@ export const secondProviderResponse = "real-agent-turn-two-context-ok";
 
 const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001";
 const realAgentHumanID = "0198f0f4-9b72-7000-8000-000000000002";
-const directChatInstallationID = "0198f0f4-9b72-7000-8000-000000000051";
 const workspaceBrowserHumanID = "0198f0f4-9b72-7000-8000-00000000e2e0";
 const generation = "7";
+const firebaseProjectID = "sumi-studio";
+const firebaseWebAPIKey = "sumi-direct-chat-e2e-public-key";
+const firebaseWebAppID = "1:000000000000:web:0000000000000000000000";
 
 export interface RealAgentBuild {
   directory: string;
@@ -625,6 +627,7 @@ async function startRealAgentStackOnce(
     const leaseID = `lease-${randomIdentifier()}`;
     const fenceID = `fence-${randomIdentifier()}`;
     const wrappingKey = randomBytes(32).toString("hex");
+    const wrappingKeyID = `e2e-${randomIdentifier()}`;
     const approvalDigestKey = randomBytes(32).toString("hex");
     const executorSocket = join(paths.ipc, "executor.sock");
     const redactions = [
@@ -642,8 +645,10 @@ async function startRealAgentStackOnce(
       SUMI_RPC_GENERATION: generation,
       SUMI_RPC_NONCE: rpcNonce,
     };
+    const firebaseAuthEmulator = requiredFirebaseAuthEmulator();
 
     await provider.start();
+    await assertFirebaseAuthEmulator(firebaseAuthEmulator);
 
     const api = ManagedProcess.start("Go production API", build.apiServer, [], {
       cwd: apiDirectory,
@@ -657,6 +662,11 @@ async function startRealAgentStackOnce(
         SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
         SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
         SUMI_BROWSER_WS_ALLOWED_ORIGINS: webURL,
+        FIREBASE_AUTH_EMULATOR_HOST: firebaseAuthEmulator.host,
+        SUMI_AUTH_FIREBASE_PROJECT_ID: firebaseProjectID,
+        SUMI_AUTH_TENANT_ID: tenantID,
+        SUMI_AUTH_ALLOW_INSECURE_COOKIES: "true",
+        SUMI_AGENT_WRAPPING_KEY_ID: wrappingKeyID,
         SUMI_DB_URL: databaseURL,
         SUMI_LOCAL_CONTROL_ENABLED: "1",
         SUMI_LOCAL_CONTROL_BEARER: localControlBearer,
@@ -677,7 +687,7 @@ async function startRealAgentStackOnce(
 
     const sessionCookie = (
       await runCommand(
-        "provision Direct Chat authority and issue production browser session",
+        "provision Human and Secretary and issue production browser session",
         build.sessionIssuer,
         [],
         {
@@ -691,8 +701,7 @@ async function startRealAgentStackOnce(
             SUMI_E2E_SESSION_PERSONALITY_AGENT_ID: personalityAgentID,
             SUMI_E2E_SESSION_DATABASE_URL: databaseURL,
             SUMI_E2E_SESSION_DISPLAY_NAME: "Direct Chat E2E Human",
-            SUMI_E2E_SESSION_DIRECT_CHAT_INSTALLATION_ID:
-              directChatInstallationID,
+            SUMI_E2E_SESSION_PROVISION_SECRETARY: "1",
           },
           redactions,
           timeoutMilliseconds: 15_000,
@@ -749,7 +758,7 @@ async function startRealAgentStackOnce(
           SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: String(
             Math.floor(Date.now() / 1_000) + 30 * 60,
           ),
-          SUMI_AGENT_WRAPPING_KEY_ID: `e2e-${randomIdentifier()}`,
+          SUMI_AGENT_WRAPPING_KEY_ID: wrappingKeyID,
           SUMI_AGENT_WRAPPING_KEY: wrappingKey,
           SUMI_APPROVAL_SECRET_DIGEST_KEY: approvalDigestKey,
           SUMI_MODEL_PRESET: "opencode-go",
@@ -766,7 +775,7 @@ async function startRealAgentStackOnce(
     children.push(agent);
 
     const vite = ManagedProcess.start(
-      "Vite preissued-session server",
+      "Vite same-origin production-session server",
       process.execPath,
       [
         resolve(webDirectory, "node_modules/vite/bin/vite.js"),
@@ -780,11 +789,12 @@ async function startRealAgentStackOnce(
         cwd: webDirectory,
         env: {
           ...baseEnvironment,
-          VITE_API_BASE_URL: apiURL,
-          VITE_SUMI_AUTH_MODE: "preissued",
-          VITE_SUMI_PREISSUED_USER_ID: userID,
-          VITE_SUMI_DIRECT_CHAT_INSTALLATION_ID: directChatInstallationID,
-          VITE_SUMI_DIRECT_CHAT_AUTHORITY_EPOCH: "1",
+          SUMI_DEV_API_ORIGIN: apiURL,
+          VITE_FIREBASE_API_KEY: firebaseWebAPIKey,
+          VITE_FIREBASE_AUTH_DOMAIN: `${firebaseProjectID}.firebaseapp.com`,
+          VITE_FIREBASE_PROJECT_ID: firebaseProjectID,
+          VITE_FIREBASE_APP_ID: firebaseWebAppID,
+          VITE_FIREBASE_AUTH_EMULATOR_URL: firebaseAuthEmulator.url,
         },
         redactions,
       },
@@ -1223,6 +1233,63 @@ function randomToken(): string {
 
 function randomIdentifier(): string {
   return randomBytes(18).toString("hex");
+}
+
+function requiredFirebaseAuthEmulator(): { host: string; url: string } {
+  const rawHost = process.env.FIREBASE_AUTH_EMULATOR_HOST?.trim();
+  if (!rawHost) {
+    throw new Error(
+      "FIREBASE_AUTH_EMULATOR_HOST must name the local Firebase Auth emulator",
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(`http://${rawHost}`);
+  } catch {
+    throw new Error(
+      "FIREBASE_AUTH_EMULATOR_HOST must be host:port without a scheme",
+    );
+  }
+  if (
+    url.protocol !== "http:" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    !url.hostname ||
+    !url.port ||
+    rawHost.includes("/")
+  ) {
+    throw new Error(
+      "FIREBASE_AUTH_EMULATOR_HOST must be host:port without a scheme",
+    );
+  }
+  return { host: url.host, url: url.origin };
+}
+
+async function assertFirebaseAuthEmulator({
+  url,
+}: {
+  url: string;
+}): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(
+      `${url}/emulator/v1/projects/${firebaseProjectID}/config`,
+      { signal: controller.signal },
+    );
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+  } catch (error) {
+    throw new Error(
+      `Firebase Auth emulator is unavailable at ${url}: ${toError(error).message}`,
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function environmentWithoutSumiConfiguration(): NodeJS.ProcessEnv {
