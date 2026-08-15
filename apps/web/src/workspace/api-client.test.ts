@@ -485,6 +485,7 @@ describe("WorkspaceApiClient", () => {
       kind: "participant" as const,
       participant: { kind: "human" as const, humanId: HUMAN_A_ID },
     };
+    const operationId = "00000000-0000-4000-8000-000000000202";
 
     await expect(client.listInstallations(owner)).resolves.toEqual([
       {
@@ -498,7 +499,7 @@ describe("WorkspaceApiClient", () => {
       },
     ]);
     await expect(
-      client.installApp(owner, "direct-chat"),
+      client.installApp(owner, "direct-chat", operationId),
     ).resolves.toMatchObject({
       installationId: INSTALLATION_ID,
       owner,
@@ -517,6 +518,7 @@ describe("WorkspaceApiClient", () => {
         participant: { kind: "human", human_id: HUMAN_A_ID },
       },
       app_id: "direct-chat",
+      operation_id: operationId,
     });
   });
 

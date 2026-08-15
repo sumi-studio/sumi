@@ -14,6 +14,12 @@ import type {
 } from "./model";
 import { participantID } from "./model";
 
+type WorkspaceAppOwnerRef = Extract<AppOwnerRef, { kind: "workspace" }>;
+type ParticipantAppOwnerRef = Extract<AppOwnerRef, { kind: "participant" }>;
+type InstallAppArguments =
+  | [owner: WorkspaceAppOwnerRef, appId: string, operationId?: string]
+  | [owner: ParticipantAppOwnerRef, appId: string, operationId: string];
+
 const REQUEST_TIMEOUT_MS = 15_000;
 
 export class WorkspaceAPIError extends Error {
@@ -74,15 +80,11 @@ export interface WorkspaceControlClient {
     roleIds: string[],
   ): Promise<string[]>;
   listAppCatalog(): Promise<AppDescriptor[]>;
-  // Lifecycle reads and installs carry the canonical AppInstallationOwnerRef.
-  // Workspace and Participant owners share one operation; only the owner ref
-  // differs, so no scope is ever inferred from the client's current Workspace.
+  // Lifecycle reads and installs carry the canonical AppInstallationOwnerRef,
+  // so no scope is inferred from the client's current Workspace. Participant
+  // installs additionally require the durable takeover operation identity.
   listInstallations(owner: AppOwnerRef): Promise<AppInstallation[]>;
-  installApp(
-    owner: AppOwnerRef,
-    appId: string,
-    operationId?: string,
-  ): Promise<AppInstallation>;
+  installApp(...args: InstallAppArguments): Promise<AppInstallation>;
   setInstallationState(
     installationId: string,
     state: AppInstallationState,
@@ -283,10 +285,11 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
   }
 
   async installApp(
-    owner: AppOwnerRef,
-    appId: string,
-    operationId?: string,
+    ...[owner, appId, operationId]: InstallAppArguments
   ): Promise<AppInstallation> {
+    if (owner.kind === "participant" && operationId === undefined) {
+      throw new Error("Participant install operation id is required");
+    }
     return parseInstallation(
       await this.request("/app-installations", {
         method: "POST",

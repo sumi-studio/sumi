@@ -528,6 +528,31 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		t.Fatalf("Human app install operation mismatch = %d, body=%s",
 			humanInstallMismatch.Code, humanInstallMismatch.Body.String())
 	}
+	for _, test := range []struct {
+		name           string
+		operationField string
+	}{
+		{name: "omitted"},
+		{name: "null", operationField: `,"operation_id":null`},
+		{name: "empty", operationField: `,"operation_id":""`},
+		{name: "malformed", operationField: `,"operation_id":"not-a-uuid"`},
+	} {
+		invalid := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
+			`{"owner":{"kind":"participant","participant":{"kind":"human","human_id":%q}},"app_id":"alarm"%s}`,
+			w.humanA.ID, test.operationField))
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("Participant install with %s operation id = %d, body=%s",
+				test.name, invalid.Code, invalid.Body.String())
+		}
+	}
+	const participantInstallOperation = "00000000-0000-4000-8000-000000000202"
+	participantInstall := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
+		`{"owner":{"kind":"participant","participant":{"kind":"human","human_id":%q}},"app_id":"alarm","operation_id":%q}`,
+		w.humanA.ID, participantInstallOperation))
+	if participantInstall.Code != http.StatusCreated {
+		t.Fatalf("Participant install with canonical operation id = %d, body=%s",
+			participantInstall.Code, participantInstall.Body.String())
+	}
 	agentInstall := invokeLocal(server.localInstallApp, fmt.Sprintf(
 		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
 		agentWorkspace.WorkspaceID), w.agentA.ID)

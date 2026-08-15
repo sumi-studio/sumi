@@ -662,6 +662,9 @@ export function createParticipantAppStore(
       try {
         switch (intent.kind) {
           case "install": {
+            if (owner.kind !== "participant") {
+              throw new Error("Participant app owner changed");
+            }
             const response = await client.installApp(
               owner,
               intent.appId,
@@ -919,7 +922,7 @@ export function createParticipantAppStore(
         const operation = enqueueOwnerOperation(token, () =>
           lifecycleCoordinator.runExclusive(token.ownerKey, async () => {
             const owner = get().owner;
-            if (!owner || !isCurrentAuthority(token)) {
+            if (owner?.kind !== "participant" || !isCurrentAuthority(token)) {
               throw new Error("Participant app owner changed");
             }
             if (await resolvePendingLifecycleIntent(owner, token.ownerKey)) {
