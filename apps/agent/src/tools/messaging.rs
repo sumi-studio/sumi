@@ -16,11 +16,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use uuid::{Uuid, Variant, Version};
 
 use crate::{
+    apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
-        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi,
+        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
         ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
@@ -51,6 +53,18 @@ const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
 const DEFAULT_OPEN_LIMIT: usize = 20;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
+const MESSAGING_APP_ID: &str = "messaging";
+// A single PersonalityAgent is single-threaded and normally inhabits only a
+// handful of Workspace installations at once. Sixteen retains ample locality
+// while bounding stale uninstall/reinstall and Workspace churn.
+const MAX_CACHED_MESSAGING_VIEWS: usize = 16;
+
+#[derive(Clone, Debug, Deserialize)]
+struct MessagingProposal {
+    workspace_id: String,
+    #[serde(flatten)]
+    action: MessagingAction,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -151,6 +165,14 @@ enum BoundMessagingAction {
     },
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct BoundMessagingInvocation {
+    workspace_id: String,
+    installation_id: String,
+    #[serde(flatten)]
+    action: BoundMessagingAction,
+}
+
 #[derive(Clone, Copy)]
 enum PostCommitMode {
     /// The legacy raw route cannot return a live post-commit hook. A read
@@ -158,6 +180,13 @@ enum PostCommitMode {
     /// safely unread if no such call occurs.
     DeferToLaterRawCall,
     ReturnLiveHook,
+}
+
+struct ExactMessagingExecutionContext<'a> {
+    flow_id: &'a str,
+    call_id: &'a str,
+    cancel: &'a tokio_util::sync::CancellationToken,
+    post_commit_mode: PostCommitMode,
 }
 
 struct ExactMessagingOutcome {
@@ -278,21 +307,102 @@ struct MessagingViewState {
     visible_reply_later_markers: Vec<VisibleReplyLaterMarker>,
 }
 
+struct CachedMessagingView {
+    view: Arc<Mutex<MessagingViewState>>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct MessagingViewCache {
+    entries: BTreeMap<ExactMessagingScope, CachedMessagingView>,
+    clock: u64,
+}
+
+impl MessagingViewCache {
+    fn get_or_insert(&mut self, scope: &ExactMessagingScope) -> Arc<Mutex<MessagingViewState>> {
+        self.clock = self.clock.wrapping_add(1);
+        if self.clock == 0 {
+            // Renormalize before an astronomically unlikely wrap so ordering
+            // remains meaningful rather than silently reversing the LRU.
+            let mut ordered = self
+                .entries
+                .iter_mut()
+                .collect::<Vec<(&ExactMessagingScope, &mut CachedMessagingView)>>();
+            ordered.sort_by_key(|(_, entry)| entry.last_used);
+            for (index, (_, entry)) in ordered.into_iter().enumerate() {
+                entry.last_used = index as u64;
+            }
+            self.clock = self.entries.len() as u64 + 1;
+        }
+        if let Some(entry) = self.entries.get_mut(scope) {
+            entry.last_used = self.clock;
+            return entry.view.clone();
+        }
+        if self.entries.len() == MAX_CACHED_MESSAGING_VIEWS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(candidate_scope, entry)| (entry.last_used, *candidate_scope))
+                .map(|(candidate_scope, _)| candidate_scope.clone())
+                .expect("a full Messaging view cache has an oldest entry");
+            // Any in-flight operation or post-result hook owns another Arc.
+            // Removing the cache's reference cannot invalidate that work.
+            self.entries.remove(&oldest);
+        }
+        let view = Arc::new(Mutex::new(MessagingViewState::default()));
+        self.entries.insert(
+            scope.clone(),
+            CachedMessagingView {
+                view: view.clone(),
+                last_used: self.clock,
+            },
+        );
+        view
+    }
+}
+
 pub(crate) struct MessagingTool {
     api: Arc<dyn MessagingApi>,
-    view: Arc<Mutex<MessagingViewState>>,
+    views: Arc<Mutex<MessagingViewCache>>,
 }
 
 impl MessagingTool {
     pub(crate) fn new(api: Arc<dyn MessagingApi>) -> Self {
         Self {
             api,
-            view: Arc::new(Mutex::new(MessagingViewState::default())),
+            views: Arc::new(Mutex::new(MessagingViewCache::default())),
         }
+    }
+
+    async fn resolve_scope_for_binding(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ExactMessagingScope, DescribeError> {
+        validate_canonical_uuid_v7(workspace_id).map_err(|_| DescribeError::InvalidArguments)?;
+        let installation = self
+            .api
+            .resolve_enabled_workspace_app(ResolveEnabledWorkspaceAppRequest {
+                workspace_id,
+                app_id: MESSAGING_APP_ID,
+            })
+            .await
+            .map_err(map_app_resolution_error)?;
+        validate_canonical_uuid_v7(&installation.installation_id)
+            .map_err(|_| DescribeError::BindingInternal)?;
+        Ok(ExactMessagingScope {
+            workspace_id: workspace_id.to_owned(),
+            installation_id: installation.installation_id,
+        })
+    }
+
+    async fn view_for(&self, scope: &ExactMessagingScope) -> Arc<Mutex<MessagingViewState>> {
+        let mut views = self.views.lock().await;
+        views.get_or_insert(scope)
     }
 
     async fn retry_pending_reads_best_effort(
         &self,
+        scope: &ExactMessagingScope,
         state: &mut MessagingViewState,
         cancel: &tokio_util::sync::CancellationToken,
     ) {
@@ -304,7 +414,7 @@ impl MessagingTool {
         for (place_id, seq) in pending {
             let result = tokio::select! {
                 _ = cancel.cancelled() => return,
-                result = self.api.read_through(ReadMessagingThroughRequest {
+                result = self.api.read_through(scope, ReadMessagingThroughRequest {
                     place_id: &place_id,
                     seq,
                 }) => result,
@@ -320,7 +430,8 @@ fn messaging_parameters_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "description": concat!(
-            "Choose one messaging action and include only the fields used by that action. ",
+            "Choose an explicit workspace_id and one messaging action, then include only the ",
+            "fields used by that action. No current or default Workspace is inferred. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
             "or limit; write requires content and may include urgency or reply_to; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
@@ -331,6 +442,10 @@ fn messaging_parameters_schema() -> Value {
             "already shown or returned in this tool view, but not its place open."
         ),
         "properties": {
+            "workspace_id": {
+                "type": "string",
+                "description": "Required for every action. The exact Sumi Workspace whose Messaging app is being used."
+            },
             "action": {
                 "type": "string",
                 "enum": [
@@ -442,7 +557,7 @@ fn messaging_parameters_schema() -> Value {
                 )
             }
         },
-        "required": ["action"],
+        "required": ["workspace_id", "action"],
         "additionalProperties": false
     })
 }
@@ -487,13 +602,18 @@ impl BoundToolAdapter for MessagingTool {
     }
 
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
-        let action: MessagingAction =
+        let proposal: MessagingProposal =
             serde_json::from_value(Value::Object(ctx.args.as_object().clone()))
                 .map_err(|_| DescribeError::InvalidArguments)?;
-        validate_action(&action).map_err(|_| DescribeError::InvalidArguments)?;
+        validate_action(&proposal.action).map_err(|_| DescribeError::InvalidArguments)?;
+        let scope = self
+            .resolve_scope_for_binding(&proposal.workspace_id)
+            .await?;
+        let view = self.view_for(&scope).await;
 
-        match action {
+        match proposal.action {
             MessagingAction::Overview {} => messaging_binding(
+                &scope,
                 "overview",
                 CapabilityClass::Read,
                 vec![ResourceScope::collection("messaging", "place")],
@@ -512,6 +632,7 @@ impl BoundToolAdapter for MessagingTool {
                 insert_optional_u64(&mut arguments, "limit", limit.map(u64::from));
                 let review_projection = arguments.clone();
                 messaging_binding(
+                    &scope,
                     "open",
                     CapabilityClass::Read,
                     vec![ResourceScope::resource("messaging", "place", &place_id)],
@@ -524,7 +645,7 @@ impl BoundToolAdapter for MessagingTool {
                 urgency,
                 reply_to,
             } => {
-                let state = self.view.lock().await;
+                let state = view.lock().await;
                 let place_id = focused_place_for_binding(&state, "write")?;
                 drop(state);
                 let mut scopes = vec![ResourceScope::resource("messaging", "place", &place_id)];
@@ -553,6 +674,7 @@ impl BoundToolAdapter for MessagingTool {
                 );
                 insert_optional_string(&mut arguments, "reply_to", reply_to);
                 messaging_binding(
+                    &scope,
                     "write",
                     CapabilityClass::Mutate,
                     scopes,
@@ -565,7 +687,7 @@ impl BoundToolAdapter for MessagingTool {
                 seq,
                 emoji,
             } => {
-                let state = self.view.lock().await;
+                let state = view.lock().await;
                 let place_id = focused_place_for_binding(&state, "react")?;
                 let target = visible_target_for_binding(&state, &message_id, seq, "react")?;
                 let arguments = object([
@@ -575,6 +697,7 @@ impl BoundToolAdapter for MessagingTool {
                     ("emoji", Value::String(emoji)),
                 ]);
                 messaging_binding(
+                    &scope,
                     "react",
                     CapabilityClass::Mutate,
                     vec![
@@ -618,6 +741,7 @@ impl BoundToolAdapter for MessagingTool {
                     expires_in_minutes.map(u64::from),
                 );
                 messaging_binding(
+                    &scope,
                     "status",
                     CapabilityClass::Mutate,
                     vec![ResourceScope::resource("messaging", "participant", "self")],
@@ -631,7 +755,7 @@ impl BoundToolAdapter for MessagingTool {
                 note,
                 remind_in_minutes,
             } => {
-                let state = self.view.lock().await;
+                let state = view.lock().await;
                 let place_id = focused_place_for_binding(&state, "reply_later")?;
                 let target = visible_target_for_binding(&state, &message_id, seq, "reply_later")?;
                 let mut review_projection = object([
@@ -664,6 +788,7 @@ impl BoundToolAdapter for MessagingTool {
                     remind_in_minutes.map(u64::from),
                 );
                 messaging_binding(
+                    &scope,
                     "reply_later",
                     CapabilityClass::Mutate,
                     vec![
@@ -675,7 +800,7 @@ impl BoundToolAdapter for MessagingTool {
                 )
             }
             MessagingAction::ResolveReplyLater { marker_id } => {
-                let state = self.view.lock().await;
+                let state = view.lock().await;
                 let marker = visible_reply_later_marker_for_binding(&state, &marker_id)?;
                 let marker_scope =
                     ResourceScope::resource("messaging", "reply_later_marker", &marker_id);
@@ -701,6 +826,7 @@ impl BoundToolAdapter for MessagingTool {
                     ),
                 ]);
                 messaging_binding(
+                    &scope,
                     "resolve_reply_later",
                     CapabilityClass::Mutate,
                     vec![
@@ -717,23 +843,33 @@ impl BoundToolAdapter for MessagingTool {
     }
 
     async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError> {
-        let action: BoundMessagingAction =
+        let invocation: BoundMessagingInvocation =
             serde_json::from_value(Value::Object(ctx.args.as_object().clone()))
                 .map_err(|_| ToolError::InvalidArguments)?;
-        validate_bound_action(&action)?;
+        let scope = ExactMessagingScope {
+            workspace_id: invocation.workspace_id,
+            installation_id: invocation.installation_id,
+        };
+        validate_exact_scope(&scope)?;
+        validate_bound_action(&invocation.action)?;
 
         // Exact bound execution performs only the sealed app operation. It
         // does not flush delayed reads, initialize membership through an
         // overview, or reinterpret a target from current view state.
-        let mut state = self.view.lock().await;
+        let view = self.view_for(&scope).await;
+        let mut state = view.lock().await;
         let outcome = self
             .execute_exact_action(
+                &scope,
+                view.clone(),
                 &mut state,
-                action,
-                ctx.flow_id,
-                ctx.call_id,
-                &ctx.cancel,
-                PostCommitMode::ReturnLiveHook,
+                invocation.action,
+                ExactMessagingExecutionContext {
+                    flow_id: ctx.flow_id,
+                    call_id: ctx.call_id,
+                    cancel: &ctx.cancel,
+                    post_commit_mode: PostCommitMode::ReturnLiveHook,
+                },
             )
             .await?;
         Ok(BoundToolExecutionOutcome {
@@ -745,32 +881,41 @@ impl BoundToolAdapter for MessagingTool {
 
 impl MessagingTool {
     async fn execute_raw(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
-        let action: MessagingAction =
+        let proposal: MessagingProposal =
             serde_json::from_value(Value::Object(ctx.args.as_object().clone()))
                 .map_err(|_| ToolError::InvalidArguments)?;
-        validate_action(&action)?;
+        validate_action(&proposal.action)?;
+        let scope = self
+            .resolve_scope_for_binding(&proposal.workspace_id)
+            .await
+            .map_err(|error| ToolError::Rpc(error.to_string()))?;
+        let view = self.view_for(&scope).await;
 
-        // Serialize this particular view. Multiple views may exist later; none
-        // of them is the PersonalityAgent or owns a separate life log.
-        let mut state = self.view.lock().await;
+        // Serialize only this exact Workspace installation view. It is client
+        // state, not the PersonalityAgent or a separate life log.
+        let mut state = view.lock().await;
 
         // Raw ToolOutput has no channel for a post-commit hook. The production
         // runner durably admits each prior ToolResult before starting its next
         // call, so only reads left pending by an earlier raw invocation are
         // eligible here. An Open below merely records its cursor: without a
         // later raw Messaging call it remains on the safe, unread side.
-        self.retry_pending_reads_best_effort(&mut state, &ctx.cancel)
+        self.retry_pending_reads_best_effort(&scope, &mut state, &ctx.cancel)
             .await;
 
-        let action = resolve_raw_action(&state, action)?;
+        let action = resolve_raw_action(&state, proposal.action)?;
         let outcome = self
             .execute_exact_action(
+                &scope,
+                view.clone(),
                 &mut state,
                 action,
-                ctx.flow_id,
-                ctx.call_id,
-                &ctx.cancel,
-                PostCommitMode::DeferToLaterRawCall,
+                ExactMessagingExecutionContext {
+                    flow_id: ctx.flow_id,
+                    call_id: ctx.call_id,
+                    cancel: &ctx.cancel,
+                    post_commit_mode: PostCommitMode::DeferToLaterRawCall,
+                },
             )
             .await?;
         debug_assert!(outcome.live_post_commit.is_none());
@@ -783,19 +928,18 @@ impl MessagingTool {
     /// delivery mode differs. No pre-action maintenance belongs here.
     async fn execute_exact_action(
         &self,
+        scope: &ExactMessagingScope,
+        view: Arc<Mutex<MessagingViewState>>,
         state: &mut MessagingViewState,
         action: BoundMessagingAction,
-        flow_id: &str,
-        call_id: &str,
-        cancel: &tokio_util::sync::CancellationToken,
-        post_commit_mode: PostCommitMode,
+        execution: ExactMessagingExecutionContext<'_>,
     ) -> Result<ExactMessagingOutcome, ToolError> {
         let mut live_post_commit = None;
         let response = match action {
             BoundMessagingAction::Overview {} => {
                 let response = tokio::select! {
-                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.overview() => result,
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.overview(scope) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
                 admit_overview_snapshot(state, &response);
@@ -807,8 +951,8 @@ impl MessagingTool {
                 limit,
             } => {
                 let response = tokio::select! {
-                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.open(OpenMessagingPlaceRequest {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.open(scope, OpenMessagingPlaceRequest {
                         place_id: &place_id,
                         before_seq,
                         limit,
@@ -820,10 +964,11 @@ impl MessagingTool {
                 state.visible_messages = admission.visible_messages;
                 if let Some(seq) = admission.read_through_seq {
                     record_pending_read_through(state, &place_id, seq);
-                    if matches!(post_commit_mode, PostCommitMode::ReturnLiveHook) {
+                    if matches!(execution.post_commit_mode, PostCommitMode::ReturnLiveHook) {
                         live_post_commit = Some(read_through_post_commit(
                             self.api.clone(),
-                            self.view.clone(),
+                            scope.clone(),
+                            view.clone(),
                             place_id.clone(),
                             seq,
                         ));
@@ -837,10 +982,10 @@ impl MessagingTool {
                 urgency,
                 reply_to,
             } => {
-                let nonce = client_nonce(flow_id, call_id);
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
                 let response = tokio::select! {
-                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.write(WriteMessagingMessageRequest {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.write(scope, WriteMessagingMessageRequest {
                         place_id: &place_id,
                         content: &content,
                         urgency: urgency_text(urgency),
@@ -864,10 +1009,10 @@ impl MessagingTool {
                 message_id,
                 emoji,
             } => {
-                let nonce = client_nonce(flow_id, call_id);
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
                 tokio::select! {
-                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.react(ReactMessagingReactionRequest {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.react(scope, ReactMessagingReactionRequest {
                         place_id: &place_id,
                         message_id: &message_id,
                         emoji: &emoji,
@@ -881,8 +1026,8 @@ impl MessagingTool {
                 note,
                 expires_in_minutes,
             } => tokio::select! {
-                _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                result = self.api.set_status(SetMessagingStatusRequest {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.set_status(scope, SetMessagingStatusRequest {
                     status: status_text(status),
                     note: note.as_deref(),
                     expires_in_minutes,
@@ -896,8 +1041,8 @@ impl MessagingTool {
                 remind_in_minutes,
             } => {
                 let response = tokio::select! {
-                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.reply_later(CreateMessagingReplyLaterRequest {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.reply_later(scope, CreateMessagingReplyLaterRequest {
                         place_id: &place_id,
                         message_id: &message_id,
                         note: note.as_deref(),
@@ -918,8 +1063,8 @@ impl MessagingTool {
             }
             BoundMessagingAction::ResolveReplyLater { marker_id } => {
                 let response = tokio::select! {
-                    _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.resolve_reply_later(ResolveMessagingReplyLaterRequest {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.resolve_reply_later(scope, ResolveMessagingReplyLaterRequest {
                         marker_id: &marker_id,
                     }) => result,
                 }
@@ -948,12 +1093,29 @@ fn render_messaging_output(response: Value) -> Result<ToolOutput, ToolError> {
 }
 
 fn messaging_binding(
+    scope: &ExactMessagingScope,
     operation: &str,
     capability: CapabilityClass,
-    resource_scopes: Vec<ResourceScope>,
-    review_projection: Map<String, Value>,
-    execution_arguments: Map<String, Value>,
+    mut resource_scopes: Vec<ResourceScope>,
+    mut review_projection: Map<String, Value>,
+    mut execution_arguments: Map<String, Value>,
 ) -> Result<ToolBinding, DescribeError> {
+    resource_scopes.insert(
+        0,
+        ResourceScope::resource("workspace", "workspace", &scope.workspace_id),
+    );
+    review_projection.insert(
+        "workspace_id".to_owned(),
+        Value::String(scope.workspace_id.clone()),
+    );
+    execution_arguments.insert(
+        "workspace_id".to_owned(),
+        Value::String(scope.workspace_id.clone()),
+    );
+    execution_arguments.insert(
+        "installation_id".to_owned(),
+        Value::String(scope.installation_id.clone()),
+    );
     Ok(ToolBinding::new(
         AppActionDescriptor::new(operation, capability, resource_scopes)?,
         ReviewProjection::from_value(Value::Object(review_projection))?,
@@ -982,6 +1144,7 @@ fn insert_optional_u64(arguments: &mut Map<String, Value>, key: &str, value: Opt
 
 fn read_through_post_commit(
     api: Arc<dyn MessagingApi>,
+    scope: ExactMessagingScope,
     view: Arc<Mutex<MessagingViewState>>,
     place_id: String,
     seq: u64,
@@ -991,7 +1154,7 @@ fn read_through_post_commit(
             _ = cancel.cancelled() => {
                 return LiveAppPostCommitOutcome::Deferred(ToolError::Cancelled);
             }
-            result = api.read_through(ReadMessagingThroughRequest {
+            result = api.read_through(&scope, ReadMessagingThroughRequest {
                 place_id: &place_id,
                 seq,
             }) => result,
@@ -1121,6 +1284,25 @@ fn app_precondition(code: &str, message: String) -> DescribeError {
     }
 }
 
+fn map_app_resolution_error(error: AppInstallationResolutionError) -> DescribeError {
+    match error {
+        AppInstallationResolutionError::Forbidden
+        | AppInstallationResolutionError::NotFound
+        | AppInstallationResolutionError::InstallationNotFound
+        | AppInstallationResolutionError::AppDisabled => app_precondition(
+            "enabled_installation_required",
+            "the selected Workspace must have an enabled Messaging installation and active membership"
+                .to_owned(),
+        ),
+        AppInstallationResolutionError::AuthenticationUnavailable
+        | AppInstallationResolutionError::ServiceUnavailable
+        | AppInstallationResolutionError::TransportUnavailable => {
+            DescribeError::BindingUnavailable
+        }
+        AppInstallationResolutionError::Protocol => DescribeError::BindingInternal,
+    }
+}
+
 fn focused_place_for_binding(
     state: &MessagingViewState,
     operation: &str,
@@ -1226,6 +1408,22 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             validate_bounded_nonempty(marker_id, MAX_MARKER_ID_BYTES)
         }
     }
+}
+
+fn validate_canonical_uuid_v7(value: &str) -> Result<(), ToolError> {
+    let parsed = Uuid::parse_str(value).map_err(|_| ToolError::InvalidArguments)?;
+    if parsed.get_version() != Some(Version::SortRand)
+        || parsed.get_variant() != Variant::RFC4122
+        || parsed.to_string() != value
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+fn validate_exact_scope(scope: &ExactMessagingScope) -> Result<(), ToolError> {
+    validate_canonical_uuid_v7(&scope.workspace_id)?;
+    validate_canonical_uuid_v7(&scope.installation_id)
 }
 
 fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError> {
@@ -1700,12 +1898,22 @@ mod tests {
     use super::*;
 
     use crate::{
+        apiclient::apps::{
+            AppInstallationResolutionResult, AppInstallationResolver, ResolvedAppInstallation,
+        },
         provider::types::{ToolCall, ValidatedToolArguments},
         tools::{
             BoundExecutionError, BoundToolInvocation, ToolRegistry, ToolRegistryBuilder,
             WorkspacePaths,
         },
     };
+
+    const TEST_WORKSPACE_ID: &str = "0198f0f4-9b72-7000-8000-000000000201";
+    const TEST_INSTALLATION_ID: &str = "0198f0f4-9b72-7000-8000-000000000301";
+    const TEST_WORKSPACE_B_ID: &str = "0198f0f4-9b72-7000-8000-000000000202";
+    const TEST_INSTALLATION_B_ID: &str = "0198f0f4-9b72-7000-8000-000000000302";
+    const TEST_WRONG_VARIANT_WORKSPACE_ID: &str = "0198f0f4-9b72-7000-0000-000000000201";
+    const TEST_WRONG_VARIANT_INSTALLATION_ID: &str = "0198f0f4-9b72-7000-0000-000000000301";
 
     fn test_participant() -> Value {
         json!({"kind": "human", "human_id": "human-fixture"})
@@ -1765,23 +1973,68 @@ mod tests {
         test_open_response(request.place_id, latest_seq, 5, first_seq, last_seq, None)
     }
 
+    type RecordedStatus = (String, Option<String>, Option<u32>);
+    type RecordedReplyLater = (String, String, Option<String>, Option<u32>);
+
     #[derive(Default)]
     struct FakeMessagingApi {
         calls: AsyncMutex<Vec<String>>,
+        scopes: AsyncMutex<Vec<ExactMessagingScope>>,
+        scope_resolutions: AsyncMutex<Vec<(String, String)>>,
+        resolution_failures: AsyncMutex<VecDeque<AppInstallationResolutionError>>,
+        resolved_installation_override: AsyncMutex<Option<String>>,
         reads: AsyncMutex<Vec<(String, u64)>>,
         writes: AsyncMutex<Vec<(String, String, String)>>,
         reacts: AsyncMutex<Vec<(String, String, String)>>,
-        statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
-        promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
+        statuses: AsyncMutex<Vec<RecordedStatus>>,
+        promises: AsyncMutex<Vec<RecordedReplyLater>>,
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
+    impl FakeMessagingApi {
+        async fn record_scope(&self, scope: &ExactMessagingScope) {
+            self.scopes.lock().await.push(scope.clone());
+        }
+    }
+
+    #[async_trait]
+    impl AppInstallationResolver for FakeMessagingApi {
+        async fn resolve_enabled_workspace_app(
+            &self,
+            request: ResolveEnabledWorkspaceAppRequest<'_>,
+        ) -> AppInstallationResolutionResult<ResolvedAppInstallation> {
+            self.scope_resolutions
+                .lock()
+                .await
+                .push((request.workspace_id.to_owned(), request.app_id.to_owned()));
+            if let Some(error) = self.resolution_failures.lock().await.pop_front() {
+                return Err(error);
+            }
+            if let Some(installation_id) = self.resolved_installation_override.lock().await.clone()
+            {
+                return Ok(ResolvedAppInstallation { installation_id });
+            }
+            if request.app_id != MESSAGING_APP_ID {
+                return Err(AppInstallationResolutionError::Protocol);
+            }
+            let installation_id = match request.workspace_id {
+                TEST_WORKSPACE_ID => TEST_INSTALLATION_ID,
+                TEST_WORKSPACE_B_ID => TEST_INSTALLATION_B_ID,
+                _ => return Err(AppInstallationResolutionError::NotFound),
+            };
+            Ok(ResolvedAppInstallation {
+                installation_id: installation_id.to_owned(),
+            })
+        }
+    }
+
     #[async_trait]
     impl MessagingApi for FakeMessagingApi {
-        async fn overview(&self) -> Result<Value> {
+        async fn overview(&self, scope: &ExactMessagingScope) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls.lock().await.push("overview".to_owned());
             let reply_later_markers = self.reply_later_markers.lock().await.clone();
             Ok(json!({
@@ -1794,7 +2047,12 @@ mod tests {
             }))
         }
 
-        async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<Value> {
+        async fn open(
+            &self,
+            scope: &ExactMessagingScope,
+            request: OpenMessagingPlaceRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
@@ -1805,7 +2063,12 @@ mod tests {
             Ok(default_test_open_response(&request))
         }
 
-        async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<Value> {
+        async fn write(
+            &self,
+            scope: &ExactMessagingScope,
+            request: WriteMessagingMessageRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
@@ -1823,7 +2086,12 @@ mod tests {
             }))
         }
 
-        async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {
+        async fn react(
+            &self,
+            scope: &ExactMessagingScope,
+            request: ReactMessagingReactionRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
@@ -1840,7 +2108,12 @@ mod tests {
             }))
         }
 
-        async fn set_status(&self, request: SetMessagingStatusRequest<'_>) -> Result<Value> {
+        async fn set_status(
+            &self,
+            scope: &ExactMessagingScope,
+            request: SetMessagingStatusRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
@@ -1855,8 +2128,10 @@ mod tests {
 
         async fn reply_later(
             &self,
+            scope: &ExactMessagingScope,
             request: CreateMessagingReplyLaterRequest<'_>,
         ) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
@@ -1887,8 +2162,10 @@ mod tests {
 
         async fn resolve_reply_later(
             &self,
+            scope: &ExactMessagingScope,
             request: ResolveMessagingReplyLaterRequest<'_>,
         ) -> Result<Value> {
+            self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
@@ -1904,7 +2181,12 @@ mod tests {
             Ok(json!({"marker": {"marker_id": request.marker_id, "resolved": true}}))
         }
 
-        async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
+        async fn read_through(
+            &self,
+            scope: &ExactMessagingScope,
+            request: ReadMessagingThroughRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
             if self.failures.lock().await.pop_front() == Some("read") {
                 return Err(anyhow!("read failed"));
             }
@@ -1925,7 +2207,8 @@ mod tests {
         action: Value,
         call_id: &str,
     ) -> Result<ToolOutput, ToolError> {
-        let args: ValidatedToolArguments = serde_json::from_value(action).unwrap();
+        let args: ValidatedToolArguments =
+            serde_json::from_value(with_default_workspace(action)).unwrap();
         let workspace = WorkspacePaths::new("/workspace").unwrap();
         Tool::execute(
             tool,
@@ -1945,8 +2228,66 @@ mod tests {
         ToolCall {
             id: id.to_owned(),
             name: TOOL_NAME.to_owned(),
-            arguments: serde_json::from_value(action).expect("object-shaped arguments"),
+            arguments: serde_json::from_value(with_default_workspace(action))
+                .expect("object-shaped arguments"),
         }
+    }
+
+    fn with_default_workspace(mut action: Value) -> Value {
+        action
+            .as_object_mut()
+            .expect("Messaging fixture action must be an object")
+            .entry("workspace_id")
+            .or_insert_with(|| Value::String(TEST_WORKSPACE_ID.to_owned()));
+        action
+    }
+
+    async fn default_state(
+        tool: &MessagingTool,
+    ) -> tokio::sync::OwnedMutexGuard<MessagingViewState> {
+        tool.view_for(&ExactMessagingScope {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            installation_id: TEST_INSTALLATION_ID.to_owned(),
+        })
+        .await
+        .lock_owned()
+        .await
+    }
+
+    fn scoped_execution(mut arguments: Value) -> Value {
+        let object = arguments
+            .as_object_mut()
+            .expect("bound execution arguments must be an object");
+        object.insert(
+            "workspace_id".to_owned(),
+            Value::String(TEST_WORKSPACE_ID.to_owned()),
+        );
+        object.insert(
+            "installation_id".to_owned(),
+            Value::String(TEST_INSTALLATION_ID.to_owned()),
+        );
+        arguments
+    }
+
+    fn scoped_review(mut projection: Value) -> Value {
+        projection
+            .as_object_mut()
+            .expect("review projection must be an object")
+            .insert(
+                "workspace_id".to_owned(),
+                Value::String(TEST_WORKSPACE_ID.to_owned()),
+            );
+        projection
+    }
+
+    fn scoped_resources(mut scopes: Vec<ResourceScope>) -> Vec<ResourceScope> {
+        scopes.push(ResourceScope::resource(
+            "workspace",
+            "workspace",
+            TEST_WORKSPACE_ID,
+        ));
+        scopes.sort();
+        scopes
     }
 
     async fn bind_action(
@@ -1980,7 +2321,12 @@ mod tests {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
         {
-            let mut state = tool.view.lock().await;
+            let scope = ExactMessagingScope {
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                installation_id: TEST_INSTALLATION_ID.to_owned(),
+            };
+            let view = tool.view_for(&scope).await;
+            let mut state = view.lock().await;
             state.focused_place_id = Some("place-a".to_owned());
             state.visible_messages = vec![
                 VisibleMessage {
@@ -2060,8 +2406,11 @@ mod tests {
 
         assert_flat_provider_schema(&schema);
         assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["required"], json!(["workspace_id", "action"]));
         assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["workspace_id"]["type"], "string");
+        assert!(schema["properties"].get("app_id").is_none());
+        assert!(schema["properties"].get("installation_id").is_none());
         assert_eq!(
             schema["properties"]["action"]["enum"],
             json!([
@@ -2099,8 +2448,471 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            15
+            16
         );
+    }
+
+    #[tokio::test]
+    async fn model_must_select_a_workspace_but_cannot_supply_app_or_installation_identity() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let call = |id: &str, value: Value| ToolCall {
+            id: id.to_owned(),
+            name: TOOL_NAME.to_owned(),
+            arguments: serde_json::from_value(value).expect("object-shaped arguments"),
+        };
+
+        for (id, value) in [
+            ("missing", json!({"action": "overview"})),
+            (
+                "app-authored",
+                json!({
+                    "workspace_id": TEST_WORKSPACE_ID,
+                    "app_id": "messaging",
+                    "action": "overview"
+                }),
+            ),
+            (
+                "installation-authored",
+                json!({
+                    "workspace_id": TEST_WORKSPACE_ID,
+                    "installation_id": TEST_INSTALLATION_ID,
+                    "action": "overview"
+                }),
+            ),
+            (
+                "wrong-variant-workspace",
+                json!({
+                    "workspace_id": TEST_WRONG_VARIANT_WORKSPACE_ID,
+                    "action": "overview"
+                }),
+            ),
+        ] {
+            let error = match registry.bind(&call(id, value), "flow", &workspace).await {
+                Ok(_) => panic!("scope inference and model-authored identities must fail"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DescribeError::InvalidArguments));
+        }
+        assert!(
+            api.scope_resolutions.lock().await.is_empty(),
+            "invalid model proposals must fail before app resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_resolves_fixed_messaging_identity_once_and_keeps_installation_private() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call("status", json!({"action": "status", "status": "available"})),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind exact Messaging status");
+        let invocation = registry
+            .validate_bound(&sealed)
+            .expect("live registry validates its seal");
+        assert_eq!(
+            api.scope_resolutions.lock().await.as_slice(),
+            &[(TEST_WORKSPACE_ID.to_owned(), MESSAGING_APP_ID.to_owned())]
+        );
+        assert!(api.scopes.lock().await.is_empty());
+        assert_eq!(
+            invocation.review_projection.as_object()["workspace_id"],
+            TEST_WORKSPACE_ID
+        );
+        assert!(
+            !invocation
+                .review_projection
+                .as_object()
+                .contains_key("installation_id")
+        );
+        assert!(
+            invocation
+                .descriptor
+                .resource_scopes
+                .iter()
+                .any(|resource| resource
+                    == &ResourceScope::resource("workspace", "workspace", TEST_WORKSPACE_ID,))
+        );
+        assert!(
+            !serde_json::to_string(&invocation.descriptor)
+                .unwrap()
+                .contains(TEST_INSTALLATION_ID)
+        );
+        assert!(
+            !serde_json::to_string(invocation.review_projection.as_object())
+                .unwrap()
+                .contains(TEST_INSTALLATION_ID)
+        );
+        assert_eq!(
+            invocation.execution_arguments.as_object()["workspace_id"],
+            TEST_WORKSPACE_ID
+        );
+        assert_eq!(
+            invocation.execution_arguments.as_object()["installation_id"],
+            TEST_INSTALLATION_ID
+        );
+
+        registry
+            .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+            .await
+            .expect("execute the privately sealed exact scope");
+        assert_eq!(
+            api.scope_resolutions.lock().await.len(),
+            1,
+            "execution must not resolve a newer installation"
+        );
+        assert_eq!(
+            api.scopes.lock().await.as_slice(),
+            &[ExactMessagingScope {
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                installation_id: TEST_INSTALLATION_ID.to_owned(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_exposes_only_domain_preconditions_and_redacts_resolver_failures() {
+        enum ExpectedBindingFailure {
+            DomainPrecondition,
+            Unavailable,
+            Internal,
+        }
+
+        for (failure, expected) in [
+            (
+                AppInstallationResolutionError::Forbidden,
+                ExpectedBindingFailure::DomainPrecondition,
+            ),
+            (
+                AppInstallationResolutionError::NotFound,
+                ExpectedBindingFailure::DomainPrecondition,
+            ),
+            (
+                AppInstallationResolutionError::InstallationNotFound,
+                ExpectedBindingFailure::DomainPrecondition,
+            ),
+            (
+                AppInstallationResolutionError::AppDisabled,
+                ExpectedBindingFailure::DomainPrecondition,
+            ),
+            (
+                AppInstallationResolutionError::AuthenticationUnavailable,
+                ExpectedBindingFailure::Unavailable,
+            ),
+            (
+                AppInstallationResolutionError::ServiceUnavailable,
+                ExpectedBindingFailure::Unavailable,
+            ),
+            (
+                AppInstallationResolutionError::TransportUnavailable,
+                ExpectedBindingFailure::Unavailable,
+            ),
+            (
+                AppInstallationResolutionError::Protocol,
+                ExpectedBindingFailure::Internal,
+            ),
+        ] {
+            let api = Arc::new(FakeMessagingApi::default());
+            api.resolution_failures.lock().await.push_back(failure);
+            let tool = Arc::new(MessagingTool::new(api.clone()));
+            let mut builder = ToolRegistryBuilder::default();
+            builder.register(tool).expect("register Messaging");
+            let registry = builder.build();
+            let error = bind_action(&registry, "resolve-failure", json!({"action": "overview"}))
+                .await
+                .expect_err("resolver failure must stop binding");
+            match expected {
+                ExpectedBindingFailure::DomainPrecondition => match error {
+                    DescribeError::AppPrecondition { precondition } => {
+                        assert_eq!(precondition.code, "enabled_installation_required");
+                        assert!(!precondition.message.contains(&failure.to_string()));
+                    }
+                    other => panic!("domain rejection mapped to {other:?}"),
+                },
+                ExpectedBindingFailure::Unavailable => {
+                    assert_eq!(error, DescribeError::BindingUnavailable)
+                }
+                ExpectedBindingFailure::Internal => {
+                    assert_eq!(error, DescribeError::BindingInternal)
+                }
+            }
+            assert!(api.scopes.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_execution_rejects_a_wrong_variant_sealed_installation_id() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let args = BoundExecutionArguments::from_value(json!({
+            "workspace_id": TEST_WORKSPACE_ID,
+            "installation_id": TEST_WRONG_VARIANT_INSTALLATION_ID,
+            "action": "overview"
+        }))
+        .expect("object-shaped private arguments");
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let result = BoundToolAdapter::execute(
+            &tool,
+            BoundToolCtx {
+                flow_id: "flow",
+                call_id: "wrong-variant-installation",
+                args: &args,
+                cancel: CancellationToken::new(),
+                on_update: Arc::new(|_| {}),
+                workspace: &workspace,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments)));
+        assert!(api.scopes.lock().await.is_empty());
+        assert!(api.scope_resolutions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_to_seal_a_wrong_variant_resolved_installation_id() {
+        let api = Arc::new(FakeMessagingApi::default());
+        *api.resolved_installation_override.lock().await =
+            Some(TEST_WRONG_VARIANT_INSTALLATION_ID.to_owned());
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool).expect("register Messaging");
+        let registry = builder.build();
+        let error = bind_action(
+            &registry,
+            "wrong-resolved-installation",
+            json!({"action": "overview"}),
+        )
+        .await
+        .expect_err("non-RFC4122 installation identity must never be sealed");
+        assert_eq!(error, DescribeError::BindingInternal);
+        assert!(api.scopes.lock().await.is_empty());
+        assert_eq!(api.scope_resolutions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn messaging_view_state_is_isolated_by_workspace_and_installation() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool).expect("register Messaging");
+        let registry = builder.build();
+
+        execute_bound_action(
+            &registry,
+            "open-a",
+            json!({
+                "workspace_id": TEST_WORKSPACE_ID,
+                "action": "open",
+                "place_id": "place-a"
+            }),
+        )
+        .await
+        .expect("open Workspace A");
+        let no_workspace_b_focus = bind_action(
+            &registry,
+            "write-b-before-open",
+            json!({
+                "workspace_id": TEST_WORKSPACE_B_ID,
+                "action": "write",
+                "content": "must not inherit A"
+            }),
+        )
+        .await
+        .expect_err("Workspace B cannot inherit Workspace A focus");
+        assert!(matches!(
+            no_workspace_b_focus,
+            DescribeError::AppPrecondition { precondition }
+                if precondition.code == "focused_resource_required"
+        ));
+
+        execute_bound_action(
+            &registry,
+            "open-b",
+            json!({
+                "workspace_id": TEST_WORKSPACE_B_ID,
+                "action": "open",
+                "place_id": "place-b"
+            }),
+        )
+        .await
+        .expect("open Workspace B");
+        let bound_a = bind_action(
+            &registry,
+            "write-a",
+            json!({
+                "workspace_id": TEST_WORKSPACE_ID,
+                "action": "write",
+                "content": "A"
+            }),
+        )
+        .await
+        .expect("Workspace A retains only its own focus");
+        let bound_b = bind_action(
+            &registry,
+            "write-b",
+            json!({
+                "workspace_id": TEST_WORKSPACE_B_ID,
+                "action": "write",
+                "content": "B"
+            }),
+        )
+        .await
+        .expect("Workspace B retains only its own focus");
+        assert_eq!(
+            bound_a.execution_arguments.as_object()["place_id"],
+            "place-a"
+        );
+        assert_eq!(
+            bound_b.execution_arguments.as_object()["place_id"],
+            "place-b"
+        );
+        assert_eq!(
+            bound_a.execution_arguments.as_object()["installation_id"],
+            TEST_INSTALLATION_ID
+        );
+        assert_eq!(
+            bound_b.execution_arguments.as_object()["installation_id"],
+            TEST_INSTALLATION_B_ID
+        );
+    }
+
+    fn churn_scope(index: usize) -> ExactMessagingScope {
+        ExactMessagingScope {
+            workspace_id: format!("0198f0f4-9b72-7000-8000-{index:012x}"),
+            installation_id: format!(
+                "0198f0f4-9b72-7000-8000-{:012x}",
+                index + MAX_CACHED_MESSAGING_VIEWS + 1
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_view_cache_is_bounded_lru_under_installation_churn() {
+        let tool = MessagingTool::new(Arc::new(FakeMessagingApi::default()));
+        let scopes = (0..=MAX_CACHED_MESSAGING_VIEWS)
+            .map(churn_scope)
+            .collect::<Vec<_>>();
+
+        for (index, scope) in scopes[..MAX_CACHED_MESSAGING_VIEWS].iter().enumerate() {
+            tool.view_for(scope).await.lock().await.focused_place_id =
+                Some(format!("place-{index}"));
+        }
+        // Scope zero becomes most-recently used, so the next insertion must
+        // retire scope one without disturbing any other scope's state.
+        assert_eq!(
+            tool.view_for(&scopes[0])
+                .await
+                .lock()
+                .await
+                .focused_place_id
+                .as_deref(),
+            Some("place-0")
+        );
+        tool.view_for(&scopes[MAX_CACHED_MESSAGING_VIEWS])
+            .await
+            .lock()
+            .await
+            .focused_place_id = Some("newest".to_owned());
+
+        {
+            let cache = tool.views.lock().await;
+            assert_eq!(cache.entries.len(), MAX_CACHED_MESSAGING_VIEWS);
+            assert!(cache.entries.contains_key(&scopes[0]));
+            assert!(!cache.entries.contains_key(&scopes[1]));
+            assert!(
+                cache
+                    .entries
+                    .contains_key(&scopes[MAX_CACHED_MESSAGING_VIEWS])
+            );
+        }
+        assert!(
+            tool.view_for(&scopes[1])
+                .await
+                .lock()
+                .await
+                .focused_place_id
+                .is_none(),
+            "an evicted installation must not inherit another scope's focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinstalled_messaging_app_cannot_inherit_the_prior_installation_view() {
+        let tool = MessagingTool::new(Arc::new(FakeMessagingApi::default()));
+        let prior = ExactMessagingScope {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            installation_id: TEST_INSTALLATION_ID.to_owned(),
+        };
+        let replacement = ExactMessagingScope {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            installation_id: TEST_INSTALLATION_B_ID.to_owned(),
+        };
+        tool.view_for(&prior).await.lock().await.focused_place_id = Some("prior-place".to_owned());
+        assert!(
+            tool.view_for(&replacement)
+                .await
+                .lock()
+                .await
+                .focused_place_id
+                .is_none()
+        );
+        tool.view_for(&replacement)
+            .await
+            .lock()
+            .await
+            .focused_place_id = Some("replacement-place".to_owned());
+        assert_eq!(
+            tool.view_for(&prior)
+                .await
+                .lock()
+                .await
+                .focused_place_id
+                .as_deref(),
+            Some("prior-place")
+        );
+    }
+
+    #[tokio::test]
+    async fn lru_eviction_does_not_invalidate_an_in_flight_read_through_hook() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let scope = churn_scope(0);
+        let view = tool.view_for(&scope).await;
+        record_pending_read_through(&mut *view.lock().await, "place-a", 7);
+        let hook = read_through_post_commit(
+            api.clone(),
+            scope.clone(),
+            view.clone(),
+            "place-a".to_owned(),
+            7,
+        );
+
+        for index in 1..=MAX_CACHED_MESSAGING_VIEWS {
+            tool.view_for(&churn_scope(index)).await;
+        }
+        assert!(
+            !tool.views.lock().await.entries.contains_key(&scope),
+            "oldest scope should leave the bounded cache even while its hook owns the view"
+        );
+
+        assert!(matches!(
+            hook.invoke_after_result_commit(CancellationToken::new())
+                .await,
+            LiveAppPostCommitOutcome::Applied
+        ));
+        assert!(view.lock().await.pending_read_through.is_empty());
+        assert_eq!(
+            api.scopes.lock().await.as_slice(),
+            std::slice::from_ref(&scope)
+        );
+        let replacement = tool.view_for(&scope).await;
+        assert!(!Arc::ptr_eq(&view, &replacement));
+        assert!(replacement.lock().await.pending_read_through.is_empty());
     }
 
     #[test]
@@ -2212,11 +3024,11 @@ mod tests {
         assert_eq!(overview.descriptor.capability, CapabilityClass::Read);
         assert_eq!(
             overview.descriptor.resource_scopes,
-            vec![ResourceScope::collection("messaging", "place")]
+            scoped_resources(vec![ResourceScope::collection("messaging", "place")])
         );
         assert_eq!(
             Value::Object(overview.execution_arguments.as_object().clone()),
-            json!({"action": "overview"})
+            scoped_execution(json!({"action": "overview"}))
         );
 
         let open = bind_action(
@@ -2235,16 +3047,20 @@ mod tests {
         assert_eq!(open.descriptor.capability, CapabilityClass::Read);
         assert_eq!(
             Value::Object(open.execution_arguments.as_object().clone()),
-            json!({
+            scoped_execution(json!({
                 "action": "open",
                 "place_id": "place-b",
                 "before_seq": 8,
                 "limit": 25
-            })
+            }))
         );
         assert_eq!(
             open.descriptor.resource_scopes,
-            vec![ResourceScope::resource("messaging", "place", "place-b")]
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "place",
+                "place-b"
+            )])
         );
 
         let write = bind_action(
@@ -2263,7 +3079,7 @@ mod tests {
         assert_eq!(write.descriptor.capability, CapabilityClass::Mutate);
         assert_eq!(
             Value::Object(write.review_projection.as_object().clone()),
-            json!({
+            scoped_review(json!({
                 "action": "write",
                 "place_id": "place-a",
                 "urgency": "urgent",
@@ -2271,18 +3087,18 @@ mod tests {
                 "content_bytes": 5,
                 "content_characters": 5,
                 "reply_to": "message-6"
-            })
+            }))
         );
         assert_eq!(write.review_projection.as_object()["content"], "hello");
         assert_eq!(
             Value::Object(write.execution_arguments.as_object().clone()),
-            json!({
+            scoped_execution(json!({
                 "action": "write",
                 "place_id": "place-a",
                 "content": "hello",
                 "urgency": "urgent",
                 "reply_to": "message-6"
-            })
+            }))
         );
         assert!(
             write
@@ -2312,12 +3128,12 @@ mod tests {
         assert_eq!(react.descriptor.capability, CapabilityClass::Mutate);
         assert_eq!(
             Value::Object(react.execution_arguments.as_object().clone()),
-            json!({
+            scoped_execution(json!({
                 "action": "react",
                 "place_id": "place-a",
                 "message_id": "message-7",
                 "emoji": "👍"
-            })
+            }))
         );
         assert!(!react.execution_arguments.as_object().contains_key("seq"));
 
@@ -2339,16 +3155,20 @@ mod tests {
         assert_eq!(status.review_projection.as_object()["note_characters"], 9);
         assert_eq!(
             status.descriptor.resource_scopes,
-            vec![ResourceScope::resource("messaging", "participant", "self")]
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "participant",
+                "self",
+            )])
         );
         assert_eq!(
             Value::Object(status.execution_arguments.as_object().clone()),
-            json!({
+            scoped_execution(json!({
                 "action": "status",
                 "status": "busy",
                 "note": "deep work",
                 "expires_in_minutes": 30
-            })
+            }))
         );
 
         let reply_later = bind_action(
@@ -2371,13 +3191,13 @@ mod tests {
         assert_eq!(reply_later.review_projection.as_object()["has_note"], true);
         assert_eq!(
             Value::Object(reply_later.execution_arguments.as_object().clone()),
-            json!({
+            scoped_execution(json!({
                 "action": "reply_later",
                 "place_id": "place-a",
                 "message_id": "message-6",
                 "note": "after review",
                 "remind_in_minutes": 45
-            })
+            }))
         );
 
         let resolve = bind_action(
@@ -2393,7 +3213,7 @@ mod tests {
         assert_eq!(resolve.descriptor.operation, "resolve_reply_later");
         assert_eq!(
             Value::Object(resolve.review_projection.as_object().clone()),
-            json!({
+            scoped_review(json!({
                 "action": "resolve_reply_later",
                 "marker_id": "marker-1",
                 "marker_meaning": "own_reply_later_promise",
@@ -2403,7 +3223,7 @@ mod tests {
                 "note": "after review",
                 "has_note": true,
                 "note_characters": 12
-            })
+            }))
         );
         assert!(
             resolve
@@ -2423,10 +3243,10 @@ mod tests {
         );
         assert_eq!(
             Value::Object(resolve.execution_arguments.as_object().clone()),
-            json!({
+            scoped_execution(json!({
                 "action": "resolve_reply_later",
                 "marker_id": "marker-1"
-            })
+            }))
         );
 
         assert!(api.calls.lock().await.is_empty());
@@ -2447,7 +3267,7 @@ mod tests {
             .expect("bind write to place A");
 
         {
-            let mut state = tool.view.lock().await;
+            let mut state = default_state(&tool).await;
             state.focused_place_id = Some("place-b".to_owned());
             state.visible_messages.clear();
         }
@@ -2473,7 +3293,7 @@ mod tests {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
         {
-            let mut state = tool.view.lock().await;
+            let mut state = default_state(&tool).await;
             state.self_participant = Some(ParticipantIdentity {
                 kind: "personality_agent".to_owned(),
                 id: "agent-1".to_owned(),
@@ -2600,7 +3420,7 @@ mod tests {
             .expect("bind write to place A");
 
         {
-            let mut state = tool.view.lock().await;
+            let mut state = default_state(&tool).await;
             state.focused_place_id = Some("place-b".to_owned());
             state.visible_messages.clear();
         }
@@ -2618,7 +3438,7 @@ mod tests {
                 client_nonce("flow", "write-a")
             )]
         );
-        let state = tool.view.lock().await;
+        let state = default_state(&tool).await;
         assert_eq!(state.focused_place_id.as_deref(), Some("place-b"));
         assert!(state.visible_messages.is_empty());
     }
@@ -2627,8 +3447,7 @@ mod tests {
     async fn bound_open_has_no_hidden_overview_or_pre_action_cursor_flush() {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
-        tool.view
-            .lock()
+        default_state(&tool)
             .await
             .pending_read_through
             .insert("old-place".to_owned(), 4);
@@ -2647,7 +3466,7 @@ mod tests {
         assert_eq!(api.calls.lock().await.as_slice(), &["open:general"]);
         assert!(api.reads.lock().await.is_empty());
         {
-            let state = tool.view.lock().await;
+            let state = default_state(&tool).await;
             assert_eq!(state.pending_read_through.get("old-place"), Some(&4));
             assert_eq!(state.pending_read_through.get("general"), Some(&7));
         }
@@ -2664,7 +3483,7 @@ mod tests {
             api.reads.lock().await.as_slice(),
             &[("general".to_owned(), 7)]
         );
-        let state = tool.view.lock().await;
+        let state = default_state(&tool).await;
         assert_eq!(state.pending_read_through.get("old-place"), Some(&4));
         assert!(!state.pending_read_through.contains_key("general"));
     }
@@ -2697,9 +3516,7 @@ mod tests {
         assert!(latest_gap.live_post_commit.is_none());
         assert!(api.reads.lock().await.is_empty());
         assert!(
-            !tool
-                .view
-                .lock()
+            !default_state(&tool)
                 .await
                 .pending_read_through
                 .contains_key("general")
@@ -2871,7 +3688,7 @@ mod tests {
             .push_back(test_open_response("other", 2, 0, 1, 2, None));
         let tool = Arc::new(MessagingTool::new(api.clone()));
         {
-            let mut state = tool.view.lock().await;
+            let mut state = default_state(&tool).await;
             state.focused_place_id = Some("old-place".to_owned());
             state.visible_messages = vec![VisibleMessage {
                 message_id: "old-message".to_owned(),
@@ -2879,7 +3696,7 @@ mod tests {
             }];
             state.pending_read_through.insert("old-place".to_owned(), 9);
         }
-        let expected_state = tool.view.lock().await.clone();
+        let expected_state = default_state(&tool).await.clone();
         let mut builder = ToolRegistryBuilder::default();
         builder.register(tool.clone()).expect("register Messaging");
         let registry = builder.build();
@@ -2898,7 +3715,7 @@ mod tests {
             error,
             BoundExecutionError::Tool(ToolError::Protocol(_))
         ));
-        assert_eq!(*tool.view.lock().await, expected_state);
+        assert_eq!(*default_state(&tool).await, expected_state);
         assert!(api.reads.lock().await.is_empty());
     }
 
@@ -2929,7 +3746,7 @@ mod tests {
         assert_eq!(outcome.output.details["messages"][2]["content"], "");
         assert!(api.reads.lock().await.is_empty());
         {
-            let state = tool.view.lock().await;
+            let state = default_state(&tool).await;
             assert_eq!(state.focused_place_id.as_deref(), Some("general"));
             assert_eq!(
                 state
@@ -2983,7 +3800,10 @@ mod tests {
                 if message == "read failed"
         ));
         assert_eq!(
-            tool.view.lock().await.pending_read_through.get("general"),
+            default_state(&tool)
+                .await
+                .pending_read_through
+                .get("general"),
             Some(&7)
         );
 
@@ -2992,7 +3812,10 @@ mod tests {
             .await
             .expect("a failed retry must not fail an unrelated action");
         assert_eq!(
-            tool.view.lock().await.pending_read_through.get("general"),
+            default_state(&tool)
+                .await
+                .pending_read_through
+                .get("general"),
             Some(&7)
         );
 
@@ -3003,7 +3826,7 @@ mod tests {
         )
         .await
         .expect("a later opportunistic retry may apply the pending cursor");
-        assert!(tool.view.lock().await.pending_read_through.is_empty());
+        assert!(default_state(&tool).await.pending_read_through.is_empty());
         assert_eq!(
             api.calls.lock().await.as_slice(),
             &[
@@ -3048,9 +3871,7 @@ mod tests {
         .await
         .expect("old open");
         assert_eq!(
-            old_tool
-                .view
-                .lock()
+            default_state(&old_tool)
                 .await
                 .pending_read_through
                 .get("general"),
@@ -3061,7 +3882,12 @@ mod tests {
         drop(old_tool);
 
         let recreated = Arc::new(MessagingTool::new(api));
-        assert!(recreated.view.lock().await.pending_read_through.is_empty());
+        assert!(
+            default_state(&recreated)
+                .await
+                .pending_read_through
+                .is_empty()
+        );
         let mut recreated_builder = ToolRegistryBuilder::default();
         recreated_builder
             .register(recreated.clone())
@@ -3076,9 +3902,7 @@ mod tests {
         .expect("the next exact open safely recomputes the cursor");
         assert!(recomputed.live_post_commit.is_some());
         assert_eq!(
-            recreated
-                .view
-                .lock()
+            default_state(&recreated)
                 .await
                 .pending_read_through
                 .get("general"),
@@ -3107,7 +3931,7 @@ mod tests {
                 if precondition.code == "focused_resource_required"
         ));
 
-        tool.view.lock().await.focused_place_id = Some("place-a".to_owned());
+        default_state(&tool).await.focused_place_id = Some("place-a".to_owned());
         let invisible = bind_action(
             &registry,
             "react",
@@ -3151,7 +3975,10 @@ mod tests {
         .unwrap();
         assert!(api.reads.lock().await.is_empty());
         assert_eq!(
-            tool.view.lock().await.pending_read_through.get("general"),
+            default_state(&tool)
+                .await
+                .pending_read_through
+                .get("general"),
             Some(&7)
         );
         assert_eq!(api.calls.lock().await.as_slice(), &["open:general"]);
@@ -3240,14 +4067,17 @@ mod tests {
             .await
             .expect("maintenance failure must not fail the unrelated action");
         assert_eq!(
-            tool.view.lock().await.pending_read_through.get("general"),
+            default_state(&tool)
+                .await
+                .pending_read_through
+                .get("general"),
             Some(&7)
         );
         execute(&tool, json!({"action": "overview"}), "two")
             .await
             .unwrap();
         assert_eq!(api.reads.lock().await.len(), 1);
-        assert!(tool.view.lock().await.pending_read_through.is_empty());
+        assert!(default_state(&tool).await.pending_read_through.is_empty());
     }
 
     #[tokio::test]
@@ -3532,7 +4362,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tool.view.lock().await.focused_place_id = None;
+        default_state(&tool).await.focused_place_id = None;
 
         // Like the human's reply-later list, keeping a known own promise is
         // reachable from anywhere — the place it was made in need not be open.

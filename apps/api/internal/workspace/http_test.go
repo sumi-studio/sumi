@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
@@ -193,6 +194,115 @@ func TestHumanAndAgentTransportsConvergeOnWorkspaceOperations(t *testing.T) {
 
 	if sessions.authorizeCalls != 4 { // create, invite creation, redemption, owner transfer
 		t.Fatalf("browser mutation admission calls = %d", sessions.authorizeCalls)
+	}
+}
+
+func TestLocalResolveEnabledAppBindsAuthenticatedActorWithoutInferenceOrSideEffects(t *testing.T) {
+	w := newTestWorld(t)
+	ctx := context.Background()
+	appStore := applicationapps.New(w.pool, w.store)
+	server := NewServer(w.store, appStore, nil)
+	created, err := w.store.CreateWorkspace(ctx, "resolver", w.agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := appStore.Install(ctx,
+		applicationapps.WorkspaceOwner(created.WorkspaceID), w.agentA, "messaging")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before struct {
+		workspaces, memberships, installations int
+		enabled                                bool
+		updatedAt                              time.Time
+	}
+	if err := w.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM workspaces),
+		       (SELECT count(*) FROM workspace_members),
+		       (SELECT count(*) FROM app_installations), enabled, updated_at
+		FROM app_installations WHERE installation_id=$1`, installed.InstallationID,
+	).Scan(&before.workspaces, &before.memberships, &before.installations,
+		&before.enabled, &before.updatedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	requestBody := fmt.Sprintf(`{"workspace_id":%q,"app_id":"messaging"}`, created.WorkspaceID)
+	resolved := invokeLocal(server.localResolveEnabledApp, requestBody, w.agentA.ID)
+	if resolved.Code != http.StatusOK {
+		t.Fatalf("resolve enabled app = %d: %s", resolved.Code, resolved.Body.String())
+	}
+	var resolution map[string]any
+	decodeRecorder(t, resolved, &resolution)
+	if len(resolution) != 1 || resolution["installation_id"] != installed.InstallationID {
+		t.Fatalf("resolver exposed unexpected fields: %#v", resolution)
+	}
+
+	var after struct {
+		workspaces, memberships, installations int
+		enabled                                bool
+		updatedAt                              time.Time
+	}
+	if err := w.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM workspaces),
+		       (SELECT count(*) FROM workspace_members),
+		       (SELECT count(*) FROM app_installations), enabled, updated_at
+		FROM app_installations WHERE installation_id=$1`, installed.InstallationID,
+	).Scan(&after.workspaces, &after.memberships, &after.installations,
+		&after.enabled, &after.updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("bind-time app resolution mutated state: before=%#v after=%#v", before, after)
+	}
+
+	for name, body := range map[string]string{
+		"missing Workspace": `{"app_id":"messaging"}`,
+		"invalid Workspace": `{"workspace_id":"not-a-workspace","app_id":"messaging"}`,
+		"missing app":       fmt.Sprintf(`{"workspace_id":%q}`, created.WorkspaceID),
+		"unknown field":     fmt.Sprintf(`{"workspace_id":%q,"app_id":"messaging","installation_id":%q}`, created.WorkspaceID, installed.InstallationID),
+	} {
+		response := invokeLocal(server.localResolveEnabledApp, body, w.agentA.ID)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d: %s", name, response.Code, response.Body.String())
+		}
+	}
+	nonMember := invokeLocal(server.localResolveEnabledApp, requestBody, w.agentB.ID)
+	if nonMember.Code != http.StatusNotFound || !strings.Contains(nonMember.Body.String(), `"not_found"`) {
+		t.Fatalf("non-member resolution = %d: %s", nonMember.Code, nonMember.Body.String())
+	}
+	missingApp := invokeLocal(server.localResolveEnabledApp,
+		fmt.Sprintf(`{"workspace_id":%q,"app_id":"alarm"}`, created.WorkspaceID), w.agentA.ID)
+	if missingApp.Code != http.StatusNotFound || !strings.Contains(missingApp.Body.String(), `"installation_not_found"`) {
+		t.Fatalf("missing installation = %d: %s", missingApp.Code, missingApp.Body.String())
+	}
+
+	forbiddenServer := NewServer(w.store, applicationapps.New(w.pool, nil), nil)
+	forbidden := invokeLocal(forbiddenServer.localResolveEnabledApp, requestBody, w.agentA.ID)
+	if forbidden.Code != http.StatusForbidden || !strings.Contains(forbidden.Body.String(), `"forbidden"`) {
+		t.Fatalf("unavailable Workspace authority = %d: %s", forbidden.Code, forbidden.Body.String())
+	}
+	if _, err := appStore.SetEnabledByID(ctx, installed.InstallationID, w.agentA, false); err != nil {
+		t.Fatal(err)
+	}
+	disabled := invokeLocal(server.localResolveEnabledApp, requestBody, w.agentA.ID)
+	if disabled.Code != http.StatusConflict || !strings.Contains(disabled.Body.String(), `"app_disabled"`) {
+		t.Fatalf("disabled installation = %d: %s", disabled.Code, disabled.Body.String())
+	}
+	if _, err := appStore.SetEnabledByID(ctx, installed.InstallationID, w.agentA, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := appStore.UninstallByID(ctx, installed.InstallationID, w.agentA); err != nil {
+		t.Fatal(err)
+	}
+	uninstalled := invokeLocal(server.localResolveEnabledApp, requestBody, w.agentA.ID)
+	if uninstalled.Code != http.StatusNotFound || !strings.Contains(uninstalled.Body.String(), `"installation_not_found"`) {
+		t.Fatalf("uninstalled installation = %d: %s", uninstalled.Code, uninstalled.Body.String())
+	}
+	unavailable := invokeLocal(NewServer(w.store, nil, nil).localResolveEnabledApp,
+		requestBody, w.agentA.ID)
+	if unavailable.Code != http.StatusServiceUnavailable || !strings.Contains(unavailable.Body.String(), `"apps_unavailable"`) {
+		t.Fatalf("unavailable app lifecycle = %d: %s", unavailable.Code, unavailable.Body.String())
 	}
 }
 
@@ -745,6 +855,19 @@ func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *t
 	}
 	var installation appInstallationWire
 	decodeRecorder(t, installResponse, &installation)
+	resolveResponse := call(LocalAppResolvePath, authorization.BearerToken, fmt.Sprintf(
+		`{"workspace_id":%q,"app_id":"messaging"}`, created.WorkspaceID))
+	if resolveResponse.Code != http.StatusOK {
+		t.Fatalf("registered app resolver = %d: %s", resolveResponse.Code, resolveResponse.Body.String())
+	}
+	var resolved struct {
+		InstallationID string `json:"installation_id"`
+	}
+	decodeRecorder(t, resolveResponse, &resolved)
+	if resolved.InstallationID != installation.InstallationID {
+		t.Fatalf("registered app resolver id = %q, want %q",
+			resolved.InstallationID, installation.InstallationID)
+	}
 
 	replacement := authorization
 	replacement.BearerToken = "workspace-local-control-bearer-generation-two"

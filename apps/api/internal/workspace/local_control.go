@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
@@ -44,6 +46,7 @@ const (
 	LocalMemberRolesPath      = "/local-control/v1/workspace:member-roles"
 	LocalAppCatalogPath       = "/local-control/v1/apps:catalog"
 	LocalAppInstallationsPath = "/local-control/v1/apps:installations"
+	LocalAppResolvePath       = "/local-control/v1/apps:resolve-enabled"
 	LocalAppInstallPath       = "/local-control/v1/apps:install"
 	LocalAppSetEnabledPath    = "/local-control/v1/apps:set-enabled"
 	LocalAppUninstallPath     = "/local-control/v1/apps:uninstall"
@@ -77,6 +80,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalMemberRolesPath, s.localSetMemberRoles},
 		{"POST " + LocalAppCatalogPath, s.localAppCatalog},
 		{"POST " + LocalAppInstallationsPath, s.localAppInstallations},
+		{"POST " + LocalAppResolvePath, s.localResolveEnabledApp},
 		{"POST " + LocalAppInstallPath, s.localInstallApp},
 		{"POST " + LocalAppSetEnabledPath, s.localSetAppEnabled},
 		{"POST " + LocalAppUninstallPath, s.localUninstallApp},
@@ -546,6 +550,52 @@ func (s *Server) localAppInstallations(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	writeInstallationList(w, installations)
+}
+
+// localResolveEnabledApp is the app-lifecycle-owned bind seam used by trusted
+// app adapters. The model selects a Workspace, while the adapter supplies its
+// own fixed app identity. The authenticated local-control authorization is the
+// only source of actor identity; this read neither installs nor enables an app.
+func (s *Server) localResolveEnabledApp(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string `json:"workspace_id"`
+		AppID       string `json:"app_id"`
+	}
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	if s.Apps == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "apps_unavailable")
+		return
+	}
+	owner := applicationapps.WorkspaceOwner(request.WorkspaceID)
+	if owner.Validate() != nil || request.AppID == "" || len(request.AppID) > 128 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	installation, err := s.Apps.ResolveEnabledInstallation(
+		r.Context(), owner, localActor(authorization), request.AppID,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, applicationapps.ErrForbidden), errors.Is(err, ErrForbidden):
+			writeAPIError(w, http.StatusForbidden, "forbidden")
+		case errors.Is(err, ErrNotFound), errors.Is(err, ErrMemberNotFound):
+			// Workspace reads deliberately conceal whether the Workspace or
+			// membership is absent. Preserve that boundary at this resolver.
+			writeAPIError(w, http.StatusNotFound, "not_found")
+		case errors.Is(err, applicationapps.ErrInstallationNotFound):
+			writeAPIError(w, http.StatusNotFound, "installation_not_found")
+		case errors.Is(err, applicationapps.ErrAppDisabled):
+			writeAPIError(w, http.StatusConflict, "app_disabled")
+		default:
+			writeAPIError(w, http.StatusServiceUnavailable, "apps_unavailable")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		InstallationID string `json:"installation_id"`
+	}{InstallationID: installation.InstallationID})
 }
 
 func (s *Server) localInstallApp(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

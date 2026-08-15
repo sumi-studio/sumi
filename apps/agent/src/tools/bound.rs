@@ -466,6 +466,10 @@ pub(crate) enum DescribeError {
     InvalidExecutionIdentity { reason: String },
     #[error("tool arguments did not match the app-owned binding schema")]
     InvalidArguments,
+    #[error("app binding is temporarily unavailable")]
+    BindingUnavailable,
+    #[error("app binding failed internal protocol validation")]
+    BindingInternal,
     #[error("app precondition failed ({precondition:?})")]
     AppPrecondition { precondition: AppPrecondition },
     #[error("app precondition is invalid: {reason}")]
