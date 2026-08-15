@@ -1,4 +1,5 @@
 import {
+  type APIResponse,
   expect,
   type Page,
   type Request,
@@ -224,7 +225,7 @@ test("two real Chrome pages own Direct Chat through the production Participant l
       }
     };
     page.on("request", observeDisableRequest);
-    const disableResponse = page.waitForResponse(isLifecycleStateResponse);
+    const lostDisableResponse = await loseNextLifecycleStateResponse(page);
     const disableMenu = await openParticipantApps(page);
     await directChatRow(disableMenu)
       .getByRole("button", { name: "無効化" })
@@ -235,12 +236,13 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     delayedSecondPageList.release();
     expect((await delayedRefreshResponse).status()).toBe(200);
     const disabled = expectInstallation(
-      await responseJSON(await disableResponse, 200, webOrigin),
+      await responseJSON(await lostDisableResponse.committed, 200, webOrigin),
       sessionUserID,
       "disabled",
       "2",
       installed.installationID,
     );
+    await lostDisableResponse.dispose();
     page.off("request", observeDisableRequest);
     await expect
       .poll(delayedSecondPageList.requestCount)
@@ -726,6 +728,39 @@ async function holdNextParticipantInstallationList(page: Page): Promise<{
   };
 }
 
+async function loseNextLifecycleStateResponse(page: Page): Promise<{
+  committed: Promise<APIResponse>;
+  dispose: () => Promise<void>;
+}> {
+  const pattern = "**/app-installations/*/state";
+  const committed = deferred<APIResponse>();
+  let intercepted = false;
+  const handler = async (route: Route) => {
+    if (
+      intercepted ||
+      route.request().method() !== "PUT" ||
+      !/^\/app-installations\/[^/]+\/state$/.test(
+        new URL(route.request().url()).pathname,
+      )
+    ) {
+      await route.continue();
+      return;
+    }
+    intercepted = true;
+    // The production API receives and commits the exact request. Only the
+    // response leg is then lost, reproducing the ambiguous browser outcome
+    // that cross-document invalidation must survive.
+    const response = await route.fetch();
+    committed.resolve(response);
+    await route.abort("failed");
+  };
+  await page.route(pattern, handler);
+  return {
+    committed: committed.promise,
+    dispose: () => page.unroute(pattern, handler),
+  };
+}
+
 function isInstallResponse(response: Response) {
   return (
     response.request().method() === "POST" &&
@@ -769,7 +804,7 @@ function isParticipantInstallationList(method: string, rawURL: string) {
 }
 
 async function responseJSON(
-  response: Response,
+  response: Response | APIResponse,
   status: number,
   webOrigin: string,
 ) {

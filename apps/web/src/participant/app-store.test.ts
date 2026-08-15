@@ -87,10 +87,20 @@ describe("Participant app lifecycle store", () => {
   it("uses the same exact lifecycle verbs and retains app data semantics on disable", async () => {
     const installed = installation(OWNER_A);
     const disabled = { ...installed, state: "disabled" as const, updatedAt: 4 };
-    const installApp = vi.fn(async () => installed);
-    const setInstallationState = vi.fn(async () => disabled);
-    const uninstallApp = vi.fn(async () => undefined);
+    let serverSnapshot: AppInstallation[] = [];
+    const installApp = vi.fn(async () => {
+      serverSnapshot = [installed];
+      return installed;
+    });
+    const setInstallationState = vi.fn(async () => {
+      serverSnapshot = [disabled];
+      return disabled;
+    });
+    const uninstallApp = vi.fn(async () => {
+      serverSnapshot = [];
+    });
     const client = participantClient({
+      listInstallations: vi.fn(async () => serverSnapshot),
       installApp,
       setInstallationState,
       uninstallApp,
@@ -180,14 +190,13 @@ describe("Participant app lifecycle store", () => {
       installations: [enabledEpoch1],
     });
     disable.resolve(disabledEpoch2);
-    await disabling;
+    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(2));
+    refreshResponses[0]?.resolve([disabledEpoch2]);
+    await Promise.all([disabling, refreshAfterDisable]);
     expect(store.getState()).toMatchObject({
       mutation: null,
       installations: [disabledEpoch2],
     });
-    await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(2));
-    refreshResponses[0]?.resolve([disabledEpoch2]);
-    await refreshAfterDisable;
     expect(store.getState().installations).toEqual([disabledEpoch2]);
 
     const enabling = store
@@ -197,10 +206,9 @@ describe("Participant app lifecycle store", () => {
     expect(listInstallations).toHaveBeenCalledTimes(2);
     expect(store.getState().mutation).toBe("set_installation_enabled");
     enable.resolve(enabledEpoch2);
-    await enabling;
     await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(3));
     refreshResponses[1]?.resolve([enabledEpoch2]);
-    await refreshAfterEnable;
+    await Promise.all([enabling, refreshAfterEnable]);
     expect(store.getState().installations).toEqual([enabledEpoch2]);
 
     const uninstalling = store
@@ -210,10 +218,9 @@ describe("Participant app lifecycle store", () => {
     expect(listInstallations).toHaveBeenCalledTimes(3);
     expect(store.getState().mutation).toBe("uninstall_app");
     uninstall.resolve();
-    await uninstalling;
     await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(4));
     refreshResponses[2]?.resolve([]);
-    await refreshAfterUninstall;
+    await Promise.all([uninstalling, refreshAfterUninstall]);
     expect(store.getState().installations).toEqual([]);
 
     const reinstalling = store.getState().installApp("direct-chat");
@@ -221,10 +228,9 @@ describe("Participant app lifecycle store", () => {
     expect(listInstallations).toHaveBeenCalledTimes(4);
     expect(store.getState().mutation).toBe("install_app");
     reinstall.resolve(reinstalled);
-    await reinstalling;
     await vi.waitFor(() => expect(listInstallations).toHaveBeenCalledTimes(5));
     refreshResponses[3]?.resolve([reinstalled]);
-    await refreshAfterReinstall;
+    await Promise.all([reinstalling, refreshAfterReinstall]);
     expect(store.getState()).toMatchObject({
       status: "ready",
       mutation: null,
@@ -288,6 +294,235 @@ describe("Participant app lifecycle store", () => {
       }),
     );
     expect(firstStore.getState().installations).toEqual([disabledEpoch2]);
+  });
+
+  it("announces invalidation before a delayed remote effect and keeps peer reads behind the owner lock", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const disabledEpoch2 = {
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+      updatedAt: 3,
+    };
+    let serverSnapshot = [enabledEpoch1];
+    const remoteEffect = deferred<AppInstallation>();
+    const coordinators = lifecycleCoordinatorPair();
+    const firstList = vi.fn(async () => serverSnapshot);
+    const secondList = vi.fn(async () => serverSnapshot);
+    const setInstallationState = vi.fn(() => remoteEffect.promise);
+    const firstStore = createParticipantAppStore(
+      participantClient({
+        listInstallations: firstList,
+        setInstallationState,
+      }),
+      coordinators[0],
+    );
+    const secondStore = createParticipantAppStore(
+      participantClient({ listInstallations: secondList }),
+      coordinators[1],
+    );
+    await Promise.all([
+      firstStore.getState().bindParticipant(HUMAN_A),
+      secondStore.getState().bindParticipant(HUMAN_A),
+    ]);
+
+    const disabling = firstStore
+      .getState()
+      .setInstallationState(enabledEpoch1.installationId, "disabled");
+    await vi.waitFor(() => expect(setInstallationState).toHaveBeenCalledOnce());
+
+    expect(secondStore.getState()).toMatchObject({
+      status: "loading",
+      installations: [enabledEpoch1],
+    });
+    expect(secondList).toHaveBeenCalledTimes(1);
+
+    serverSnapshot = [disabledEpoch2];
+    remoteEffect.resolve(disabledEpoch2);
+    await disabling;
+
+    await vi.waitFor(() =>
+      expect(secondStore.getState()).toMatchObject({
+        status: "ready",
+        installations: [disabledEpoch2],
+      }),
+    );
+    expect(firstStore.getState()).toMatchObject({
+      status: "ready",
+      mutation: null,
+      installations: [disabledEpoch2],
+    });
+    expect(firstList).toHaveBeenCalledTimes(2);
+    expect(secondList).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets a peer converge after commit plus response loss even when the sender disappears", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const disabledEpoch2 = {
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+      updatedAt: 3,
+    };
+    let serverSnapshot = [enabledEpoch1];
+    const senderRefresh = deferred<AppInstallation[]>();
+    const coordinators = lifecycleCoordinatorPair();
+    const firstList = vi
+      .fn<() => Promise<AppInstallation[]>>()
+      .mockResolvedValueOnce([enabledEpoch1])
+      .mockImplementationOnce(() => senderRefresh.promise);
+    const secondList = vi.fn(async () => serverSnapshot);
+    const firstStore = createParticipantAppStore(
+      participantClient({
+        listInstallations: firstList,
+        setInstallationState: vi.fn(async () => {
+          serverSnapshot = [disabledEpoch2];
+          throw new Error("response lost after commit");
+        }),
+      }),
+      coordinators[0],
+    );
+    const secondStore = createParticipantAppStore(
+      participantClient({ listInstallations: secondList }),
+      coordinators[1],
+    );
+    await Promise.all([
+      firstStore.getState().bindParticipant(HUMAN_A),
+      secondStore.getState().bindParticipant(HUMAN_A),
+    ]);
+
+    const mutationResult = firstStore
+      .getState()
+      .setInstallationState(enabledEpoch1.installationId, "disabled")
+      .catch((error: unknown) => error);
+
+    await vi.waitFor(() =>
+      expect(secondStore.getState()).toMatchObject({
+        status: "ready",
+        installations: [disabledEpoch2],
+      }),
+    );
+    await vi.waitFor(() => expect(firstList).toHaveBeenCalledTimes(2));
+    expect(firstStore.getState()).toMatchObject({
+      status: "loading",
+      mutation: "set_installation_disabled",
+      installations: [enabledEpoch1],
+    });
+
+    await firstStore.getState().bindParticipant(null);
+    senderRefresh.resolve([disabledEpoch2]);
+    const mutationError = await mutationResult;
+
+    expect(mutationError).toEqual(new Error("response lost after commit"));
+    expect(firstStore.getState()).toMatchObject({
+      owner: null,
+      status: "idle",
+      mutation: null,
+      installations: [],
+    });
+    expect(secondStore.getState()).toMatchObject({
+      status: "ready",
+      installations: [disabledEpoch2],
+      errorCode: null,
+    });
+    expect(secondList).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns both documents to old truth when an announced effect does not commit", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    const coordinators = lifecycleCoordinatorPair();
+    const firstList = vi.fn(async () => [enabledEpoch1]);
+    const secondList = vi.fn(async () => [enabledEpoch1]);
+    const firstStore = createParticipantAppStore(
+      participantClient({
+        listInstallations: firstList,
+        setInstallationState: vi.fn(async () => {
+          throw new Error("write rejected before commit");
+        }),
+      }),
+      coordinators[0],
+    );
+    const secondStore = createParticipantAppStore(
+      participantClient({ listInstallations: secondList }),
+      coordinators[1],
+    );
+    await Promise.all([
+      firstStore.getState().bindParticipant(HUMAN_A),
+      secondStore.getState().bindParticipant(HUMAN_A),
+    ]);
+
+    await expect(
+      firstStore
+        .getState()
+        .setInstallationState(enabledEpoch1.installationId, "disabled"),
+    ).rejects.toThrow("write rejected before commit");
+
+    expect(firstStore.getState()).toMatchObject({
+      status: "ready",
+      mutation: null,
+      installations: [enabledEpoch1],
+      errorCode: "write rejected before commit",
+    });
+    expect(secondStore.getState()).toMatchObject({
+      status: "ready",
+      installations: [enabledEpoch1],
+      errorCode: null,
+    });
+    expect(firstList).toHaveBeenCalledTimes(2);
+    expect(secondList).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed before a lifecycle effect when owner coordination becomes unavailable", async () => {
+    const enabledEpoch1 = installation(OWNER_A);
+    let coordinationAvailable = true;
+    const publishMutation = vi.fn();
+    const setInstallationState = vi.fn(async () => ({
+      ...enabledEpoch1,
+      state: "disabled" as const,
+      authorityEpoch: "2",
+    }));
+    const coordinator: ParticipantAppLifecycleCoordinator = {
+      async runExclusive<T>(
+        _ownerKey: string,
+        operation: () => Promise<T>,
+      ): Promise<T> {
+        if (!coordinationAvailable) {
+          throw new Error(
+            "Participant app cross-document coordination is unavailable",
+          );
+        }
+        return operation();
+      },
+      publishMutation,
+      subscribeMutations: () => () => undefined,
+      subscribeResume: () => () => undefined,
+    };
+    const store = createParticipantAppStore(
+      participantClient({
+        listInstallations: vi.fn(async () => [enabledEpoch1]),
+        setInstallationState,
+      }),
+      coordinator,
+    );
+    await store.getState().bindParticipant(HUMAN_A);
+
+    coordinationAvailable = false;
+    await expect(
+      store
+        .getState()
+        .setInstallationState(enabledEpoch1.installationId, "disabled"),
+    ).rejects.toThrow(
+      "Participant app cross-document coordination is unavailable",
+    );
+
+    expect(publishMutation).not.toHaveBeenCalled();
+    expect(setInstallationState).not.toHaveBeenCalled();
+    expect(store.getState()).toMatchObject({
+      status: "error",
+      mutation: null,
+      installations: [enabledEpoch1],
+      errorCode: "Participant app cross-document coordination is unavailable",
+    });
   });
 
   it("discards an in-flight snapshot when another document announces a commit", async () => {
