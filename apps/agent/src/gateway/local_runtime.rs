@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
@@ -45,7 +46,9 @@ use crate::apiclient::messaging::{
     SetMessagingStatusRequest, WriteMessagingMessageRequest,
 };
 use crate::apiclient::workspace::{
-    WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceListPage, WorkspaceSummary,
+    WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceInvitationApi,
+    WorkspaceInvitationListPage, WorkspaceInvitationSummary, WorkspaceListPage,
+    WorkspaceMembershipTenure, WorkspaceSummary,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -746,6 +749,45 @@ struct WorkspaceSummaryWire {
     created_at: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceInvitationListWire {
+    invitations: Vec<WorkspaceInvitationSummaryWire>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null_string")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceInvitationSummaryWire {
+    invitation_id: String,
+    workspace_id: String,
+    workspace_name: String,
+    expires_at: String,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceMembershipParticipantWire {
+    kind: String,
+    personality_agent_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceMembershipTenureWire {
+    workspace_member_id: String,
+    workspace_id: String,
+    participant: WorkspaceMembershipParticipantWire,
+    display_name: String,
+    owner: bool,
+    role_ids: Vec<String>,
+    joined_at: String,
+    // Value keeps JSON null distinct from a missing required field.
+    left_at: serde_json::Value,
+}
+
 #[async_trait]
 impl WorkspaceApi for LocalControlHttpClient {
     async fn list_memberships(
@@ -808,6 +850,165 @@ impl WorkspaceApi for LocalControlHttpClient {
             next_cursor: wire.next_cursor,
         })
     }
+}
+
+#[async_trait]
+impl WorkspaceInvitationApi for LocalControlHttpClient {
+    async fn list_invitations(
+        &self,
+        cursor: Option<&str>,
+    ) -> WorkspaceApiResult<WorkspaceInvitationListPage> {
+        if cursor.is_some_and(|value| !is_workspace_list_cursor_shape(value)) {
+            return Err(WorkspaceApiError::InvalidRequest);
+        }
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cursor: Option<&'a str>,
+        }
+
+        let (status, body) = self
+            .post_json_bounded_raw(
+                "/local-control/v1/workspace:invitation-list",
+                &Request { cursor },
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+            )
+            .await
+            .map_err(|_| WorkspaceApiError::Transport)?;
+        if !status.is_success() {
+            return Err(workspace_status_error(status));
+        }
+        let wire: WorkspaceInvitationListWire =
+            serde_json::from_slice(body.as_slice()).map_err(|_| WorkspaceApiError::Protocol)?;
+        if wire.invitations.len() > MAX_WORKSPACE_LIST_PAGE_ITEMS
+            || (wire.next_cursor.is_some()
+                && wire.invitations.len() != MAX_WORKSPACE_LIST_PAGE_ITEMS)
+        {
+            return Err(WorkspaceApiError::Protocol);
+        }
+
+        let mut seen_invitations = BTreeSet::new();
+        let mut seen_workspaces = BTreeSet::new();
+        let mut previous_invitation_id: Option<String> = None;
+        let mut invitations = Vec::with_capacity(wire.invitations.len());
+        for item in wire.invitations {
+            if !is_canonical_uuid_v7(&item.invitation_id)
+                || !is_canonical_uuid_v7(&item.workspace_id)
+                || item.workspace_name.trim() != item.workspace_name
+                || !(1..=200).contains(&item.workspace_name.chars().count())
+                || !seen_invitations.insert(item.invitation_id.clone())
+                || !seen_workspaces.insert(item.workspace_id.clone())
+                || previous_invitation_id
+                    .as_ref()
+                    .is_some_and(|previous| item.invitation_id <= *previous)
+            {
+                return Err(WorkspaceApiError::Protocol);
+            }
+            let created_at = parse_workspace_timestamp(&item.created_at)?;
+            let expires_at = parse_workspace_timestamp(&item.expires_at)?;
+            if expires_at <= created_at {
+                return Err(WorkspaceApiError::Protocol);
+            }
+            previous_invitation_id = Some(item.invitation_id.clone());
+            invitations.push(WorkspaceInvitationSummary {
+                invitation_id: item.invitation_id,
+                workspace_id: item.workspace_id,
+                workspace_name: item.workspace_name,
+                expires_at,
+                created_at,
+            });
+        }
+        if wire
+            .next_cursor
+            .as_deref()
+            .is_some_and(|value| !is_workspace_list_cursor_shape(value))
+        {
+            return Err(WorkspaceApiError::Protocol);
+        }
+        Ok(WorkspaceInvitationListPage {
+            invitations,
+            next_cursor: wire.next_cursor,
+        })
+    }
+
+    async fn accept_invitation(
+        &self,
+        invitation_id: &str,
+    ) -> WorkspaceApiResult<WorkspaceMembershipTenure> {
+        if !is_canonical_uuid_v7(invitation_id) {
+            return Err(WorkspaceApiError::InvalidRequest);
+        }
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request<'a> {
+            invitation_id: &'a str,
+        }
+
+        let (status, body) = self
+            .post_json_bounded_raw(
+                "/local-control/v1/workspace:invitation-accept",
+                &Request { invitation_id },
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+            )
+            .await
+            .map_err(|_| WorkspaceApiError::Transport)?;
+        if !status.is_success() {
+            return Err(workspace_status_error(status));
+        }
+        let wire: WorkspaceMembershipTenureWire =
+            serde_json::from_slice(body.as_slice()).map_err(|_| WorkspaceApiError::Protocol)?;
+        if !is_canonical_uuid_v7(&wire.workspace_member_id)
+            || !is_canonical_uuid_v7(&wire.workspace_id)
+            || wire.participant.kind != "personality_agent"
+            || wire.participant.personality_agent_id
+                != self.authority.personality_agent_id().as_str()
+            || wire.display_name.is_empty()
+        {
+            return Err(WorkspaceApiError::Protocol);
+        }
+        let mut seen_roles = BTreeSet::new();
+        if wire
+            .role_ids
+            .iter()
+            .any(|role_id| !is_canonical_uuid_v7(role_id) || !seen_roles.insert(role_id.clone()))
+        {
+            return Err(WorkspaceApiError::Protocol);
+        }
+        let joined_at = parse_workspace_timestamp(&wire.joined_at)?;
+        let left_at = match wire.left_at {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(value) => Some(parse_workspace_timestamp(&value)?),
+            _ => return Err(WorkspaceApiError::Protocol),
+        };
+        if left_at.is_some_and(|left_at| left_at < joined_at) {
+            return Err(WorkspaceApiError::Protocol);
+        }
+        Ok(WorkspaceMembershipTenure {
+            workspace_member_id: wire.workspace_member_id,
+            workspace_id: wire.workspace_id,
+            display_name: wire.display_name,
+            owner: wire.owner,
+            role_ids: wire.role_ids,
+            joined_at,
+            left_at,
+        })
+    }
+}
+
+fn parse_workspace_timestamp(value: &str) -> WorkspaceApiResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| WorkspaceApiError::Protocol)
+}
+
+fn deserialize_optional_non_null_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 fn is_workspace_list_cursor_shape(value: &str) -> bool {
@@ -3378,6 +3579,232 @@ mod tests {
             &valid[..75]
         )));
         assert!(!is_workspace_list_cursor_shape(&format!("{valid}A")));
+    }
+
+    #[derive(Clone)]
+    struct WorkspaceInvitationFixtureState {
+        expected_authorization: String,
+        list_bodies: Arc<StdMutex<Vec<serde_json::Value>>>,
+        accept_bodies: Arc<StdMutex<Vec<serde_json::Value>>>,
+        next_cursor: String,
+        accepted_personality_agent_id: String,
+        add_unknown_accept_field: bool,
+    }
+
+    async fn workspace_invitation_list_http_fixture(
+        State(state): State<WorkspaceInvitationFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some(state.expected_authorization.as_str())
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        state.list_bodies.lock().unwrap().push(request);
+        let invitations = (0..MAX_WORKSPACE_LIST_PAGE_ITEMS)
+            .map(|index| {
+                serde_json::json!({
+                    "invitation_id": format!(
+                        "0198f0f4-9b72-7000-8002-{:012x}",
+                        index + 0x11
+                    ),
+                    "workspace_id": format!(
+                        "0198f0f4-9b72-7000-8003-{:012x}",
+                        index + 0x11
+                    ),
+                    "workspace_name": format!("Inviting team {index}"),
+                    "expires_at": "2026-08-17T00:00:00Z",
+                    "created_at": "2026-08-16T00:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Json(serde_json::json!({
+            "invitations": invitations,
+            "next_cursor": state.next_cursor
+        })))
+    }
+
+    async fn workspace_invitation_accept_http_fixture(
+        State(state): State<WorkspaceInvitationFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some(state.expected_authorization.as_str())
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        state.accept_bodies.lock().unwrap().push(request);
+        let mut response = serde_json::json!({
+            "workspace_member_id": "0198f0f4-9b72-7000-8004-000000000011",
+            "workspace_id": "0198f0f4-9b72-7000-8003-000000000011",
+            "participant": {
+                "kind": "personality_agent",
+                "personality_agent_id": state.accepted_personality_agent_id.clone()
+            },
+            "display_name": "Kuro",
+            "owner": false,
+            "role_ids": [],
+            "joined_at": "2026-08-16T00:00:00Z",
+            "left_at": null
+        });
+        if state.add_unknown_accept_field {
+            response
+                .as_object_mut()
+                .unwrap()
+                .insert("target_id".to_owned(), serde_json::json!(OTHER_PAID));
+        }
+        Ok(Json(response))
+    }
+
+    #[tokio::test]
+    async fn workspace_invitation_http_uses_only_bearer_actor_and_strict_exact_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = WorkspaceInvitationFixtureState {
+            expected_authorization: "Bearer control-secret".to_owned(),
+            list_bodies: Arc::new(StdMutex::new(Vec::new())),
+            accept_bodies: Arc::new(StdMutex::new(Vec::new())),
+            next_cursor:
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    .to_owned(),
+            accepted_personality_agent_id: PAID.to_owned(),
+            add_unknown_accept_field: false,
+        };
+        let app = Router::new()
+            .route(
+                "/local-control/v1/workspace:invitation-list",
+                post(workspace_invitation_list_http_fixture),
+            )
+            .route(
+                "/local-control/v1/workspace:invitation-accept",
+                post(workspace_invitation_accept_http_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+
+        let page = WorkspaceInvitationApi::list_invitations(&client, None)
+            .await
+            .expect("list exact targeted invitations");
+        assert_eq!(page.invitations.len(), MAX_WORKSPACE_LIST_PAGE_ITEMS);
+        assert_eq!(
+            page.invitations[0].invitation_id,
+            "0198f0f4-9b72-7000-8002-000000000011"
+        );
+        let cursor = page.next_cursor.expect("bounded invitation cursor");
+        let _ = WorkspaceInvitationApi::list_invitations(&client, Some(&cursor))
+            .await
+            .expect("continue exact invitation page");
+        let membership = WorkspaceInvitationApi::accept_invitation(
+            &client,
+            "0198f0f4-9b72-7000-8002-000000000011",
+        )
+        .await
+        .expect("accept exact targeted invitation");
+        assert_eq!(
+            membership.workspace_member_id,
+            "0198f0f4-9b72-7000-8004-000000000011"
+        );
+        assert_eq!(
+            membership.workspace_id,
+            "0198f0f4-9b72-7000-8003-000000000011"
+        );
+        assert!(membership.left_at.is_none());
+        assert_eq!(
+            *state.list_bodies.lock().unwrap(),
+            vec![serde_json::json!({}), serde_json::json!({"cursor": cursor})],
+            "list request must contain no actor, PAID, Workspace, default, install, or wake input"
+        );
+        assert_eq!(
+            *state.accept_bodies.lock().unwrap(),
+            vec![serde_json::json!({
+                "invitation_id": "0198f0f4-9b72-7000-8002-000000000011"
+            })],
+            "accept request must contain only the exact invitation identity"
+        );
+        assert_eq!(
+            WorkspaceInvitationApi::list_invitations(&client, Some("short")).await,
+            Err(WorkspaceApiError::InvalidRequest)
+        );
+        assert_eq!(
+            WorkspaceInvitationApi::accept_invitation(&client, "not-a-uuid").await,
+            Err(WorkspaceApiError::InvalidRequest)
+        );
+        assert_eq!(state.list_bodies.lock().unwrap().len(), 2);
+        assert_eq!(state.accept_bodies.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_invitation_accept_rejects_cross_actor_and_extended_responses() {
+        for (accepted_personality_agent_id, add_unknown_accept_field) in
+            [(OTHER_PAID, false), (PAID, true)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = WorkspaceInvitationFixtureState {
+                expected_authorization: "Bearer control-secret".to_owned(),
+                list_bodies: Arc::new(StdMutex::new(Vec::new())),
+                accept_bodies: Arc::new(StdMutex::new(Vec::new())),
+                next_cursor: String::new(),
+                accepted_personality_agent_id: accepted_personality_agent_id.to_owned(),
+                add_unknown_accept_field,
+            };
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/workspace:invitation-accept",
+                    post(workspace_invitation_accept_http_fixture),
+                )
+                .with_state(state);
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let result = WorkspaceInvitationApi::accept_invitation(
+                &client,
+                "0198f0f4-9b72-7000-8002-000000000011",
+            )
+            .await;
+            assert_eq!(result, Err(WorkspaceApiError::Protocol));
+            server.abort();
+        }
     }
 
     async fn issue_http_fixture(

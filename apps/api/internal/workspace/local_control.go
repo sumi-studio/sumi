@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -23,6 +24,13 @@ const (
 	workspaceListCursorEncodedBytes = 76
 	localWorkspaceListResponseBytes = 64 * 1024
 	workspaceListCursorDomain       = "sumi-workspace-list-cursor-v2\x00"
+
+	workspaceInvitationListCursorVersion      = byte(1)
+	workspaceInvitationListCursorPayloadBytes = 1 + 8 + 16
+	workspaceInvitationListCursorMACBytes     = sha256.Size
+	workspaceInvitationListCursorBytes        = workspaceInvitationListCursorPayloadBytes + workspaceInvitationListCursorMACBytes
+	workspaceInvitationListCursorEncodedBytes = 76
+	workspaceInvitationListCursorDomain       = "sumi-workspace-invitation-list-cursor-v1\x00"
 )
 
 const (
@@ -39,6 +47,8 @@ const (
 	LocalInvitePreviewPath    = "/local-control/v1/workspace:invite-preview"
 	LocalInviteRedeemPath     = "/local-control/v1/workspace:invite-redeem"
 	LocalInviteRevokePath     = "/local-control/v1/workspace:invite-revoke"
+	LocalInvitationListPath   = "/local-control/v1/workspace:invitation-list"
+	LocalInvitationAcceptPath = "/local-control/v1/workspace:invitation-accept"
 	LocalRolesPath            = "/local-control/v1/workspace:roles"
 	LocalRoleCreatePath       = "/local-control/v1/workspace:role-create"
 	LocalRoleUpdatePath       = "/local-control/v1/workspace:role-update"
@@ -73,6 +83,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalInvitePreviewPath, s.localPreviewInvite},
 		{"POST " + LocalInviteRedeemPath, s.localRedeemInvite},
 		{"POST " + LocalInviteRevokePath, s.localRevokeInvite},
+		{"POST " + LocalInvitationListPath, s.localInvitationList},
+		{"POST " + LocalInvitationAcceptPath, s.localInvitationAccept},
 		{"POST " + LocalRolesPath, s.localRoles},
 		{"POST " + LocalRoleCreatePath, s.localCreateRole},
 		{"POST " + LocalRoleUpdatePath, s.localUpdateRole},
@@ -215,6 +227,171 @@ func workspaceListCursorMAC(
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write(payload)
 	return mac.Sum(nil)
+}
+
+type targetedInvitationWire struct {
+	InvitationID  string `json:"invitation_id"`
+	WorkspaceID   string `json:"workspace_id"`
+	WorkspaceName string `json:"workspace_name"`
+	ExpiresAt     string `json:"expires_at"`
+	CreatedAt     string `json:"created_at"`
+}
+
+func targetedInvitationToWire(item TargetedInvitation) targetedInvitationWire {
+	return targetedInvitationWire{
+		InvitationID:  item.InvitationID,
+		WorkspaceID:   item.WorkspaceID,
+		WorkspaceName: item.WorkspaceName,
+		ExpiresAt:     item.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		CreatedAt:     item.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func (s *Server) localInvitationList(
+	w http.ResponseWriter,
+	r *http.Request,
+	authorization agentevents.LocalRuntimeAuthorization,
+) {
+	var request struct {
+		// JSON null is not an omitted cursor and must not gain a second meaning.
+		Cursor json.RawMessage `json:"cursor"`
+	}
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	var after *workspaceInvitationListCursorPosition
+	if request.Cursor != nil {
+		var rawCursor string
+		if err := json.Unmarshal(request.Cursor, &rawCursor); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		var err error
+		after, err = decodeWorkspaceInvitationListCursor(rawCursor, authorization)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+	}
+	page, err := s.Store.targetedInvitationPageFor(
+		r.Context(),
+		localActor(authorization),
+		after,
+	)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	items := make([]targetedInvitationWire, len(page.Items))
+	for i, item := range page.Items {
+		items[i] = targetedInvitationToWire(item.Invitation)
+	}
+	var nextCursor *string
+	if page.HasMore {
+		encoded, encodeErr := encodeWorkspaceInvitationListCursor(
+			page.Items[len(page.Items)-1].Position,
+			authorization,
+		)
+		if encodeErr != nil {
+			writeDomainError(w, encodeErr)
+			return
+		}
+		nextCursor = &encoded
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Invitations []targetedInvitationWire `json:"invitations"`
+		NextCursor  *string                  `json:"next_cursor,omitempty"`
+	}{Invitations: items, NextCursor: nextCursor})
+}
+
+func encodeWorkspaceInvitationListCursor(
+	position workspaceInvitationListCursorPosition,
+	authorization agentevents.LocalRuntimeAuthorization,
+) (string, error) {
+	if len(authorization.BearerToken) < 32 || !isCanonicalUUIDv7(position.InvitationID) {
+		return "", ErrInvalidWorkspaceInvitationListCursor
+	}
+	invitationID, err := uuid.Parse(position.InvitationID)
+	if err != nil {
+		return "", ErrInvalidWorkspaceInvitationListCursor
+	}
+	payload := make([]byte, workspaceInvitationListCursorPayloadBytes)
+	payload[0] = workspaceInvitationListCursorVersion
+	copy(payload[9:], invitationID[:])
+
+	mac := workspaceInvitationListCursorMAC(authorization, payload)
+	wire := make([]byte, 0, workspaceInvitationListCursorBytes)
+	wire = append(wire, payload...)
+	wire = append(wire, mac...)
+	return base64.RawURLEncoding.EncodeToString(wire), nil
+}
+
+func decodeWorkspaceInvitationListCursor(
+	raw string,
+	authorization agentevents.LocalRuntimeAuthorization,
+) (*workspaceInvitationListCursorPosition, error) {
+	if len(authorization.BearerToken) < 32 || len(raw) != workspaceInvitationListCursorEncodedBytes {
+		return nil, ErrInvalidWorkspaceInvitationListCursor
+	}
+	wire, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || len(wire) != workspaceInvitationListCursorBytes {
+		return nil, ErrInvalidWorkspaceInvitationListCursor
+	}
+	payload := wire[:workspaceInvitationListCursorPayloadBytes]
+	wantMAC := workspaceInvitationListCursorMAC(authorization, payload)
+	if !hmac.Equal(wire[workspaceInvitationListCursorPayloadBytes:], wantMAC) {
+		return nil, ErrInvalidWorkspaceInvitationListCursor
+	}
+	if payload[0] != workspaceInvitationListCursorVersion {
+		return nil, ErrInvalidWorkspaceInvitationListCursor
+	}
+	for _, reserved := range payload[1:9] {
+		if reserved != 0 {
+			return nil, ErrInvalidWorkspaceInvitationListCursor
+		}
+	}
+	invitationID, err := uuid.FromBytes(payload[9:])
+	if err != nil || invitationID.Version() != 7 || invitationID.Variant() != uuid.RFC4122 {
+		return nil, ErrInvalidWorkspaceInvitationListCursor
+	}
+	return &workspaceInvitationListCursorPosition{
+		InvitationID: invitationID.String(),
+	}, nil
+}
+
+func workspaceInvitationListCursorMAC(
+	authorization agentevents.LocalRuntimeAuthorization,
+	payload []byte,
+) []byte {
+	mac := hmac.New(sha256.New, []byte(authorization.BearerToken))
+	_, _ = mac.Write([]byte(workspaceInvitationListCursorDomain))
+	_, _ = mac.Write([]byte(authorization.PersonalityAgentID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(payload)
+	return mac.Sum(nil)
+}
+
+func (s *Server) localInvitationAccept(
+	w http.ResponseWriter,
+	r *http.Request,
+	authorization agentevents.LocalRuntimeAuthorization,
+) {
+	var request struct {
+		InvitationID string `json:"invitation_id"`
+	}
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	membership, err := s.Store.AcceptTargetedInvitation(
+		r.Context(),
+		request.InvitationID,
+		localActor(authorization),
+	)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, membershipToWire(membership))
 }
 
 func (s *Server) localCreateWorkspace(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

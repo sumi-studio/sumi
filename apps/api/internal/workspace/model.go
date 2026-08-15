@@ -58,6 +58,7 @@ var (
 )
 
 var ErrInvalidWorkspaceListCursor = errors.New("invalid workspace list cursor")
+var ErrInvalidWorkspaceInvitationListCursor = errors.New("invalid workspace invitation list cursor")
 
 type PermissionSet map[string]bool
 
@@ -177,4 +178,16 @@ type InvitePreview struct {
 	WorkspaceID   string
 	WorkspaceName string
 	ExpiresAt     time.Time
+}
+
+// TargetedInvitation is the exact, non-secret intent visible to its target
+// PersonalityAgent.  It deliberately contains no issuer or target identity:
+// the local-control bearer supplies the target and issuer authority is only a
+// current admission predicate.
+type TargetedInvitation struct {
+	InvitationID  string
+	WorkspaceID   string
+	WorkspaceName string
+	ExpiresAt     time.Time
+	CreatedAt     time.Time
 }

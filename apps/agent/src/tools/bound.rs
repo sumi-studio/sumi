@@ -165,6 +165,8 @@ impl AppActionDescriptor {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderReviewIdentity {
     WorkspaceListV1,
+    WorkspaceInvitationListV1,
+    WorkspaceInvitationAcceptV1,
     MessagingV1,
     WorkspaceReadFileV1,
     WorkspaceListDirV1,
@@ -188,6 +190,12 @@ impl ProviderReviewIdentity {
     fn from_local(tool_name: &str, adapter: &AdapterIdentity) -> Result<Self, DescribeError> {
         let identity = match (tool_name, adapter.id.as_str(), adapter.version) {
             ("workspace_list", "sumi.workspace.list", 1) => Self::WorkspaceListV1,
+            ("workspace_invitation_list", "sumi.workspace.invitation.list", 1) => {
+                Self::WorkspaceInvitationListV1
+            }
+            ("workspace_invitation_accept", "sumi.workspace.invitation.accept", 1) => {
+                Self::WorkspaceInvitationAcceptV1
+            }
             ("messaging", "sumi.messaging", 1) => Self::MessagingV1,
             ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
             ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
@@ -219,6 +227,8 @@ impl ProviderReviewIdentity {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderReviewOperation {
     ListMemberships,
+    ListInvitations,
+    AcceptInvitation,
     Overview,
     Open,
     Write,
@@ -258,6 +268,7 @@ pub(crate) enum ProviderReviewNamespace {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderReviewResourceKind {
     Membership,
+    Invitation,
     Workspace,
     Place,
     Message,
@@ -357,6 +368,12 @@ fn provider_review_operation(
 
     let operation = match (identity, exact.operation.as_str(), &exact.capability) {
         (Identity::WorkspaceListV1, "list_memberships", Read) => Operation::ListMemberships,
+        (Identity::WorkspaceInvitationListV1, "list_invitations", Read) => {
+            Operation::ListInvitations
+        }
+        (Identity::WorkspaceInvitationAcceptV1, "accept_invitation", Mutate) => {
+            Operation::AcceptInvitation
+        }
         (Identity::MessagingV1, "overview", Read) => Operation::Overview,
         (Identity::MessagingV1, "open", Read) => Operation::Open,
         (Identity::MessagingV1, "write", Mutate) => Operation::Write,
@@ -414,6 +431,15 @@ fn provider_review_scope(
     let safe = match (identity, scope_type, namespace, kind) {
         (Identity::WorkspaceListV1, Collection, "workspace", "membership") => {
             (Collection, Namespace::Workspace, Kind::Membership)
+        }
+        (Identity::WorkspaceInvitationListV1, Collection, "workspace", "invitation") => {
+            (Collection, Namespace::Workspace, Kind::Invitation)
+        }
+        (Identity::WorkspaceInvitationAcceptV1, Resource, "workspace", "invitation") => {
+            (Resource, Namespace::Workspace, Kind::Invitation)
+        }
+        (Identity::WorkspaceInvitationAcceptV1, Resource, "workspace", "membership") => {
+            (Resource, Namespace::Workspace, Kind::Membership)
         }
         (Identity::MessagingV1, Resource, "workspace", "workspace") => {
             (Resource, Namespace::Workspace, Kind::Workspace)
