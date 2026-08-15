@@ -20,6 +20,50 @@ const wranglerEntry = resolve(
 const productionWranglerConfig = resolve(webDirectory, "wrangler.jsonc");
 const runtimeReleaseSha = "fedcba9876543210fedcba9876543210fedcba98";
 
+test("readiness ignores raw 404s until the Worker denial is canonical", async () => {
+  const responses = [
+    new Response(null, { status: 404 }),
+    new Response(null, {
+      status: 404,
+      headers: { "Cache-Control": "no-store" },
+    }),
+    new Response(null, {
+      status: 404,
+      headers: { "X-Content-Type-Options": "nosniff" },
+    }),
+    new Response(null, {
+      status: 404,
+      headers: {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      },
+    }),
+  ];
+  let elapsedMilliseconds = 0;
+  let probeCount = 0;
+
+  await waitUntilReady(
+    "http://127.0.0.1:8787",
+    { exitCode: null },
+    {
+      now: () => elapsedMilliseconds,
+      pause: async (milliseconds) => {
+        elapsedMilliseconds += milliseconds;
+      },
+      probe: async (url) => {
+        assert.equal(url, "http://127.0.0.1:8787/ready");
+        const response = responses[probeCount];
+        assert.ok(response, "readiness performed an unexpected extra probe");
+        probeCount += 1;
+        return response;
+      },
+    },
+  );
+
+  assert.equal(probeCount, responses.length);
+  assert.equal(elapsedMilliseconds, 300);
+});
+
 test("pinned Wrangler dry-run and local workerd enforce the production artifact", {
   timeout: 120_000,
 }, async () => {
@@ -87,6 +131,7 @@ test("pinned Wrangler dry-run and local workerd enforce the production artifact"
       const ready = await manualFetch(origin, "/ready");
       assert.equal(ready.status, 404);
       assert.equal(ready.headers.get("Cache-Control"), "no-store");
+      assert.equal(ready.headers.get("X-Content-Type-Options"), "nosniff");
 
       const serviceWorker = await manualFetch(origin, "/sw.js");
       assert.equal(serviceWorker.status, 404);
@@ -415,22 +460,45 @@ function startWrangler(
   return child;
 }
 
+interface ReadinessDependencies {
+  now(): number;
+  pause(milliseconds: number): Promise<void>;
+  probe(url: string): Promise<Response>;
+}
+
+const defaultReadinessDependencies: ReadinessDependencies = {
+  now: Date.now,
+  pause: (milliseconds) =>
+    new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds)),
+  probe: (url) =>
+    fetch(url, {
+      signal: AbortSignal.timeout(1_000),
+    }),
+};
+
+function isCanonicalWorkerDenial(response: Response): boolean {
+  return (
+    response.status === 404 &&
+    response.headers.get("Cache-Control") === "no-store" &&
+    response.headers.get("X-Content-Type-Options") === "nosniff"
+  );
+}
+
 async function waitUntilReady(
   origin: string,
-  child: ChildProcess,
+  child: Pick<ChildProcess, "exitCode">,
+  dependencies: ReadinessDependencies = defaultReadinessDependencies,
 ): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
+  const deadline = dependencies.now() + 30_000;
+  while (dependencies.now() < deadline) {
     if (child.exitCode !== null) {
       throw new Error(`wrangler exited before readiness (${child.exitCode})`);
     }
     try {
-      const response = await fetch(`${origin}/ready`, {
-        signal: AbortSignal.timeout(1_000),
-      });
-      if (response.status === 404) return;
+      const response = await dependencies.probe(`${origin}/ready`);
+      if (isCanonicalWorkerDenial(response)) return;
     } catch {}
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    await dependencies.pause(100);
   }
   throw new Error("wrangler local runtime did not become ready within 30s");
 }
