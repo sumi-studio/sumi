@@ -858,24 +858,34 @@ impl BoundToolAdapter for MessagingTool {
         // overview, or reinterpret a target from current view state.
         let view = self.view_for(&scope).await;
         let mut state = view.lock().await;
-        let outcome = self
-            .execute_exact_action(
-                &scope,
-                view.clone(),
-                &mut state,
-                invocation.action,
-                ExactMessagingExecutionContext {
-                    flow_id: ctx.flow_id,
-                    call_id: ctx.call_id,
-                    cancel: &ctx.cancel,
-                    post_commit_mode: PostCommitMode::ReturnLiveHook,
-                },
-            )
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let effect_receipt = ctx
+            .committed_effect_permit
+            .begin_local_effect()
+            .complete(|| {
+                self.execute_exact_action(
+                    &scope,
+                    view.clone(),
+                    &mut state,
+                    invocation.action,
+                    ExactMessagingExecutionContext {
+                        flow_id: ctx.flow_id,
+                        call_id: ctx.call_id,
+                        cancel: &ctx.cancel,
+                        post_commit_mode: PostCommitMode::ReturnLiveHook,
+                    },
+                )
+            })
             .await?;
-        Ok(BoundToolExecutionOutcome {
-            output: render_messaging_output(outcome.response)?,
-            live_post_commit: outcome.live_post_commit,
-        })
+        let effect_receipt = effect_receipt.try_map(|outcome| {
+            Ok::<_, ToolError>((
+                render_messaging_output(outcome.response)?,
+                outcome.live_post_commit,
+            ))
+        })?;
+        Ok(BoundToolExecutionOutcome::new(effect_receipt))
     }
 }
 
@@ -1888,7 +1898,7 @@ fn client_nonce(flow_id: &str, call_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, time::Duration};
 
     use anyhow::{Result, anyhow};
     use chrono::Utc;
@@ -2326,8 +2336,9 @@ mod tests {
             .bind(&tool_call(id, action), "flow", &workspace)
             .await
             .map_err(BoundExecutionError::InvalidInvocation)?;
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
         registry
-            .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
             .await
     }
 
@@ -2724,8 +2735,9 @@ mod tests {
             TEST_INSTALLATION_ID
         );
 
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
         registry
-            .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
             .await
             .expect("execute the privately sealed exact scope");
         assert_eq!(
@@ -2829,6 +2841,12 @@ mod tests {
                 flow_id: "flow",
                 call_id: "wrong-variant-installation",
                 args: &args,
+                committed_effect_permit:
+                    crate::approval::authority::CommittedExecutionPermit::executor_fixture(
+                        "wrong-variant-installation",
+                        ToolInvocationRoute::Normal,
+                        crate::approval::authority::ExecutionAuthorityProvenance::AgentOwn,
+                    ),
                 cancel: CancellationToken::new(),
                 on_update: Arc::new(|_| {}),
                 workspace: &workspace,
@@ -3592,8 +3610,9 @@ mod tests {
             state.visible_messages.clear();
         }
 
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
         let outcome = registry
-            .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
             .await
             .expect("execute bound write");
         assert!(outcome.live_post_commit.is_none());
@@ -3608,6 +3627,49 @@ mod tests {
         let state = default_state(&tool).await;
         assert_eq!(state.focused_place_id.as_deref(), Some("place-b"));
         assert!(state.visible_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bound_permit_waits_through_view_lock_and_cancel_prevents_the_local_effect() {
+        let (api, tool, registry) = binding_fixture().await;
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "write-cancelled-while-locked",
+                    json!({"action": "write", "content": "must not send"}),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind exact write before taking the execution lock");
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let cancel = CancellationToken::new();
+        let state_guard = default_state(&tool).await;
+        let execution = registry.execute_bound(authorized, cancel.clone(), Arc::new(|_| {}));
+        tokio::pin!(execution);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut execution)
+                .await
+                .is_err(),
+            "bound execution must retain its permit while waiting for the view lock"
+        );
+        assert!(api.calls.lock().await.is_empty());
+
+        cancel.cancel();
+        drop(state_guard);
+        let error = match execution.await {
+            Err(error) => error,
+            Ok(_) => panic!("cancellation after the lock wait must prevent the local effect"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+        assert!(api.calls.lock().await.is_empty());
+        assert!(api.writes.lock().await.is_empty());
     }
 
     #[tokio::test]

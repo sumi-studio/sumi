@@ -61,7 +61,7 @@ use crate::{
     },
     tools::{
         Tool, WorkspacePaths,
-        executor::{ExecutorClient, remote_executor_registry_with_tools},
+        executor::{ExecutorClient, decode_hex_32, remote_executor_registry_with_tools},
         messaging::MessagingTool,
         workspace::WorkspaceListTool,
     },
@@ -85,6 +85,7 @@ struct BootstrapContext {
     local_control_bearer: Zeroizing<String>,
     local_control_bearer_expires_at: SystemTime,
     wrapping_key_id: String,
+    executor_call_authority_private_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 enum LocalControlEndpoint {
@@ -131,6 +132,14 @@ impl BootstrapContext {
             &required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX")?,
         )?;
         let wrapping_key_id = required_value(&mut get, "SUMI_AGENT_WRAPPING_KEY_ID")?;
+        let encoded_executor_call_authority_private_key = Zeroizing::new(required_value(
+            &mut get,
+            "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY",
+        )?);
+        let executor_call_authority_private_key = Zeroizing::new(
+            decode_hex_32(encoded_executor_call_authority_private_key.as_str())
+                .context("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY must be lowercase hex")?,
+        );
         let allow_insecure_loopback_gateway = match get("SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY") {
             None => false,
             Some(value) if value == "true" => true,
@@ -153,6 +162,7 @@ impl BootstrapContext {
             local_control_bearer: Zeroizing::new(local_control_bearer),
             local_control_bearer_expires_at,
             wrapping_key_id,
+            executor_call_authority_private_key: Some(executor_call_authority_private_key),
         })
     }
 }
@@ -891,7 +901,7 @@ fn control_teardown_error(
 }
 
 pub(crate) async fn run_production() -> Result<()> {
-    disable_process_dumping()?;
+    crate::runtime::process_security::disable_dumps_and_core_files()?;
     load_explicit_env_file()?;
     let context = BootstrapContext::from_process_env()?;
     run_with_context(context).await
@@ -907,17 +917,6 @@ fn load_explicit_env_file() -> Result<()> {
             Path::new(&path).display()
         )
     })
-}
-
-fn disable_process_dumping() -> Result<()> {
-    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    if result != 0 {
-        bail!(
-            "failed to disable process dumping: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
 }
 
 async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
@@ -954,7 +953,20 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         .await
         .context("publish startup NotReady")?;
 
-    run_after_not_ready(&context, control, messaging_api, workspace_api, &publisher).await
+    let executor_call_authority_private_key = context
+        .executor_call_authority_private_key
+        .take()
+        .context("executor call-authority private key was already consumed")?;
+
+    run_after_not_ready(
+        &context,
+        control,
+        messaging_api,
+        workspace_api,
+        executor_call_authority_private_key,
+        &publisher,
+    )
+    .await
 }
 
 async fn run_after_not_ready(
@@ -962,6 +974,7 @@ async fn run_after_not_ready(
     control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane>,
     messaging_api: Arc<dyn MessagingApi>,
     workspace_api: Arc<dyn WorkspaceApi>,
+    executor_call_authority_private_key: Zeroizing<[u8; 32]>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
     // Own and poll the process signal before any Session construction,
@@ -1061,10 +1074,14 @@ async fn run_after_not_ready(
             escalation_reviewer,
         ));
 
-        let executor_client = Arc::new(ExecutorClient::new(
-            &context.executor_socket,
-            context.authority.rpc_identity().clone(),
-        ));
+        let executor_client = Arc::new(
+            ExecutorClient::new(
+                &context.executor_socket,
+                context.authority.rpc_identity().clone(),
+            )
+            .with_call_authority_signing_key(executor_call_authority_private_key)
+            .context("install executor exact-call authority signer")?,
+        );
         wait_for_authenticated_executor_ready(
             &executor_client,
             &context.authority,
@@ -2167,6 +2184,10 @@ mod tests {
                 "SUMI_AGENT_WRAPPING_KEY_ID".to_owned(),
                 "wrapping-key-a".into(),
             ),
+            (
+                "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY".to_owned(),
+                "22".repeat(32).into(),
+            ),
             ("SUMI_MODEL_PRESET".to_owned(), "kimi-k3".into()),
         ])
     }
@@ -2558,6 +2579,7 @@ mod tests {
             "SUMI_LOCAL_CONTROL_BEARER",
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
+            "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY",
         ] {
             let mut env = valid_env();
             env.remove(name);
@@ -2583,6 +2605,7 @@ mod tests {
             "SUMI_LOCAL_CONTROL_BEARER",
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
+            "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY",
         ] {
             let mut env = valid_env();
             env.insert(name.to_owned(), OsString::new());

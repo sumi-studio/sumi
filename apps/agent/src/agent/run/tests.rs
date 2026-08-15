@@ -50,6 +50,16 @@ fn test_executor_generation() -> ProcessGeneration {
     ProcessGeneration::from_wire(73).expect("valid test generation")
 }
 
+#[test]
+fn executor_authority_capacity_fail_stops_generation_but_one_shot_replay_does_not() {
+    assert!(executor_error_requires_generation_fail_stop(
+        &ToolError::Rpc("executor exact-call authority capacity is exhausted".to_owned(),)
+    ));
+    assert!(!executor_error_requires_generation_fail_stop(
+        &ToolError::Protocol("executor exact-call authority was already consumed".to_owned()),
+    ));
+}
+
 #[derive(Clone)]
 enum Script {
     Output(Box<AssistantMessage>),

@@ -55,7 +55,9 @@ use crate::{
     runtime::contracts::{ProcessGeneration, RpcIdentity},
     store::{tool_result_message_id, user_message_id},
     tools::{
-        BoundExecutionError, DescribeError, LiveAppPostCommit, SealedBoundToolInvocation, ToolError,
+        BoundExecutionError, DescribeError, LiveAppPostCommit, SealedBoundToolInvocation,
+        ToolError,
+        executor::{ExecutorErrorClassification, classify_executor_error},
     },
 };
 
@@ -2135,6 +2137,13 @@ impl Runner {
                 {
                     Ok(outcome) => (outcome.result, outcome.live_post_commit),
                     Err(ExecuteBoundToolError::Worker(failure)) => return Err(failure),
+                    Err(ExecuteBoundToolError::Bound(BoundExecutionError::Tool(error)))
+                        if executor_error_requires_generation_fail_stop(&error) =>
+                    {
+                        return Err(WorkerFailure::Error(format!(
+                            "executor generation must fail-stop and roll over: {error}"
+                        )));
+                    }
                     Err(ExecuteBoundToolError::Bound(BoundExecutionError::Tool(
                         ToolError::RpcIndeterminate(message),
                     ))) => {
@@ -4101,6 +4110,16 @@ impl Runner {
         binding.turn_id = Uuid::now_v7().to_string();
         self.emit(AgentEvent::TurnStart).await
     }
+}
+
+fn executor_error_requires_generation_fail_stop(error: &ToolError) -> bool {
+    matches!(
+        classify_executor_error(error),
+        Some(
+            ExecutorErrorClassification::GenerationRolloverRequired
+                | ExecutorErrorClassification::CallAuthorityCapacityExhausted
+        )
+    )
 }
 
 impl Drop for Runner {

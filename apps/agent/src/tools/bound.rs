@@ -988,6 +988,8 @@ pub(crate) enum DescribeError {
     RegistryIdentityMismatch,
     #[error("bound invocation digest or identity was altered after registry sealing")]
     SealedEvidenceMismatch,
+    #[error("committed execution permit does not match the exact sealed invocation")]
+    ExecutionPermitMismatch,
 }
 
 fn hex_nibble(byte: u8) -> u8 {

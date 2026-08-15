@@ -676,7 +676,7 @@ epoch_identity() {
   local paid= generation= nonce=
   declare -A seen=()
   output="$(prepare_compose run --rm --no-deps --entrypoint /bin/bash allocator \
-    -c 'cat /var/lib/sumi-allocator-root/identity-output/runtime/identity.env' 2>/dev/null)" ||
+    -c 'cat /var/lib/sumi-allocator-root/identity-output/broker/identity.env' 2>/dev/null)" ||
     return 1
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ "${line}" == *=* ]] || return 1
@@ -688,7 +688,6 @@ epoch_identity() {
       SUMI_PERSONALITY_AGENT_ID) paid="${value}" ;;
       SUMI_RPC_GENERATION) generation="${value}" ;;
       SUMI_RPC_NONCE) nonce="${value}" ;;
-      SUMI_PROCESS_GENERATION_LEASE_ID|SUMI_GENERATION_RECOVERY_FENCE_ID) ;;
       *) return 1 ;;
     esac
   done <<< "${output}"

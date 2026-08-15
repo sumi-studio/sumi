@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ArtifactResponse, ExecutorClient, ExecutorOperation, ExecutorResponse};
 use crate::{
+    approval::authority::{CommittedEffectReceipt, CommittedExecutionPermit},
     provider::types::{ToolDefinition, ValidatedToolArguments},
     tools::{
         AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
@@ -52,6 +53,14 @@ trait ExecutorInvoker: Send + Sync {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError>;
+
+    async fn execute_authorized(
+        &self,
+        operation: ExecutorOperation,
+        permit: CommittedExecutionPermit,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<CommittedEffectReceipt<ExecutorResponse>, ToolError>;
 }
 
 #[async_trait]
@@ -63,6 +72,16 @@ impl ExecutorInvoker for ExecutorClient {
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError> {
         ExecutorClient::execute(self, operation, cancel, on_update).await
+    }
+
+    async fn execute_authorized(
+        &self,
+        operation: ExecutorOperation,
+        permit: CommittedExecutionPermit,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<CommittedEffectReceipt<ExecutorResponse>, ToolError> {
+        ExecutorClient::execute_authorized(self, operation, permit, cancel, on_update).await
     }
 }
 
@@ -222,7 +241,7 @@ impl Tool for RemoteTool {
     fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
         self.kind
             .supports_production_binding()
-            .then(|| self as Arc<dyn BoundToolAdapter>)
+            .then_some(self as Arc<dyn BoundToolAdapter>)
     }
 
     async fn execute(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
@@ -248,10 +267,23 @@ impl BoundToolAdapter for RemoteTool {
     async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError> {
         let execution_id = execution_id(ctx.flow_id, ctx.call_id);
         let (operation, read_context) = self.kind.bound_operation(ctx.args, execution_id)?;
-        let output = self
-            .execute_operation(operation, read_context, ctx.cancel, ctx.on_update)
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let effect_receipt = self
+            .client
+            .execute_authorized(
+                operation,
+                ctx.committed_effect_permit,
+                ctx.cancel,
+                ctx.on_update,
+            )
             .await?;
-        Ok(BoundToolExecutionOutcome::without_live_post_commit(output))
+        let effect_receipt =
+            effect_receipt.try_map(|response| self.kind.output(response, read_context))?;
+        Ok(BoundToolExecutionOutcome::without_live_post_commit(
+            effect_receipt,
+        ))
     }
 }
 
@@ -1070,7 +1102,10 @@ struct BashArgs {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -1111,11 +1146,12 @@ mod tests {
         operations: Mutex<Vec<ExecutorOperation>>,
         responses: Mutex<VecDeque<Result<ExecutorResponse, ToolError>>>,
         updates: Mutex<VecDeque<Value>>,
+        raw_calls: AtomicUsize,
+        authorized_calls: AtomicUsize,
     }
 
-    #[async_trait]
-    impl ExecutorInvoker for FakeInvoker {
-        async fn execute(
+    impl FakeInvoker {
+        async fn respond(
             &self,
             operation: ExecutorOperation,
             cancel: CancellationToken,
@@ -1132,6 +1168,36 @@ mod tests {
                 });
             }
             self.responses.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ExecutorInvoker for FakeInvoker {
+        async fn execute(
+            &self,
+            operation: ExecutorOperation,
+            cancel: CancellationToken,
+            on_update: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> Result<ExecutorResponse, ToolError> {
+            self.raw_calls.fetch_add(1, Ordering::Relaxed);
+            self.respond(operation, cancel, on_update).await
+        }
+
+        async fn execute_authorized(
+            &self,
+            operation: ExecutorOperation,
+            permit: CommittedExecutionPermit,
+            cancel: CancellationToken,
+            on_update: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> Result<CommittedEffectReceipt<ExecutorResponse>, ToolError> {
+            self.authorized_calls.fetch_add(1, Ordering::Relaxed);
+            permit
+                .begin_executor_effect()
+                .complete(|permit| {
+                    drop(permit);
+                    self.respond(operation, cancel, on_update)
+                })
+                .await
         }
     }
 
@@ -1199,6 +1265,22 @@ mod tests {
                     eof: end == self.source.len(),
                 },
             })
+        }
+
+        async fn execute_authorized(
+            &self,
+            operation: ExecutorOperation,
+            permit: CommittedExecutionPermit,
+            cancel: CancellationToken,
+            on_update: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> Result<CommittedEffectReceipt<ExecutorResponse>, ToolError> {
+            permit
+                .begin_executor_effect()
+                .complete(|permit| {
+                    drop(permit);
+                    self.execute(operation, cancel, on_update)
+                })
+                .await
         }
     }
 
@@ -2125,8 +2207,10 @@ mod tests {
                 AdapterIdentity::new(BINDING_ADAPTER_ID, 1).unwrap()
             );
 
+            let authorized =
+                crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
             let outcome = registry
-                .execute_bound(sealed, CancellationToken::new(), Arc::new(|_| {}))
+                .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
                 .await
                 .unwrap();
             assert!(
@@ -2137,6 +2221,12 @@ mod tests {
                 fake.operations.lock().unwrap().len(),
                 index + 1,
                 "executing {name} must make exactly one executor call"
+            );
+            assert_eq!(fake.raw_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                fake.authorized_calls.load(Ordering::Relaxed),
+                index + 1,
+                "bound execution must use the move-only authorized invoker"
             );
         }
 
@@ -2302,6 +2392,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_bound_execution_never_begins_the_executor_effect() {
+        let fake = Arc::new(FakeInvoker::default());
+        let registry = bound_test_registry_from_invoker(fake.clone()).unwrap();
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "cancel-before-executor-effect",
+                    "list_dir",
+                    json!({"path":"src"}),
+                ),
+                "flow-cancel-before-executor-effect",
+                &workspace,
+            )
+            .await
+            .unwrap();
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = match registry
+            .execute_bound(authorized, cancel, Arc::new(|_| {}))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("pre-effect cancellation must fail without an executor call"),
+        };
+        assert!(matches!(
+            error,
+            crate::tools::BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+        assert_eq!(fake.authorized_calls.load(Ordering::Relaxed), 0);
+        assert!(fake.operations.lock().unwrap().is_empty());
     }
 
     #[test]

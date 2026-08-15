@@ -13,11 +13,13 @@ use std::{
     process::{Command, Output, Stdio},
     sync::{Mutex, MutexGuard, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const PAID_A: &str = "0198f0f4-9b72-7000-8000-000000000001";
@@ -44,6 +46,34 @@ fn read_deploy(name: &str) -> String {
 
 fn compose() -> Value {
     serde_yaml::from_str(&read_deploy("compose.yaml")).unwrap()
+}
+
+#[test]
+fn process_disclosure_hardening_precedes_every_mode_and_supervisor_reads_public_broker_identity() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main = std::fs::read_to_string(manifest.join("src/main.rs")).unwrap();
+    let process_security =
+        std::fs::read_to_string(manifest.join("src/runtime/process_security.rs")).unwrap();
+    let hardening = main
+        .find("disable_dumps_and_core_files()?")
+        .expect("process disclosure hardening call");
+    let argument_parse = main.find("env::args()").expect("mode argument parse");
+    let allocator = main
+        .find("--supervisor-allocate")
+        .expect("allocator mode dispatch");
+    assert!(hardening < argument_parse && argument_parse < allocator);
+    assert!(process_security.contains("libc::setrlimit(libc::RLIMIT_CORE"));
+    assert!(process_security.contains("libc::prctl(libc::PR_SET_DUMPABLE, 0"));
+
+    let supervisor = read_deploy("supervisor");
+    let epoch = supervisor
+        .split("epoch_identity() {")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("supervisor epoch identity function");
+    assert!(epoch.contains("identity-output/broker/identity.env"));
+    assert!(!epoch.contains("identity-output/runtime/identity.env"));
+    assert!(!epoch.contains("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"));
 }
 
 fn service<'a>(compose: &'a Value, name: &str) -> &'a Value {
@@ -880,6 +910,71 @@ fn exchange_executor_socket(socket: &std::path::Path, request: JsonValue) -> Jso
     serde_json::from_str(response.trim()).expect("decode executor response")
 }
 
+fn signed_executor_authority(
+    generation: u64,
+    nonce: &str,
+    request_id: &str,
+    operation: &JsonValue,
+    signing_key: &SigningKey,
+) -> JsonValue {
+    let digest = |domain: &[u8], value: &[u8]| {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let claims = serde_json::json!({
+        "version": 1,
+        "authority_id": Uuid::now_v7().hyphenated().to_string(),
+        "audience": "sumi.tool-executor.read.v1",
+        "generation": generation,
+        "boot_nonce_digest": digest(b"sumi.executor.boot-nonce-digest.v1\0", nonce.as_bytes()),
+        "request_id": request_id,
+        "execution_id": operation["execution_id"],
+        "operation_digest": digest(
+            b"sumi.executor.operation-digest.v1\0",
+            &serde_json::to_vec(operation).unwrap(),
+        ),
+        "permit": {
+            "grant_digest": "44".repeat(32),
+            "bound_evidence_digest": "11".repeat(32),
+            "action_digest": "33".repeat(32),
+            "authorization_projection_digest": "22".repeat(32),
+            "route": "normal",
+            "resolved_authority": "agent_own",
+        },
+        "issued_at_unix_ms": now,
+        "expires_at_unix_ms": now + 30_000,
+    });
+    let key_id = "sumi.executor.call-authority.ed25519.v1";
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "key_id": key_id,
+        "claims": &claims,
+    }))
+    .unwrap();
+    let mut payload = b"sumi.executor.call-authority.signature.v1\0".to_vec();
+    payload.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    payload.extend_from_slice(&encoded);
+    let signature = signing_key.sign(&payload);
+    serde_json::json!({
+        "key_id": key_id,
+        "claims": claims,
+        "signature": signature.to_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    })
+}
+
 #[test]
 fn compose_has_no_global_name_and_supervisor_derives_one_project_per_paid() {
     let source = read_deploy("compose.yaml");
@@ -1251,6 +1346,15 @@ fn assert_allocator_identities(
                 "SUMI_GENERATION_RECOVERY_FENCE_ID".to_owned(),
                 identity["SUMI_GENERATION_RECOVERY_FENCE_ID"].clone(),
             );
+            expected.insert(
+                "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY".to_owned(),
+                identity["SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"].clone(),
+            );
+        } else if role == "executor" {
+            expected.insert(
+                "SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY".to_owned(),
+                identity["SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"].clone(),
+            );
         }
         expected.insert(
             "SUMI_RPC_NONCE".to_owned(),
@@ -1262,7 +1366,36 @@ fn assert_allocator_identities(
     let nonce = identities["runtime"]["SUMI_RPC_NONCE"].clone();
     assert_eq!(identities["executor"]["SUMI_RPC_NONCE"], nonce);
     assert_eq!(identities["broker"]["SUMI_RPC_NONCE"], nonce);
+    let private_key =
+        decode_lower_hex_32(&identities["runtime"]["SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"]);
+    let expected_public_key = SigningKey::from_bytes(&private_key)
+        .verifying_key()
+        .to_bytes();
+    let executor_public_key =
+        decode_lower_hex_32(&identities["executor"]["SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"]);
+    assert_eq!(
+        executor_public_key, expected_public_key,
+        "runtime private seed and Executor public identity are not one pair"
+    );
+    assert!(!identities["runtime"].contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"));
+    assert!(!identities["executor"].contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"));
+    assert!(!identities["broker"].contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY"));
+    assert!(!identities["broker"].contains_key("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY"));
     identities
+}
+
+fn decode_lower_hex_32(encoded: &str) -> [u8; 32] {
+    assert_eq!(encoded.len(), 64);
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |value: u8| match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            _ => panic!("identity key is not lowercase hex"),
+        };
+        decoded[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    decoded
 }
 
 fn assert_no_allocator_temps_or_interrupted_handoff(
@@ -1738,6 +1871,161 @@ exit 99
 }
 
 #[test]
+fn identity_loader_enforces_role_minimal_authority_keys_and_exact_hex_without_echoing_them() {
+    fn identity_harness() -> String {
+        let entrypoint = read_deploy("container-entrypoint");
+        let start = entrypoint.find("fail() {").expect("entrypoint helpers");
+        let tail = &entrypoint[start..];
+        let end = tail
+            .find("\nverify_identity_output() {")
+            .expect("identity loader terminator");
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n{}\nload_identity \"$1\" \"$2\"\nprintf 'IDENTITY_LOADED\\n'\n",
+            &tail[..end]
+        )
+    }
+
+    fn common_identity() -> String {
+        format!(
+            "SUMI_PERSONALITY_AGENT_ID={PAID_A}\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=identity-loader-nonce\n"
+        )
+    }
+
+    fn run(harness: &std::path::Path, role: &str, identity: &std::path::Path) -> Output {
+        Command::new("/bin/bash")
+            .arg(harness)
+            .arg(role)
+            .arg(identity)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    }
+
+    let root = std::env::temp_dir().join(format!("identity-loader-{}", Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&root).unwrap();
+    let harness = root.join("harness");
+    std::fs::write(&harness, identity_harness()).unwrap();
+
+    let private_key = "07".repeat(32);
+    let public_key = SigningKey::from_bytes(&[7; 32])
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let valid = [
+        (
+            "runtime",
+            format!(
+                "{}SUMI_PROCESS_GENERATION_LEASE_ID=lease\nSUMI_GENERATION_RECOVERY_FENCE_ID=fence\nSUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY={private_key}\n",
+                common_identity()
+            ),
+        ),
+        (
+            "executor",
+            format!(
+                "{}SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY={public_key}\n",
+                common_identity()
+            ),
+        ),
+        ("broker", common_identity()),
+    ];
+    for (index, (role, identity)) in valid.iter().enumerate() {
+        let path = root.join(format!("valid-{index}.env"));
+        std::fs::write(&path, identity).unwrap();
+        let output = run(&harness, role, &path);
+        assert!(
+            output.status.success(),
+            "valid {role} identity failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"IDENTITY_LOADED\n");
+    }
+
+    let private_sentinel = "de".repeat(32);
+    let public_sentinel = "ad".repeat(32);
+    let invalid = [
+        (
+            "runtime-public-cross-role",
+            "runtime",
+            format!(
+                "{}SUMI_PROCESS_GENERATION_LEASE_ID=lease\nSUMI_GENERATION_RECOVERY_FENCE_ID=fence\nSUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY={public_sentinel}\n",
+                common_identity()
+            ),
+            public_sentinel.clone(),
+        ),
+        (
+            "executor-private-cross-role",
+            "executor",
+            format!(
+                "{}SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY={private_sentinel}\n",
+                common_identity()
+            ),
+            private_sentinel.clone(),
+        ),
+        (
+            "broker-private-cross-role",
+            "broker",
+            format!(
+                "{}SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY={private_sentinel}\n",
+                common_identity()
+            ),
+            private_sentinel.clone(),
+        ),
+        (
+            "runtime-short-private",
+            "runtime",
+            format!(
+                "{}SUMI_PROCESS_GENERATION_LEASE_ID=lease\nSUMI_GENERATION_RECOVERY_FENCE_ID=fence\nSUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY={}\n",
+                common_identity(),
+                "a".repeat(63)
+            ),
+            "a".repeat(63),
+        ),
+        (
+            "runtime-uppercase-private",
+            "runtime",
+            format!(
+                "{}SUMI_PROCESS_GENERATION_LEASE_ID=lease\nSUMI_GENERATION_RECOVERY_FENCE_ID=fence\nSUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY={}\n",
+                common_identity(),
+                "A".repeat(64)
+            ),
+            "A".repeat(64),
+        ),
+        (
+            "executor-nonhex-public",
+            "executor",
+            format!(
+                "{}SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY={}\n",
+                common_identity(),
+                "g".repeat(64)
+            ),
+            "g".repeat(64),
+        ),
+    ];
+    for (index, (label, role, identity, secret)) in invalid.iter().enumerate() {
+        let path = root.join(format!("invalid-{index}.env"));
+        std::fs::write(&path, identity).unwrap();
+        let output = run(&harness, role, &path);
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{label} unexpectedly loaded"
+        );
+        let combined = [output.stdout, output.stderr].concat();
+        assert!(
+            !combined
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+        assert!(!String::from_utf8_lossy(&combined).contains("IDENTITY_LOADED"));
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn executor_deployment_is_broker_blind_and_read_only() {
     let compose = compose();
     let executor = service(&compose, "executor");
@@ -1786,6 +2074,7 @@ fn executor_deployment_is_broker_blind_and_read_only() {
         "SUMI_PERSONALITY_AGENT_ID=\"${SUMI_PERSONALITY_AGENT_ID}\"",
         "SUMI_RPC_GENERATION=\"${SUMI_RPC_GENERATION}\"",
         "SUMI_RPC_NONCE=\"${SUMI_RPC_NONCE}\"",
+        "SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY=\"${SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY}\"",
         "SUMI_WORKSPACE=/workspace",
         "SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock",
         "/usr/local/bin/sumi-agent --tool-executor-socket",
@@ -1911,6 +2200,13 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
     let body = catch_unwind(AssertUnwindSafe(|| {
         let paid = Uuid::now_v7().to_string();
         let nonce = format!("executor-smoke-{}", Uuid::now_v7());
+        let call_authority_key = SigningKey::from_bytes(&[7; 32]);
+        let call_authority_public_key = call_authority_key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
 
         let build = smoke.docker(
             600,
@@ -1932,7 +2228,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         std::fs::write(
             smoke.root.join("identity/identity.env"),
             format!(
-                "SUMI_PERSONALITY_AGENT_ID={paid}\nSUMI_RPC_GENERATION=1\nSUMI_RPC_NONCE={nonce}\n"
+                "SUMI_PERSONALITY_AGENT_ID={paid}\nSUMI_RPC_GENERATION=1\nSUMI_RPC_NONCE={nonce}\nSUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY={call_authority_public_key}\n"
             ),
         )
         .unwrap();
@@ -2116,6 +2412,10 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
             health["result"]["Ok"]["service_role"].as_str(),
             Some("tool_executor")
         );
+        let read_operation = serde_json::json!({
+            "type": "read_file", "path": "note.txt", "offset": 0,
+            "limit": 1024, "execution_id": "read"
+        });
         let read_file = exchange_executor_socket(
             &socket,
             serde_json::json!({
@@ -2123,10 +2423,14 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
                 "generation": 1,
                 "nonce": nonce,
                 "request_id": "read",
-                "operation": {
-                    "type": "read_file", "path": "note.txt", "offset": 0,
-                    "limit": 1024, "execution_id": "read"
-                },
+                "call_authority": signed_executor_authority(
+                    1,
+                    &nonce,
+                    "read",
+                    &read_operation,
+                    &call_authority_key,
+                ),
+                "operation": read_operation,
             }),
         );
         assert_eq!(
@@ -2308,7 +2612,7 @@ fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\nSUMI_PROCESS_GENERATION_LEASE_ID=fixture-lease\\nSUMI_GENERATION_RECOVERY_FENCE_ID=fixture-fence\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2410,7 +2714,7 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\nSUMI_PROCESS_GENERATION_LEASE_ID=fixture-lease\\nSUMI_GENERATION_RECOVERY_FENCE_ID=fixture-fence\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();

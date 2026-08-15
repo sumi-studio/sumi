@@ -194,7 +194,11 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     await expect(page.getByText(firstUserMessage, { exact: true })).toHaveCount(
       1,
     );
-    expect(stack.provider.requestCount).toBe(1);
+    expect(stack.provider.requestCount).toBe(2);
+    expect(stack.provider.executorToolVerified).toBe(true);
+    // The accepted built-in policy evaluates CapabilityClass::Read directly;
+    // Normal list_dir must not be silently rerouted through a reviewer model.
+    expect(stack.executionReviewCount).toBe(0);
 
     const delayedSecondPageList =
       await holdNextParticipantInstallationList(secondPage);
@@ -405,8 +409,10 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     await expect
       .poll(() => assistantMessageEndSequence.get(secondProviderResponse))
       .toBeGreaterThan(0);
-    expect(stack.provider.requestCount).toBe(2);
-    expect(stack.provider.requests).toHaveLength(2);
+    expect(stack.provider.requestCount).toBe(3);
+    expect(stack.provider.requests).toHaveLength(3);
+    expect(stack.provider.executorToolVerified).toBe(true);
+    expect(stack.executionReviewCount).toBe(0);
     expect(stack.provider.contextVerified).toBe(true);
     expect(
       assistantMessageEndSequence.get(secondProviderResponse),

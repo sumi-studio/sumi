@@ -136,8 +136,16 @@ impl BoundToolAdapter for WorkspaceListTool {
         let arguments =
             decode_list(ctx.args.as_object()).map_err(|_| ToolError::InvalidArguments)?;
         validate_list_arguments(&arguments).map_err(|_| ToolError::InvalidArguments)?;
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let effect_receipt = ctx
+            .committed_effect_permit
+            .begin_local_effect()
+            .complete(|| self.execute_list(&arguments, &ctx.cancel))
+            .await?;
         Ok(BoundToolExecutionOutcome::without_live_post_commit(
-            self.execute_list(&arguments, &ctx.cancel).await?,
+            effect_receipt,
         ))
     }
 }
@@ -229,7 +237,7 @@ mod tests {
         },
         provider::types::{ToolCall, ToolInvocationRoute, ValidatedToolArguments},
         store::Redactor,
-        tools::{ToolRegistryBuilder, WorkspacePaths},
+        tools::{BoundExecutionError, ToolRegistryBuilder, WorkspacePaths},
     };
 
     const WORKSPACE_ID: &str = "0198f0f4-9b72-7000-8000-000000000011";
@@ -324,6 +332,12 @@ mod tests {
                 flow_id: "flow-a",
                 call_id: "call-a",
                 args: &binding.execution_arguments,
+                committed_effect_permit:
+                    crate::approval::authority::CommittedExecutionPermit::executor_fixture(
+                        "workspace-list-a",
+                        ToolInvocationRoute::Normal,
+                        crate::approval::authority::ExecutionAuthorityProvenance::AgentOwn,
+                    ),
                 cancel: CancellationToken::new(),
                 on_update: Arc::new(|_| {}),
                 workspace: &workspace,
@@ -379,6 +393,52 @@ mod tests {
 
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         assert_eq!(output.details, json!({"workspaces": []}));
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_bound_list_never_calls_the_workspace_api() {
+        let api = Arc::new(FakeWorkspaceApi {
+            calls: AtomicUsize::new(0),
+            cursors: Mutex::new(Vec::new()),
+            result: Ok(page(Vec::new(), None)),
+        });
+        let tool = Arc::new(WorkspaceListTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(tool)
+            .expect("register Workspace list tool");
+        let registry = builder.build();
+        let workspace = workspace_paths();
+        let sealed = registry
+            .bind(
+                &ToolCall {
+                    id: "cancelled-workspace-list".to_owned(),
+                    name: LIST_TOOL_NAME.to_owned(),
+                    route: ToolInvocationRoute::Normal,
+                    arguments: arguments(json!({})),
+                },
+                "cancelled-workspace-flow",
+                &workspace,
+            )
+            .await
+            .expect("bind Workspace list");
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = match registry
+            .execute_bound(authorized, cancel, Arc::new(|_| {}))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled Workspace list must not succeed"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+        assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+        assert!(api.cursors.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -442,6 +502,12 @@ mod tests {
                 flow_id: "flow-page",
                 call_id: "call-page",
                 args: &binding.execution_arguments,
+                committed_effect_permit:
+                    crate::approval::authority::CommittedExecutionPermit::executor_fixture(
+                        "workspace-list-page",
+                        ToolInvocationRoute::Normal,
+                        crate::approval::authority::ExecutionAuthorityProvenance::AgentOwn,
+                    ),
                 cancel: CancellationToken::new(),
                 on_update: Arc::new(|_| {}),
                 workspace: &workspace,

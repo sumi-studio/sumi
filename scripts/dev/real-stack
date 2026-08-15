@@ -566,12 +566,57 @@ SUMI_BROWSER_SESSION_SECRET="$(random_base64)"
 SUMI_LOCAL_CONTROL_BEARER="$(random_token)"
 SUMI_AGENT_WRAPPING_KEY="$(random_token)"
 SUMI_APPROVAL_SECRET_DIGEST_KEY="$(random_token)"
+mapfile -t executor_call_authority_key_pair < <(
+  node <<'NODE'
+const { generateKeyPairSync } = require("node:crypto");
+
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+const privateJwk = privateKey.export({ format: "jwk" });
+const publicJwk = publicKey.export({ format: "jwk" });
+if (
+  privateJwk.kty !== "OKP" ||
+  privateJwk.crv !== "Ed25519" ||
+  typeof privateJwk.d !== "string" ||
+  typeof privateJwk.x !== "string" ||
+  publicJwk.kty !== "OKP" ||
+  publicJwk.crv !== "Ed25519" ||
+  typeof publicJwk.x !== "string"
+) {
+  throw new Error("Node returned an invalid Ed25519 JWK pair");
+}
+const privateSeed = Buffer.from(privateJwk.d, "base64url");
+const embeddedPublic = Buffer.from(privateJwk.x, "base64url");
+const publicBytes = Buffer.from(publicJwk.x, "base64url");
+try {
+  if (
+    privateSeed.length !== 32 ||
+    embeddedPublic.length !== 32 ||
+    publicBytes.length !== 32 ||
+    !embeddedPublic.equals(publicBytes)
+  ) {
+    throw new Error("Node returned a non-corresponding Ed25519 JWK pair");
+  }
+  process.stdout.write(`${privateSeed.toString("hex")}\n${publicBytes.toString("hex")}\n`);
+} finally {
+  privateSeed.fill(0);
+  embeddedPublic.fill(0);
+  publicBytes.fill(0);
+}
+NODE
+)
+[[ "${#executor_call_authority_key_pair[@]}" -eq 2 ]] ||
+  fail "failed to generate one Executor call-authority key pair"
+SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY="${executor_call_authority_key_pair[0]}"
+SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY="${executor_call_authority_key_pair[1]}"
+unset executor_call_authority_key_pair
 SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX="$(( $(date +%s) + 8 * 60 * 60 ))"
 readonly SUMI_RPC_GENERATION SUMI_RPC_NONCE
 readonly SUMI_PROCESS_GENERATION_LEASE_ID SUMI_GENERATION_RECOVERY_FENCE_ID
 readonly SUMI_AGENT_TOKEN_SECRET SUMI_BROWSER_SESSION_SECRET
 readonly SUMI_LOCAL_CONTROL_BEARER SUMI_AGENT_WRAPPING_KEY
 readonly SUMI_APPROVAL_SECRET_DIGEST_KEY
+readonly SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY
+readonly SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY
 readonly SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX
 
 declare -a adc_environment=("HOME=${HOME}" "GOOGLE_CLOUD_PROJECT=${SUMI_AUTH_FIREBASE_PROJECT_ID}")
@@ -632,6 +677,7 @@ log "starting authenticated tool executor"
     "SUMI_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}" \
     "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" \
     "SUMI_RPC_NONCE=${SUMI_RPC_NONCE}" \
+    "SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY=${SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY}" \
     "SUMI_WORKSPACE=${WORKSPACE_DIR}" \
     "SUMI_EXECUTOR_SOCKET=${EXECUTOR_SOCKET}" \
     "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}" \
@@ -653,6 +699,7 @@ declare -a runtime_environment=(
   "SUMI_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}"
   "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}"
   "SUMI_RPC_NONCE=${SUMI_RPC_NONCE}"
+  "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY=${SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY}"
   "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}"
   "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}"
   "SUMI_STATE_DIR=${AGENT_STATE_DIR}"

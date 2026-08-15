@@ -259,6 +259,30 @@ Normalのgrantがcommit時再認可でstaleになった場合は、同じsealed 
 Human promptへfallbackしない。`ToolExecutionStart`を発行した後にcontrolが競合した場合も、
 commit barrierの結果を受け取る前にmove-only execution authorityを破棄してはならない。
 
+commit成功後にだけ、sealed invocationと対になったmove-only
+`CommittedExecutionPermit`をregistryへ渡す。app-local effectはpermitをlocal effect startへ、
+executor RPCはexecutor effect startへ一度だけ変換でき、両方へ分岐できない。effect startは
+実際のresult-producing futureを所有し、成功したfutureだけが非constructibleなreceiptを返す。
+adapterはこのreceiptなしに成功outcomeやpost-commit hookを作れない。cancelはlock取得後かつ
+effect start直前にも再検査し、cancel済みcallがAPI/RPCへ到達しないことを固定する。
+
+別processのexecutorへ渡すtokenは、durable evidenceそのものではなく、次のopaque digestと
+closed enumだけを持つsafe authorization projectionへ限定する。
+
+- grant、bound evidence、canonical action、safe authorization projectionのdomain-separated digest
+- immutable routeとresolved authority provenance
+- exact request/execution/operation、`ProcessGeneration`、RPC boot nonce digest、短いexpiry
+
+conversation、raw arguments/resource、tenant/PersonalityAgent/Human principal ID、Human command ID、
+reviewerのfree-form text、これらprivate valueから導出したauthorization projection digestはtokenへ
+入れない。principal間の分離はtokenへIDを複写するのではなく、allocatorがgenerationごとに一つ
+生成するEd25519 pairと、executor managerのlocal grant admission stateで維持する。runtimeだけが
+private seedを受け取り、executorだけが対応するpublic keyを受け取り、brokerはどちらも受け取らない。
+key IDを含む全token envelopeを署名し、executorはexact operation/generation/nonce/request/execution/
+expiryとone-shot grant consumptionを検証する。restart/recoveryではpairをrotationし、supervisorは
+private seedを含まないbroker identityからepochを読む。全modeはallocatorを含むmode dispatchより前に
+core dumpとprocess dumpabilityを無効化する。
+
 ### 9. #134で使う語彙
 
 permission/approval surfaceでは、少なくとも次を別名で扱う。

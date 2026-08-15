@@ -75,14 +75,14 @@ test("runtime provisioner receives a file-scoped Docker config", async () => {
     provisioner,
     /source: \$\{SUMI_DOCKER_CONFIG_FILE:\?SUMI_DOCKER_CONFIG_FILE is required\}/,
   );
-  assert.match(
-    provisioner,
-    /target: \/run\/sumi\/docker-config\/config\.json/,
-  );
+  assert.match(provisioner, /target: \/run\/sumi\/docker-config\/config\.json/);
   assert.match(provisioner, /read_only: true/);
   assert.match(provisioner, /create_host_path: false/);
   assert.doesNotMatch(provisioner, /\/root\/\.docker/);
-  assert.match(provisionerDockerfile, /install -d -m 0700 \/run\/sumi\/docker-config/);
+  assert.match(
+    provisionerDockerfile,
+    /install -d -m 0700 \/run\/sumi\/docker-config/,
+  );
 });
 
 test("Jenkins rebuilds the provisioner for every source tree embedded in it", async () => {
@@ -96,14 +96,8 @@ test("Jenkins rebuilds the provisioner for every source tree embedded in it", as
     provisionerDockerfile,
     /COPY --from=build \/usr\/local\/bin\/sumi-runtime-provisioner/,
   );
-  assert.match(
-    provisionerDockerfile,
-    /\/opt\/sumi\/deploy\/agent\/supervisor/,
-  );
-  assert.match(
-    jenkinsfile,
-    /provisioner:\s*\['apps\/api', 'deploy\/agent'\]/,
-  );
+  assert.match(provisionerDockerfile, /\/opt\/sumi\/deploy\/agent\/supervisor/);
+  assert.match(jenkinsfile, /provisioner:\s*\['apps\/api', 'deploy\/agent'\]/);
   assert.match(
     jenkinsfile,
     /watchedDirs\.addAll\(extraWatchedDirsByImage\[name\] \?: \[\]\)/,
@@ -145,6 +139,9 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   const executorGate = launcher.search(
     /wait_for_socket "\$\{EXECUTOR_SOCKET\}" "\$\{EXECUTOR_PID\}"/,
   );
+  const runtimeEnvironmentStart = launcher.indexOf(
+    "declare -a runtime_environment=(",
+  );
   const runtimeStart = launcher.indexOf(
     'log "starting production PersonalityAgent"',
   );
@@ -155,6 +152,7 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
     apiGate,
     executorStart,
     executorGate,
+    runtimeEnvironmentStart,
     runtimeStart,
     runtimeGate,
     viteStart,
@@ -163,9 +161,30 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   }
   assert.ok(apiGate < executorStart);
   assert.ok(executorStart < executorGate);
-  assert.ok(executorGate < runtimeStart);
+  assert.ok(executorGate < runtimeEnvironmentStart);
+  assert.ok(runtimeEnvironmentStart < runtimeStart);
   assert.ok(runtimeStart < runtimeGate);
   assert.ok(runtimeGate < viteStart);
+  const executorBlock = launcher.slice(executorStart, runtimeEnvironmentStart);
+  const runtimeBlock = launcher.slice(runtimeEnvironmentStart, viteStart);
+  assert.match(launcher, /generateKeyPairSync\("ed25519"\)/);
+  assert.match(launcher, /embeddedPublic\.equals\(publicBytes\)/);
+  assert.match(
+    executorBlock,
+    /SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY=\$\{SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY\}/,
+  );
+  assert.doesNotMatch(
+    executorBlock,
+    /SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY=\$\{/,
+  );
+  assert.match(
+    runtimeBlock,
+    /SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY=\$\{SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY\}/,
+  );
+  assert.doesNotMatch(
+    runtimeBlock,
+    /SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY=\$\{/,
+  );
   assert.match(launcher, /state\.local_control\?\.state === "ready"/);
   assert.match(launcher, /state\.local_control\?\.integrity\?\.mac/);
   assert.match(

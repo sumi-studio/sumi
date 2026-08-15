@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -18,12 +19,20 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use super::manager::RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE;
+use super::manager::{
+    RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE, RPC_CALL_AUTHORITY_REPLAY_CODE,
+    RPC_CALL_AUTHORITY_STALE_CODE, RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE,
+};
 use super::protocol::{RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, parse_artifact_handle};
 use super::{
-    ArtifactResponse, ExecutorOperation, ExecutorResponse, ExecutorServiceRole, MAX_RPC_LINE_BYTES,
-    RpcError, RpcFrame, RpcOperationValidation, RpcRequest, decode_rpc_frame,
+    ArtifactResponse, Ed25519CallAuthorityIssuer, ExecutorOperation, ExecutorResponse,
+    ExecutorRpcRequest, ExecutorServiceRole, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
+    RpcOperationValidation, SignedCallAuthority, call_authority_key_id, decode_rpc_frame,
+};
+use crate::approval::authority::{
+    CommittedEffectReceipt, CommittedExecutionPermit, ExecutorCommittedExecutionPermit,
 };
 use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity};
 use crate::tools::{
@@ -35,11 +44,18 @@ use crate::tools::{
 const MAX_EXECUTOR_UPDATES: usize = 65_536;
 const GENERATION_ROLLOVER_REQUIRED_MESSAGE: &str = "executor generation rollover required";
 const REPLAY_OUTCOME_UNAVAILABLE_MESSAGE: &str = "executor replay outcome is no longer retained";
+const CALL_AUTHORITY_REPLAY_MESSAGE: &str = "executor exact-call authority was already consumed";
+const CALL_AUTHORITY_CAPACITY_EXHAUSTED_MESSAGE: &str =
+    "executor exact-call authority capacity is exhausted";
+const CALL_AUTHORITY_STALE_MESSAGE: &str = "executor exact-call authority expired before effect";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutorErrorClassification {
     GenerationRolloverRequired,
     ReplayOutcomeUnavailable,
+    CallAuthorityReplay,
+    CallAuthorityCapacityExhausted,
+    CallAuthorityStale,
 }
 
 pub fn classify_executor_error(error: &ToolError) -> Option<ExecutorErrorClassification> {
@@ -49,6 +65,15 @@ pub fn classify_executor_error(error: &ToolError) -> Option<ExecutorErrorClassif
         }
         ToolError::Rpc(message) if message == REPLAY_OUTCOME_UNAVAILABLE_MESSAGE => {
             Some(ExecutorErrorClassification::ReplayOutcomeUnavailable)
+        }
+        ToolError::Protocol(message) if message == CALL_AUTHORITY_REPLAY_MESSAGE => {
+            Some(ExecutorErrorClassification::CallAuthorityReplay)
+        }
+        ToolError::Rpc(message) if message == CALL_AUTHORITY_CAPACITY_EXHAUSTED_MESSAGE => {
+            Some(ExecutorErrorClassification::CallAuthorityCapacityExhausted)
+        }
+        ToolError::Protocol(message) if message == CALL_AUTHORITY_STALE_MESSAGE => {
+            Some(ExecutorErrorClassification::CallAuthorityStale)
         }
         _ => None,
     }
@@ -90,6 +115,7 @@ impl Default for Deadlines {
 pub struct ExecutorClient {
     socket: PathBuf,
     identity: RpcIdentity,
+    call_authority_issuer: Option<Arc<Ed25519CallAuthorityIssuer>>,
     deadlines: Deadlines,
 }
 
@@ -98,8 +124,24 @@ impl ExecutorClient {
         Self {
             socket: socket.into(),
             identity,
+            call_authority_issuer: None,
             deadlines: Deadlines::default(),
         }
+    }
+
+    pub(crate) fn with_call_authority_signing_key(
+        mut self,
+        signing_key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, ToolError> {
+        self.call_authority_issuer = Some(Arc::new(
+            Ed25519CallAuthorityIssuer::new(
+                call_authority_key_id(),
+                SigningKey::from_bytes(&signing_key),
+                self.identity.clone(),
+            )
+            .map_err(ToolError::from)?,
+        ));
+        Ok(self)
     }
 
     pub fn socket(&self) -> &Path {
@@ -134,6 +176,7 @@ impl ExecutorClient {
                 ExecutorOperation::Health {
                     service_role: ExecutorServiceRole::ToolExecutor,
                 },
+                None,
                 cancel,
                 Arc::new(|_| {}),
                 overall,
@@ -155,19 +198,56 @@ impl ExecutorClient {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError> {
-        self.execute_with_overall(operation, cancel, on_update, self.deadlines.overall)
+        self.execute_with_overall(operation, None, cancel, on_update, self.deadlines.overall)
+            .await
+    }
+
+    pub(crate) async fn execute_authorized(
+        &self,
+        operation: ExecutorOperation,
+        permit: CommittedExecutionPermit,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<CommittedEffectReceipt<ExecutorResponse>, ToolError> {
+        self.validate_execution_request(&operation, &cancel)?;
+        // The adapter has already derived the complete operation from sealed
+        // bound arguments. Consume the one-shot permit only after all local
+        // validation and cancellation checks, immediately before the future
+        // whose first irreversible step signs exact operation claims.
+        let effect_start = permit.begin_executor_effect();
+        effect_start
+            .complete(|permit| {
+                self.execute_validated_with_overall(
+                    operation,
+                    Some(permit),
+                    cancel,
+                    on_update,
+                    self.deadlines.overall,
+                )
+            })
             .await
     }
 
     async fn execute_with_overall(
         &self,
         operation: ExecutorOperation,
+        permit: Option<ExecutorCommittedExecutionPermit>,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
         overall: Duration,
     ) -> Result<ExecutorResponse, ToolError> {
+        self.validate_execution_request(&operation, &cancel)?;
+        self.execute_validated_with_overall(operation, permit, cancel, on_update, overall)
+            .await
+    }
+
+    fn validate_execution_request(
+        &self,
+        operation: &ExecutorOperation,
+        cancel: &CancellationToken,
+    ) -> Result<(), ToolError> {
         operation.validate()?;
-        validate_operation_for_personality_agent(&operation, self.identity.personality_agent_id())?;
+        validate_operation_for_personality_agent(operation, self.identity.personality_agent_id())?;
         if matches!(operation, ExecutorOperation::Cancel { .. }) {
             return Err(ToolError::Protocol(
                 "ExecutorClient owns cancel request construction".to_owned(),
@@ -176,9 +256,25 @@ impl ExecutorClient {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+        Ok(())
+    }
 
+    async fn execute_validated_with_overall(
+        &self,
+        operation: ExecutorOperation,
+        permit: Option<ExecutorCommittedExecutionPermit>,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+        overall: Duration,
+    ) -> Result<ExecutorResponse, ToolError> {
         let request_emitted = Arc::new(AtomicBool::new(false));
-        let execution = self.execute_inner(operation, cancel, on_update, request_emitted.clone());
+        let execution = self.execute_inner(
+            operation,
+            permit,
+            cancel,
+            on_update,
+            request_emitted.clone(),
+        );
         match timeout(overall, execution).await {
             Ok(result) => result,
             Err(_) if request_emitted.load(Ordering::Acquire) => {
@@ -193,14 +289,44 @@ impl ExecutorClient {
     async fn execute_inner(
         &self,
         operation: ExecutorOperation,
+        permit: Option<ExecutorCommittedExecutionPermit>,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
         request_emitted: Arc<AtomicBool>,
     ) -> Result<ExecutorResponse, ToolError> {
-        let cancellation_mode = cancellation_mode(&operation);
+        // The production critical endpoint is a single-frame synchronous
+        // exchange. Once an authorized read is emitted it returns the exact
+        // primary terminal; it cannot truthfully acknowledge a second-frame
+        // Cancel. Cancellation therefore remains prompt only before emission.
+        let cancellation_mode = if permit.is_some()
+            && super::call_authority::is_production_read_operation(&operation)
+        {
+            CancellationMode::None
+        } else {
+            cancellation_mode(&operation)
+        };
         let execution_id = operation_execution_id(&operation).to_owned();
         let request_id = format!("executor-{}", Uuid::now_v7());
-        let encoded = encode_request(&self.identity, &request_id, operation.clone())?;
+        let call_authority = match permit {
+            Some(permit) => Some(
+                self.call_authority_issuer
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ToolError::Protocol(
+                            "executor exact-call authority signer is unavailable".to_owned(),
+                        )
+                    })?
+                    .issue(request_id.clone(), operation.clone(), permit)
+                    .map_err(ToolError::from)?,
+            ),
+            None => None,
+        };
+        let encoded = encode_request(
+            &self.identity,
+            &request_id,
+            call_authority,
+            operation.clone(),
+        )?;
 
         let stream = tokio::select! {
             biased;
@@ -264,6 +390,7 @@ impl ExecutorClient {
                     let cancel_bytes = encode_request(
                         &self.identity,
                         &id,
+                        None,
                         ExecutorOperation::Cancel { execution_id: execution_id.clone() },
                     )?;
                     write_with_deadline(
@@ -409,8 +536,8 @@ enum CancelTerminal {
 
 #[derive(Clone, Copy)]
 enum CancellationMode {
-    /// Health authenticates a fixed endpoint but has no execution identity.
-    /// It is cancellable only before its request is emitted.
+    /// Health and production single-frame reads are cancellable only before
+    /// request emission. After emission their primary terminal is truth.
     None,
     /// Synchronous executor operations cannot be actively stopped, but a
     /// post-emission cancellation must be settled against their terminal.
@@ -448,13 +575,16 @@ fn cancellation_mode(operation: &ExecutorOperation) -> CancellationMode {
 fn encode_request(
     identity: &RpcIdentity,
     request_id: &str,
+    call_authority: Option<SignedCallAuthority>,
     operation: ExecutorOperation,
 ) -> Result<Vec<u8>, ToolError> {
-    let request = RpcRequest {
+    let request = ExecutorRpcRequest {
         personality_agent_id: identity.personality_agent_id().clone(),
         generation: identity.generation().to_wire(),
         nonce: identity.nonce().as_str().to_owned(),
         request_id: request_id.to_owned(),
+        call_authority,
+        verified_call_authority: None,
         operation,
     };
     let mut encoded = serde_json::to_vec(&request)
@@ -728,6 +858,15 @@ fn map_rpc_error(operation: &ExecutorOperation, error: RpcError) -> ToolError {
         (RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE, None) => {
             ToolError::Rpc(REPLAY_OUTCOME_UNAVAILABLE_MESSAGE.to_owned())
         }
+        (RPC_CALL_AUTHORITY_REPLAY_CODE, None) => {
+            ToolError::Protocol(CALL_AUTHORITY_REPLAY_MESSAGE.to_owned())
+        }
+        (RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE, None) => {
+            ToolError::Rpc(CALL_AUTHORITY_CAPACITY_EXHAUSTED_MESSAGE.to_owned())
+        }
+        (RPC_CALL_AUTHORITY_STALE_CODE, None) => {
+            ToolError::Protocol(CALL_AUTHORITY_STALE_MESSAGE.to_owned())
+        }
         ("resource_limit", Some(limit)) => ToolError::ResourceLimit(limit),
         ("cancelled", None) if !mutating => ToolError::Cancelled,
         ("invalid_arguments", None) => ToolError::InvalidArguments,
@@ -760,14 +899,19 @@ mod tests {
     use super::*;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
-    use crate::tools::{
-        executor::{
-            ArtifactBrokerClient,
-            service::{
-                ExecutorTestControls, run_executor_service, run_executor_service_with_cancel_delay,
+    use crate::{
+        approval::authority::{CommittedExecutionPermit, ExecutionAuthorityProvenance},
+        provider::types::ToolInvocationRoute,
+        tools::{
+            executor::{
+                ArtifactBrokerClient,
+                service::{
+                    ExecutorTestControls, run_critical_executor_test_service, run_executor_service,
+                    run_executor_service_with_cancel_delay,
+                },
             },
+            fs::WorkspaceFs,
         },
-        fs::WorkspaceFs,
     };
     use serde_json::{Value, json};
     use std::sync::Mutex;
@@ -1357,6 +1501,81 @@ mod tests {
             response,
             ExecutorResponse::Healthy {
                 service_role: ExecutorServiceRole::ToolExecutor,
+            }
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_read_post_emission_cancel_preserves_primary_without_cancel_frame() {
+        let root = temp_root("prd-cancel");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("visible.txt"), "visible").unwrap();
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_server = cancel.clone();
+        let service_identity = identity();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let mut first_line = Vec::new();
+            let count = read.read_until(b'\n', &mut first_line).await.unwrap();
+            assert!(count > 0, "authorized request must reach production socket");
+            assert_eq!(first_line.pop(), Some(b'\n'));
+            let request: Value = serde_json::from_slice(&first_line).unwrap();
+            assert_eq!(request["operation"]["type"], "list_dir");
+            assert!(request["call_authority"].is_object());
+
+            // The primary request is now emitted. The production endpoint owns
+            // a single synchronous exchange, so cancellation cannot become an
+            // unverified second tool operation on this connection.
+            cancel_server.cancel();
+            let mut second_line = Vec::new();
+            assert!(
+                timeout(
+                    Duration::from_millis(100),
+                    read.read_until(b'\n', &mut second_line),
+                )
+                .await
+                .is_err(),
+                "authorized production read must not emit a follow-up Cancel frame"
+            );
+            assert!(second_line.is_empty());
+
+            run_critical_executor_test_service(first_line, write, service_identity, workspace)
+                .await
+                .unwrap();
+        });
+
+        let operation = ExecutorOperation::ListDir {
+            path: ".".to_owned(),
+            execution_id: "production-read-cancel".to_owned(),
+        };
+        let response = ExecutorClient::new(&socket, identity())
+            .with_call_authority_signing_key(Zeroizing::new([7; 32]))
+            .unwrap()
+            .with_deadlines(test_deadlines())
+            .execute_authorized(
+                operation,
+                CommittedExecutionPermit::executor_fixture(
+                    "grant-production-read-cancel",
+                    ToolInvocationRoute::Normal,
+                    ExecutionAuthorityProvenance::AgentOwn,
+                ),
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("post-emission cancellation must preserve the production primary terminal")
+            .into_inner();
+        assert_eq!(
+            response,
+            ExecutorResponse::Listed {
+                entries: vec!["visible.txt".to_owned()],
             }
         );
         server.await.unwrap();
@@ -2123,6 +2342,37 @@ mod tests {
             Some(ExecutorErrorClassification::ReplayOutcomeUnavailable)
         );
         assert!(matches!(replay_unavailable, ToolError::Rpc(_)));
+
+        for (code, expected, rpc) in [
+            (
+                RPC_CALL_AUTHORITY_REPLAY_CODE,
+                ExecutorErrorClassification::CallAuthorityReplay,
+                false,
+            ),
+            (
+                RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE,
+                ExecutorErrorClassification::CallAuthorityCapacityExhausted,
+                true,
+            ),
+            (
+                RPC_CALL_AUTHORITY_STALE_CODE,
+                ExecutorErrorClassification::CallAuthorityStale,
+                false,
+            ),
+        ] {
+            let error = map_rpc_error(
+                &ExecutorOperation::ListDir {
+                    path: ".".to_owned(),
+                    execution_id: format!("classification-{code}"),
+                },
+                RpcError {
+                    code: code.to_owned(),
+                    resource_limit: None,
+                },
+            );
+            assert_eq!(classify_executor_error(&error), Some(expected));
+            assert_eq!(matches!(error, ToolError::Rpc(_)), rpc);
+        }
         assert_eq!(
             classify_executor_error(&ToolError::Rpc("different".to_owned())),
             None

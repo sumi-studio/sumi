@@ -17,6 +17,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use ed25519_dalek::VerifyingKey;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -31,12 +32,15 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse, ExecutorOperation,
-    ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
-    RpcRequest, decode_rpc_line, encode_rpc_frame,
+    ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse,
+    ExecutorCallAuthorityVerifier, ExecutorOperation, ExecutorResponse, ExecutorRpcRequest,
+    InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker, RpcRequest,
+    call_authority_key_id, decode_executor_rpc_line, decode_hex_32, decode_rpc_line,
+    encode_rpc_frame,
     manager::{
         CancelDecision, ExecutionLease, ExecutionRegistration, ExecutorManager, PendingExecution,
-        RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE,
+        RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE, RPC_CALL_AUTHORITY_REPLAY_CODE,
+        RPC_CALL_AUTHORITY_STALE_CODE, RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE,
     },
     protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE,
     resolve_input,
@@ -145,9 +149,28 @@ impl<R> ExecutorInput<R> {
     }
 }
 
-/// Bind without stealing a live endpoint. Only a connection-refused path that
-/// is itself a Unix socket is eligible for stale-socket cleanup.
+#[derive(Clone, Copy)]
+enum StaleSocketPolicy {
+    Reclaim,
+    Refuse,
+}
+
+/// Bind without stealing a live endpoint. A caller may allow a trusted
+/// connection-refused socket to be reclaimed, or require the supervisor's
+/// generation-preparation phase to have removed every prior socket first.
 async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListener> {
+    bind_unix_listener_with_policy(path, label, StaleSocketPolicy::Reclaim).await
+}
+
+async fn bind_fresh_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListener> {
+    bind_unix_listener_with_policy(path, label, StaleSocketPolicy::Refuse).await
+}
+
+async fn bind_unix_listener_with_policy(
+    path: &Path,
+    label: &str,
+    stale_socket_policy: StaleSocketPolicy,
+) -> Result<OwnedUnixListener> {
     let trusted_path = TrustedSocketPath::open(path, label)?;
     let ownership_lock = acquire_socket_ownership(&trusted_path, label)?;
     trusted_path.validate(label)?;
@@ -160,6 +183,12 @@ async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListene
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(Err(error)) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+            if matches!(stale_socket_policy, StaleSocketPolicy::Refuse) {
+                bail!(
+                    "{label} socket {} belongs to a prior process boot; supervisor generation preparation is required",
+                    path.display()
+                );
+            }
             trusted_path.validate(label)?;
             let metadata = trusted_path.socket_entry(label)?;
             if !metadata.is_socket()
@@ -1059,6 +1088,8 @@ struct BlockingFsRegistry {
     total: Arc<Semaphore>,
     #[cfg(test)]
     before_execute: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    authorized_effect_started: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl BlockingFsRegistry {
@@ -1070,6 +1101,8 @@ impl BlockingFsRegistry {
             total: Arc::new(Semaphore::new(total_capacity)),
             #[cfg(test)]
             before_execute: None,
+            #[cfg(test)]
+            authorized_effect_started: None,
         }
     }
 
@@ -1092,7 +1125,45 @@ impl BlockingFsRegistry {
         }
     }
 
+    #[cfg(test)]
+    fn with_test_authority_hooks(
+        worker_capacity: usize,
+        total_capacity: usize,
+        before_execute: Arc<dyn Fn() + Send + Sync>,
+        authorized_effect_started: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            before_execute: Some(before_execute),
+            authorized_effect_started: Some(authorized_effect_started),
+            ..Self::new(worker_capacity, total_capacity)
+        }
+    }
+
     async fn execute<T, F>(&self, operation: F) -> Result<T, ToolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ToolError> + Send + 'static,
+    {
+        self.execute_inner(None, operation).await
+    }
+
+    async fn execute_authorized<T, F>(
+        &self,
+        expiry: super::call_authority::VerifiedAuthorityExpiry,
+        operation: F,
+    ) -> Result<T, ToolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ToolError> + Send + 'static,
+    {
+        self.execute_inner(Some(expiry), operation).await
+    }
+
+    async fn execute_inner<T, F>(
+        &self,
+        expiry: Option<super::call_authority::VerifiedAuthorityExpiry>,
+        operation: F,
+    ) -> Result<T, ToolError>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, ToolError> + Send + 'static,
@@ -1110,11 +1181,25 @@ impl BlockingFsRegistry {
             .map_err(|_| io_error("executor filesystem blocking-work registry closed"))?;
         #[cfg(test)]
         let before_execute = self.before_execute.clone();
+        #[cfg(test)]
+        let authorized_effect_started = self.authorized_effect_started.clone();
         tokio::task::spawn_blocking(move || {
             let _permits = (total_permit, worker_permit);
             #[cfg(test)]
             if let Some(before_execute) = before_execute {
                 before_execute();
+            }
+            if let Some(expiry) = expiry {
+                expiry.ensure_fresh().map_err(|error| match error {
+                    super::call_authority::CallAuthorityError::Stale => {
+                        ToolError::Protocol(RPC_CALL_AUTHORITY_STALE_CODE.to_owned())
+                    }
+                    other => ToolError::from(other),
+                })?;
+                #[cfg(test)]
+                if let Some(authorized_effect_started) = authorized_effect_started {
+                    authorized_effect_started();
+                }
             }
             operation()
         })
@@ -1200,6 +1285,17 @@ pub async fn run_tool_executor_mode() -> Result<()> {
 /// one manager created before the accept loop.
 pub async fn run_tool_executor_socket_mode() -> Result<()> {
     let identity = identity_from_env()?;
+    let encoded_public_key = env::var("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY")
+        .context("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY is required")?;
+    let verifying_key = parse_executor_call_authority_public_key(&encoded_public_key)?;
+    let call_authority = Arc::new(
+        ExecutorCallAuthorityVerifier::new(
+            call_authority_key_id(),
+            verifying_key,
+            identity.clone(),
+        )
+        .context("construct executor exact-call authority verifier")?,
+    );
     let workspace = required_path("SUMI_WORKSPACE")?;
     let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
     let blocking_fs = BlockingFsRegistry::production();
@@ -1207,7 +1303,11 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         .open_workspace(workspace.clone())
         .await
         .context("failed to open executor workspace")?;
-    let listener = bind_unix_listener(&executor_socket, "executor").await?;
+    // A stale executor socket proves that a prior process in this generation
+    // reached the listening boundary. Refuse to recreate an empty replay
+    // ledger under the same nonce/key; only supervisor preparation for a
+    // freshly allocated generation may remove this tombstone.
+    let listener = bind_fresh_unix_listener(&executor_socket, "executor").await?;
     let handshakes = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
     let ordinary_connections = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
     let control_connections = Arc::new(Semaphore::new(EXECUTOR_CONTROL_CONNECTION_CAPACITY));
@@ -1229,6 +1329,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         let blocking_fs = blocking_fs.clone();
         let ordinary_connections = ordinary_connections.clone();
         let control_connections = control_connections.clone();
+        let call_authority = call_authority.clone();
         tokio::spawn(async move {
             let (read, write) = stream.into_split();
             let mut read = BufReader::new(read);
@@ -1245,7 +1346,11 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                         return;
                     }
                 };
-            let decoded = match decode_executor_request(&first_line, &identity) {
+            let decoded = match decode_authorized_executor_request(
+                &first_line,
+                &identity,
+                &call_authority,
+            ) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     tracing::warn!(%error, "executor socket rejected unauthenticated initial frame");
@@ -1254,7 +1359,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             };
             let control = matches!(
                 decoded,
-                Ok(RpcRequest {
+                Ok(ExecutorRpcRequest {
                     operation: ExecutorOperation::Health { .. },
                     ..
                 })
@@ -1280,6 +1385,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                     fs,
                     manager,
                     blocking_fs,
+                    call_authority,
                 )
                 .await
             })
@@ -1313,13 +1419,47 @@ async fn run_critical_executor_service(
     fs: Arc<WorkspaceFs>,
     manager: Arc<ExecutorManager>,
     blocking_fs: BlockingFsRegistry,
+    call_authority: Arc<ExecutorCallAuthorityVerifier>,
 ) -> Result<()> {
-    let result =
-        run_critical_executor_exchange(first_line, &writer, identity, fs, manager, blocking_fs)
-            .await;
+    let result = run_critical_executor_exchange(
+        first_line,
+        &writer,
+        identity,
+        fs,
+        manager,
+        blocking_fs,
+        call_authority,
+    )
+    .await;
     writer_task.abort();
     let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
+}
+
+#[cfg(test)]
+pub(super) async fn run_critical_executor_test_service(
+    first_line: Vec<u8>,
+    write: tokio::net::unix::OwnedWriteHalf,
+    identity: RpcIdentity,
+    workspace: PathBuf,
+) -> Result<()> {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let call_authority = Arc::new(ExecutorCallAuthorityVerifier::new(
+        call_authority_key_id(),
+        signing_key.verifying_key(),
+        identity.clone(),
+    )?);
+    let fs = Arc::new(WorkspaceFs::open(&workspace)?);
+    run_critical_executor_service(
+        first_line,
+        ExecutorWriter::start(write),
+        identity,
+        fs,
+        ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
+        BlockingFsRegistry::production(),
+        call_authority,
+    )
+    .await
 }
 
 async fn run_critical_executor_exchange(
@@ -1329,8 +1469,10 @@ async fn run_critical_executor_exchange(
     fs: Arc<WorkspaceFs>,
     manager: Arc<ExecutorManager>,
     blocking_fs: BlockingFsRegistry,
+    call_authority: Arc<ExecutorCallAuthorityVerifier>,
 ) -> Result<()> {
-    let request = match decode_executor_request(&first_line, &identity)? {
+    let request = match decode_authorized_executor_request(&first_line, &identity, &call_authority)?
+    {
         Ok(request) => request,
         Err((request_id, error)) => {
             let result = match manager.reject_request(&request_id) {
@@ -1343,7 +1485,14 @@ async fn run_critical_executor_exchange(
         }
     };
 
-    match request.operation {
+    let ExecutorRpcRequest {
+        request_id,
+        operation,
+        verified_call_authority,
+        ..
+    } = request;
+
+    match operation {
         ExecutorOperation::Health { service_role } => {
             // Health intentionally bypasses every lifecycle/admission registry:
             // it authenticates this process identity and role without consuming
@@ -1351,7 +1500,7 @@ async fn run_critical_executor_exchange(
             writer
                 .terminal(
                     &identity,
-                    request.request_id,
+                    request_id,
                     Ok(ExecutorResponse::Healthy { service_role }),
                 )
                 .await?;
@@ -1361,22 +1510,27 @@ async fn run_critical_executor_exchange(
         | ExecutorOperation::Glob { .. }
         | ExecutorOperation::Grep { .. }) => {
             let execution_id = operation_execution_id(&operation).to_owned();
-            let registration =
-                match manager.register_execution(request.request_id.clone(), execution_id, None) {
-                    Ok(registration) => registration,
-                    Err(error) if is_typed_admission_error(&error) => {
-                        writer
-                            .terminal(&identity, request.request_id, Err(rpc_error(error)))
-                            .await?;
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error.into()),
-                };
+            let authority = verified_call_authority.ok_or_else(|| {
+                ToolError::Protocol("verified executor call authority is missing".to_owned())
+            })?;
+            let registration = match manager.register_authorized_execution(
+                request_id.clone(),
+                execution_id,
+                None,
+                authority,
+            ) {
+                Ok(registration) => registration,
+                Err(error) if is_typed_admission_error(&error) => {
+                    writer
+                        .terminal(&identity, request_id, Err(rpc_error(error)))
+                        .await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             let execution = match registration {
                 ExecutionRegistration::Replay(result) => {
-                    writer
-                        .terminal(&identity, request.request_id, result)
-                        .await?;
+                    writer.terminal(&identity, request_id, result).await?;
                     return Ok(());
                 }
                 ExecutionRegistration::Pending(mut pending) => {
@@ -1395,19 +1549,15 @@ async fn run_critical_executor_exchange(
                         tracing::error!(%error, "critical read/discovery ownership task stopped");
                         Err(bounded_error("rpc_indeterminate"))
                     });
-            writer
-                .terminal(&identity, request.request_id, result)
-                .await?;
+            writer.terminal(&identity, request_id, result).await?;
         }
         _ => {
-            let result = match manager.reject_request(&request.request_id) {
+            let result = match manager.reject_request(&request_id) {
                 Ok(()) => Err(bounded_error("protocol")),
                 Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
                 Err(error) => return Err(error.into()),
             };
-            writer
-                .terminal(&identity, request.request_id, result)
-                .await?;
+            writer.terminal(&identity, request_id, result).await?;
         }
     }
     Ok(())
@@ -1420,16 +1570,19 @@ fn start_critical_read_discovery_execution(
     operation: ExecutorOperation,
 ) -> JoinHandle<Result<ExecutorResponse, RpcError>> {
     tokio::spawn(async move {
-        let result = match operation {
-            ExecutorOperation::ReadFile {
-                path,
-                offset,
-                limit,
-                ..
-            } => match resolve_input("read_file", &path) {
+        let result = match (execution.authority_expiry(), operation) {
+            (
+                Some(expiry),
+                ExecutorOperation::ReadFile {
+                    path,
+                    offset,
+                    limit,
+                    ..
+                },
+            ) => match resolve_input("read_file", &path) {
                 Ok(InputRoute::Workspace) => {
                     blocking_fs
-                        .execute(move || {
+                        .execute_authorized(expiry, move || {
                             Ok(ExecutorResponse::ReadFile {
                                 result: fs.read_file(Path::new(&path), offset, limit)?,
                             })
@@ -1441,55 +1594,65 @@ fn start_critical_read_discovery_execution(
                 )),
                 Err(error) => Err(error),
             },
-            ExecutorOperation::ListDir { path, .. } => match resolve_input("list_dir", &path) {
-                Ok(InputRoute::Workspace) => {
-                    blocking_fs
-                        .execute(move || {
-                            Ok(ExecutorResponse::Listed {
-                                entries: fs.list_dir(Path::new(&path))?,
-                            })
-                        })
-                        .await
-                }
-                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
-                    "production executor does not expose artifact directory listings".to_owned(),
-                )),
-                Err(error) => Err(error),
-            },
-            ExecutorOperation::Glob { pattern, .. } => match resolve_input("glob", &pattern) {
-                Ok(InputRoute::Workspace) => {
-                    blocking_fs
-                        .execute(move || {
-                            Ok(ExecutorResponse::Globbed {
-                                paths: fs.glob(&pattern)?,
-                            })
-                        })
-                        .await
-                }
-                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
-                    "production executor does not expose artifact globs".to_owned(),
-                )),
-                Err(error) => Err(error),
-            },
-            ExecutorOperation::Grep { path, pattern, .. } => match resolve_input("grep", &path) {
-                Ok(InputRoute::Workspace) => match Regex::new(&pattern) {
-                    Ok(pattern) => {
+            (Some(expiry), ExecutorOperation::ListDir { path, .. }) => {
+                match resolve_input("list_dir", &path) {
+                    Ok(InputRoute::Workspace) => {
                         blocking_fs
-                            .execute(move || {
-                                Ok(ExecutorResponse::Grepped {
-                                    matches: fs.grep(Path::new(&path), &pattern)?,
+                            .execute_authorized(expiry, move || {
+                                Ok(ExecutorResponse::Listed {
+                                    entries: fs.list_dir(Path::new(&path))?,
                                 })
                             })
                             .await
                     }
-                    Err(_) => Err(ToolError::Protocol("invalid grep pattern".to_owned())),
-                },
-                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
-                    "production executor does not expose artifact grep".to_owned(),
-                )),
-                Err(error) => Err(error),
-            },
-            _ => Err(ToolError::Protocol(
+                    Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                        "production executor does not expose artifact directory listings"
+                            .to_owned(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            (Some(expiry), ExecutorOperation::Glob { pattern, .. }) => {
+                match resolve_input("glob", &pattern) {
+                    Ok(InputRoute::Workspace) => {
+                        blocking_fs
+                            .execute_authorized(expiry, move || {
+                                Ok(ExecutorResponse::Globbed {
+                                    paths: fs.glob(&pattern)?,
+                                })
+                            })
+                            .await
+                    }
+                    Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                        "production executor does not expose artifact globs".to_owned(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            (Some(expiry), ExecutorOperation::Grep { path, pattern, .. }) => {
+                match resolve_input("grep", &path) {
+                    Ok(InputRoute::Workspace) => match Regex::new(&pattern) {
+                        Ok(pattern) => {
+                            blocking_fs
+                                .execute_authorized(expiry, move || {
+                                    Ok(ExecutorResponse::Grepped {
+                                        matches: fs.grep(Path::new(&path), &pattern)?,
+                                    })
+                                })
+                                .await
+                        }
+                        Err(_) => Err(ToolError::Protocol("invalid grep pattern".to_owned())),
+                    },
+                    Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                        "production executor does not expose artifact grep".to_owned(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            (None, _) => Err(ToolError::Protocol(
+                "critical executor lost verified authority before effect start".to_owned(),
+            )),
+            (Some(_), _) => Err(ToolError::Protocol(
                 "critical executor received an unsupported operation".to_owned(),
             )),
         }
@@ -2633,6 +2796,46 @@ fn decode_executor_request(
     }
 }
 
+fn decode_authorized_executor_request(
+    line: &[u8],
+    identity: &RpcIdentity,
+    verifier: &ExecutorCallAuthorityVerifier,
+) -> Result<Result<ExecutorRpcRequest, (String, RpcError)>, ToolError> {
+    let validation = (|| {
+        let mut request = decode_executor_rpc_line(line, identity)?;
+        request.verified_call_authority = verifier
+            .verify(
+                request.call_authority.as_ref(),
+                &request.request_id,
+                &request.operation,
+            )
+            .map_err(ToolError::from)?;
+        Ok::<_, ToolError>(request)
+    })();
+    match validation {
+        Ok(request) => Ok(Ok(request)),
+        Err(validation_error) => {
+            let request = match serde_json::from_slice::<ExecutorRpcRequest>(line) {
+                Ok(request) => request,
+                Err(_) => return Err(validation_error),
+            };
+            if identity
+                .validate_wire(
+                    request.personality_agent_id.as_str(),
+                    request.generation,
+                    &request.nonce,
+                )
+                .is_err()
+                || request.request_id.is_empty()
+                || request.request_id.len() > 128
+            {
+                return Err(validation_error);
+            }
+            Ok(Err((request.request_id, rpc_error(validation_error))))
+        }
+    }
+}
+
 fn decode_artifact_request(
     line: &[u8],
     identity: &RpcIdentity,
@@ -2733,6 +2936,15 @@ fn rpc_error(error: ToolError) -> RpcError {
         ToolError::Protocol(message) if message == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE => {
             bounded_error(RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE)
         }
+        ToolError::Protocol(message) if message == RPC_CALL_AUTHORITY_REPLAY_CODE => {
+            bounded_error(RPC_CALL_AUTHORITY_REPLAY_CODE)
+        }
+        ToolError::Protocol(message) if message == RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE => {
+            bounded_error(RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE)
+        }
+        ToolError::Protocol(message) if message == RPC_CALL_AUTHORITY_STALE_CODE => {
+            bounded_error(RPC_CALL_AUTHORITY_STALE_CODE)
+        }
         ToolError::Protocol(_) => bounded_error("protocol"),
     }
 }
@@ -2748,7 +2960,10 @@ fn is_typed_admission_error(error: &ToolError) -> bool {
     is_boot_uniqueness_exhausted(error)
         || matches!(
             error,
-            ToolError::Protocol(message) if message == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE
+            ToolError::Protocol(message)
+                if message == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE
+                    || message == RPC_CALL_AUTHORITY_REPLAY_CODE
+                    || message == RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE
         )
 }
 
@@ -2794,6 +3009,18 @@ fn nonblocking_stdio_fd(raw_fd: libc::c_int) -> std::io::Result<AsyncFd<OwnedFd>
     AsyncFd::new(fd)
 }
 
+fn parse_executor_call_authority_public_key(encoded: &str) -> Result<VerifyingKey> {
+    let bytes = decode_hex_32(encoded).context(
+        "SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY must be exactly 64 lowercase hex characters",
+    )?;
+    let key = VerifyingKey::from_bytes(&bytes)
+        .context("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY is not a valid Ed25519 point")?;
+    if key.is_weak() {
+        bail!("SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY must not be a weak Ed25519 key");
+    }
+    Ok(key)
+}
+
 fn identity_from_env() -> Result<RpcIdentity> {
     identity_from_values(
         &required_text("SUMI_PERSONALITY_AGENT_ID")?,
@@ -2835,10 +3062,16 @@ fn required_path(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Condvar;
+    use std::sync::{
+        Condvar,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
-    use crate::{runtime::contracts::MAX_PROCESS_GENERATION, tools::executor::decode_rpc_frame};
+    use crate::{
+        runtime::contracts::MAX_PROCESS_GENERATION,
+        tools::executor::{call_authority, decode_rpc_frame},
+    };
 
     #[derive(Default)]
     struct BlockingFsGate {
@@ -2850,6 +3083,58 @@ mod tests {
     struct BlockingFsGateState {
         started: usize,
         released: bool,
+    }
+
+    struct ManualAuthorityClock(AtomicU64);
+
+    impl ManualAuthorityClock {
+        fn new(now_unix_ms: u64) -> Self {
+            Self(AtomicU64::new(now_unix_ms))
+        }
+
+        fn set(&self, now_unix_ms: u64) {
+            self.0.store(now_unix_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl call_authority::AuthorityClock for ManualAuthorityClock {
+        fn now_unix_ms(&self) -> Result<u64, call_authority::CallAuthorityError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn executor_public_key_parser_is_exact_and_rejects_weak_or_invalid_points() {
+        use ed25519_dalek::SigningKey;
+
+        let encoded = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let valid = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        assert_eq!(
+            parse_executor_call_authority_public_key(&encoded(&valid.to_bytes())).unwrap(),
+            valid
+        );
+
+        for malformed in [
+            "00".repeat(31),
+            "GG".repeat(32),
+            encoded(&valid.to_bytes()).to_uppercase(),
+        ] {
+            assert!(parse_executor_call_authority_public_key(&malformed).is_err());
+        }
+        let mut invalid_point = [0_u8; 32];
+        invalid_point[0] = 2;
+        assert!(parse_executor_call_authority_public_key(&encoded(&invalid_point)).is_err());
+
+        let mut identity_point = [0_u8; 32];
+        identity_point[0] = 1;
+        let error = parse_executor_call_authority_public_key(&encoded(&identity_point))
+            .expect_err("the identity point is weak");
+        assert!(error.to_string().contains("must not be a weak Ed25519 key"));
     }
 
     impl BlockingFsGate {
@@ -2940,11 +3225,89 @@ mod tests {
         request_id: &str,
         operation: ExecutorOperation,
     ) -> (tokio::io::DuplexStream, JoinHandle<Result<()>>) {
-        let request = RpcRequest {
+        start_critical_test_session_with_authority(
+            identity,
+            fs,
+            manager,
+            blocking_fs,
+            request_id,
+            operation,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_critical_test_session_with_authority(
+        identity: RpcIdentity,
+        fs: Arc<WorkspaceFs>,
+        manager: Arc<ExecutorManager>,
+        blocking_fs: BlockingFsRegistry,
+        request_id: &str,
+        operation: ExecutorOperation,
+        clock: Option<Arc<dyn call_authority::AuthorityClock>>,
+        grant_id: Option<&str>,
+    ) -> (tokio::io::DuplexStream, JoinHandle<Result<()>>) {
+        use ed25519_dalek::SigningKey;
+
+        use crate::tools::executor::call_authority::{
+            CallAuthorityPermitClaims, Ed25519CallAuthorityIssuer, ExecutorAuthorityProvenance,
+            ExecutorInvocationRoute, is_production_read_operation,
+        };
+
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let verifier = ExecutorCallAuthorityVerifier::new(
+            call_authority_key_id(),
+            signing_key.verifying_key(),
+            identity.clone(),
+        )
+        .expect("critical test verifier");
+        let verifier = Arc::new(match clock.clone() {
+            Some(clock) => verifier.with_clock(clock),
+            None => verifier,
+        });
+        let call_authority = if is_production_read_operation(&operation) {
+            let issuer = Ed25519CallAuthorityIssuer::new(
+                call_authority_key_id(),
+                signing_key,
+                identity.clone(),
+            )
+            .expect("critical test issuer");
+            let issuer = match clock {
+                Some(clock) => issuer.with_clock(clock),
+                None => issuer,
+            };
+            Some(
+                issuer
+                    .issue_for_test(
+                        request_id.to_owned(),
+                        operation.clone(),
+                        CallAuthorityPermitClaims {
+                            grant_digest: call_authority::test_grant_digest(
+                                grant_id
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| format!("grant-{request_id}"))
+                                    .as_str(),
+                            ),
+                            bound_evidence_digest: "11".repeat(32),
+                            action_digest: "33".repeat(32),
+                            authorization_projection_digest: "22".repeat(32),
+                            route: ExecutorInvocationRoute::Normal,
+                            resolved_authority: ExecutorAuthorityProvenance::AgentOwn,
+                        },
+                    )
+                    .expect("critical test authority"),
+            )
+        } else {
+            None
+        };
+        let request = ExecutorRpcRequest {
             personality_agent_id: identity.personality_agent_id().clone(),
             generation: identity.generation().to_wire(),
             nonce: identity.nonce().as_str().to_owned(),
             request_id: request_id.to_owned(),
+            call_authority,
+            verified_call_authority: None,
             operation,
         };
         let line = serde_json::to_vec(&request).expect("encode critical test request");
@@ -2957,6 +3320,7 @@ mod tests {
             fs,
             manager,
             blocking_fs,
+            verifier,
         ));
         (client, task)
     }
@@ -3067,6 +3431,103 @@ mod tests {
             "critical endpoint accepted a mutation"
         );
         std::fs::remove_dir_all(root).expect("remove critical endpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn queued_authority_expiry_is_rechecked_inside_worker_and_consumed_without_effect() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-critical-expiry-{}", uuid::Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create expiry workspace");
+        std::fs::write(workspace.join("sentinel.txt"), "untouched").expect("write expiry sentinel");
+        let fs = Arc::new(WorkspaceFs::open(&workspace).expect("open expiry workspace"));
+        let identity = test_identity();
+        let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
+        let clock = Arc::new(ManualAuthorityClock::new(1_000));
+        let gate = Arc::new(BlockingFsGate::default());
+        let hook_gate = gate.clone();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let observed_effects = effects.clone();
+        let blocking_fs = BlockingFsRegistry::with_test_authority_hooks(
+            1,
+            2,
+            Arc::new(move || hook_gate.block()),
+            Arc::new(move || {
+                observed_effects.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let blocker_registry = blocking_fs.clone();
+        let blocker =
+            tokio::spawn(async move { blocker_registry.execute(|| Ok::<_, ToolError>(())).await });
+        wait_for_blocking_fs_starts(&gate, 1).await;
+
+        let (mut client, task) = start_critical_test_session_with_authority(
+            identity.clone(),
+            fs.clone(),
+            manager.clone(),
+            blocking_fs.clone(),
+            "expiry-request",
+            ExecutorOperation::ListDir {
+                path: ".".to_owned(),
+                execution_id: "expiry-execution".to_owned(),
+            },
+            Some(clock.clone()),
+            Some("expiry-grant"),
+        );
+        timeout(Duration::from_secs(2), async {
+            while blocking_fs.available_total_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authorized operation did not queue behind saturated worker");
+
+        // Default authority lifetime is 30 seconds. Expire only after decode
+        // and manager consumption, while the effect is waiting for a worker.
+        clock.set(31_000);
+        gate.release();
+        blocker
+            .await
+            .expect("join blocking worker fixture")
+            .expect("blocking worker fixture result");
+        let terminal = read_test_terminal(&mut client).await;
+        assert_eq!(
+            terminal["result"]["Err"]["code"],
+            RPC_CALL_AUTHORITY_STALE_CODE
+        );
+        task.await
+            .expect("join expired critical execution")
+            .expect("expired critical execution result");
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.active_count(), 0);
+
+        // A fresh signature cannot remint the already-consumed grant.
+        let (mut replay_client, replay_task) = start_critical_test_session_with_authority(
+            identity,
+            fs,
+            manager,
+            blocking_fs,
+            "expiry-remint-request",
+            ExecutorOperation::ListDir {
+                path: ".".to_owned(),
+                execution_id: "expiry-remint-execution".to_owned(),
+            },
+            Some(clock),
+            Some("expiry-grant"),
+        );
+        let replay_terminal = read_test_terminal(&mut replay_client).await;
+        assert_eq!(
+            replay_terminal["result"]["Err"]["code"],
+            RPC_CALL_AUTHORITY_REPLAY_CODE
+        );
+        replay_task
+            .await
+            .expect("join remint rejection")
+            .expect("remint rejection result");
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+
+        std::fs::remove_dir_all(root).expect("remove expiry fixture");
     }
 
     #[tokio::test]
@@ -3257,6 +3718,18 @@ mod tests {
         ));
         assert_eq!(error.code, RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE);
         assert_eq!(error.resource_limit, None);
+    }
+
+    #[test]
+    fn exact_call_authority_denials_are_typed_terminal_admission_errors() {
+        for code in [
+            RPC_CALL_AUTHORITY_REPLAY_CODE,
+            RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE,
+        ] {
+            let error = ToolError::Protocol(code.to_owned());
+            assert!(is_typed_admission_error(&error));
+            assert_eq!(rpc_error(error).code, code);
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Process-wide lifecycle state for one generation-fenced executor manager.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -11,17 +11,26 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use super::protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE;
 use super::protocol::rpc_id_digest;
-use super::{ExecutorResponse, RpcError, RpcLifecycleTracker};
+use super::{
+    ExecutorResponse, RpcError, RpcLifecycleTracker, VerifiedCallAuthority,
+    call_authority::{AuthorityReplayBinding, VerifiedAuthorityExpiry},
+};
 use crate::tools::ToolError;
 
 const RETAINED_OUTCOME_CAPACITY: usize = 256;
 const RETAINED_OUTCOME_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
+const CONSUMED_GRANT_CAPACITY: usize = 1_000_000;
 pub(super) const RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE: &str = "rpc_replay_outcome_unavailable";
+pub(super) const RPC_CALL_AUTHORITY_REPLAY_CODE: &str = "executor_call_authority_replay";
+pub(super) const RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE: &str =
+    "executor_call_authority_capacity_exhausted";
+pub(super) const RPC_CALL_AUTHORITY_STALE_CODE: &str = "executor_call_authority_stale";
 
 #[derive(Clone, Debug, PartialEq)]
 struct RetainedOutcome {
     request_id: String,
     result: Result<ExecutorResponse, RpcError>,
+    authority_binding: Option<AuthorityReplayBinding>,
     encoded_bytes: usize,
 }
 
@@ -32,6 +41,7 @@ struct CompletedExecutionReceipt {
 
 struct ActiveExecution {
     request_id: String,
+    authority_binding: Option<AuthorityReplayBinding>,
     cancel: Option<CancellationToken>,
     cancel_waiters: Vec<oneshot::Sender<Result<ExecutorResponse, RpcError>>>,
 }
@@ -44,6 +54,7 @@ struct ManagerRegistry {
     retained_outcomes: HashMap<String, RetainedOutcome>,
     retained_order: VecDeque<String>,
     retained_outcome_bytes: usize,
+    consumed_grants: HashSet<[u8; 32]>,
 }
 
 pub(super) enum ExecutionRegistration {
@@ -70,6 +81,7 @@ pub(super) enum CancelDecision {
 pub(super) struct ExecutorManager {
     registry: Arc<Mutex<ManagerRegistry>>,
     admission: Arc<Semaphore>,
+    consumed_grant_capacity: usize,
 }
 
 impl ExecutorManager {
@@ -78,11 +90,37 @@ impl ExecutorManager {
     }
 
     fn with_registry(operation_capacity: usize, registry: ManagerRegistry) -> Arc<Self> {
+        Self::with_registry_and_grant_capacity(
+            operation_capacity,
+            registry,
+            CONSUMED_GRANT_CAPACITY,
+        )
+    }
+
+    fn with_registry_and_grant_capacity(
+        operation_capacity: usize,
+        registry: ManagerRegistry,
+        consumed_grant_capacity: usize,
+    ) -> Arc<Self> {
         assert!(operation_capacity > 0);
+        assert!(consumed_grant_capacity > 0);
         Arc::new(Self {
             registry: Arc::new(Mutex::new(registry)),
             admission: Arc::new(Semaphore::new(operation_capacity)),
+            consumed_grant_capacity,
         })
+    }
+
+    #[cfg(test)]
+    fn with_test_consumed_grant_capacity(
+        operation_capacity: usize,
+        consumed_grant_capacity: usize,
+    ) -> Arc<Self> {
+        Self::with_registry_and_grant_capacity(
+            operation_capacity,
+            ManagerRegistry::default(),
+            consumed_grant_capacity,
+        )
     }
 
     #[cfg(test)]
@@ -128,6 +166,42 @@ impl ExecutorManager {
         execution_id: String,
         cancel: Option<CancellationToken>,
     ) -> Result<ExecutionRegistration, ToolError> {
+        self.register_execution_inner(request_id, execution_id, cancel, None, None)
+    }
+
+    /// Consume the verified grant id in the same manager critical section that
+    /// admits the request/execution identity. A failed admission cannot leave
+    /// a request registered without consuming its grant, and reminting a new
+    /// random token id cannot admit the same grant twice.
+    pub(super) fn register_authorized_execution(
+        self: &Arc<Self>,
+        request_id: String,
+        execution_id: String,
+        cancel: Option<CancellationToken>,
+        authority: VerifiedCallAuthority,
+    ) -> Result<ExecutionRegistration, ToolError> {
+        if authority.request_id() != request_id || authority.execution_id() != execution_id {
+            return Err(ToolError::Protocol(
+                "verified executor authority identity mismatch".to_owned(),
+            ));
+        }
+        self.register_execution_inner(
+            request_id,
+            execution_id,
+            cancel,
+            Some(authority.replay_binding()),
+            Some(authority.expiry()),
+        )
+    }
+
+    fn register_execution_inner(
+        self: &Arc<Self>,
+        request_id: String,
+        execution_id: String,
+        cancel: Option<CancellationToken>,
+        authority_binding: Option<AuthorityReplayBinding>,
+        authority_expiry: Option<VerifiedAuthorityExpiry>,
+    ) -> Result<ExecutionRegistration, ToolError> {
         let mut registry = self.lock_registry()?;
         let execution_digest = rpc_id_digest(&execution_id);
         if let Some(receipt) = registry.completed_execution_receipts.get(&execution_digest) {
@@ -137,7 +211,10 @@ impl ExecutorManager {
                 ));
             }
             return match registry.retained_outcomes.get(&execution_id) {
-                Some(outcome) if outcome.request_id == request_id => {
+                Some(outcome)
+                    if outcome.request_id == request_id
+                        && outcome.authority_binding == authority_binding =>
+                {
                     Ok(ExecutionRegistration::Replay(outcome.result.clone()))
                 }
                 _ => Err(ToolError::Protocol(
@@ -145,15 +222,34 @@ impl ExecutorManager {
                 )),
             };
         }
+        let grant_digest = authority_binding
+            .as_ref()
+            .map(|binding| rpc_id_digest(binding.grant_digest()));
+        if let Some(grant_digest) = grant_digest {
+            if registry.consumed_grants.contains(&grant_digest) {
+                return Err(ToolError::Protocol(
+                    RPC_CALL_AUTHORITY_REPLAY_CODE.to_owned(),
+                ));
+            }
+            if registry.consumed_grants.len() >= self.consumed_grant_capacity {
+                return Err(ToolError::Protocol(
+                    RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE.to_owned(),
+                ));
+            }
+        }
         registry
             .lifecycle
             .begin_execution(&request_id, &execution_id)?;
+        if let Some(grant_digest) = grant_digest {
+            registry.consumed_grants.insert(grant_digest);
+        }
         if registry
             .active
             .insert(
                 execution_id.clone(),
                 ActiveExecution {
                     request_id: request_id.clone(),
+                    authority_binding,
                     cancel: cancel.clone(),
                     cancel_waiters: Vec::new(),
                 },
@@ -170,6 +266,7 @@ impl ExecutorManager {
             request_id,
             execution_id,
             cancel,
+            authority_expiry,
             registered: true,
         }))
     }
@@ -268,6 +365,7 @@ impl ExecutorManager {
                 RetainedOutcome {
                     request_id: request_id.to_owned(),
                     result: result.clone(),
+                    authority_binding: active.authority_binding,
                     encoded_bytes: 0,
                 },
             );
@@ -305,6 +403,7 @@ impl ExecutorManager {
                 RetainedOutcome {
                     request_id: request_id.to_owned(),
                     result: terminal.clone(),
+                    authority_binding: active.authority_binding,
                     encoded_bytes: 0,
                 },
             );
@@ -392,6 +491,7 @@ fn retain_outcome(registry: &mut ManagerRegistry, execution_id: String, outcome:
     let outcome = RetainedOutcome {
         request_id: outcome.request_id,
         result,
+        authority_binding: outcome.authority_binding,
         encoded_bytes: encoded.len(),
     };
     if registry.retained_outcomes.contains_key(&execution_id) {
@@ -442,6 +542,7 @@ pub(super) struct PendingExecution {
     request_id: String,
     execution_id: String,
     cancel: Option<CancellationToken>,
+    authority_expiry: Option<VerifiedAuthorityExpiry>,
     registered: bool,
 }
 
@@ -490,6 +591,7 @@ impl PendingExecution {
             request_id: self.request_id.clone(),
             execution_id: self.execution_id.clone(),
             cancel: self.cancel.clone(),
+            authority_expiry: self.authority_expiry.take(),
             _permit: permit,
             terminal: false,
         })
@@ -523,6 +625,7 @@ pub(super) struct ExecutionLease {
     request_id: String,
     execution_id: String,
     cancel: Option<CancellationToken>,
+    authority_expiry: Option<VerifiedAuthorityExpiry>,
     _permit: OwnedSemaphorePermit,
     terminal: bool,
 }
@@ -530,6 +633,10 @@ pub(super) struct ExecutionLease {
 impl ExecutionLease {
     pub(super) fn cancellation_token(&self) -> Option<CancellationToken> {
         self.cancel.clone()
+    }
+
+    pub(super) fn authority_expiry(&self) -> Option<VerifiedAuthorityExpiry> {
+        self.authority_expiry.clone()
     }
 
     pub(super) fn complete(
@@ -555,6 +662,156 @@ impl Drop for ExecutionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verified_authority(request_id: &str, execution_id: &str) -> VerifiedCallAuthority {
+        verified_authority_for_grant(request_id, execution_id, "manager-grant")
+    }
+
+    fn verified_authority_for_grant(
+        request_id: &str,
+        execution_id: &str,
+        grant_id: &str,
+    ) -> VerifiedCallAuthority {
+        use ed25519_dalek::SigningKey;
+
+        use crate::{
+            runtime::contracts::RpcIdentity,
+            tools::executor::{
+                ExecutorCallAuthorityVerifier, ExecutorOperation,
+                call_authority::{
+                    CallAuthorityPermitClaims, Ed25519CallAuthorityIssuer,
+                    ExecutorAuthorityProvenance, ExecutorInvocationRoute,
+                },
+                call_authority_key_id,
+            },
+        };
+
+        let identity = RpcIdentity::from_wire(
+            "018f47a2-9b3c-7def-8abc-0123456789ab",
+            7,
+            "manager-authority",
+        )
+        .unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let issuer =
+            Ed25519CallAuthorityIssuer::new(call_authority_key_id(), key.clone(), identity.clone())
+                .unwrap();
+        let operation = ExecutorOperation::ListDir {
+            path: ".".to_owned(),
+            execution_id: execution_id.to_owned(),
+        };
+        let signed = issuer
+            .issue_for_test(
+                request_id.to_owned(),
+                operation.clone(),
+                CallAuthorityPermitClaims {
+                    grant_digest: crate::tools::executor::call_authority::test_grant_digest(
+                        grant_id,
+                    ),
+                    bound_evidence_digest: "11".repeat(32),
+                    action_digest: "33".repeat(32),
+                    authorization_projection_digest: "22".repeat(32),
+                    route: ExecutorInvocationRoute::Normal,
+                    resolved_authority: ExecutorAuthorityProvenance::AgentOwn,
+                },
+            )
+            .unwrap();
+        ExecutorCallAuthorityVerifier::new(call_authority_key_id(), key.verifying_key(), identity)
+            .unwrap()
+            .verify(Some(&signed), request_id, &operation)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authority_consumption_and_execution_admission_are_one_manager_decision() {
+        let manager = ExecutorManager::new(1);
+        let authority = verified_authority("authorized-request", "authorized-execution");
+        let registration = manager
+            .register_authorized_execution(
+                "authorized-request".to_owned(),
+                "authorized-execution".to_owned(),
+                None,
+                authority.clone(),
+            )
+            .unwrap();
+        let ExecutionRegistration::Pending(mut pending) = registration else {
+            panic!("first exact authority must admit one execution");
+        };
+        let reminted_authority = verified_authority("authorized-request", "authorized-execution");
+        assert!(matches!(
+            manager.register_authorized_execution(
+                "authorized-request".to_owned(),
+                "authorized-execution".to_owned(),
+                None,
+                reminted_authority,
+            ),
+            Err(ToolError::Protocol(code)) if code == RPC_CALL_AUTHORITY_REPLAY_CODE
+        ));
+        let permit = pending.wait_for_admission().await.unwrap().unwrap();
+        let mut execution = pending.promote(permit).unwrap();
+        let result = Ok(ExecutorResponse::Listed {
+            entries: vec!["alpha".to_owned()],
+        });
+        execution.complete(result.clone()).unwrap();
+        assert!(matches!(
+            manager
+                .register_authorized_execution(
+                    "authorized-request".to_owned(),
+                    "authorized-execution".to_owned(),
+                    None,
+                    authority,
+                )
+                .unwrap(),
+            ExecutionRegistration::Replay(replayed) if replayed == result
+        ));
+    }
+
+    #[test]
+    fn consumed_grant_replay_and_capacity_exhaustion_remain_distinct() {
+        let manager = ExecutorManager::with_test_consumed_grant_capacity(2, 1);
+        let pending = manager
+            .register_authorized_execution(
+                "capacity-request-a".to_owned(),
+                "capacity-execution-a".to_owned(),
+                None,
+                verified_authority_for_grant(
+                    "capacity-request-a",
+                    "capacity-execution-a",
+                    "capacity-grant-a",
+                ),
+            )
+            .expect("first grant fills the test capacity");
+        assert!(matches!(pending, ExecutionRegistration::Pending(_)));
+
+        assert!(matches!(
+            manager.register_authorized_execution(
+                "capacity-request-b".to_owned(),
+                "capacity-execution-b".to_owned(),
+                None,
+                verified_authority_for_grant(
+                    "capacity-request-b",
+                    "capacity-execution-b",
+                    "capacity-grant-b",
+                ),
+            ),
+            Err(ToolError::Protocol(code))
+                if code == RPC_CALL_AUTHORITY_CAPACITY_EXHAUSTED_CODE
+        ));
+        assert!(matches!(
+            manager.register_authorized_execution(
+                "replay-request".to_owned(),
+                "replay-execution".to_owned(),
+                None,
+                verified_authority_for_grant(
+                    "replay-request",
+                    "replay-execution",
+                    "capacity-grant-a",
+                ),
+            ),
+            Err(ToolError::Protocol(code)) if code == RPC_CALL_AUTHORITY_REPLAY_CODE
+        ));
+    }
 
     #[tokio::test]
     async fn connections_share_uniqueness_cancellation_and_outcomes() {
