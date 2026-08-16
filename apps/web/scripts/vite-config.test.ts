@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createDevServerConfig,
+  parseDevAllowedHosts,
   SUMI_COMPOSE_API_ORIGIN,
   SUMI_DEV_API_ORIGIN,
   SUMI_DEV_HOST,
@@ -107,4 +108,25 @@ test("an explicit Tailnet IPv4 binds Vite and its API proxy without widening", (
   assert.equal(directChat.ws, true);
   assert.equal(messaging.target, "http://100.64.0.42:8080");
   assert.equal(messaging.ws, true);
+});
+
+test("extra allowed hosts front the dev server without loosening the host check by default", () => {
+  assert.deepEqual(parseDevAllowedHosts(undefined), []);
+  assert.deepEqual(
+    parseDevAllowedHosts(" desktop-example.tail1234.ts.net , .ts.net "),
+    ["desktop-example.tail1234.ts.net", ".ts.net"],
+  );
+  const bare = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
+  assert.equal("allowedHosts" in bare, false);
+  const fronted = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST, [
+    "desktop-example.tail1234.ts.net",
+  ]);
+  assert.deepEqual(fronted.allowedHosts, ["desktop-example.tail1234.ts.net"]);
+  assert.throws(
+    () =>
+      createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST, [
+        "https://desktop-example.tail1234.ts.net",
+      ]),
+    /plain hostname/,
+  );
 });
