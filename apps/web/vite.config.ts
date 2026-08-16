@@ -30,9 +30,22 @@ function apiProxy(target: string, websocket = false): ProxyOptions {
   };
 }
 
+/**
+ * Extra browser hosts (for example a Tailscale HTTPS name that fronts the dev
+ * server) that Vite must accept in the Host header. Empty means Vite's default
+ * host check, which admits only localhost and the literal listen host.
+ */
+export function parseDevAllowedHosts(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value !== "");
+}
+
 export function createDevServerConfig(
   apiOrigin = SUMI_DEV_API_ORIGIN,
   host = SUMI_DEV_HOST,
+  allowedHosts: readonly string[] = [],
 ): ServerOptions {
   const target = new URL(apiOrigin);
   if (
@@ -47,10 +60,16 @@ export function createDevServerConfig(
       "Sumi dev host must be an explicit literal IPv4 address and API origin must be literal IPv4 or the exact Compose service",
     );
   }
+  for (const allowed of allowedHosts) {
+    if (!/^\.?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(allowed)) {
+      throw new Error(`Sumi dev allowed host is not a plain hostname: ${allowed}`);
+    }
+  }
   return {
     host,
     port: SUMI_DEV_PORT,
     strictPort: true,
+    ...(allowedHosts.length > 0 ? { allowedHosts: [...allowedHosts] } : {}),
     proxy: {
       "/auth": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
@@ -73,5 +92,6 @@ export default defineConfig({
   server: createDevServerConfig(
     process.env.SUMI_DEV_API_ORIGIN?.trim() || SUMI_DEV_API_ORIGIN,
     process.env.SUMI_DEV_HOST?.trim() || SUMI_DEV_HOST,
+    parseDevAllowedHosts(process.env.SUMI_DEV_ALLOWED_HOSTS),
   ),
 });

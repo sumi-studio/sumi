@@ -406,7 +406,25 @@ fi
 [[ "${ACTION}" == "down" || "${VITE_FIREBASE_PROJECT_ID:-sumi-studio}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
   fail "Firebase web and Admin project IDs must match"
 export SUMI_BROWSER_SESSION_AUDIENCE="${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}"
-export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${SUMI_DEV_WEB_ORIGIN}"
+# Optional extra browser origins that front this stack over HTTPS, e.g. a
+# Tailscale Serve name: SUMI_DEV_PUBLIC_ORIGINS="https://desktop-x.tail1234.ts.net".
+# Each must be an exact https origin; the API admits it as a browser origin and
+# Vite accepts its host. Nothing is added when the variable is unset.
+SUMI_DEV_ALLOWED_HOSTS=""
+browser_origins="${SUMI_DEV_WEB_ORIGIN}"
+if [[ -n "${SUMI_DEV_PUBLIC_ORIGINS:-}" ]]; then
+  IFS=',' read -r -a public_origins <<< "${SUMI_DEV_PUBLIC_ORIGINS}"
+  for public_origin in "${public_origins[@]}"; do
+    public_origin="${public_origin// /}"
+    [[ -z "${public_origin}" ]] && continue
+    [[ "${public_origin}" =~ ^https://([A-Za-z0-9.-]+)(:[0-9]{1,5})?$ ]] ||
+      fail "SUMI_DEV_PUBLIC_ORIGINS entries must be exact https origins: ${public_origin}"
+    SUMI_DEV_ALLOWED_HOSTS="${SUMI_DEV_ALLOWED_HOSTS:+${SUMI_DEV_ALLOWED_HOSTS},}${BASH_REMATCH[1]}"
+    browser_origins="${browser_origins},${public_origin}"
+  done
+fi
+export SUMI_DEV_ALLOWED_HOSTS
+export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${browser_origins}"
 export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
 
 # The only mutable compatibility upgrade is complete. Release the advisory

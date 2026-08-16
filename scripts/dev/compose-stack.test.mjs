@@ -380,3 +380,13 @@ async function writeExecutable(path, contents) {
   await writeFile(path, contents, { mode: 0o700 });
   await chmod(path, 0o700);
 }
+
+test("compose-stack admits optional https public origins for the API and Vite host check", async () => {
+  const launcher = await readFile(new URL("./compose-stack", import.meta.url), "utf8");
+  assert.match(launcher, /SUMI_DEV_PUBLIC_ORIGINS/);
+  assert.match(launcher, /\^https:\/\/\(\[A-Za-z0-9\.-\]\+\)/);
+  assert.match(launcher, /export SUMI_DEV_ALLOWED_HOSTS/);
+  assert.match(launcher, /export SUMI_BROWSER_WS_ALLOWED_ORIGINS="\$\{browser_origins\}"/);
+  const compose = await readFile(new URL("../../deploy/local/compose.dev.yaml", import.meta.url), "utf8");
+  assert.match(compose, /SUMI_DEV_ALLOWED_HOSTS: \$\{SUMI_DEV_ALLOWED_HOSTS:-\}/);
+});

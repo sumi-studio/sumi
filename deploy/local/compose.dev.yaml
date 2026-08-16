@@ -259,6 +259,7 @@ services:
       # which Docker has published only on a selected Tailnet address.
       SUMI_DEV_HOST: ${SUMI_DEV_BIND_HOST:-127.0.0.1}
       SUMI_DEV_API_ORIGIN: http://${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080
+      SUMI_DEV_ALLOWED_HOSTS: ${SUMI_DEV_ALLOWED_HOSTS:-}
     # The Vite server binds the selected host/Tailnet address directly.
     depends_on:
       api:
