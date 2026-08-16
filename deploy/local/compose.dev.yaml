@@ -198,6 +198,7 @@ services:
       # Keep lazily provisioned agent containers on the same selected image
       # tag as the local control plane. The default remains latest.
       SUMI_AGENT_IMAGE_TAG: ${SUMI_AGENT_IMAGE_TAG:-latest}
+      SUMI_AGENT_IMAGE_PULL_POLICY: ${SUMI_AGENT_IMAGE_PULL_POLICY:-always}
       # Passed only to the supervisor's non-secret activation descriptor.
       # Empty keeps the agent default; local diagnostics may set a bounded
       # tracing filter without rebuilding the API.
