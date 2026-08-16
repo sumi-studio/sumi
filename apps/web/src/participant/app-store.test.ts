@@ -132,6 +132,36 @@ describe("Participant app lifecycle store", () => {
     expect(installsFinished).toEqual(["notes", "tasks"]);
   });
 
+  it("serializes lifecycle effects across documents with a storage lease when Web Locks are missing", async () => {
+    // Two coordinators = two tabs sharing one localStorage and no Web Locks.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("localStorage", memoryStorage());
+    vi.stubGlobal("BroadcastChannel", undefined);
+    const tabA = createBrowserLifecycleCoordinator();
+    const tabB = createBrowserLifecycleCoordinator();
+    const order: string[] = [];
+    let releaseA: () => void = () => {};
+    const aRunning = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const a = tabA.runExclusive("owner", async () => {
+      order.push("a:start");
+      await aRunning;
+      order.push("a:end");
+    });
+    // Let tab A settle its lease before tab B tries.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const b = tabB.runExclusive("owner", async () => {
+      order.push("b:start");
+      order.push("b:end");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(order).toEqual(["a:start"]);
+    releaseA();
+    await Promise.all([a, b]);
+    expect(order).toEqual(["a:start", "a:end", "b:start", "b:end"]);
+  });
+
   it("continues to use Web Locks when they are available", async () => {
     const locks = {
       request: vi.fn(
