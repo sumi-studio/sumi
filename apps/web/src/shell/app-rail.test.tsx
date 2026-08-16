@@ -66,6 +66,7 @@ afterEach(() => {
     installations: [],
     errorCode: null,
     mutation: null,
+    coordination: "document-only",
   });
 });
 
@@ -79,6 +80,7 @@ describe("AppRail settings", () => {
           humanId: "01913f5e-7b8a-7abc-8def-0123456789ab",
         },
       },
+      coordination: "document-only",
       status: "ready",
       catalog: [
         {

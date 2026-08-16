@@ -15,6 +15,7 @@ import type {
 import { appOwnerKey, isOwnedBy } from "../workspace/model";
 
 export type ParticipantAppStatus = "idle" | "loading" | "ready" | "error";
+export type ParticipantAppCoordination = "web-locks" | "document-only";
 
 /**
  * Participant-owned app lifecycle.
@@ -33,6 +34,8 @@ export interface ParticipantAppState {
   installations: AppInstallation[];
   errorCode: string | null;
   mutation: string | null;
+  /** Web Locks serialize across documents; document-only is this tab only. */
+  coordination: ParticipantAppCoordination;
 
   bindParticipant(participant: ParticipantRef | null): Promise<void>;
   refresh(): Promise<void>;
@@ -107,6 +110,8 @@ export type ParticipantAppLifecycleSignal =
     };
 
 export interface ParticipantAppLifecycleCoordinator {
+  /** @internal The coordinator's serialization scope. */
+  coordination?: ParticipantAppCoordination;
   runExclusive<T>(ownerKey: string, operation: () => Promise<T>): Promise<T>;
   publishMutation(notice: ParticipantAppLifecycleNotice): void;
   pendingMutation(ownerKey: string): ParticipantAppLifecyclePending;
@@ -121,22 +126,32 @@ const participantAppLifecycleLockPrefix =
   "sumi:participant-app-lifecycle:owner:";
 const participantAppLifecycleStoragePrefix =
   "sumi:participant-app-lifecycle:unsettled:";
+let warnedAboutDocumentOnlyCoordination = false;
+
+function runDocumentExclusive<T>(
+  tails: Map<string, Promise<void>>,
+  lockName: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = tails.get(lockName) ?? Promise.resolve();
+  const result = previous.then(operation, operation);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  tails.set(lockName, tail);
+  void tail.finally(() => {
+    if (tails.get(lockName) === tail) tails.delete(lockName);
+  });
+  return result;
+}
 
 function createIsolatedLifecycleCoordinator(): ParticipantAppLifecycleCoordinator {
   const tails = new Map<string, Promise<void>>();
   return {
+    coordination: "document-only",
     runExclusive<T>(ownerKey: string, operation: () => Promise<T>) {
-      const previous = tails.get(ownerKey) ?? Promise.resolve();
-      const result = previous.then(operation, operation);
-      const tail = result.then(
-        () => undefined,
-        () => undefined,
-      );
-      tails.set(ownerKey, tail);
-      void tail.finally(() => {
-        if (tails.get(ownerKey) === tail) tails.delete(ownerKey);
-      });
-      return result;
+      return runDocumentExclusive(tails, ownerKey, operation);
     },
     publishMutation() {},
     pendingMutation() {
@@ -151,7 +166,8 @@ function createIsolatedLifecycleCoordinator(): ParticipantAppLifecycleCoordinato
   };
 }
 
-function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator {
+/** @internal Exported so browser capability fallbacks can be regression-tested. */
+export function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator {
   const mutationListeners = new Set<
     (signal: ParticipantAppLifecycleSignal) => void
   >();
@@ -162,6 +178,20 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
     typeof globalThis.BroadcastChannel === "function"
       ? new globalThis.BroadcastChannel(participantAppLifecycleChannel)
       : null;
+  const locks = globalThis.navigator?.locks;
+  const coordination: ParticipantAppCoordination = locks
+    ? "web-locks"
+    : "document-only";
+  const documentTails = new Map<string, Promise<void>>();
+  if (
+    coordination === "document-only" &&
+    !warnedAboutDocumentOnlyCoordination
+  ) {
+    warnedAboutDocumentOnlyCoordination = true;
+    console.warn(
+      "Participant app cross-tab coordination is disabled because Web Locks is unavailable",
+    );
+  }
 
   const emitMutation = (signal: ParticipantAppLifecycleSignal) => {
     if (!("operationId" in signal)) {
@@ -226,36 +256,38 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
     if (globalThis.document.visibilityState === "visible") emitResume();
   });
 
-  const requireCoordination = () => {
-    const locks = globalThis.navigator?.locks;
+  const requireStorage = () => {
     let storage: Storage | null = null;
     try {
       storage = globalThis.localStorage;
     } catch {
       // Access can be denied even when the property exists.
     }
-    if (!channel || !locks || !storage) {
+    if (!storage) {
       throw new Error(
-        "Participant app cross-document coordination is unavailable",
+        "Participant app lifecycle durable storage is unavailable",
       );
     }
-    return { channel, locks, storage };
+    return storage;
   };
 
   const storageKey = (ownerKey: string) =>
     `${participantAppLifecycleStoragePrefix}${encodeURIComponent(ownerKey)}`;
 
   return {
+    coordination,
     runExclusive<T>(ownerKey: string, operation: () => Promise<T>) {
-      const { locks } = requireCoordination();
-      return locks.request(
-        `${participantAppLifecycleLockPrefix}${ownerKey}`,
-        { mode: "exclusive" },
-        operation,
-      );
+      // The journal is the durable hand-off point for lifecycle effects, so
+      // no read or write can proceed if it is unavailable. Web Locks merely
+      // widens serialization from this document to all same-origin documents.
+      requireStorage();
+      const lockName = `${participantAppLifecycleLockPrefix}${ownerKey}`;
+      return locks
+        ? locks.request(lockName, { mode: "exclusive" }, operation)
+        : runDocumentExclusive(documentTails, lockName, operation);
     },
     publishMutation(notice: ParticipantAppLifecycleNotice) {
-      const { channel: availableChannel, storage } = requireCoordination();
+      const storage = requireStorage();
       const key = storageKey(notice.ownerKey);
       if (notice.phase === "unsettled") {
         const current = readLifecycleJournal(storage, notice.ownerKey, key);
@@ -278,10 +310,10 @@ function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoordinator
           storage.removeItem(key);
         }
       }
-      availableChannel.postMessage(notice);
+      channel?.postMessage(notice);
     },
     pendingMutation(ownerKey: string) {
-      const { storage } = requireCoordination();
+      const storage = requireStorage();
       return readLifecycleJournal(storage, ownerKey, storageKey(ownerKey));
     },
     subscribeMutations(
@@ -533,6 +565,7 @@ export function createParticipantAppStore(
   } | null = null;
 
   return create<ParticipantAppState>((set, get) => {
+    const coordination = lifecycleCoordinator.coordination ?? "document-only";
     const currentAuthority = (): OwnerAuthorityToken => {
       const owner = get().owner;
       if (!owner) throw new Error("Participant app owner is not bound");
@@ -867,6 +900,7 @@ export function createParticipantAppStore(
       installations: [],
       errorCode: null,
       mutation: null,
+      coordination,
 
       async bindParticipant(participant) {
         if (!participant) {

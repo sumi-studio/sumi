@@ -48,6 +48,7 @@ beforeEach(() => {
     installations: [],
     errorCode: null,
     mutation: null,
+    coordination: "web-locks",
     installApp: mocks.installApp,
     setInstallationState: mocks.setInstallationState,
     uninstallApp: mocks.uninstallApp,
@@ -108,5 +109,20 @@ describe("ParticipantAppsMenu", () => {
       );
       expect(mocks.uninstallApp).toHaveBeenCalledWith(INSTALLATION_ID);
     });
+  });
+
+  it("shows the store failure reason when no Participant app catalog is available", async () => {
+    useParticipantApps.setState({
+      status: "error",
+      catalog: [],
+      installations: [],
+      errorCode: "Participant app lifecycle durable storage is unavailable",
+    });
+    render(<ParticipantAppsMenu />);
+    fireEvent.click(screen.getByRole("button", { name: "個人用アプリ" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Participant app lifecycle durable storage is unavailable",
+    );
   });
 });
