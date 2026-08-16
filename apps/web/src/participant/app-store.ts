@@ -146,6 +146,81 @@ function runDocumentExclusive<T>(
   return result;
 }
 
+const participantAppLifecycleLeaseTtlMs = 15_000;
+const participantAppLifecycleLeaseSettleMs = 30;
+const participantAppLifecycleLeaseWaitMs = 10_000;
+const participantAppLifecycleLeaseHolder = `${Date.now().toString(36)}-${Math.random()
+  .toString(36)
+  .slice(2, 10)}`;
+
+/**
+ * Cross-document serialization when Web Locks are unavailable: an expiring
+ * lease in localStorage, claimed with a claim-then-recheck round so two
+ * documents that both saw an absent lease do not both proceed. It is weaker
+ * than a real lock (storage writes are not atomic across tabs) but closes the
+ * window in which the durable journal could be overwritten by another tab.
+ */
+async function withStorageLease<T>(
+  storage: Storage,
+  lockName: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = `${lockName}:lease`;
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const readHolder = (): { holder: string; expiresAt: number } | null => {
+    try {
+      const raw = storage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as {
+        holder?: unknown;
+        expiresAt?: unknown;
+      };
+      if (
+        typeof parsed.holder !== "string" ||
+        typeof parsed.expiresAt !== "number"
+      ) {
+        return null;
+      }
+      return { holder: parsed.holder, expiresAt: parsed.expiresAt };
+    } catch {
+      return null;
+    }
+  };
+  const claim = () =>
+    storage.setItem(
+      key,
+      JSON.stringify({
+        holder: participantAppLifecycleLeaseHolder,
+        expiresAt: Date.now() + participantAppLifecycleLeaseTtlMs,
+      }),
+    );
+  const deadline = Date.now() + participantAppLifecycleLeaseWaitMs;
+  for (;;) {
+    const current = readHolder();
+    if (!current || current.expiresAt <= Date.now()) {
+      claim();
+      await sleep(participantAppLifecycleLeaseSettleMs);
+      if (readHolder()?.holder === participantAppLifecycleLeaseHolder) break;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "Participant app lifecycle is busy in another tab; retry shortly",
+      );
+    }
+    await sleep(50 + Math.floor(Math.random() * 100));
+  }
+  const renew = setInterval(claim, participantAppLifecycleLeaseTtlMs / 3);
+  try {
+    return await operation();
+  } finally {
+    clearInterval(renew);
+    if (readHolder()?.holder === participantAppLifecycleLeaseHolder) {
+      storage.removeItem(key);
+    }
+  }
+}
+
 function createIsolatedLifecycleCoordinator(): ParticipantAppLifecycleCoordinator {
   const tails = new Map<string, Promise<void>>();
   return {
@@ -280,11 +355,13 @@ export function createBrowserLifecycleCoordinator(): ParticipantAppLifecycleCoor
       // The journal is the durable hand-off point for lifecycle effects, so
       // no read or write can proceed if it is unavailable. Web Locks merely
       // widens serialization from this document to all same-origin documents.
-      requireStorage();
+      const storage = requireStorage();
       const lockName = `${participantAppLifecycleLockPrefix}${ownerKey}`;
       return locks
         ? locks.request(lockName, { mode: "exclusive" }, operation)
-        : runDocumentExclusive(documentTails, lockName, operation);
+        : runDocumentExclusive(documentTails, lockName, () =>
+            withStorageLease(storage, lockName, operation),
+          );
     },
     publishMutation(notice: ParticipantAppLifecycleNotice) {
       const storage = requireStorage();
