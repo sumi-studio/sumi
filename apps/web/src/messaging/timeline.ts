@@ -15,6 +15,8 @@ export interface PendingMessage {
   mentions: Message["mentions"];
   urgency: Urgency;
   replyTo: string | null;
+  /** upload済みの受領。送信者の順序で、楽観的描画にそのまま出す。 */
+  attachments: Message["attachments"];
   createdAt: number;
   /** 送信失敗。UIは再送を促し、再送は同じclientNonceで冪等に行う。 */
   failed?: boolean;
@@ -209,6 +211,7 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         mentions: entry.mentions,
         urgency: entry.urgency,
         reactions: [],
+        attachments: entry.attachments,
         replyTo: entry.replyTo,
         createdAt: entry.createdAt,
         editedAt: null,

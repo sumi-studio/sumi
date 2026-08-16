@@ -98,6 +98,7 @@ describe("ApiMessagingBackend", () => {
         urgency: "normal",
         replyTo: null,
         clientNonce: "nonce-1",
+        attachments: [],
       }),
     ).resolves.toEqual({
       clientNonce: "nonce-1",

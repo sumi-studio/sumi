@@ -71,6 +71,33 @@ export interface ReactionMutationResult {
   reactions: ReactionSummary[];
 }
 
+/** 1ファイルの上限（20 MiB）と1メッセージあたりの添付数。サーバーと同じ値。 */
+export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+
+/**
+ * メッセージが運ぶファイル。bytesは含まず、`MessagingBackend.attachmentURL`から
+ * 現在のexact scopeで再認可された上で取りに行く。mimeはサーバーがバイト先頭を
+ * sniffして決めた値で、inline表示できる画像型はサーバー側の許可リストに従う。
+ */
+export interface Attachment {
+  attachmentId: string;
+  filename: string;
+  mime: string;
+  sizeBytes: number;
+  sha256: string;
+  position: number;
+}
+
+export function isInlineImageMime(mime: string): boolean {
+  return (
+    mime === "image/png" ||
+    mime === "image/jpeg" ||
+    mime === "image/gif" ||
+    mime === "image/webp"
+  );
+}
+
 export interface Message {
   messageId: string;
   place: Place;
@@ -82,6 +109,8 @@ export interface Message {
   mentions: ParticipantRef[];
   urgency: Urgency;
   reactions: ReactionSummary[];
+  /** 送信者が選んだ順序。tombstoneでは空。 */
+  attachments: Attachment[];
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -234,6 +263,24 @@ export interface SendMessageInput {
   replyTo: string | null;
   /** 必須のidempotency key。再送しても二重投稿にならない。 */
   clientNonce: string;
+  /** upload済みattachmentのIDを送信者の順序で。contentが空でも1件あれば送れる。 */
+  attachments: string[];
+}
+
+export interface UploadAttachmentInput {
+  place: Place;
+  /** ファイルごとに安定なnonce。再送は同じ受領を返す。 */
+  clientNonce: string;
+  filename: string;
+  /** ブラウザのMIME候補。サーバーはバイトを見て決め直す。 */
+  contentType: string;
+  body: Blob;
+  signal?: AbortSignal;
+}
+
+export interface UploadAttachmentReceipt {
+  attachment: Attachment;
+  created: boolean;
 }
 
 /** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
@@ -290,6 +337,15 @@ export interface MessagingBackend {
   createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
   updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
+  /** メッセージより先にbytesを預ける。受領したIDをsendMessageのattachmentsへ。 */
+  uploadAttachment(
+    input: UploadAttachmentInput,
+  ): Promise<UploadAttachmentReceipt>;
+  /**
+   * 現在のexact scopeで再認可されるbytes取得URL。<img src>と<a download>が
+   * そのまま使う。scopeが変われば別のURLになる。
+   */
+  attachmentURL(attachmentId: string): string;
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;

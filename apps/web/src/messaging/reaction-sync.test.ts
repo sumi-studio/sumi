@@ -586,6 +586,7 @@ function message(
     mentions: [],
     urgency: "normal",
     reactions: [],
+    attachments: [],
     replyTo: null,
     createdAt: 1,
     editedAt,
@@ -690,6 +691,12 @@ class StubBackend implements MessagingBackend {
     replyLaterMarkers: [],
   }));
 
+  async uploadAttachment(): Promise<never> {
+    throw new Error("uploadAttachment is not part of this test");
+  }
+  attachmentURL(attachmentId: string): string {
+    return `/test/attachments/${attachmentId}`;
+  }
   sendMessage = vi.fn();
   editMessage = vi.fn(async () => undefined);
   deleteMessage = vi.fn(async () => undefined);

@@ -68,6 +68,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
+	mux.HandleFunc("POST /messaging/places/{place_id}/attachments", s.serveUploadAttachment)
+	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
 }
 
 // --- wire shapes (snake_case, ActorRef/PlaceRef-compatible) ---
@@ -142,6 +144,7 @@ type messageWire struct {
 	Mentions    []participantWire `json:"mentions"`
 	Urgency     string            `json:"urgency"`
 	Reactions   []reactionWire    `json:"reactions"`
+	Attachments []attachmentWire  `json:"attachments"`
 	ReplyTo     *string           `json:"reply_to"`
 	ClientNonce string            `json:"client_nonce"`
 	CreatedAt   time.Time         `json:"created_at"`
@@ -214,6 +217,7 @@ func messageToWire(place Place, m Message) messageWire {
 		Mentions:    participantsToWire(m.Mentions),
 		Urgency:     m.Urgency,
 		Reactions:   reactionsToWire(m.Reactions),
+		Attachments: attachmentsToWire(m.Attachments),
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
@@ -904,26 +908,17 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Content     string `json:"content"`
-		Urgency     string `json:"urgency"`
-		ReplyTo     string `json:"reply_to"`
-		ClientNonce string `json:"client_nonce"`
+		Content     string   `json:"content"`
+		Urgency     string   `json:"urgency"`
+		ReplyTo     string   `json:"reply_to"`
+		ClientNonce string   `json:"client_nonce"`
+		Attachments []string `json:"attachments"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	switch req.Urgency {
-	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_urgency")
-		return
-	}
-	if req.Content == "" || !messageContentFitsStorage(req.Content) {
-		writeError(w, http.StatusBadRequest, "invalid_content")
-		return
-	}
-	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+	if code := validateSendRequest(req.Content, req.Urgency, req.ClientNonce, req.Attachments); code != "" {
+		writeError(w, http.StatusBadRequest, code)
 		return
 	}
 	store := scopedStoreForRequest(r)
@@ -941,6 +936,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		msg, created, opErr = store.AppendMessage(r.Context(), AppendInput{
 			PlaceID: placeID, Author: viewer, Content: req.Content,
 			Urgency: req.Urgency, ReplyTo: req.ReplyTo, ClientNonce: req.ClientNonce,
+			AttachmentIDs: req.Attachments,
 		})
 		return opErr
 	})
@@ -960,6 +956,32 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		publishMessageCreated(r.Context(), store, s.Hub, place, msg)
 	}
 	writeJSON(w, status, messageReceiptToWire(msg, created))
+}
+
+// validateSendRequest is the transport-shape check shared by the browser and
+// PA send routes. It returns the error code, or "" when the shape is valid.
+// Attachment-only messages are legitimate; empty and attachment-less is not.
+func validateSendRequest(content, urgency, clientNonce string, attachments []string) string {
+	switch urgency {
+	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
+	default:
+		return "invalid_urgency"
+	}
+	if (content == "" && len(attachments) == 0) || !messageContentFitsStorage(content) {
+		return "invalid_content"
+	}
+	if len(attachments) > MaxAttachmentsPerMessage {
+		return "too_many_attachments"
+	}
+	for _, id := range attachments {
+		if !validAttachmentID(id) {
+			return "invalid_attachment"
+		}
+	}
+	if clientNonce == "" || len(clientNonce) > 128 {
+		return "invalid_client_nonce"
+	}
+	return ""
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
@@ -1365,6 +1387,24 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "message_deleted")
 	case errors.Is(err, ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, "idempotency_conflict")
+	case errors.Is(err, ErrAttachmentNotFound):
+		writeError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, ErrAttachmentTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+	case errors.Is(err, ErrAttachmentSizeMismatch):
+		writeError(w, http.StatusBadRequest, "attachment_size_mismatch")
+	case errors.Is(err, ErrAttachmentQuotaExceeded):
+		writeError(w, http.StatusInsufficientStorage, "attachment_quota_exceeded")
+	case errors.Is(err, ErrAttachmentDraftLimit):
+		writeError(w, http.StatusConflict, "attachment_draft_limit")
+	case errors.Is(err, ErrAttachmentUploadConflict):
+		writeError(w, http.StatusConflict, "attachment_upload_conflict")
+	case errors.Is(err, ErrAttachmentUploadExpired):
+		writeError(w, http.StatusGone, "attachment_upload_expired")
+	case errors.Is(err, ErrTooManyAttachments):
+		writeError(w, http.StatusBadRequest, "too_many_attachments")
+	case errors.Is(err, ErrAttachmentsUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
 	case errors.Is(err, ErrSeqBeyondLatest):
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	case errors.Is(err, ErrNotAChannel):

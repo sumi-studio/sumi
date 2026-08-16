@@ -2,7 +2,11 @@ package messaging
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -23,7 +27,29 @@ const (
 	// uses for a Human. This adapter route does not itself define which agent
 	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
+	// LocalUploadAttachmentPattern is the PAID-local raw-body upload route. The
+	// exact Messaging scope travels in headers because the body is the file.
+	LocalUploadAttachmentPattern = "/local-control/v1/messaging/places/{place_id}/attachments"
+	// LocalAttachmentPath returns the bytes of one attachment the agent can
+	// currently see, bounded by MaxLocalAttachmentFetchBytes.
+	LocalAttachmentPath = "/local-control/v1/messaging:attachment"
+
+	LocalScopeWorkspaceHeader      = "X-Sumi-Workspace-Id"
+	LocalScopeInstallationHeader   = "X-Sumi-Installation-Id"
+	LocalScopeAuthorityEpochHeader = "X-Sumi-Authority-Epoch"
 )
+
+// MaxLocalAttachmentFetchBytes bounds what the local control lane returns for
+// one attachment read. The agent reads an attachment to look at it, not to
+// archive it, so the useful bound is much smaller than the upload limit. A
+// larger attachment is refused by size, never truncated.
+const MaxLocalAttachmentFetchBytes int64 = 2 << 20
+
+// LocalUploadAttachmentPath returns the concrete PAID-local upload endpoint
+// for one place.
+func LocalUploadAttachmentPath(placeID string) string {
+	return "/local-control/v1/messaging/places/" + url.PathEscape(placeID) + "/attachments"
+}
 
 // maxRelativeMinutes bounds every relative duration the agent lane accepts.
 // The agent names durations ("30分後に"), not wall-clock instants, so the
@@ -48,13 +74,14 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
+		{"POST " + LocalAttachmentPath, s.localAttachment},
 	}
 	for _, route := range routes {
 		if err := control.RegisterAuthorizedRoute(route.pattern, route.handler); err != nil {
 			return err
 		}
 	}
-	return nil
+	return control.RegisterStagedAuthorizedRoute("POST "+LocalUploadAttachmentPattern, s.localUploadAttachment)
 }
 
 func localViewer(authorization agentevents.LocalRuntimeAuthorization) ParticipantRef {
@@ -196,30 +223,24 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		localScopeWire
-		PlaceID     string  `json:"place_id"`
-		Content     string  `json:"content"`
-		Urgency     string  `json:"urgency"`
-		ReplyTo     *string `json:"reply_to,omitempty"`
-		ClientNonce string  `json:"client_nonce"`
+		PlaceID     string   `json:"place_id"`
+		Content     string   `json:"content"`
+		Urgency     string   `json:"urgency"`
+		ReplyTo     *string  `json:"reply_to,omitempty"`
+		ClientNonce string   `json:"client_nonce"`
+		Attachments []string `json:"attachments,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	switch request.Urgency {
-	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_urgency")
-		return
-	}
 	// Reject an invalid mutation before scope authorization or storage. A
 	// rejected write must not allocate a sequence or create a durable row.
-	if request.PlaceID == "" || request.Content == "" ||
-		!messageContentFitsStorage(request.Content) {
+	if request.PlaceID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
-	if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+	if code := validateSendRequest(request.Content, request.Urgency, request.ClientNonce, request.Attachments); code != "" {
+		writeError(w, http.StatusBadRequest, code)
 		return
 	}
 	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
@@ -238,6 +259,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	message, created, err := store.AppendMessage(r.Context(), AppendInput{
 		PlaceID: request.PlaceID, Content: request.Content,
 		Urgency: request.Urgency, ReplyTo: replyTo, ClientNonce: request.ClientNonce,
+		AttachmentIDs: request.Attachments,
 	})
 	if err != nil {
 		writeStoreError(w, err)
@@ -514,4 +536,148 @@ func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, author
 		Place       placeWire `json:"place"`
 		LastReadSeq int64     `json:"last_read_seq"`
 	}{placeToWire(place), lastRead})
+}
+
+// localScopeFromHeaders reads the exact Messaging scope for a raw-body route.
+// Every header must be present exactly once; the epoch must be a canonical
+// positive int64.
+func localScopeFromHeaders(r *http.Request) (localScopeWire, bool) {
+	var scope localScopeWire
+	for header, target := range map[string]*localRequiredString{
+		LocalScopeWorkspaceHeader:    &scope.WorkspaceID,
+		LocalScopeInstallationHeader: &scope.InstallationID,
+	} {
+		values := r.Header.Values(header)
+		if len(values) != 1 || values[0] == "" {
+			return localScopeWire{}, false
+		}
+		target.value, target.seen = values[0], true
+	}
+	epochValues := r.Header.Values(LocalScopeAuthorityEpochHeader)
+	if len(epochValues) != 1 {
+		return localScopeWire{}, false
+	}
+	epoch, ok := parseCanonicalAuthorityEpoch(epochValues[0])
+	if !ok {
+		return localScopeWire{}, false
+	}
+	scope.AuthorityEpoch = localAuthorityEpoch(epoch)
+	return scope, true
+}
+
+// localUploadAttachment accepts bytes the runtime already obtained through
+// its signed executor source operation. Messaging owns upload persistence
+// and visibility from this application boundary; the runtime supplies only
+// the exact scope, the per-file nonce, and the body. The shared upload state
+// machine reacquires the exact runtime authorization epoch for both the
+// reservation and the finalization, while the body streams without any lease.
+func (s *Server) localUploadAttachment(
+	w http.ResponseWriter,
+	r *http.Request,
+	authorization agentevents.LocalRuntimeAuthorization,
+	release func(),
+	admit agentevents.LocalAuthorizationAdmission,
+) {
+	scope, ok := localScopeFromHeaders(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return
+	}
+	store, ok := s.localBoundStore(w, authorization, scope)
+	if !ok {
+		return
+	}
+	if !store.Store.AttachmentsEnabled() {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	req, err := parseAttachmentUploadRequest(r, r.PathValue("place_id"))
+	if err != nil {
+		writeAttachmentUploadError(w, err)
+		return
+	}
+	// The initial lease is released before any body byte is read; every
+	// durable phase below readmits the exact epoch that authenticated us.
+	release()
+	body := http.MaxBytesReader(w, r.Body, MaxAttachmentBytes)
+	att, created, admitted, err := uploadAttachment(
+		r.Context(), store, req,
+		attachmentUploadAdmission(admit),
+		func() error { return setAttachmentUploadDeadlines(w) },
+		body,
+	)
+	if err != nil {
+		writeAttachmentUploadError(w, err)
+		return
+	}
+	if !admitted {
+		writeLocalUnauthorized(w)
+		return
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, attachmentUploadWire{attachmentToWire(att), created})
+}
+
+func writeLocalUnauthorized(w http.ResponseWriter) {
+	writeError(w, http.StatusUnauthorized, "invalid_authorization")
+}
+
+// localAttachment gives a PersonalityAgent the bytes of an attachment it can
+// currently see. The request binds the exact place and message the agent's
+// view showed the attachment on; a mismatch is not-found, never a hint. The
+// read goes through the same AttachmentForViewer rule the browser download
+// uses and is bounded by MaxLocalAttachmentFetchBytes.
+func (s *Server) localAttachment(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		PlaceID      string `json:"place_id"`
+		MessageID    string `json:"message_id"`
+		AttachmentID string `json:"attachment_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.MessageID == "" || !validAttachmentID(request.AttachmentID) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	if !store.Store.AttachmentsEnabled() {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	att, err := store.AttachmentForViewer(r.Context(), request.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if att.PlaceID != request.PlaceID || att.MessageID == "" || att.MessageID != request.MessageID {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if att.SizeBytes > MaxLocalAttachmentFetchBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	}
+	blob, err := store.Store.blobs.Open(att.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	defer blob.Close()
+	writeAttachmentHeaders(w.Header(), att)
+	// The bytes are delivered as an opaque body regardless of MIME; the agent
+	// renders from the declared type, never by sniffing.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(att.SizeBytes, 10))
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.CopyN(w, blob, att.SizeBytes); err != nil && !errors.Is(err, io.EOF) {
+		return
+	}
 }

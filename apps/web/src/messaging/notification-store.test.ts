@@ -114,6 +114,12 @@ class StubBackend implements MessagingBackend {
   > {
     throw new Error("unused");
   }
+  async uploadAttachment(): Promise<never> {
+    throw new Error("uploadAttachment is not part of this test");
+  }
+  attachmentURL(attachmentId: string): string {
+    return `/test/attachments/${attachmentId}`;
+  }
   async sendMessage() {
     return {
       clientNonce: "notification-test",
@@ -185,6 +191,7 @@ function incoming(overrides: Partial<Message> = {}): Message {
     mentions: [],
     urgency: "normal",
     reactions: [],
+    attachments: [],
     replyTo: null,
     createdAt: 1,
     editedAt: null,

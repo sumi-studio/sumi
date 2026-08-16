@@ -172,7 +172,12 @@ type LocalControlServer struct {
 	tokenTTL                time.Duration
 	now                     func() time.Time
 	extensionMu             sync.RWMutex
-	extensions              map[string]LocalAuthorizedHandler
+	extensions              map[string]localControlExtension
+}
+
+type localControlExtension struct {
+	handler       LocalAuthorizedHandler
+	stagedHandler LocalStagedAuthorizedHandler
 }
 
 // LocalAuthorizedHandler is an extension mounted on the PAID-bound local
@@ -181,20 +186,54 @@ type LocalControlServer struct {
 // handler returns.
 type LocalAuthorizedHandler func(http.ResponseWriter, *http.Request, LocalRuntimeAuthorization)
 
+// LocalAuthorizationAdmission reacquires the exact PAID/process epoch that
+// authenticated a staged request and holds its read lease only while op runs.
+// It returns admitted=false after a replacement or removal. Application code
+// uses it around short preflight/finalization mutations, never body or blob
+// I/O.
+type LocalAuthorizationAdmission func(op func() error) (admitted bool, err error)
+
+// LocalStagedAuthorizedHandler is for bounded requests whose body or external
+// I/O must not pin a runtime authorization generation. The handler starts with
+// the usual lease held so it can perform an application preflight, then calls
+// release before consuming the body. Every durable mutation must subsequently
+// run through admit, which accepts only the exact original authorization
+// epoch.
+type LocalStagedAuthorizedHandler func(
+	http.ResponseWriter,
+	*http.Request,
+	LocalRuntimeAuthorization,
+	func(),
+	LocalAuthorizationAdmission,
+)
+
 // RegisterAuthorizedRoute adds one authenticated local-control extension.
 func (s *LocalControlServer) RegisterAuthorizedRoute(pattern string, handler LocalAuthorizedHandler) error {
 	if s == nil || handler == nil || pattern == "" {
 		return errors.New("local control authorized route is invalid")
 	}
+	return s.registerExtension(pattern, localControlExtension{handler: handler})
+}
+
+// RegisterStagedAuthorizedRoute adds an authenticated extension that can
+// release its initial epoch lease while it performs bounded body or blob I/O.
+func (s *LocalControlServer) RegisterStagedAuthorizedRoute(pattern string, handler LocalStagedAuthorizedHandler) error {
+	if s == nil || handler == nil || pattern == "" {
+		return errors.New("local control staged authorized route is invalid")
+	}
+	return s.registerExtension(pattern, localControlExtension{stagedHandler: handler})
+}
+
+func (s *LocalControlServer) registerExtension(pattern string, extension localControlExtension) error {
 	s.extensionMu.Lock()
 	defer s.extensionMu.Unlock()
 	if s.extensions == nil {
-		s.extensions = make(map[string]LocalAuthorizedHandler)
+		s.extensions = make(map[string]localControlExtension)
 	}
 	if _, exists := s.extensions[pattern]; exists {
 		return errors.New("local control authorized route is already registered")
 	}
-	s.extensions[pattern] = handler
+	s.extensions[pattern] = extension
 	return nil
 }
 
@@ -571,6 +610,32 @@ func (r *localRuntimeAuthorizationRegistry) remove(personalityAgentID string) {
 	delete(r.byPAID, personalityAgentID)
 }
 
+// admitExact runs op under the registry read lock only if the exact
+// authorization that authenticated a staged request is still the current one
+// for its PAID. A replaced or removed epoch reports admitted=false.
+func (r *localRuntimeAuthorizationRegistry) admitExact(
+	expected LocalRuntimeAuthorization,
+	op func() error,
+) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	current, exists := r.byPAID[expected.PersonalityAgentID]
+	if !exists || !localRuntimeAuthorizationsEqual(current, expected) {
+		return false, nil
+	}
+	return true, op()
+}
+
+func localRuntimeAuthorizationsEqual(left, right LocalRuntimeAuthorization) bool {
+	return bearerTokensEqual(left.BearerToken, right.BearerToken) &&
+		left.TenantID == right.TenantID &&
+		left.PersonalityAgentID == right.PersonalityAgentID &&
+		left.Generation == right.Generation &&
+		left.RPCBootNonce == right.RPCBootNonce &&
+		left.Audience == right.Audience &&
+		left.DeliveryAuthorization == right.DeliveryAuthorization
+}
+
 func (r *localRuntimeAuthorizationRegistry) acquire(
 	bearerToken string,
 	boundPersonalityAgentID string,
@@ -603,15 +668,30 @@ func (s *LocalControlServer) RegisterRoutes(mux *http.ServeMux) error {
 	mux.HandleFunc("POST "+LocalRuntimeStatePublishPath, s.handleRuntimeStatePublish)
 	s.extensionMu.RLock()
 	defer s.extensionMu.RUnlock()
-	for pattern, handler := range s.extensions {
-		handler := handler
+	for pattern, extension := range s.extensions {
+		extension := extension
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 			authorization, release, ok := s.authorize(w, r)
 			if !ok {
 				return
 			}
-			defer release()
-			handler(w, r, authorization)
+			var releaseOnce sync.Once
+			releaseInitial := func() { releaseOnce.Do(release) }
+			defer releaseInitial()
+			if extension.stagedHandler != nil {
+				extension.stagedHandler(
+					w,
+					r,
+					authorization,
+					releaseInitial,
+					func(op func() error) (bool, error) {
+						releaseInitial()
+						return s.authorizations.admitExact(authorization, op)
+					},
+				)
+				return
+			}
+			extension.handler(w, r, authorization)
 		})
 	}
 	return nil
