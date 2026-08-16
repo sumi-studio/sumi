@@ -8,6 +8,11 @@ import {
   useState,
 } from "react";
 import { isImeComposing } from "../../lib/ime";
+import { CallBanner } from "../call/call-banner";
+import { CallFailureNotice } from "../call/call-failure-notice";
+import { CallStage } from "../call/call-stage";
+import { CallStartButtons } from "../call/call-start-buttons";
+import { IncomingCall } from "../call/incoming-call";
 import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
 import {
   dismissPermissionPrompt,
@@ -547,6 +552,11 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const hasSelectablePlace = channels.length > 0 || dms.length > 0;
   const selectedPlaceIsLoaded =
     selectedPlaceKey !== null && activePlaceKey === selectedPlaceKey;
+  const selectedChannel = selectedPlaceKey?.startsWith("channel:")
+    ? channels.find(
+        (channel) => `channel:${channel.channelId}` === selectedPlaceKey,
+      )
+    : undefined;
 
   return (
     <div className="flex h-full bg-background text-foreground">
@@ -579,6 +589,11 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
+            {selectedPlaceIsLoaded &&
+            selectedPlaceKey &&
+            (display?.kind !== "channel" || selectedChannel?.voice) ? (
+              <CallStartButtons placeKey={selectedPlaceKey} />
+            ) : null}
             {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             {selectedPlaceIsLoaded ? (
@@ -596,10 +611,15 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           </span>
         </header>
         <ConnectionBanner />
+        {selectedPlaceKey ? (
+          <CallFailureNotice placeKey={selectedPlaceKey} />
+        ) : null}
+        <CallBanner />
         <div className="flex min-h-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col">
             {selectedPlaceIsLoaded ? (
               <>
+                <CallStage />
                 <MessageList handleRef={listRef} />
                 <TypingIndicator />
                 <Composer />
@@ -628,6 +648,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
         </div>
       </div>
+      <IncomingCall />
       {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}
     </div>
   );

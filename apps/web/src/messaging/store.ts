@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
   ChannelSummary,
@@ -143,6 +144,7 @@ interface MessagingState {
     workspaceId: string,
     name: string,
     topic: string,
+    voice: boolean,
   ): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
@@ -724,6 +726,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
+    if (event.type === "call_state") {
+      useCall.getState().applyCallState(event.call);
+      return;
+    }
     if (event.type === "reaction_updated") {
       applyReactionUpdate(event);
       return;
@@ -1205,6 +1211,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
               everConnected: state.everConnected || connection === "connected",
             }));
             if (connection !== "connected") return;
+            void useCall.getState().hydrate();
             if (connectedOnce) {
               void reconcilePlaces().catch(() => undefined);
             } else {
@@ -1260,7 +1267,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
     },
 
-    async createChannel(workspaceId, name, topic) {
+    async createChannel(workspaceId, name, topic, voice) {
       const currentBackend = backend;
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
@@ -1268,6 +1275,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         workspaceId,
         name,
         topic,
+        voice,
       );
       if (
         backend !== currentBackend ||
@@ -1675,6 +1683,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
   reactionProjectionByPlace.clear();
   backend.dispose();
+  useCall.getState().reset();
   backend = nextBackend;
   initialized = false;
   presenceResyncGeneration += 1;

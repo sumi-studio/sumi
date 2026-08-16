@@ -1,3 +1,4 @@
+import { parseCallState } from "./call/call-api";
 import type {
   ChannelSummary,
   ConnectionState,
@@ -168,10 +169,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     workspaceId: string,
     name: string,
     topic: string,
+    voice: boolean,
   ): Promise<ChannelSummary> {
     const body = await this.request("/messaging/channels", {
       method: "POST",
-      body: { workspace_id: workspaceId, name, topic },
+      body: { workspace_id: workspaceId, name, topic, voice },
     });
     return this.registerChannel(body);
   }
@@ -478,6 +480,8 @@ export class ApiMessagingBackend implements MessagingBackend {
         place,
         participant: parseParticipant(wire.actor),
       };
+    } else if (eventType === "call_state") {
+      parsed = { type: "call_state", call: parseCallState(wire.call) };
     } else if (eventType === "place_created") {
       parsed =
         wire.channel === undefined || wire.channel === null
@@ -510,6 +514,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       name: asString(wire.name),
       topic: asString(wire.topic),
       visibility: asVisibility(wire.visibility),
+      voice: asBoolean(wire.voice),
     };
     if (!this.cursors.has(channel.channelId)) {
       this.cursors.set(channel.channelId, 0);

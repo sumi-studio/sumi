@@ -648,6 +648,7 @@ class StubBackend implements MessagingBackend {
           name: "general",
           topic: "",
           visibility: "public",
+          voice: false,
         },
       ],
       dms: [],

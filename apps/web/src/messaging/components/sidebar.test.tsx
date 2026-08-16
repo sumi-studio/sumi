@@ -58,6 +58,7 @@ function setTwoWorkspaceState(
         name: "alpha",
         topic: "",
         visibility: "public",
+        voice: false,
       },
       {
         channelId: "channel-b",
@@ -65,6 +66,7 @@ function setTwoWorkspaceState(
         name: "beta",
         topic: "",
         visibility: "public",
+        voice: false,
       },
     ],
     dms: [],
@@ -158,7 +160,12 @@ describe("Sidebar route authority", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
 
     await waitFor(() =>
-      expect(createChannel).toHaveBeenCalledWith("workspace-b", "new-b", ""),
+      expect(createChannel).toHaveBeenCalledWith(
+        "workspace-b",
+        "new-b",
+        "",
+        false,
+      ),
     );
     expect(navigation.navigate).toHaveBeenCalledWith("channel:created-for-b");
 
@@ -196,7 +203,12 @@ describe("Sidebar route authority", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
 
     await waitFor(() =>
-      expect(createChannel).toHaveBeenCalledWith("workspace-b", "first-b", ""),
+      expect(createChannel).toHaveBeenCalledWith(
+        "workspace-b",
+        "first-b",
+        "",
+        false,
+      ),
     );
     expect(navigation.navigate).toHaveBeenCalledWith("channel:first-b");
   });
@@ -219,7 +231,12 @@ describe("Sidebar route authority", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
 
     await waitFor(() => expect(getMessagingSessionIdentity()).toBe("human-b"));
-    expect(createChannel).toHaveBeenCalledWith("workspace-b", "private-b", "");
+    expect(createChannel).toHaveBeenCalledWith(
+      "workspace-b",
+      "private-b",
+      "",
+      false,
+    );
     expect(navigation.navigate).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -241,7 +258,12 @@ describe("Sidebar route authority", () => {
       target: { value: "late-b" },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
-    expect(createChannel).toHaveBeenCalledWith("workspace-b", "late-b", "");
+    expect(createChannel).toHaveBeenCalledWith(
+      "workspace-b",
+      "late-b",
+      "",
+      false,
+    );
 
     view.rerender(
       <Sidebar

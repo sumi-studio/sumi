@@ -33,6 +33,7 @@
     "@tanstack/react-virtual": "^3.14.9",
     "firebase": "^12.16.0",
     "gen-interface-jp": "^0.7.0",
+    "livekit-client": "^2.21.0",
     "lucide-react": "^1.24.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
