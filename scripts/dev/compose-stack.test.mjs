@@ -148,12 +148,16 @@ test("down remains available without a Docker credential file", async () => {
   const fixture = await createFixture(0o600);
   try {
     await runLauncher(fixture, "emulator", ["down"]);
+    // Compose leaves containers of unselected profiles running, so teardown
+    // selects the media profile whether or not calls are configured now.
     assert.deepEqual(await dockerArguments(fixture), [
       "compose",
       "-p",
       "sumi-dev",
       "-f",
       baseCompose,
+      "--profile",
+      "calls",
       "down",
     ]);
   } finally {
@@ -191,6 +195,89 @@ test("real Firebase mode rejects a host ADC readable by other users", async () =
     });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an unconfigured stack starts no media server", async () => {
+  const fixture = await createFixture(0o600);
+  try {
+    const result = await runLauncher(fixture, "emulator", ["up"], {
+      SUMI_DOCKER_CONFIG_FILE: fixture.dockerConfigFile,
+    });
+    assert.match(result.stderr, /calls disabled/);
+    assert.deepEqual(await dockerArguments(fixture), [
+      "compose",
+      "-p",
+      "sumi-dev",
+      "-f",
+      baseCompose,
+      "up",
+    ]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("both LiveKit credentials select the calls profile", async () => {
+  const fixture = await createFixture(0o600);
+  try {
+    const result = await runLauncher(fixture, "emulator", ["up"], {
+      SUMI_DOCKER_CONFIG_FILE: fixture.dockerConfigFile,
+      SUMI_LIVEKIT_API_KEY: "test-livekit-key",
+      SUMI_LIVEKIT_API_SECRET: "test-livekit-secret",
+    });
+    assert.doesNotMatch(
+      `${result.stdout}\n${result.stderr}`,
+      /test-livekit-secret/,
+    );
+    assert.deepEqual(await dockerArguments(fixture), [
+      "compose",
+      "-p",
+      "sumi-dev",
+      "-f",
+      baseCompose,
+      "--profile",
+      "calls",
+      "up",
+    ]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("half a LiveKit credential is refused, but teardown still runs", async (t) => {
+  for (const [name, value] of [
+    ["SUMI_LIVEKIT_API_KEY", "test-livekit-key"],
+    ["SUMI_LIVEKIT_API_SECRET", "test-livekit-secret"],
+  ]) {
+    await t.test(`only ${name}`, async () => {
+      const fixture = await createFixture(0o600);
+      try {
+        await assert.rejects(
+          runLauncher(fixture, "emulator", ["up"], {
+            SUMI_DOCKER_CONFIG_FILE: fixture.dockerConfigFile,
+            [name]: value,
+          }),
+          /SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET must be set together/,
+        );
+        await assert.rejects(stat(fixture.dockerLog));
+        // Teardown must survive a rotated or half-removed credential, and it
+        // must still reach a media server started while calls were configured.
+        await runLauncher(fixture, "emulator", ["down"], { [name]: value });
+        assert.deepEqual(await dockerArguments(fixture), [
+          "compose",
+          "-p",
+          "sumi-dev",
+          "-f",
+          baseCompose,
+          "--profile",
+          "calls",
+          "down",
+        ]);
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -364,6 +451,10 @@ async function runLauncher(fixture, mode, action = ["config"], extraEnv = {}) {
       SUMI_TEST_DOCKER_CONFIG_ENV_LOG: fixture.dockerConfigEnvLog,
       FIREBASE_AUTH_EMULATOR_HOST: "must-be-cleared",
       VITE_FIREBASE_AUTH_EMULATOR_URL: "must-be-cleared",
+      // Calls are opt-in; keep the developer's own credentials out of the
+      // expected Compose invocation unless a case sets them deliberately.
+      SUMI_LIVEKIT_API_KEY: "",
+      SUMI_LIVEKIT_API_SECRET: "",
       ...extraEnv,
     },
   });

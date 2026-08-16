@@ -159,7 +159,9 @@ services:
       SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL: ${SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL:-}
       SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE: ${SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE:-}
       # The URL is browser-facing. Empty credentials deliberately leave call
-      # routes unmounted while text messaging continues normally.
+      # routes unmounted while text messaging continues normally. The launcher
+      # starts the livekit service below for exactly the same credential pair,
+      # so calls are opt-in on both sides and never half-enabled.
       SUMI_LIVEKIT_URL: ${SUMI_LIVEKIT_URL:-ws://${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880}
       SUMI_LIVEKIT_API_KEY: ${SUMI_LIVEKIT_API_KEY:-}
       SUMI_LIVEKIT_API_SECRET: ${SUMI_LIVEKIT_API_SECRET:-}
@@ -200,11 +202,20 @@ services:
 
   # LiveKit carries media only; API-issued room tokens retain admission
   # authority. rtc-mux keeps local UDP exposure to one port (ADR 0012).
+  #
+  # Calls are opt-in and this repository holds no media credential. The service
+  # lives in the `calls` profile, which scripts/dev/compose-stack enables only
+  # when SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET are both set — the
+  # same pair the API requires. An unconfigured stack therefore runs no media
+  # server at all instead of publishing one whose key is readable here.
   livekit:
+    profiles: ["calls"]
     image: livekit/livekit-server:v1.8
     pull_policy: missing
     command: ["--config", "/etc/livekit.yaml"]
     environment:
+      SUMI_LIVEKIT_API_KEY: ${SUMI_LIVEKIT_API_KEY:-}
+      SUMI_LIVEKIT_API_SECRET: ${SUMI_LIVEKIT_API_SECRET:-}
       LIVEKIT_CONFIG: |
         port: 7880
         log_level: info
@@ -217,15 +228,23 @@ services:
           # to, so signalling succeeds and media then silently never connects.
           node_ip: ${SUMI_DEV_BIND_HOST:-127.0.0.1}
         keys:
-          ${SUMI_LIVEKIT_API_KEY:-sumi-local}: ${SUMI_LIVEKIT_API_SECRET:-sumi-local-dev-secret-change-me}
+          ${SUMI_LIVEKIT_API_KEY:-}: ${SUMI_LIVEKIT_API_SECRET:-}
         webhook:
-          api_key: ${SUMI_LIVEKIT_API_KEY:-sumi-local}
+          api_key: ${SUMI_LIVEKIT_API_KEY:-}
           urls:
             - http://api:8080/messaging/livekit/webhook
+    # Refuse to serve on an empty credential. Reaching this check means the
+    # profile was enabled by hand without the pair the API also needs.
     entrypoint:
       - /bin/sh
       - -c
-      - 'printf %s "$$LIVEKIT_CONFIG" > /etc/livekit.yaml && exec /livekit-server --config /etc/livekit.yaml'
+      - |
+        if [ -z "$$SUMI_LIVEKIT_API_KEY" ] || [ -z "$$SUMI_LIVEKIT_API_SECRET" ]; then
+          echo "livekit: SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET are required" >&2
+          exit 1
+        fi
+        printf %s "$$LIVEKIT_CONFIG" > /etc/livekit.yaml
+        exec /livekit-server --config /etc/livekit.yaml
     ports:
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880:7880"
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7882:7882/udp"
