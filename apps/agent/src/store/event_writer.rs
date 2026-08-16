@@ -14951,8 +14951,8 @@ mod tests {
             },
             route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
             route_reviewer::{
-                ESCALATION_PROMPT_VERSION_V5, ESCALATION_REVIEWER_VERSION_V5,
-                ESCALATION_SCHEMA_VERSION_V5, EscalationReviewDecision, EscalationReviewEvidence,
+                ESCALATION_PROMPT_VERSION_V6, ESCALATION_REVIEWER_VERSION_V6,
+                ESCALATION_SCHEMA_VERSION_V6, EscalationReviewDecision, EscalationReviewEvidence,
                 EscalationReviewOutcome, ReviewerBudgetV1, ReviewerTerminalClass, RiskLevel,
             },
         },
@@ -15384,15 +15384,16 @@ mod tests {
 
     fn escalation_ask_human_evidence() -> EscalationReviewEvidence {
         EscalationReviewEvidence {
-            reviewer_version: ESCALATION_REVIEWER_VERSION_V5.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V5.to_owned(),
-            schema_version: ESCALATION_SCHEMA_VERSION_V5.to_owned(),
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V6.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V6.to_owned(),
+            schema_version: ESCALATION_SCHEMA_VERSION_V6.to_owned(),
             model_id: "fixture-reviewer".to_owned(),
             model_binding_digest: "fixture-model-binding".to_owned(),
             budget: ReviewerBudgetV1::escalation()
                 .compile()
                 .expect("fixture reviewer budget")
                 .evidence(1, ReviewerTerminalClass::ValidDecision),
+            tool_trace: Vec::new(),
             decision: EscalationReviewDecision {
                 outcome: EscalationReviewOutcome::AskHuman,
                 risk: RiskLevel::Medium,

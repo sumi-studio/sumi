@@ -19,7 +19,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{RwLock, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -38,7 +41,7 @@ use crate::{
         route_reviewer::{
             EscalationReviewer, ExecutionReviewer, ProviderEscalationReviewerTransport,
             ProviderExecutionReviewerTransport, ReviewerBudgetV1,
-            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels,
+            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels, ReviewerToolRuntime,
         },
     },
     config::Config,
@@ -1061,39 +1064,6 @@ async fn run_after_not_ready(
         )
         .await?;
 
-        let execution_reviewer_model =
-            RouteReviewerModelSpec::from_provider(&execution_reviewer_spec);
-        let escalation_reviewer_model =
-            RouteReviewerModelSpec::from_provider(&escalation_reviewer_spec);
-        let execution_reviewer = Arc::new(
-            ExecutionReviewer::new(
-                execution_reviewer_model,
-                reviewer_trust.clone(),
-                Arc::new(ProviderExecutionReviewerTransport::new(
-                    execution_reviewer_spec,
-                )),
-                ReviewerBudgetV1::execution(),
-            )
-            .context("construct fail-closed Execution AutoReview")?,
-        );
-        let escalation_reviewer = Arc::new(
-            EscalationReviewer::new(
-                escalation_reviewer_model,
-                reviewer_trust,
-                Arc::new(ProviderEscalationReviewerTransport::new(
-                    escalation_reviewer_spec,
-                )),
-                ReviewerBudgetV1::escalation(),
-            )
-            .context("construct fail-closed Escalation AutoReview")?,
-        );
-        let approval = Arc::new(RouteApprovalBroker::new(
-            RoutePolicy::baseline_only_v1(),
-            Redactor::v1(),
-            execution_reviewer,
-            escalation_reviewer,
-        ));
-
         let executor_client = Arc::new(
             ExecutorClient::new(
                 &context.executor_socket,
@@ -1125,6 +1095,48 @@ async fn run_after_not_ready(
             ],
         )
         .context("build exact remote executor, messaging, Workspace, and invitation registry")?;
+        let workspace = WorkspacePaths::new(config.workspace.clone())?;
+        let policy = Arc::new(RwLock::new(RoutePolicy::baseline_only_v1()));
+        let reviewer_tools = Arc::new(ReviewerToolRuntime::new(
+            registry.clone(),
+            workspace.clone(),
+            policy.clone(),
+            Redactor::v1(),
+        ));
+        let execution_reviewer_model =
+            RouteReviewerModelSpec::from_provider(&execution_reviewer_spec);
+        let escalation_reviewer_model =
+            RouteReviewerModelSpec::from_provider(&escalation_reviewer_spec);
+        let execution_reviewer = Arc::new(
+            ExecutionReviewer::new(
+                execution_reviewer_model,
+                reviewer_trust.clone(),
+                Arc::new(ProviderExecutionReviewerTransport::new(
+                    execution_reviewer_spec,
+                    reviewer_tools.clone(),
+                )),
+                ReviewerBudgetV1::execution(),
+            )
+            .context("construct fail-closed Execution AutoReview")?,
+        );
+        let escalation_reviewer = Arc::new(
+            EscalationReviewer::new(
+                escalation_reviewer_model,
+                reviewer_trust,
+                Arc::new(ProviderEscalationReviewerTransport::new(
+                    escalation_reviewer_spec,
+                    reviewer_tools,
+                )),
+                ReviewerBudgetV1::escalation(),
+            )
+            .context("construct fail-closed Escalation AutoReview")?,
+        );
+        let approval = Arc::new(RouteApprovalBroker::with_shared_policy(
+            policy,
+            Redactor::v1(),
+            execution_reviewer,
+            escalation_reviewer,
+        ));
         let prompt = PromptContext {
             system_prompt: config.system_prompt.clone(),
             memory_blocks: Vec::new(),
@@ -1138,7 +1150,7 @@ async fn run_after_not_ready(
             RequestOptions::default(),
             Some(prompt),
             Some(registry),
-            Some(WorkspacePaths::new(config.workspace.clone())?),
+            Some(workspace),
             Some(context.authority.generation()),
         )
         .context("compose real provider RunDriver")?

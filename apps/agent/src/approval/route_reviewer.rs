@@ -13,13 +13,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use tokio::time::{Instant, timeout};
+use tokio::{
+    sync::RwLock,
+    time::{Instant, timeout},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     approval::{
-        authority::PolicyDecisionRecord,
-        route_policy::{PolicySnapshot, PolicySourceState},
+        authority::{AuthorizedBoundInvocation, PolicyDecisionRecord},
+        route_policy::{
+            NormalPolicyDecision, PolicyEvaluation, PolicySnapshot, PolicySourceState, RoutePolicy,
+        },
     },
     provider::{
         ModelSpec, ProtocolCompat, RequestOptions,
@@ -27,14 +32,19 @@ use crate::{
         retry, stream,
         types::{
             AssistantContent, ContextMessage, Message, PromptContext, ProviderEvent, StopReason,
-            ToolArgumentError, ToolInvocationRoute, UserContent, UserMessage,
+            ToolArgumentError, ToolCall, ToolDefinition, ToolInvocationRoute, ToolResultMessage,
+            UserContent, UserMessage,
         },
     },
+    store::Redactor,
+    tools::{CapabilityClass, ToolRegistry, WorkspacePaths},
 };
 
-const MAX_COMPILED_ATTEMPTS: u8 = 2;
-const MAX_COMPILED_TOTAL: Duration = Duration::from_secs(30);
+const MAX_COMPILED_ATTEMPTS: u8 = 3;
+const MAX_COMPILED_TOTAL: Duration = Duration::from_secs(120);
 const MAX_REVIEW_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_REVIEW_TOOL_CALLS: usize = 4;
+const MAX_REVIEW_TOOL_RESULT_CHARS: usize = 4_000;
 pub(crate) const MAX_REVIEW_ACTION_CHARS: usize = 64_000;
 const REVIEW_ACTION_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-action/v3\0";
 const REVIEW_ACTION_SCHEMA_VERSION_V3: u32 = 3;
@@ -42,12 +52,12 @@ pub(crate) const REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5: u32 = 5;
 pub(crate) const REVIEW_TRUNCATION_MARKER: &str = "[... truncated ...]";
 
 pub const REVIEWER_BUDGET_VERSION_V1: &str = "reviewer-budget/v1";
-pub const EXECUTION_REVIEWER_VERSION_V5: &str = "execution-reviewer/v5";
-pub const EXECUTION_PROMPT_VERSION_V5: &str = "execution-review-prompt/v5";
-pub const EXECUTION_SCHEMA_VERSION_V5: &str = "execution-review-schema/v5";
-pub const ESCALATION_REVIEWER_VERSION_V5: &str = "escalation-reviewer/v5";
-pub const ESCALATION_PROMPT_VERSION_V5: &str = "escalation-review-prompt/v5";
-pub const ESCALATION_SCHEMA_VERSION_V5: &str = "escalation-review-schema/v5";
+pub const EXECUTION_REVIEWER_VERSION_V6: &str = "execution-reviewer/v6";
+pub const EXECUTION_PROMPT_VERSION_V6: &str = "execution-review-prompt/v6";
+pub const EXECUTION_SCHEMA_VERSION_V6: &str = "execution-review-schema/v6";
+pub const ESCALATION_REVIEWER_VERSION_V6: &str = "escalation-reviewer/v6";
+pub const ESCALATION_PROMPT_VERSION_V6: &str = "escalation-review-prompt/v6";
+pub const ESCALATION_SCHEMA_VERSION_V6: &str = "escalation-review-schema/v6";
 
 const EXECUTION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/execution-review.md");
 const ESCALATION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/escalation-review.md");
@@ -64,26 +74,26 @@ pub struct ReviewerBudgetV1 {
 impl ReviewerBudgetV1 {
     pub const fn execution() -> Self {
         Self {
-            max_attempts: 2,
-            // Reasoning-heavy models are not suitable for this bounded lane;
-            // deployments should bind a small non-reasoning review model.
-            attempt_timeout: Duration::from_secs(15),
-            total_timeout: Duration::from_secs(25),
+            max_attempts: 3,
+            // Guardian parity leaves time for bounded verification reads.
+            // Deployments should bind a small, non-reasoning review model.
+            attempt_timeout: Duration::from_secs(60),
+            total_timeout: Duration::from_secs(90),
         }
     }
 
     pub const fn escalation() -> Self {
         Self {
-            max_attempts: 2,
-            attempt_timeout: Duration::from_secs(20),
-            total_timeout: Duration::from_secs(30),
+            max_attempts: 3,
+            attempt_timeout: Duration::from_secs(60),
+            total_timeout: Duration::from_secs(90),
         }
     }
 
     pub fn compile(self) -> Result<CompiledReviewerBudget, ReviewerNotReady> {
         if self.max_attempts == 0 || self.max_attempts > MAX_COMPILED_ATTEMPTS {
             return Err(ReviewerNotReady::InvalidBudget(
-                "max_attempts must be between 1 and 2".to_owned(),
+                "max_attempts must be between 1 and 3".to_owned(),
             ));
         }
         if self.attempt_timeout.is_zero()
@@ -92,7 +102,7 @@ impl ReviewerBudgetV1 {
             || self.total_timeout > MAX_COMPILED_TOTAL
         {
             return Err(ReviewerNotReady::InvalidBudget(
-                "timeouts must be non-zero, attempt <= total, and total <= 30s".to_owned(),
+                "timeouts must be non-zero, attempt <= total, and total <= 120s".to_owned(),
             ));
         }
         let encoded = serde_json::to_vec(&self).map_err(|error| {
@@ -288,6 +298,7 @@ pub enum ReviewerTerminalClass {
     FatalTransport,
     EmptyResponse,
     ToolCallResponse,
+    ToolCallLimit,
     InsufficientEvidence,
 }
 
@@ -303,6 +314,7 @@ impl ReviewerTerminalClass {
             Self::FatalTransport => "fatal_transport",
             Self::EmptyResponse => "empty_response",
             Self::ToolCallResponse => "tool_call_response",
+            Self::ToolCallLimit => "tool_call_limit",
             Self::InsufficientEvidence => "insufficient_evidence",
         }
     }
@@ -359,6 +371,210 @@ pub struct EscalationReviewDecision {
     pub risk: RiskLevel,
     pub misunderstanding: Option<String>,
     pub rationale: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerToolTrace {
+    pub tool: String,
+    pub arguments: Value,
+    pub result_digest: String,
+    pub is_error: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewerKind {
+    Execution,
+    Escalation,
+}
+
+impl ReviewerKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Escalation => "escalation",
+        }
+    }
+}
+
+/// Frozen, production reviewer read boundary. Definitions come from the same
+/// bound registry as the PA. Each proposed call is rebound, checked as Read,
+/// evaluated through the live Normal policy, and executed by the same adapter.
+#[derive(Clone)]
+pub(crate) struct ReviewerToolRuntime {
+    registry: ToolRegistry,
+    workspace: WorkspacePaths,
+    policy: Arc<RwLock<RoutePolicy>>,
+    redactor: Redactor,
+}
+
+impl ReviewerToolRuntime {
+    pub(crate) fn new(
+        registry: ToolRegistry,
+        workspace: WorkspacePaths,
+        policy: Arc<RwLock<RoutePolicy>>,
+        redactor: Redactor,
+    ) -> Self {
+        Self {
+            registry,
+            workspace,
+            policy,
+            redactor,
+        }
+    }
+
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.registry.reviewer_read_definitions()
+    }
+
+    async fn execute(
+        &self,
+        reviewer: ReviewerKind,
+        ordinal: usize,
+        mut call: ToolCall,
+        cancel: CancellationToken,
+    ) -> ReviewerToolOutcome {
+        let started = Instant::now();
+        call.id = format!("review-{}-{}", reviewer.as_str(), ordinal + 1);
+        let arguments = self
+            .redactor
+            .redact_value(&Value::Object(call.arguments.as_object().clone()))
+            .unwrap_or_else(|_| json!({"error": "arguments could not be redacted"}));
+        let arguments = cap_reviewer_trace_arguments(arguments);
+        let result = self.execute_exact(call.clone(), cancel).await;
+        let (is_error, value) = match result {
+            Ok(result) => (
+                result.is_error,
+                json!({
+                    "content": result.content,
+                    "details": result.details,
+                }),
+            ),
+            Err(message) => (true, json!({"error": message})),
+        };
+        let redacted = self
+            .redactor
+            .redact_value(&value)
+            .unwrap_or_else(|_| json!({"error": "result could not be redacted"}));
+        let encoded = serde_json::to_string(&redacted)
+            .unwrap_or_else(|_| "{\"error\":\"result serialization failed\"}".to_owned());
+        let content = cap_reviewer_tool_result(&encoded);
+        let mut digest = Sha256::new();
+        digest.update(b"sumi-reviewer-tool-result/v1\0");
+        digest.update((content.len() as u64).to_be_bytes());
+        digest.update(content.as_bytes());
+        let trace = ReviewerToolTrace {
+            tool: call.name.clone(),
+            arguments,
+            result_digest: hex(&digest.finalize()),
+            is_error,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        ReviewerToolOutcome {
+            call,
+            result: ToolResultMessage {
+                tool_call_id: trace_call_id(reviewer, ordinal),
+                tool_name: trace.tool.clone(),
+                content: vec![UserContent::Text { text: content }],
+                details: Value::Null,
+                is_error,
+                timestamp: Utc::now(),
+            },
+            trace,
+        }
+    }
+
+    async fn execute_exact(
+        &self,
+        call: ToolCall,
+        cancel: CancellationToken,
+    ) -> Result<crate::tools::ToolOutput, String> {
+        if call.route != ToolInvocationRoute::Normal {
+            return Err("reviewer tools require the normal route".to_owned());
+        }
+        let flow_id = format!("reviewer-{}", uuid::Uuid::now_v7());
+        let sealed = self
+            .registry
+            .bind(&call, &flow_id, &self.workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        if sealed.invocation().descriptor.capability != CapabilityClass::Read {
+            return Err("reviewers may execute read-only tools only".to_owned());
+        }
+        let (snapshot, decision) = match self
+            .policy
+            .read()
+            .await
+            .evaluate_normal(sealed.invocation(), Utc::now())
+        {
+            PolicyEvaluation::Ready {
+                snapshot,
+                decision: NormalPolicyDecision::Allow,
+            } => (snapshot, PolicyDecisionRecord::Allow),
+            PolicyEvaluation::Ready {
+                decision: NormalPolicyDecision::Unmatched,
+                snapshot,
+            } => (snapshot, PolicyDecisionRecord::Unmatched),
+            PolicyEvaluation::Ready {
+                decision: NormalPolicyDecision::Deny { .. },
+                ..
+            } => return Err("policy denies this read".to_owned()),
+            PolicyEvaluation::Unavailable { .. } => {
+                return Err("policy denies this read".to_owned());
+            }
+        };
+        let authorized = AuthorizedBoundInvocation::for_reviewer_read(sealed, &snapshot, decision)
+            .map_err(|error| error.to_string())?;
+        let outcome = self
+            .registry
+            .execute_bound(authorized, cancel, Arc::new(|_| {}))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(outcome.output)
+    }
+}
+
+struct ReviewerToolOutcome {
+    call: ToolCall,
+    result: ToolResultMessage,
+    trace: ReviewerToolTrace,
+}
+
+fn trace_call_id(reviewer: ReviewerKind, ordinal: usize) -> String {
+    format!("review-{}-{}", reviewer.as_str(), ordinal + 1)
+}
+
+fn cap_reviewer_tool_result(value: &str) -> String {
+    if value.chars().count() <= MAX_REVIEW_TOOL_RESULT_CHARS {
+        value.to_owned()
+    } else {
+        format!(
+            "{}{}",
+            value
+                .chars()
+                .take(MAX_REVIEW_TOOL_RESULT_CHARS)
+                .collect::<String>(),
+            REVIEW_TRUNCATION_MARKER
+        )
+    }
+}
+
+fn cap_reviewer_trace_arguments(value: Value) -> Value {
+    let Ok(encoded) = serde_json::to_string(&value) else {
+        return json!({"error": "arguments could not be serialized"});
+    };
+    if encoded.chars().count() <= MAX_REVIEW_TOOL_RESULT_CHARS {
+        value
+    } else {
+        json!({
+            "json_prefix": encoded
+                .chars()
+                .take(MAX_REVIEW_TOOL_RESULT_CHARS)
+                .collect::<String>(),
+            "marker": REVIEW_TRUNCATION_MARKER,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -583,9 +799,9 @@ pub struct EscalationReviewRequest {
 pub struct ExecutionReviewOutputSchema(StructuredOutputSchema);
 
 impl ExecutionReviewOutputSchema {
-    fn v5() -> Self {
+    fn v6() -> Self {
         Self(StructuredOutputSchema {
-            name: "sumi_execution_review_v5".to_owned(),
+            name: "sumi_execution_review_v6".to_owned(),
             description: "Sumi Execution AutoReview decision".to_owned(),
             schema: json!({
                 "type": "object",
@@ -609,9 +825,9 @@ impl ExecutionReviewOutputSchema {
 pub struct EscalationReviewOutputSchema(StructuredOutputSchema);
 
 impl EscalationReviewOutputSchema {
-    fn v5() -> Self {
+    fn v6() -> Self {
         Self(StructuredOutputSchema {
-            name: "sumi_escalation_review_v5".to_owned(),
+            name: "sumi_escalation_review_v6".to_owned(),
             description: "Sumi Escalation AutoReview decision".to_owned(),
             schema: json!({
                 "type": "object",
@@ -677,6 +893,32 @@ pub enum ReviewerTransportError {
     Empty,
     #[error("reviewer returned a tool call")]
     ToolCall,
+    #[error("reviewer exceeded the read-tool call limit")]
+    ToolCallLimit(Vec<ReviewerToolTrace>),
+    #[error("reviewer transport failed after read-tool calls: {error}")]
+    WithTrace {
+        error: Box<ReviewerTransportError>,
+        trace: Vec<ReviewerToolTrace>,
+    },
+}
+
+impl ReviewerTransportError {
+    fn with_trace(self, trace: Vec<ReviewerToolTrace>) -> Self {
+        if trace.is_empty() || matches!(self, Self::ToolCallLimit(_) | Self::WithTrace { .. }) {
+            self
+        } else {
+            Self::WithTrace {
+                error: Box::new(self),
+                trace,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewerTransportOutput {
+    pub text: String,
+    pub tool_trace: Vec<ReviewerToolTrace>,
 }
 
 #[async_trait]
@@ -686,8 +928,9 @@ pub trait ExecutionReviewerTransport: Send + Sync {
     async fn complete(
         &self,
         prompt: &ExecutionReviewerPrompt,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError>;
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError>;
 }
 
 #[async_trait]
@@ -697,8 +940,9 @@ pub trait EscalationReviewerTransport: Send + Sync {
     async fn complete(
         &self,
         prompt: &EscalationReviewerPrompt,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError>;
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError>;
 }
 
 /// Production transport for Execution AutoReview. Its concrete type stays
@@ -706,12 +950,13 @@ pub trait EscalationReviewerTransport: Send + Sync {
 pub struct ProviderExecutionReviewerTransport {
     spec: ModelSpec,
     model: ReviewerModelSpec,
+    tools: Arc<ReviewerToolRuntime>,
 }
 
 impl ProviderExecutionReviewerTransport {
-    pub fn new(spec: ModelSpec) -> Self {
+    pub(crate) fn new(spec: ModelSpec, tools: Arc<ReviewerToolRuntime>) -> Self {
         let model = ReviewerModelSpec::from_provider(&spec);
-        Self { spec, model }
+        Self { spec, model, tools }
     }
 }
 
@@ -724,13 +969,17 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
     async fn complete(
         &self,
         prompt: &ExecutionReviewerPrompt,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError> {
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
             &self.spec,
+            ReviewerKind::Execution,
+            self.tools.as_ref(),
             prompt.system,
             prompt.output_schema.provider_schema(),
             prompt,
+            tool_call_offset,
             cancel,
         )
         .await
@@ -740,12 +989,13 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
 pub struct ProviderEscalationReviewerTransport {
     spec: ModelSpec,
     model: ReviewerModelSpec,
+    tools: Arc<ReviewerToolRuntime>,
 }
 
 impl ProviderEscalationReviewerTransport {
-    pub fn new(spec: ModelSpec) -> Self {
+    pub(crate) fn new(spec: ModelSpec, tools: Arc<ReviewerToolRuntime>) -> Self {
         let model = ReviewerModelSpec::from_provider(&spec);
-        Self { spec, model }
+        Self { spec, model, tools }
     }
 }
 
@@ -758,13 +1008,17 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
     async fn complete(
         &self,
         prompt: &EscalationReviewerPrompt,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError> {
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
             &self.spec,
+            ReviewerKind::Escalation,
+            self.tools.as_ref(),
             prompt.system,
             prompt.output_schema.provider_schema(),
             prompt,
+            tool_call_offset,
             cancel,
         )
         .await
@@ -773,29 +1027,112 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
 
 async fn complete_provider_review(
     spec: &ModelSpec,
+    reviewer: ReviewerKind,
+    tools: &ReviewerToolRuntime,
     system: &str,
     output_schema: &StructuredOutputSchema,
     prompt: &impl Serialize,
+    tool_call_offset: usize,
     cancel: CancellationToken,
-) -> Result<String, ReviewerTransportError> {
-    let (context, options) = build_provider_review_request(spec, system, output_schema, prompt)?;
-    let mut events = stream(spec.clone(), context, options, cancel.clone());
+) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+    let structured_retry = tool_call_offset == usize::MAX;
+    let tool_definitions = if structured_retry {
+        Vec::new()
+    } else {
+        tools.definitions()
+    };
+    let (mut context, options) = build_provider_review_request(
+        spec,
+        system,
+        output_schema,
+        prompt,
+        &tool_definitions,
+        structured_retry,
+    )?;
+    let mut trace = Vec::new();
     loop {
-        let Some(event) = events.recv().await else {
-            return Err(ReviewerTransportError::Transient(
-                "provider ended without a terminal event".to_owned(),
-            ));
+        let mut events = stream(
+            spec.clone(),
+            context.clone(),
+            options.clone(),
+            cancel.clone(),
+        );
+        let message = loop {
+            let Some(event) = events.recv().await else {
+                return Err(ReviewerTransportError::Transient(
+                    "provider ended without a terminal event".to_owned(),
+                )
+                .with_trace(trace));
+            };
+            if let Some(terminal) = classify_provider_review_terminal(event, cancel.is_cancelled())
+            {
+                match terminal {
+                    Ok(message) => break message,
+                    Err(error) => return Err(error.with_trace(trace)),
+                }
+            }
         };
-        if let Some(terminal) = classify_provider_review_terminal(event, cancel.is_cancelled()) {
-            return terminal;
+        if message.stop_reason == StopReason::Stop {
+            return match extract_provider_review_text(message) {
+                Ok(text) => Ok(ReviewerTransportOutput {
+                    text,
+                    tool_trace: trace,
+                }),
+                Err(error) => Err(error.with_trace(trace)),
+            };
         }
+        if structured_retry {
+            return Err(ReviewerTransportError::ToolCall);
+        }
+        let calls = message
+            .content
+            .iter()
+            .filter(|content| matches!(content, AssistantContent::ToolCall { .. }))
+            .count();
+        if calls == 0 {
+            return Err(ReviewerTransportError::ToolCall.with_trace(trace));
+        }
+        if tool_call_offset
+            .saturating_add(trace.len())
+            .saturating_add(calls)
+            > MAX_REVIEW_TOOL_CALLS
+        {
+            return Err(ReviewerTransportError::ToolCallLimit(trace));
+        }
+        let mut message = message;
+        let mut results = Vec::with_capacity(calls);
+        for content in &mut message.content {
+            match content {
+                AssistantContent::ToolCall { tool_call, .. } => {
+                    let ordinal = tool_call_offset + trace.len();
+                    let outcome = tools
+                        .execute(reviewer, ordinal, tool_call.clone(), cancel.child_token())
+                        .await;
+                    *tool_call = outcome.call;
+                    trace.push(outcome.trace);
+                    results.push(outcome.result);
+                }
+                AssistantContent::RejectedToolCall { .. } => {
+                    return Err(ReviewerTransportError::ToolCall.with_trace(trace));
+                }
+                AssistantContent::Text { .. } | AssistantContent::Thinking { .. } => {}
+            }
+        }
+        context.messages.push(ContextMessage::Synthetic {
+            message: Message::Assistant(message),
+        });
+        context
+            .messages
+            .extend(results.into_iter().map(|result| ContextMessage::Synthetic {
+                message: Message::ToolResult(result),
+            }));
     }
 }
 
 fn classify_provider_review_terminal(
     event: ProviderEvent,
     cancelled: bool,
-) -> Option<Result<String, ReviewerTransportError>> {
+) -> Option<Result<crate::provider::types::AssistantMessage, ReviewerTransportError>> {
     let (kind, reason, output) = match event {
         ProviderEvent::Done { reason, output } => ("done", reason, output),
         ProviderEvent::Error { reason, output } => ("error", reason, output),
@@ -810,8 +1147,11 @@ fn classify_provider_review_terminal(
         ))));
     }
     match reason {
-        StopReason::Stop if kind == "done" => Some(extract_provider_review_text(output.message)),
-        StopReason::ToolUse => Some(Err(ReviewerTransportError::ToolCall)),
+        StopReason::Stop if kind == "done" => Some(Ok(output.message)),
+        StopReason::ToolUse if kind == "done" => Some(Ok(output.message)),
+        StopReason::ToolUse => Some(Err(ReviewerTransportError::Fatal(
+            "provider emitted an error terminal with a tool-use reason".to_owned(),
+        ))),
         StopReason::Length => Some(Err(ReviewerTransportError::Fatal(
             "provider truncated the reviewer response".to_owned(),
         ))),
@@ -861,29 +1201,42 @@ fn classify_provider_review_error(
 }
 
 fn build_provider_review_request(
-    spec: &ModelSpec,
+    _spec: &ModelSpec,
     system: &str,
     output_schema: &StructuredOutputSchema,
     prompt: &impl Serialize,
+    tools: &[ToolDefinition],
+    structured_retry: bool,
 ) -> Result<(PromptContext, RequestOptions), ReviewerTransportError> {
     let evidence = serde_json::to_string(prompt).map_err(|error| {
         ReviewerTransportError::Fatal(format!("reviewer prompt serialization failed: {error}"))
     })?;
+    let mut messages = vec![ContextMessage::Synthetic {
+        message: Message::User(UserMessage {
+            content: vec![UserContent::Text { text: evidence }],
+            timestamp: Utc::now(),
+        }),
+    }];
+    if structured_retry {
+        messages.push(ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "answer the JSON now".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        });
+    }
     let context = PromptContext::new(
         system.to_owned(),
         Vec::new(),
-        vec![ContextMessage::Synthetic {
-            message: Message::User(UserMessage {
-                content: vec![UserContent::Text { text: evidence }],
-                timestamp: Utc::now(),
-            }),
-        }],
+        messages,
         Vec::new(),
-        Vec::new(),
+        tools.to_vec(),
     );
     let options = RequestOptions {
-        max_tokens: Some(spec.max_output_tokens.min(2_048)),
-        structured_output: Some(output_schema.clone()),
+        max_tokens: Some(4_096),
+        structured_output: structured_retry.then(|| output_schema.clone()),
         ..RequestOptions::default()
     };
     Ok((context, options))
@@ -894,12 +1247,14 @@ fn provider_wire_bodies_for_test(
     system: &str,
     schema: &StructuredOutputSchema,
     prompt: &impl Serialize,
+    structured_retry: bool,
 ) -> Vec<(&'static str, Value)> {
     let mut bodies = Vec::new();
     for (label, preset) in [("kimi", "kimi-k3"), ("glm", "glm-5.2")] {
         let spec = ModelSpec::preset(preset).expect("chat reviewer preset");
-        let (context, options) = build_provider_review_request(&spec, system, schema, prompt)
-            .expect("provider review request");
+        let (context, options) =
+            build_provider_review_request(&spec, system, schema, prompt, &[], structured_retry)
+                .expect("provider review request");
         bodies.push((
             label,
             crate::provider::adapters::chat_completions::build_request(&spec, &context, &options)
@@ -908,8 +1263,9 @@ fn provider_wire_bodies_for_test(
     }
 
     let spec = ModelSpec::preset("openai-responses").expect("Responses reviewer preset");
-    let (context, options) = build_provider_review_request(&spec, system, schema, prompt)
-        .expect("Responses review request");
+    let (context, options) =
+        build_provider_review_request(&spec, system, schema, prompt, &[], structured_retry)
+            .expect("Responses review request");
     bodies.push((
         "openai-responses",
         crate::provider::adapters::responses::build_request(&spec, &context, &options)
@@ -917,8 +1273,9 @@ fn provider_wire_bodies_for_test(
     ));
 
     let spec = ModelSpec::preset("anthropic").expect("Anthropic reviewer preset");
-    let (context, options) = build_provider_review_request(&spec, system, schema, prompt)
-        .expect("Anthropic review request");
+    let (context, options) =
+        build_provider_review_request(&spec, system, schema, prompt, &[], structured_retry)
+            .expect("Anthropic review request");
     bodies.push((
         "anthropic",
         crate::provider::adapters::anthropic::build_request(&spec, &context, &options)
@@ -936,9 +1293,9 @@ pub(crate) fn execution_provider_wire_bodies_for_test(
         .flat_map(|retry_validation_code| {
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
-                output_schema: ExecutionReviewOutputSchema::v5(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V5,
-                schema_version: EXECUTION_SCHEMA_VERSION_V5,
+                output_schema: ExecutionReviewOutputSchema::v6(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V6,
+                schema_version: EXECUTION_SCHEMA_VERSION_V6,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -946,6 +1303,7 @@ pub(crate) fn execution_provider_wire_bodies_for_test(
                 prompt.system,
                 prompt.output_schema.provider_schema(),
                 &prompt,
+                retry_validation_code.is_some(),
             )
         })
         .collect()
@@ -960,9 +1318,9 @@ pub(crate) fn escalation_provider_wire_bodies_for_test(
         .flat_map(|retry_validation_code| {
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
-                output_schema: EscalationReviewOutputSchema::v5(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V5,
-                schema_version: ESCALATION_SCHEMA_VERSION_V5,
+                output_schema: EscalationReviewOutputSchema::v6(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V6,
+                schema_version: ESCALATION_SCHEMA_VERSION_V6,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -970,6 +1328,7 @@ pub(crate) fn escalation_provider_wire_bodies_for_test(
                 prompt.system,
                 prompt.output_schema.provider_schema(),
                 &prompt,
+                retry_validation_code.is_some(),
             )
         })
         .collect()
@@ -984,6 +1343,7 @@ pub struct ExecutionReviewEvidence {
     pub model_id: String,
     pub model_binding_digest: String,
     pub budget: ReviewerBudgetEvidence,
+    pub tool_trace: Vec<ReviewerToolTrace>,
     pub decision: ExecutionReviewDecision,
 }
 
@@ -1002,6 +1362,7 @@ pub struct EscalationReviewEvidence {
     pub model_id: String,
     pub model_binding_digest: String,
     pub budget: ReviewerBudgetEvidence,
+    pub tool_trace: Vec<ReviewerToolTrace>,
     pub decision: EscalationReviewDecision,
 }
 
@@ -1043,24 +1404,36 @@ impl ExecutionReviewer {
         cancel: CancellationToken,
     ) -> ExecutionReviewResult {
         if !review_request_is_bounded(&request) {
-            return execution_synthetic_block(self, 0, ReviewerTerminalClass::InsufficientEvidence);
+            return execution_synthetic_block(
+                self,
+                0,
+                ReviewerTerminalClass::InsufficientEvidence,
+                Vec::new(),
+            );
         }
         let mut retry_validation_code = None;
+        let mut structured_retry_used = false;
+        let mut tool_trace = Vec::new();
         let started = Instant::now();
         let mut attempts = 0;
         loop {
             attempts += 1;
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
-                output_schema: ExecutionReviewOutputSchema::v5(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V5,
-                schema_version: EXECUTION_SCHEMA_VERSION_V5,
+                output_schema: ExecutionReviewOutputSchema::v6(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V6,
+                schema_version: EXECUTION_SCHEMA_VERSION_V6,
                 request: request.clone(),
                 retry_validation_code,
             };
             let attempt = run_attempt(
                 &*self.transport,
                 &prompt,
+                if structured_retry_used {
+                    usize::MAX
+                } else {
+                    tool_trace.len()
+                },
                 cancel.clone(),
                 self.budget.budget.attempt_timeout,
                 self.budget
@@ -1070,48 +1443,65 @@ impl ExecutionReviewer {
             )
             .await;
             match attempt {
-                AttemptOutcome::Response(raw) => match parse_execution_decision(&raw) {
-                    Ok(mut decision) => {
-                        let terminal = if decision.risk == RiskLevel::Critical
-                            && decision.outcome == ExecutionReviewOutcome::Allow
+                AttemptOutcome::Response(output) => {
+                    tool_trace.extend(output.tool_trace);
+                    match parse_execution_decision(&output.text) {
+                        Ok(mut decision) => {
+                            let terminal = if decision.risk == RiskLevel::Critical
+                                && decision.outcome == ExecutionReviewOutcome::Allow
+                            {
+                                decision.outcome = ExecutionReviewOutcome::Block;
+                                ReviewerTerminalClass::CriticalPositiveBlocked
+                            } else {
+                                ReviewerTerminalClass::ValidDecision
+                            };
+                            return execution_result(
+                                self, decision, attempts, terminal, tool_trace,
+                            );
+                        }
+                        Err(code)
+                            if !structured_retry_used
+                                && attempts < self.budget.budget.max_attempts =>
                         {
-                            decision.outcome = ExecutionReviewOutcome::Block;
-                            ReviewerTerminalClass::CriticalPositiveBlocked
-                        } else {
-                            ReviewerTerminalClass::ValidDecision
-                        };
-                        return execution_result(self, decision, attempts, terminal);
+                            retry_validation_code = Some(code);
+                            structured_retry_used = true;
+                        }
+                        Err(_) => {
+                            return execution_synthetic_block(
+                                self,
+                                attempts,
+                                ReviewerTerminalClass::MalformedExhausted,
+                                tool_trace,
+                            );
+                        }
                     }
-                    Err(code) if attempts < self.budget.budget.max_attempts => {
-                        retry_validation_code = Some(code);
-                    }
-                    Err(_) => {
-                        return execution_synthetic_block(
-                            self,
-                            attempts,
-                            ReviewerTerminalClass::MalformedExhausted,
-                        );
-                    }
-                },
-                AttemptOutcome::RetryTransient
-                    if attempts < self.budget.budget.max_attempts
-                        && started.elapsed() < self.budget.budget.total_timeout => {}
-                AttemptOutcome::RetryTransient => {
+                }
+                AttemptOutcome::RetryTransient(attempt_trace)
+                    if !structured_retry_used
+                        && attempts < self.budget.budget.max_attempts
+                        && started.elapsed() < self.budget.budget.total_timeout =>
+                {
+                    tool_trace.extend(attempt_trace);
+                }
+                AttemptOutcome::RetryTransient(attempt_trace) => {
+                    tool_trace.extend(attempt_trace);
                     return execution_synthetic_block(
                         self,
                         attempts,
                         ReviewerTerminalClass::TransientExhausted,
+                        tool_trace,
                     );
                 }
-                AttemptOutcome::Terminal(class) => {
-                    return execution_synthetic_block(self, attempts, class);
+                AttemptOutcome::Terminal(class, attempt_trace) => {
+                    tool_trace.extend(attempt_trace);
+                    return execution_synthetic_block(self, attempts, class, tool_trace);
                 }
             }
         }
     }
 
     pub fn block_without_call(&self, terminal: ReviewerTerminalClass) -> ExecutionReviewEvidence {
-        execution_synthetic_block(self, 0, terminal).into_evidence()
+        execution_synthetic_block(self, 0, terminal, Vec::new()).into_evidence()
     }
 }
 
@@ -1151,24 +1541,32 @@ impl EscalationReviewer {
                 self,
                 0,
                 ReviewerTerminalClass::InsufficientEvidence,
+                Vec::new(),
             );
         }
         let mut retry_validation_code = None;
+        let mut structured_retry_used = false;
+        let mut tool_trace = Vec::new();
         let started = Instant::now();
         let mut attempts = 0;
         loop {
             attempts += 1;
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
-                output_schema: EscalationReviewOutputSchema::v5(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V5,
-                schema_version: ESCALATION_SCHEMA_VERSION_V5,
+                output_schema: EscalationReviewOutputSchema::v6(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V6,
+                schema_version: ESCALATION_SCHEMA_VERSION_V6,
                 request: request.clone(),
                 retry_validation_code,
             };
             let attempt = run_attempt(
                 &*self.transport,
                 &prompt,
+                if structured_retry_used {
+                    usize::MAX
+                } else {
+                    tool_trace.len()
+                },
                 cancel.clone(),
                 self.budget.budget.attempt_timeout,
                 self.budget
@@ -1178,48 +1576,65 @@ impl EscalationReviewer {
             )
             .await;
             match attempt {
-                AttemptOutcome::Response(raw) => match parse_escalation_decision(&raw) {
-                    Ok(mut decision) => {
-                        let terminal = if decision.risk == RiskLevel::Critical
-                            && decision.outcome == EscalationReviewOutcome::AskHuman
+                AttemptOutcome::Response(output) => {
+                    tool_trace.extend(output.tool_trace);
+                    match parse_escalation_decision(&output.text) {
+                        Ok(mut decision) => {
+                            let terminal = if decision.risk == RiskLevel::Critical
+                                && decision.outcome == EscalationReviewOutcome::AskHuman
+                            {
+                                decision.outcome = EscalationReviewOutcome::Block;
+                                ReviewerTerminalClass::CriticalPositiveBlocked
+                            } else {
+                                ReviewerTerminalClass::ValidDecision
+                            };
+                            return escalation_result(
+                                self, decision, attempts, terminal, tool_trace,
+                            );
+                        }
+                        Err(code)
+                            if !structured_retry_used
+                                && attempts < self.budget.budget.max_attempts =>
                         {
-                            decision.outcome = EscalationReviewOutcome::Block;
-                            ReviewerTerminalClass::CriticalPositiveBlocked
-                        } else {
-                            ReviewerTerminalClass::ValidDecision
-                        };
-                        return escalation_result(self, decision, attempts, terminal);
+                            retry_validation_code = Some(code);
+                            structured_retry_used = true;
+                        }
+                        Err(_) => {
+                            return escalation_synthetic_block(
+                                self,
+                                attempts,
+                                ReviewerTerminalClass::MalformedExhausted,
+                                tool_trace,
+                            );
+                        }
                     }
-                    Err(code) if attempts < self.budget.budget.max_attempts => {
-                        retry_validation_code = Some(code);
-                    }
-                    Err(_) => {
-                        return escalation_synthetic_block(
-                            self,
-                            attempts,
-                            ReviewerTerminalClass::MalformedExhausted,
-                        );
-                    }
-                },
-                AttemptOutcome::RetryTransient
-                    if attempts < self.budget.budget.max_attempts
-                        && started.elapsed() < self.budget.budget.total_timeout => {}
-                AttemptOutcome::RetryTransient => {
+                }
+                AttemptOutcome::RetryTransient(attempt_trace)
+                    if !structured_retry_used
+                        && attempts < self.budget.budget.max_attempts
+                        && started.elapsed() < self.budget.budget.total_timeout =>
+                {
+                    tool_trace.extend(attempt_trace);
+                }
+                AttemptOutcome::RetryTransient(attempt_trace) => {
+                    tool_trace.extend(attempt_trace);
                     return escalation_synthetic_block(
                         self,
                         attempts,
                         ReviewerTerminalClass::TransientExhausted,
+                        tool_trace,
                     );
                 }
-                AttemptOutcome::Terminal(class) => {
-                    return escalation_synthetic_block(self, attempts, class);
+                AttemptOutcome::Terminal(class, attempt_trace) => {
+                    tool_trace.extend(attempt_trace);
+                    return escalation_synthetic_block(self, attempts, class, tool_trace);
                 }
             }
         }
     }
 
     pub fn block_without_call(&self, terminal: ReviewerTerminalClass) -> EscalationReviewEvidence {
-        escalation_synthetic_block(self, 0, terminal).into_evidence()
+        escalation_synthetic_block(self, 0, terminal, Vec::new()).into_evidence()
     }
 }
 
@@ -1241,9 +1656,9 @@ impl EscalationReviewResult {
 
 #[derive(Debug)]
 enum AttemptOutcome {
-    Response(String),
-    RetryTransient,
-    Terminal(ReviewerTerminalClass),
+    Response(ReviewerTransportOutput),
+    RetryTransient(Vec<ReviewerToolTrace>),
+    Terminal(ReviewerTerminalClass, Vec<ReviewerToolTrace>),
 }
 
 #[async_trait]
@@ -1251,8 +1666,9 @@ trait AttemptTransport<P>: Send + Sync {
     async fn call(
         &self,
         prompt: &P,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError>;
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError>;
 }
 
 #[async_trait]
@@ -1260,9 +1676,10 @@ impl<T: ExecutionReviewerTransport + ?Sized> AttemptTransport<ExecutionReviewerP
     async fn call(
         &self,
         prompt: &ExecutionReviewerPrompt,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError> {
-        self.complete(prompt, cancel).await
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+        self.complete(prompt, tool_call_offset, cancel).await
     }
 }
 
@@ -1271,62 +1688,100 @@ impl<T: EscalationReviewerTransport + ?Sized> AttemptTransport<EscalationReviewe
     async fn call(
         &self,
         prompt: &EscalationReviewerPrompt,
+        tool_call_offset: usize,
         cancel: CancellationToken,
-    ) -> Result<String, ReviewerTransportError> {
-        self.complete(prompt, cancel).await
+    ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+        self.complete(prompt, tool_call_offset, cancel).await
     }
 }
 
 async fn run_attempt<P>(
     transport: &(impl AttemptTransport<P> + ?Sized),
     prompt: &P,
+    tool_call_offset: usize,
     cancel: CancellationToken,
     attempt_timeout: Duration,
     remaining_total: Duration,
 ) -> AttemptOutcome {
     if cancel.is_cancelled() {
-        return AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled);
+        return AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled, Vec::new());
     }
     let deadline = attempt_timeout.min(remaining_total);
     if deadline.is_zero() {
-        return AttemptOutcome::Terminal(ReviewerTerminalClass::AttemptTimeout);
+        return AttemptOutcome::Terminal(ReviewerTerminalClass::AttemptTimeout, Vec::new());
     }
     let attempt_cancel = cancel.child_token();
     let response = tokio::select! {
         _ = cancel.cancelled() => {
             attempt_cancel.cancel();
-            return AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled);
+            return AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled, Vec::new());
         }
-        response = timeout(deadline, transport.call(prompt, attempt_cancel.clone())) => response,
+        response = timeout(deadline, transport.call(prompt, tool_call_offset, attempt_cancel.clone())) => response,
     };
     match response {
         Err(_) => {
             attempt_cancel.cancel();
-            AttemptOutcome::Terminal(ReviewerTerminalClass::AttemptTimeout)
+            AttemptOutcome::Terminal(ReviewerTerminalClass::AttemptTimeout, Vec::new())
         }
-        Ok(Err(ReviewerTransportError::Transient(_))) => AttemptOutcome::RetryTransient,
+        Ok(Err(ReviewerTransportError::Transient(_))) => AttemptOutcome::RetryTransient(Vec::new()),
         Ok(Err(ReviewerTransportError::Fatal(_))) => {
-            AttemptOutcome::Terminal(ReviewerTerminalClass::FatalTransport)
+            AttemptOutcome::Terminal(ReviewerTerminalClass::FatalTransport, Vec::new())
         }
         Ok(Err(ReviewerTransportError::Cancelled)) => {
-            AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled)
+            AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled, Vec::new())
         }
         Ok(Err(ReviewerTransportError::Empty)) => {
-            AttemptOutcome::Terminal(ReviewerTerminalClass::EmptyResponse)
+            AttemptOutcome::Terminal(ReviewerTerminalClass::EmptyResponse, Vec::new())
         }
         Ok(Err(ReviewerTransportError::ToolCall)) => {
-            AttemptOutcome::Terminal(ReviewerTerminalClass::ToolCallResponse)
+            AttemptOutcome::Terminal(ReviewerTerminalClass::ToolCallResponse, Vec::new())
         }
-        Ok(Ok(raw)) if raw.trim().is_empty() => {
-            AttemptOutcome::Terminal(ReviewerTerminalClass::EmptyResponse)
+        Ok(Err(ReviewerTransportError::ToolCallLimit(trace))) => {
+            AttemptOutcome::Terminal(ReviewerTerminalClass::ToolCallLimit, trace)
         }
-        Ok(Ok(raw)) => AttemptOutcome::Response(raw),
+        Ok(Err(ReviewerTransportError::WithTrace { error, trace })) => match *error {
+            ReviewerTransportError::Transient(_) => AttemptOutcome::RetryTransient(trace),
+            ReviewerTransportError::Fatal(_) => {
+                AttemptOutcome::Terminal(ReviewerTerminalClass::FatalTransport, trace)
+            }
+            ReviewerTransportError::Cancelled => {
+                AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled, trace)
+            }
+            ReviewerTransportError::Empty => {
+                AttemptOutcome::Terminal(ReviewerTerminalClass::EmptyResponse, trace)
+            }
+            ReviewerTransportError::ToolCall => {
+                AttemptOutcome::Terminal(ReviewerTerminalClass::ToolCallResponse, trace)
+            }
+            ReviewerTransportError::ToolCallLimit(mut nested)
+            | ReviewerTransportError::WithTrace {
+                trace: mut nested, ..
+            } => {
+                let mut trace = trace;
+                trace.append(&mut nested);
+                AttemptOutcome::Terminal(ReviewerTerminalClass::ToolCallLimit, trace)
+            }
+        },
+        Ok(Ok(output)) if output.text.trim().is_empty() => {
+            AttemptOutcome::Terminal(ReviewerTerminalClass::EmptyResponse, Vec::new())
+        }
+        Ok(Ok(output)) => AttemptOutcome::Response(output),
     }
 }
 
 fn parse_decision<T: DeserializeOwned>(raw: &str) -> Result<T, ReviewerValidationCode> {
-    let value: Value =
-        serde_json::from_str(raw).map_err(|_| ReviewerValidationCode::InvalidJson)?;
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => {
+            let start = raw.find('{').ok_or(ReviewerValidationCode::InvalidJson)?;
+            let end = raw.rfind('}').ok_or(ReviewerValidationCode::InvalidJson)?;
+            if end < start {
+                return Err(ReviewerValidationCode::InvalidJson);
+            }
+            serde_json::from_str(&raw[start..=end])
+                .map_err(|_| ReviewerValidationCode::InvalidJson)?
+        }
+    };
     serde_json::from_value(value).map_err(|_| ReviewerValidationCode::SchemaMismatch)
 }
 
@@ -1341,8 +1796,7 @@ fn parse_execution_decision(raw: &str) -> Result<ExecutionReviewDecision, Review
 fn parse_escalation_decision(
     raw: &str,
 ) -> Result<EscalationReviewDecision, ReviewerValidationCode> {
-    let value: Value =
-        serde_json::from_str(raw).map_err(|_| ReviewerValidationCode::InvalidJson)?;
+    let value: Value = parse_json_object(raw)?;
     if !value
         .as_object()
         .is_some_and(|object| object.contains_key("misunderstanding"))
@@ -1362,6 +1816,20 @@ fn parse_escalation_decision(
     Ok(decision)
 }
 
+fn parse_json_object(raw: &str) -> Result<Value, ReviewerValidationCode> {
+    match serde_json::from_str(raw) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            let start = raw.find('{').ok_or(ReviewerValidationCode::InvalidJson)?;
+            let end = raw.rfind('}').ok_or(ReviewerValidationCode::InvalidJson)?;
+            if end < start {
+                return Err(ReviewerValidationCode::InvalidJson);
+            }
+            serde_json::from_str(&raw[start..=end]).map_err(|_| ReviewerValidationCode::InvalidJson)
+        }
+    }
+}
+
 fn valid_rationale(rationale: &str) -> bool {
     !rationale.trim().is_empty() && rationale.chars().count() <= 1000
 }
@@ -1375,18 +1843,20 @@ fn execution_result(
     mut decision: ExecutionReviewDecision,
     attempts: u8,
     terminal: ReviewerTerminalClass,
+    tool_trace: Vec<ReviewerToolTrace>,
 ) -> ExecutionReviewResult {
     let allow = decision.outcome == ExecutionReviewOutcome::Allow;
     if decision.risk == RiskLevel::Critical {
         decision.outcome = ExecutionReviewOutcome::Block;
     }
     let evidence = ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V5.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V5.to_owned(),
-        schema_version: EXECUTION_SCHEMA_VERSION_V5.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V6.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V6.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION_V6.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
+        tool_trace,
         decision,
     };
     if allow && evidence.decision.outcome == ExecutionReviewOutcome::Allow {
@@ -1400,14 +1870,16 @@ fn execution_synthetic_block(
     reviewer: &ExecutionReviewer,
     attempts: u8,
     terminal: ReviewerTerminalClass,
+    tool_trace: Vec<ReviewerToolTrace>,
 ) -> ExecutionReviewResult {
     ExecutionReviewResult::Block(ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V5.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V5.to_owned(),
-        schema_version: EXECUTION_SCHEMA_VERSION_V5.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V6.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V6.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION_V6.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
+        tool_trace,
         decision: ExecutionReviewDecision {
             outcome: ExecutionReviewOutcome::Block,
             risk: RiskLevel::High,
@@ -1421,18 +1893,20 @@ fn escalation_result(
     mut decision: EscalationReviewDecision,
     attempts: u8,
     terminal: ReviewerTerminalClass,
+    tool_trace: Vec<ReviewerToolTrace>,
 ) -> EscalationReviewResult {
     let ask_human = decision.outcome == EscalationReviewOutcome::AskHuman;
     if decision.risk == RiskLevel::Critical {
         decision.outcome = EscalationReviewOutcome::Block;
     }
     let evidence = EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V5.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V5.to_owned(),
-        schema_version: ESCALATION_SCHEMA_VERSION_V5.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V6.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V6.to_owned(),
+        schema_version: ESCALATION_SCHEMA_VERSION_V6.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
+        tool_trace,
         decision,
     };
     if ask_human && evidence.decision.outcome == EscalationReviewOutcome::AskHuman {
@@ -1446,14 +1920,16 @@ fn escalation_synthetic_block(
     reviewer: &EscalationReviewer,
     attempts: u8,
     terminal: ReviewerTerminalClass,
+    tool_trace: Vec<ReviewerToolTrace>,
 ) -> EscalationReviewResult {
     EscalationReviewResult::Block(EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V5.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V5.to_owned(),
-        schema_version: ESCALATION_SCHEMA_VERSION_V5.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V6.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V6.to_owned(),
+        schema_version: ESCALATION_SCHEMA_VERSION_V6.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
+        tool_trace,
         decision: EscalationReviewDecision {
             outcome: EscalationReviewOutcome::Block,
             risk: RiskLevel::High,
@@ -1477,6 +1953,7 @@ fn technical_review_message(terminal: ReviewerTerminalClass, escalation: bool) -
         ReviewerTerminalClass::FatalTransport => "接続エラーで完了できず",
         ReviewerTerminalClass::EmptyResponse => "空の応答しか得られず",
         ReviewerTerminalClass::ToolCallResponse => "判定ではなくツール呼び出しが返され",
+        ReviewerTerminalClass::ToolCallLimit => "読み取りツールの呼び出し上限を超え",
         ReviewerTerminalClass::InsufficientEvidence => "必要な証拠を構成できず",
         ReviewerTerminalClass::ValidDecision | ReviewerTerminalClass::CriticalPositiveBlocked => {
             "技術的に完了できず"
@@ -1513,7 +1990,97 @@ mod tests {
     };
 
     use super::*;
-    use crate::tools::{BoundToolInvocation, CapabilityClass};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::tools::{
+        AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
+        BoundToolCtx, BoundToolExecutionOutcome, BoundToolInvocation, DescribeError,
+        ReviewProjection, Tool, ToolBindCtx, ToolBinding, ToolCtx, ToolError, ToolOutput,
+        ToolRegistryBuilder, ToolRisk,
+    };
+
+    struct ReviewerFixtureTool {
+        name: &'static str,
+        capability: CapabilityClass,
+        reviewer_read_capable: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ReviewerFixtureTool {
+        fn def(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.to_owned(),
+                description: "fixture".to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        fn risk(&self) -> ToolRisk {
+            match self.capability {
+                CapabilityClass::Read => ToolRisk::ReadOnly,
+                CapabilityClass::Mutate | CapabilityClass::Administer => ToolRisk::Mutating,
+                CapabilityClass::Execute => ToolRisk::Exec,
+            }
+        }
+
+        fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+            Some(self)
+        }
+
+        async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+            unreachable!("reviewer fixtures use the bound path")
+        }
+    }
+
+    #[async_trait]
+    impl BoundToolAdapter for ReviewerFixtureTool {
+        fn identity(&self) -> AdapterIdentity {
+            match self.name {
+                "inspect" => AdapterIdentity::new("test.binding", 1).unwrap(),
+                "app_action" => AdapterIdentity::new("test.app", 1).unwrap(),
+                other => panic!("unsupported fixture tool {other}"),
+            }
+        }
+
+        fn reviewer_read_capable(&self) -> bool {
+            self.reviewer_read_capable
+        }
+
+        async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+            Ok(ToolBinding::new(
+                AppActionDescriptor::new("inspect", self.capability.clone(), vec![])?,
+                ReviewProjection::from_value(json!({"operation": "inspect"}))?,
+                BoundExecutionArguments::from_value(Value::Object(ctx.args.as_object().clone()))?,
+            ))
+        }
+
+        async fn execute(
+            &self,
+            ctx: BoundToolCtx<'_>,
+        ) -> Result<BoundToolExecutionOutcome, ToolError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let receipt = ctx
+                .committed_effect_permit
+                .begin_local_effect()
+                .complete(|| async {
+                    Ok::<_, ToolError>(ToolOutput {
+                        content: vec![UserContent::Text {
+                            text: "verified sk-abcdefghijklmnop".to_owned(),
+                        }],
+                        details: json!({"query": ctx.args.as_object().get("query")}),
+                        is_error: false,
+                    })
+                })
+                .await?;
+            Ok(BoundToolExecutionOutcome::without_live_post_commit(receipt))
+        }
+    }
 
     struct ExecutionTransport(Mutex<VecDeque<Result<String, ReviewerTransportError>>>);
 
@@ -1526,13 +2093,18 @@ mod tests {
         async fn complete(
             &self,
             _prompt: &ExecutionReviewerPrompt,
+            _tool_call_offset: usize,
             _cancel: CancellationToken,
-        ) -> Result<String, ReviewerTransportError> {
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.0
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("fixture response")
+                .map(|text| ReviewerTransportOutput {
+                    text,
+                    tool_trace: Vec::new(),
+                })
         }
     }
 
@@ -1547,13 +2119,18 @@ mod tests {
         async fn complete(
             &self,
             _prompt: &EscalationReviewerPrompt,
+            _tool_call_offset: usize,
             _cancel: CancellationToken,
-        ) -> Result<String, ReviewerTransportError> {
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.0
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("fixture response")
+                .map(|text| ReviewerTransportOutput {
+                    text,
+                    tool_trace: Vec::new(),
+                })
         }
     }
 
@@ -1571,14 +2148,19 @@ mod tests {
         async fn complete(
             &self,
             prompt: &ExecutionReviewerPrompt,
+            _tool_call_offset: usize,
             _cancel: CancellationToken,
-        ) -> Result<String, ReviewerTransportError> {
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.prompts.lock().unwrap().push(prompt.clone());
             self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("fixture response")
+                .map(|text| ReviewerTransportOutput {
+                    text,
+                    tool_trace: Vec::new(),
+                })
         }
     }
 
@@ -1596,14 +2178,19 @@ mod tests {
         async fn complete(
             &self,
             prompt: &EscalationReviewerPrompt,
+            _tool_call_offset: usize,
             _cancel: CancellationToken,
-        ) -> Result<String, ReviewerTransportError> {
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.prompts.lock().unwrap().push(prompt.clone());
             self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("fixture response")
+                .map(|text| ReviewerTransportOutput {
+                    text,
+                    tool_trace: Vec::new(),
+                })
         }
     }
 
@@ -1752,22 +2339,195 @@ mod tests {
     #[test]
     fn compiled_budget_caps_are_enforced() {
         let execution = ReviewerBudgetV1::execution();
-        assert_eq!(execution.attempt_timeout, Duration::from_secs(15));
-        assert_eq!(execution.total_timeout, Duration::from_secs(25));
+        assert_eq!(execution.max_attempts, 3);
+        assert_eq!(execution.attempt_timeout, Duration::from_secs(60));
+        assert_eq!(execution.total_timeout, Duration::from_secs(90));
         assert!(execution.compile().is_ok());
         let escalation = ReviewerBudgetV1::escalation();
-        assert_eq!(escalation.attempt_timeout, Duration::from_secs(20));
-        assert_eq!(escalation.total_timeout, Duration::from_secs(30));
+        assert_eq!(escalation.max_attempts, 3);
+        assert_eq!(escalation.attempt_timeout, Duration::from_secs(60));
+        assert_eq!(escalation.total_timeout, Duration::from_secs(90));
         assert!(escalation.compile().is_ok());
         assert!(matches!(
             ReviewerBudgetV1 {
-                max_attempts: 3,
+                max_attempts: 4,
                 attempt_timeout: Duration::from_secs(1),
                 total_timeout: Duration::from_secs(2),
             }
             .compile(),
             Err(ReviewerNotReady::InvalidBudget(_))
         ));
+    }
+
+    #[test]
+    fn initial_review_uses_tools_without_response_format_and_retry_inverts_that_shape() {
+        let spec = ModelSpec::preset("openai-responses").unwrap();
+        let prompt = ExecutionReviewerPrompt {
+            system: EXECUTION_SYSTEM_PROMPT,
+            output_schema: ExecutionReviewOutputSchema::v6(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V6,
+            schema_version: EXECUTION_SCHEMA_VERSION_V6,
+            request: execution_request(),
+            retry_validation_code: None,
+        };
+        let tool = ToolDefinition {
+            name: "inspect".to_owned(),
+            description: "fixture read".to_owned(),
+            parameters: json!({"type": "object"}),
+        };
+        let (initial_context, initial_options) = build_provider_review_request(
+            &spec,
+            prompt.system,
+            prompt.output_schema.provider_schema(),
+            &prompt,
+            std::slice::from_ref(&tool),
+            false,
+        )
+        .unwrap();
+        assert_eq!(initial_context.tools, vec![tool]);
+        assert_eq!(initial_options.max_tokens, Some(4_096));
+        assert!(initial_options.structured_output.is_none());
+
+        let (retry_context, retry_options) = build_provider_review_request(
+            &spec,
+            prompt.system,
+            prompt.output_schema.provider_schema(),
+            &prompt,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(retry_context.tools.is_empty());
+        assert_eq!(retry_options.max_tokens, Some(4_096));
+        assert_eq!(
+            retry_options.structured_output.as_ref(),
+            Some(prompt.output_schema.provider_schema())
+        );
+        let ContextMessage::Synthetic {
+            message: Message::User(last),
+        } = retry_context.messages.last().unwrap()
+        else {
+            panic!("structured retry ends with a user instruction")
+        };
+        assert_eq!(
+            last.content,
+            vec![UserContent::Text {
+                text: "answer the JSON now".to_owned()
+            }]
+        );
+    }
+
+    fn reviewer_tool_runtime(policy: RoutePolicy) -> (ReviewerToolRuntime, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(ReviewerFixtureTool {
+                name: "inspect",
+                capability: CapabilityClass::Read,
+                reviewer_read_capable: true,
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        builder
+            .register(Arc::new(ReviewerFixtureTool {
+                name: "app_action",
+                capability: CapabilityClass::Mutate,
+                reviewer_read_capable: false,
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        (
+            ReviewerToolRuntime::new(
+                builder.build(),
+                WorkspacePaths::new("/workspace").unwrap(),
+                Arc::new(RwLock::new(policy)),
+                Redactor::v1(),
+            ),
+            calls,
+        )
+    }
+
+    fn reviewer_tool_call() -> ToolCall {
+        ToolCall {
+            id: "provider-call-id".to_owned(),
+            name: "inspect".to_owned(),
+            route: ToolInvocationRoute::Normal,
+            arguments: serde_json::from_value(json!({
+                "query": "secret=abcdefghijklmnop"
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_offers_only_read_capable_bound_tools_and_executes_with_redacted_trace() {
+        let (runtime, calls) = reviewer_tool_runtime(RoutePolicy::baseline_only_v1());
+        assert_eq!(
+            runtime
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["inspect"]
+        );
+        let outcome = runtime
+            .execute(
+                ReviewerKind::Execution,
+                0,
+                reviewer_tool_call(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.call.id, "review-execution-1");
+        assert_eq!(outcome.result.tool_call_id, "review-execution-1");
+        assert!(!outcome.result.is_error);
+        assert_eq!(outcome.trace.tool, "inspect");
+        assert_eq!(outcome.trace.arguments["query"], "secret=[REDACTED:secret]");
+        let UserContent::Text { text } = &outcome.result.content[0] else {
+            panic!("reviewer result is text")
+        };
+        assert!(text.contains("[REDACTED:api_key]"));
+        assert_eq!(outcome.trace.result_digest.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn reviewer_policy_deny_is_an_error_result_and_never_executes() {
+        let now = Utc::now();
+        let source = PolicySourceState::verified_overlay_v1(
+            1,
+            "reviewer-deny",
+            now + chrono::Duration::minutes(5),
+            None,
+            now,
+        )
+        .unwrap();
+        let policy = RoutePolicy::verified_overlay_v1(
+            source,
+            BTreeMap::from([(
+                CapabilityClass::Read,
+                NormalPolicyDecision::Deny {
+                    reason: "fixture".to_owned(),
+                },
+            )]),
+        )
+        .unwrap();
+        let (runtime, calls) = reviewer_tool_runtime(policy);
+        let outcome = runtime
+            .execute(
+                ReviewerKind::Escalation,
+                0,
+                reviewer_tool_call(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(outcome.result.is_error);
+        assert!(outcome.trace.is_error);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let UserContent::Text { text } = &outcome.result.content[0] else {
+            panic!("reviewer result is text")
+        };
+        assert!(text.contains("policy denies this read"));
     }
 
     #[test]
@@ -2076,13 +2836,13 @@ mod tests {
             Some(Err(ReviewerTransportError::Fatal(message)))
                 if message.contains("invalid_provider_request")
         ));
-        assert_eq!(
-            classify_provider_review_terminal(
-                provider_terminal("done", StopReason::Stop, Some(valid_json), None),
-                false,
-            ),
-            Some(Ok(valid_json.to_owned()))
-        );
+        let message = classify_provider_review_terminal(
+            provider_terminal("done", StopReason::Stop, Some(valid_json), None),
+            false,
+        )
+        .expect("terminal")
+        .expect("valid terminal");
+        assert_eq!(extract_provider_review_text(message).unwrap(), valid_json);
     }
 
     #[test]
@@ -2162,15 +2922,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
-        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V5);
-        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V5);
-        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V5);
+        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V6);
+        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V6);
+        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V6);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
-            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v5());
-            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V5);
-            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V5);
+            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v6());
+            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V6);
+            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V6);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -2184,11 +2944,13 @@ mod tests {
                 prompt.system,
                 prompt.output_schema.provider_schema(),
                 prompt,
+                &[],
+                index != 0,
             )
             .unwrap();
             assert_eq!(
                 options.structured_output.as_ref(),
-                Some(prompt.output_schema.provider_schema())
+                (index != 0).then(|| prompt.output_schema.provider_schema())
             );
         }
     }
@@ -2227,15 +2989,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
-        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V5);
-        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V5);
-        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V5);
+        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V6);
+        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V6);
+        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V6);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
-            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v5());
-            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V5);
-            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V5);
+            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v6());
+            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V6);
+            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V6);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -2249,16 +3011,18 @@ mod tests {
                 prompt.system,
                 prompt.output_schema.provider_schema(),
                 prompt,
+                &[],
+                index != 0,
             )
             .unwrap();
             assert_eq!(
                 options.structured_output.as_ref(),
-                Some(prompt.output_schema.provider_schema())
+                (index != 0).then(|| prompt.output_schema.provider_schema())
             );
         }
         assert_ne!(
-            ExecutionReviewOutputSchema::v5().provider_schema().schema,
-            EscalationReviewOutputSchema::v5().provider_schema().schema
+            ExecutionReviewOutputSchema::v6().provider_schema().schema,
+            EscalationReviewOutputSchema::v6().provider_schema().schema
         );
     }
 
@@ -2273,13 +3037,247 @@ mod tests {
     }
 
     #[test]
+    fn final_decision_parser_accepts_bare_and_once_wrapped_json() {
+        let bare = r#"{"outcome":"allow","risk":"low","rationale":"ok"}"#;
+        assert_eq!(
+            parse_execution_decision(bare).unwrap().outcome,
+            ExecutionReviewOutcome::Allow
+        );
+        assert_eq!(
+            parse_execution_decision(&format!("answer follows: {bare}\nfinished"))
+                .unwrap()
+                .outcome,
+            ExecutionReviewOutcome::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_structured_retry_still_fails_closed() {
+        let model = reviewer_model();
+        let reviewer = ExecutionReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            Arc::new(ExecutionTransport(Mutex::new(VecDeque::from([
+                Ok("not-json".to_owned()),
+                Ok("still-not-json".to_owned()),
+            ])))),
+            ReviewerBudgetV1::execution(),
+        )
+        .unwrap();
+        let ExecutionReviewResult::Block(evidence) = reviewer
+            .review(execution_request(), CancellationToken::new())
+            .await
+        else {
+            panic!("malformed structured retry must block")
+        };
+        assert_eq!(evidence.budget.attempts, 2);
+        assert_eq!(
+            evidence.budget.terminal,
+            ReviewerTerminalClass::MalformedExhausted
+        );
+    }
+
+    struct ToolThenVerdictTransport {
+        trace: ReviewerToolTrace,
+    }
+
+    #[async_trait]
+    impl ExecutionReviewerTransport for ToolThenVerdictTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            _prompt: &ExecutionReviewerPrompt,
+            _tool_call_offset: usize,
+            _cancel: CancellationToken,
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            Ok(ReviewerTransportOutput {
+                text: r#"{"outcome":"allow","risk":"low","rationale":"verified by read"}"#
+                    .to_owned(),
+                tool_trace: vec![self.trace.clone()],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EscalationReviewerTransport for ToolThenVerdictTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            _prompt: &EscalationReviewerPrompt,
+            _tool_call_offset: usize,
+            _cancel: CancellationToken,
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            Ok(ReviewerTransportOutput {
+                text: r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":"verified by read"}"#
+                    .to_owned(),
+                tool_trace: vec![self.trace.clone()],
+            })
+        }
+    }
+
+    fn fixture_trace(ordinal: usize) -> ReviewerToolTrace {
+        ReviewerToolTrace {
+            tool: "workspace_invitation_list".to_owned(),
+            arguments: json!({"page": ordinal}),
+            result_digest: format!("{ordinal:064x}"),
+            is_error: false,
+            elapsed_ms: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_tool_then_verdict_transport_persists_trace_in_review_evidence() {
+        let model = reviewer_model();
+        let trace = fixture_trace(1);
+        let reviewer = ExecutionReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            Arc::new(ToolThenVerdictTransport {
+                trace: trace.clone(),
+            }),
+            ReviewerBudgetV1::execution(),
+        )
+        .unwrap();
+        let ExecutionReviewResult::Allow(evidence) = reviewer
+            .review(execution_request(), CancellationToken::new())
+            .await
+        else {
+            panic!("verified verdict should allow")
+        };
+        assert_eq!(evidence.tool_trace, vec![trace]);
+
+        let trace = fixture_trace(2);
+        let escalation = EscalationReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            Arc::new(ToolThenVerdictTransport {
+                trace: trace.clone(),
+            }),
+            ReviewerBudgetV1::escalation(),
+        )
+        .unwrap();
+        let EscalationReviewResult::AskHuman(evidence) = escalation
+            .review(escalation_request(), CancellationToken::new())
+            .await
+        else {
+            panic!("verified escalation should ask the Human")
+        };
+        assert_eq!(evidence.tool_trace, vec![trace]);
+    }
+
+    struct TransientAfterReadsTransport {
+        attempts: AtomicUsize,
+        offsets: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl ExecutionReviewerTransport for TransientAfterReadsTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            _prompt: &ExecutionReviewerPrompt,
+            tool_call_offset: usize,
+            _cancel: CancellationToken,
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            self.offsets.lock().unwrap().push(tool_call_offset);
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(
+                    ReviewerTransportError::Transient("retry after reads".to_owned())
+                        .with_trace((0..3).map(fixture_trace).collect()),
+                );
+            }
+            Ok(ReviewerTransportOutput {
+                text: r#"{"outcome":"allow","risk":"low","rationale":"verified after retry"}"#
+                    .to_owned(),
+                tool_trace: vec![fixture_trace(3)],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_retry_carries_prior_reads_into_the_review_wide_call_cap() {
+        let model = reviewer_model();
+        let transport = Arc::new(TransientAfterReadsTransport {
+            attempts: AtomicUsize::new(0),
+            offsets: Mutex::new(Vec::new()),
+        });
+        let reviewer = ExecutionReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            transport.clone(),
+            ReviewerBudgetV1::execution(),
+        )
+        .unwrap();
+        let ExecutionReviewResult::Allow(evidence) = reviewer
+            .review(execution_request(), CancellationToken::new())
+            .await
+        else {
+            panic!("retry after reads should preserve a valid verdict")
+        };
+        assert_eq!(*transport.offsets.lock().unwrap(), vec![0, 3]);
+        assert_eq!(evidence.tool_trace.len(), MAX_REVIEW_TOOL_CALLS);
+    }
+
+    struct ToolLimitTransport;
+
+    #[async_trait]
+    impl ExecutionReviewerTransport for ToolLimitTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            _prompt: &ExecutionReviewerPrompt,
+            _tool_call_offset: usize,
+            _cancel: CancellationToken,
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            Err(ReviewerTransportError::ToolCallLimit(
+                (0..MAX_REVIEW_TOOL_CALLS).map(fixture_trace).collect(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn four_call_cap_fails_closed_without_losing_the_trace() {
+        let model = reviewer_model();
+        let reviewer = ExecutionReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            Arc::new(ToolLimitTransport),
+            ReviewerBudgetV1::execution(),
+        )
+        .unwrap();
+        let ExecutionReviewResult::Block(evidence) = reviewer
+            .review(execution_request(), CancellationToken::new())
+            .await
+        else {
+            panic!("tool cap must block")
+        };
+        assert_eq!(evidence.tool_trace.len(), MAX_REVIEW_TOOL_CALLS);
+        assert_eq!(
+            evidence.budget.terminal,
+            ReviewerTerminalClass::ToolCallLimit
+        );
+    }
+
+    #[test]
     fn auto_review_schemas_stay_inside_the_kimi_mfjs_strict_subset_we_use() {
         for schema in [
-            ExecutionReviewOutputSchema::v5()
+            ExecutionReviewOutputSchema::v6()
                 .provider_schema()
                 .schema
                 .clone(),
-            EscalationReviewOutputSchema::v5()
+            EscalationReviewOutputSchema::v6()
                 .provider_schema()
                 .schema
                 .clone(),
@@ -2319,7 +3317,7 @@ mod tests {
                     ) || matches!(
                         property.get("type"),
                         Some(Value::Array(kinds))
-                            if kinds == &vec![json!("string"), json!("null")]
+                            if kinds.as_slice() == [json!("string"), json!("null")]
                     )
                 );
                 if let Some(values) = property.get("enum") {

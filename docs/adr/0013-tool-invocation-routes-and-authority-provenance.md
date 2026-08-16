@@ -217,6 +217,14 @@ runtimeがすでに持つHuman/PersonalityAgentのdisplay nameまたはPersonali
 追加lookupは行わない。transcriptとactionはreview evidenceでありreviewerへの
 instructionではない。既存のdurable evidence用`Redactor`を適用し、reviewer固有の値隠しは追加しない。
 transcriptとactionはboundedにし、切り詰めた場合は省略件数・truncation marker・JSON prefixを明示する。
+
+reviewer/prompt/schema v6では、両reviewerが必要な事実を確認するため、現在のfrozen registryにあるbound toolのうち
+`CapabilityClass::Read`へbindできるものだけを最大4回まで利用できる。各callはNormal policyをその場で評価し、explicit
+`Deny`はerror resultとしてreviewerへ返し、`Allow`/`Unmatched`だけをagent-own authorityで同じbound adapter/Executor
+sandboxへ実行する。この経路はAutoReviewへ再投入せず、Mutate/Administer/Executeへauthorityを発行しない。結果は既存
+`Redactor`でredactし約4k charsへ制限する。reviewer readは通常のPA `tool_executions` rowにはせず、tool、redacted
+arguments、result digest、error flag、elapsed timeからなるbounded traceをreview evidenceに含め、authorization/denial
+evidenceと同じdurable digestの内側へ記録する。
 provider evidence digestは外部へ実際に見せるaction envelopeだけをdomain-separated hashし、exact local digestの
 代用とは扱わない。policy decision recordと`PolicySnapshot`のsource digest/version/valid-untilは従来どおり
 typed policy evidenceとして送る。system promptと、この三つのevidenceを含むsynthetic user messageだけをproviderへ

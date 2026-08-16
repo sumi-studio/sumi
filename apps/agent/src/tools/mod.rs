@@ -274,6 +274,13 @@ pub(crate) struct AuthorizedBoundRegistryAccess(());
 #[async_trait]
 pub(crate) trait BoundToolAdapter: Send + Sync {
     fn identity(&self) -> AdapterIdentity;
+    /// Whether this frozen registration can bind at least one reviewer-safe
+    /// read operation. The exact invocation is checked again after binding;
+    /// mixed tools such as Messaging may expose one definition while only
+    /// their Read variants are executable by a reviewer.
+    fn reviewer_read_capable(&self) -> bool {
+        false
+    }
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError>;
     async fn execute(&self, ctx: BoundToolCtx<'_>) -> Result<BoundToolExecutionOutcome, ToolError>;
 }
@@ -332,6 +339,10 @@ struct GuardedBoundToolAdapter {
 impl BoundToolAdapter for GuardedBoundToolAdapter {
     fn identity(&self) -> AdapterIdentity {
         self.inner.identity()
+    }
+
+    fn reviewer_read_capable(&self) -> bool {
+        self.inner.reviewer_read_capable()
     }
 
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
@@ -673,6 +684,21 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .values()
+            .map(|entry| entry.definition.clone())
+            .collect()
+    }
+
+    /// Provider definitions for bound registrations that can resolve a Read
+    /// descriptor. Execution still rejects every non-Read bound invocation.
+    pub(crate) fn reviewer_read_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .values()
+            .filter(|entry| {
+                entry
+                    .bound_adapter
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.adapter.reviewer_read_capable())
+            })
             .map(|entry| entry.definition.clone())
             .collect()
     }

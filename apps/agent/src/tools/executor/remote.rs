@@ -260,6 +260,16 @@ impl BoundToolAdapter for RemoteTool {
             .expect("static foundation workspace binding adapter identity must be valid")
     }
 
+    fn reviewer_read_capable(&self) -> bool {
+        matches!(
+            self.kind,
+            RemoteToolKind::WorkspaceReadFile
+                | RemoteToolKind::ListDir
+                | RemoteToolKind::Glob
+                | RemoteToolKind::WorkspaceGrep
+        )
+    }
+
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
         self.kind.bind(ctx)
     }
