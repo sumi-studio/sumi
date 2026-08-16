@@ -1638,7 +1638,7 @@ async fn run_chat_stream(
                     .chat_compat()
                     .is_some_and(|compat| compat.infer_finish_reason_at_done);
                 let finished = if infer {
-                    receive.finish_after_done_sentinel(Utc::now())
+                    receive.finish_after_clean_eof(Utc::now())
                 } else {
                     receive.finish(Utc::now())
                 };
