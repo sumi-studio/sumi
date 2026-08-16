@@ -13,10 +13,9 @@ import (
 )
 
 const (
-	legacyBrowserSessionRevocationStateVersion = uint64(1)
-	browserSessionRevocationStateVersion       = uint64(2)
-	maxBrowserSessionRevocationStateBytes      = 2 << 20
-	browserSessionRevocationLockID             = "browser-session-revocations"
+	browserSessionRevocationStateVersion  = uint64(2)
+	maxBrowserSessionRevocationStateBytes = 2 << 20
+	browserSessionRevocationLockID        = "browser-session-revocations"
 )
 
 type browserSessionMutationKind string
@@ -526,20 +525,6 @@ func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocati
 	}
 	_, hasLineages := encodedFields["lineages"]
 	switch state.Version {
-	case legacyBrowserSessionRevocationStateVersion:
-		if hasLineages {
-			return browserSessionRevocationState{}, errors.New(
-				"invalid legacy browser session revocation state",
-			)
-		}
-		if err := validateLegacyBrowserSessionRevocationState(state); err != nil {
-			return browserSessionRevocationState{}, err
-		}
-		// The v2 cookie-signing domain rejects every credential represented
-		// by this pre-lineage denylist. Start the new credential namespace
-		// empty instead of pretending its unknowable successor graph can be
-		// reconstructed; the next mutation persists the v2 format.
-		state = newBrowserSessionRevocationState()
 	case browserSessionRevocationStateVersion:
 		if !hasLineages || state.Lineages == nil {
 			return browserSessionRevocationState{}, errors.New(
@@ -548,29 +533,13 @@ func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocati
 		}
 	default:
 		return browserSessionRevocationState{}, errors.New(
-			"invalid browser session revocation state version",
+			"unsupported browser session revocation state version; delete the state file to reset it",
 		)
 	}
 	if err := validateBrowserSessionRevocationState(state); err != nil {
 		return browserSessionRevocationState{}, err
 	}
 	return state, nil
-}
-
-func validateLegacyBrowserSessionRevocationState(
-	state browserSessionRevocationState,
-) error {
-	if state.Version != legacyBrowserSessionRevocationStateVersion ||
-		state.Entries == nil ||
-		len(state.Entries) > maxRevokedSessions {
-		return errors.New("invalid legacy browser session revocation state")
-	}
-	for sessionID, expiresAt := range state.Entries {
-		if !validBrowserSessionID(sessionID) || expiresAt <= 0 {
-			return errors.New("invalid legacy browser session revocation entry")
-		}
-	}
-	return nil
 }
 
 func validateBrowserSessionRevocationState(
