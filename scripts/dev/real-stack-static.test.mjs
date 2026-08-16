@@ -136,6 +136,7 @@ test("Compose gives runtime only the logical executor workspace address", async 
 
 test("the supported launcher gates API, executor, runtime Ready, then Vite", async () => {
   const launcher = await source("scripts/dev/real-stack");
+  const apiStart = launcher.indexOf('log "starting API"');
   const apiGate = launcher.search(
     /wait_for_http "\$\{API_ORIGIN\}\/health" "\$\{API_PID\}" "API"/,
   );
@@ -155,6 +156,7 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   const viteStart = launcher.search(/log "starting Vite at \$\{WEB_ORIGIN\}"/);
 
   for (const position of [
+    apiStart,
     apiGate,
     executorStart,
     executorGate,
@@ -200,6 +202,30 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   assert.match(launcher, /SUMI_BROWSER_SESSION_AUDIENCE=sumi:web/);
   assert.match(launcher, /SUMI_BROWSER_WS_ALLOWED_ORIGINS=\$\{WEB_ORIGIN\}/);
   assert.match(launcher, /SUMI_AUTH_ALLOW_INSECURE_COOKIES=true/);
+  const apiBlock = launcher.slice(apiStart, executorStart);
+  for (const [apiVariable, launcherVariable] of [
+    [
+      "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES",
+      "MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES",
+    ],
+    [
+      "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS",
+      "MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS",
+    ],
+    [
+      "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES",
+      "MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES",
+    ],
+    [
+      "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS",
+      "MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS",
+    ],
+  ]) {
+    assert.match(
+      apiBlock,
+      new RegExp(`"${apiVariable}=\\$\\{${launcherVariable}\\}"`),
+    );
+  }
   assert.match(launcher, /"SUMI_PUBLIC_LISTEN=\$\{SUMI_PUBLIC_LISTEN\}"/);
   assert.match(launcher, /100\.64\.0\.0\/10/);
   assert.match(
