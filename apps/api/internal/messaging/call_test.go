@@ -29,6 +29,9 @@ func testLiveKit() LiveKitConfig {
 
 func TestCallAccessTokenCarriesOnlyTheAuthenticatedParticipantGrant(t *testing.T) {
 	now := time.Unix(1_780_000_000, 0)
+	if CallTokenTTL != 5*time.Minute {
+		t.Fatalf("CallTokenTTL = %s, want a five-minute join credential", CallTokenTTL)
+	}
 	token, err := testLiveKit().accessToken("place-1", "human:abc", "Yohaku", now, CallTokenTTL)
 	if err != nil {
 		t.Fatal(err)
@@ -264,9 +267,11 @@ func TestCallTokenAdmissionTracksCurrentMessagingAuthority(t *testing.T) {
 }
 
 type stubLiveKitRoomService struct {
-	rooms        []liveKitRoom
-	participants map[string][]liveKitParticipant
-	err          error
+	rooms              []liveKitRoom
+	participants       map[string][]liveKitParticipant
+	err                error
+	onListParticipants func(string)
+	removed            *[][2]string
 }
 
 func (s stubLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom, error) {
@@ -274,7 +279,17 @@ func (s stubLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom, error
 }
 
 func (s stubLiveKitRoomService) ListParticipants(_ context.Context, room string) ([]liveKitParticipant, error) {
+	if s.onListParticipants != nil {
+		s.onListParticipants(room)
+	}
 	return s.participants[room], s.err
+}
+
+func (s stubLiveKitRoomService) RemoveParticipant(_ context.Context, room, identity string) error {
+	if s.removed != nil {
+		*s.removed = append(*s.removed, [2]string{room, identity})
+	}
+	return s.err
 }
 
 func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
@@ -300,6 +315,64 @@ func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
 	if !ok || !state.Active || state.StartedAt.Unix() != 1_780_000_000 || len(state.Participants) != 1 ||
 		!state.Participants[0].ScreenShare || state.Participants[0].JoinedAt.Unix() != 1_780_000_001 {
 		t.Fatalf("rebuilt state = %+v", state)
+	}
+}
+
+func TestCallRegistryRebuildPreservesWebhookAppliedDuringSnapshot(t *testing.T) {
+	now := time.Unix(1_780_000_100, 0)
+	registry := NewCallRegistry()
+	webhookParticipant := Human("01900000-0000-7000-8000-0000000000bb")
+	service := &CallService{
+		Registry: registry,
+		Now:      func() time.Time { return now },
+		RoomService: stubLiveKitRoomService{
+			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			participants: map[string][]liveKitParticipant{
+				"place-1": {{Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001}},
+			},
+			onListParticipants: func(string) {
+				// This is the previously unsafe interleaving: RoomService has
+				// already been read, then LiveKit delivers a newer webhook.
+				registry.join("place-1", webhookParticipant, now)
+			},
+		},
+	}
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, ok := registry.snapshot("place-1")
+	if !ok || len(state.Participants) != 1 || state.Participants[0].Participant != webhookParticipant {
+		t.Fatalf("newer webhook state was overwritten by snapshot: %+v", state)
+	}
+}
+
+func TestCallServiceRemovesClosedWorkspaceMemberFromLiveKitRooms(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	fixture := newScopedContractFixture(t, ctx, w, "call-removal", w.humanB)
+	owner := fixture.scope(t, w, w.humanA)
+	channel, err := owner.CreateChannel(ctx, "通話", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := [][2]string{}
+	service := &CallService{
+		Server:   NewServer(w.store.core, nil),
+		Registry: NewCallRegistry(),
+		RoomService: stubLiveKitRoomService{
+			rooms: []liveKitRoom{{Name: channel.PlaceID}, {Name: "01900000-0000-7000-8000-0000000000ff"}},
+			participants: map[string][]liveKitParticipant{
+				channel.PlaceID: {{Identity: w.humanB.Key()}},
+			},
+			removed: &removed,
+		},
+	}
+	if err := service.RemoveWorkspaceParticipant(ctx, fixture.workspace.WorkspaceID, w.humanB); err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != [2]string{channel.PlaceID, w.humanB.Key()} {
+		t.Fatalf("RemoveParticipant calls = %+v", removed)
 	}
 }
 

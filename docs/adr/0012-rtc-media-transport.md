@@ -66,6 +66,15 @@
   テキストのように durable な seq を持たせない。
 - **identity は participant key（`human:<id>` / `personality_agent:<id>`）。**
   人間と人格 agent を通話でも同じ「参加者」として扱い、bot 用の別枠を作らない。
+- **room join token は参加の都度発行し、5 分で失効する。** LiveKit は署名済み JWT を
+  API へ問い合わせずに検証するため、すでに発行済みの token を個別に失効させる
+  server-side blacklist はこの API にはない。Workspace membership が閉じた後は、API の
+  Workspace removal / leave 経路がその Workspace の現在の LiveKit rooms から当人を
+  `RemoveParticipant` する。これには channel と DM の rooms が含まれる。RoomService が
+  一時的に失敗しても durable な membership closure を戻さない。その場合、既存の media
+  session は切断まで残り得るが、新規接続・再接続の window は token TTL 以下になる。直接
+  DB を更新する運用や、現在 API に存在しない単独 DM member removal にはこの post-commit
+  hook は届かず、持続 retry queue もまだない。
 
 ### アクセストークンを自前で発行する
 

@@ -30,6 +30,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
+	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -402,6 +403,11 @@ func newApplicationFromEnv() (*application, error) {
 		if callsEnabled {
 			calls := messaging.NewCallService(messagingServer, livekit)
 			messagingServer.Calls = calls
+			workspaceServer.MembershipClosed = func(ctx context.Context, workspaceID string, member participant.Ref) {
+				if err := calls.RemoveWorkspaceParticipant(ctx, workspaceID, member); err != nil {
+					log.Printf("remove LiveKit participant after Workspace membership closure: %v", err)
+				}
+			}
 			calls.RegisterRoutes(mux)
 			log.Printf("messaging calls ready (livekit url=%s)", livekit.URL)
 		}

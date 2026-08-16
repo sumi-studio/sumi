@@ -21,7 +21,10 @@ import (
 )
 
 const (
-	CallTokenTTL        = 6 * time.Hour
+	// Call tokens are minted for one join attempt. LiveKit validates them
+	// locally, so a membership change cannot revoke a credential already issued.
+	// Keep the residual reconnect window deliberately short.
+	CallTokenTTL        = 5 * time.Minute
 	callWebhookLeeway   = 5 * time.Minute
 	maxCallWebhookBytes = 1 << 20
 )
@@ -56,12 +59,16 @@ type CallState struct {
 // API restart, the service reconciles it from LiveKit's RoomService; webhooks
 // keep that projection current afterwards.
 type CallRegistry struct {
-	mu    sync.Mutex
-	rooms map[string]*CallState
+	mu           sync.Mutex
+	rooms        map[string]*CallState
+	sequence     uint64
+	roomSequence map[string]uint64
 }
 
 func NewCallRegistry() *CallRegistry {
-	return &CallRegistry{rooms: map[string]*CallState{}}
+	return &CallRegistry{
+		rooms: map[string]*CallState{}, roomSequence: map[string]uint64{},
+	}
 }
 
 func (r *CallRegistry) snapshot(placeID string) (CallState, bool) {
@@ -85,14 +92,38 @@ func (r *CallRegistry) active() []CallState {
 	return out
 }
 
-func (r *CallRegistry) replace(states []CallState) {
+// replaceSnapshot applies a RoomService snapshot without losing any room that
+// received a newer webhook while the snapshot was being read. roomSequence
+// retains tombstones too, so a room_finished webhook cannot be resurrected by
+// a stale snapshot.
+func (r *CallRegistry) replaceSnapshot(states []CallState, snapshotSequence uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.rooms = make(map[string]*CallState, len(states))
+	next := make(map[string]*CallState, len(states))
 	for _, state := range states {
+		if r.roomSequence[state.PlaceID] > snapshotSequence {
+			continue
+		}
 		copy := cloneCallState(&state)
-		r.rooms[state.PlaceID] = &copy
+		next[state.PlaceID] = &copy
 	}
+	for placeID, state := range r.rooms {
+		if r.roomSequence[placeID] > snapshotSequence {
+			next[placeID] = state
+		}
+	}
+	r.rooms = next
+}
+
+func (r *CallRegistry) snapshotSequence() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sequence
+}
+
+func (r *CallRegistry) changed(placeID string) {
+	r.sequence++
+	r.roomSequence[placeID] = r.sequence
 }
 
 func cloneCallState(state *CallState) CallState {
@@ -112,6 +143,7 @@ func (r *CallRegistry) open(placeID string, at time.Time) CallState {
 		r.rooms[placeID] = state
 	}
 	state.Active = true
+	r.changed(placeID)
 	return cloneCallState(state)
 }
 
@@ -119,6 +151,7 @@ func (r *CallRegistry) close(placeID string) CallState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.rooms, placeID)
+	r.changed(placeID)
 	return CallState{PlaceID: placeID}
 }
 
@@ -131,6 +164,7 @@ func (r *CallRegistry) join(placeID string, participant ParticipantRef, at time.
 		r.rooms[placeID] = state
 	}
 	state.Active = true
+	r.changed(placeID)
 	for _, existing := range state.Participants {
 		if existing.Participant == participant {
 			return cloneCallState(state)
@@ -155,6 +189,7 @@ func (r *CallRegistry) leave(placeID string, participant ParticipantRef) (CallSt
 	if !ok {
 		return CallState{}, false
 	}
+	r.changed(placeID)
 	for i, existing := range state.Participants {
 		if existing.Participant == participant {
 			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
@@ -171,6 +206,7 @@ func (r *CallRegistry) setScreenShare(placeID string, participant ParticipantRef
 	if !ok {
 		return CallState{}, false
 	}
+	r.changed(placeID)
 	for i := range state.Participants {
 		if state.Participants[i].Participant != participant {
 			continue
@@ -502,6 +538,7 @@ func participantFromIdentity(identity string) (ParticipantRef, error) {
 type liveKitRoomService interface {
 	ListRooms(context.Context) ([]liveKitRoom, error)
 	ListParticipants(context.Context, string) ([]liveKitParticipant, error)
+	RemoveParticipant(context.Context, string, string) error
 }
 
 type liveKitRoom struct {
@@ -541,6 +578,10 @@ func (s unavailableLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom
 
 func (s unavailableLiveKitRoomService) ListParticipants(context.Context, string) ([]liveKitParticipant, error) {
 	return nil, s.err
+}
+
+func (s unavailableLiveKitRoomService) RemoveParticipant(context.Context, string, string) error {
+	return s.err
 }
 
 func (c LiveKitConfig) roomServiceURL() (string, error) {
@@ -594,6 +635,17 @@ func (c *liveKitRoomServiceClient) ListParticipants(ctx context.Context, room st
 	return response.Participants, nil
 }
 
+func (c *liveKitRoomServiceClient) RemoveParticipant(ctx context.Context, room, identity string) error {
+	token, err := c.config.roomServiceToken(time.Now(), livekitVideoGrant{Room: room, RoomAdmin: true})
+	if err != nil {
+		return err
+	}
+	return c.call(ctx, "RemoveParticipant", struct {
+		Room     string `json:"room"`
+		Identity string `json:"identity"`
+	}{Room: room, Identity: identity}, &struct{}{}, token)
+}
+
 func (c *liveKitRoomServiceClient) call(ctx context.Context, method string, request, response any, token string) error {
 	payload, err := json.Marshal(request)
 	if err != nil {
@@ -629,6 +681,11 @@ func (c *CallService) rebuildRegistry(ctx context.Context) error {
 	if c.RoomService == nil {
 		return errors.New("LiveKit RoomService is unavailable")
 	}
+	// Snapshot sequence is captured before the first RoomService read. Webhook
+	// application takes the registry mutex and records a per-room sequence, so
+	// replaceSnapshot keeps any newer webhook projection instead of clobbering
+	// it with this necessarily non-atomic RoomService snapshot.
+	snapshotSequence := c.Registry.snapshotSequence()
 	rooms, err := c.RoomService.ListRooms(ctx)
 	if err != nil {
 		return err
@@ -673,8 +730,60 @@ func (c *CallService) rebuildRegistry(ctx context.Context) error {
 		})
 		states = append(states, state)
 	}
-	c.Registry.replace(states)
+	c.Registry.replaceSnapshot(states, snapshotSequence)
 	c.rebuiltOnce = true
+	return nil
+}
+
+// RemoveWorkspaceParticipant asks LiveKit to end active media sessions for a
+// participant whose Workspace membership has just closed. The Workspace
+// transaction is already committed when this runs: RoomService failure must
+// never resurrect its authorization.
+func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceID string, participant ParticipantRef) error {
+	if c == nil || c.Server == nil || c.Server.Store == nil || c.RoomService == nil {
+		return errors.New("LiveKit RoomService is unavailable")
+	}
+	rooms, err := c.RoomService.ListRooms(ctx)
+	if err != nil {
+		return err
+	}
+	for _, room := range rooms {
+		if room.Name == "" {
+			continue
+		}
+		var belongs bool
+		if err := c.Server.Store.pool.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM places WHERE workspace_id=$1 AND place_id=$2
+			)`, workspaceID, room.Name,
+		).Scan(&belongs); err != nil {
+			return fmt.Errorf("check LiveKit room Workspace: %w", err)
+		}
+		if !belongs {
+			continue
+		}
+		participants, err := c.RoomService.ListParticipants(ctx, room.Name)
+		if err != nil {
+			return fmt.Errorf("list LiveKit participants in room %s: %w", room.Name, err)
+		}
+		found := false
+		for _, entry := range participants {
+			if entry.Identity == participant.Key() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		if err := c.RoomService.RemoveParticipant(ctx, room.Name, participant.Key()); err != nil {
+			return fmt.Errorf("remove LiveKit participant from room %s: %w", room.Name, err)
+		}
+		// The corresponding webhook normally publishes the projection update.
+		// Update local reads immediately as well, and leave duplicate webhook
+		// delivery idempotent.
+		c.Registry.leave(room.Name, participant)
+	}
 	return nil
 }
 

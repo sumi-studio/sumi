@@ -482,6 +482,7 @@ func (s *Server) localLeave(w http.ResponseWriter, r *http.Request, authorizatio
 		writeDomainError(w, err)
 		return
 	}
+	s.notifyMembershipClosed(r.Context(), request.WorkspaceID, localActor(authorization))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -490,11 +491,13 @@ func (s *Server) localRemoveMember(w http.ResponseWriter, r *http.Request, autho
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
-	if err := s.Store.RemoveMember(r.Context(), request.WorkspaceID,
-		request.WorkspaceMemberID, localActor(authorization)); err != nil {
+	target, err := s.Store.RemoveMemberWithTarget(r.Context(), request.WorkspaceID,
+		request.WorkspaceMemberID, localActor(authorization))
+	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
+	s.notifyMembershipClosed(r.Context(), request.WorkspaceID, target.Participant)
 	w.WriteHeader(http.StatusNoContent)
 }
 

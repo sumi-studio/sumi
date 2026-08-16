@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -160,6 +161,7 @@ func (s *Server) serveLeaveWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
+	s.notifyMembershipClosed(r.Context(), r.PathValue("workspace_id"), actor)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -168,9 +170,12 @@ func (s *Server) serveRemoveMember(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var target Membership
 	done, err := s.browserMutation(w, r, claims, func() error {
-		return s.Store.RemoveMember(r.Context(), r.PathValue("workspace_id"),
+		var removeErr error
+		target, removeErr = s.Store.RemoveMemberWithTarget(r.Context(), r.PathValue("workspace_id"),
 			r.PathValue("workspace_member_id"), actor)
+		return removeErr
 	})
 	if !done {
 		return
@@ -179,7 +184,14 @@ func (s *Server) serveRemoveMember(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
+	s.notifyMembershipClosed(r.Context(), r.PathValue("workspace_id"), target.Participant)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) notifyMembershipClosed(ctx context.Context, workspaceID string, member participant.Ref) {
+	if s.MembershipClosed != nil {
+		s.MembershipClosed(ctx, workspaceID, member)
+	}
 }
 
 func (s *Server) serveCreateInvite(w http.ResponseWriter, r *http.Request) {
