@@ -21,9 +21,10 @@ use uuid::{Uuid, Variant, Version};
 use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi,
-        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, WriteMessagingMessageRequest,
+        CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
+        MessagingApi, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
+        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+        WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{
@@ -118,6 +119,11 @@ enum MessagingAction {
     /// Mark one's own earlier promise as kept. The marker must already be
     /// known in this view, but its place need not remain open.
     ResolveReplyLater { marker_id: String },
+    /// Read volatile call presence without gaining any ability to join it.
+    GetCallState {
+        #[serde(default)]
+        place_id: Option<String>,
+    },
 }
 
 /// Registry-sealed app arguments. Unlike the model-facing schema, every
@@ -162,6 +168,10 @@ enum BoundMessagingAction {
     },
     ResolveReplyLater {
         marker_id: String,
+    },
+    GetCallState {
+        #[serde(default)]
+        place_id: Option<String>,
     },
 }
 
@@ -444,8 +454,9 @@ fn messaging_parameters_schema() -> Value {
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id. Write, react and reply_later act on the place most recently opened in ",
-            "this tool view; status needs no open place; resolve_reply_later needs a marker ",
+            "marker_id; get_call_state may include place_id. Write, react and reply_later act ",
+            "on the place most recently opened in this tool view; status and get_call_state ",
+            "need no open place; resolve_reply_later needs a marker ",
             "already shown or returned in this tool view, but not its place open."
         ),
         "properties": {
@@ -457,7 +468,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "react",
-                    "status", "reply_later", "resolve_reply_later"
+                    "status", "reply_later", "resolve_reply_later", "get_call_state"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -465,12 +476,13 @@ fn messaging_parameters_schema() -> Value {
                     "the currently open place; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
-                    "own availability; resolve_reply_later marks one of your promises as kept."
+                    "own availability; resolve_reply_later marks one of your promises as kept; ",
+                    "get_call_state reports who is currently in calls you can see."
                 )
             },
             "place_id": {
                 "type": "string",
-                "description": "Required for open and omitted for other actions. The place to open."
+                "description": "Required for open, optional for get_call_state, and omitted for other actions. The place to open or whose current call to report."
             },
             "before_seq": {
                 "type": "integer",
@@ -850,6 +862,25 @@ impl BoundToolAdapter for MessagingTool {
                     arguments,
                 )
             }
+            MessagingAction::GetCallState { place_id } => {
+                let mut arguments =
+                    object([("action", Value::String("get_call_state".to_owned()))]);
+                insert_optional_string(&mut arguments, "place_id", place_id.clone());
+                let scopes = match &place_id {
+                    Some(place_id) => {
+                        vec![ResourceScope::resource("messaging", "place", place_id)]
+                    }
+                    None => vec![ResourceScope::collection("messaging", "place")],
+                };
+                messaging_binding(
+                    &scope,
+                    "get_call_state",
+                    CapabilityClass::Read,
+                    scopes,
+                    arguments.clone(),
+                    arguments,
+                )
+            }
         }
     }
 
@@ -946,7 +977,7 @@ impl MessagingTool {
     }
 
     /// Execute exactly one already-resolved Messaging action. Raw and bound
-    /// paths share this single seven-arm implementation; only the admission
+    /// paths share this single implementation; only the admission
     /// delivery mode differs. No pre-action maintenance belongs here.
     async fn execute_exact_action(
         &self,
@@ -1096,6 +1127,13 @@ impl MessagingTool {
                     .retain(|marker| marker.marker_id != marker_id);
                 response
             }
+            BoundMessagingAction::GetCallState { place_id } => tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.call_state(scope, GetMessagingCallStateRequest {
+                    place_id: place_id.as_deref(),
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
         };
         Ok(ExactMessagingOutcome {
             response,
@@ -1300,6 +1338,9 @@ fn resolve_raw_action(
             })?;
             Ok(BoundMessagingAction::ResolveReplyLater { marker_id })
         }
+        MessagingAction::GetCallState { place_id } => {
+            Ok(BoundMessagingAction::GetCallState { place_id })
+        }
     }
 }
 
@@ -1433,6 +1474,15 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         MessagingAction::ResolveReplyLater { marker_id } => {
             validate_bounded_nonempty(marker_id, MAX_MARKER_ID_BYTES)
         }
+        MessagingAction::GetCallState { place_id } => {
+            if place_id
+                .as_deref()
+                .is_some_and(|id| validate_bounded_nonempty(id, MAX_PLACE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1529,6 +1579,11 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
         BoundMessagingAction::ResolveReplyLater { marker_id } => {
             validate_action(&MessagingAction::ResolveReplyLater {
                 marker_id: marker_id.clone(),
+            })
+        }
+        BoundMessagingAction::GetCallState { place_id } => {
+            validate_action(&MessagingAction::GetCallState {
+                place_id: place_id.clone(),
             })
         }
     }
@@ -2259,6 +2314,24 @@ mod tests {
                 .push((request.place_id.to_owned(), request.seq));
             Ok(json!({"last_read_seq": request.seq}))
         }
+
+        async fn call_state(
+            &self,
+            scope: &ExactMessagingScope,
+            request: GetMessagingCallStateRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls
+                .lock()
+                .await
+                .push(format!("call_state:{}", request.place_id.unwrap_or("*")));
+            Ok(json!({"calls": [{
+                "place": {"kind": "channel", "channel_id": request.place_id.unwrap_or("general")},
+                "active": true,
+                "started_at": "2026-08-17T00:00:00Z",
+                "participants": []
+            }]}))
+        }
     }
 
     async fn execute(
@@ -2647,7 +2720,8 @@ mod tests {
                 "react",
                 "status",
                 "reply_later",
-                "resolve_reply_later"
+                "resolve_reply_later",
+                "get_call_state"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -3321,6 +3395,30 @@ mod tests {
             resolve,
             MessagingAction::ResolveReplyLater { marker_id } if marker_id == "marker-1"
         ));
+
+        let call_state: MessagingAction = serde_json::from_value(json!({
+            "action": "get_call_state",
+            "place_id": "general"
+        }))
+        .unwrap();
+        assert!(matches!(
+            call_state,
+            MessagingAction::GetCallState { place_id: Some(place_id) } if place_id == "general"
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_state_is_read_only_and_needs_no_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let output = execute(&tool, json!({"action": "get_call_state"}), "calls")
+            .await
+            .expect("read call state");
+        assert_eq!(output.details["calls"][0]["active"], true);
+        assert_eq!(
+            api.calls.lock().await.last().map(String::as_str),
+            Some("call_state:*")
+        );
     }
 
     #[tokio::test]
@@ -3337,6 +3435,22 @@ mod tests {
         assert_eq!(
             overview.descriptor.resource_scopes,
             scoped_resources(vec![ResourceScope::collection("messaging", "place")])
+        );
+
+        let calls = bind_action(
+            &registry,
+            "get-call-state",
+            json!({"action": "get_call_state", "place_id": "place-a"}),
+        )
+        .await
+        .expect("bind call state");
+        assert_eq!(calls.descriptor.operation, "get_call_state");
+        assert_eq!(calls.descriptor.capability, CapabilityClass::Read);
+        assert!(
+            calls
+                .descriptor
+                .resource_scopes
+                .contains(&ResourceScope::resource("messaging", "place", "place-a"))
         );
         assert_eq!(
             Value::Object(overview.execution_arguments.as_object().clone()),
@@ -3649,7 +3763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_and_bound_paths_share_one_exact_executor_for_all_seven_actions() {
+    async fn raw_and_bound_paths_share_one_exact_executor_for_all_eight_actions() {
         let cases = [
             ("overview", json!({"action": "overview"})),
             (
@@ -3695,6 +3809,10 @@ mod tests {
                     "action": "resolve_reply_later",
                     "marker_id": "marker-1"
                 }),
+            ),
+            (
+                "call-state",
+                json!({"action": "get_call_state", "place_id": "place-a"}),
             ),
         ];
 
