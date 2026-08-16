@@ -18,6 +18,7 @@ const (
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
+	LocalCallStatePath         = "/local-control/v1/messaging:call-state"
 	// LocalNotificationSettingsPath reads and writes the same app-owned
 	// notification-setting resource for a PersonalityAgent that the Human UI
 	// uses for a Human. This adapter route does not itself define which agent
@@ -49,12 +50,55 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 	}
+	if s.Calls != nil {
+		routes = append(routes, struct {
+			pattern string
+			handler agentevents.LocalAuthorizedHandler
+		}{"POST " + LocalCallStatePath, s.Calls.localCallState})
+	}
 	for _, route := range routes {
 		if err := control.RegisterAuthorizedRoute(route.pattern, route.handler); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (c *CallService) localCallState(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		PlaceID string `json:"place_id,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	store, ok := c.Server.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	if request.PlaceID == "" {
+		calls, err := c.visibleCalls(r.Context(), store)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Calls []callStateWire `json:"calls"`
+		}{calls})
+		return
+	}
+	place, err := store.PlaceFor(r.Context(), request.PlaceID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	state, found := c.Registry.snapshot(request.PlaceID)
+	if !found {
+		state = CallState{PlaceID: request.PlaceID}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Calls []callStateWire `json:"calls"`
+	}{[]callStateWire{callStateToWire(place, state)}})
 }
 
 func localViewer(authorization agentevents.LocalRuntimeAuthorization) ParticipantRef {

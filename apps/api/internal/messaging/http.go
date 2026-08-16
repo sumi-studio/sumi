@@ -38,6 +38,8 @@ type Server struct {
 	// WebSocket subscribers see messages regardless of which transport
 	// committed them. Nil is fine: durable truth lives in the store.
 	Hub *Hub
+	// Calls is nil when this deployment has no configured media transport.
+	Calls *CallService
 	// reactionMu keeps a reaction commit, its authoritative snapshot and the
 	// corresponding live publish in one process-local order. Hub itself is
 	// process-local, so this is the ordering boundary clients can observe.
@@ -236,6 +238,7 @@ type channelWire struct {
 	Name        string `json:"name"`
 	Topic       string `json:"topic"`
 	Visibility  string `json:"visibility"`
+	Voice       bool   `json:"voice"`
 }
 
 func channelToWire(p Place) channelWire {
@@ -245,6 +248,7 @@ func channelToWire(p Place) channelWire {
 		Name:        p.Name,
 		Topic:       p.Topic,
 		Visibility:  p.Visibility,
+		Voice:       p.Voice,
 	}
 }
 
@@ -677,6 +681,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID string `json:"workspace_id"`
 		Name        string `json:"name"`
 		Topic       string `json:"topic"`
+		Voice       bool   `json:"voice"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -695,7 +700,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		if req.WorkspaceID != "" && req.WorkspaceID != scopedStoreForRequest(r).Scope.WorkspaceID {
 			return ErrInvalidScope
 		}
-		place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic)
+		place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic, req.Voice)
 		return opErr
 	})
 	if !done {

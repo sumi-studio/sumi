@@ -28,7 +28,11 @@ func (s *Store) withLiveAudience(
 	if s == nil || s.workspaces == nil || s.apps == nil || deliver == nil {
 		return ErrInvalidScope
 	}
-	if err := scope.Validate(); err != nil {
+	if requireActor {
+		if err := scope.Validate(); err != nil {
+			return err
+		}
+	} else if err := scope.validateAddress(); err != nil {
 		return err
 	}
 	if boundary.key() == "" {

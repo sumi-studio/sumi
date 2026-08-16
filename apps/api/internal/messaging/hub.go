@@ -24,6 +24,7 @@ type Event struct {
 	DM       *dmWire             `json:"dm,omitempty"`
 	Status   *statusWire         `json:"status,omitempty"`
 	Marker   *replyLaterWire     `json:"marker,omitempty"`
+	Call     *callStateWire      `json:"call,omitempty"`
 	// Notify rides only on the copy addressed to a recipient the server decided
 	// to interrupt. Its absence is the answer "this is not worth calling you
 	// for", which is why it is per-recipient rather than part of the message.
@@ -75,6 +76,7 @@ const (
 	EventReplyLaterResolved = "reply_later_resolved"
 	EventPlaceCreated       = "place_created"
 	EventPlaceUpdated       = "place_updated"
+	EventCallState          = "call_state"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible keeps
@@ -205,6 +207,15 @@ func (h *Hub) PublishActorScoped(ctx context.Context, store *ScopedStore, event 
 		return ErrInvalidScope
 	}
 	return h.publishVariants(ctx, store.Scope, true, []Event{event})
+}
+
+// PublishSystemScoped carries trusted server-side projections, such as a
+// verified LiveKit webhook, through the current installation/place audience.
+func (h *Hub) PublishSystemScoped(ctx context.Context, scope Scope, event Event) error {
+	if err := scope.validateAddress(); err != nil {
+		return err
+	}
+	return h.publishVariants(ctx, scope, false, []Event{event})
 }
 
 // PublishVariants delivers mutually exclusive recipient variants of one

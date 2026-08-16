@@ -488,7 +488,7 @@ func (s *testMessagingStore) CreateChannel(ctx context.Context, workspaceID, nam
 	if err != nil {
 		return Place{}, err
 	}
-	return scoped.CreateChannel(ctx, name, topic)
+	return scoped.CreateChannel(ctx, name, topic, false)
 }
 
 func (s *testMessagingStore) UpdateChannelTopic(ctx context.Context, placeID, topic string, actor ParticipantRef) (Place, error) {

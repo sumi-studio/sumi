@@ -71,6 +71,9 @@ type Place struct {
 	Topic       string
 	Visibility  string
 	LastSeq     int64
+	// Voice is an attribute rather than a place kind because conversation text
+	// and call presence belong to the same place (ADR 0012).
+	Voice bool
 }
 
 // MemberProfile is a participant with their scope-resolved display name.
