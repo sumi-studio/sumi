@@ -150,21 +150,35 @@ impl Config {
     }
 
     pub fn execution_reviewer_model_spec(&self) -> Result<ModelSpec> {
-        let config = self.reviewers.execution.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Execution reviewer model must be configured explicitly under [reviewers.execution] or SUMI_EXECUTION_REVIEWER_MODEL_*"
-            )
-        })?;
-        resolve_model_spec(config, None, "Execution reviewer")
+        self.reviewer_model_spec(self.reviewers.execution.as_ref(), "Execution reviewer")
     }
 
     pub fn escalation_reviewer_model_spec(&self) -> Result<ModelSpec> {
-        let config = self.reviewers.escalation.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Escalation reviewer model must be configured explicitly under [reviewers.escalation] or SUMI_ESCALATION_REVIEWER_MODEL_*"
-            )
-        })?;
-        resolve_model_spec(config, None, "Escalation reviewer")
+        self.reviewer_model_spec(self.reviewers.escalation.as_ref(), "Escalation reviewer")
+    }
+
+    fn reviewer_model_spec(
+        &self,
+        reviewer: Option<&ModelConfig>,
+        label: &str,
+    ) -> Result<ModelSpec> {
+        let conversation = self.model_spec()?;
+        let Some(reviewer) = reviewer else {
+            return Ok(conversation);
+        };
+        let mut spec = match reviewer.preset.as_deref() {
+            Some(preset) => ModelSpec::preset(preset)
+                .with_context(|| format!("unknown model preset {preset}"))?,
+            None => conversation.clone(),
+        };
+        if reviewer.id.is_none() {
+            spec.set_model_id(&conversation.id);
+        }
+        if reviewer.api_key_env.is_none() {
+            spec.api_key_env.clone_from(&conversation.api_key_env);
+        }
+        apply_model_config(&mut spec, reviewer)?;
+        validate_resolved_model_spec(spec, label)
     }
 
     fn resolve(file: FileConfig, overrides: EnvOverrides) -> Result<Self> {
@@ -244,6 +258,11 @@ fn resolve_model_spec(
         .ok_or_else(|| anyhow::anyhow!("{label} preset must be configured explicitly"))?;
     let mut spec =
         ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
+    apply_model_config(&mut spec, model)?;
+    validate_resolved_model_spec(spec, label)
+}
+
+fn apply_model_config(spec: &mut ModelSpec, model: &ModelConfig) -> Result<()> {
     if let Some(id) = &model.id {
         spec.set_model_id(id);
     }
@@ -321,6 +340,10 @@ fn resolve_model_spec(
     } else if *compat_config != CompatConfig::default() {
         anyhow::bail!("Chat compatibility overrides require a Chat protocol preset");
     }
+    Ok(())
+}
+
+fn validate_resolved_model_spec(spec: ModelSpec, label: &str) -> Result<ModelSpec> {
     match (&spec.protocol, &spec.compat) {
         (ApiProtocol::OpenAiChatCompletions, ProtocolCompat::Chat(_))
         | (ApiProtocol::OpenAiResponses, ProtocolCompat::Responses(_))
@@ -339,6 +362,9 @@ fn resolve_model_spec(
     }
     if ResponseBudget::for_output_tokens(spec.max_output_tokens).is_none() {
         anyhow::bail!("max_output_tokens cannot be represented by the provider response budget");
+    }
+    if spec.id.trim().is_empty() {
+        anyhow::bail!("{label} model id must not be empty");
     }
     Ok(spec)
 }
@@ -1183,7 +1209,7 @@ default_output_tokens = 16000
     }
 
     #[test]
-    fn reviewer_models_require_explicit_presets_and_support_independent_overrides() {
+    fn reviewer_models_inherit_conversation_provider_and_support_explicit_overrides() {
         let mut file = FileConfig {
             reviewers: ReviewerModelsConfig {
                 execution: Some(ModelConfig {
@@ -1232,23 +1258,65 @@ default_output_tokens = 16000
 
         let missing = Config::resolve(FileConfig::default(), identity_overrides())
             .expect("ordinary config remains loadable");
-        assert!(missing.execution_reviewer_model_spec().is_err());
-        assert!(missing.escalation_reviewer_model_spec().is_err());
+        let conversation = missing.model_spec().expect("conversation model");
+        assert_eq!(
+            missing
+                .execution_reviewer_model_spec()
+                .expect("inherited Execution reviewer"),
+            conversation
+        );
+        assert_eq!(
+            missing
+                .escalation_reviewer_model_spec()
+                .expect("inherited Escalation reviewer"),
+            conversation
+        );
 
-        let missing_preset = Config {
+        let partial = Config {
             reviewers: ReviewerModelsConfig {
-                execution: Some(ModelConfig::default()),
+                execution: Some(ModelConfig {
+                    id: Some("cheap-reviewer".to_owned()),
+                    ..ModelConfig::default()
+                }),
                 escalation: None,
             },
             ..missing
         };
-        assert_eq!(
-            missing_preset
-                .execution_reviewer_model_spec()
-                .expect_err("reviewer must not inherit the conversation preset")
-                .to_string(),
-            "Execution reviewer preset must be configured explicitly"
-        );
+        let partial_execution = partial
+            .execution_reviewer_model_spec()
+            .expect("partial reviewer inherits provider and credential");
+        assert_eq!(partial_execution.id, "cheap-reviewer");
+        assert_eq!(partial_execution.provider, conversation.provider);
+        assert_eq!(partial_execution.base_url, conversation.base_url);
+        assert_eq!(partial_execution.api_key_env, conversation.api_key_env);
+    }
+
+    #[test]
+    fn single_provider_configuration_builds_both_reviewers() {
+        let config = Config::resolve(
+            FileConfig {
+                model: ModelConfig {
+                    preset: Some("kimi-k3".to_owned()),
+                    api_key_env: Some("SUMI_ONE_PROVIDER_KEY".to_owned()),
+                    ..ModelConfig::default()
+                },
+                ..FileConfig::default()
+            },
+            identity_overrides(),
+        )
+        .expect("single-provider config");
+        let conversation = config.model_spec().expect("conversation model");
+        let execution = config
+            .execution_reviewer_model_spec()
+            .expect("inherited Execution reviewer");
+        let escalation = config
+            .escalation_reviewer_model_spec()
+            .expect("inherited Escalation reviewer");
+
+        assert_eq!(execution, conversation);
+        assert_eq!(escalation, conversation);
+        crate::approval::route_reviewer::ReviewerModels::new(execution, escalation)
+            .expect("shared structured-output provider is startup-ready");
     }
 
     #[test]

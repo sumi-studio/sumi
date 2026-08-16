@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elevated_remote_bind_keeps_exact_selectors_local_and_out_of_every_reviewer_wire() {
+    async fn elevated_remote_bind_sends_exact_selectors_to_every_reviewer_wire() {
         const PATH_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
         const PATTERN_SENTINEL: &str = "remote-review-pattern-secret";
         assert_eq!(PATH_SENTINEL.chars().count(), 43);
@@ -2353,15 +2353,18 @@ mod tests {
                 ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
                 other => panic!("remote Elevated review expected Ready, got {other:?}"),
             };
-            let (sealed_evidence, policy_evidence) = provider_review_inputs_for_test(
+            let (transcript, action, policy_evidence) = provider_review_inputs_for_test(
                 bound,
+                &[],
                 ToolInvocationRoute::Elevated,
                 PolicyDecisionRecord::ElevatedPreflight,
                 &snapshot,
+                &Redactor::v1(),
             )
             .expect("remote reviewer inputs");
             let request = EscalationReviewRequest {
-                sealed_evidence,
+                transcript,
+                action,
                 policy: policy_evidence,
             };
             let local_digests = [
@@ -2376,11 +2379,11 @@ mod tests {
             assert_eq!(bodies.len(), 8, "four providers x initial/retry");
             for (provider, body) in bodies {
                 let encoded = body.to_string();
-                for sentinel in [PATH_SENTINEL, PATTERN_SENTINEL] {
-                    assert_eq!(
-                        encoded.matches(sentinel).count(),
-                        0,
-                        "{name} remote selector leaked through {provider}"
+                assert!(encoded.contains(PATH_SENTINEL));
+                if has_private_pattern {
+                    assert!(
+                        encoded.contains(PATTERN_SENTINEL),
+                        "{name} exact remote pattern missing from {provider}"
                     );
                 }
                 for digest in &local_digests {

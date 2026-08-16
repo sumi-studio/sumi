@@ -2424,7 +2424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_bindings_keep_exact_human_text_but_never_wire_it_to_reviewers() {
+    async fn real_bindings_send_exact_human_projection_to_both_reviewers() {
         const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
         assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
 
@@ -2518,15 +2518,19 @@ mod tests {
                 } => snapshot,
                 other => panic!("{id} expected Normal/Unmatched, got {other:?}"),
             };
-            let (execution_evidence, execution_policy) = provider_review_inputs_for_test(
-                &bound,
-                ToolInvocationRoute::Normal,
-                PolicyDecisionRecord::Unmatched,
-                &normal_snapshot,
-            )
-            .expect("Execution reviewer inputs");
+            let (execution_transcript, execution_action, execution_policy) =
+                provider_review_inputs_for_test(
+                    &bound,
+                    &[],
+                    ToolInvocationRoute::Normal,
+                    PolicyDecisionRecord::Unmatched,
+                    &normal_snapshot,
+                    &Redactor::v1(),
+                )
+                .expect("Execution reviewer inputs");
             let execution_request = ExecutionReviewRequest {
-                sealed_evidence: execution_evidence,
+                transcript: execution_transcript,
+                action: execution_action,
                 policy: execution_policy,
             };
 
@@ -2534,15 +2538,19 @@ mod tests {
                 ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
                 other => panic!("{id} expected Elevated/Ready, got {other:?}"),
             };
-            let (escalation_evidence, escalation_policy) = provider_review_inputs_for_test(
-                &bound,
-                ToolInvocationRoute::Elevated,
-                PolicyDecisionRecord::ElevatedPreflight,
-                &elevated_snapshot,
-            )
-            .expect("Escalation reviewer inputs");
+            let (escalation_transcript, escalation_action, escalation_policy) =
+                provider_review_inputs_for_test(
+                    &bound,
+                    &[],
+                    ToolInvocationRoute::Elevated,
+                    PolicyDecisionRecord::ElevatedPreflight,
+                    &elevated_snapshot,
+                    &Redactor::v1(),
+                )
+                .expect("Escalation reviewer inputs");
             let escalation_request = EscalationReviewRequest {
-                sealed_evidence: escalation_evidence,
+                transcript: escalation_transcript,
+                action: escalation_action,
                 policy: escalation_policy,
             };
 
@@ -2560,10 +2568,9 @@ mod tests {
             {
                 let encoded = body.to_string();
                 assert!(encoded.contains("provider_evidence_digest"));
-                assert_eq!(
-                    encoded.matches(INVITE_CODE_SENTINEL).count(),
-                    0,
-                    "{id} leaked free-form text through {provider}"
+                assert!(
+                    encoded.contains(INVITE_CODE_SENTINEL),
+                    "{id} exact review projection missing from {provider}"
                 );
                 for digest in &local_digests {
                     assert_eq!(

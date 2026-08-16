@@ -1,9 +1,9 @@
 //! ADR 0013's two fail-closed AutoReview boundaries.
 //!
 //! The two reviewers deliberately have separate request, prompt, transport,
-//! decision, evidence, and result types. This module consumes only already
-//! provider-safe, app-owned evidence; it never receives raw execution
-//! arguments, exact Human projections, or exact resource identifiers.
+//! decision, evidence, and result types. Both receive bounded user-authored
+//! transcript evidence and the exact app-owned action projection, while tool
+//! results and assistant-authored text remain outside the review request.
 
 use std::{sync::Arc, time::Duration};
 
@@ -29,21 +29,24 @@ use crate::{
             ToolInvocationRoute, UserContent, UserMessage,
         },
     },
-    tools::{ProviderReviewDescriptor, ProviderReviewIdentity, ProviderReviewProjection},
 };
 
 const MAX_COMPILED_ATTEMPTS: u8 = 2;
 const MAX_COMPILED_TOTAL: Duration = Duration::from_secs(30);
-const MAX_REVIEW_REQUEST_BYTES: usize = 256 * 1024;
-const PROVIDER_REVIEW_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-evidence/v1\0";
+const MAX_REVIEW_REQUEST_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_REVIEW_ACTION_CHARS: usize = 64_000;
+const REVIEW_ACTION_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-action/v3\0";
+const REVIEW_ACTION_SCHEMA_VERSION_V3: u32 = 3;
+pub(crate) const REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3: u32 = 3;
+pub(crate) const REVIEW_TRUNCATION_MARKER: &str = "[... truncated ...]";
 
 pub const REVIEWER_BUDGET_VERSION_V1: &str = "reviewer-budget/v1";
-pub const EXECUTION_REVIEWER_VERSION_V2: &str = "execution-reviewer/v2";
-pub const EXECUTION_PROMPT_VERSION_V2: &str = "execution-review-prompt/v2";
-pub const EXECUTION_SCHEMA_VERSION_V1: &str = "execution-review-schema/v1";
-pub const ESCALATION_REVIEWER_VERSION_V2: &str = "escalation-reviewer/v2";
-pub const ESCALATION_PROMPT_VERSION_V2: &str = "escalation-review-prompt/v2";
-pub const ESCALATION_SCHEMA_VERSION_V1: &str = "escalation-review-schema/v1";
+pub const EXECUTION_REVIEWER_VERSION_V3: &str = "execution-reviewer/v3";
+pub const EXECUTION_PROMPT_VERSION_V3: &str = "execution-review-prompt/v3";
+pub const EXECUTION_SCHEMA_VERSION_V3: &str = "execution-review-schema/v3";
+pub const ESCALATION_REVIEWER_VERSION_V3: &str = "escalation-reviewer/v3";
+pub const ESCALATION_PROMPT_VERSION_V3: &str = "escalation-review-prompt/v3";
+pub const ESCALATION_SCHEMA_VERSION_V3: &str = "escalation-review-schema/v3";
 
 const EXECUTION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/execution-review.md");
 const ESCALATION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/escalation-review.md");
@@ -132,55 +135,18 @@ pub enum ReviewerNotReady {
     UntrustedModel,
     #[error("{reviewer} reviewer model does not support structured output")]
     StructuredOutputUnsupported { reviewer: &'static str },
-    #[error("{left} and {right} must use distinct provider-instance/account/model identities")]
-    CollapsedModelIdentity {
-        left: &'static str,
-        right: &'static str,
-    },
-    #[error("{left} and {right} must use distinct normalized provider base endpoints")]
-    CollapsedProviderOrigin {
-        left: &'static str,
-        right: &'static str,
-    },
-    #[error("{left} and {right} must use distinct credential sources")]
-    CollapsedCredentialSource {
-        left: &'static str,
-        right: &'static str,
-    },
 }
 
 #[derive(Clone, Debug)]
-pub struct IndependentReviewerModels {
+pub struct ReviewerModels {
     execution: ModelSpec,
     escalation: ModelSpec,
 }
 
-impl IndependentReviewerModels {
-    pub fn new(
-        conversation: &ModelSpec,
-        execution: ModelSpec,
-        escalation: ModelSpec,
-    ) -> Result<Self, ReviewerNotReady> {
+impl ReviewerModels {
+    pub fn new(execution: ModelSpec, escalation: ModelSpec) -> Result<Self, ReviewerNotReady> {
         require_structured_output("Execution", &execution)?;
         require_structured_output("Escalation", &escalation)?;
-        require_independent_pair(
-            "conversation",
-            conversation,
-            "Execution reviewer",
-            &execution,
-        )?;
-        require_independent_pair(
-            "conversation",
-            conversation,
-            "Escalation reviewer",
-            &escalation,
-        )?;
-        require_independent_pair(
-            "Execution reviewer",
-            &execution,
-            "Escalation reviewer",
-            &escalation,
-        )?;
         Ok(Self {
             execution,
             escalation,
@@ -193,28 +159,6 @@ impl IndependentReviewerModels {
         let trust = ReviewerTrustSet::new(vec![execution_model.clone(), escalation_model.clone()]);
         (self.execution, self.escalation, trust)
     }
-}
-
-fn require_independent_pair(
-    left_name: &'static str,
-    left: &ModelSpec,
-    right_name: &'static str,
-    right: &ModelSpec,
-) -> Result<(), ReviewerNotReady> {
-    require_distinct_identity(left_name, left, right_name, right)?;
-    if left.provider_origin_id() == right.provider_origin_id() {
-        return Err(ReviewerNotReady::CollapsedProviderOrigin {
-            left: left_name,
-            right: right_name,
-        });
-    }
-    if left.api_key_env == right.api_key_env {
-        return Err(ReviewerNotReady::CollapsedCredentialSource {
-            left: left_name,
-            right: right_name,
-        });
-    }
-    Ok(())
 }
 
 fn require_structured_output(
@@ -231,32 +175,6 @@ fn require_structured_output(
         Ok(())
     } else {
         Err(ReviewerNotReady::StructuredOutputUnsupported { reviewer })
-    }
-}
-
-fn require_distinct_identity(
-    left_name: &'static str,
-    left: &ModelSpec,
-    right_name: &'static str,
-    right: &ModelSpec,
-) -> Result<(), ReviewerNotReady> {
-    let left_identity = (
-        left.provider_instance_id(),
-        left.account_scope.as_str(),
-        left.id.as_str(),
-    );
-    let right_identity = (
-        right.provider_instance_id(),
-        right.account_scope.as_str(),
-        right.id.as_str(),
-    );
-    if left_identity == right_identity {
-        Err(ReviewerNotReady::CollapsedModelIdentity {
-            left: left_name,
-            right: right_name,
-        })
-    } else {
-        Ok(())
     }
 }
 
@@ -299,7 +217,7 @@ impl ReviewerModelSpec {
             base_url: spec.base_url.clone(),
             account_scope: spec.account_scope.clone(),
             trust_domain_id: spec.provider_instance_id(),
-            data_processing_policy: "same-provider-account".to_owned(),
+            data_processing_policy: "configured-provider-binding".to_owned(),
         }
     }
 
@@ -419,55 +337,125 @@ pub struct EscalationReviewDecision {
     pub rationale: String,
 }
 
-/// App-owned review material sealed before policy evaluation. This type has
-/// no field capable of carrying conversation messages, provider context, or
-/// raw execution arguments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewerTranscriptEntry {
+    User {
+        text: String,
+        truncated: bool,
+    },
+    Omission {
+        omitted_entries: usize,
+        marker: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerTranscript {
+    pub(crate) schema_version: u32,
+    pub(crate) entries: Vec<ReviewerTranscriptEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewActionTruncation {
+    descriptor_omitted_characters: usize,
+    review_projection_omitted_characters: usize,
+    marker: &'static str,
+}
+
+/// Provider-visible action evidence. Normal-size actions preserve the exact
+/// redacted descriptor and Human-facing projection as JSON values. Oversized
+/// values retain an explicit JSON prefix and omission count instead of being
+/// replaced by structural counts.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SealedReviewEvidence {
+pub struct ReviewerActionEvidence {
     schema_version: u32,
     route: ToolInvocationRoute,
     provider_evidence_digest: String,
-    identity: ProviderReviewIdentity,
-    provider_descriptor: ProviderReviewDescriptor,
-    provider_review_projection: ProviderReviewProjection,
+    descriptor: Value,
+    review_projection: Value,
+    truncation: Option<ReviewActionTruncation>,
 }
 
-impl SealedReviewEvidence {
+impl ReviewerActionEvidence {
     pub(crate) fn new(
-        schema_version: u32,
         route: ToolInvocationRoute,
-        identity: ProviderReviewIdentity,
-        provider_descriptor: ProviderReviewDescriptor,
-        provider_review_projection: ProviderReviewProjection,
+        descriptor: Value,
+        review_projection: Value,
     ) -> Result<Self, serde_json::Error> {
+        let descriptor_json = serde_json::to_string(&descriptor)?;
+        let projection_json = serde_json::to_string(&review_projection)?;
+        let descriptor_chars = descriptor_json.chars().count();
+        let projection_chars = projection_json.chars().count();
+        let (descriptor_budget, projection_budget) =
+            action_component_budgets(descriptor_chars, projection_chars);
+        let descriptor_omitted = descriptor_chars.saturating_sub(descriptor_budget);
+        let projection_omitted = projection_chars.saturating_sub(projection_budget);
+        let descriptor = capped_json_value(descriptor, &descriptor_json, descriptor_budget);
+        let review_projection =
+            capped_json_value(review_projection, &projection_json, projection_budget);
+        let truncation = (descriptor_omitted != 0 || projection_omitted != 0).then_some(
+            ReviewActionTruncation {
+                descriptor_omitted_characters: descriptor_omitted,
+                review_projection_omitted_characters: projection_omitted,
+                marker: REVIEW_TRUNCATION_MARKER,
+            },
+        );
+
         #[derive(Serialize)]
         struct DigestInput<'a> {
             schema_version: u32,
             route: ToolInvocationRoute,
-            identity: ProviderReviewIdentity,
-            provider_descriptor: &'a ProviderReviewDescriptor,
-            provider_review_projection: &'a ProviderReviewProjection,
+            descriptor: &'a Value,
+            review_projection: &'a Value,
+            truncation: &'a Option<ReviewActionTruncation>,
         }
-
         let digest_input = serde_json::to_vec(&DigestInput {
-            schema_version,
+            schema_version: REVIEW_ACTION_SCHEMA_VERSION_V3,
             route,
-            identity,
-            provider_descriptor: &provider_descriptor,
-            provider_review_projection: &provider_review_projection,
+            descriptor: &descriptor,
+            review_projection: &review_projection,
+            truncation: &truncation,
         })?;
         let mut digest = Sha256::new();
-        digest.update(PROVIDER_REVIEW_EVIDENCE_DIGEST_DOMAIN);
+        digest.update(REVIEW_ACTION_EVIDENCE_DIGEST_DOMAIN);
         digest.update(digest_input);
 
         Ok(Self {
-            schema_version,
+            schema_version: REVIEW_ACTION_SCHEMA_VERSION_V3,
             route,
             provider_evidence_digest: hex(&digest.finalize()),
-            identity,
-            provider_descriptor,
-            provider_review_projection,
+            descriptor,
+            review_projection,
+            truncation,
+        })
+    }
+}
+
+fn action_component_budgets(descriptor_chars: usize, projection_chars: usize) -> (usize, usize) {
+    if descriptor_chars.saturating_add(projection_chars) <= MAX_REVIEW_ACTION_CHARS {
+        return (descriptor_chars, projection_chars);
+    }
+    let half = MAX_REVIEW_ACTION_CHARS / 2;
+    if descriptor_chars <= half {
+        (descriptor_chars, MAX_REVIEW_ACTION_CHARS - descriptor_chars)
+    } else if projection_chars <= half {
+        (MAX_REVIEW_ACTION_CHARS - projection_chars, projection_chars)
+    } else {
+        (half, MAX_REVIEW_ACTION_CHARS - half)
+    }
+}
+
+fn capped_json_value(exact: Value, encoded: &str, budget: usize) -> Value {
+    if encoded.chars().count() <= budget {
+        exact
+    } else {
+        json!({
+            "json_prefix": encoded.chars().take(budget).collect::<String>(),
+            "marker": REVIEW_TRUNCATION_MARKER,
         })
     }
 }
@@ -514,14 +502,16 @@ impl ReviewerPolicyEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReviewRequest {
-    pub sealed_evidence: SealedReviewEvidence,
+    pub transcript: ReviewerTranscript,
+    pub action: ReviewerActionEvidence,
     pub policy: ReviewerPolicyEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EscalationReviewRequest {
-    pub sealed_evidence: SealedReviewEvidence,
+    pub transcript: ReviewerTranscript,
+    pub action: ReviewerActionEvidence,
     pub policy: ReviewerPolicyEvidence,
 }
 
@@ -529,9 +519,9 @@ pub struct EscalationReviewRequest {
 pub struct ExecutionReviewOutputSchema(StructuredOutputSchema);
 
 impl ExecutionReviewOutputSchema {
-    fn v1() -> Self {
+    fn v3() -> Self {
         Self(StructuredOutputSchema {
-            name: "sumi_execution_review_v1".to_owned(),
+            name: "sumi_execution_review_v3".to_owned(),
             description: "Sumi Execution AutoReview decision".to_owned(),
             schema: json!({
                 "type": "object",
@@ -555,9 +545,9 @@ impl ExecutionReviewOutputSchema {
 pub struct EscalationReviewOutputSchema(StructuredOutputSchema);
 
 impl EscalationReviewOutputSchema {
-    fn v1() -> Self {
+    fn v3() -> Self {
         Self(StructuredOutputSchema {
-            name: "sumi_escalation_review_v1".to_owned(),
+            name: "sumi_escalation_review_v3".to_owned(),
             description: "Sumi Escalation AutoReview decision".to_owned(),
             schema: json!({
                 "type": "object",
@@ -882,9 +872,9 @@ pub(crate) fn execution_provider_wire_bodies_for_test(
         .flat_map(|retry_validation_code| {
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
-                output_schema: ExecutionReviewOutputSchema::v1(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V2,
-                schema_version: EXECUTION_SCHEMA_VERSION_V1,
+                output_schema: ExecutionReviewOutputSchema::v3(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V3,
+                schema_version: EXECUTION_SCHEMA_VERSION_V3,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -906,9 +896,9 @@ pub(crate) fn escalation_provider_wire_bodies_for_test(
         .flat_map(|retry_validation_code| {
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
-                output_schema: EscalationReviewOutputSchema::v1(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V2,
-                schema_version: ESCALATION_SCHEMA_VERSION_V1,
+                output_schema: EscalationReviewOutputSchema::v3(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V3,
+                schema_version: ESCALATION_SCHEMA_VERSION_V3,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -998,9 +988,9 @@ impl ExecutionReviewer {
             attempts += 1;
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
-                output_schema: ExecutionReviewOutputSchema::v1(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V2,
-                schema_version: EXECUTION_SCHEMA_VERSION_V1,
+                output_schema: ExecutionReviewOutputSchema::v3(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V3,
+                schema_version: EXECUTION_SCHEMA_VERSION_V3,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -1106,9 +1096,9 @@ impl EscalationReviewer {
             attempts += 1;
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
-                output_schema: EscalationReviewOutputSchema::v1(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V2,
-                schema_version: ESCALATION_SCHEMA_VERSION_V1,
+                output_schema: EscalationReviewOutputSchema::v3(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V3,
+                schema_version: ESCALATION_SCHEMA_VERSION_V3,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -1327,9 +1317,9 @@ fn execution_result(
         decision.outcome = ExecutionReviewOutcome::Block;
     }
     let evidence = ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V2.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V2.to_owned(),
-        schema_version: EXECUTION_SCHEMA_VERSION_V1.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V3.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V3.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION_V3.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1348,9 +1338,9 @@ fn execution_synthetic_block(
     terminal: ReviewerTerminalClass,
 ) -> ExecutionReviewResult {
     ExecutionReviewResult::Block(ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V2.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V2.to_owned(),
-        schema_version: EXECUTION_SCHEMA_VERSION_V1.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V3.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V3.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION_V3.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1373,9 +1363,9 @@ fn escalation_result(
         decision.outcome = EscalationReviewOutcome::Block;
     }
     let evidence = EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V2.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V2.to_owned(),
-        schema_version: ESCALATION_SCHEMA_VERSION_V1.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V3.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V3.to_owned(),
+        schema_version: ESCALATION_SCHEMA_VERSION_V3.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1394,9 +1384,9 @@ fn escalation_synthetic_block(
     terminal: ReviewerTerminalClass,
 ) -> EscalationReviewResult {
     EscalationReviewResult::Block(EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V2.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V2.to_owned(),
-        schema_version: ESCALATION_SCHEMA_VERSION_V1.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V3.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V3.to_owned(),
+        schema_version: ESCALATION_SCHEMA_VERSION_V3.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1528,23 +1518,31 @@ mod tests {
         }
     }
 
-    fn sealed_evidence(route: ToolInvocationRoute) -> SealedReviewEvidence {
+    fn action_evidence(route: ToolInvocationRoute) -> ReviewerActionEvidence {
         let bound = BoundToolInvocation::test_fixture("tool-call-1", CapabilityClass::Mutate);
-        sealed_evidence_from_bound(&bound, route)
+        action_evidence_from_bound(&bound, route)
     }
 
-    fn sealed_evidence_from_bound(
+    fn action_evidence_from_bound(
         bound: &BoundToolInvocation,
         route: ToolInvocationRoute,
-    ) -> SealedReviewEvidence {
-        SealedReviewEvidence::new(
-            bound.schema_version,
+    ) -> ReviewerActionEvidence {
+        ReviewerActionEvidence::new(
             route,
-            bound.provider_review_identity,
-            bound.provider_review_descriptor.clone(),
-            bound.provider_review_projection.clone(),
+            serde_json::to_value(&bound.descriptor).expect("exact descriptor"),
+            Value::Object(bound.review_projection.as_object().clone()),
         )
-        .expect("provider-safe sealed evidence")
+        .expect("reviewer action evidence")
+    }
+
+    fn transcript_evidence() -> ReviewerTranscript {
+        ReviewerTranscript {
+            schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3,
+            entries: vec![ReviewerTranscriptEntry::User {
+                text: "Please update the exact record I named.".to_owned(),
+                truncated: false,
+            }],
+        }
     }
 
     fn policy_evidence(
@@ -1563,14 +1561,16 @@ mod tests {
 
     fn execution_request() -> ExecutionReviewRequest {
         ExecutionReviewRequest {
-            sealed_evidence: sealed_evidence(ToolInvocationRoute::Normal),
+            transcript: transcript_evidence(),
+            action: action_evidence(ToolInvocationRoute::Normal),
             policy: policy_evidence(ToolInvocationRoute::Normal, PolicyDecisionRecord::Unmatched),
         }
     }
 
     fn escalation_request() -> EscalationReviewRequest {
         EscalationReviewRequest {
-            sealed_evidence: sealed_evidence(ToolInvocationRoute::Elevated),
+            transcript: transcript_evidence(),
+            action: action_evidence(ToolInvocationRoute::Elevated),
             policy: policy_evidence(
                 ToolInvocationRoute::Elevated,
                 PolicyDecisionRecord::ElevatedPreflight,
@@ -1660,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_request_types_expose_only_sealed_action_and_policy_evidence() {
+    fn reviewer_request_types_keep_separate_transcript_action_and_policy_evidence() {
         for request in [
             serde_json::to_value(execution_request()).expect("execution request"),
             serde_json::to_value(escalation_request()).expect("escalation request"),
@@ -1668,22 +1668,22 @@ mod tests {
             let object = request.as_object().expect("review request object");
             assert_eq!(
                 object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-                BTreeSet::from(["policy", "sealed_evidence"])
+                BTreeSet::from(["action", "policy", "transcript"])
             );
             assert_eq!(
-                object["sealed_evidence"]
+                object["action"]
                     .as_object()
-                    .expect("sealed evidence")
+                    .expect("action evidence")
                     .keys()
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([
-                    "identity",
+                    "descriptor",
                     "provider_evidence_digest",
-                    "provider_descriptor",
-                    "provider_review_projection",
+                    "review_projection",
                     "route",
                     "schema_version",
+                    "truncation",
                 ])
             );
             assert_eq!(
@@ -1704,9 +1704,7 @@ mod tests {
             );
             let encoded = serde_json::to_string(&request).expect("encoded review request");
             for forbidden in [
-                "bounded_context",
                 "context_version",
-                "conversation",
                 "tenant_id",
                 "personality_agent_id",
                 "human_principal_id",
@@ -1727,23 +1725,23 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_wire_builder_omits_canonical_transcript_and_invite_code() {
-        const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
-        const ASSISTANT_SENTINEL: &str = "assistant-canonical-transcript-sentinel";
-        const CONTEXT_SENTINEL: &str = "canonical-context-v9";
-        assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
-        let canonical_transcript = json!({
-            "context_version": CONTEXT_SENTINEL,
-            "messages": [
-                {"role": "user", "text": INVITE_CODE_SENTINEL},
-                {"role": "assistant", "text": ASSISTANT_SENTINEL}
-            ]
-        });
-        let canonical_encoded = canonical_transcript.to_string();
-        assert!(canonical_encoded.contains(INVITE_CODE_SENTINEL));
-        assert!(canonical_encoded.contains(ASSISTANT_SENTINEL));
-        assert!(canonical_encoded.contains(CONTEXT_SENTINEL));
+    fn oversized_action_uses_json_prefix_and_explicit_truncation_marker() {
+        let action = ReviewerActionEvidence::new(
+            ToolInvocationRoute::Elevated,
+            json!({"operation":"write", "resource_scopes":[]}),
+            json!({"content":"x".repeat(MAX_REVIEW_ACTION_CHARS)}),
+        )
+        .expect("bounded action evidence");
+        let encoded = serde_json::to_string(&action).expect("encoded action evidence");
 
+        assert!(encoded.contains(REVIEW_TRUNCATION_MARKER));
+        assert!(encoded.contains("json_prefix"));
+        assert!(encoded.contains("review_projection_omitted_characters"));
+        assert!(!encoded.contains(&"x".repeat(MAX_REVIEW_ACTION_CHARS)));
+    }
+
+    #[test]
+    fn every_provider_wire_builder_carries_the_typed_user_and_exact_action_evidence() {
         let bodies = execution_provider_wire_bodies_for_test(execution_request())
             .into_iter()
             .chain(escalation_provider_wire_bodies_for_test(
@@ -1763,19 +1761,10 @@ mod tests {
             invalid_json_retries += encoded.matches("invalid_json").count();
             schema_mismatch_retries += encoded.matches("schema_mismatch").count();
             retry_fields += encoded.matches("retry_validation_code").count();
-            for forbidden in [
-                INVITE_CODE_SENTINEL,
-                ASSISTANT_SENTINEL,
-                CONTEXT_SENTINEL,
-                "context_version",
-                "bounded_context",
-            ] {
-                assert_eq!(
-                    encoded.matches(forbidden).count(),
-                    0,
-                    "provider request leaked {forbidden}"
-                );
-            }
+            assert!(encoded.contains("Please update the exact record I named."));
+            assert!(encoded.contains("descriptor"));
+            assert!(encoded.contains("review_projection"));
+            assert!(encoded.contains("provider_evidence_digest"));
         }
         assert_eq!(invalid_json_retries, 4);
         assert_eq!(schema_mismatch_retries, 4);
@@ -1788,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn every_initial_and_retry_wire_omits_exact_bound_private_values_and_digests() {
+    fn every_initial_and_retry_wire_contains_exact_descriptor_and_projection_only() {
         const TOOL_CALL_ID_SENTINEL: &str = "private-tool-call-id-sentinel";
         const FLOW_ID_SENTINEL: &str = "private-flow-id-sentinel";
         const RESOURCE_ID_SENTINEL: &str = "arbitrary-private-resource-id-sentinel";
@@ -1824,11 +1813,13 @@ mod tests {
         ];
 
         let execution = ExecutionReviewRequest {
-            sealed_evidence: sealed_evidence_from_bound(&bound, ToolInvocationRoute::Normal),
+            transcript: transcript_evidence(),
+            action: action_evidence_from_bound(&bound, ToolInvocationRoute::Normal),
             policy: policy_evidence(ToolInvocationRoute::Normal, PolicyDecisionRecord::Unmatched),
         };
         let escalation = EscalationReviewRequest {
-            sealed_evidence: sealed_evidence_from_bound(&bound, ToolInvocationRoute::Elevated),
+            transcript: transcript_evidence(),
+            action: action_evidence_from_bound(&bound, ToolInvocationRoute::Elevated),
             policy: policy_evidence(
                 ToolInvocationRoute::Elevated,
                 PolicyDecisionRecord::ElevatedPreflight,
@@ -1858,18 +1849,10 @@ mod tests {
             );
             execution_retries += encoded.matches("invalid_json").count();
             escalation_retries += encoded.matches("schema_mismatch").count();
-            for private in [
-                TOOL_CALL_ID_SENTINEL,
-                FLOW_ID_SENTINEL,
-                RESOURCE_ID_SENTINEL,
-                PRIVATE_TEXT_SENTINEL,
-            ] {
-                assert_eq!(
-                    encoded.matches(private).count(),
-                    0,
-                    "{provider} leaked exact bound marker {private}"
-                );
-            }
+            assert!(encoded.contains(RESOURCE_ID_SENTINEL));
+            assert!(encoded.contains(PRIVATE_TEXT_SENTINEL));
+            assert!(!encoded.contains(TOOL_CALL_ID_SENTINEL));
+            assert!(!encoded.contains(FLOW_ID_SENTINEL));
             for digest in &local_digests {
                 assert_eq!(
                     encoded.matches(digest).count(),
@@ -1893,87 +1876,30 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_models_are_explicit_structured_and_independent() {
-        let conversation = distinct_model("opencode-go", "conversation", "conversation-account");
+    fn reviewer_models_require_structured_output_but_may_share_one_provider_and_credential() {
         let execution = distinct_model("kimi-k3", "execution", "execution-account");
         let escalation = distinct_model("glm-5.2", "escalation", "escalation-account");
-        let (_, _, trust) =
-            IndependentReviewerModels::new(&conversation, execution.clone(), escalation.clone())
-                .expect("three independent reviewer identities")
-                .into_parts();
+        let (_, _, trust) = ReviewerModels::new(execution.clone(), escalation.clone())
+            .expect("explicit structured-output reviewer models")
+            .into_parts();
 
-        assert!(!trust.allows(&ReviewerModelSpec::from_provider(&conversation)));
         assert!(trust.allows(&ReviewerModelSpec::from_provider(&execution)));
         assert!(trust.allows(&ReviewerModelSpec::from_provider(&escalation)));
 
-        let conversation = distinct_model("kimi-k3", "conversation", "conversation-account");
-        let error = IndependentReviewerModels::new(&conversation, conversation.clone(), escalation)
-            .expect_err("Execution reviewer must not collapse to conversation model");
-        assert!(matches!(
-            error,
-            ReviewerNotReady::CollapsedModelIdentity {
-                left: "conversation",
-                right: "Execution reviewer"
-            }
-        ));
-
-        let execution = distinct_model("glm-5.2", "execution", "execution-account");
-        let error = IndependentReviewerModels::new(&conversation, execution.clone(), execution)
-            .expect_err("the two reviewers must not collapse to one identity");
-        assert!(matches!(
-            error,
-            ReviewerNotReady::CollapsedModelIdentity {
-                left: "Execution reviewer",
-                right: "Escalation reviewer"
-            }
-        ));
-
-        let conversation = distinct_model("opencode-go", "conversation", "conversation-account");
-        let execution = distinct_model("kimi-k3", "execution", "execution-account");
-        let same_origin = distinct_model("kimi-k3", "escalation", "escalation-account");
-        assert!(matches!(
-            IndependentReviewerModels::new(&conversation, execution.clone(), same_origin),
-            Err(ReviewerNotReady::CollapsedProviderOrigin {
-                left: "Execution reviewer",
-                right: "Escalation reviewer"
-            })
-        ));
-
-        let mut renamed_same_endpoint =
-            distinct_model("glm-5.2", "escalation", "escalation-account");
-        renamed_same_endpoint
-            .base_url
-            .clone_from(&execution.base_url);
-        assert!(matches!(
-            IndependentReviewerModels::new(&conversation, execution.clone(), renamed_same_endpoint,),
-            Err(ReviewerNotReady::CollapsedProviderOrigin {
-                left: "Execution reviewer",
-                right: "Escalation reviewer"
-            })
-        ));
-
-        let mut shared_credential = distinct_model("glm-5.2", "escalation", "escalation-account");
-        shared_credential
-            .api_key_env
-            .clone_from(&execution.api_key_env);
-        assert!(matches!(
-            IndependentReviewerModels::new(&conversation, execution, shared_credential),
-            Err(ReviewerNotReady::CollapsedCredentialSource {
-                left: "Execution reviewer",
-                right: "Escalation reviewer"
-            })
-        ));
+        let shared = distinct_model("kimi-k3", "shared-reviewer", "shared-account");
+        let (_, _, trust) = ReviewerModels::new(shared.clone(), shared.clone())
+            .expect("role and prompt separation do not require provider separation")
+            .into_parts();
+        assert!(trust.allows(&ReviewerModelSpec::from_provider(&shared)));
     }
 
     #[test]
     fn structured_output_incompatible_reviewer_fails_startup() {
-        let conversation =
-            distinct_model("openai-responses", "conversation", "conversation-account");
         let unsupported = ModelSpec::preset("umans").expect("umans fixture preset");
         let escalation = distinct_model("glm-5.2", "escalation", "escalation-account");
 
         assert!(matches!(
-            IndependentReviewerModels::new(&conversation, unsupported, escalation),
+            ReviewerModels::new(unsupported, escalation),
             Err(ReviewerNotReady::StructuredOutputUnsupported {
                 reviewer: "Execution"
             })
@@ -2098,15 +2024,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
-        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V2);
-        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V2);
-        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V1);
+        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V3);
+        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V3);
+        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V3);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
-            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v1());
-            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V2);
-            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V1);
+            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v3());
+            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V3);
+            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V3);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -2163,15 +2089,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
-        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V2);
-        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V2);
-        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V1);
+        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V3);
+        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V3);
+        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V3);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
-            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v1());
-            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V2);
-            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V1);
+            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v3());
+            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V3);
+            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V3);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -2193,8 +2119,8 @@ mod tests {
             );
         }
         assert_ne!(
-            ExecutionReviewOutputSchema::v1().provider_schema().schema,
-            EscalationReviewOutputSchema::v1().provider_schema().schema
+            ExecutionReviewOutputSchema::v3().provider_schema().schema,
+            EscalationReviewOutputSchema::v3().provider_schema().schema
         );
     }
 
@@ -2211,11 +2137,11 @@ mod tests {
     #[test]
     fn auto_review_schemas_stay_inside_the_kimi_mfjs_strict_subset_we_use() {
         for schema in [
-            ExecutionReviewOutputSchema::v1()
+            ExecutionReviewOutputSchema::v3()
                 .provider_schema()
                 .schema
                 .clone(),
-            EscalationReviewOutputSchema::v1()
+            EscalationReviewOutputSchema::v3()
                 .provider_schema()
                 .schema
                 .clone(),

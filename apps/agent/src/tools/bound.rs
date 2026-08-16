@@ -535,8 +535,8 @@ impl BoundExecutionArguments {
 /// App-owned, deliberately bounded details suitable for authenticated Human
 /// review and local durable binding. This value is explicit rather than
 /// generically derived from execution arguments: an app must retain the
-/// operation's meaning, target, and consent payload. External reviewers receive
-/// only [`ProviderReviewProjection`], never this exact local value.
+/// operation's meaning, target, and consent payload. AutoReview receives this
+/// exact value through the bounded, redacted reviewer request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ReviewProjection(Map<String, Value>);
@@ -556,14 +556,12 @@ impl ReviewProjection {
     }
 }
 
-/// A provider-safe structural summary of the exact local Human projection.
+/// A structural summary of the exact local Human projection.
 ///
 /// The exact projection remains in [`BoundToolInvocation::review_projection`]
 /// for authenticated Human consent and local durable evidence. This separate
-/// value deliberately contains no keys or scalar strings from that projection,
-/// and no digest derived from its hidden values. A separately reduced
-/// [`ProviderReviewDescriptor`] carries only trusted adapter vocabulary and
-/// resource-shape counts; exact resource identifiers also remain local.
+/// This remains useful for app-owned validation and diagnostics, but it is not
+/// a substitute for the exact projection sent to AutoReview.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProviderReviewProjection {

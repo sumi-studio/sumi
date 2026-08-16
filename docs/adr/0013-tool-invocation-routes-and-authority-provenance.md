@@ -204,30 +204,25 @@ Humanが書く固定prompt本文はRustの文字列literalへ埋め込まない�
 Execution AutoReview、Escalation AutoReviewを含むproductionのmodel-facing promptは、用途ごとの
 専用`.md`を正本にし、Rustは`include_str!`、typedな動的evidence組立、version/digestの束縛だけを
 持つ。ExecutionとEscalationの`.md`は共通base promptへ畳まず、個別にreview・version管理する。
-JSON schema、provider-safe action evidence、評価済みpolicy evidenceなどの動的payloadはtyped構造として
-分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt v2はcanonical
-conversation、user/assistant transcript、tool result、`context_version`、raw execution arguments、
-認証済みtenant/PersonalityAgent/Human principal IDをrequest型で表現せずproviderへ送らない。exact local
-descriptor/`ReviewProjection`はauthenticated Human consentとdurable bindingに保持するが、providerへは送らない。
-providerへ送信できるaction evidenceはroute、production allowlistでclosed codeへ変換したtool/adapter identity、
-operation/capability、resource namespace/kindとcollection/resource別件数、exact projectionの文字列値を持たない
-structural summaryだけである。localのtool/adapter/operation/namespace/kind `String`はnonempty検証だけでtrusted
-vocabularyとは扱わず、closed mappingにない組合せはbind時にfail closedにする。
-resource ID、path、pattern、regex、opaque cursor、任意textと、それらhidden valueから導出した
-proposal/descriptor/evidence digestを送らない。provider evidence digestは外部へ実際に見せるsafe envelopeだけを
-domain-separated hashし、exact local digestの代用とは扱わない。policy decision recordと`PolicySnapshot`の
-source digest/version/valid-untilはtyped policy evidenceとして送る。exact local tuple/digestsはreview response、
-Human decision、grant、durable startをlocalで束縛する。output schemaはv1を維持する。
+JSON schema、bounded transcript、exact action evidence、評価済みpolicy evidenceなどの動的payloadはtyped構造として
+分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt/schema v3は、最初と最新を必ず
+残して新しい順に予算内へ収めたuser textだけのtranscriptと、exact `AppActionDescriptor`（resource ID、path、
+patternを含む）およびauthenticated Humanへ示すexact `ReviewProjection`を受け取る。assistant text、Thinking、
+tool result、画像、conversation provider context、`context_version`、raw execution arguments、認証済み
+tenant/PersonalityAgent/Human principal IDは送らない。transcriptとactionはreview evidenceでありreviewerへの
+instructionではない。既存のdurable evidence用`Redactor`を適用し、reviewer固有の値隠しは追加しない。
+transcriptとactionはboundedにし、切り詰めた場合は省略件数・truncation marker・JSON prefixを明示する。
+provider evidence digestは外部へ実際に見せるaction envelopeだけをdomain-separated hashし、exact local digestの
+代用とは扱わない。policy decision recordと`PolicySnapshot`のsource digest/version/valid-untilは従来どおり
+typed policy evidenceとして送る。system promptと、この三つのevidenceを含むsynthetic user messageだけをproviderへ
+送り、structured outputを必須とする。
 
-conversation generation、Execution AutoReview、Escalation AutoReviewは、それぞれ明示的な
-`ModelSpec`を持つ。reviewerはconversation modelを暗黙に継承せず、reviewer trust setも
-conversation modelを自動許可しない。起動時に、各reviewerがstructured outputを扱えることと、
-`provider_instance_id / account_scope / model_id`のtrust identityがconversationと一致せず、かつ
-二つのreviewer間でも一致しないことを検証する。さらに、設定labelだけでは偽装できない境界として
-normalized provider base endpointとcredential sourceも三者で別でなければならない。provider名や
-protocol labelを変えただけで同一endpointを別originとして扱わない。`account_scope`は
-trust bindingへ含めるが、その文字列だけで実provider accountの分離を証明したとは扱わない。
-未設定、未対応preset、identity/origin/credential sourceのcollapseはruntimeを起動せず
+conversation generation、Execution AutoReview、Escalation AutoReviewは、それぞれ明示的な`ModelSpec`を持つ。
+`[reviewers.execution]` / `[reviewers.escalation]`はconversation preset・credential・model idを継承でき、
+provider endpoint、credential source、account、model idはconversationおよび二reviewer間で一致してよい。
+独立性はprovider分離ではなく、別々のrole、system prompt、request/result型、cache、metricと、通常は専用の
+review modelを選ぶことで成立させる。起動時には各reviewerがstructured outputを扱えることと、実際に選ばれた
+完全なmodel bindingがreviewer trust setに含まれることを検証する。未対応presetまたはtrust binding不一致は
 `ReviewerNotReady`としてfail closedにする。
 
 Executionの`Allow`をEscalationの`AskHuman`として再利用せず、Escalationのpositive resultで

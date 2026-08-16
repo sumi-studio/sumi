@@ -1816,10 +1816,16 @@ impl Runner {
             personality_agent_id: binding.provenance.personality_agent_id().to_string(),
             human_principal_id: binding.provenance.actor().principal_id().to_owned(),
         };
+        let transcript = self
+            .context
+            .iter()
+            .map(|message| message_to_public(context_message(message).clone()))
+            .collect::<Vec<_>>();
         let review_cancel = self.cancel.child_token();
         let request = broker.start_request(
             sealed,
             route,
+            &transcript,
             scope,
             &run_id,
             &turn_id,
