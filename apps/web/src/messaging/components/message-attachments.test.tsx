@@ -78,6 +78,7 @@ describe("Composer attachments", () => {
           name: "general",
           topic: "",
           visibility: "public",
+          voice: false,
         },
       ],
       messagesByPlace: { "channel:ch-general": [] },

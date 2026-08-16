@@ -1321,6 +1321,21 @@ func (s *Store) RevokeInvite(ctx context.Context, workspaceID, inviteID string, 
 }
 
 func (s *Store) RemoveMember(ctx context.Context, workspaceID, membershipID string, actor participant.Ref) error {
+	return s.removeMember(ctx, workspaceID, membershipID, actor, nil)
+}
+
+// RemoveMemberWithTarget returns the exact member only after its membership
+// closure commits, so post-commit integrations cannot observe or disclose a
+// target before the regular permission fence has succeeded.
+func (s *Store) RemoveMemberWithTarget(ctx context.Context, workspaceID, membershipID string, actor participant.Ref) (Membership, error) {
+	var target Membership
+	if err := s.removeMember(ctx, workspaceID, membershipID, actor, &target); err != nil {
+		return Membership{}, err
+	}
+	return target, nil
+}
+
+func (s *Store) removeMember(ctx context.Context, workspaceID, membershipID string, actor participant.Ref, removed *Membership) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin remove workspace member: %w", err)
@@ -1367,6 +1382,9 @@ func (s *Store) RemoveMember(ctx context.Context, workspaceID, membershipID stri
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit member removal: %w", err)
+	}
+	if removed != nil {
+		*removed = target
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,10 @@ type Server struct {
 	Sessions                 agentevents.UserSessionAuthorizer
 	CurrentEmployerAuthority CurrentEmployerAuthority
 	AllowedOrigins           []string
+	// MembershipClosed runs after a committed membership closure. It is a
+	// best-effort integration hook; durable Workspace authority never depends
+	// on an external transport succeeding.
+	MembershipClosed func(context.Context, string, participant.Ref)
 }
 
 func NewServer(

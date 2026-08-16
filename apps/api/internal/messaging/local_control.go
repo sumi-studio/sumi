@@ -3,6 +3,7 @@ package messaging
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -112,6 +113,12 @@ func (c *CallService) localCallState(w http.ResponseWriter, r *http.Request, aut
 		writeJSON(w, http.StatusOK, struct {
 			Calls []callStateWire `json:"calls"`
 		}{calls})
+		return
+	}
+	// An exact agent read is as authoritative as the list form. Reconcile the
+	// volatile projection before taking its per-place snapshot after restart.
+	if err := c.rebuildRegistry(r.Context()); err != nil {
+		writeStoreError(w, fmt.Errorf("reconcile livekit call state: %w", err))
 		return
 	}
 	place, err := store.PlaceFor(r.Context(), request.PlaceID)

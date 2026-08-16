@@ -277,6 +277,38 @@ func TestLocalControlRequiresAuthenticatedExactScope(t *testing.T) {
 	}
 }
 
+func TestLocalExactCallStateReconcilesAfterRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	fixture := newScopedContractFixture(t, ctx, w, "agent-call-state", w.agent)
+	owner := fixture.scope(t, w, w.humanA)
+	channel, err := owner.CreateChannel(ctx, "通話", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := fixture.scope(t, w, w.agent)
+	server := NewServer(w.store.core, nil)
+	calls := NewCallService(server, testLiveKit())
+	calls.RoomService = stubLiveKitRoomService{
+		rooms: []liveKitRoom{{Name: channel.PlaceID, CreatedAt: time.Now().Unix()}},
+		participants: map[string][]liveKitParticipant{
+			channel.PlaceID: {{Identity: w.humanA.Key(), JoinedAt: time.Now().Unix()}},
+		},
+	}
+	status, body := callLocalWithoutFixtureInference(t, ctx, calls.localCallState, LocalCallStatePath, map[string]any{
+		"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
+		"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10), "place_id": channel.PlaceID,
+	}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
+	if status != http.StatusOK {
+		t.Fatalf("exact call state status=%d body=%v", status, body)
+	}
+	callsWire, ok := body["calls"].([]any)
+	if !ok || len(callsWire) != 1 || callsWire[0].(map[string]any)["active"] != true {
+		t.Fatalf("exact call state did not reconcile: %v", body)
+	}
+}
+
 func TestLocalWriteReauthorizesASealedInstallationAtCommit(t *testing.T) {
 	for _, test := range []struct {
 		name       string
