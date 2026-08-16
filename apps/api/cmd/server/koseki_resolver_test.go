@@ -156,20 +156,20 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	if err != nil {
 		t.Fatalf("auto-register second: %v", err)
 	}
-	firstInstallation, err := appStore.InstallAtOperation(
+	firstInstallation, err := appStore.ResolveEnabledInstallation(
 		ctx,
 		applicationapps.ParticipantOwner(participant.Human(first.HumanID)),
 		participant.Human(first.HumanID),
-		"direct-chat", uuid.NewString(),
+		"direct-chat",
 	)
 	if err != nil {
 		t.Fatalf("install first direct chat: %v", err)
 	}
-	secondInstallation, err := appStore.InstallAtOperation(
+	secondInstallation, err := appStore.ResolveEnabledInstallation(
 		ctx,
 		applicationapps.ParticipantOwner(participant.Human(second.HumanID)),
 		participant.Human(second.HumanID),
-		"direct-chat", uuid.NewString(),
+		"direct-chat",
 	)
 	if err != nil {
 		t.Fatalf("install second direct chat: %v", err)
@@ -252,7 +252,7 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	actor := participant.Human(registration.HumanID)
-	installation, err := appStore.InstallAtOperation(ctx, applicationapps.ParticipantOwner(actor), actor, "direct-chat", uuid.NewString())
+	installation, err := appStore.ResolveEnabledInstallation(ctx, applicationapps.ParticipantOwner(actor), actor, "direct-chat")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,11 +417,11 @@ func TestDirectChatProcessFenceSurvivesBackendLossAfterAuthorizationCommit(t *te
 		t.Fatal(err)
 	}
 	actor := participant.Human(first.HumanID)
-	installation, err := appStore.InstallAtOperation(
+	installation, err := appStore.ResolveEnabledInstallation(
 		ctx,
 		applicationapps.ParticipantOwner(actor),
 		actor,
-		directchat.AppID, uuid.NewString(),
+		directchat.AppID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -629,7 +629,7 @@ func TestDirectChatAuthorizerUninstallReinstallDoesNotReviveStaleInstallation(t 
 	}
 	actor := participant.Human(registration.HumanID)
 	owner := applicationapps.ParticipantOwner(actor)
-	oldInstallation, err := appStore.InstallAtOperation(ctx, owner, actor, "direct-chat", uuid.NewString())
+	oldInstallation, err := appStore.ResolveEnabledInstallation(ctx, owner, actor, "direct-chat")
 	if err != nil {
 		t.Fatal(err)
 	}

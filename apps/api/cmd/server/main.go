@@ -343,7 +343,9 @@ func newApplicationFromEnv() (*application, error) {
 	var authServer *agentevents.BrowserAuthServer
 	var authEnabled bool
 	if browserAuthConfiguredFromEnv() {
-		authServer, authEnabled, err = browserAuthServerFromEnvWithDB(context.Background(), sv, browserOrigins, databasePool)
+		authServer, authEnabled, err = browserAuthServerFromEnvWithDB(
+			context.Background(), sv, browserOrigins, databasePool, directChatLifecycle,
+		)
 		if err != nil {
 			closeOnError()
 			return nil, fmt.Errorf("browser auth: %w", err)

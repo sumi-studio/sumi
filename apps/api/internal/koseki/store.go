@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 )
@@ -50,12 +51,18 @@ type Store struct {
 	pool                *pgxpool.Pool
 	wrappingKeyID       string
 	directChatLifecycle *directchat.LifecycleFence
+	directChatApps      *applicationapps.Store
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to a
 // database that has had the 戸籍 migrations applied.
 func New(pool *pgxpool.Pool, directChatLifecycle ...*directchat.LifecycleFence) *Store {
-	return &Store{pool: pool, directChatLifecycle: firstLifecycleFence(directChatLifecycle)}
+	lifecycle := firstLifecycleFence(directChatLifecycle)
+	return &Store{
+		pool:                pool,
+		directChatLifecycle: lifecycle,
+		directChatApps:      applicationapps.New(pool, nil, lifecycle),
+	}
 }
 
 // NewWithWrappingKeyID returns a Store that can provision new agents using the
@@ -65,16 +72,18 @@ func NewWithWrappingKeyID(
 	wrappingKeyID string,
 	directChatLifecycle ...*directchat.LifecycleFence,
 ) *Store {
+	lifecycle := firstLifecycleFence(directChatLifecycle)
 	return &Store{
 		pool:                pool,
 		wrappingKeyID:       wrappingKeyID,
-		directChatLifecycle: firstLifecycleFence(directChatLifecycle),
+		directChatLifecycle: lifecycle,
+		directChatApps:      applicationapps.New(pool, nil, lifecycle),
 	}
 }
 
 func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.LifecycleFence {
-	if len(fences) == 0 {
-		return nil
+	if len(fences) == 0 || fences[0] == nil {
+		return directchat.NewLifecycleFence()
 	}
 	return fences[0]
 }
@@ -440,6 +449,9 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 			return Registration{}, ErrCredentialAlreadyBound
 		}
 		return Registration{}, fmt.Errorf("bind credential: %w", err)
+	}
+	if _, err := s.directChatApps.InstallDirectChatForNewHumanInTx(ctx, tx, humanID); err != nil {
+		return Registration{}, fmt.Errorf("install initial direct chat: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Registration{}, fmt.Errorf("commit auto-register: %w", err)

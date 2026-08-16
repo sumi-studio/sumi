@@ -938,6 +938,55 @@ func TestWorkspaceCurrentAgentInviteMigrationUpgradeDownAndReupgrade(t *testing.
 	assertRedeemedShare("re-upgrade")
 }
 
+func TestHumanDirectChatDefaultMigrationBackfillsOnlyAbsentBindings(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 20)
+
+	const (
+		missingHumanID  = "0198f0f4-9b72-7000-8000-000000000321"
+		disabledHumanID = "0198f0f4-9b72-7000-8000-000000000322"
+		disabledAppID   = "0198f0f4-9b72-7000-8000-000000000323"
+	)
+	if _, err := pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1), ($2)`, missingHumanID, disabledHumanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_installations
+			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch)
+		VALUES ($1, 'human', $2, 'direct-chat', false, 4)`, disabledAppID, disabledHumanID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("upgrade through direct-chat default: %v", err)
+	}
+	var installationID string
+	var enabled bool
+	var epoch int64
+	if err := pool.QueryRow(ctx, `
+		SELECT installation_id, enabled, authority_epoch
+		FROM app_installations
+		WHERE owner_kind='human' AND owner_id=$1 AND app_id='direct-chat'`, missingHumanID,
+	).Scan(&installationID, &enabled, &epoch); err != nil {
+		t.Fatalf("load backfilled installation: %v", err)
+	}
+	if installationID == "" || !enabled || epoch != 1 {
+		t.Fatalf("backfilled installation = id=%q enabled=%v epoch=%d", installationID, enabled, epoch)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT enabled, authority_epoch
+		FROM app_installations
+		WHERE installation_id=$1`, disabledAppID,
+	).Scan(&enabled, &epoch); err != nil {
+		t.Fatalf("load preserved disabled installation: %v", err)
+	}
+	if enabled || epoch != 4 {
+		t.Fatalf("existing disabled installation changed: enabled=%v epoch=%d", enabled, epoch)
+	}
+}
+
 func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maxVersion int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {

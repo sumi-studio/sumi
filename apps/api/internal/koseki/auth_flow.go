@@ -427,6 +427,9 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 			return AuthFlow{}, fmt.Errorf("record initial provider link: %w", err)
 		}
 	}
+	if _, err := s.directChatApps.InstallDirectChatForNewHumanInTx(ctx, tx, humanID); err != nil {
+		return AuthFlow{}, fmt.Errorf("install initial direct chat: %w", err)
+	}
 	return completeExistingFlow(ctx, tx, flow, identity.FirebaseUID, humanID, agentID, OutcomeAccountCreated)
 }
 

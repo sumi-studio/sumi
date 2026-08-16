@@ -36,3 +36,10 @@ func TestInstallOperationIDRequiresCanonicalUUIDv4(t *testing.T) {
 		}
 	}
 }
+
+func TestDirectChatProvisionOperationIDIsCanonicalUUIDv4(t *testing.T) {
+	operationID := directChatProvisionOperationID("0198f0f4-9b72-7000-8000-000000000202")
+	if err := ValidateInstallOperationID(operationID); err != nil {
+		t.Fatalf("direct-chat provision operation id %q rejected: %v", operationID, err)
+	}
+}

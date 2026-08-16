@@ -13,6 +13,7 @@ import (
 	firebaseauth "firebase.google.com/go/v4/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 )
@@ -176,6 +177,7 @@ func browserAuthServerFromEnvWithDB(
 	sessions *agentevents.HMACUserSessionVerifier,
 	allowedOrigins []string,
 	pool *pgxpool.Pool,
+	directChatLifecycle ...*directchat.LifecycleFence,
 ) (*agentevents.BrowserAuthServer, bool, error) {
 	firebaseUID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_UID"))
 	kosekiMode := pool != nil
@@ -214,7 +216,7 @@ func browserAuthServerFromEnvWithDB(
 		if err := runtimeprovision.ValidateAgentWrappingKeyID(wrappingKeyID); err != nil {
 			return nil, false, fmt.Errorf("SUMI_AGENT_WRAPPING_KEY_ID: %w", err)
 		}
-		registrationStore = koseki.NewWithWrappingKeyID(pool, wrappingKeyID)
+		registrationStore = koseki.NewWithWrappingKeyID(pool, wrappingKeyID, directChatLifecycle...)
 		bindings = newKosekiIdentityBindingResolver(registrationStore, tenantID, "firebase")
 	} else {
 		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))

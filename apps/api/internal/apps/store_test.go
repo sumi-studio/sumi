@@ -553,6 +553,46 @@ func TestDurableInstallOperationReceiptSurvivesUninstall(t *testing.T) {
 	}
 }
 
+func TestInstallDirectChatForNewHumanInTxCreatesEnabledEpochOneBinding(t *testing.T) {
+	w := newAppWorld(t)
+	ctx := context.Background()
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := applicationapps.New(w.pool, w.workspaces, directchat.NewLifecycleFence()).InstallDirectChatForNewHumanInTx(
+		ctx, tx, testHumanMember,
+	)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("install initial direct chat: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if installed.AppID != directchat.AppID || installed.State != applicationapps.StateEnabled || installed.AuthorityEpoch != 1 {
+		t.Fatalf("initial direct-chat installation = %#v", installed)
+	}
+
+	tx, err = w.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := applicationapps.New(w.pool, w.workspaces, directchat.NewLifecycleFence()).InstallDirectChatForNewHumanInTx(
+		ctx, tx, testHumanMember,
+	)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("replay initial direct chat: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if replayed != installed {
+		t.Fatalf("deterministic installation replay = %#v, want %#v", replayed, installed)
+	}
+}
+
 func TestExactInstallationAdmissionRejectsOwnerAndAppSubstitution(t *testing.T) {
 	w := newAppWorld(t)
 	ctx := context.Background()
