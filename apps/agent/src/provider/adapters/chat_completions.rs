@@ -1181,6 +1181,7 @@ pub struct ChatReceiveState {
     tool_slots_with_stream_index: HashSet<usize>,
     tool_by_id: HashMap<String, usize>,
     usage: Usage,
+    usage_received: bool,
     finish_reason: Option<String>,
     response_id: Option<String>,
     response_model: Option<String>,
@@ -1206,6 +1207,7 @@ impl ChatReceiveState {
             tool_slots_with_stream_index: HashSet::new(),
             tool_by_id: HashMap::new(),
             usage: Usage::default(),
+            usage_received: false,
             finish_reason: None,
             response_id: None,
             response_model: None,
@@ -1229,6 +1231,7 @@ impl ChatReceiveState {
                 .and_then(|choice| choice.usage.as_ref())
         }) {
             self.usage = Usage::from_raw(raw);
+            self.usage_received = true;
         }
         if let Some(error) = chunk.error {
             return Err(ChatAdapterError::Provider {
@@ -1627,6 +1630,21 @@ impl ChatReceiveState {
                 );
                 self.finish_reason = Some(reason.to_owned());
             }
+        }
+        self.finish(timestamp)
+    }
+
+    /// Same inference as [`Self::finish_after_done_sentinel`], for a body that
+    /// ended by HTTP framing without any `[DONE]`. Because a proxy or the
+    /// provider could also close mid-stream, this only infers when the final
+    /// usage chunk was received — the provider emits it after the last content
+    /// delta, so a cut stream does not carry it. Otherwise it stays strict.
+    pub fn finish_after_clean_eof(
+        &mut self,
+        timestamp: DateTime<Utc>,
+    ) -> Result<ChatTerminal, ChatAdapterError> {
+        if self.finish_reason.is_none() && self.usage_received {
+            return self.finish_after_done_sentinel(timestamp);
         }
         self.finish(timestamp)
     }
@@ -3895,6 +3913,28 @@ mod tests {
             receive.finish(Utc::now()),
             Err(ChatAdapterError::MissingFinishReason)
         ));
+
+        // Bare EOF (no [DONE]): infer only when the usage chunk proved the
+        // provider reached its end; a cut stream carries content but no usage.
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        receive
+            .push_json(r#"{"choices":[{"delta":{"content":"{\"outcome\":\"allow\"}"}}]}"#)
+            .expect("content delta");
+        assert!(matches!(
+            receive.finish_after_clean_eof(Utc::now()),
+            Err(ChatAdapterError::MissingFinishReason)
+        ));
+        receive
+            .push_json(r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#)
+            .expect("usage chunk");
+        assert_eq!(
+            receive
+                .finish_after_clean_eof(Utc::now())
+                .expect("usage-backed EOF infers stop")
+                .stop_reason,
+            StopReason::Stop
+        );
 
         // Nothing received at all: even after [DONE] there is nothing to infer.
         let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
