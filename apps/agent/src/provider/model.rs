@@ -237,7 +237,14 @@ impl ModelSpec {
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: false,
-                    structured_output: ChatStructuredOutputMode::Unsupported,
+                    // Verified 2026-08-16 against opencode.ai/zen/go/v1 with
+                    // kimi-k2.7-code: `response_format: {"type": "json_object"}`
+                    // yields bare JSON content (no code fence) while the schema
+                    // travels in the system message; `json_schema` is accepted
+                    // but not proven to constrain, so it is not claimed. The
+                    // model spends reasoning tokens before answering, so callers
+                    // must keep max_tokens well above the JSON itself.
+                    structured_output: ChatStructuredOutputMode::JsonObjectWithPromptSchema,
                 },
             ),
             _ => return None,
