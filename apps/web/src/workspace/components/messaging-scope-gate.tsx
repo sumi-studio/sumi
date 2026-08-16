@@ -13,7 +13,6 @@ import {
   getMessagingScope,
   useMessaging,
 } from "../../messaging/store";
-import { AppRail } from "../../shell/app-rail";
 import {
   effectiveWorkspacePermissions,
   exactHumanMembership,
@@ -223,8 +222,7 @@ function MessagingLifecycleState({
 }) {
   const navigate = useNavigate();
   return (
-    <div className="flex h-dvh bg-background text-foreground">
-      <AppRail activeAppId="messaging" workspaceId={workspaceId} />
+    <div className="flex h-full bg-background text-foreground">
       <main className="grid min-w-0 flex-1 place-items-center px-8">
         <section
           className="flex max-w-lg flex-col items-center text-center"

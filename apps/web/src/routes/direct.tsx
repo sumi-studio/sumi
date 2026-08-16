@@ -1,5 +1,4 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { AuthGate } from "../auth/auth-gate";
 import { DirectChatGate } from "../auth/direct-chat-gate";
 
 /**
@@ -8,9 +7,5 @@ import { DirectChatGate } from "../auth/direct-chat-gate";
  * そのまま使い、Secretary DMとは別surfaceのまま入口だけ同じ家に置く。
  */
 export const Route = createFileRoute("/direct")({
-  component: () => (
-    <AuthGate>
-      <DirectChatGate />
-    </AuthGate>
-  ),
+  component: DirectChatGate,
 });

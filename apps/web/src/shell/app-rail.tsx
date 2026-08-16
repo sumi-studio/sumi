@@ -78,6 +78,16 @@ export function AppRail({
   return (
     <aside className="app-sidebar flex h-dvh w-12 shrink-0 flex-col overflow-clip">
       <nav className="flex flex-col gap-1 px-1 py-2" aria-label="Sumi">
+        {!workspaceId ? (
+          <RailButton
+            label="Workspace一覧"
+            active={activeAppId === "workspace"}
+            onClick={() => void navigate({ to: "/" })}
+          >
+            <LayoutGrid className="size-4" />
+          </RailButton>
+        ) : null}
+
         {workspaceId ? (
           <Popover>
             <Tooltip>

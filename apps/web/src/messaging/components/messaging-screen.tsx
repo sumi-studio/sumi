@@ -8,7 +8,6 @@ import {
   useState,
 } from "react";
 import { isImeComposing } from "../../lib/ime";
-import { AppRail } from "../../shell/app-rail";
 import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
 import {
   dismissPermissionPrompt,
@@ -544,7 +543,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
 
   if (!ready) {
     return (
-      <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground text-sm">
+      <div className="flex h-full items-center justify-center bg-background text-muted-foreground text-sm">
         読み込み中…
       </div>
     );
@@ -555,11 +554,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     selectedPlaceKey !== null && activePlaceKey === selectedPlaceKey;
 
   return (
-    <div className="flex h-dvh bg-background text-foreground">
-      <AppRail
-        activeAppId="messaging"
-        workspaceId={getMessagingScope()?.workspaceId}
-      />
+    <div className="flex h-full bg-background text-foreground">
       <Sidebar
         selectedPlaceKey={selectedPlaceKey}
         workspaceId={getMessagingScope()?.workspaceId ?? null}

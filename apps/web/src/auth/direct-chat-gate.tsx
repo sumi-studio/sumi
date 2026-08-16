@@ -8,7 +8,6 @@ import {
   useParticipantApps,
 } from "../participant/app-store";
 import { DIRECT_CHAT_RENDERER } from "../shell/app-descriptors";
-import { AppRail } from "../shell/app-rail";
 import { preissuedSessionMode, useAuth } from "./auth-context";
 
 /**
@@ -184,8 +183,7 @@ function DirectChatLifecycle({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex h-dvh bg-background text-foreground">
-      <AppRail activeAppId="" />
+    <div className="flex h-full bg-background text-foreground">
       <main className="grid min-w-0 flex-1 place-items-center px-6">
         <section
           aria-live="polite"

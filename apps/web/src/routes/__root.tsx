@@ -1,9 +1,15 @@
-import { createRootRoute, Outlet } from "@tanstack/react-router";
+import { createRootRoute } from "@tanstack/react-router";
+import { AuthGate } from "../auth/auth-gate";
+import { AppShell } from "../shell/app-shell";
 
 export const Route = createRootRoute({
   component: RootLayout,
 });
 
-function RootLayout() {
-  return <Outlet />;
+export function RootLayout() {
+  return (
+    <AuthGate>
+      <AppShell />
+    </AuthGate>
+  );
 }

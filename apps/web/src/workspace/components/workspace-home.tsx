@@ -18,7 +18,6 @@ import {
 import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../../auth/auth-context";
 import { WORKSPACE_APP_RENDERERS } from "../../shell/app-descriptors";
-import { AppRail } from "../../shell/app-rail";
 import { WorkspaceAPIError } from "../api-client";
 import type {
   AppDescriptor,
@@ -71,8 +70,7 @@ export function WorkspaceHome({ workspaceId }: { workspaceId: string }) {
 
   if (!workspace) return null;
   return (
-    <div className="flex h-dvh bg-background text-foreground">
-      <AppRail activeAppId="workspace" workspaceId={workspaceId} />
+    <div className="flex h-full bg-background text-foreground">
       <aside className="flex w-56 shrink-0 flex-col border-border border-r bg-muted/15 px-3 py-4">
         <div className="mb-6 px-2">
           <p className="text-muted-foreground text-[11px] uppercase tracking-[0.14em]">

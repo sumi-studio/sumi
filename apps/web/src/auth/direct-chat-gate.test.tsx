@@ -47,10 +47,6 @@ vi.mock("../components/chat-screen", () => ({
   ),
 }));
 
-vi.mock("../shell/app-rail", () => ({
-  AppRail: () => <aside data-testid="app-rail" />,
-}));
-
 vi.mock("./auth-context", () => ({
   preissuedSessionMode: false,
   useAuth: () => ({
@@ -120,7 +116,7 @@ describe("DirectChatGate", () => {
     fireEvent.click(screen.getByRole("button", { name: "有効にする" }));
 
     expect(screen.queryByTestId("direct-chat")).not.toBeInTheDocument();
-    expect(screen.getByTestId("app-rail")).toBeInTheDocument();
+    expect(screen.getByText("直通は無効になっています")).toBeInTheDocument();
     await waitFor(() => {
       expect(mocks.setInstallationState).toHaveBeenCalledWith(
         INSTALLATION_ID,

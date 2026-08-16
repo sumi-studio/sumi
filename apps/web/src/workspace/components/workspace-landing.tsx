@@ -2,7 +2,6 @@ import { Button } from "@sumi/ui/components/button";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowRight, Building2, KeyRound, Plus, RefreshCw } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
-import { AppRail } from "../../shell/app-rail";
 import type { WorkspaceInvitePreview } from "../model";
 import { useWorkspaceControl } from "../store";
 
@@ -89,10 +88,9 @@ export function WorkspaceLanding() {
   };
 
   return (
-    <div className="flex min-h-dvh bg-background text-foreground">
-      <AppRail activeAppId="workspace" />
+    <div className="flex h-full bg-background text-foreground">
       <main className="min-w-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-8 py-10 lg:px-12">
+        <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col px-8 py-10 lg:px-12">
           <header className="mb-10 flex items-end justify-between gap-6">
             <div>
               <p className="mb-2 font-medium text-muted-foreground text-xs uppercase tracking-[0.16em]">
