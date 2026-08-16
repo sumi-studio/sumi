@@ -890,6 +890,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           const installation = await client.installApp(
             { kind: "workspace", workspaceId: token.workspaceId },
             appId,
+            crypto.randomUUID(),
           );
           if (!isCurrentScope(token)) return installation;
           validateInstallation(token.workspaceId, installation, appId);

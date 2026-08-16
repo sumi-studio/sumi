@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -322,8 +323,8 @@ func (s *testMessagingStore) createWorkspace(
 	if err != nil {
 		return Workspace{}, err
 	}
-	if _, err := s.apps.Install(
-		ctx, applicationapps.WorkspaceOwner(created.WorkspaceID), creator, MessagingAppID,
+	if _, err := s.apps.InstallAtOperation(
+		ctx, applicationapps.WorkspaceOwner(created.WorkspaceID), creator, MessagingAppID, uuid.NewString(),
 	); err != nil {
 		return Workspace{}, err
 	}
@@ -419,8 +420,8 @@ func (s *testMessagingStore) seedDefaultWorkspaceFixture(
 		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
-		if _, err := s.apps.Install(ctx,
-			applicationapps.WorkspaceOwner(DefaultWorkspaceID), member, MessagingAppID,
+		if _, err := s.apps.InstallAtOperation(ctx,
+			applicationapps.WorkspaceOwner(DefaultWorkspaceID), member, MessagingAppID, uuid.NewString(),
 		); err != nil {
 			return err
 		}

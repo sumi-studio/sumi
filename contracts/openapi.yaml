@@ -1230,7 +1230,7 @@ components:
           participant: "#/components/schemas/ParticipantAppOwnerRef"
     WorkspaceAppInstallRequest:
       type: object
-      required: [owner, app_id]
+      required: [owner, app_id, operation_id]
       additionalProperties: false
       properties:
         owner:
@@ -1251,7 +1251,7 @@ components:
         operation_id:
           $ref: "#/components/schemas/UUIDv4"
     AppInstallRequest:
-      description: Strict owner-discriminated install intent. Participant installs require a durable UUIDv4 operation identity; Workspace installs may omit it for the legacy flow.
+      description: Strict owner-discriminated install intent with a durable UUIDv4 operation identity.
       oneOf:
         - $ref: "#/components/schemas/WorkspaceAppInstallRequest"
         - $ref: "#/components/schemas/ParticipantAppInstallRequest"

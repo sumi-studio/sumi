@@ -71,9 +71,9 @@ try {
   const lifecycleTypeAssertions = [
     {
       component: "WorkspaceAppInstallRequest",
-      pattern: /operation_id\?: components\["schemas"\]\["UUIDv4"\];/,
+      pattern: /operation_id: components\["schemas"\]\["UUIDv4"\];/,
       message:
-        "Workspace install operation_id must remain an optional canonical UUIDv4 in generated types.",
+        "Workspace install operation_id must remain a required canonical UUIDv4 in generated types.",
     },
     {
       component: "ParticipantAppInstallRequest",

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 )
@@ -77,7 +78,7 @@ func TestExactScopeIsolatesWorkspacesAndInstallationLifecycles(t *testing.T) {
 	if err := w.apps.UninstallByID(ctx, first.installation.InstallationID, w.humanA); err != nil {
 		t.Fatal(err)
 	}
-	reinstalled, err := w.apps.Install(ctx, applicationapps.WorkspaceOwner(first.workspace.WorkspaceID), w.humanA, MessagingAppID)
+	reinstalled, err := w.apps.InstallAtOperation(ctx, applicationapps.WorkspaceOwner(first.workspace.WorkspaceID), w.humanA, MessagingAppID, uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +243,7 @@ func TestRESTRejectsMissingDisabledAndStaleExactScope(t *testing.T) {
 	if err := w.apps.UninstallByID(ctx, fixture.installation.InstallationID, w.humanA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.apps.Install(ctx, applicationapps.WorkspaceOwner(fixture.workspace.WorkspaceID), w.humanA, MessagingAppID); err != nil {
+	if _, err := w.apps.InstallAtOperation(ctx, applicationapps.WorkspaceOwner(fixture.workspace.WorkspaceID), w.humanA, MessagingAppID, uuid.NewString()); err != nil {
 		t.Fatal(err)
 	}
 	if got := request(fixture.workspace.WorkspaceID, fixture.installation.InstallationID, epoch).StatusCode; got != http.StatusNotFound {

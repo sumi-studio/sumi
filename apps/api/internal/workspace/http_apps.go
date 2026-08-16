@@ -63,25 +63,16 @@ func (s *Server) serveInstallApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operationID, operationPresent, operationValid := optionalNonEmptyString(request.OperationID)
-	if !operationValid ||
-		(owner.Kind == applicationapps.OwnerParticipant && !operationPresent) ||
-		(operationPresent && applicationapps.ValidateInstallOperationID(operationID) != nil) {
+	if !operationPresent || !operationValid || applicationapps.ValidateInstallOperationID(operationID) != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	var installation applicationapps.Installation
 	done, err := s.browserMutation(w, r, claims, func() error {
-		var installErr error
-		if operationPresent {
-			installation, installErr = s.Apps.InstallAtOperation(
-				r.Context(), owner, actor, request.AppID, operationID,
-			)
-		} else {
-			installation, installErr = s.Apps.Install(
-				r.Context(), owner, actor, request.AppID,
-			)
-		}
-		return installErr
+		installation, err = s.Apps.InstallAtOperation(
+			r.Context(), owner, actor, request.AppID, operationID,
+		)
+		return err
 	})
 	if !done {
 		return

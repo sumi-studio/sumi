@@ -427,8 +427,7 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		writeAPIError(w, http.StatusNotFound, "membership_not_active")
 	case errors.Is(err, ErrLastAdministrator):
 		writeAPIError(w, http.StatusConflict, "last_administrator")
-	case errors.Is(err, ErrAlreadyMember), errors.Is(err, ErrRoleNameTaken),
-		errors.Is(err, applicationapps.ErrAlreadyInstalled):
+	case errors.Is(err, ErrAlreadyMember), errors.Is(err, ErrRoleNameTaken):
 		writeAPIError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, applicationapps.ErrInstallIntentAlreadyInstalled):
 		writeAPIError(w, http.StatusConflict, "install_intent_already_installed")

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
@@ -38,7 +39,7 @@ func TestDirectChatLifecycleUsesProcessFenceAndOtherAppsDoNot(t *testing.T) {
 	defer cancel()
 	owner := applicationapps.ParticipantOwner(w.owner)
 	withoutFence := applicationapps.New(w.pool, w.workspaces)
-	if _, err := withoutFence.Install(ctx, owner, w.owner, directchat.AppID); !errors.Is(err, directchat.ErrLifecycleFenceUnavailable) {
+	if _, err := withoutFence.InstallAtOperation(ctx, owner, w.owner, directchat.AppID, uuid.NewString()); !errors.Is(err, directchat.ErrLifecycleFenceUnavailable) {
 		t.Fatalf("direct-chat install without lifecycle fence = %v", err)
 	}
 
@@ -54,16 +55,16 @@ func TestDirectChatLifecycleUsesProcessFenceAndOtherAppsDoNot(t *testing.T) {
 	}
 	directChatDone := make(chan installResult, 1)
 	go func() {
-		installation, installErr := store.Install(ctx, owner, w.owner, directchat.AppID)
+		installation, installErr := store.InstallAtOperation(ctx, owner, w.owner, directchat.AppID, uuid.NewString())
 		directChatDone <- installResult{installation: installation, err: installErr}
 	}()
 	alarmDone := make(chan error, 1)
 	go func() {
-		_, installErr := store.Install(
+		_, installErr := store.InstallAtOperation(
 			ctx,
 			applicationapps.ParticipantOwner(w.member),
 			w.member,
-			"alarm",
+			"alarm", uuid.NewString(),
 		)
 		alarmDone <- installErr
 	}()
@@ -154,7 +155,7 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	}
 	workspaceOwner := applicationapps.WorkspaceOwner(created.WorkspaceID)
 
-	installed, err := w.apps.Install(ctx, workspaceOwner, w.owner, "messaging")
+	installed, err := w.apps.InstallAtOperation(ctx, workspaceOwner, w.owner, "messaging", uuid.NewString())
 	if err != nil {
 		t.Fatalf("install Messaging: %v", err)
 	}
@@ -294,7 +295,7 @@ func TestInstallationLifecycleAuthorizesOwnerAndPreservesAppData(t *testing.T) {
 	if err != nil || len(list) != 0 {
 		t.Fatalf("post-uninstall list = %#v, %v", list, err)
 	}
-	reinstalled, err := w.apps.Install(ctx, workspaceOwner, w.owner, "messaging")
+	reinstalled, err := w.apps.InstallAtOperation(ctx, workspaceOwner, w.owner, "messaging", uuid.NewString())
 	if err != nil {
 		t.Fatalf("reinstall Messaging: %v", err)
 	}
@@ -320,7 +321,7 @@ func TestExactLifecycleReplaysSerializeAtDatabaseBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := applicationapps.WorkspaceOwner(created.WorkspaceID)
-	installed, err := w.apps.Install(ctx, owner, w.owner, "messaging")
+	installed, err := w.apps.InstallAtOperation(ctx, owner, w.owner, "messaging", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +565,7 @@ func TestExactInstallationAdmissionRejectsOwnerAndAppSubstitution(t *testing.T) 
 		t.Fatal(err)
 	}
 	firstOwner := applicationapps.WorkspaceOwner(first.WorkspaceID)
-	installed, err := w.apps.Install(ctx, firstOwner, w.owner, "messaging")
+	installed, err := w.apps.InstallAtOperation(ctx, firstOwner, w.owner, "messaging", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +638,7 @@ func TestParticipantOwnerRoundTripPreservesNestedAgentKind(t *testing.T) {
 	w := newAppWorld(t)
 	ctx := context.Background()
 	owner := applicationapps.ParticipantOwner(w.agent)
-	installed, err := w.apps.Install(ctx, owner, w.agent, "alarm")
+	installed, err := w.apps.InstallAtOperation(ctx, owner, w.agent, "alarm", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +685,7 @@ func TestParticipantAndWorkspaceOwnerRulesUseOneLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspaceOwner := applicationapps.WorkspaceOwner(created.WorkspaceID)
-	if _, err := w.apps.Install(ctx, workspaceOwner, w.member, "messaging"); !errors.Is(err, workspace.ErrForbidden) {
+	if _, err := w.apps.InstallAtOperation(ctx, workspaceOwner, w.member, "messaging", uuid.NewString()); !errors.Is(err, workspace.ErrForbidden) {
 		t.Fatalf("member without manage_apps error = %v", err)
 	}
 	appManager, err := w.workspaces.CreateRole(ctx, created.WorkspaceID, w.owner,
@@ -696,21 +697,21 @@ func TestParticipantAndWorkspaceOwnerRulesUseOneLifecycle(t *testing.T) {
 		membership.WorkspaceMemberID, w.owner, []string{appManager.RoleID}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.apps.Install(ctx, workspaceOwner, w.member, "messaging"); err != nil {
+	if _, err := w.apps.InstallAtOperation(ctx, workspaceOwner, w.member, "messaging", uuid.NewString()); err != nil {
 		t.Fatalf("member with manage_apps: %v", err)
 	}
 
 	personal := applicationapps.ParticipantOwner(w.member)
-	if _, err := w.apps.Install(ctx, personal, w.member, "alarm"); err != nil {
+	if _, err := w.apps.InstallAtOperation(ctx, personal, w.member, "alarm", uuid.NewString()); err != nil {
 		t.Fatalf("participant installs own Alarm: %v", err)
 	}
-	if _, err := w.apps.Install(ctx, personal, w.owner, "life-log"); !errors.Is(err, applicationapps.ErrForbidden) {
+	if _, err := w.apps.InstallAtOperation(ctx, personal, w.owner, "life-log", uuid.NewString()); !errors.Is(err, applicationapps.ErrForbidden) {
 		t.Fatalf("other Human manages participant owner: %v", err)
 	}
-	if _, err := w.apps.Install(ctx, personal, w.member, "messaging"); !errors.Is(err, applicationapps.ErrOwnerKindUnsupported) {
+	if _, err := w.apps.InstallAtOperation(ctx, personal, w.member, "messaging", uuid.NewString()); !errors.Is(err, applicationapps.ErrOwnerKindUnsupported) {
 		t.Fatalf("participant-scoped Messaging error = %v", err)
 	}
-	if _, err := w.apps.Install(ctx, workspaceOwner, w.owner, "alarm"); !errors.Is(err, applicationapps.ErrOwnerKindUnsupported) {
+	if _, err := w.apps.InstallAtOperation(ctx, workspaceOwner, w.owner, "alarm", uuid.NewString()); !errors.Is(err, applicationapps.ErrOwnerKindUnsupported) {
 		t.Fatalf("workspace-scoped Alarm error = %v", err)
 	}
 }
@@ -730,7 +731,7 @@ func TestConcurrentInstallCreatesOneBinding(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			_, err := w.apps.Install(ctx, owner, w.owner, "messaging")
+			_, err := w.apps.InstallAtOperation(ctx, owner, w.owner, "messaging", uuid.NewString())
 			results <- err
 		}()
 	}
@@ -742,7 +743,7 @@ func TestConcurrentInstallCreatesOneBinding(t *testing.T) {
 		switch {
 		case err == nil:
 			createdCount++
-		case errors.Is(err, applicationapps.ErrAlreadyInstalled):
+		case errors.Is(err, applicationapps.ErrInstallIntentAlreadyInstalled):
 			alreadyCount++
 		default:
 			t.Fatalf("unexpected concurrent install error: %v", err)
