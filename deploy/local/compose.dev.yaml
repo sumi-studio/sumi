@@ -212,6 +212,10 @@ services:
           tcp_port: 7881
           udp_port: 7882
           use_external_ip: false
+          # Advertise the address the browser can actually reach. Left unset,
+          # LiveKit offers its container address, which no browser can route
+          # to, so signalling succeeds and media then silently never connects.
+          node_ip: ${SUMI_DEV_BIND_HOST:-127.0.0.1}
         keys:
           ${SUMI_LIVEKIT_API_KEY:-sumi-local}: ${SUMI_LIVEKIT_API_SECRET:-sumi-local-dev-secret-change-me}
         webhook:
