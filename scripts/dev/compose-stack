@@ -390,6 +390,12 @@ export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral
 export SUMI_AGENT_IMAGE_PULL_POLICY="${SUMI_AGENT_IMAGE_PULL_POLICY:-always}"
 [[ "${SUMI_AGENT_IMAGE_PULL_POLICY}" =~ ^(always|missing|never)$ ]] ||
   fail "SUMI_AGENT_IMAGE_PULL_POLICY must be always, missing, or never"
+# Reusing a local image only makes sense for an explicitly pinned build tag;
+# the floating `latest` tag would still resolve to whatever was pulled last.
+if [[ "${ACTION}" != "down" && "${SUMI_AGENT_IMAGE_PULL_POLICY}" != "always" &&
+  ( -z "${SUMI_AGENT_IMAGE_TAG:-}" || "${SUMI_AGENT_IMAGE_TAG}" == "latest" ) ]]; then
+  fail "SUMI_AGENT_IMAGE_PULL_POLICY=${SUMI_AGENT_IMAGE_PULL_POLICY} requires SUMI_AGENT_IMAGE_TAG to name a specific local build (not latest)"
+fi
 export SUMI_AUTH_TENANT_ID="${SUMI_AUTH_TENANT_ID:-sumi-dev}"
 export SUMI_AUTH_FIREBASE_PROJECT_ID="${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}"
 export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-${SUMI_AUTH_FIREBASE_PROJECT_ID}}"
