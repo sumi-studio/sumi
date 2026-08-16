@@ -35,6 +35,10 @@ const FAILURE_LABELS: Record<string, string> = {
   attachment_upload_conflict: "同じファイルの別内容が先に送られています",
   attachment_upload_expired:
     "アップロードの予約が切れました。もう一度お試しください",
+  attachment_upload_retired:
+    "削除済みのファイルです。新しく添付し直してください",
+  attachment_upload_in_progress:
+    "同じファイルをアップロード中です。少し待ってから再試行してください",
   attachments_unavailable: "このサーバーでは添付を受け付けていません",
   invalid_session: "サインインし直してください",
   app_disabled: "Messagingが無効化されています",

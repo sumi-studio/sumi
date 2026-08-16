@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // pngHeader is enough for http.DetectContentType to sniff image/png.
@@ -33,6 +35,15 @@ func newAttachmentWorld(t *testing.T, ctx context.Context, policy AttachmentPoli
 	}
 	if policy.WorkspaceQuotaBytes == 0 {
 		policy.WorkspaceQuotaBytes = 64 << 20
+	}
+	if policy.WorkspaceQuotaObjects == 0 {
+		policy.WorkspaceQuotaObjects = 10_000
+	}
+	if policy.TotalQuotaBytes == 0 {
+		policy.TotalQuotaBytes = 256 << 20
+	}
+	if policy.TotalQuotaObjects == 0 {
+		policy.TotalQuotaObjects = 50_000
 	}
 	if err := w.store.core.ConfigureAttachments(blobs, policy); err != nil {
 		t.Fatalf("configure attachments: %v", err)
@@ -81,6 +92,29 @@ func (f attachmentFixture) usedBytes(t *testing.T, ctx context.Context, workspac
 		t.Fatalf("read quota: %v", err)
 	}
 	return used
+}
+
+func (f attachmentFixture) usedObjects(t *testing.T, ctx context.Context, workspaceID string) int64 {
+	t.Helper()
+	var used int64
+	err := f.store.core.pool.QueryRow(ctx,
+		"SELECT COALESCE((SELECT object_count FROM message_attachment_quotas WHERE workspace_id=$1), 0)",
+		workspaceID).Scan(&used)
+	if err != nil {
+		t.Fatalf("read workspace object quota: %v", err)
+	}
+	return used
+}
+
+func (f attachmentFixture) totalUsage(t *testing.T, ctx context.Context) (int64, int64) {
+	t.Helper()
+	var bytes, objects int64
+	err := f.store.core.pool.QueryRow(ctx,
+		"SELECT COALESCE((SELECT used_bytes FROM message_attachment_store_usage WHERE singleton), 0), COALESCE((SELECT object_count FROM message_attachment_store_usage WHERE singleton), 0)").Scan(&bytes, &objects)
+	if err != nil {
+		t.Fatalf("read attachment store usage: %v", err)
+	}
+	return bytes, objects
 }
 
 func (f attachmentFixture) blobPath(id string) string {
@@ -389,7 +423,7 @@ func TestAttachmentQuotaDraftBudgetAndConcurrentReservations(t *testing.T) {
 	}
 	_, _, err = sender.FinalizeAttachmentUpload(ctx, channel.PlaceID, StagedAttachment{
 		UploadID: reserved[0].UploadID, Filename: "late.bin", MIME: "application/octet-stream",
-		Size: one, SHA256: staged.SHA256, Handle: staged,
+		Size: one, SHA256: staged.SHA256, StageToken: reserved[0].StageToken, Handle: staged,
 	})
 	if !errors.Is(err, ErrAttachmentUploadExpired) || !AttachmentFinalizeDefinitelyNotCommitted(err) {
 		t.Fatalf("finalize after expiry: %v", err)
@@ -439,6 +473,218 @@ func TestAttachmentQuotaDraftBudgetAndConcurrentReservations(t *testing.T) {
 	}
 }
 
+func TestAttachmentWholeStoreByteAndObjectCapsReconcile(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// Both dimensions are deliberately tiny. The policy still permits a full
+	// single attachment per Workspace, but cannot be multiplied by creating
+	// more Workspaces.
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{
+		WorkspaceQuotaBytes:   MaxAttachmentBytes,
+		WorkspaceQuotaObjects: 1,
+		TotalQuotaBytes:       MaxAttachmentBytes,
+		TotalQuotaObjects:     2,
+		ReservationTTL:        30 * time.Millisecond,
+	})
+	ws1, ch1 := f.workspaceWithChannel(t, ctx)
+	s1 := f.store.mustScope(t, ctx, ws1.WorkspaceID, f.humanA)
+	if _, err := s1.ReserveAttachmentUpload(ctx, ch1.PlaceID, "one", 12<<20); err != nil {
+		t.Fatalf("first reservation: %v", err)
+	}
+	if _, err := s1.ReserveAttachmentUpload(ctx, ch1.PlaceID, "workspace-object", 1); !errors.Is(err, ErrAttachmentQuotaExceeded) {
+		t.Fatalf("workspace object cap: %v", err)
+	}
+	ws2, err := f.store.CreateWorkspace(ctx, "second", f.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch2, err := f.store.CreateChannel(ctx, ws2.WorkspaceID, "general", "", f.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := f.store.mustScope(t, ctx, ws2.WorkspaceID, f.humanA)
+	if _, err := s2.ReserveAttachmentUpload(ctx, ch2.PlaceID, "two", 8<<20); err != nil {
+		t.Fatalf("second workspace exact remaining bytes: %v", err)
+	}
+	ws3, err := f.store.CreateWorkspace(ctx, "third", f.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch3, err := f.store.CreateChannel(ctx, ws3.WorkspaceID, "general", "", f.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3 := f.store.mustScope(t, ctx, ws3.WorkspaceID, f.humanA)
+	if _, err := s3.ReserveAttachmentUpload(ctx, ch3.PlaceID, "global-object", 1); !errors.Is(err, ErrAttachmentQuotaExceeded) {
+		t.Fatalf("whole-store byte/object cap: %v", err)
+	}
+	if bytes, objects := f.totalUsage(t, ctx); bytes != MaxAttachmentBytes || objects != 2 {
+		t.Fatalf("whole-store usage = %d bytes/%d objects, want %d/2", bytes, objects, MaxAttachmentBytes)
+	}
+	if got := f.usedObjects(t, ctx, ws1.WorkspaceID); got != 1 {
+		t.Fatalf("workspace one objects = %d, want 1", got)
+	}
+	time.Sleep(40 * time.Millisecond)
+	report, err := f.store.core.ReconcileAttachments(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ReleasedReservations != 2 {
+		t.Fatalf("released %d reservations, want 2", report.ReleasedReservations)
+	}
+	if bytes, objects := f.totalUsage(t, ctx); bytes != 0 || objects != 0 {
+		t.Fatalf("whole-store reconciliation left %d bytes/%d objects", bytes, objects)
+	}
+}
+
+func TestAttachmentDeletedNonceNeverReturnsAReadyReceipt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{})
+	workspace, channel := f.workspaceWithChannel(t, ctx)
+	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
+	att := f.mustUpload(t, ctx, sender, channel.PlaceID, "stable-source-nonce", "doc.txt", "text/plain", []byte("document"))
+	msg, _, err := sender.AppendMessage(ctx, AppendInput{PlaceID: channel.PlaceID, Content: "doc", ClientNonce: "message", AttachmentIDs: []string{att.AttachmentID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.DeleteMessage(ctx, channel.PlaceID, msg.MessageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.core.ReconcileAttachments(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := sender.ReserveAttachmentUpload(ctx, channel.PlaceID, "stable-source-nonce", int64(len("document"))); !errors.Is(err, ErrAttachmentUploadRetired) || receipt.Existing != nil {
+		t.Fatalf("tombstoned nonce receipt = %+v, %v; want a retired non-ready receipt", receipt, err)
+	}
+}
+
+func TestAttachmentDownloadHonorsPrivatePlaceVisibleFromSeq(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{})
+	workspace, _ := f.workspaceWithChannel(t, ctx)
+	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
+	reader := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanB)
+	group, err := sender.CreateGroupDM(ctx, []ParticipantRef{f.humanB, f.agent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	att := f.mustUpload(t, ctx, sender, group.PlaceID, "private-visible", "doc.txt", "text/plain", []byte("private"))
+	msg, _, err := sender.AppendMessage(ctx, AppendInput{PlaceID: group.PlaceID, Content: "doc", ClientNonce: "private-message", AttachmentIDs: []string{att.AttachmentID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.AttachmentForViewer(ctx, att.AttachmentID); err != nil {
+		t.Fatalf("initial private-place download: %v", err)
+	}
+	if _, err := f.store.core.pool.Exec(ctx, `
+		UPDATE place_members SET visible_from_seq = $3
+		WHERE workspace_id = $1 AND place_id = $2 AND member_kind = 'human' AND member_id = $4`,
+		workspace.WorkspaceID, group.PlaceID, msg.Seq+1, f.humanB.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.AttachmentForViewer(ctx, att.AttachmentID); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("pre-tenure private attachment = %v, want not found", err)
+	}
+}
+
+func TestAttachmentConcurrentReserveAndReclaimHasNoDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{ReservationTTL: time.Millisecond})
+	workspace, channel := f.workspaceWithChannel(t, ctx)
+	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
+	for i := 0; i < 12; i++ {
+		if _, err := sender.ReserveAttachmentUpload(ctx, channel.PlaceID, fmt.Sprintf("expired-%d", i), 1); err != nil {
+			t.Fatalf("seed reservation %d: %v", i, err)
+		}
+		time.Sleep(2 * time.Millisecond)
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		go func() {
+			<-start
+			_, err := f.store.core.releaseExpiredReservations(ctx, time.Now())
+			errs <- err
+		}()
+		go func() {
+			<-start
+			_, err := sender.ReserveAttachmentUpload(ctx, channel.PlaceID, fmt.Sprintf("expired-%d", i), 1)
+			errs <- err
+		}()
+		close(start)
+		for range 2 {
+			if err := <-errs; err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+					t.Fatalf("reserve/reclaim deadlocked on iteration %d: %v", i, err)
+				}
+				if !errors.Is(err, ErrAttachmentUploadExpired) && !errors.Is(err, ErrAttachmentUploadInProgress) {
+					t.Fatalf("reserve/reclaim iteration %d: %v", i, err)
+				}
+			}
+		}
+		if _, err := f.store.core.releaseExpiredReservations(ctx, time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("cleanup reservation %d: %v", i, err)
+		}
+	}
+}
+
+func TestAttachmentSameNonceHasOnePhysicalStager(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{})
+	workspace, channel := f.workspaceWithChannel(t, ctx)
+	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
+	req := attachmentUploadRequest{placeID: channel.PlaceID, clientNonce: "same-nonce", filename: "one.txt", declaredMIME: "text/plain", declaredSize: 4}
+	reader, writer := io.Pipe()
+	type result struct {
+		att     Attachment
+		created bool
+		err     error
+	}
+	first := make(chan result, 1)
+	go func() {
+		att, created, _, err := uploadAttachment(ctx, sender, req, admitAlways, nil, reader)
+		first <- result{att: att, created: created, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entries, _ := filepath.Glob(filepath.Join(f.root, "*", "*", ".staging-*"+attachmentStagingSuffix))
+		if len(entries) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first same-nonce upload never acquired a staging file")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for i := 0; i < 3; i++ {
+		_, _, _, err := uploadAttachment(ctx, sender, req, admitAlways, nil, bytes.NewReader([]byte("data")))
+		if !errors.Is(err, ErrAttachmentUploadInProgress) {
+			t.Fatalf("concurrent same-nonce retry %d = %v, want staging in progress", i, err)
+		}
+	}
+	entries, _ := filepath.Glob(filepath.Join(f.root, "*", "*", ".staging-*"+attachmentStagingSuffix))
+	if len(entries) != 1 {
+		t.Fatalf("physical staging files = %v, want exactly one", entries)
+	}
+	if _, err := writer.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := <-first
+	if got.err != nil || !got.created {
+		t.Fatalf("first same-nonce upload = %+v", got)
+	}
+	entries, _ = filepath.Glob(filepath.Join(f.root, "*", "*", ".staging-*"+attachmentStagingSuffix))
+	if len(entries) != 0 {
+		t.Fatalf("staging remained after finalize: %v", entries)
+	}
+}
+
 func TestAttachmentVisibilityTombstoneAndDeletionOutbox(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -462,8 +708,7 @@ func TestAttachmentVisibilityTombstoneAndDeletionOutbox(t *testing.T) {
 	if _, err := foreign.AttachmentForViewer(ctx, att.AttachmentID); !errors.Is(err, ErrAttachmentNotFound) {
 		t.Fatalf("foreign scope: %v", err)
 	}
-	// A member who joins a private place later cannot see history before
-	// their visible_from; a group DM re-admission proves the seq fence.
+	// Channel members receive the full channel history.
 	if _, err := reader.AttachmentForViewer(ctx, att.AttachmentID); err != nil {
 		t.Fatalf("channel member: %v", err)
 	}
@@ -636,7 +881,7 @@ func TestAttachmentUploadPhasesFenceStaleScopeAndDuplicateNonce(t *testing.T) {
 	}
 	stagedAttachment := StagedAttachment{
 		UploadID: receipt.Reservation.UploadID, Filename: "f.txt", MIME: "text/plain",
-		Size: int64(len(data)), SHA256: staged.SHA256, Handle: staged,
+		Size: int64(len(data)), SHA256: staged.SHA256, StageToken: receipt.Reservation.StageToken, Handle: staged,
 	}
 	_, _, err = sender.FinalizeAttachmentUpload(ctx, channel.PlaceID, stagedAttachment)
 	if err == nil || !AttachmentFinalizeDefinitelyNotCommitted(err) {
@@ -666,6 +911,7 @@ func TestAttachmentUploadPhasesFenceStaleScopeAndDuplicateNonce(t *testing.T) {
 		t.Fatal(err)
 	}
 	stagedAttachment.Handle = staged3
+	stagedAttachment.StageToken = again.Reservation.StageToken
 	att, created, err := current.FinalizeAttachmentUpload(ctx, channel.PlaceID, stagedAttachment)
 	if err != nil || !created {
 		t.Fatalf("finalize under current epoch: %v created=%v", err, created)
@@ -695,9 +941,14 @@ func TestAttachmentUploadPhasesFenceStaleScopeAndDuplicateNonce(t *testing.T) {
 	}
 	wg.Wait()
 	createdCount := 0
+	inProgressCount := 0
 	var id string
 	for _, r := range results {
 		if r.err != nil {
+			if errors.Is(r.err, ErrAttachmentUploadInProgress) {
+				inProgressCount++
+				continue
+			}
 			t.Fatalf("duplicate upload: %v", r.err)
 		}
 		if r.created {
@@ -711,6 +962,15 @@ func TestAttachmentUploadPhasesFenceStaleScopeAndDuplicateNonce(t *testing.T) {
 	}
 	if createdCount != 1 {
 		t.Fatalf("created=%d for one nonce", createdCount)
+	}
+	// A live duplicate either observes the durable receipt after the first
+	// finalizes or receives the explicit single-stager retry response; neither
+	// may create an extra staging file or attachment identity.
+	if inProgressCount > 0 {
+		replay, created, err := f.upload(t, ctx, current, channel.PlaceID, "dup", "dup.bin", "application/octet-stream", body)
+		if err != nil || created || replay.AttachmentID != id {
+			t.Fatalf("post-stager replay: %+v created=%v err=%v", replay, created, err)
+		}
 	}
 	if entries, _ := filepath.Glob(filepath.Join(f.root, "*", "*", ".staging-*")); len(entries) != 0 {
 		t.Fatalf("staging debris after duplicate uploads: %v", entries)
@@ -733,7 +993,7 @@ func TestAttachmentUploadPhasesFenceStaleScopeAndDuplicateNonce(t *testing.T) {
 	}
 	if _, _, err := other.FinalizeAttachmentUpload(ctx, channel.PlaceID, StagedAttachment{
 		UploadID: r2.Reservation.UploadID, Filename: "l.txt", MIME: "text/plain",
-		Size: int64(len(data)), SHA256: staged4.SHA256, Handle: staged4,
+		Size: int64(len(data)), SHA256: staged4.SHA256, StageToken: r2.Reservation.StageToken, Handle: staged4,
 	}); err == nil || !AttachmentFinalizeDefinitelyNotCommitted(err) {
 		t.Fatalf("finalize after membership loss: %v", err)
 	}

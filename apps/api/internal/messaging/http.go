@@ -1401,6 +1401,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "attachment_upload_conflict")
 	case errors.Is(err, ErrAttachmentUploadExpired):
 		writeError(w, http.StatusGone, "attachment_upload_expired")
+	case errors.Is(err, ErrAttachmentUploadRetired):
+		writeError(w, http.StatusGone, "attachment_upload_retired")
 	case errors.Is(err, ErrTooManyAttachments):
 		writeError(w, http.StatusBadRequest, "too_many_attachments")
 	case errors.Is(err, ErrAttachmentsUnavailable):

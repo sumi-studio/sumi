@@ -1,9 +1,7 @@
 package messaging
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -49,6 +47,15 @@ type AttachmentBlobs interface {
 	// against durable metadata. Blobs newer than cutoff are never reported,
 	// so a finalization in flight is never mistaken for an orphan.
 	Sweep(cutoff time.Time) ([]string, error)
+	// PublishedBefore rechecks a Sweep candidate immediately before removal.
+	// The reconciler combines it with the reservation row lock so a stale
+	// snapshot can never unlink bytes a concurrent finalizer just published.
+	PublishedBefore(id string, cutoff time.Time) (bool, error)
+	// StagingExists and DiscardStaging operate only on the deterministic staging
+	// path for one reservation. They let the reconciler prove artifacts are
+	// absent before it releases their quota.
+	StagingExists(id string) (bool, error)
+	DiscardStaging(id string) error
 }
 
 // DiskAttachments keeps attachment bytes under one operator-configured root,
@@ -183,6 +190,14 @@ func (d *DiskAttachments) finalPath(id string) (string, string, error) {
 	return directory, filepath.Join(directory, id+".bin"), nil
 }
 
+func (d *DiskAttachments) stagingPath(id string, create bool) (string, string, error) {
+	directory, err := d.shardDirectory(id, create)
+	if err != nil {
+		return "", "", err
+	}
+	return directory, filepath.Join(directory, attachmentStagingPrefix+id+attachmentStagingSuffix), nil
+}
+
 func (d *DiskAttachments) Stage(id string, r io.Reader, expected int64) (StagedBlob, error) {
 	if expected <= 0 {
 		return StagedBlob{}, ErrAttachmentEmpty
@@ -190,18 +205,15 @@ func (d *DiskAttachments) Stage(id string, r io.Reader, expected int64) (StagedB
 	if expected > MaxAttachmentBytes {
 		return StagedBlob{}, ErrAttachmentTooLarge
 	}
-	directory, err := d.shardDirectory(id, true)
+	_, tempPath, err := d.stagingPath(id, true)
 	if err != nil {
 		return StagedBlob{}, err
 	}
-	var suffix [8]byte
-	if _, err := rand.Read(suffix[:]); err != nil {
-		return StagedBlob{}, fmt.Errorf("staging name entropy: %w", err)
-	}
-	tempPath := filepath.Join(directory,
-		attachmentStagingPrefix+id+"-"+hex.EncodeToString(suffix[:])+attachmentStagingSuffix)
 	temp, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, attachmentFileMode)
 	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return StagedBlob{}, ErrAttachmentUploadInProgress
+		}
 		return StagedBlob{}, fmt.Errorf("create attachment staging file: %w", err)
 	}
 	staged := StagedBlob{ID: id, tempPath: tempPath}
@@ -318,6 +330,51 @@ func (d *DiskAttachments) Discard(staged StagedBlob) error {
 		return fmt.Errorf("discard attachment staging file: %w", err)
 	}
 	return nil
+}
+
+func (d *DiskAttachments) StagingExists(id string) (bool, error) {
+	_, path, err := d.stagingPath(id, false)
+	if errors.Is(err, ErrAttachmentNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect attachment staging file: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, errors.New("attachment staging file is not a regular file")
+	}
+	return true, nil
+}
+
+func (d *DiskAttachments) DiscardStaging(id string) error {
+	directory, path, err := d.stagingPath(id, false)
+	if errors.Is(err, ErrAttachmentNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect attachment staging before discard: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("attachment staging file is not a regular file")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("discard attachment staging file: %w", err)
+	}
+	return d.syncDirectory(directory)
 }
 
 func (d *DiskAttachments) Open(id string) (io.ReadSeekCloser, error) {
@@ -438,4 +495,22 @@ func (d *DiskAttachments) Sweep(cutoff time.Time) ([]string, error) {
 		return nil, fmt.Errorf("sweep attachment root: %w", err)
 	}
 	return older, nil
+}
+
+func (d *DiskAttachments) PublishedBefore(id string, cutoff time.Time) (bool, error) {
+	_, path, err := d.finalPath(id)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect published attachment: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, ErrAttachmentNotFound
+	}
+	return info.ModTime().Before(cutoff), nil
 }

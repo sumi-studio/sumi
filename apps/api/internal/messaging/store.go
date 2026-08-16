@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -51,6 +53,13 @@ type Store struct {
 	// keeps every attachment operation failing closed.
 	blobs            AttachmentBlobs
 	attachmentPolicy AttachmentPolicy
+	missingBlobScan  attachmentMissingBlobScan
+}
+
+type attachmentMissingBlobScan struct {
+	sync.Mutex
+	createdAt    time.Time
+	attachmentID string
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to

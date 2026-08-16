@@ -9,7 +9,12 @@
  * （正本はサーバー）に一本化する。
  */
 
-import type { NotificationLevel, NotifyReason, PlaceKey } from "./model";
+import type {
+  Attachment,
+  NotificationLevel,
+  NotifyReason,
+  PlaceKey,
+} from "./model";
 
 const SOUND_STORAGE_KEY = "sumi.messaging.notification-sound";
 const PROMPT_STORAGE_KEY = "sumi.messaging.notification-prompt";
@@ -129,8 +134,17 @@ export function notificationTitle(
   return placeName ? `${placeName} — ${authorName}` : authorName;
 }
 
-export function notificationBody(content: string): string {
+export function notificationBody(
+  content: string,
+  attachments: readonly Attachment[] = [],
+): string {
   const collapsed = content.replace(/\s+/g, " ").trim();
+  if (!collapsed && attachments.length > 0) {
+    const first = attachments[0];
+    return attachments.length === 1
+      ? `📎 ${first.filename}`
+      : `📎 ${attachments.length}件のファイル`;
+  }
   return collapsed.length > MAX_SNIPPET_CHARS
     ? `${collapsed.slice(0, MAX_SNIPPET_CHARS - 1)}…`
     : collapsed;

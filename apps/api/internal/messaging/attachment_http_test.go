@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 func newAttachmentTestServer(t *testing.T, ctx context.Context) (attachmentFixture, *httptest.Server) {
@@ -241,9 +242,17 @@ func TestAttachmentHTTPUploadSendAndSafeDownload(t *testing.T) {
 			t.Fatalf("download %q: %d", id, resp.StatusCode)
 		}
 	}
-	// A stranger without membership sees the same 404 as a missing id.
-	stranger := newWorld(t, ctx)
-	_ = stranger
+	// A real registered Human without membership sees the same 404 as a
+	// missing id; the fixture scope is intentionally present so this proves
+	// attachment authorization rather than a missing session/scope shortcut.
+	strangerID, err := koseki.New(f.store.core.pool).MintHuman(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = rawDownload(t, ts, strangerID, imageID)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("stranger download: %d", resp.StatusCode)
+	}
 	// Session-less download is 401, never a hint about existence.
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+scopedPath(t, ts, f.humanB.ID, "/messaging/attachments/"+imageID), nil)
 	noSession, err := http.DefaultClient.Do(req)

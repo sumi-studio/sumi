@@ -158,6 +158,12 @@
   metadata を同じ transaction で記録する。reservation は installation/epoch に fence
   され、disable/re-enable・membership 喪失・session 失効・runtime 世代交代のあとは
   finalize が閉じる（`410 attachment_upload_expired` または 401）。
+  同じ nonce の live retry は durable single-stager lease で 1 本だけが body を読む。
+  他の retry は `409 attachment_upload_in_progress` となり、1つの reservation の外に
+  staging file や bytes を積まない。expiry の quota 解放は staging と publish path の
+  削除確認後だけに行う。
+  tombstone 済みの nonce は historical logical-upload identity として retired になり、
+  ready receipt に化けず `410 attachment_upload_retired` を返す。
 - 送信 `POST /messaging/places/{place_id}/messages` の body に
   `attachments: [attachment_id, ...]` を順序付きで載せる。bind は message insert・
   mention・seq 割当・notification intent と同じ transaction で行われ、1 件でも
@@ -171,15 +177,14 @@
   すべて `404 not_found`。応答は `Cache-Control: private, no-store`、`nosniff`、
   `CSP sandbox`、`CORP same-origin` を持ち、inline 表示は png/jpeg/gif/webp だけ。
 - 未送信 draft は uploader ごと・place ごとに 10 件 / 200 MiB（1 メッセージ分）に
-  制限され、Workspace 全体は運用者が明示した byte cap（`SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES`、
-  未設定なら添付機能そのものが無効）で reserved+unbound+bound の合計を制限する。
+  制限され、reserved+unbound+bound は Workspace と API 全体の byte/object cap で
+  二重に制限する。4つの `SUMI_MESSAGING_ATTACHMENT_{WORKSPACE,TOTAL}_QUOTA_{BYTES,OBJECTS}`
+  は root とともにすべて必須で、どれかを省略した構成では添付を有効化しない。
 - tombstone はメタデータ行を残したまま bytes を非同期 deletion outbox
   （`blob_state='deleting'`）で削除する。quota は削除確認と同じ transaction でだけ返る。
-- Agent 側: `messaging` tool の `write` は Workspace 内の path を `attachments` に列挙
-  でき、`open_attachment` で「今開いている place に見えている」attachment を読む。
-  transport は PAID-local control socket の staged upload
-  （`/local-control/v1/messaging/places/{place_id}/attachments`）と
-  `messaging:attachment` で、Human と同じ Store 規則を通る。
+- Agent 側の Workspace path 送信と `open_attachment` は次の Agent head で接続する予定で
+  あり、この Human/Core head にはまだ含まれない。PAID-local control の staged upload
+  route はそのための内部 seam で、Human UI の経路ではない。
 
 ## API / event（人間UI側）
 

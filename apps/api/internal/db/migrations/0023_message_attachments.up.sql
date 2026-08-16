@@ -8,14 +8,24 @@
 -- carries workspace_id and place_id so a cross-workspace or cross-place bind
 -- is impossible at the database level.
 
--- One row per Workspace: bytes currently accounted against the Workspace
--- attachment cap. It covers reserved (in-flight) uploads, finalized unbound
--- drafts, and bound message attachments. Bytes leave the ledger only in the
--- same transaction that records the reservation release or confirms that the
--- blob is gone.
+-- The one whole-store row is locked before every Workspace row. It bounds the
+-- API-owned blob root even when a caller creates many Workspaces, and counts
+-- objects as well as bytes so small files cannot exhaust inodes first.
+CREATE TABLE message_attachment_store_usage (
+    singleton     boolean      PRIMARY KEY DEFAULT true CHECK (singleton),
+    used_bytes    bigint       NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+    object_count  bigint       NOT NULL DEFAULT 0 CHECK (object_count >= 0),
+    updated_at    timestamptz  NOT NULL DEFAULT now()
+);
+
+-- One row per Workspace. It covers reserved (in-flight) uploads, finalized
+-- unbound drafts, and bound message attachments. Bytes and object counts leave
+-- the ledger only in the same transaction that records reservation release or
+-- confirms the blob is gone.
 CREATE TABLE message_attachment_quotas (
     workspace_id uuidv7      PRIMARY KEY REFERENCES workspaces(workspace_id),
     used_bytes   bigint      NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+    object_count bigint      NOT NULL DEFAULT 0 CHECK (object_count >= 0),
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
@@ -102,11 +112,17 @@ CREATE TABLE message_attachment_uploads (
     state           text        NOT NULL DEFAULT 'reserved'
         CHECK (state IN ('reserved', 'finalized', 'released')),
     attachment_id   uuidv7      REFERENCES message_attachments(attachment_id),
+    -- Exactly one durable body-staging claim may exist for a reservation.
+    -- Finalization verifies this token, so a delayed claimant cannot publish
+    -- after a retry has acquired a new claim.
+    staging_token   uuidv7,
+    staging_expires_at timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     expires_at      timestamptz NOT NULL,
     settled_at      timestamptz,
     CHECK ((state = 'finalized') = (attachment_id IS NOT NULL)),
     CHECK ((state = 'reserved') = (settled_at IS NULL)),
+    CHECK ((staging_token IS NULL) = (staging_expires_at IS NULL)),
     CHECK (expires_at > created_at),
     CONSTRAINT message_attachment_uploads_place_uploader_nonce
         UNIQUE (workspace_id, place_id, uploader_kind, uploader_id, client_nonce),

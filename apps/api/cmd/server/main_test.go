@@ -25,6 +25,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 )
 
 var testTokenSecret = []byte("test-secret-32bytes-long-string!!")
@@ -2385,5 +2386,40 @@ func TestLocalControlPreviousSigningSecretsFromEnvIsBoundedAndStrict(t *testing.
 	)
 	if _, err := localControlPreviousSigningSecretsFromEnv(); err == nil {
 		t.Fatal("unbounded previous signing-secret set was accepted")
+	}
+}
+
+func TestConfigureMessagingAttachmentsRequiresWholeStoreCaps(t *testing.T) {
+	all := map[string]string{
+		messagingAttachmentRootEnv:             filepath.Join(t.TempDir(), "attachments"),
+		messagingAttachmentWorkspaceBytesEnv:   "20971520",
+		messagingAttachmentWorkspaceObjectsEnv: "10",
+		messagingAttachmentTotalBytesEnv:       "41943040",
+		messagingAttachmentTotalObjectsEnv:     "20",
+	}
+	for name := range all {
+		t.Setenv(name, "")
+	}
+	store := messaging.New(nil, nil, nil)
+	if err := configureMessagingAttachmentsFromEnv(store); err != nil {
+		t.Fatalf("all absent must leave attachments disabled: %v", err)
+	}
+	if store.AttachmentsEnabled() {
+		t.Fatal("all-absent attachment configuration enabled storage")
+	}
+	for name, value := range all {
+		t.Setenv(name, value)
+	}
+	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil)); err != nil {
+		t.Fatalf("complete attachment cap configuration: %v", err)
+	}
+	for missing := range all {
+		for name, value := range all {
+			t.Setenv(name, value)
+		}
+		t.Setenv(missing, "")
+		if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil)); err == nil {
+			t.Fatalf("configuration missing %s was accepted", missing)
+		}
 	}
 }

@@ -100,6 +100,41 @@ describe("notification text", () => {
     expect(body).toHaveLength(MAX_SNIPPET_CHARS);
     expect(body.endsWith("…")).toBe(true);
   });
+
+  it("names attachment-only messages instead of showing an empty notification", () => {
+    expect(
+      notificationBody("", [
+        {
+          attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+          filename: "plan.pdf",
+          mime: "application/pdf",
+          sizeBytes: 1,
+          sha256: "00",
+          position: 0,
+        },
+      ]),
+    ).toBe("📎 plan.pdf");
+    expect(
+      notificationBody("", [
+        {
+          attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+          filename: "one.txt",
+          mime: "text/plain",
+          sizeBytes: 1,
+          sha256: "00",
+          position: 0,
+        },
+        {
+          attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaab",
+          filename: "two.txt",
+          mime: "text/plain",
+          sizeBytes: 1,
+          sha256: "00",
+          position: 1,
+        },
+      ]),
+    ).toBe("📎 2件のファイル");
+  });
 });
 
 describe("notification badge aggregation", () => {
