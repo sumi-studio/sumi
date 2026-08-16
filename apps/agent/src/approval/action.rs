@@ -143,7 +143,7 @@ impl CanonicalAction {
             "messaging" => {
                 let operation = get_string(map, tool_name, "action")?;
                 let permission = match operation.as_str() {
-                    "overview" | "open" => Permission::ReadDomain,
+                    "overview" | "open" | "get_call_state" => Permission::ReadDomain,
                     "write" => Permission::DomainMutation,
                     _ => {
                         return Err(ActionError::InvalidAction("unknown messaging operation"));
@@ -211,7 +211,12 @@ impl CanonicalAction {
             "edit_file" => "edit",
             "delete" => "delete",
             BASH_TOOL_NAME => "exec",
-            "messaging" if matches!(self.operation.as_str(), "overview" | "open" | "write") => {
+            "messaging"
+                if matches!(
+                    self.operation.as_str(),
+                    "overview" | "open" | "write" | "get_call_state"
+                ) =>
+            {
                 self.operation.as_str()
             }
             _ => return Err(ActionError::InvalidAction("unknown canonical tool")),
