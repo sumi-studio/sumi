@@ -841,6 +841,104 @@ impl WorkspaceFs {
         Ok(matches)
     }
 
+    /// Open an exact ordered list of regular Workspace files read-only for a
+    /// Messaging attachment send. Each path is resolved beneath the Workspace
+    /// root with symlinks and magic links refused, must be a regular file
+    /// within the attachment size bounds, and is digested through the very
+    /// descriptor that is returned (positional reads leave its offset at 0
+    /// for the receiving process). A file whose identity, size, or times
+    /// change while it is digested is refused as ambiguous rather than
+    /// guessed at.
+    pub fn open_source_files(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(OwnedFd, super::executor::SourceFileManifest)>, ToolError> {
+        use std::os::unix::fs::FileExt;
+
+        use sha2::{Digest, Sha256};
+
+        use super::executor::{
+            MAX_SOURCE_FILE_BYTES, MAX_SOURCE_FILES_PER_OPERATION, MAX_SOURCE_FILES_TOTAL_BYTES,
+            SourceFileManifest,
+        };
+
+        if paths.is_empty() || paths.len() > MAX_SOURCE_FILES_PER_OPERATION {
+            return Err(ToolError::InvalidArguments);
+        }
+        let mut opened = Vec::with_capacity(paths.len());
+        let mut total: u64 = 0;
+        for path in paths {
+            let relative = self.relative(Path::new(path))?;
+            let filename = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or_else(|| {
+                    ToolError::InvalidPath("source path has no file name".to_owned())
+                })?
+                .to_owned();
+            let fd = openat2(
+                self.root.as_raw_fd(),
+                &relative,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0,
+                RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+            )?;
+            let file = File::from(fd.try_clone()?);
+            let before = file.metadata()?;
+            if !before.is_file() {
+                return Err(ToolError::InvalidPath(
+                    "attachment source is not a regular file".to_owned(),
+                ));
+            }
+            let size = before.len();
+            if size == 0 || size > MAX_SOURCE_FILE_BYTES {
+                return Err(ToolError::ResourceLimit(ResourceLimit::InputBytes {
+                    observed: size,
+                    limit: MAX_SOURCE_FILE_BYTES,
+                }));
+            }
+            total = total
+                .checked_add(size)
+                .filter(|total| *total <= MAX_SOURCE_FILES_TOTAL_BYTES)
+                .ok_or(ToolError::ResourceLimit(ResourceLimit::InputBytes {
+                    observed: total.saturating_add(size),
+                    limit: MAX_SOURCE_FILES_TOTAL_BYTES,
+                }))?;
+            let mut digest = Sha256::new();
+            let mut buffer = vec![0u8; 256 * 1024];
+            let mut offset: u64 = 0;
+            while offset < size {
+                let read = file.read_at(&mut buffer, offset)?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+                offset += read as u64;
+            }
+            let after = file.metadata()?;
+            if offset != size || !same_file_version(&before, &after) {
+                return Err(ToolError::Protocol(
+                    "attachment source changed while it was being read".to_owned(),
+                ));
+            }
+            let mut sha256 = String::with_capacity(64);
+            for byte in digest.finalize() {
+                use std::fmt::Write as _;
+                let _ = write!(sha256, "{byte:02x}");
+            }
+            let manifest = SourceFileManifest {
+                path: path.clone(),
+                filename,
+                size_bytes: size,
+                sha256,
+            };
+            manifest.validate()?;
+            opened.push((fd, manifest));
+        }
+        Ok(opened)
+    }
+
     pub fn display_path(&self, relative: &Path) -> PathBuf {
         self.display_root.join(relative)
     }

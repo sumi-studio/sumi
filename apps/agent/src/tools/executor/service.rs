@@ -6,7 +6,7 @@ use std::{
     fs::{File, OpenOptions},
     future::{Future, poll_fn},
     mem::MaybeUninit,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
@@ -1331,6 +1331,15 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         let control_connections = control_connections.clone();
         let call_authority = call_authority.clone();
         tokio::spawn(async move {
+            // A duplicated handle on the same socket lets one operation attach
+            // SCM_RIGHTS descriptors to its terminal frame. It shares the
+            // non-blocking file description with the tokio halves.
+            let descriptor_channel = stream
+                .as_fd()
+                .try_clone_to_owned()
+                .ok()
+                .and_then(|fd| AsyncFd::new(fd).ok())
+                .map(Arc::new);
             let (read, write) = stream.into_split();
             let mut read = BufReader::new(read);
             let first_line =
@@ -1386,6 +1395,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                     manager,
                     blocking_fs,
                     call_authority,
+                    descriptor_channel,
                 )
                 .await
             })
@@ -1420,6 +1430,7 @@ async fn run_critical_executor_service(
     manager: Arc<ExecutorManager>,
     blocking_fs: BlockingFsRegistry,
     call_authority: Arc<ExecutorCallAuthorityVerifier>,
+    descriptor_channel: Option<Arc<AsyncFd<OwnedFd>>>,
 ) -> Result<()> {
     let result = run_critical_executor_exchange(
         first_line,
@@ -1429,6 +1440,7 @@ async fn run_critical_executor_service(
         manager,
         blocking_fs,
         call_authority,
+        descriptor_channel,
     )
     .await;
     writer_task.abort();
@@ -1450,6 +1462,13 @@ pub(super) async fn run_critical_executor_test_service(
         identity.clone(),
     )?);
     let fs = Arc::new(WorkspaceFs::open(&workspace)?);
+    let descriptor_channel = write
+        .as_ref()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| AsyncFd::new(fd).ok())
+        .map(Arc::new);
     run_critical_executor_service(
         first_line,
         ExecutorWriter::start(write),
@@ -1458,6 +1477,7 @@ pub(super) async fn run_critical_executor_test_service(
         ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
         BlockingFsRegistry::production(),
         call_authority,
+        descriptor_channel,
     )
     .await
 }
@@ -1470,6 +1490,7 @@ async fn run_critical_executor_exchange(
     manager: Arc<ExecutorManager>,
     blocking_fs: BlockingFsRegistry,
     call_authority: Arc<ExecutorCallAuthorityVerifier>,
+    descriptor_channel: Option<Arc<AsyncFd<OwnedFd>>>,
 ) -> Result<()> {
     let request = match decode_authorized_executor_request(&first_line, &identity, &call_authority)?
     {
@@ -1550,6 +1571,85 @@ async fn run_critical_executor_exchange(
                         Err(bounded_error("rpc_indeterminate"))
                     });
             writer.terminal(&identity, request_id, result).await?;
+        }
+        operation @ ExecutorOperation::OpenSourceFiles { .. } => {
+            let execution_id = operation_execution_id(&operation).to_owned();
+            let authority = verified_call_authority.ok_or_else(|| {
+                ToolError::Protocol("verified executor call authority is missing".to_owned())
+            })?;
+            let Some(channel) = descriptor_channel else {
+                let result = match manager.reject_request(&request_id) {
+                    Ok(()) => Err(bounded_error("protocol")),
+                    Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                    Err(error) => return Err(error.into()),
+                };
+                writer.terminal(&identity, request_id, result).await?;
+                return Ok(());
+            };
+            let registration = match manager.register_authorized_execution(
+                request_id.clone(),
+                execution_id,
+                None,
+                authority,
+            ) {
+                Ok(registration) => registration,
+                Err(error) if is_typed_admission_error(&error) => {
+                    writer
+                        .terminal(&identity, request_id, Err(rpc_error(error)))
+                        .await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let execution = match registration {
+                ExecutionRegistration::Replay(_) => {
+                    // A replayed manifest cannot carry the descriptors that
+                    // travelled with the original terminal. The runtime treats
+                    // a descriptor/manifest mismatch as failure, so refuse the
+                    // replay outright instead of pretending.
+                    writer
+                        .terminal(&identity, request_id, Err(bounded_error("protocol")))
+                        .await?;
+                    return Ok(());
+                }
+                ExecutionRegistration::Pending(mut pending) => {
+                    let permit = pending.wait_for_admission().await?.ok_or_else(|| {
+                        ToolError::Protocol(
+                            "non-cancellable executor operation lost admission".to_owned(),
+                        )
+                    })?;
+                    pending.promote(permit)?
+                }
+            };
+            let outcome = start_critical_source_transfer_execution(execution, fs, blocking_fs, operation)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "critical source transfer ownership task stopped");
+                    Err(bounded_error("rpc_indeterminate"))
+                });
+            match outcome {
+                Ok((response, descriptors)) => {
+                    let frame = RpcFrame::Terminal {
+                        personality_agent_id: identity.personality_agent_id().clone(),
+                        generation: identity.generation().to_wire(),
+                        nonce: identity.nonce().as_str().to_owned(),
+                        request_id,
+                        result: Ok::<_, RpcError>(response),
+                    };
+                    let bytes = encode_rpc_frame(&frame)?;
+                    let raw: Vec<RawFd> = descriptors.iter().map(|fd| fd.as_raw_fd()).collect();
+                    timeout(
+                        EXECUTOR_TERMINAL_WRITE_DEADLINE,
+                        super::descriptor_transfer::send_frame_with_fds(&channel, &bytes, &raw),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("source transfer terminal write deadline elapsed"))??;
+                    drop(descriptors);
+                }
+                Err(error) => {
+                    writer.terminal(&identity, request_id, Err(error)).await?;
+                }
+            }
         }
         _ => {
             let result = match manager.reject_request(&request_id) {
@@ -1659,6 +1759,49 @@ fn start_critical_read_discovery_execution(
         .map_err(rpc_error);
         if let Err(error) = execution.complete(result.clone()) {
             tracing::error!(%error, "failed to settle critical read/discovery ownership");
+            return Err(bounded_error("rpc_indeterminate"));
+        }
+        result
+    })
+}
+
+type SourceTransferOutcome = Result<(ExecutorResponse, Vec<OwnedFd>), RpcError>;
+
+/// Open the exact ordered sources under the verified authority's expiry and
+/// settle the execution with the manifest only; descriptors are never part of
+/// the durable replay record.
+fn start_critical_source_transfer_execution(
+    mut execution: ExecutionLease,
+    fs: Arc<WorkspaceFs>,
+    blocking_fs: BlockingFsRegistry,
+    operation: ExecutorOperation,
+) -> JoinHandle<SourceTransferOutcome> {
+    tokio::spawn(async move {
+        let result = match (execution.authority_expiry(), operation) {
+            (Some(expiry), ExecutorOperation::OpenSourceFiles { paths, .. }) => {
+                blocking_fs
+                    .execute_authorized(expiry, move || {
+                        let opened = fs.open_source_files(&paths)?;
+                        let (descriptors, files): (Vec<OwnedFd>, Vec<_>) =
+                            opened.into_iter().unzip();
+                        Ok((ExecutorResponse::SourceFiles { files }, descriptors))
+                    })
+                    .await
+            }
+            (None, _) => Err(ToolError::Protocol(
+                "critical executor lost verified authority before effect start".to_owned(),
+            )),
+            (Some(_), _) => Err(ToolError::Protocol(
+                "critical executor received an unsupported operation".to_owned(),
+            )),
+        }
+        .map_err(rpc_error);
+        let settlement = result
+            .as_ref()
+            .map(|(response, _)| response.clone())
+            .map_err(Clone::clone);
+        if let Err(error) = execution.complete(settlement) {
+            tracing::error!(%error, "failed to settle critical source transfer ownership");
             return Err(bounded_error("rpc_indeterminate"));
         }
         result
@@ -2743,6 +2886,11 @@ async fn execute_non_bash(
                     .await
             }
         }
+        // Descriptor transfer needs the authenticated Unix socket; the generic
+        // stdio/broker service has no channel that can carry it.
+        ExecutorOperation::OpenSourceFiles { .. } => Err(ToolError::Protocol(
+            "source file transfer requires the production Unix executor endpoint".to_owned(),
+        )),
         ExecutorOperation::Health { .. }
         | ExecutorOperation::Bash { .. }
         | ExecutorOperation::Cancel { .. } => Err(ToolError::Protocol(
@@ -2760,6 +2908,7 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
         | ExecutorOperation::ListDir { execution_id, .. }
         | ExecutorOperation::Glob { execution_id, .. }
         | ExecutorOperation::Grep { execution_id, .. }
+        | ExecutorOperation::OpenSourceFiles { execution_id, .. }
         | ExecutorOperation::Bash { execution_id, .. }
         | ExecutorOperation::Cancel { execution_id } => execution_id,
         ExecutorOperation::Health { .. } => {
@@ -3321,6 +3470,7 @@ mod tests {
             manager,
             blocking_fs,
             verifier,
+            None,
         ));
         (client, task)
     }
