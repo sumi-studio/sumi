@@ -437,7 +437,16 @@ func TestAttachmentQuotaDraftBudgetAndConcurrentReservations(t *testing.T) {
 		t.Fatalf("declared size drift: %v", err)
 	}
 	// Expired reservations release their bytes only through reconciliation.
-	time.Sleep(2200 * time.Millisecond)
+	// Age them in the ledger rather than sleeping out the TTL: a wall-clock
+	// sleep decides the outcome by how busy the machine is, not by the rule
+	// under test.
+	// Both timestamps move, because the table requires expires_at > created_at.
+	if _, err := f.store.core.pool.Exec(ctx,
+		`UPDATE message_attachment_uploads
+		 SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour'
+		 WHERE state = 'reserved'`); err != nil {
+		t.Fatalf("age live reservations: %v", err)
+	}
 	report, err := f.store.core.ReconcileAttachments(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -959,7 +968,12 @@ func TestAttachmentVisibilityTombstoneAndDeletionOutbox(t *testing.T) {
 func TestAttachmentReconcilerReclaimsDraftsOrphansAndReportsMissing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	f := newAttachmentWorld(t, ctx, AttachmentPolicy{ReservationTTL: 50 * time.Millisecond, UnboundTTL: 100 * time.Millisecond})
+	// UnboundTTL is the rule under test, so it stays short. ReservationTTL is
+	// left at its default: it bounds how long the test's own uploads may take,
+	// and a millisecond value there makes them race their own reservation and
+	// fail the finalize on any busy machine. The rows are then aged explicitly
+	// below so no cutoff depends on wall-clock timing.
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{UnboundTTL: 100 * time.Millisecond})
 	workspace, channel := f.workspaceWithChannel(t, ctx)
 	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
 	draft := f.mustUpload(t, ctx, sender, channel.PlaceID, "d1", "draft.txt", "text/plain", []byte("draft"))
@@ -990,7 +1004,23 @@ func TestAttachmentReconcilerReclaimsDraftsOrphansAndReportsMissing(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	time.Sleep(150 * time.Millisecond)
+	// Age every attachment row and settled receipt past the reconciler's
+	// cutoffs. Sleeping out a short TTL instead lets machine load decide the
+	// outcome: the unbound draft must be expired, and the bound row whose blob
+	// vanished must be old enough for the blob sweep to judge it missing.
+	if _, err := f.store.core.pool.Exec(ctx,
+		`UPDATE message_attachments SET created_at = now() - interval '1 hour'`); err != nil {
+		t.Fatalf("age attachment rows: %v", err)
+	}
+	// expires_at > created_at is a table constraint, so both move together.
+	if _, err := f.store.core.pool.Exec(ctx, `
+		UPDATE message_attachment_uploads
+		SET created_at = now() - interval '2 hours',
+		    expires_at = now() - interval '90 minutes',
+		    settled_at = now() - interval '1 hour'
+		WHERE settled_at IS NOT NULL`); err != nil {
+		t.Fatalf("age settled receipts: %v", err)
+	}
 	report, err := f.store.core.ReconcileAttachments(ctx)
 	if err != nil {
 		t.Fatal(err)
