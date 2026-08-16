@@ -1629,7 +1629,20 @@ async fn run_chat_stream(
             }
             Ok(None) => {
                 let usage = receive.usage().clone();
-                match receive.finish(Utc::now()) {
+                // A body that ends by HTTP framing without [DONE]. Endpoints
+                // flagged `infer_finish_reason_at_done` (opencode.ai zen/go with
+                // gpt-5.6-luna, observed 2026-08-17) also omit the sentinel, so
+                // the same inference applies; a transport error still arrives as
+                // Err below and is never inferred as complete.
+                let infer = spec
+                    .chat_compat()
+                    .is_some_and(|compat| compat.infer_finish_reason_at_done);
+                let finished = if infer {
+                    receive.finish_after_done_sentinel(Utc::now())
+                } else {
+                    receive.finish(Utc::now())
+                };
+                match finished {
                     Ok(terminal) => {
                         finish_terminal(
                             &tx,
@@ -1702,7 +1715,15 @@ async fn finish_chat(
     success_terminal_committed: &SuccessTerminalCommit,
 ) {
     let usage = receive.usage().clone();
-    match receive.finish(Utc::now()) {
+    let infer_at_done = spec
+        .chat_compat()
+        .is_some_and(|compat| compat.infer_finish_reason_at_done);
+    let finished = if infer_at_done {
+        receive.finish_after_done_sentinel(Utc::now())
+    } else {
+        receive.finish(Utc::now())
+    };
+    match finished {
         Ok(terminal) => {
             finish_terminal(
                 tx,

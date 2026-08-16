@@ -1599,6 +1599,38 @@ impl ChatReceiveState {
         Ok(slot)
     }
 
+    /// Some OpenAI-compatible endpoints (observed 2026-08-17: `gpt-5.6-luna` via
+    /// opencode.ai zen/go) never set `finish_reason` — not even on the last
+    /// chunk — and may end the body without the `[DONE]` sentinel. When the
+    /// driver has established that the response ended cleanly (sentinel or
+    /// proper HTTP end of body, never a transport error) and the preset opts in
+    /// (`ChatCompat::infer_finish_reason_at_done`), the stop reason is inferred
+    /// from what was received: tool calls mean `tool_calls`, otherwise any
+    /// content means `stop`. `finish` itself stays strict.
+    pub fn finish_after_done_sentinel(
+        &mut self,
+        timestamp: DateTime<Utc>,
+    ) -> Result<ChatTerminal, ChatAdapterError> {
+        if self.finish_reason.is_none() {
+            let inferred = if self.tools.iter().any(Option::is_some) {
+                Some("tool_calls")
+            } else if self.text.is_some() || self.thinking.is_some() {
+                Some("stop")
+            } else {
+                None
+            };
+            if let Some(reason) = inferred {
+                tracing::debug!(
+                    response_id = self.response_id.as_deref().unwrap_or_default(),
+                    inferred_finish_reason = reason,
+                    "Chat Completions stream reached [DONE] without finish_reason; inferring"
+                );
+                self.finish_reason = Some(reason.to_owned());
+            }
+        }
+        self.finish(timestamp)
+    }
+
     pub fn finish(&mut self, timestamp: DateTime<Utc>) -> Result<ChatTerminal, ChatAdapterError> {
         let raw_reason = self
             .finish_reason
@@ -2154,12 +2186,26 @@ mod tests {
                 .ends_with(&encoded_schema)
         );
 
-        for preset in ["umans", "opencode-go"] {
-            assert!(matches!(
-                build_request(&ModelSpec::preset(preset).unwrap(), &context, &options),
-                Err(ChatAdapterError::StructuredOutputUnsupported)
-            ));
-        }
+        assert!(matches!(
+            build_request(&ModelSpec::preset("umans").unwrap(), &context, &options),
+            Err(ChatAdapterError::StructuredOutputUnsupported)
+        ));
+
+        // opencode-go (kimi-k2.7-code / gpt-5.6-luna via opencode.ai zen/go) was
+        // verified live on 2026-08-16 to honour JSON object mode.
+        let opencode = build_request(
+            &ModelSpec::preset("opencode-go").unwrap(),
+            &context,
+            &options,
+        )
+        .expect("OpenCode Go honours JSON object mode");
+        assert_eq!(opencode["response_format"], json!({"type": "json_object"}));
+        assert!(
+            opencode["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(&encoded_schema)
+        );
 
         assert_eq!(
             ModelSpec::preset("kimi-k3")
@@ -3819,6 +3865,44 @@ mod tests {
         );
         assert_eq!(receive.content_bytes, 0);
         assert_eq!(receive.event_count, 0);
+    }
+
+    #[test]
+    fn done_sentinel_without_finish_reason_infers_stop_but_closed_stream_still_fails() {
+        // Observed with gpt-5.6-luna via opencode.ai zen/go: content deltas, a usage
+        // chunk, then `[DONE]`, never a finish_reason.
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        receive
+            .push_json(r#"{"choices":[{"delta":{"content":"{\"outcome\":\"allow\"}"}}]}"#)
+            .expect("content delta");
+        receive
+            .push_json(r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#)
+            .expect("usage chunk");
+        let terminal = receive
+            .finish_after_done_sentinel(Utc::now())
+            .expect("inferred stop after [DONE]");
+        assert_eq!(terminal.stop_reason, StopReason::Stop);
+
+        // Without the sentinel a missing finish_reason stays an error: a dropped
+        // connection must not be mistaken for a complete answer.
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        receive
+            .push_json(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
+            .expect("content delta");
+        assert!(matches!(
+            receive.finish(Utc::now()),
+            Err(ChatAdapterError::MissingFinishReason)
+        ));
+
+        // Nothing received at all: even after [DONE] there is nothing to infer.
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        assert!(matches!(
+            receive.finish_after_done_sentinel(Utc::now()),
+            Err(ChatAdapterError::MissingFinishReason)
+        ));
     }
 
     #[test]

@@ -50,6 +50,10 @@ pub struct ChatCompat {
     pub supports_developer_role: bool,
     pub allows_sampling_parameters: bool,
     pub structured_output: ChatStructuredOutputMode,
+    /// The endpoint completes streams with the `[DONE]` sentinel but may never
+    /// set `finish_reason`; infer `stop`/`tool_calls` from the received content
+    /// once the sentinel arrives. Off for endpoints whose contract is strict.
+    pub infer_finish_reason_at_done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +173,7 @@ impl ModelSpec {
                     supports_developer_role: false,
                     allows_sampling_parameters: false,
                     structured_output: ChatStructuredOutputMode::JsonSchema,
+                    infer_finish_reason_at_done: false,
                 },
             ),
             "glm-5.2" => (
@@ -192,6 +197,7 @@ impl ModelSpec {
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
                     structured_output: ChatStructuredOutputMode::JsonObjectWithPromptSchema,
+                    infer_finish_reason_at_done: false,
                 },
             ),
             "umans" | "umans-kimi-k2.7" => (
@@ -215,6 +221,7 @@ impl ModelSpec {
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
                     structured_output: ChatStructuredOutputMode::Unsupported,
+                    infer_finish_reason_at_done: false,
                 },
             ),
             "opencode-go" | "opencode-zen-go" => (
@@ -245,6 +252,8 @@ impl ModelSpec {
                     // model spends reasoning tokens before answering, so callers
                     // must keep max_tokens well above the JSON itself.
                     structured_output: ChatStructuredOutputMode::JsonObjectWithPromptSchema,
+                    // gpt-5.6-luna on this endpoint never sets finish_reason (2026-08-17).
+                    infer_finish_reason_at_done: true,
                 },
             ),
             _ => return None,
