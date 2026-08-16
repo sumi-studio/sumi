@@ -938,6 +938,36 @@ describe("Workspace control store", () => {
     ).toBeNull();
   });
 
+  it("ends the install mutation even when the reconciliation read fails", async () => {
+    const installApp = vi.fn(async () => {
+      throw new WorkspaceAPIError("install_intent_already_installed", 409);
+    });
+    let listCalls = 0;
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [ROLE_A],
+        listAppCatalog: async () => [APP],
+        listInstallations: async () => {
+          listCalls += 1;
+          if (listCalls > 1) throw new WorkspaceAPIError("unavailable", 503);
+          return [];
+        },
+        installApp,
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    await expect(store.getState().installApp(APP_ID)).rejects.toMatchObject({
+      code: "install_intent_already_installed",
+    });
+    expect(store.getState().mutation).toBeNull();
+  });
+
   it("reconciles a retried install that the server already committed", async () => {
     const enabled = installation(
       WORKSPACE_A_ID,

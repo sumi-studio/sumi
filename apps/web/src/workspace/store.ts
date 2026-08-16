@@ -908,15 +908,25 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
             error.code === "install_intent_already_installed" &&
             isCurrentScope(token)
           ) {
-            const installations = await client.listInstallations({
-              kind: "workspace",
-              workspaceId: token.workspaceId,
-            });
-            if (!isCurrentScope(token)) throw error;
-            const installed = installations.find(
+            // The reconciliation read may itself fail; the mutation must still
+            // end, or every later lifecycle action stays disabled.
+            let installations: AppInstallation[] | null = null;
+            try {
+              installations = await client.listInstallations({
+                kind: "workspace",
+                workspaceId: token.workspaceId,
+              });
+            } catch {
+              installations = null;
+            }
+            if (!isCurrentScope(token)) {
+              endMutation(token, error);
+              throw error;
+            }
+            const installed = installations?.find(
               (installation) => installation.appId === appId,
             );
-            if (installed) {
+            if (installed && installations) {
               validateInstallation(token.workspaceId, installed, appId);
               set({ installations });
               endMutation(token);
