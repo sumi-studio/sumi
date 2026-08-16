@@ -97,12 +97,19 @@ func TestCallWebhookRejectsSignaturesAndRebuildsState(t *testing.T) {
 		t.Fatal("rejected webhook changed state")
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/messaging/livekit/webhook", strings.NewReader(string(body)))
-	request.Header.Set("Authorization", "Bearer "+signCallWebhook(t, body, now))
-	response := httptest.NewRecorder()
-	mux.ServeHTTP(response, request)
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("signed status=%d body=%s", response.Code, response.Body.String())
+	for _, authorization := range []string{
+		// livekit-server v1.8 sends the signed JWT directly, while accepting
+		// Bearer keeps compatibility with SDKs and reverse proxies that add it.
+		signCallWebhook(t, body, now),
+		"Bearer " + signCallWebhook(t, body, now),
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/messaging/livekit/webhook", strings.NewReader(string(body)))
+		request.Header.Set("Authorization", authorization)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("signed status=%d body=%s", response.Code, response.Body.String())
+		}
 	}
 	state, ok := service.Registry.snapshot("place-1")
 	if !ok || !state.Active || len(state.Participants) != 1 ||
@@ -193,6 +200,7 @@ func TestCallTokenAdmissionTracksCurrentMessagingAuthority(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("authorized status=%d body=%v", response.StatusCode, body)
 	}
+
 	payload, err := verifyJWT(body["token"].(string), testLiveKitSecret)
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +211,15 @@ func TestCallTokenAdmissionTracksCurrentMessagingAuthority(t *testing.T) {
 	}
 	if claims.Subject != w.humanB.Key() || body["identity"] != w.humanB.Key() {
 		t.Fatalf("transport actor was not authoritative: claims=%+v body=%v", claims, body)
+	}
+
+	nonVoice, err := ownerScope.CreateChannel(ctx, "general", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, body = issueCallToken(t, ts.URL, nonVoice.PlaceID, w.humanB.ID, memberScope.Scope)
+	if response.StatusCode != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("non-voice channel token status=%d body=%v", response.StatusCode, body)
 	}
 
 	if err := w.store.RemoveWorkspaceMember(ctx, fixture.workspace.WorkspaceID, w.humanB); err != nil {
@@ -243,6 +260,89 @@ func TestCallTokenAdmissionTracksCurrentMessagingAuthority(t *testing.T) {
 	response, body = issueCallToken(t, ts.URL, channel.PlaceID, w.humanA.ID, current.Scope)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("current epoch status=%d body=%v", response.StatusCode, body)
+	}
+}
+
+type stubLiveKitRoomService struct {
+	rooms        []liveKitRoom
+	participants map[string][]liveKitParticipant
+	err          error
+}
+
+func (s stubLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom, error) {
+	return s.rooms, s.err
+}
+
+func (s stubLiveKitRoomService) ListParticipants(_ context.Context, room string) ([]liveKitParticipant, error) {
+	return s.participants[room], s.err
+}
+
+func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
+	service := &CallService{
+		Registry: NewCallRegistry(),
+		Now:      func() time.Time { return time.Unix(1_780_000_100, 0) },
+		RoomService: stubLiveKitRoomService{
+			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			participants: map[string][]liveKitParticipant{
+				"place-1": {{
+					Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001,
+					Tracks: []struct {
+						Source string `json:"source"`
+					}{{Source: "SCREEN_SHARE"}},
+				}},
+			},
+		},
+	}
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, ok := service.Registry.snapshot("place-1")
+	if !ok || !state.Active || state.StartedAt.Unix() != 1_780_000_000 || len(state.Participants) != 1 ||
+		!state.Participants[0].ScreenShare || state.Participants[0].JoinedAt.Unix() != 1_780_000_001 {
+		t.Fatalf("rebuilt state = %+v", state)
+	}
+}
+
+func TestCallRegistryRebuildUsesLiveKitTwirpRoomService(t *testing.T) {
+	now := time.Unix(1_780_000_000, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			t.Fatal("RoomService request was unsigned")
+		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		payload, err := verifyJWT(token, testLiveKitSecret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var claims livekitClaims
+		if err := json.Unmarshal(payload, &claims); err != nil {
+			t.Fatal(err)
+		}
+		switch r.URL.Path {
+		case "/twirp/livekit.RoomService/ListRooms":
+			if !claims.Video.RoomList || claims.Video.RoomAdmin || claims.Video.Room != "" {
+				t.Fatalf("ListRooms grant = %+v", claims.Video)
+			}
+			_, _ = w.Write([]byte(`{"rooms":[{"name":"place-1","creationTime":1780000000}]}`))
+		case "/twirp/livekit.RoomService/ListParticipants":
+			if claims.Video.RoomList || !claims.Video.RoomAdmin || claims.Video.Room != "place-1" {
+				t.Fatalf("ListParticipants grant = %+v", claims.Video)
+			}
+			_, _ = w.Write([]byte(`{"participants":[{"identity":"human:01900000-0000-7000-8000-0000000000aa","joinedAt":1780000001}]}`))
+		default:
+			t.Fatalf("unexpected RoomService path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	service := NewCallService(nil, LiveKitConfig{
+		URL: strings.Replace(server.URL, "http://", "ws://", 1), APIKey: testLiveKitKey, APISecret: testLiveKitSecret,
+	})
+	service.Now = func() time.Time { return now }
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state, ok := service.Registry.snapshot("place-1"); !ok || len(state.Participants) != 1 {
+		t.Fatalf("twirp rebuilt state = %+v", state)
 	}
 }
 
@@ -287,8 +387,16 @@ func TestCallStateReadFiltersInvisiblePlaces(t *testing.T) {
 	server := NewServer(w.store.core, stubSessions{})
 	server.AllowedOrigins = []string{testOrigin}
 	calls := NewCallService(server, testLiveKit())
-	calls.Registry.join(channel.PlaceID, w.humanA, time.Now())
-	calls.Registry.join(dm.PlaceID, w.agent, time.Now())
+	calls.RoomService = stubLiveKitRoomService{
+		rooms: []liveKitRoom{
+			{Name: channel.PlaceID, CreatedAt: time.Now().Unix()},
+			{Name: dm.PlaceID, CreatedAt: time.Now().Unix()},
+		},
+		participants: map[string][]liveKitParticipant{
+			channel.PlaceID: {{Identity: w.humanA.Key(), JoinedAt: time.Now().Unix()}},
+			dm.PlaceID:      {{Identity: w.agent.Key(), JoinedAt: time.Now().Unix()}},
+		},
+	}
 	visible, err := calls.visibleCalls(ctx, fixture.scope(t, w, w.humanB))
 	if err != nil {
 		t.Fatal(err)

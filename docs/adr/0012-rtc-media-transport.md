@@ -61,8 +61,8 @@
 - **通話状態（誰が今その place で通話しているか）の正本は LiveKit ではなく
   api のメモリに置き、WS イベント `call_state` で配る。** LiveKit の webhook
   （`participant_joined` / `participant_left` / `room_started` / `room_finished`）
-  を受けて更新する。通話状態は volatile である — プロセスが落ちれば webhook から
-  再構成され、クライアントは再接続時に `GET /messaging/calls` で現在値を読み直す。
+  を受けて更新する。プロセス再起動後の最初の `GET /messaging/calls` では LiveKit
+  RoomService の `ListRooms` / `ListParticipants` から投影を復元してから現在値を返す。
   テキストのように durable な seq を持たせない。
 - **identity は participant key（`human:<id>` / `personality_agent:<id>`）。**
   人間と人格 agent を通話でも同じ「参加者」として扱い、bot 用の別枠を作らない。

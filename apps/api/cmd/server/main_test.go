@@ -519,7 +519,7 @@ func TestBrowserAuthPartialConfigurationFailsClosed(t *testing.T) {
 }
 
 func TestLiveKitConfigIsOptionalButNeverPartial(t *testing.T) {
-	for _, name := range []string{"SUMI_LIVEKIT_URL", "SUMI_LIVEKIT_API_KEY", "SUMI_LIVEKIT_API_SECRET"} {
+	for _, name := range []string{"SUMI_LIVEKIT_URL", "SUMI_LIVEKIT_API_URL", "SUMI_LIVEKIT_API_KEY", "SUMI_LIVEKIT_API_SECRET"} {
 		t.Setenv(name, "")
 	}
 	if _, enabled, err := liveKitConfigFromEnv(); err != nil || enabled {
@@ -538,6 +538,11 @@ func TestLiveKitConfigIsOptionalButNeverPartial(t *testing.T) {
 	t.Setenv("SUMI_LIVEKIT_URL", "https://calls.sumi.test")
 	if _, _, err := liveKitConfigFromEnv(); err == nil {
 		t.Fatal("non-WebSocket signalling URL was accepted")
+	}
+	t.Setenv("SUMI_LIVEKIT_URL", "wss://calls.sumi.test")
+	t.Setenv("SUMI_LIVEKIT_API_URL", "ws://calls.sumi.test")
+	if _, _, err := liveKitConfigFromEnv(); err == nil {
+		t.Fatal("non-HTTP RoomService URL was accepted")
 	}
 }
 
