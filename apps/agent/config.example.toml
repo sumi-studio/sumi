@@ -31,20 +31,17 @@ preset = "opencode-go"
 # zai_tool_stream = false
 # supports_required_tool_choice = false
 
-# AutoReview never inherits [model]. Configure both blocks before production
-# startup. Each reviewer must support structured output; its provider/base
-# origin and credential source must differ from [model] and from the other
-# reviewer. account_scope is retained in the trust identity, but a label alone
-# is not proof that two credentials belong to separate provider accounts.
+# Both AutoReviews need structured-output-capable ModelSpecs. When a reviewer
+# block is absent, it inherits [model] completely. A partial block can select a
+# dedicated model id while inheriting the conversation preset and credential;
+# preset, endpoint, account scope, and credential may also be overridden.
 #
 # [reviewers.execution]
-# preset = "<structured-output-capable-preset>"
-# id = "<execution-reviewer-model>"
-# account_scope = "<declared-account-scope>"
-# api_key_env = "SUMI_EXECUTION_REVIEWER_API_KEY"
+# id = "<dedicated-execution-reviewer-model>"
+# preset = "<optional-structured-output-capable-preset>"
+# api_key_env = "<optional-reviewer-api-key-env>"
 #
 # [reviewers.escalation]
-# preset = "<different-structured-output-capable-preset>"
-# id = "<escalation-reviewer-model>"
-# account_scope = "<declared-account-scope>"
-# api_key_env = "SUMI_ESCALATION_REVIEWER_API_KEY"
+# id = "<dedicated-escalation-reviewer-model>"
+# preset = "<optional-structured-output-capable-preset>"
+# api_key_env = "<optional-reviewer-api-key-env>"

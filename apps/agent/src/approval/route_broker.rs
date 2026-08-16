@@ -34,14 +34,19 @@ use crate::{
             EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewRequest,
             EscalationReviewResult, EscalationReviewer, ExecutionReviewEvidence,
             ExecutionReviewOutcome, ExecutionReviewRequest, ExecutionReviewResult,
-            ExecutionReviewer, ReviewerPolicyEvidence, ReviewerTerminalClass, SealedReviewEvidence,
+            ExecutionReviewer, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3, REVIEW_TRUNCATION_MARKER,
+            ReviewerActionEvidence, ReviewerPolicyEvidence, ReviewerTerminalClass,
+            ReviewerTranscript, ReviewerTranscriptEntry,
         },
     },
-    provider::types::ToolInvocationRoute,
+    provider::types::{PublicMessage, ToolInvocationRoute, UserContent},
     store::Redactor,
     tools::{BoundToolInvocation, SealedBoundToolInvocation},
 };
 
+const MAX_CONTEXT_MESSAGES: usize = 12;
+const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
+const MAX_CONTEXT_TOTAL_CHARS: usize = 24_000;
 pub(crate) const MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS: usize = 3;
 
 pub(crate) const fn normal_reauthorization_exhausted(attempts: usize) -> bool {
@@ -327,6 +332,7 @@ impl RouteApprovalBroker {
         &self,
         sealed: SealedBoundToolInvocation,
         route: ToolInvocationRoute,
+        transcript: &[PublicMessage],
         scope: ApprovalPrincipalScope,
         run_id: &str,
         turn_id: &str,
@@ -381,11 +387,13 @@ impl RouteApprovalBroker {
                         snapshot,
                         decision: NormalPolicyDecision::Unmatched,
                     } => {
-                        let (sealed_evidence, policy) = match review_inputs(
+                        let (transcript, action, policy) = match review_inputs(
                             bound,
+                            transcript,
                             route,
                             PolicyDecisionRecord::Unmatched,
                             &snapshot,
+                            self.redactor.as_ref(),
                         ) {
                             Ok(inputs) => inputs,
                             Err(_) => {
@@ -408,7 +416,8 @@ impl RouteApprovalBroker {
                             .execution_reviewer
                             .review(
                                 ExecutionReviewRequest {
-                                    sealed_evidence,
+                                    transcript,
+                                    action,
                                     policy,
                                 },
                                 cancel,
@@ -476,11 +485,13 @@ impl RouteApprovalBroker {
                     }
                     ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
                 };
-                let (sealed_evidence, policy) = match review_inputs(
+                let (transcript, action, policy) = match review_inputs(
                     bound,
+                    transcript,
                     route,
                     PolicyDecisionRecord::ElevatedPreflight,
                     &snapshot,
+                    self.redactor.as_ref(),
                 ) {
                     Ok(inputs) => inputs,
                     Err(_) => {
@@ -503,7 +514,8 @@ impl RouteApprovalBroker {
                     .escalation_reviewer
                     .review(
                         EscalationReviewRequest {
-                            sealed_evidence,
+                            transcript,
+                            action,
                             policy,
                         },
                         cancel,
@@ -855,30 +867,132 @@ impl RouteApprovalBroker {
 
 fn review_inputs(
     bound: &BoundToolInvocation,
+    transcript: &[PublicMessage],
     route: ToolInvocationRoute,
     decision: PolicyDecisionRecord,
     snapshot: &PolicySnapshot,
-) -> Result<(SealedReviewEvidence, ReviewerPolicyEvidence)> {
+    redactor: &Redactor,
+) -> Result<(
+    ReviewerTranscript,
+    ReviewerActionEvidence,
+    ReviewerPolicyEvidence,
+)> {
+    let descriptor = redactor.redact_value(
+        &serde_json::to_value(&bound.descriptor).context("serialize reviewer action descriptor")?,
+    )?;
+    let review_projection =
+        redactor.redact_value(&Value::Object(bound.review_projection.as_object().clone()))?;
     Ok((
-        SealedReviewEvidence::new(
-            bound.schema_version,
-            route,
-            bound.provider_review_identity,
-            bound.provider_review_descriptor.clone(),
-            bound.provider_review_projection.clone(),
-        )?,
+        bounded_user_transcript(transcript, redactor),
+        ReviewerActionEvidence::new(route, descriptor, review_projection)?,
         ReviewerPolicyEvidence::from_snapshot(route, decision, snapshot),
     ))
+}
+
+fn bounded_user_transcript(
+    transcript: &[PublicMessage],
+    redactor: &Redactor,
+) -> ReviewerTranscript {
+    let users = transcript
+        .iter()
+        .filter_map(|message| {
+            let PublicMessage::User(message) = message else {
+                return None;
+            };
+            let text = message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    UserContent::Text { text } => Some(text.as_str()),
+                    UserContent::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then(|| redactor.redact_text(&text))
+        })
+        .collect::<Vec<_>>();
+    let mut selected = Vec::<(usize, ReviewerTranscriptEntry)>::new();
+    let mut remaining = MAX_CONTEXT_TOTAL_CHARS;
+
+    if let Some(first) = users.first() {
+        push_context_entry(&mut selected, &mut remaining, 0, first);
+    }
+    if users.len() > 1 {
+        push_context_entry(
+            &mut selected,
+            &mut remaining,
+            users.len() - 1,
+            users.last().expect("non-empty users"),
+        );
+    }
+    for index in (1..users.len().saturating_sub(1)).rev() {
+        if selected.len() >= MAX_CONTEXT_MESSAGES || remaining == 0 {
+            break;
+        }
+        push_context_entry(&mut selected, &mut remaining, index, &users[index]);
+    }
+    selected.sort_by_key(|(index, _)| *index);
+    let omitted_entries = users.len().saturating_sub(selected.len());
+    let mut entries = Vec::with_capacity(selected.len() + usize::from(omitted_entries != 0));
+    for (position, (index, entry)) in selected.into_iter().enumerate() {
+        if position == 1 && omitted_entries != 0 && index > 1 {
+            entries.push(ReviewerTranscriptEntry::Omission {
+                omitted_entries,
+                marker: REVIEW_TRUNCATION_MARKER,
+            });
+        }
+        entries.push(entry);
+    }
+    ReviewerTranscript {
+        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3,
+        entries,
+    }
+}
+
+fn push_context_entry(
+    selected: &mut Vec<(usize, ReviewerTranscriptEntry)>,
+    remaining: &mut usize,
+    index: usize,
+    text: &str,
+) {
+    let limit = (*remaining).min(MAX_CONTEXT_TEXT_CHARS);
+    if limit == 0 {
+        return;
+    }
+    if text.chars().count() > limit && limit < REVIEW_TRUNCATION_MARKER.chars().count() {
+        return;
+    }
+    let (text, truncated) = truncate_context_text(text, limit);
+    *remaining = (*remaining).saturating_sub(text.chars().count());
+    selected.push((index, ReviewerTranscriptEntry::User { text, truncated }));
+}
+
+fn truncate_context_text(value: &str, limit: usize) -> (String, bool) {
+    let characters = value.chars().count();
+    if characters <= limit {
+        return (value.to_owned(), false);
+    }
+    let marker_chars = REVIEW_TRUNCATION_MARKER.chars().count();
+    let prefix_chars = limit.saturating_sub(marker_chars);
+    let mut text = value.chars().take(prefix_chars).collect::<String>();
+    text.push_str(REVIEW_TRUNCATION_MARKER);
+    (text, true)
 }
 
 #[cfg(test)]
 pub(crate) fn provider_review_inputs_for_test(
     bound: &BoundToolInvocation,
+    transcript: &[PublicMessage],
     route: ToolInvocationRoute,
     decision: PolicyDecisionRecord,
     snapshot: &PolicySnapshot,
-) -> Result<(SealedReviewEvidence, ReviewerPolicyEvidence)> {
-    review_inputs(bound, route, decision, snapshot)
+    redactor: &Redactor,
+) -> Result<(
+    ReviewerTranscript,
+    ReviewerActionEvidence,
+    ReviewerPolicyEvidence,
+)> {
+    review_inputs(bound, transcript, route, decision, snapshot, redactor)
 }
 
 fn non_empty_reason(reason: String) -> String {
@@ -912,7 +1026,11 @@ mod tests {
                 ReviewerTransportError, ReviewerTrustSet,
             },
         },
-        provider::types::{ToolCall, ToolDefinition, ValidatedToolArguments},
+        provider::types::{
+            ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
+            StopReason, ToolCall, ToolDefinition, ToolResultMessage, Usage, UserMessage,
+            ValidatedToolArguments,
+        },
         tools::{
             AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
             BoundToolCtx, BoundToolExecutionOutcome, CapabilityClass, DescribeError, ResourceScope,
@@ -1105,6 +1223,46 @@ mod tests {
         }
     }
 
+    fn user_message(text: impl Into<String>) -> PublicMessage {
+        PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text { text: text.into() }],
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn assistant_message(text: impl Into<String>) -> PublicMessage {
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: text.into(),
+                wire_item_index: 0,
+            }],
+            model: "fixture".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "fixture".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "fixture".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn tool_result_message(text: impl Into<String>) -> PublicMessage {
+        PublicMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "prior-call".to_owned(),
+            tool_name: "prior-tool".to_owned(),
+            content: vec![UserContent::Text { text: text.into() }],
+            details: Value::Null,
+            is_error: false,
+            timestamp: Utc::now(),
+        })
+    }
+
     async fn sealed(
         capability: CapabilityClass,
         route: ToolInvocationRoute,
@@ -1168,6 +1326,7 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Read, ToolInvocationRoute::Normal).await,
                 ToolInvocationRoute::Normal,
+                &[],
                 scope(),
                 "run-1",
                 "turn-1",
@@ -1235,6 +1394,7 @@ mod tests {
                 .start_request(
                     sealed,
                     ToolInvocationRoute::Normal,
+                    &[],
                     scope(),
                     "run-1",
                     "turn-1",
@@ -1305,6 +1465,7 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Mutate, ToolInvocationRoute::Normal).await,
                 ToolInvocationRoute::Normal,
+                &[],
                 scope(),
                 "run-1",
                 "turn-1",
@@ -1377,6 +1538,7 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
                 ToolInvocationRoute::Elevated,
+                &[],
                 scope(),
                 "run-1",
                 "turn-1",
@@ -1453,6 +1615,7 @@ mod tests {
             .start_request(
                 sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
                 ToolInvocationRoute::Elevated,
+                &[],
                 scope(),
                 "run-1",
                 "turn-1",
@@ -1504,10 +1667,50 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bounded_transcript_keeps_first_and_latest_user_turns_and_marks_omissions() {
+        let mut transcript = (0..14)
+            .map(|index| user_message(format!("user-turn<{index}>")))
+            .collect::<Vec<_>>();
+        transcript.insert(4, assistant_message("assistant-text-must-not-appear"));
+        transcript.insert(9, tool_result_message("tool-result-must-not-appear"));
+        let bounded = bounded_user_transcript(&transcript, &Redactor::v1());
+        let encoded = serde_json::to_string(&bounded).expect("bounded transcript");
+
+        assert!(encoded.contains("user-turn<0>"));
+        assert!(encoded.contains("user-turn<13>"));
+        assert!(!encoded.contains("user-turn<1>"));
+        assert!(!encoded.contains("user-turn<2>"));
+        assert!(encoded.contains("omitted_entries"));
+        assert!(encoded.contains(REVIEW_TRUNCATION_MARKER));
+        assert!(!encoded.contains("assistant-text-must-not-appear"));
+        assert!(!encoded.contains("tool-result-must-not-appear"));
+    }
+
     #[tokio::test]
-    async fn route_reviewers_receive_no_raw_proposal_or_authenticated_principal_ids() {
+    async fn route_reviewers_receive_user_intent_and_exact_action_without_non_user_text() {
         const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        const USER_SENTINEL: &str = "user-intent-review-sentinel";
+        const IMAGE_SENTINEL: &str = "image-data-must-not-reach-reviewer";
+        const ASSISTANT_SENTINEL: &str = "assistant-text-must-not-reach-reviewer";
+        const TOOL_RESULT_SENTINEL: &str = "tool-result-must-not-reach-reviewer";
         assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
+        let transcript = vec![
+            PublicMessage::User(UserMessage {
+                content: vec![
+                    UserContent::Text {
+                        text: USER_SENTINEL.to_owned(),
+                    },
+                    UserContent::Image {
+                        data: IMAGE_SENTINEL.to_owned(),
+                        mime_type: "image/png".to_owned(),
+                    },
+                ],
+                timestamp: Utc::now(),
+            }),
+            assistant_message(ASSISTANT_SENTINEL),
+            tool_result_message(TOOL_RESULT_SENTINEL),
+        ];
 
         let (broker, execution, escalation) = broker(
             json!({"outcome":"allow","risk":"medium","rationale":"intrinsically safe"}),
@@ -1527,6 +1730,7 @@ mod tests {
                 )
                 .await,
                 ToolInvocationRoute::Normal,
+                &transcript,
                 scope(),
                 "run-1",
                 "turn-1",
@@ -1545,6 +1749,7 @@ mod tests {
                 )
                 .await,
                 ToolInvocationRoute::Elevated,
+                &transcript,
                 scope(),
                 "run-2",
                 "turn-2",
@@ -1566,14 +1771,12 @@ mod tests {
         let escalation_prompts = escalation.prompts.lock().expect("escalation prompts");
         for prompt in execution_prompts.iter().chain(escalation_prompts.iter()) {
             let encoded = serde_json::to_string(prompt).expect("encode reviewer prompt");
-            assert_eq!(encoded.matches(INVITE_CODE_SENTINEL).count(), 0);
-            for forbidden in [
-                "bounded_context",
-                "context_version",
-                "tenant-1",
-                "agent-1",
-                "human-1",
-            ] {
+            assert!(encoded.contains(INVITE_CODE_SENTINEL));
+            assert!(encoded.contains(USER_SENTINEL));
+            assert!(!encoded.contains(IMAGE_SENTINEL));
+            assert!(!encoded.contains(ASSISTANT_SENTINEL));
+            assert!(!encoded.contains(TOOL_RESULT_SENTINEL));
+            for forbidden in ["context_version", "tenant-1", "agent-1", "human-1"] {
                 assert!(
                     !encoded.contains(forbidden),
                     "leaked reviewer field: {forbidden}"

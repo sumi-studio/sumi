@@ -36,9 +36,9 @@ use crate::{
         route_broker::RouteApprovalBroker,
         route_policy::RoutePolicy,
         route_reviewer::{
-            EscalationReviewer, ExecutionReviewer, IndependentReviewerModels,
-            ProviderEscalationReviewerTransport, ProviderExecutionReviewerTransport,
-            ReviewerBudgetV1, ReviewerModelSpec as RouteReviewerModelSpec,
+            EscalationReviewer, ExecutionReviewer, ProviderEscalationReviewerTransport,
+            ProviderExecutionReviewerTransport, ReviewerBudgetV1,
+            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels,
         },
     },
     config::Config,
@@ -1011,6 +1011,21 @@ async fn run_after_not_ready(
         let escalation_reviewer_spec = config
             .escalation_reviewer_model_spec()
             .context("resolve Escalation reviewer provider")?;
+        for (reviewer, spec) in [
+            ("Execution", &execution_reviewer_spec),
+            ("Escalation", &escalation_reviewer_spec),
+        ] {
+            if spec.provider_instance_id() == model_spec.provider_instance_id()
+                && spec.account_scope == model_spec.account_scope
+                && spec.id == model_spec.id
+            {
+                tracing::info!(
+                    reviewer,
+                    model_id = %spec.id,
+                    "approval reviewer shares the conversation model"
+                );
+            }
+        }
         for (label, spec) in [
             ("Execution reviewer", &execution_reviewer_spec),
             ("Escalation reviewer", &escalation_reviewer_spec),
@@ -1020,12 +1035,9 @@ async fn run_after_not_ready(
             validate_provider_credential(&spec.api_key_env)
                 .with_context(|| format!("validate {label} provider credential"))?;
         }
-        let reviewer_models = IndependentReviewerModels::new(
-            &model_spec,
-            execution_reviewer_spec,
-            escalation_reviewer_spec,
-        )
-        .context("validate independent fail-closed reviewer models")?;
+        let reviewer_models =
+            ReviewerModels::new(execution_reviewer_spec, escalation_reviewer_spec)
+                .context("validate fail-closed reviewer models")?;
         let (execution_reviewer_spec, escalation_reviewer_spec, reviewer_trust) =
             reviewer_models.into_parts();
 

@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opaque_cursor_stays_exact_for_human_and_execution_but_never_reaches_reviewer_wire() {
+    async fn opaque_cursor_stays_exact_for_human_execution_and_reviewer() {
         let api = Arc::new(FakeWorkspaceApi {
             calls: AtomicUsize::new(0),
             cursors: Mutex::new(Vec::new()),
@@ -577,15 +577,18 @@ mod tests {
             ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
             other => panic!("Workspace cursor expected Elevated/Ready, got {other:?}"),
         };
-        let (sealed_evidence, policy_evidence) = provider_review_inputs_for_test(
+        let (transcript, action, policy_evidence) = provider_review_inputs_for_test(
             bound,
+            &[],
             ToolInvocationRoute::Elevated,
             PolicyDecisionRecord::ElevatedPreflight,
             &snapshot,
+            &Redactor::v1(),
         )
         .expect("Workspace cursor reviewer inputs");
         let request = EscalationReviewRequest {
-            sealed_evidence,
+            transcript,
+            action,
             policy: policy_evidence,
         };
         let local_digests = [
@@ -598,10 +601,9 @@ mod tests {
         ];
         for (provider, body) in escalation_provider_wire_bodies_for_test(request) {
             let encoded = body.to_string();
-            assert_eq!(
-                encoded.matches(CURSOR).count(),
-                0,
-                "Workspace cursor leaked through {provider}"
+            assert!(
+                encoded.contains(CURSOR),
+                "Workspace cursor missing from {provider} reviewer evidence"
             );
             for digest in &local_digests {
                 assert_eq!(
