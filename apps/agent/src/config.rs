@@ -171,11 +171,18 @@ impl Config {
                 .with_context(|| format!("unknown model preset {preset}"))?,
             None => conversation.clone(),
         };
-        if reviewer.id.is_none() {
-            spec.set_model_id(&conversation.id);
-        }
-        if reviewer.api_key_env.is_none() {
-            spec.api_key_env.clone_from(&conversation.api_key_env);
+        // A reviewer that inherits the conversation preset also inherits its
+        // model id and credential unless overridden. A reviewer that names a
+        // different preset keeps that preset's own default model id and key —
+        // sending the conversation model's id to another provider's endpoint
+        // would fail every review closed.
+        if reviewer.preset.is_none() {
+            if reviewer.id.is_none() {
+                spec.set_model_id(&conversation.id);
+            }
+            if reviewer.api_key_env.is_none() {
+                spec.api_key_env.clone_from(&conversation.api_key_env);
+            }
         }
         apply_model_config(&mut spec, reviewer)?;
         validate_resolved_model_spec(spec, label)
@@ -1317,6 +1324,52 @@ default_output_tokens = 16000
         assert_eq!(escalation, conversation);
         crate::approval::route_reviewer::ReviewerModels::new(execution, escalation)
             .expect("shared structured-output provider is startup-ready");
+    }
+
+    #[test]
+    fn reviewer_with_its_own_preset_keeps_that_presets_model_id_and_key() {
+        let config = Config::resolve(
+            FileConfig {
+                model: ModelConfig {
+                    preset: Some("kimi-k3".to_owned()),
+                    api_key_env: Some("SUMI_ONE_PROVIDER_KEY".to_owned()),
+                    ..ModelConfig::default()
+                },
+                reviewers: ReviewerModelsConfig {
+                    execution: Some(ModelConfig {
+                        preset: Some("glm-5.2".to_owned()),
+                        ..ModelConfig::default()
+                    }),
+                    escalation: Some(ModelConfig {
+                        id: Some("dedicated-review-model".to_owned()),
+                        ..ModelConfig::default()
+                    }),
+                },
+                ..FileConfig::default()
+            },
+            identity_overrides(),
+        )
+        .expect("mixed reviewer config");
+        let conversation = config.model_spec().expect("conversation model");
+        let glm = ModelSpec::preset("glm-5.2").expect("glm preset");
+
+        // Different preset, no id: keep the preset's own model id and key.
+        let execution = config
+            .execution_reviewer_model_spec()
+            .expect("Execution reviewer on its own preset");
+        assert_eq!(execution.id, glm.id);
+        assert_eq!(execution.base_url, glm.base_url);
+        assert_eq!(execution.api_key_env, glm.api_key_env);
+        assert_ne!(execution.id, conversation.id);
+
+        // Same preset (inherited), explicit id: conversation endpoint + key,
+        // dedicated model id.
+        let escalation = config
+            .escalation_reviewer_model_spec()
+            .expect("Escalation reviewer inheriting the conversation preset");
+        assert_eq!(escalation.id, "dedicated-review-model");
+        assert_eq!(escalation.base_url, conversation.base_url);
+        assert_eq!(escalation.api_key_env, conversation.api_key_env);
     }
 
     #[test]
