@@ -171,12 +171,21 @@ impl Config {
                 .with_context(|| format!("unknown model preset {preset}"))?,
             None => conversation.clone(),
         };
-        // A reviewer that inherits the conversation preset also inherits its
-        // model id and credential unless overridden. A reviewer that names a
-        // different preset keeps that preset's own default model id and key —
+        // A reviewer on the conversation's preset (omitted, or the same preset
+        // named explicitly — the compose launcher does that) inherits the
+        // conversation's model id and credential unless overridden, including
+        // any custom id/key the conversation set. A reviewer that names a
+        // *different* preset keeps that preset's own default model id and key —
         // sending the conversation model's id to another provider's endpoint
         // would fail every review closed.
-        if reviewer.preset.is_none() {
+        let same_preset = match (reviewer.preset.as_deref(), self.model.preset.as_deref()) {
+            (None, _) => true,
+            (Some(reviewer_preset), Some(conversation_preset)) => {
+                reviewer_preset == conversation_preset
+            }
+            (Some(_), None) => false,
+        };
+        if same_preset {
             if reviewer.id.is_none() {
                 spec.set_model_id(&conversation.id);
             }
@@ -1370,6 +1379,40 @@ default_output_tokens = 16000
         assert_eq!(escalation.id, "dedicated-review-model");
         assert_eq!(escalation.base_url, conversation.base_url);
         assert_eq!(escalation.api_key_env, conversation.api_key_env);
+    }
+
+    #[test]
+    fn reviewer_naming_the_conversation_preset_inherits_its_custom_id_and_key() {
+        // The compose launcher restates the conversation preset for both
+        // reviewers; a conversation with a custom model id and key env must not
+        // lose them for such a reviewer.
+        let config = Config::resolve(
+            FileConfig {
+                model: ModelConfig {
+                    preset: Some("kimi-k3".to_owned()),
+                    id: Some("custom-conversation-model".to_owned()),
+                    api_key_env: Some("SUMI_CUSTOM_KEY".to_owned()),
+                    ..ModelConfig::default()
+                },
+                reviewers: ReviewerModelsConfig {
+                    execution: Some(ModelConfig {
+                        preset: Some("kimi-k3".to_owned()),
+                        ..ModelConfig::default()
+                    }),
+                    escalation: None,
+                },
+                ..FileConfig::default()
+            },
+            identity_overrides(),
+        )
+        .expect("same-preset reviewer config");
+        let conversation = config.model_spec().expect("conversation model");
+        let execution = config
+            .execution_reviewer_model_spec()
+            .expect("Execution reviewer restating the conversation preset");
+        assert_eq!(execution.id, "custom-conversation-model");
+        assert_eq!(execution.api_key_env, "SUMI_CUSTOM_KEY");
+        assert_eq!(execution, conversation);
     }
 
     #[test]
