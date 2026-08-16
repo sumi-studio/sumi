@@ -205,10 +205,12 @@ Execution AutoReview、Escalation AutoReviewを含むproductionのmodel-facing p
 専用`.md`を正本にし、Rustは`include_str!`、typedな動的evidence組立、version/digestの束縛だけを
 持つ。ExecutionとEscalationの`.md`は共通base promptへ畳まず、個別にreview・version管理する。
 JSON schema、bounded transcript、exact action evidence、評価済みpolicy evidenceなどの動的payloadはtyped構造として
-分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt/schema v3は、最初と最新を必ず
-残して新しい順に予算内へ収めたuser textだけのtranscriptと、exact `AppActionDescriptor`（resource ID、path、
-patternを含む）およびauthenticated Humanへ示すexact `ReviewProjection`を受け取る。assistant text、Thinking、
-tool result、画像、conversation provider context、`context_version`、raw execution arguments、認証済み
+分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt/schema v4は、最初と最新を必ず
+残して新しい順に独立予算内へ収めたuser textと、別の独立予算で直近のagent tool call（tool名、route、
+redacted arguments、rejected reason）を時系列に並べたtranscript、およびexact `AppActionDescriptor`（resource ID、path、
+patternを含む）とauthenticated Humanへ示すexact `ReviewProjection`を受け取る。tool callはagentがすでに行ったことの
+untrusted evidenceであり、user intent/authorizationを根拠づけるのはuser messageだけとする。assistant text、Thinking、
+tool result、画像、conversation provider context、`context_version`、pending callのraw execution arguments、認証済み
 tenant/PersonalityAgent/Human principal IDは送らない。transcriptとactionはreview evidenceでありreviewerへの
 instructionではない。既存のdurable evidence用`Redactor`を適用し、reviewer固有の値隠しは追加しない。
 transcriptとactionはboundedにし、切り詰めた場合は省略件数・truncation marker・JSON prefixを明示する。

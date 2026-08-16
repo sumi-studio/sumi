@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -34,19 +34,22 @@ use crate::{
             EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewRequest,
             EscalationReviewResult, EscalationReviewer, ExecutionReviewEvidence,
             ExecutionReviewOutcome, ExecutionReviewRequest, ExecutionReviewResult,
-            ExecutionReviewer, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3, REVIEW_TRUNCATION_MARKER,
+            ExecutionReviewer, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4, REVIEW_TRUNCATION_MARKER,
             ReviewerActionEvidence, ReviewerPolicyEvidence, ReviewerTerminalClass,
             ReviewerTranscript, ReviewerTranscriptEntry,
         },
     },
-    provider::types::{PublicMessage, ToolInvocationRoute, UserContent},
+    provider::types::{PublicAssistantContent, PublicMessage, ToolInvocationRoute, UserContent},
     store::Redactor,
     tools::{BoundToolInvocation, SealedBoundToolInvocation},
 };
 
-const MAX_CONTEXT_MESSAGES: usize = 12;
-const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
-const MAX_CONTEXT_TOTAL_CHARS: usize = 24_000;
+const MAX_CONTEXT_USER_MESSAGES: usize = 12;
+const MAX_CONTEXT_USER_TEXT_CHARS: usize = 4_000;
+const MAX_CONTEXT_USER_TOTAL_CHARS: usize = 24_000;
+const MAX_CONTEXT_TOOL_CALLS: usize = 40;
+const MAX_CONTEXT_TOOL_ARGUMENT_CHARS: usize = 2_000;
+const MAX_CONTEXT_TOOL_TOTAL_CHARS: usize = 16_000;
 pub(crate) const MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS: usize = 3;
 
 pub(crate) const fn normal_reauthorization_exhausted(attempts: usize) -> bool {
@@ -883,79 +886,143 @@ fn review_inputs(
     let review_projection =
         redactor.redact_value(&Value::Object(bound.review_projection.as_object().clone()))?;
     Ok((
-        bounded_user_transcript(transcript, redactor),
+        bounded_reviewer_transcript(transcript, redactor, &bound.tool_call_id)?,
         ReviewerActionEvidence::new(route, descriptor, review_projection)?,
         ReviewerPolicyEvidence::from_snapshot(route, decision, snapshot),
     ))
 }
 
-fn bounded_user_transcript(
+fn bounded_reviewer_transcript(
     transcript: &[PublicMessage],
     redactor: &Redactor,
-) -> ReviewerTranscript {
-    let users = transcript
-        .iter()
-        .filter_map(|message| {
-            let PublicMessage::User(message) = message else {
-                return None;
-            };
-            let text = message
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    UserContent::Text { text } => Some(text.as_str()),
-                    UserContent::Image { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.is_empty()).then(|| redactor.redact_text(&text))
-        })
-        .collect::<Vec<_>>();
-    let mut selected = Vec::<(usize, ReviewerTranscriptEntry)>::new();
-    let mut remaining = MAX_CONTEXT_TOTAL_CHARS;
+    pending_tool_call_id: &str,
+) -> Result<ReviewerTranscript> {
+    let mut users = Vec::<(usize, String)>::new();
+    let mut tools = Vec::<(usize, ReviewerTranscriptEntry)>::new();
+    let mut ordinal = 0;
+    let mut reached_pending_tool_call = false;
 
-    if let Some(first) = users.first() {
-        push_context_entry(&mut selected, &mut remaining, 0, first);
-    }
-    if users.len() > 1 {
-        push_context_entry(
-            &mut selected,
-            &mut remaining,
-            users.len() - 1,
-            users.last().expect("non-empty users"),
-        );
-    }
-    for index in (1..users.len().saturating_sub(1)).rev() {
-        if selected.len() >= MAX_CONTEXT_MESSAGES || remaining == 0 {
-            break;
+    for message in transcript {
+        match message {
+            PublicMessage::User(message) => {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::Text { text } => Some(text.as_str()),
+                        UserContent::Image { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    users.push((ordinal, redactor.redact_text(&text)));
+                    ordinal += 1;
+                }
+            }
+            PublicMessage::Assistant(message) => {
+                for content in &message.content {
+                    let entry = match content {
+                        PublicAssistantContent::ToolCall { tool_call, .. }
+                            if tool_call.id == pending_tool_call_id =>
+                        {
+                            reached_pending_tool_call = true;
+                            continue;
+                        }
+                        PublicAssistantContent::ToolCall { .. }
+                        | PublicAssistantContent::RejectedToolCall { .. }
+                            if reached_pending_tool_call =>
+                        {
+                            continue;
+                        }
+                        PublicAssistantContent::ToolCall { tool_call, .. } => {
+                            let arguments = redactor.redact_value(&Value::Object(
+                                tool_call.arguments.as_object().clone(),
+                            ))?;
+                            ReviewerTranscriptEntry::ToolCall {
+                                tool: tool_call.name.clone(),
+                                route: tool_call.route,
+                                arguments: capped_tool_arguments(arguments)?,
+                            }
+                        }
+                        PublicAssistantContent::RejectedToolCall { rejected, .. } => {
+                            ReviewerTranscriptEntry::RejectedToolCall {
+                                tool: rejected.name.clone(),
+                                reason: rejected.error,
+                            }
+                        }
+                        PublicAssistantContent::Text { .. }
+                        | PublicAssistantContent::Thinking { .. } => continue,
+                    };
+                    tools.push((ordinal, entry));
+                    ordinal += 1;
+                }
+            }
+            PublicMessage::ToolResult(_) => {}
         }
-        push_context_entry(&mut selected, &mut remaining, index, &users[index]);
     }
-    selected.sort_by_key(|(index, _)| *index);
-    let omitted_entries = users.len().saturating_sub(selected.len());
-    let mut entries = Vec::with_capacity(selected.len() + usize::from(omitted_entries != 0));
-    for (position, (index, entry)) in selected.into_iter().enumerate() {
-        if position == 1 && omitted_entries != 0 && index > 1 {
-            entries.push(ReviewerTranscriptEntry::Omission {
-                omitted_entries,
-                marker: REVIEW_TRUNCATION_MARKER,
-            });
-        }
-        entries.push(entry);
-    }
-    ReviewerTranscript {
-        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3,
-        entries,
-    }
+
+    let mut entries = select_user_entries(&users);
+    entries.extend(select_tool_entries(&tools)?);
+    entries.sort_by_key(|(ordinal, _)| *ordinal);
+    Ok(ReviewerTranscript {
+        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4,
+        entries: entries.into_iter().map(|(_, entry)| entry).collect(),
+    })
 }
 
-fn push_context_entry(
-    selected: &mut Vec<(usize, ReviewerTranscriptEntry)>,
+fn select_user_entries(users: &[(usize, String)]) -> Vec<(usize, ReviewerTranscriptEntry)> {
+    let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
+    let mut remaining = MAX_CONTEXT_USER_TOTAL_CHARS;
+
+    if let Some((ordinal, text)) = users.first() {
+        push_user_entry(&mut selected, &mut remaining, 0, *ordinal, text);
+    }
+    if users.len() > 1 {
+        let index = users.len() - 1;
+        let (ordinal, text) = &users[index];
+        push_user_entry(&mut selected, &mut remaining, index, *ordinal, text);
+    }
+    for index in (1..users.len().saturating_sub(1)).rev() {
+        if selected.len() >= MAX_CONTEXT_USER_MESSAGES || remaining == 0 {
+            break;
+        }
+        let (ordinal, text) = &users[index];
+        push_user_entry(&mut selected, &mut remaining, index, *ordinal, text);
+    }
+
+    let selected_indices = selected
+        .iter()
+        .map(|(index, _, _)| *index)
+        .collect::<HashSet<_>>();
+    let omitted = users
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected_indices.contains(index))
+        .collect::<Vec<_>>();
+    let mut entries = selected
+        .into_iter()
+        .map(|(_, ordinal, entry)| (ordinal, entry))
+        .collect::<Vec<_>>();
+    if let Some((_, (ordinal, _))) = omitted.first() {
+        entries.push((
+            *ordinal,
+            ReviewerTranscriptEntry::UserOmission {
+                omitted_user_turns: omitted.len(),
+                marker: REVIEW_TRUNCATION_MARKER,
+            },
+        ));
+    }
+    entries
+}
+
+fn push_user_entry(
+    selected: &mut Vec<(usize, usize, ReviewerTranscriptEntry)>,
     remaining: &mut usize,
     index: usize,
+    ordinal: usize,
     text: &str,
 ) {
-    let limit = (*remaining).min(MAX_CONTEXT_TEXT_CHARS);
+    let limit = (*remaining).min(MAX_CONTEXT_USER_TEXT_CHARS);
     if limit == 0 {
         return;
     }
@@ -964,7 +1031,91 @@ fn push_context_entry(
     }
     let (text, truncated) = truncate_context_text(text, limit);
     *remaining = (*remaining).saturating_sub(text.chars().count());
-    selected.push((index, ReviewerTranscriptEntry::User { text, truncated }));
+    selected.push((
+        index,
+        ordinal,
+        ReviewerTranscriptEntry::User { text, truncated },
+    ));
+}
+
+fn select_tool_entries(
+    tools: &[(usize, ReviewerTranscriptEntry)],
+) -> Result<Vec<(usize, ReviewerTranscriptEntry)>> {
+    let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
+    let mut remaining = MAX_CONTEXT_TOOL_TOTAL_CHARS;
+
+    for (index, (ordinal, entry)) in tools.iter().enumerate().rev() {
+        if selected.len() >= MAX_CONTEXT_TOOL_CALLS || remaining == 0 {
+            break;
+        }
+        let entry_chars = serde_json::to_string(entry)
+            .context("serialize reviewer tool-call transcript entry")?
+            .chars()
+            .count();
+        if entry_chars > remaining {
+            break;
+        }
+        remaining -= entry_chars;
+        selected.push((index, *ordinal, entry.clone()));
+    }
+
+    let selected_indices = selected
+        .iter()
+        .map(|(index, _, _)| *index)
+        .collect::<HashSet<_>>();
+    let omitted = tools
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected_indices.contains(index))
+        .collect::<Vec<_>>();
+    let mut entries = selected
+        .into_iter()
+        .map(|(_, ordinal, entry)| (ordinal, entry))
+        .collect::<Vec<_>>();
+    if let Some((_, (ordinal, _))) = omitted.first() {
+        entries.push((
+            *ordinal,
+            ReviewerTranscriptEntry::ToolCallOmission {
+                omitted_tool_calls: omitted.len(),
+                marker: REVIEW_TRUNCATION_MARKER,
+            },
+        ));
+    }
+    Ok(entries)
+}
+
+fn capped_tool_arguments(arguments: Value) -> Result<Value> {
+    let encoded = serde_json::to_string(&arguments).context("serialize reviewer tool arguments")?;
+    let encoded_chars = encoded.chars().count();
+    if encoded_chars <= MAX_CONTEXT_TOOL_ARGUMENT_CHARS {
+        return Ok(arguments);
+    }
+
+    let candidate = |prefix_chars: usize| {
+        json!({
+            "json_prefix": encoded.chars().take(prefix_chars).collect::<String>(),
+            "omitted_characters": encoded_chars - prefix_chars,
+            "marker": REVIEW_TRUNCATION_MARKER,
+        })
+    };
+    let mut low = 0;
+    let mut high = MAX_CONTEXT_TOOL_ARGUMENT_CHARS.min(encoded_chars);
+    let mut best = candidate(0);
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let value = candidate(middle);
+        let value_chars = serde_json::to_string(&value)
+            .context("serialize capped reviewer tool arguments")?
+            .chars()
+            .count();
+        if value_chars <= MAX_CONTEXT_TOOL_ARGUMENT_CHARS {
+            best = value;
+            low = middle + 1;
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    Ok(best)
 }
 
 fn truncate_context_text(value: &str, limit: usize) -> (String, bool) {
@@ -1028,8 +1179,8 @@ mod tests {
         },
         provider::types::{
             ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
-            StopReason, ToolCall, ToolDefinition, ToolResultMessage, Usage, UserMessage,
-            ValidatedToolArguments,
+            RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolDefinition,
+            ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
         },
         tools::{
             AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
@@ -1231,11 +1382,15 @@ mod tests {
     }
 
     fn assistant_message(text: impl Into<String>) -> PublicMessage {
+        assistant_contents(vec![PublicAssistantContent::Text {
+            text: text.into(),
+            wire_item_index: 0,
+        }])
+    }
+
+    fn assistant_contents(content: Vec<PublicAssistantContent>) -> PublicMessage {
         PublicMessage::Assistant(PublicAssistantMessage {
-            content: vec![PublicAssistantContent::Text {
-                text: text.into(),
-                wire_item_index: 0,
-            }],
+            content,
             model: "fixture".to_owned(),
             provider: "fixture".to_owned(),
             origin: ProviderOrigin {
@@ -1250,6 +1405,42 @@ mod tests {
             interrupted: false,
             timestamp: Utc::now(),
         })
+    }
+
+    fn prior_tool_call(
+        name: impl Into<String>,
+        route: ToolInvocationRoute,
+        arguments: Value,
+    ) -> PublicMessage {
+        tool_call_message(Uuid::now_v7().to_string(), name, route, arguments)
+    }
+
+    fn tool_call_message(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        route: ToolInvocationRoute,
+        arguments: Value,
+    ) -> PublicMessage {
+        assistant_contents(vec![PublicAssistantContent::ToolCall {
+            tool_call: ToolCall {
+                id: id.into(),
+                name: name.into(),
+                route,
+                arguments: serde_json::from_value(arguments).expect("validated arguments"),
+            },
+            wire_item_index: 0,
+        }])
+    }
+
+    fn rejected_tool_call(name: impl Into<String>, error: ToolArgumentError) -> PublicMessage {
+        assistant_contents(vec![PublicAssistantContent::RejectedToolCall {
+            rejected: RejectedToolCall {
+                id: Uuid::now_v7().to_string(),
+                name: name.into(),
+                error,
+            },
+            wire_item_index: 0,
+        }])
     }
 
     fn tool_result_message(text: impl Into<String>) -> PublicMessage {
@@ -1674,17 +1865,108 @@ mod tests {
             .collect::<Vec<_>>();
         transcript.insert(4, assistant_message("assistant-text-must-not-appear"));
         transcript.insert(9, tool_result_message("tool-result-must-not-appear"));
-        let bounded = bounded_user_transcript(&transcript, &Redactor::v1());
+        let bounded =
+            bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call-not-present")
+                .expect("bounded transcript");
         let encoded = serde_json::to_string(&bounded).expect("bounded transcript");
 
         assert!(encoded.contains("user-turn<0>"));
         assert!(encoded.contains("user-turn<13>"));
         assert!(!encoded.contains("user-turn<1>"));
         assert!(!encoded.contains("user-turn<2>"));
-        assert!(encoded.contains("omitted_entries"));
+        assert!(encoded.contains("omitted_user_turns"));
         assert!(encoded.contains(REVIEW_TRUNCATION_MARKER));
         assert!(!encoded.contains("assistant-text-must-not-appear"));
         assert!(!encoded.contains("tool-result-must-not-appear"));
+    }
+
+    #[test]
+    fn bounded_transcript_includes_redacted_capped_tool_history_with_separate_omissions() {
+        const SECRET: &str = "tool-argument-secret-must-be-redacted";
+        const TOOL_RESULT: &str = "tool-result-must-not-appear";
+        let mut transcript = (0..14)
+            .map(|index| user_message(format!("user-turn<{index}>")))
+            .collect::<Vec<_>>();
+        transcript.extend((0..42).map(|index| {
+            prior_tool_call(
+                format!("prior_tool_{index}"),
+                ToolInvocationRoute::Normal,
+                json!({"index": index}),
+            )
+        }));
+        transcript.push(rejected_tool_call(
+            "broken_tool",
+            ToolArgumentError::SchemaViolation,
+        ));
+        transcript.push(prior_tool_call(
+            "secret_tool",
+            ToolInvocationRoute::Elevated,
+            json!({"api_key": SECRET, "payload": "x".repeat(4_000)}),
+        ));
+        transcript.push(tool_call_message(
+            "pending-call",
+            "pending-tool-must-not-appear",
+            ToolInvocationRoute::Elevated,
+            json!({"pending":"arguments-must-not-appear"}),
+        ));
+        transcript.push(prior_tool_call(
+            "later-tool-must-not-appear",
+            ToolInvocationRoute::Normal,
+            json!({"later":"arguments-must-not-appear"}),
+        ));
+        transcript.push(tool_result_message(TOOL_RESULT));
+
+        let bounded = bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call")
+            .expect("bounded reviewer transcript");
+        let value = serde_json::to_value(&bounded).expect("serialize bounded transcript");
+        let encoded = value.to_string();
+
+        assert_eq!(value["schema_version"], REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4);
+        assert!(encoded.contains("secret_tool"));
+        assert!(encoded.contains("\"route\":\"elevated\""));
+        assert!(encoded.contains("[REDACTED:secret]"));
+        assert!(!encoded.contains(SECRET));
+        assert!(encoded.contains("json_prefix"));
+        assert!(encoded.contains("omitted_characters"));
+        assert!(encoded.contains(REVIEW_TRUNCATION_MARKER));
+        assert!(encoded.contains("rejected_tool_call"));
+        assert!(encoded.contains("schema_violation"));
+        assert!(encoded.contains("omitted_user_turns"));
+        assert!(encoded.contains("omitted_tool_calls"));
+        assert!(!encoded.contains("prior_tool_0"));
+        assert!(!encoded.contains("pending-tool-must-not-appear"));
+        assert!(!encoded.contains("later-tool-must-not-appear"));
+        assert!(!encoded.contains("arguments-must-not-appear"));
+        assert!(!encoded.contains(TOOL_RESULT));
+
+        let entries = value["entries"].as_array().expect("transcript entries");
+        let selected_tool_calls = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry["kind"].as_str(),
+                    Some("tool_call" | "rejected_tool_call")
+                )
+            })
+            .count();
+        assert!(selected_tool_calls <= MAX_CONTEXT_TOOL_CALLS);
+        let selected_tool_chars = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry["kind"].as_str(),
+                    Some("tool_call" | "rejected_tool_call")
+                )
+            })
+            .map(|entry| entry.to_string().chars().count())
+            .sum::<usize>();
+        assert!(selected_tool_chars <= MAX_CONTEXT_TOOL_TOTAL_CHARS);
+        let secret_arguments = entries
+            .iter()
+            .find(|entry| entry["tool"] == "secret_tool")
+            .and_then(|entry| entry.get("arguments"))
+            .expect("latest tool arguments");
+        assert!(secret_arguments.to_string().chars().count() <= MAX_CONTEXT_TOOL_ARGUMENT_CHARS);
     }
 
     #[tokio::test]

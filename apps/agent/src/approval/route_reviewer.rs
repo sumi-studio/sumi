@@ -2,8 +2,9 @@
 //!
 //! The two reviewers deliberately have separate request, prompt, transport,
 //! decision, evidence, and result types. Both receive bounded user-authored
-//! transcript evidence and the exact app-owned action projection, while tool
-//! results and assistant-authored text remain outside the review request.
+//! transcript evidence, the agent's earlier tool-call history, and the exact
+//! app-owned action projection, while tool results and assistant-authored text
+//! remain outside the review request.
 
 use std::{sync::Arc, time::Duration};
 
@@ -26,7 +27,7 @@ use crate::{
         retry, stream,
         types::{
             AssistantContent, ContextMessage, Message, PromptContext, ProviderEvent, StopReason,
-            ToolInvocationRoute, UserContent, UserMessage,
+            ToolArgumentError, ToolInvocationRoute, UserContent, UserMessage,
         },
     },
 };
@@ -37,16 +38,16 @@ const MAX_REVIEW_REQUEST_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_REVIEW_ACTION_CHARS: usize = 64_000;
 const REVIEW_ACTION_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-action/v3\0";
 const REVIEW_ACTION_SCHEMA_VERSION_V3: u32 = 3;
-pub(crate) const REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3: u32 = 3;
+pub(crate) const REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4: u32 = 4;
 pub(crate) const REVIEW_TRUNCATION_MARKER: &str = "[... truncated ...]";
 
 pub const REVIEWER_BUDGET_VERSION_V1: &str = "reviewer-budget/v1";
-pub const EXECUTION_REVIEWER_VERSION_V3: &str = "execution-reviewer/v3";
-pub const EXECUTION_PROMPT_VERSION_V3: &str = "execution-review-prompt/v3";
-pub const EXECUTION_SCHEMA_VERSION_V3: &str = "execution-review-schema/v3";
-pub const ESCALATION_REVIEWER_VERSION_V3: &str = "escalation-reviewer/v3";
-pub const ESCALATION_PROMPT_VERSION_V3: &str = "escalation-review-prompt/v3";
-pub const ESCALATION_SCHEMA_VERSION_V3: &str = "escalation-review-schema/v3";
+pub const EXECUTION_REVIEWER_VERSION_V4: &str = "execution-reviewer/v4";
+pub const EXECUTION_PROMPT_VERSION_V4: &str = "execution-review-prompt/v4";
+pub const EXECUTION_SCHEMA_VERSION_V4: &str = "execution-review-schema/v4";
+pub const ESCALATION_REVIEWER_VERSION_V4: &str = "escalation-reviewer/v4";
+pub const ESCALATION_PROMPT_VERSION_V4: &str = "escalation-review-prompt/v4";
+pub const ESCALATION_SCHEMA_VERSION_V4: &str = "escalation-review-schema/v4";
 
 const EXECUTION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/execution-review.md");
 const ESCALATION_SYSTEM_PROMPT: &str = include_str!("../../prompts/approval/escalation-review.md");
@@ -344,8 +345,21 @@ pub enum ReviewerTranscriptEntry {
         text: String,
         truncated: bool,
     },
-    Omission {
-        omitted_entries: usize,
+    ToolCall {
+        tool: String,
+        route: ToolInvocationRoute,
+        arguments: Value,
+    },
+    RejectedToolCall {
+        tool: String,
+        reason: ToolArgumentError,
+    },
+    UserOmission {
+        omitted_user_turns: usize,
+        marker: &'static str,
+    },
+    ToolCallOmission {
+        omitted_tool_calls: usize,
         marker: &'static str,
     },
 }
@@ -519,9 +533,9 @@ pub struct EscalationReviewRequest {
 pub struct ExecutionReviewOutputSchema(StructuredOutputSchema);
 
 impl ExecutionReviewOutputSchema {
-    fn v3() -> Self {
+    fn v4() -> Self {
         Self(StructuredOutputSchema {
-            name: "sumi_execution_review_v3".to_owned(),
+            name: "sumi_execution_review_v4".to_owned(),
             description: "Sumi Execution AutoReview decision".to_owned(),
             schema: json!({
                 "type": "object",
@@ -545,9 +559,9 @@ impl ExecutionReviewOutputSchema {
 pub struct EscalationReviewOutputSchema(StructuredOutputSchema);
 
 impl EscalationReviewOutputSchema {
-    fn v3() -> Self {
+    fn v4() -> Self {
         Self(StructuredOutputSchema {
-            name: "sumi_escalation_review_v3".to_owned(),
+            name: "sumi_escalation_review_v4".to_owned(),
             description: "Sumi Escalation AutoReview decision".to_owned(),
             schema: json!({
                 "type": "object",
@@ -872,9 +886,9 @@ pub(crate) fn execution_provider_wire_bodies_for_test(
         .flat_map(|retry_validation_code| {
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
-                output_schema: ExecutionReviewOutputSchema::v3(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V3,
-                schema_version: EXECUTION_SCHEMA_VERSION_V3,
+                output_schema: ExecutionReviewOutputSchema::v4(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V4,
+                schema_version: EXECUTION_SCHEMA_VERSION_V4,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -896,9 +910,9 @@ pub(crate) fn escalation_provider_wire_bodies_for_test(
         .flat_map(|retry_validation_code| {
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
-                output_schema: EscalationReviewOutputSchema::v3(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V3,
-                schema_version: ESCALATION_SCHEMA_VERSION_V3,
+                output_schema: EscalationReviewOutputSchema::v4(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V4,
+                schema_version: ESCALATION_SCHEMA_VERSION_V4,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -988,9 +1002,9 @@ impl ExecutionReviewer {
             attempts += 1;
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
-                output_schema: ExecutionReviewOutputSchema::v3(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V3,
-                schema_version: EXECUTION_SCHEMA_VERSION_V3,
+                output_schema: ExecutionReviewOutputSchema::v4(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V4,
+                schema_version: EXECUTION_SCHEMA_VERSION_V4,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -1096,9 +1110,9 @@ impl EscalationReviewer {
             attempts += 1;
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
-                output_schema: EscalationReviewOutputSchema::v3(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V3,
-                schema_version: ESCALATION_SCHEMA_VERSION_V3,
+                output_schema: EscalationReviewOutputSchema::v4(),
+                prompt_version: ESCALATION_PROMPT_VERSION_V4,
+                schema_version: ESCALATION_SCHEMA_VERSION_V4,
                 request: request.clone(),
                 retry_validation_code,
             };
@@ -1317,9 +1331,9 @@ fn execution_result(
         decision.outcome = ExecutionReviewOutcome::Block;
     }
     let evidence = ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V3.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V3.to_owned(),
-        schema_version: EXECUTION_SCHEMA_VERSION_V3.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V4.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V4.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION_V4.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1338,9 +1352,9 @@ fn execution_synthetic_block(
     terminal: ReviewerTerminalClass,
 ) -> ExecutionReviewResult {
     ExecutionReviewResult::Block(ExecutionReviewEvidence {
-        reviewer_version: EXECUTION_REVIEWER_VERSION_V3.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V3.to_owned(),
-        schema_version: EXECUTION_SCHEMA_VERSION_V3.to_owned(),
+        reviewer_version: EXECUTION_REVIEWER_VERSION_V4.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V4.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION_V4.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1363,9 +1377,9 @@ fn escalation_result(
         decision.outcome = EscalationReviewOutcome::Block;
     }
     let evidence = EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V3.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V3.to_owned(),
-        schema_version: ESCALATION_SCHEMA_VERSION_V3.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V4.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V4.to_owned(),
+        schema_version: ESCALATION_SCHEMA_VERSION_V4.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1384,9 +1398,9 @@ fn escalation_synthetic_block(
     terminal: ReviewerTerminalClass,
 ) -> EscalationReviewResult {
     EscalationReviewResult::Block(EscalationReviewEvidence {
-        reviewer_version: ESCALATION_REVIEWER_VERSION_V3.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V3.to_owned(),
-        schema_version: ESCALATION_SCHEMA_VERSION_V3.to_owned(),
+        reviewer_version: ESCALATION_REVIEWER_VERSION_V4.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V4.to_owned(),
+        schema_version: ESCALATION_SCHEMA_VERSION_V4.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
         budget: reviewer.budget.evidence(attempts, terminal),
@@ -1537,11 +1551,18 @@ mod tests {
 
     fn transcript_evidence() -> ReviewerTranscript {
         ReviewerTranscript {
-            schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V3,
-            entries: vec![ReviewerTranscriptEntry::User {
-                text: "Please update the exact record I named.".to_owned(),
-                truncated: false,
-            }],
+            schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4,
+            entries: vec![
+                ReviewerTranscriptEntry::User {
+                    text: "Please update the exact record I named.".to_owned(),
+                    truncated: false,
+                },
+                ReviewerTranscriptEntry::ToolCall {
+                    tool: "prior_lookup_wire_sentinel".to_owned(),
+                    route: ToolInvocationRoute::Normal,
+                    arguments: json!({"record":"reviewer-tool-history-sentinel"}),
+                },
+            ],
         }
     }
 
@@ -1703,6 +1724,8 @@ mod tests {
                 ])
             );
             let encoded = serde_json::to_string(&request).expect("encoded review request");
+            assert!(encoded.contains("prior_lookup_wire_sentinel"));
+            assert!(encoded.contains("reviewer-tool-history-sentinel"));
             for forbidden in [
                 "context_version",
                 "tenant_id",
@@ -1762,6 +1785,8 @@ mod tests {
             schema_mismatch_retries += encoded.matches("schema_mismatch").count();
             retry_fields += encoded.matches("retry_validation_code").count();
             assert!(encoded.contains("Please update the exact record I named."));
+            assert!(encoded.contains("prior_lookup_wire_sentinel"));
+            assert!(encoded.contains("reviewer-tool-history-sentinel"));
             assert!(encoded.contains("descriptor"));
             assert!(encoded.contains("review_projection"));
             assert!(encoded.contains("provider_evidence_digest"));
@@ -2024,15 +2049,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
-        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V3);
-        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V3);
-        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V3);
+        assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V4);
+        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V4);
+        assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V4);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
-            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v3());
-            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V3);
-            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V3);
+            assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v4());
+            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V4);
+            assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V4);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -2089,15 +2114,15 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
         );
-        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V3);
-        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V3);
-        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V3);
+        assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V4);
+        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V4);
+        assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V4);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         for (index, prompt) in prompts.iter().enumerate() {
-            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v3());
-            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V3);
-            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V3);
+            assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v4());
+            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V4);
+            assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V4);
             assert_eq!(
                 prompt.retry_validation_code,
                 if index == 0 {
@@ -2119,8 +2144,8 @@ mod tests {
             );
         }
         assert_ne!(
-            ExecutionReviewOutputSchema::v3().provider_schema().schema,
-            EscalationReviewOutputSchema::v3().provider_schema().schema
+            ExecutionReviewOutputSchema::v4().provider_schema().schema,
+            EscalationReviewOutputSchema::v4().provider_schema().schema
         );
     }
 
@@ -2137,11 +2162,11 @@ mod tests {
     #[test]
     fn auto_review_schemas_stay_inside_the_kimi_mfjs_strict_subset_we_use() {
         for schema in [
-            ExecutionReviewOutputSchema::v3()
+            ExecutionReviewOutputSchema::v4()
                 .provider_schema()
                 .schema
                 .clone(),
-            EscalationReviewOutputSchema::v3()
+            EscalationReviewOutputSchema::v4()
                 .provider_schema()
                 .schema
                 .clone(),
