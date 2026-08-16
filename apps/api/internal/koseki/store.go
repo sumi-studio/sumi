@@ -91,6 +91,12 @@ func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.Lifecy
 // MintHuman mints a fresh, globally unique HumanId (UUIDv7) and records the
 // Human in the registry. The returned ID is the canonical lowercase hyphenated
 // form.
+//
+// This is a registry primitive (tests, low-level fixtures): it records only the
+// Human row. Account provisioning — Secretary, employment, secrets, credential
+// and the default Direct Chat installation — happens in the auth-flow and
+// auto-registration paths; a Human minted here has no Direct Chat until it goes
+// through one of those, or the 0022 backfill runs.
 func (s *Store) MintHuman(ctx context.Context) (string, error) {
 	humanID := newUUIDv7()
 	_, err := s.pool.Exec(ctx,
