@@ -285,8 +285,22 @@ impl RouteApprovalBroker {
         execution_reviewer: Arc<ExecutionReviewer>,
         escalation_reviewer: Arc<EscalationReviewer>,
     ) -> Self {
+        Self::with_shared_policy(
+            Arc::new(RwLock::new(policy)),
+            redactor,
+            execution_reviewer,
+            escalation_reviewer,
+        )
+    }
+
+    pub(crate) fn with_shared_policy(
+        policy: Arc<RwLock<RoutePolicy>>,
+        redactor: Redactor,
+        execution_reviewer: Arc<ExecutionReviewer>,
+        escalation_reviewer: Arc<EscalationReviewer>,
+    ) -> Self {
         Self {
-            policy: Arc::new(RwLock::new(policy)),
+            policy,
             clock: Arc::new(Utc::now),
             redactor: Arc::new(redactor),
             execution_reviewer,
@@ -1409,14 +1423,21 @@ mod tests {
         async fn complete(
             &self,
             prompt: &ExecutionReviewerPrompt,
+            _tool_call_offset: usize,
             _cancel: CancellationToken,
-        ) -> std::result::Result<String, ReviewerTransportError> {
+        ) -> std::result::Result<
+            crate::approval::route_reviewer::ReviewerTransportOutput,
+            ReviewerTransportError,
+        > {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.prompts
                 .lock()
                 .expect("execution prompts")
                 .push(serde_json::to_value(prompt).expect("serialize prompt"));
-            Ok(self.response.clone())
+            Ok(crate::approval::route_reviewer::ReviewerTransportOutput {
+                text: self.response.clone(),
+                tool_trace: Vec::new(),
+            })
         }
     }
 
@@ -1436,14 +1457,21 @@ mod tests {
         async fn complete(
             &self,
             prompt: &EscalationReviewerPrompt,
+            _tool_call_offset: usize,
             _cancel: CancellationToken,
-        ) -> std::result::Result<String, ReviewerTransportError> {
+        ) -> std::result::Result<
+            crate::approval::route_reviewer::ReviewerTransportOutput,
+            ReviewerTransportError,
+        > {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.prompts
                 .lock()
                 .expect("escalation prompts")
                 .push(serde_json::to_value(prompt).expect("serialize prompt"));
-            Ok(self.response.clone())
+            Ok(crate::approval::route_reviewer::ReviewerTransportOutput {
+                text: self.response.clone(),
+                tool_trace: Vec::new(),
+            })
         }
     }
 

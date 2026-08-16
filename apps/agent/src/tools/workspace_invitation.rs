@@ -117,6 +117,10 @@ impl BoundToolAdapter for WorkspaceInvitationListTool {
             .expect("static Workspace invitation list adapter identity must be valid")
     }
 
+    fn reviewer_read_capable(&self) -> bool {
+        true
+    }
+
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
         let arguments =
             decode_list(ctx.args.as_object()).map_err(|_| DescribeError::InvalidArguments)?;

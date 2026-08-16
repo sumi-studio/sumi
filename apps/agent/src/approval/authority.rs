@@ -31,6 +31,7 @@ const DENIAL_DIGEST_DOMAIN: &[u8] = b"sumi-tool-denial-evidence/v1\0";
 const EXECUTOR_AUTHORIZATION_PROJECTION_DIGEST_DOMAIN: &[u8] =
     b"sumi-executor-authorization-projection/v1\0";
 const EXECUTOR_GRANT_DIGEST_DOMAIN: &[u8] = b"sumi-executor-grant/v1\0";
+const REVIEWER_READ_AUTHORITY_DOMAIN: &[u8] = b"sumi-reviewer-read-authority/v1\0";
 const EXECUTOR_AUTHORIZATION_PROJECTION_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,6 +698,49 @@ impl AuthorizedBoundInvocation {
         &self.sealed.invocation().tool_name
     }
 
+    /// Mint process-local authority for one already-bound reviewer Read.
+    ///
+    /// Reviewer reads are not PA tool executions and do not create ordinary
+    /// `tool_executions` rows. Their bounded, redacted trace is committed as
+    /// part of the enclosing review evidence instead. This constructor is
+    /// deliberately incapable of authorizing any other capability or route.
+    pub(crate) fn for_reviewer_read(
+        sealed: SealedBoundToolInvocation,
+        policy: &PolicySnapshot,
+        policy_decision: PolicyDecisionRecord,
+    ) -> Result<Self> {
+        let bound = sealed.invocation();
+        if bound.descriptor.capability != crate::tools::CapabilityClass::Read
+            || !matches!(
+                policy_decision,
+                PolicyDecisionRecord::Allow | PolicyDecisionRecord::Unmatched
+            )
+        {
+            bail!("reviewer authority is restricted to policy-admitted reads");
+        }
+        policy.validate()?;
+        let bound_evidence_digest = bound.evidence_digest()?.to_hex();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "origin": "reviewer",
+            "route": ToolInvocationRoute::Normal,
+            "tool_call_id": bound.tool_call_id,
+            "bound_evidence_digest": bound_evidence_digest,
+            "policy_source_digest": policy.source_digest,
+            "policy_decision": policy_decision,
+            "resolved_authority": ExecutionAuthorityProvenance::AgentOwn,
+        }))?;
+        let authority_digest = digest(REVIEWER_READ_AUTHORITY_DOMAIN, &encoded);
+        let permit = CommittedExecutionPermit {
+            grant_digest: authority_digest.clone(),
+            bound_evidence_digest,
+            action_digest: bound.descriptor_digest.to_hex(),
+            authorization_projection_digest: authority_digest,
+            route: ToolInvocationRoute::Normal,
+            resolved_authority: ExecutionAuthorityProvenance::AgentOwn,
+        };
+        Ok(Self { sealed, permit })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(sealed: SealedBoundToolInvocation) -> Self {
         let permit = CommittedExecutionPermit::for_test(sealed.invocation());
@@ -928,8 +972,11 @@ impl<T> CommittedEffectReceipt<T> {
 mod executor_projection_tests {
     use super::*;
     use crate::approval::{
-        route_policy::PolicySourceState,
-        route_reviewer::{EscalationReviewDecision, ReviewerBudgetEvidence, ReviewerTerminalClass},
+        route_policy::{NormalPolicyDecision, PolicyEvaluation, PolicySourceState},
+        route_reviewer::{
+            EscalationReviewDecision, ExecutionReviewDecision, ExecutionReviewEvidence,
+            ReviewerBudgetEvidence, ReviewerTerminalClass, ReviewerToolTrace,
+        },
     };
 
     fn hidden_elevated_evidence(hidden: &str) -> ToolExecutionAuthorizationEvidence {
@@ -967,6 +1014,7 @@ mod executor_projection_tests {
                     attempts: u8::try_from(hidden.len()).unwrap(),
                     terminal: ReviewerTerminalClass::ValidDecision,
                 },
+                tool_trace: Vec::new(),
                 decision: EscalationReviewDecision {
                     outcome: EscalationReviewOutcome::AskHuman,
                     risk: RiskLevel::High,
@@ -987,6 +1035,71 @@ mod executor_projection_tests {
                 authorization_context_digest: format!("context-{hidden}"),
             }),
         }
+    }
+
+    #[test]
+    fn reviewer_tool_trace_changes_the_durable_authorization_evidence_digest() {
+        let bound = BoundToolInvocation::test_fixture(
+            "review-trace-digest",
+            crate::tools::CapabilityClass::Mutate,
+        );
+        let policy = RoutePolicy::baseline_only_v1();
+        let snapshot = match policy.evaluate_normal(&bound, Utc::now()) {
+            PolicyEvaluation::Ready {
+                snapshot,
+                decision: NormalPolicyDecision::Unmatched,
+            } => snapshot,
+            outcome => panic!("fixture mutate policy must be unmatched: {outcome:?}"),
+        };
+        let review = ExecutionReviewEvidence {
+            reviewer_version: "execution-reviewer/v6".to_owned(),
+            prompt_version: "execution-review-prompt/v6".to_owned(),
+            schema_version: "execution-review-schema/v6".to_owned(),
+            model_id: "fixture".to_owned(),
+            model_binding_digest: "fixture-binding".to_owned(),
+            budget: ReviewerBudgetEvidence {
+                version: "reviewer-budget/v1".to_owned(),
+                digest: "fixture-budget".to_owned(),
+                attempts: 1,
+                terminal: ReviewerTerminalClass::ValidDecision,
+            },
+            tool_trace: Vec::new(),
+            decision: ExecutionReviewDecision {
+                outcome: ExecutionReviewOutcome::Allow,
+                risk: RiskLevel::Low,
+                rationale: "verified".to_owned(),
+            },
+        };
+        let mut evidence = ToolExecutionAuthorizationEvidence {
+            evidence_version: AUTHORIZATION_EVIDENCE_VERSION_V1.to_owned(),
+            grant_id: "grant-review-trace".to_owned(),
+            tool_call_id: bound.tool_call_id.clone(),
+            route: ToolInvocationRoute::Normal,
+            proposal_digest: bound.proposal_digest.to_hex(),
+            descriptor_digest: bound.descriptor_digest.to_hex(),
+            bound_evidence_digest: bound.evidence_digest().unwrap().to_hex(),
+            policy: snapshot,
+            policy_decision: PolicyDecisionRecord::Unmatched,
+            resolved_authority: ExecutionAuthorityProvenance::AgentOwn,
+            execution_review: Some(review),
+            escalation_review: None,
+            human_decision: None,
+        };
+        let without_trace = authorization_evidence_digest(&evidence, &bound).unwrap();
+        evidence
+            .execution_review
+            .as_mut()
+            .unwrap()
+            .tool_trace
+            .push(ReviewerToolTrace {
+                tool: "workspace_invitation_list".to_owned(),
+                arguments: serde_json::json!({}),
+                result_digest: "ab".repeat(32),
+                is_error: false,
+                elapsed_ms: 4,
+            });
+        let with_trace = authorization_evidence_digest(&evidence, &bound).unwrap();
+        assert_ne!(without_trace, with_trace);
     }
 
     #[test]

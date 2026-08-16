@@ -27,9 +27,9 @@ use crate::{
         },
         route_policy::{PolicySnapshot, PolicySourceState},
         route_reviewer::{
-            ESCALATION_PROMPT_VERSION_V5, ESCALATION_REVIEWER_VERSION_V5,
-            ESCALATION_SCHEMA_VERSION_V5, EXECUTION_PROMPT_VERSION_V5,
-            EXECUTION_REVIEWER_VERSION_V5, EXECUTION_SCHEMA_VERSION_V5, EscalationReviewDecision,
+            ESCALATION_PROMPT_VERSION_V6, ESCALATION_REVIEWER_VERSION_V6,
+            ESCALATION_SCHEMA_VERSION_V6, EXECUTION_PROMPT_VERSION_V6,
+            EXECUTION_REVIEWER_VERSION_V6, EXECUTION_SCHEMA_VERSION_V6, EscalationReviewDecision,
             EscalationReviewEvidence, EscalationReviewOutcome, ExecutionReviewDecision,
             ExecutionReviewEvidence, ExecutionReviewOutcome, ReviewerBudgetEvidence,
             ReviewerTerminalClass, RiskLevel,
@@ -466,9 +466,9 @@ fn execution_review_denial(terminal: ReviewerTerminalClass) -> ToolExecutionDeni
         },
         policy_decision: PolicyDecisionRecord::Unmatched,
         execution_review: Some(ExecutionReviewEvidence {
-            reviewer_version: EXECUTION_REVIEWER_VERSION_V5.to_owned(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V5.to_owned(),
-            schema_version: EXECUTION_SCHEMA_VERSION_V5.to_owned(),
+            reviewer_version: EXECUTION_REVIEWER_VERSION_V6.to_owned(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V6.to_owned(),
+            schema_version: EXECUTION_SCHEMA_VERSION_V6.to_owned(),
             model_id: "reviewer".to_owned(),
             model_binding_digest: "binding".to_owned(),
             budget: ReviewerBudgetEvidence {
@@ -477,6 +477,7 @@ fn execution_review_denial(terminal: ReviewerTerminalClass) -> ToolExecutionDeni
                 attempts: 1,
                 terminal,
             },
+            tool_trace: Vec::new(),
             decision: ExecutionReviewDecision {
                 outcome: ExecutionReviewOutcome::Block,
                 risk: RiskLevel::High,
@@ -509,9 +510,9 @@ fn escalation_review_denial() -> ToolExecutionDenialEvidence {
         policy_decision: PolicyDecisionRecord::ElevatedPreflight,
         execution_review: None,
         escalation_review: Some(EscalationReviewEvidence {
-            reviewer_version: ESCALATION_REVIEWER_VERSION_V5.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V5.to_owned(),
-            schema_version: ESCALATION_SCHEMA_VERSION_V5.to_owned(),
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V6.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V6.to_owned(),
+            schema_version: ESCALATION_SCHEMA_VERSION_V6.to_owned(),
             model_id: "reviewer".to_owned(),
             model_binding_digest: "binding".to_owned(),
             budget: ReviewerBudgetEvidence {
@@ -520,6 +521,7 @@ fn escalation_review_denial() -> ToolExecutionDenialEvidence {
                 attempts: 1,
                 terminal: ReviewerTerminalClass::ValidDecision,
             },
+            tool_trace: Vec::new(),
             decision: EscalationReviewDecision {
                 outcome: EscalationReviewOutcome::Block,
                 risk: RiskLevel::Medium,

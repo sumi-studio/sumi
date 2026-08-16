@@ -608,6 +608,10 @@ impl BoundToolAdapter for MessagingTool {
             .expect("static Messaging binding adapter identity must be valid")
     }
 
+    fn reviewer_read_capable(&self) -> bool {
+        true
+    }
+
     async fn bind(&self, ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
         let proposal: MessagingProposal =
             serde_json::from_value(Value::Object(ctx.args.as_object().clone()))
