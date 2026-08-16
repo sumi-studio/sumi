@@ -217,6 +217,11 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   );
   assert.match(launcher, /"SUMI_DEV_HOST=\$\{PUBLIC_HOST\}"/);
   assert.match(launcher, /"SUMI_DEV_API_ORIGIN=\$\{API_ORIGIN\}"/);
+  assert.doesNotMatch(
+    launcher,
+    /SUMI_MODEL_API_KEY_ENV \\\n+\s+SUMI_EXECUTION_REVIEWER_MODEL_PRESET/,
+  );
+  assert.match(launcher, /\[\[ -z "\$\{reviewer_api_key_env\}" \]\] && continue/);
 });
 
 test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async () => {
