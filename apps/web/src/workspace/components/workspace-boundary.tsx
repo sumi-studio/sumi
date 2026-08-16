@@ -28,14 +28,6 @@ export function WorkspaceBoundary({
     void init();
   }, [init]);
 
-  // The Workspace route owns every nested app runtime. Returning to the
-  // Workspace list or changing the route identity drops the old transport and
-  // its private projections before another screen can render.
-  useLayoutEffect(() => {
-    if (!workspaceId) return;
-    return () => bindMessagingScope(null);
-  }, [workspaceId]);
-
   // A changed URL stops rendering the old subtree immediately. The layout
   // fence then disposes its Messaging scope before the browser paints.
   useLayoutEffect(() => {

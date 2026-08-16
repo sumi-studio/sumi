@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMessaging } from "../store";
 
 const RECONNECTED_FLASH_MS = 2_500;
+const RECONNECTING_DELAY_MS = 1_500;
 
 /**
  * 接続が切れている間だけメッセージリスト上部に出る細いバナー。
@@ -11,30 +12,53 @@ const RECONNECTED_FLASH_MS = 2_500;
 export function ConnectionBanner() {
   const connection = useMessaging((state) => state.connection);
   const [flash, setFlash] = useState(false);
+  const [interruptionVisible, setInterruptionVisible] = useState(false);
+  const interruptionWasVisible = useRef(false);
+  const hasConnected = useRef(connection === "connected");
   const wasInterrupted = useRef(false);
   const previousConnection = useRef(connection);
 
   useEffect(() => {
     const previous = previousConnection.current;
     previousConnection.current = connection;
-    if (connection !== "connected") {
-      if (previous === "connected") {
-        wasInterrupted.current = true;
-      }
+    if (connection === "connected") {
+      hasConnected.current = true;
+      if (!wasInterrupted.current) return;
+      const showRecovered = interruptionWasVisible.current;
+      wasInterrupted.current = false;
+      interruptionWasVisible.current = false;
+      setInterruptionVisible(false);
       setFlash(false);
+      if (!showRecovered) return;
+      setFlash(true);
+      const timer = window.setTimeout(
+        () => setFlash(false),
+        RECONNECTED_FLASH_MS,
+      );
+      return () => window.clearTimeout(timer);
+    }
+
+    if (!hasConnected.current) return;
+    if (previous === "connected") wasInterrupted.current = true;
+    if (!wasInterrupted.current) return;
+    setFlash(false);
+    if (connection === "disconnected") {
+      interruptionWasVisible.current = true;
+      setInterruptionVisible(true);
       return;
     }
-    if (!wasInterrupted.current) return;
-    wasInterrupted.current = false;
-    setFlash(true);
     const timer = window.setTimeout(
-      () => setFlash(false),
-      RECONNECTED_FLASH_MS,
+      () => {
+        interruptionWasVisible.current = true;
+        setInterruptionVisible(true);
+      },
+      RECONNECTING_DELAY_MS,
     );
     return () => window.clearTimeout(timer);
   }, [connection]);
 
   if (connection === "connected" && !flash) return null;
+  if (!interruptionVisible && !flash) return null;
 
   if (connection === "connected") {
     return (
