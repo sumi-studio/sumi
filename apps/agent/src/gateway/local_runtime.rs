@@ -48,7 +48,8 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi, MessagingApiFailure,
+    CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
+    MessagingApi, MessagingApiFailure,
     MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
     OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
@@ -999,6 +1000,19 @@ impl MessagingApi for LocalControlHttpClient {
         self.post_json(
             "/local-control/v1/messaging:read-through",
             &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn call_state(
+        &self,
+        scope: &ExactMessagingScope,
+        request: GetMessagingCallStateRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:call-state",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
     }

@@ -276,6 +276,15 @@ pub(crate) struct ReadMessagingThroughRequest<'a> {
     pub seq: u64,
 }
 
+/// Call presence is readable state only. There is intentionally no matching
+/// request that could obtain a room token or join media.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetMessagingCallStateRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<&'a str>,
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
     async fn overview(&self, scope: &ExactMessagingScope) -> Result<Value>;
@@ -332,6 +341,12 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         &self,
         scope: &ExactMessagingScope,
         request: ReadMessagingThroughRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn call_state(
+        &self,
+        scope: &ExactMessagingScope,
+        request: GetMessagingCallStateRequest<'_>,
     ) -> Result<Value>;
 }
 

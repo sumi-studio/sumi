@@ -241,6 +241,7 @@ pub(crate) enum ProviderReviewOperation {
     Status,
     ReplyLater,
     ResolveReplyLater,
+    GetCallState,
     ReadFile,
     ListDir,
     Glob,
@@ -414,6 +415,9 @@ fn provider_review_operation(
             "resolve_reply_later",
             Mutate,
         ) => Operation::ResolveReplyLater,
+        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "get_call_state", Read) => {
+            Operation::GetCallState
+        }
         (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
         (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
         (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
