@@ -648,8 +648,8 @@ func TestDurableBrowserSessionRevocationRejectsCorruptionAndResetsPreLineageStat
 	if _, err := verifier.VerifySession(
 		context.Background(),
 		session,
-	); err != nil {
-		t.Fatalf("pre-lineage state carried an obsolete SID into v2: %v", err)
+	); err == nil || !strings.Contains(err.Error(), "delete the state file") {
+		t.Fatalf("pre-lineage state error = %v, want reset instruction", err)
 	}
 }
 
