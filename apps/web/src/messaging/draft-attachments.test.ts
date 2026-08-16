@@ -230,6 +230,9 @@ describe("composer draft attachments", () => {
     expect(
       useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY],
     ).toHaveLength(10);
+    expect(
+      useMessaging.getState().draftAttachmentOverflowByPlace[CHANNEL_KEY],
+    ).toBe(4);
   });
 
   it("aborts and forgets drafts when the session or scope changes, ignoring late receipts", async () => {

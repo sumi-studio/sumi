@@ -112,12 +112,17 @@ services:
       SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
       # Messaging attachment bytes live in an API-owned named volume, never in
       # a PersonalityAgent artifact or Workspace volume. Compose named volumes
-      # carry no size limit, so the per-Workspace byte cap below is the only
-      # storage bound; the API refuses to serve attachments without one. The
-      # dogfood default is 1 GiB per Workspace and is a Messaging attachment
-      # decision, unrelated to the Agent Workspace volume size.
+      # carry no size limit, so both Workspace and whole-store byte/object caps
+      # are explicit and required. 512 MiB permits two full attachment messages
+      # per Workspace; the 2 GiB / 50k-object dogfood whole-store cap leaves
+      # headroom while preventing this volume from exhausting the host shared
+      # with Postgres. These are Messaging decisions, unrelated to Agent
+      # Workspace volume size.
       SUMI_MESSAGING_ATTACHMENT_ROOT: /var/lib/sumi-messaging-attachments
-      SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES: ${SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES:-1073741824}
+      SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES: ${SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES:-536870912}
+      SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS: ${SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS:-10000}
+      SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES: ${SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES:-2147483648}
+      SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS: ${SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS:-50000}
       SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:-}
       SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?SUMI_BROWSER_SESSION_SECRET is required}
       SUMI_BROWSER_SESSION_AUDIENCE: ${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}

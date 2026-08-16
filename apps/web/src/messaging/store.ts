@@ -150,6 +150,8 @@ interface MessagingState {
    * scope/session切替のresetで消える。bytesはここではなくモジュール内に置く。
    */
   draftAttachmentsByPlace: Record<PlaceKey, DraftAttachment[]>;
+  /** 直近の追加操作で上限により受け付けられなかった件数。無言で捨てない。 */
+  draftAttachmentOverflowByPlace: Record<PlaceKey, number>;
   typingByPlace: Record<PlaceKey, Record<ParticipantKey, number>>;
   replyLaterById: Record<string, ReplyLaterMarker>;
   /** 自分の通知設定。正本はサーバーで、ここはその写し。 */
@@ -759,7 +761,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       "誰か";
     presentDesktopNotification({
       title: notificationTitle(notificationPlaceLabel(state, key), authorName),
-      body: notificationBody(event.message.content),
+      body: notificationBody(event.message.content, event.message.attachments),
       placeKey: key,
       onActivate: () => notificationNavigate?.(key),
     });
@@ -1231,6 +1233,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     unreadLineByPlace: {},
     draftByPlace: {},
     draftAttachmentsByPlace: {},
+    draftAttachmentOverflowByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
     notificationDefaultLevel: "all",
@@ -1485,6 +1488,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ...current.draftAttachmentsByPlace,
           [key]: [],
         },
+        draftAttachmentOverflowByPlace: {
+          ...current.draftAttachmentOverflowByPlace,
+          [key]: 0,
+        },
         replyTargetId: null,
       }));
       dispatchSend(key, pending);
@@ -1498,6 +1505,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const existing = state.draftAttachmentsByPlace[key] ?? [];
       const room = MAX_ATTACHMENTS_PER_MESSAGE - existing.length;
       const accepted = files.slice(0, Math.max(0, room));
+      const overflow = files.length - accepted.length;
       const added: DraftAttachment[] = accepted.map((file) => {
         const clientNonce = secureRandomUUID();
         const draft: DraftAttachment = {
@@ -1524,6 +1532,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         draftAttachmentsByPlace: {
           ...current.draftAttachmentsByPlace,
           [key]: [...(current.draftAttachmentsByPlace[key] ?? []), ...added],
+        },
+        draftAttachmentOverflowByPlace: {
+          ...current.draftAttachmentOverflowByPlace,
+          [key]: overflow,
         },
       }));
       for (const draft of added) {
@@ -1907,6 +1919,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     unreadLineByPlace: {},
     draftByPlace: {},
     draftAttachmentsByPlace: {},
+    draftAttachmentOverflowByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
     notificationDefaultLevel: "all",

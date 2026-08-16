@@ -5,3 +5,4 @@ DROP TABLE IF EXISTS message_attachment_uploads;
 DROP VIEW IF EXISTS message_attachment_blob_inventory;
 DROP TABLE IF EXISTS message_attachments;
 DROP TABLE IF EXISTS message_attachment_quotas;
+DROP TABLE IF EXISTS message_attachment_store_usage;

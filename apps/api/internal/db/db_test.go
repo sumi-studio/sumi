@@ -1032,7 +1032,7 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	var tables int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM information_schema.tables
-		WHERE table_name IN ('message_attachments','message_attachment_uploads','message_attachment_quotas')`).Scan(&tables); err != nil || tables != 3 {
+		WHERE table_name IN ('message_attachments','message_attachment_uploads','message_attachment_quotas','message_attachment_store_usage')`).Scan(&tables); err != nil || tables != 4 {
 		t.Fatalf("attachment tables after re-up: %d %v", tables, err)
 	}
 	if _, err := pool.Exec(ctx, down); err != nil {
@@ -1040,7 +1040,7 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	}
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM information_schema.tables
-		WHERE table_name IN ('message_attachments','message_attachment_uploads','message_attachment_quotas')`).Scan(&tables); err != nil || tables != 0 {
+		WHERE table_name IN ('message_attachments','message_attachment_uploads','message_attachment_quotas','message_attachment_store_usage')`).Scan(&tables); err != nil || tables != 0 {
 		t.Fatalf("attachment tables after down: %d %v", tables, err)
 	}
 	var column int

@@ -189,11 +189,13 @@ func uploadAttachment(
 	reservation := receipt.Reservation
 	if beforeBody != nil {
 		if err := beforeBody(); err != nil {
+			_ = store.AbandonAttachmentStaging(context.WithoutCancel(ctx), *reservation)
 			return Attachment{}, false, true, err
 		}
 	}
 	blob, err := store.Store.blobs.Stage(reservation.UploadID, body, req.declaredSize)
 	if err != nil {
+		_ = store.AbandonAttachmentStaging(context.WithoutCancel(ctx), *reservation)
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			return Attachment{}, false, true, ErrAttachmentTooLarge
@@ -201,12 +203,13 @@ func uploadAttachment(
 		return Attachment{}, false, true, err
 	}
 	staged := StagedAttachment{
-		UploadID: reservation.UploadID,
-		Filename: req.filename,
-		MIME:     resolveAttachmentMIME(req.declaredMIME, blob.Head),
-		Size:     blob.Size,
-		SHA256:   blob.SHA256,
-		Handle:   blob,
+		UploadID:   reservation.UploadID,
+		Filename:   req.filename,
+		MIME:       resolveAttachmentMIME(req.declaredMIME, blob.Head),
+		Size:       blob.Size,
+		SHA256:     blob.SHA256,
+		StageToken: reservation.StageToken,
+		Handle:     blob,
 	}
 	var (
 		attachment Attachment
@@ -219,12 +222,14 @@ func uploadAttachment(
 	})
 	if !finalAdmitted {
 		_ = store.Store.blobs.Discard(blob)
+		_ = store.AbandonAttachmentStaging(context.WithoutCancel(ctx), *reservation)
 		return Attachment{}, false, false, nil
 	}
 	if finalErr == nil {
 		return attachment, created, true, nil
 	}
 	if AttachmentFinalizeDefinitelyNotCommitted(finalErr) {
+		_ = store.AbandonAttachmentStaging(context.WithoutCancel(ctx), *reservation)
 		return Attachment{}, false, true, finalErr
 	}
 	// The commit outcome is unknown. Probe the durable receipt briefly; if it
@@ -266,6 +271,8 @@ func writeAttachmentUploadError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 	case errors.Is(err, ErrAttachmentEmpty):
 		writeError(w, http.StatusBadRequest, "attachment_empty")
+	case errors.Is(err, ErrAttachmentUploadInProgress):
+		writeError(w, http.StatusConflict, "attachment_upload_in_progress")
 	default:
 		writeStoreError(w, err)
 	}

@@ -475,38 +475,61 @@ func newApplicationFromEnv() (*application, error) {
 	}, nil
 }
 
-// Messaging attachment storage is opt-in and fails closed. Both variables must
-// be set together: an API-owned persistent root and an explicit per-Workspace
-// byte cap. Attachments stay disabled (uploads answer 503) when either is
-// missing, rather than silently accepting bytes nothing can serve or running
-// without a storage bound.
+// Messaging attachment storage is opt-in and fails closed. The root and every
+// byte/object cap must be set together. Attachments stay disabled (uploads
+// answer 503) when all are absent, and startup fails for a partial policy so
+// the API never runs with an unbounded Workspace or whole blob store.
 const (
-	messagingAttachmentRootEnv  = "SUMI_MESSAGING_ATTACHMENT_ROOT"
-	messagingAttachmentQuotaEnv = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES"
+	messagingAttachmentRootEnv             = "SUMI_MESSAGING_ATTACHMENT_ROOT"
+	messagingAttachmentWorkspaceBytesEnv   = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES"
+	messagingAttachmentWorkspaceObjectsEnv = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS"
+	messagingAttachmentTotalBytesEnv       = "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES"
+	messagingAttachmentTotalObjectsEnv     = "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS"
 )
 
 func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 	root := strings.TrimSpace(os.Getenv(messagingAttachmentRootEnv))
-	quotaRaw := strings.TrimSpace(os.Getenv(messagingAttachmentQuotaEnv))
-	if root == "" && quotaRaw == "" {
+	values := map[string]string{
+		messagingAttachmentWorkspaceBytesEnv:   strings.TrimSpace(os.Getenv(messagingAttachmentWorkspaceBytesEnv)),
+		messagingAttachmentWorkspaceObjectsEnv: strings.TrimSpace(os.Getenv(messagingAttachmentWorkspaceObjectsEnv)),
+		messagingAttachmentTotalBytesEnv:       strings.TrimSpace(os.Getenv(messagingAttachmentTotalBytesEnv)),
+		messagingAttachmentTotalObjectsEnv:     strings.TrimSpace(os.Getenv(messagingAttachmentTotalObjectsEnv)),
+	}
+	allAbsent := root == ""
+	for _, value := range values {
+		allAbsent = allAbsent && value == ""
+	}
+	if allAbsent {
 		log.Print("messaging attachments disabled: no attachment root configured")
 		return nil
 	}
-	if root == "" || quotaRaw == "" {
-		return fmt.Errorf("%s and %s must be set together", messagingAttachmentRootEnv, messagingAttachmentQuotaEnv)
+	if root == "" {
+		return fmt.Errorf("%s and all attachment caps must be set together", messagingAttachmentRootEnv)
 	}
-	quota, err := strconv.ParseInt(quotaRaw, 10, 64)
-	if err != nil || quota <= 0 {
-		return fmt.Errorf("%s must be a positive byte count", messagingAttachmentQuotaEnv)
+	parsed := make(map[string]int64, len(values))
+	for name, raw := range values {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("%s must be a positive integer", name)
+		}
+		parsed[name] = value
 	}
 	blobs, err := messaging.NewDiskAttachments(root)
 	if err != nil {
 		return err
 	}
-	if err := store.ConfigureAttachments(blobs, messaging.AttachmentPolicy{WorkspaceQuotaBytes: quota}); err != nil {
+	policy := messaging.AttachmentPolicy{
+		WorkspaceQuotaBytes:   parsed[messagingAttachmentWorkspaceBytesEnv],
+		WorkspaceQuotaObjects: parsed[messagingAttachmentWorkspaceObjectsEnv],
+		TotalQuotaBytes:       parsed[messagingAttachmentTotalBytesEnv],
+		TotalQuotaObjects:     parsed[messagingAttachmentTotalObjectsEnv],
+	}
+	if err := store.ConfigureAttachments(blobs, policy); err != nil {
 		return err
 	}
-	log.Printf("messaging attachments ready at %s (workspace quota %d bytes)", blobs.RootPath(), quota)
+	log.Printf("messaging attachments ready at %s (workspace %d bytes/%d objects; total %d bytes/%d objects)",
+		blobs.RootPath(), policy.WorkspaceQuotaBytes, policy.WorkspaceQuotaObjects,
+		policy.TotalQuotaBytes, policy.TotalQuotaObjects)
 	return nil
 }
 

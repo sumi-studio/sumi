@@ -78,6 +78,11 @@ export function Composer() {
         NO_DRAFT_ATTACHMENTS)
       : NO_DRAFT_ATTACHMENTS,
   );
+  const attachmentOverflow = useMessaging((state) =>
+    state.activePlaceKey
+      ? (state.draftAttachmentOverflowByPlace[state.activePlaceKey] ?? 0)
+      : 0,
+  );
   const addDraftAttachments = useMessaging(
     (state) => state.addDraftAttachments,
   );
@@ -483,9 +488,11 @@ export function Composer() {
             </>
           ) : null}
           <span className="ml-auto text-[11px] text-muted-foreground/60">
-            {!editing && draftAttachments.length > 0 && !attachmentsSettled
-              ? "添付の準備ができると送信できます"
-              : "Enterで送信・Shift+Enterで改行"}
+            {!editing && attachmentOverflow > 0
+              ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
+              : !editing && draftAttachments.length > 0 && !attachmentsSettled
+                ? "添付の準備ができると送信できます"
+                : "Enterで送信・Shift+Enterで改行"}
           </span>
         </div>
       </div>
