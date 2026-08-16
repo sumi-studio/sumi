@@ -49,13 +49,10 @@ export function ConnectionBanner() {
       setInterruptionVisible(true);
       return;
     }
-    const timer = window.setTimeout(
-      () => {
-        interruptionWasVisible.current = true;
-        setInterruptionVisible(true);
-      },
-      RECONNECTING_DELAY_MS,
-    );
+    const timer = window.setTimeout(() => {
+      interruptionWasVisible.current = true;
+      setInterruptionVisible(true);
+    }, RECONNECTING_DELAY_MS);
     return () => window.clearTimeout(timer);
   }, [connection, everConnected]);
 
