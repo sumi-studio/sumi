@@ -9,11 +9,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@sumi/ui/components/tooltip";
-import { useNavigate } from "@tanstack/react-router";
 import {
   Check,
   ChevronRight,
-  LayoutGrid,
   LogOut,
   Monitor,
   Moon,
@@ -22,7 +20,7 @@ import {
   Sun,
   UserRound,
 } from "lucide-react";
-import type { ComponentType, ReactElement } from "react";
+import type { ComponentType } from "react";
 import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
@@ -30,7 +28,6 @@ import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
 import { isImeComposing } from "../lib/ime";
 import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { ParticipantAppsMenu } from "../participant/app-menu";
-import { DIRECT_CHAT_RENDERER } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
 const THEME_OPTIONS: Array<{
@@ -42,46 +39,6 @@ const THEME_OPTIONS: Array<{
   { id: "light", label: "ライト", icon: Sun },
   { id: "dark", label: "ダーク", icon: Moon },
 ];
-
-/**
- * direct chat（直通）画面のレール。アプリ一覧はshell/app-descriptorsの
- * local providerから描画し、ホーム（メッセージング）へ戻れる。
- */
-export function AppNavigation() {
-  const navigate = useNavigate();
-  const DirectIcon = DIRECT_CHAT_RENDERER.icon;
-  return (
-    <aside className="app-sidebar flex h-dvh w-12 shrink-0 flex-col overflow-clip">
-      <nav className="flex flex-col gap-1 px-1 py-2" aria-label="Sumi">
-        <NavigationTooltip label="Workspace一覧">
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Workspace一覧"
-            onClick={() => void navigate({ to: "/" })}
-            className="size-10"
-          >
-            <LayoutGrid className="size-4" />
-          </Button>
-        </NavigationTooltip>
-        <NavigationTooltip label={DIRECT_CHAT_RENDERER.label}>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label={DIRECT_CHAT_RENDERER.label}
-            aria-current="page"
-            className="size-10 bg-interactive-active"
-          >
-            <DirectIcon className="size-4" />
-          </Button>
-        </NavigationTooltip>
-      </nav>
-      <div className="mt-auto px-2 pb-3">
-        <SettingsPopover />
-      </div>
-    </aside>
-  );
-}
 
 export function SettingsPopover() {
   const { authenticated, user, logout, updateDisplayName } = useAuth();
@@ -244,21 +201,6 @@ export function SettingsPopover() {
         )}
       </PopoverContent>
     </Popover>
-  );
-}
-
-function NavigationTooltip({
-  label,
-  children,
-}: {
-  label: string;
-  children: ReactElement;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger render={children} />
-      <TooltipContent side="right">{label}</TooltipContent>
-    </Tooltip>
   );
 }
 

@@ -13,7 +13,6 @@ import type { ChatItem } from "../agent/model";
 import { collectAgentCopyText, projectConversation } from "../agent/projection";
 import { useConversation } from "../agent/store";
 import { hasInspectableTrace } from "../agent/work-summary";
-import { AppNavigation } from "./app-navigation";
 import { ChatPromptInput } from "./chat-prompt-input";
 import {
   ConversationVirtualizer,
@@ -144,8 +143,7 @@ function ChatScreenContent({
   const status = describeAvailability(connection, ready);
 
   return (
-    <div className="flex h-dvh bg-background text-foreground">
-      <AppNavigation />
+    <div className="flex h-full bg-background text-foreground">
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-border/70 border-b px-3 sm:px-5">
           <div className="min-w-0 flex-1">

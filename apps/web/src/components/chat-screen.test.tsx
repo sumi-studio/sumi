@@ -99,10 +99,6 @@ vi.mock("./conversation-virtualizer", () => ({
   ),
 }));
 
-vi.mock("./app-navigation", () => ({
-  AppNavigation: () => null,
-}));
-
 vi.mock("./chat-prompt-input", () => ({
   ChatPromptInput: ({
     value,

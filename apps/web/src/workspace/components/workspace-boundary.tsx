@@ -110,7 +110,7 @@ function BoundaryStatus({
   action?: ReactNode;
 }) {
   return (
-    <main className="grid min-h-dvh place-items-center bg-background px-6 text-foreground">
+    <main className="grid h-full place-items-center bg-background px-6 text-foreground">
       <section
         className="flex max-w-md flex-col items-center gap-3 text-center"
         aria-live="polite"
