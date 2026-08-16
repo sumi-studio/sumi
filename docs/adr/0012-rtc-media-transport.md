@@ -102,6 +102,15 @@ JWT と本文の SHA-256 の照合だけである。
 - 新しい運用対象が 1 つ増える（livekit-server）。ローカルでは compose に
   1 サービス、本番では 1 コンテナ。UDP を通す必要があるため、ローカルは
   rtc-mux（単一 UDP ポート）で公開する。
+- **鍵はリポジトリに置かない。通話は両側とも opt-in である。**
+  `SUMI_LIVEKIT_API_KEY` と `SUMI_LIVEKIT_API_SECRET` の両方が設定されたとき
+  だけ、api は通話 route を生やし、launcher は compose の `calls` profile を
+  有効にして livekit-server を起動する。どちらも未設定なら通話は無効で、
+  メディアサーバーは**そもそも起動しない**。片方だけの設定は設定誤りとして
+  起動前に失敗させる（資格情報を失った後も `down` は動く）。既定の鍵を
+  リポジトリに書くと、無設定の stack が「公開された鍵で誰でも room token を
+  署名できるメディアサーバー」を晒しながら api 側の通話だけが無効、という
+  最悪の組み合わせになる。
 - `apps/api` の Go 依存は増えない。
 - `apps/web` は `livekit-client` を 1 つ追加する。UI コンポーネント
   ライブラリ（`@livekit/components-react`）は使わない — 通話 UI は既存の

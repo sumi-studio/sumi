@@ -19,6 +19,7 @@ ACTION=
 FIREBASE_MODE=emulator
 declare -a COMPOSE_ARGUMENTS=()
 declare -a COMPOSE_FILES=(-f "${BASE_COMPOSE_FILE}")
+declare -a COMPOSE_PROFILES_ARGUMENTS=()
 
 log() {
   printf '[sumi-compose-stack] %s\n' "$*" >&2
@@ -159,6 +160,30 @@ validate_real_firebase() {
   export SUMI_FIREBASE_ADC_FILE="${adc_file}"
 }
 
+# Calls are opt-in on both sides. The API mounts call routes only when it holds
+# LiveKit credentials, and the media server runs only for that same pair, which
+# nothing in this repository supplies. An unconfigured stack therefore has no
+# media server on the network at all, rather than one anybody can sign tokens
+# for. Half a credential is a configuration error, not a degraded mode.
+configure_calls() {
+  local key="${SUMI_LIVEKIT_API_KEY:-}"
+  local secret="${SUMI_LIVEKIT_API_SECRET:-}"
+  # Compose leaves containers of unselected profiles running, so teardown
+  # always selects the media profile. Otherwise removing the credential would
+  # strand exactly the media server this stack should no longer be running.
+  if [[ "${ACTION}" == "down" ]]; then
+    COMPOSE_PROFILES_ARGUMENTS=(--profile calls)
+    return
+  fi
+  if [[ -n "${key}" && -n "${secret}" ]]; then
+    COMPOSE_PROFILES_ARGUMENTS=(--profile calls)
+    return
+  fi
+  [[ -z "${key}" && -z "${secret}" ]] ||
+    fail "SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET must be set together"
+  log "calls disabled: set SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET to run LiveKit"
+}
+
 validate_docker_config_file() {
   require_value SUMI_DOCKER_CONFIG_FILE
   local docker_config_file owner mode links
@@ -287,6 +312,12 @@ non-root API container. config validates quietly and never renders secrets.
 current user's 0400/0600 Docker config.json. It is mounted read-only only into
 the runtime provisioner so lazily provisioned private GHCR agent images can be
 pulled. `config` and `down` do not require the credential file.
+
+Calls are opt-in and have no default credential. Setting SUMI_LIVEKIT_API_KEY
+and SUMI_LIVEKIT_API_SECRET together starts the LiveKit media server and mounts
+the API's call routes; leaving both unset starts no media server and keeps the
+API's call routes unmounted. Setting only one is an error. SUMI_LIVEKIT_URL is
+the browser-facing signalling address and defaults to the local media server.
 
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
 Set SUMI_LOCAL_COMPOSE_PROJECT to target an explicitly named local stack and
@@ -445,6 +476,7 @@ fi
 export SUMI_DEV_ALLOWED_HOSTS
 export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${browser_origins}"
 export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
+configure_calls
 
 # The only mutable compatibility upgrade is complete. Release the advisory
 # lock before Docker Compose runs so a foreground stack does not block `down`.
@@ -508,10 +540,12 @@ case "${ACTION}" in
   up)
     configure_local_apparmor_fallback
     ensure_control_plane_network
-    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" up "${COMPOSE_ARGUMENTS[@]}"
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" \
+      "${COMPOSE_PROFILES_ARGUMENTS[@]}" up "${COMPOSE_ARGUMENTS[@]}"
     ;;
   down)
-    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" \
+      "${COMPOSE_PROFILES_ARGUMENTS[@]}" down "${COMPOSE_ARGUMENTS[@]}"
     if [[ "${FIREBASE_MODE}" == "real" ]]; then
       # Unlike durable database/runtime state, the staged ADC must not survive
       # an ordinary stack shutdown. Ignore only the already-absent case.
@@ -523,6 +557,7 @@ case "${ACTION}" in
     ;;
   config)
     ((${#COMPOSE_ARGUMENTS[@]} == 0)) || fail "config accepts no additional Compose arguments"
-    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" config --quiet
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" \
+      "${COMPOSE_PROFILES_ARGUMENTS[@]}" config --quiet
     ;;
 esac
