@@ -410,7 +410,6 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
 }
 
 export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
-  const init = useMessaging((state) => state.init);
   const ready = useMessaging((state) => state.ready);
   const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
@@ -445,10 +444,6 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
-
-  useEffect(() => {
-    init();
-  }, [init]);
 
   // URLが現在地の正本。route paramのplaceをstoreへ同期する。
   // homeまたはbootstrapに存在しないplace URLは「未選択」が正本。表示だけを

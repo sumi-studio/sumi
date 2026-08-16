@@ -1,23 +1,16 @@
 import { Button } from "@sumi/ui/components/button";
 import { useNavigate } from "@tanstack/react-router";
 import { AlertTriangle, MessageCircle, Power } from "lucide-react";
-import { type ReactNode, useLayoutEffect, useReducer, useState } from "react";
+import { type ReactNode, useState } from "react";
 import { useAuth } from "../../auth/auth-context";
-import {
-  type MessagingScope,
-  messagingScopeKey,
-  sameMessagingScope,
-} from "../../messaging/scope";
-import {
-  bindMessagingScope,
-  getMessagingScope,
-  useMessaging,
-} from "../../messaging/store";
+import { messagingScopeKey, sameMessagingScope } from "../../messaging/scope";
+import { getMessagingScope, useMessaging } from "../../messaging/store";
 import {
   effectiveWorkspacePermissions,
   exactHumanMembership,
   useWorkspaceControl,
 } from "../store";
+import { messagingScopeForWorkspace } from "../messaging-scope";
 
 export function MessagingScopeGate({
   workspaceId,
@@ -35,11 +28,10 @@ export function MessagingScopeGate({
   const setInstallationState = useWorkspaceControl(
     (state) => state.setInstallationState,
   );
-  // Subscribe to reset-visible state so replacing the exact transport causes
-  // a render before the Messaging subtree is exposed.
-  useMessaging((state) => state.ready);
+  // The shell replaces the transport before this route can render it. Subscribe
+  // to that replacement so this gate re-reads the exact scope synchronously.
+  useMessaging((state) => state.transportGeneration);
   const { user } = useAuth();
-  const [, scopeBound] = useReducer((value: number) => value + 1, 0);
   const [failed, setFailed] = useState("");
   const matching = installations.filter(
     (installation) => installation.appId === "messaging",
@@ -50,50 +42,17 @@ export function MessagingScopeGate({
   const descriptor = descriptors.length === 1 ? descriptors[0] : null;
   const installation = matching.length === 1 ? matching[0] : null;
   const ownMembership = exactHumanMembership(members, user?.id);
-  const desiredWorkspaceId =
-    descriptor && installation?.state === "enabled" && ownMembership
-      ? workspaceId
-      : null;
-  const desiredInstallationId =
-    descriptor && installation?.state === "enabled" && ownMembership
-      ? installation.installationId
-      : null;
-  const desiredAuthorityEpoch =
-    descriptor && installation?.state === "enabled" && ownMembership
-      ? installation.authorityEpoch
-      : null;
-  const desired: MessagingScope | null =
-    desiredWorkspaceId && desiredInstallationId && desiredAuthorityEpoch
-      ? {
-          workspaceId: desiredWorkspaceId,
-          installationId: desiredInstallationId,
-          authorityEpoch: desiredAuthorityEpoch,
-        }
-      : null;
+  const desired = messagingScopeForWorkspace({
+    workspaceId,
+    humanId: user?.id,
+    catalog,
+    installations,
+    members,
+  });
   const current = getMessagingScope();
   const canManageApps = effectiveWorkspacePermissions(ownMembership, roles).has(
     "manage_apps",
   );
-
-  useLayoutEffect(() => {
-    const nextScope: MessagingScope | null =
-      desiredWorkspaceId && desiredInstallationId && desiredAuthorityEpoch
-        ? {
-            workspaceId: desiredWorkspaceId,
-            installationId: desiredInstallationId,
-            authorityEpoch: desiredAuthorityEpoch,
-          }
-        : null;
-    if (!sameMessagingScope(getMessagingScope(), nextScope)) {
-      bindMessagingScope(nextScope);
-      scopeBound();
-    }
-    return () => {
-      if (sameMessagingScope(getMessagingScope(), nextScope)) {
-        bindMessagingScope(null);
-      }
-    };
-  }, [desiredAuthorityEpoch, desiredInstallationId, desiredWorkspaceId]);
 
   if (!ownMembership) {
     return (

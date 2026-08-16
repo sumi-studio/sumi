@@ -3,11 +3,13 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiMessagingBackend } from "../../messaging/api-backend";
 import {
   bindMessagingSessionIdentity,
   getMessagingScope,
 } from "../../messaging/store";
 import type { WorkspaceControlState } from "../store";
+import { MessagingTransport } from "./messaging-transport";
 import { MessagingScopeGate } from "./messaging-scope-gate";
 
 const mocks = vi.hoisted(() => ({
@@ -168,7 +170,7 @@ describe("MessagingScopeGate", () => {
     );
   });
 
-  it("binds one enabled installation and disposes it on unmount", () => {
+  it("keeps one enabled installation bound when the Messaging surface unmounts", () => {
     mocks.state = workspaceState([
       {
         installationId: "installation-1",
@@ -181,9 +183,12 @@ describe("MessagingScopeGate", () => {
       },
     ]);
     const view = render(
-      <MessagingScopeGate workspaceId="workspace-1">
-        <div>Messaging child</div>
-      </MessagingScopeGate>,
+      <>
+        <MessagingTransport />
+        <MessagingScopeGate workspaceId="workspace-1">
+          <div>Messaging child</div>
+        </MessagingScopeGate>
+      </>,
     );
 
     expect(screen.getByText("Messaging child")).toBeInTheDocument();
@@ -194,7 +199,11 @@ describe("MessagingScopeGate", () => {
     });
 
     view.unmount();
-    expect(getMessagingScope()).toBeNull();
+    expect(getMessagingScope()).toEqual({
+      workspaceId: "workspace-1",
+      installationId: "installation-1",
+      authorityEpoch: "1",
+    });
   });
 
   it("resets the bound transport and subtree when an enabled installation rolls epoch", () => {
@@ -214,9 +223,12 @@ describe("MessagingScopeGate", () => {
       return <div>epoch child</div>;
     }
     const view = render(
-      <MessagingScopeGate workspaceId="workspace-1">
-        <Child />
-      </MessagingScopeGate>,
+      <>
+        <MessagingTransport />
+        <MessagingScopeGate workspaceId="workspace-1">
+          <Child />
+        </MessagingScopeGate>
+      </>,
     );
     expect(getMessagingScope()?.authorityEpoch).toBe("1");
 
@@ -227,13 +239,39 @@ describe("MessagingScopeGate", () => {
       },
     ]);
     view.rerender(
-      <MessagingScopeGate workspaceId="workspace-1">
-        <Child />
-      </MessagingScopeGate>,
+      <>
+        <MessagingTransport />
+        <MessagingScopeGate workspaceId="workspace-1">
+          <Child />
+        </MessagingScopeGate>
+      </>,
     );
 
     expect(getMessagingScope()?.authorityEpoch).toBe("2");
     expect(mounts).toBe(2);
+  });
+
+  it("closes the shell-owned transport when the Messaging session logs out", () => {
+    mocks.state = workspaceState([
+      {
+        installationId: "installation-1",
+        owner: { kind: "workspace", workspaceId: "workspace-1" },
+        appId: "messaging",
+        state: "enabled",
+        authorityEpoch: "1",
+        installedAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+    const dispose = vi.spyOn(ApiMessagingBackend.prototype, "dispose");
+
+    render(<MessagingTransport />);
+    expect(getMessagingScope()).not.toBeNull();
+
+    bindMessagingSessionIdentity(null);
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(getMessagingScope()).toBeNull();
   });
 
   it("fails closed when duplicate app bindings are returned", () => {

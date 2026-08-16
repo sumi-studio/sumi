@@ -34,6 +34,9 @@ describe("ConnectionBanner", () => {
   it("shows a reconnecting banner while the socket is down", () => {
     render(<ConnectionBanner />);
     act(() => useMessaging.setState({ connection: "reconnecting" }));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    act(() => vi.advanceTimersByTime(1_500));
     expect(screen.getByRole("status")).toHaveTextContent("再接続中…");
 
     act(() => useMessaging.setState({ connection: "disconnected" }));
@@ -42,9 +45,20 @@ describe("ConnectionBanner", () => {
     );
   });
 
-  it("flashes a short notice after reconnecting, then disappears", () => {
+  it("suppresses a reconnecting blip shorter than the delay", () => {
     render(<ConnectionBanner />);
     act(() => useMessaging.setState({ connection: "reconnecting" }));
+    act(() => vi.advanceTimersByTime(1_000));
+    act(() => useMessaging.setState({ connection: "connected" }));
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("flashes a short notice after a visible reconnection, then disappears", () => {
+    render(<ConnectionBanner />);
+    act(() => useMessaging.setState({ connection: "reconnecting" }));
+    act(() => vi.advanceTimersByTime(1_500));
+    expect(screen.getByRole("status")).toHaveTextContent("再接続中…");
     act(() => useMessaging.setState({ connection: "connected" }));
     expect(screen.getByRole("status")).toHaveTextContent("再接続しました");
 

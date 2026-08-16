@@ -127,6 +127,8 @@ interface MessagingState {
   editingMessageId: string | null;
   replyTargetId: string | null;
   connection: ConnectionState;
+  /** Changes synchronously whenever the exact transport authority is replaced. */
+  transportGeneration: number;
 
   init(): void;
   selectPlace(key: PlaceKey): void;
@@ -1131,7 +1133,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     activePlaceKey: null,
     editingMessageId: null,
     replyTargetId: null,
-    connection: "connected",
+    connection: "disconnected",
+    transportGeneration: 0,
 
     init() {
       if (initialized) return;
@@ -1702,5 +1705,6 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editingMessageId: null,
     replyTargetId: null,
     connection: "disconnected",
+    transportGeneration: messagingSessionGeneration,
   });
 }
