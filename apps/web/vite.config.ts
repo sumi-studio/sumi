@@ -62,7 +62,9 @@ export function createDevServerConfig(
   }
   for (const allowed of allowedHosts) {
     if (!/^\.?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(allowed)) {
-      throw new Error(`Sumi dev allowed host is not a plain hostname: ${allowed}`);
+      throw new Error(
+        `Sumi dev allowed host is not a plain hostname: ${allowed}`,
+      );
     }
   }
   return {
