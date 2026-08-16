@@ -488,21 +488,19 @@ for reviewer in EXECUTION ESCALATION; do
   preset_name="SUMI_${reviewer}_REVIEWER_MODEL_PRESET"
   key_env_name="SUMI_${reviewer}_REVIEWER_MODEL_API_KEY_ENV"
   activation_key_name="SUMI_${reviewer}_REVIEWER_API_KEY"
-  if [[ "${ACTION}" == "down" && -z "${!preset_name:-}" ]]; then
-    export "${preset_name}=unconfigured-cleanup-only"
-    export "${activation_key_name}=cleanup-only"
-    continue
+  export "${preset_name}=${!preset_name:-${SUMI_MODEL_PRESET}}"
+  credential_name="${!key_env_name:-}"
+  if [[ -n "${credential_name}" ]]; then
+    [[ "${credential_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+      fail "${key_env_name} must name one environment variable"
+    reviewer_api_key="${!credential_name:-}"
+    [[ -n "${reviewer_api_key}" ]] ||
+      fail "${credential_name} is required by the configured reviewer provider"
+  else
+    reviewer_api_key="${SUMI_PROVIDER_API_KEY}"
   fi
-  require_value "${preset_name}"
-  require_value "${key_env_name}"
-  credential_name="${!key_env_name}"
-  [[ "${credential_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-    fail "${key_env_name} must name one environment variable"
-  reviewer_api_key="${!credential_name:-}"
-  [[ -n "${reviewer_api_key}" ]] ||
-    fail "${credential_name} is required by the configured reviewer provider"
   [[ "${reviewer_api_key}" != *$'\n'* && "${reviewer_api_key}" != *$'\r'* ]] ||
-    fail "${credential_name} must be one line"
+    fail "reviewer provider credential must be one line"
   export "${activation_key_name}=${reviewer_api_key}"
 done
 

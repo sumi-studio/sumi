@@ -246,7 +246,7 @@ validate_firebase_admin_mode() {
 }
 
 validate_configuration() {
-  local web_project provider_api_key prefix key_env_name reviewer_api_key
+  local web_project provider_api_key prefix key_env_name reviewer_api_key_env reviewer_api_key
   validate_public_listen
   require_value SUMI_PERSONALITY_AGENT_ID
   valid_paid "${SUMI_PERSONALITY_AGENT_ID}" ||
@@ -261,11 +261,7 @@ validate_configuration() {
     SUMI_AUTH_FIREBASE_PROJECT_ID \
     SUMI_AUTH_TENANT_ID \
     SUMI_MODEL_PRESET \
-    SUMI_MODEL_API_KEY_ENV \
-    SUMI_EXECUTION_REVIEWER_MODEL_PRESET \
-    SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV \
-    SUMI_ESCALATION_REVIEWER_MODEL_PRESET \
-    SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV
+    SUMI_MODEL_API_KEY_ENV
   do
     require_value "${name}"
   done
@@ -302,14 +298,15 @@ validate_configuration() {
     fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
   for prefix in SUMI_EXECUTION_REVIEWER_MODEL SUMI_ESCALATION_REVIEWER_MODEL; do
     key_env_name="${prefix}_API_KEY_ENV"
-    [[ "${!key_env_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    reviewer_api_key_env="${!key_env_name:-}"
+    [[ -z "${reviewer_api_key_env}" ]] && continue
+    [[ "${reviewer_api_key_env}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
       fail "${key_env_name} must name one environment variable"
-    reviewer_api_key="${!key_env_name}"
-    reviewer_api_key="${!reviewer_api_key:-}"
+    reviewer_api_key="${!reviewer_api_key_env:-}"
     [[ -n "${reviewer_api_key}" ]] ||
-      fail "${!key_env_name} is required by the configured reviewer provider"
+      fail "${reviewer_api_key_env} is required by the configured reviewer provider"
     [[ "${reviewer_api_key}" != *$'\n'* && "${reviewer_api_key}" != *$'\r'* ]] ||
-      fail "${!key_env_name} must be one line"
+      fail "${reviewer_api_key_env} must be one line"
   done
 
   validate_firebase_admin_mode
@@ -650,6 +647,7 @@ log "starting API"
     "SUMI_AUTH_ALLOW_INSECURE_COOKIES=true" \
     "SUMI_AUTH_SESSION_TTL=1h" \
     "SUMI_DB_URL=${POSTGRES_DB_URL}" \
+    "SUMI_AGENT_WRAPPING_KEY_ID=local-ephemeral/v1" \
     "SUMI_LOCAL_CONTROL_ENABLED=1" \
     "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}" \
     "SUMI_LOCAL_CONTROL_TENANT_ID=${SUMI_AUTH_TENANT_ID}" \
@@ -688,10 +686,6 @@ CHILD_PIDS+=("${EXECUTOR_PID}")
 wait_for_socket "${EXECUTOR_SOCKET}" "${EXECUTOR_PID}"
 
 provider_api_key="${!SUMI_MODEL_API_KEY_ENV}"
-execution_reviewer_api_key_env="${SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV}"
-execution_reviewer_api_key="${!execution_reviewer_api_key_env}"
-escalation_reviewer_api_key_env="${SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV}"
-escalation_reviewer_api_key="${!escalation_reviewer_api_key_env}"
 declare -a runtime_environment=(
   "PATH=${PATH}"
   "HOME=${AGENT_STATE_DIR}"
@@ -705,6 +699,7 @@ declare -a runtime_environment=(
   "SUMI_STATE_DIR=${AGENT_STATE_DIR}"
   "SUMI_WORKSPACE=${WORKSPACE_DIR}"
   "SUMI_EXECUTOR_SOCKET=${EXECUTOR_SOCKET}"
+  "SUMI_EXECUTOR_SERVER_UID=$(id -u)"
   "SUMI_GATEWAY_URL=ws://${LOOPBACK_GATEWAY_LISTEN}/agent/ws"
   "SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY=true"
   "SUMI_LOCAL_CONTROL_URL=${LOCAL_CONTROL_ORIGIN}"
@@ -716,28 +711,33 @@ declare -a runtime_environment=(
   "SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET}"
   "SUMI_MODEL_API_KEY_ENV=${SUMI_MODEL_API_KEY_ENV}"
   "${SUMI_MODEL_API_KEY_ENV}=${provider_api_key}"
-  "SUMI_EXECUTION_REVIEWER_MODEL_PRESET=${SUMI_EXECUTION_REVIEWER_MODEL_PRESET}"
-  "SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV=${SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV}"
-  "${SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV}=${execution_reviewer_api_key}"
-  "SUMI_ESCALATION_REVIEWER_MODEL_PRESET=${SUMI_ESCALATION_REVIEWER_MODEL_PRESET}"
-  "SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV=${SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV}"
-  "${SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV}=${escalation_reviewer_api_key}"
   "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}"
 )
 for name in \
   SUMI_MODEL_ID \
   SUMI_MODEL_BASE_URL \
+  SUMI_EXECUTION_REVIEWER_MODEL_PRESET \
   SUMI_EXECUTION_REVIEWER_MODEL_ID \
   SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL \
   SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE \
+  SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV \
+  SUMI_ESCALATION_REVIEWER_MODEL_PRESET \
   SUMI_ESCALATION_REVIEWER_MODEL_ID \
   SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL \
   SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE \
+  SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV \
   SUMI_SYSTEM_PROMPT \
   SUMI_SYSTEM_PROMPT_FILE
 do
   if [[ -n "${!name:-}" ]]; then
     runtime_environment+=("${name}=${!name}")
+  fi
+done
+for prefix in SUMI_EXECUTION_REVIEWER_MODEL SUMI_ESCALATION_REVIEWER_MODEL; do
+  key_env_name="${prefix}_API_KEY_ENV"
+  reviewer_api_key_env="${!key_env_name:-}"
+  if [[ -n "${reviewer_api_key_env}" ]]; then
+    runtime_environment+=("${reviewer_api_key_env}=${!reviewer_api_key_env}")
   fi
 done
 
