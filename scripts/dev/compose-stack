@@ -419,7 +419,13 @@ if [[ -n "${SUMI_DEV_PUBLIC_ORIGINS:-}" ]]; then
     [[ -z "${public_origin}" ]] && continue
     [[ "${public_origin}" =~ ^https://([A-Za-z0-9.-]+)(:[0-9]{1,5})?$ ]] ||
       fail "SUMI_DEV_PUBLIC_ORIGINS entries must be exact https origins: ${public_origin}"
-    SUMI_DEV_ALLOWED_HOSTS="${SUMI_DEV_ALLOWED_HOSTS:+${SUMI_DEV_ALLOWED_HOSTS},}${BASH_REMATCH[1]}"
+    # Browsers serialize Origin with a lowercase host and without the default
+    # port, and the API compares origins exactly — normalize the same way.
+    public_host="${BASH_REMATCH[1],,}"
+    public_port="${BASH_REMATCH[2]}"
+    [[ "${public_port}" == ":443" ]] && public_port=""
+    public_origin="https://${public_host}${public_port}"
+    SUMI_DEV_ALLOWED_HOSTS="${SUMI_DEV_ALLOWED_HOSTS:+${SUMI_DEV_ALLOWED_HOSTS},}${public_host}"
     browser_origins="${browser_origins},${public_origin}"
   done
 fi
