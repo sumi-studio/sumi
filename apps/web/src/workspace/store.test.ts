@@ -938,6 +938,41 @@ describe("Workspace control store", () => {
     ).toBeNull();
   });
 
+  it("reconciles a retried install that the server already committed", async () => {
+    const enabled = installation(
+      WORKSPACE_A_ID,
+      "enabled",
+      "2026-08-10T06:07:08.901Z",
+    );
+    let listed: AppInstallation[] = [];
+    const installApp = vi.fn(async () => {
+      // The first POST committed but its response was lost; the retry carries a
+      // fresh operation id and is refused as already installed.
+      listed = [enabled];
+      throw new WorkspaceAPIError("install_intent_already_installed", 409);
+    });
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [ROLE_A],
+        listAppCatalog: async () => [APP],
+        listInstallations: async () => listed,
+        installApp,
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    await expect(store.getState().installApp(APP_ID)).resolves.toEqual(enabled);
+    expect(installationForApp(store.getState().installations, APP_ID)).toBe(
+      enabled,
+    );
+    expect(store.getState().mutation).toBeNull();
+  });
+
   it("never admits a delayed old-Workspace snapshot after switching scope", async () => {
     const oldSnapshotGate = deferred<void>();
     const APP_B: AppDescriptor = {

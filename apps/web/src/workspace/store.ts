@@ -900,6 +900,29 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           endMutation(token);
           return installation;
         } catch (error) {
+          // A retry after a lost response carries a fresh operation id, so the
+          // server reports the earlier commit as already installed. Reconcile
+          // from the server instead of leaving the UI stuck on an error.
+          if (
+            error instanceof WorkspaceAPIError &&
+            error.code === "install_intent_already_installed" &&
+            isCurrentScope(token)
+          ) {
+            const installations = await client.listInstallations({
+              kind: "workspace",
+              workspaceId: token.workspaceId,
+            });
+            if (!isCurrentScope(token)) throw error;
+            const installed = installations.find(
+              (installation) => installation.appId === appId,
+            );
+            if (installed) {
+              validateInstallation(token.workspaceId, installed, appId);
+              set({ installations });
+              endMutation(token);
+              return installed;
+            }
+          }
           endMutation(token, error);
           throw error;
         }
