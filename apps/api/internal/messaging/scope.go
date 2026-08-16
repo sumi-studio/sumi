@@ -30,9 +30,16 @@ type Scope struct {
 }
 
 func (s Scope) Validate() error {
+	if err := s.validateAddress(); err != nil {
+		return err
+	}
 	if err := s.Actor.Validate(); err != nil {
 		return fmt.Errorf("%w: actor: %v", ErrInvalidScope, err)
 	}
+	return nil
+}
+
+func (s Scope) validateAddress() error {
 	if err := applicationapps.WorkspaceOwner(s.WorkspaceID).Validate(); err != nil {
 		return fmt.Errorf("%w: workspace_id", ErrInvalidScope)
 	}

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -393,6 +394,17 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
 		messagingServer.RegisterRoutes(mux)
+		livekit, callsEnabled, configErr := liveKitConfigFromEnv()
+		if configErr != nil {
+			closeOnError()
+			return nil, configErr
+		}
+		if callsEnabled {
+			calls := messaging.NewCallService(messagingServer, livekit)
+			messagingServer.Calls = calls
+			calls.RegisterRoutes(mux)
+			log.Printf("messaging calls ready (livekit url=%s)", livekit.URL)
+		}
 		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
 		messagingWS.AllowedOrigins = browserOrigins
 		mux.Handle("GET /messaging/ws", messagingWS)
@@ -531,6 +543,28 @@ func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 		blobs.RootPath(), policy.WorkspaceQuotaBytes, policy.WorkspaceQuotaObjects,
 		policy.TotalQuotaBytes, policy.TotalQuotaObjects)
 	return nil
+}
+
+// liveKitConfigFromEnv leaves calls absent when both credentials are empty.
+// A partially configured media boundary fails startup instead of mounting a
+// route that can mint unusable credentials.
+func liveKitConfigFromEnv() (messaging.LiveKitConfig, bool, error) {
+	config := messaging.LiveKitConfig{
+		URL:       strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_URL")),
+		APIKey:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_KEY")),
+		APISecret: strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_SECRET")),
+	}
+	if config.APIKey == "" && config.APISecret == "" {
+		return messaging.LiveKitConfig{}, false, nil
+	}
+	if config.APIKey == "" || config.APISecret == "" || config.URL == "" {
+		return messaging.LiveKitConfig{}, false, errors.New("SUMI_LIVEKIT_URL, SUMI_LIVEKIT_API_KEY, and SUMI_LIVEKIT_API_SECRET must be configured together")
+	}
+	parsed, err := url.Parse(config.URL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
+		return messaging.LiveKitConfig{}, false, errors.New("SUMI_LIVEKIT_URL must be an absolute ws:// or wss:// URL")
+	}
+	return config, true, nil
 }
 
 // databaseFromEnv opens and migrates the control-plane Postgres database when

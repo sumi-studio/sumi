@@ -57,7 +57,7 @@ func (s *ScopedStore) WorkspaceMembers(ctx context.Context) ([]MemberProfile, er
 	return members, nil
 }
 
-func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string) (Place, error) {
+func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string, voice bool) (Place, error) {
 	if name == "" || len(name) > 200 {
 		return Place{}, ErrInvalidChannelName
 	}
@@ -71,12 +71,12 @@ func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string) (Pl
 	}
 	place := Place{
 		PlaceID: newUUIDv7(), Kind: PlaceChannel, WorkspaceID: s.Scope.WorkspaceID,
-		Name: name, Topic: topic, Visibility: "public",
+		Name: name, Topic: topic, Visibility: "public", Voice: voice,
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO places (place_id, kind, workspace_id, name, topic)
-		VALUES ($1, 'channel', $2, $3, $4)`,
-		place.PlaceID, place.WorkspaceID, place.Name, place.Topic); err != nil {
+		INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
+		VALUES ($1, 'channel', $2, $3, $4, $5)`,
+		place.PlaceID, place.WorkspaceID, place.Name, place.Topic, place.Voice); err != nil {
 		return Place{}, fmt.Errorf("insert channel: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -296,10 +296,10 @@ func (s *ScopedStore) loadScopedPlaceWithClause(
 	var place Place
 	var name *string
 	err := q.QueryRow(ctx, `
-		SELECT place_id, kind, workspace_id, name, topic, visibility, last_seq
+		SELECT place_id, kind, workspace_id, name, topic, visibility, last_seq, voice
 		FROM places WHERE workspace_id = $1 AND place_id = $2`+lockClause,
 		s.Scope.WorkspaceID, placeID).Scan(&place.PlaceID, &place.Kind, &place.WorkspaceID,
-		&name, &place.Topic, &place.Visibility, &place.LastSeq)
+		&name, &place.Topic, &place.Visibility, &place.LastSeq, &place.Voice)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Place{}, ErrPlaceNotFound
 	}

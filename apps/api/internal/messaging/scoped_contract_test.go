@@ -54,11 +54,11 @@ func TestExactScopeIsolatesWorkspacesAndInstallationLifecycles(t *testing.T) {
 	w := newWorld(t, ctx)
 	first := newScopedContractFixture(t, ctx, w, "first", w.humanB)
 	second := newScopedContractFixture(t, ctx, w, "second", w.humanB)
-	firstChannel, err := first.scope(t, w, w.humanA).CreateChannel(ctx, "general", "")
+	firstChannel, err := first.scope(t, w, w.humanA).CreateChannel(ctx, "general", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondChannel, err := second.scope(t, w, w.humanA).CreateChannel(ctx, "general", "")
+	secondChannel, err := second.scope(t, w, w.humanA).CreateChannel(ctx, "general", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestStaleAuthorityEpochCannotReviveAcrossMessagingAuthorizers(t *testing.T)
 	w := newWorld(t, ctx)
 	fixture := newScopedContractFixture(t, ctx, w, "epoch", w.agent)
 	stale := fixture.scope(t, w, w.humanA)
-	channel, err := stale.CreateChannel(ctx, "before-disable", "")
+	channel, err := stale.CreateChannel(ctx, "before-disable", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestStaleAuthorityEpochCannotReviveAcrossMessagingAuthorizers(t *testing.T)
 		PlaceID: channel.PlaceID, Content: "stale mutation", ClientNonce: "stale-epoch",
 	})
 	assertStale("mutation", err)
-	_, err = stale.CreateChannel(ctx, "stale-manage", "")
+	_, err = stale.CreateChannel(ctx, "stale-manage", "", false)
 	assertStale("manage channels", err)
 
 	current := w.store.mustScope(t, ctx, fixture.workspace.WorkspaceID, w.humanA)
@@ -149,7 +149,7 @@ func TestExactScopedReadsHaveNoPersistenceSideEffects(t *testing.T) {
 	defer cancel()
 	w := newWorld(t, ctx)
 	fixture := newScopedContractFixture(t, ctx, w, "reads", w.humanB)
-	channel, err := fixture.scope(t, w, w.humanA).CreateChannel(ctx, "general", "")
+	channel, err := fixture.scope(t, w, w.humanA).CreateChannel(ctx, "general", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -42,7 +42,7 @@ func TestManageChannelsLockOrderIsWorkspaceThenInstallationThenAppRows(t *testin
 
 	createDone := make(chan placeOutcome, 1)
 	go func() {
-		place, err := store.CreateChannel(ctx, "ordered", "")
+		place, err := store.CreateChannel(ctx, "ordered", "", false)
 		createDone <- placeOutcome{place: place, err: err}
 	}()
 	// Channel management must already hold Workspace FOR SHARE when it reaches

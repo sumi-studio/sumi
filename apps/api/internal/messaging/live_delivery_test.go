@@ -267,7 +267,7 @@ func TestProductionHubPartitionsSocketsByExactAppAddress(t *testing.T) {
 	first := newScopedContractFixture(t, ctx, w, "first", w.humanB)
 	second := newScopedContractFixture(t, ctx, w, "second", w.humanB)
 	firstStore := first.scope(t, w, w.humanA)
-	channel, err := firstStore.CreateChannel(ctx, "general", "")
+	channel, err := firstStore.CreateChannel(ctx, "general", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
