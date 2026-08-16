@@ -375,10 +375,6 @@ func (s *Store) Installations(ctx context.Context, owner OwnerRef, actor partici
 	return installations, nil
 }
 
-func (s *Store) Install(ctx context.Context, owner OwnerRef, actor participant.Ref, appID string) (Installation, error) {
-	return s.install(ctx, owner, actor, appID, "")
-}
-
 // InstallAtOperation applies one durable browser install intent. Its receipt
 // survives uninstall, so a delayed request with the same operation id can
 // return only the historical terminal outcome and can never recreate a
@@ -404,20 +400,18 @@ func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.R
 	if err := s.authorizeMutation(ctx, tx, owner, actor); err != nil {
 		return Installation{}, err
 	}
-	if operationID != "" {
-		// A terminal receipt is the historical truth for this exact operation,
-		// even if the catalog has changed since the original request. Read it
-		// before current descriptor validation. If no receipt exists, the later
-		// atomic claim still resolves a concurrent first request.
-		historical, receiptErr := readInstallOperationReceipt(
-			ctx, tx, owner, appID, operationID,
-		)
-		if receiptErr == nil {
-			return historical, nil
-		}
-		if !errors.Is(receiptErr, pgx.ErrNoRows) {
-			return Installation{}, receiptErr
-		}
+	// A terminal receipt is the historical truth for this exact operation,
+	// even if the catalog has changed since the original request. Read it
+	// before current descriptor validation. If no receipt exists, the later
+	// atomic claim still resolves a concurrent first request.
+	historical, receiptErr := readInstallOperationReceipt(
+		ctx, tx, owner, appID, operationID,
+	)
+	if receiptErr == nil {
+		return historical, nil
+	}
+	if !errors.Is(receiptErr, pgx.ErrNoRows) {
+		return Installation{}, receiptErr
 	}
 	descriptor, err := descriptorByID(ctx, tx, appID)
 	if err != nil {
@@ -432,25 +426,6 @@ func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.R
 		State: StateEnabled, AuthorityEpoch: 1, InstalledAt: now, UpdatedAt: now,
 	}
 	storageKind, storageID := ownerStorageKey(owner)
-	if operationID == "" {
-		_, err = tx.Exec(ctx, `
-		INSERT INTO app_installations
-			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
-			 installed_at, updated_at)
-		VALUES ($1, $2, $3, $4, true, 1, $5, $5)`,
-			installation.InstallationID, storageKind, storageID, appID, now)
-		if err != nil {
-			if isUniqueConstraint(err, appInstallationOwnerAppConstraint) {
-				return Installation{}, ErrAlreadyInstalled
-			}
-			return Installation{}, fmt.Errorf("insert app installation: %w", err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return Installation{}, fmt.Errorf("commit install app: %w", err)
-		}
-		return installation, nil
-	}
-
 	claimed, historical, err := claimInstallOperation(ctx, tx, owner, appID, operationID, now)
 	if err != nil {
 		return Installation{}, err

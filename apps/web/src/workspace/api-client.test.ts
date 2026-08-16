@@ -509,6 +509,7 @@ describe("WorkspaceApiClient", () => {
       client.installApp(
         { kind: "workspace", workspaceId: WORKSPACE_A_ID },
         APP_ID,
+        "00000000-0000-4000-8000-000000000200",
       ),
     ).resolves.toEqual({
       installationId: INSTALLATION_ID,
@@ -547,6 +548,7 @@ describe("WorkspaceApiClient", () => {
     expectRequest(fetcher, 2, "/app-installations", "POST", {
       owner: { kind: "workspace", workspace_id: WORKSPACE_A_ID },
       app_id: APP_ID,
+      operation_id: "00000000-0000-4000-8000-000000000200",
     });
     expectRequest(
       fetcher,

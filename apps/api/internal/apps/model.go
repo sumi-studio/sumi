@@ -72,7 +72,6 @@ var (
 	ErrForbidden                     = errors.New("app lifecycle operation forbidden")
 	ErrAppNotFound                   = errors.New("app not found")
 	ErrOwnerKindUnsupported          = errors.New("app does not support this owner kind")
-	ErrAlreadyInstalled              = errors.New("app is already installed for this owner")
 	ErrInstallIntentAlreadyInstalled = errors.New("app install intent previously found an existing installation")
 	ErrInstallIntentMismatch         = errors.New("app install operation was reused for a different intent")
 	ErrInstallIntentIncomplete       = errors.New("app install operation receipt is incomplete")

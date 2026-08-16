@@ -785,19 +785,21 @@ func (s *Server) localResolveEnabledApp(w http.ResponseWriter, r *http.Request, 
 
 func (s *Server) localInstallApp(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
-		Owner appOwnerWire `json:"owner"`
-		AppID string       `json:"app_id"`
+		Owner       appOwnerWire    `json:"owner"`
+		AppID       string          `json:"app_id"`
+		OperationID json.RawMessage `json:"operation_id"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
 	owner, err := request.Owner.ref()
-	if err != nil || request.AppID == "" {
+	operationID, present, valid := optionalNonEmptyString(request.OperationID)
+	if err != nil || request.AppID == "" || !present || !valid || applicationapps.ValidateInstallOperationID(operationID) != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	installation, err := s.Apps.Install(r.Context(), owner,
-		localActor(authorization), request.AppID)
+	installation, err := s.Apps.InstallAtOperation(r.Context(), owner,
+		localActor(authorization), request.AppID, operationID)
 	if err != nil {
 		writeDomainError(w, err)
 		return

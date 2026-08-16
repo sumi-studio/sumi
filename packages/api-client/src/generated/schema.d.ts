@@ -613,14 +613,14 @@ export interface components {
         WorkspaceAppInstallRequest: {
             owner: components["schemas"]["WorkspaceAppOwnerRef"];
             app_id: components["schemas"]["AppId"];
-            operation_id?: components["schemas"]["UUIDv4"];
+            operation_id: components["schemas"]["UUIDv4"];
         };
         ParticipantAppInstallRequest: {
             owner: components["schemas"]["ParticipantAppOwnerRef"];
             app_id: components["schemas"]["AppId"];
             operation_id: components["schemas"]["UUIDv4"];
         };
-        /** @description Strict owner-discriminated install intent. Participant installs require a durable UUIDv4 operation identity; Workspace installs may omit it for the legacy flow. */
+        /** @description Strict owner-discriminated install intent with a durable UUIDv4 operation identity. */
         AppInstallRequest: components["schemas"]["WorkspaceAppInstallRequest"] | components["schemas"]["ParticipantAppInstallRequest"];
         AppDescriptor: {
             app_id: components["schemas"]["AppId"];

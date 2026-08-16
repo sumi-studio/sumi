@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
@@ -471,8 +472,8 @@ func TestLocalResolveEnabledAppBindsAuthenticatedActorWithoutInferenceOrSideEffe
 	if err != nil {
 		t.Fatal(err)
 	}
-	installed, err := appStore.Install(ctx,
-		applicationapps.WorkspaceOwner(created.WorkspaceID), w.agentA, "messaging")
+	installed, err := appStore.InstallAtOperation(ctx,
+		applicationapps.WorkspaceOwner(created.WorkspaceID), w.agentA, "messaging", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +828,7 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 			participantInstall.Code, participantInstall.Body.String())
 	}
 	agentInstall := invokeLocal(server.localInstallApp, fmt.Sprintf(
-		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":"00000000-0000-4000-8000-000000000203"}`,
 		agentWorkspace.WorkspaceID), w.agentA.ID)
 	if agentInstall.Code != http.StatusCreated {
 		t.Fatalf("Agent app install status = %d, body=%s", agentInstall.Code, agentInstall.Body.String())
@@ -894,7 +895,7 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		t.Fatalf("Agent uninstall status = %d, body=%s", agentUninstall.Code, agentUninstall.Body.String())
 	}
 	personalAgentInstall := invokeLocal(server.localInstallApp, fmt.Sprintf(
-		`{"owner":{"kind":"participant","participant":{"kind":"personality_agent","personality_agent_id":%q}},"app_id":"alarm"}`,
+		`{"owner":{"kind":"participant","participant":{"kind":"personality_agent","personality_agent_id":%q}},"app_id":"alarm","operation_id":"00000000-0000-4000-8000-000000000204"}`,
 		w.agentA.ID), w.agentA.ID)
 	if personalAgentInstall.Code != http.StatusCreated {
 		t.Fatalf("Agent participant app install status = %d, body=%s",
@@ -1047,7 +1048,7 @@ func TestInvitePreviewAndRequiredRequestPresenceAcrossTransports(t *testing.T) {
 	agentWorkspace := localWorkspaceMutation(t, server, server.localCreateWorkspace,
 		`{"name":"Agent presence"}`, http.StatusCreated, w.agentA.ID)
 	install := invokeLocal(server.localInstallApp, fmt.Sprintf(
-		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":"00000000-0000-4000-8000-000000000205"}`,
 		agentWorkspace.WorkspaceID), w.agentA.ID)
 	if install.Code != http.StatusCreated {
 		t.Fatalf("install app = %d: %s", install.Code, install.Body.String())
@@ -1210,7 +1211,7 @@ func TestRegisteredLocalControlWorkspaceRoutesAuthenticateAndBindGeneration(t *t
 		t.Fatalf("registered invite-preview route = %d: %s", preview.Code, preview.Body.String())
 	}
 	installResponse := call(LocalAppInstallPath, authorization.BearerToken, fmt.Sprintf(
-		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging"}`,
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":"00000000-0000-4000-8000-000000000206"}`,
 		created.WorkspaceID))
 	if installResponse.Code != http.StatusCreated {
 		t.Fatalf("registered app-install route = %d: %s", installResponse.Code, installResponse.Body.String())

@@ -187,10 +187,6 @@ const appLifecycleRequestCases = [
       {
         owner: { kind: "workspace", workspace_id: workspaceId },
         app_id: "messaging",
-      },
-      {
-        owner: { kind: "workspace", workspace_id: workspaceId },
-        app_id: "messaging",
         operation_id: operationId,
       },
       {
@@ -203,6 +199,13 @@ const appLifecycleRequestCases = [
       },
     ],
     invalid: [
+      {
+        name: "Workspace operation identity is omitted",
+        value: {
+          owner: { kind: "workspace", workspace_id: workspaceId },
+          app_id: "messaging",
+        },
+      },
       {
         name: "Participant operation identity is omitted",
         value: {
