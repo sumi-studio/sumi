@@ -127,6 +127,12 @@ interface MessagingState {
   editingMessageId: string | null;
   replyTargetId: string | null;
   connection: ConnectionState;
+  /**
+   * True once this transport authority has been connected at least once, so an
+   * interruption can be told apart from the initial handshake even by UI that
+   * mounts while the interruption is already under way. Reset with the scope.
+   */
+  everConnected: boolean;
   /** Changes synchronously whenever the exact transport authority is replaced. */
   transportGeneration: number;
 
@@ -1134,6 +1140,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     editingMessageId: null,
     replyTargetId: null,
     connection: "disconnected",
+    everConnected: false,
     transportGeneration: 0,
 
     init() {
@@ -1193,7 +1200,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
           let connectedOnce = false;
           backend.subscribeConnection((connection) => {
-            set({ connection });
+            set((state) => ({
+              connection,
+              everConnected: state.everConnected || connection === "connected",
+            }));
             if (connection !== "connected") return;
             if (connectedOnce) {
               void reconcilePlaces().catch(() => undefined);
@@ -1705,6 +1715,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editingMessageId: null,
     replyTargetId: null,
     connection: "disconnected",
+    everConnected: false,
     transportGeneration: messagingSessionGeneration,
   });
 }

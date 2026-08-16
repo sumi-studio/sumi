@@ -11,18 +11,20 @@ const RECONNECTING_DELAY_MS = 1_500;
  */
 export function ConnectionBanner() {
   const connection = useMessaging((state) => state.connection);
+  // Transport-level fact, not component-local: the shell keeps the transport
+  // alive across app routes, so this banner can mount while an interruption is
+  // already in progress and must still treat it as one.
+  const everConnected = useMessaging((state) => state.everConnected);
   const [flash, setFlash] = useState(false);
   const [interruptionVisible, setInterruptionVisible] = useState(false);
   const interruptionWasVisible = useRef(false);
-  const hasConnected = useRef(connection === "connected");
-  const wasInterrupted = useRef(false);
+  const wasInterrupted = useRef(everConnected && connection !== "connected");
   const previousConnection = useRef(connection);
 
   useEffect(() => {
     const previous = previousConnection.current;
     previousConnection.current = connection;
     if (connection === "connected") {
-      hasConnected.current = true;
       if (!wasInterrupted.current) return;
       const showRecovered = interruptionWasVisible.current;
       wasInterrupted.current = false;
@@ -38,7 +40,7 @@ export function ConnectionBanner() {
       return () => window.clearTimeout(timer);
     }
 
-    if (!hasConnected.current) return;
+    if (!everConnected) return;
     if (previous === "connected") wasInterrupted.current = true;
     if (!wasInterrupted.current) return;
     setFlash(false);
@@ -55,7 +57,7 @@ export function ConnectionBanner() {
       RECONNECTING_DELAY_MS,
     );
     return () => window.clearTimeout(timer);
-  }, [connection]);
+  }, [connection, everConnected]);
 
   if (connection === "connected" && !flash) return null;
   if (!interruptionVisible && !flash) return null;
