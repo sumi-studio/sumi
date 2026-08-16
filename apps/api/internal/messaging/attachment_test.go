@@ -25,6 +25,39 @@ type attachmentFixture struct {
 	blobs *DiskAttachments
 }
 
+// commitSweepGate makes the crash-after-publish window reproducible: Commit
+// has made the final file visible but the metadata transaction is still open
+// while Sweep records that old file as a candidate.
+type commitSweepGate struct {
+	AttachmentBlobs
+	committed chan struct{}
+	swept     chan struct{}
+	release   <-chan struct{}
+	after     func() error
+	commit    sync.Once
+	sweep     sync.Once
+}
+
+func (g *commitSweepGate) Commit(staged StagedBlob) error {
+	if err := g.AttachmentBlobs.Commit(staged); err != nil {
+		return err
+	}
+	if g.after != nil {
+		if err := g.after(); err != nil {
+			return err
+		}
+	}
+	g.commit.Do(func() { close(g.committed) })
+	<-g.release
+	return nil
+}
+
+func (g *commitSweepGate) Sweep(cutoff time.Time) ([]string, error) {
+	ids, err := g.AttachmentBlobs.Sweep(cutoff)
+	g.sweep.Do(func() { close(g.swept) })
+	return ids, err
+}
+
 func newAttachmentWorld(t *testing.T, ctx context.Context, policy AttachmentPolicy) attachmentFixture {
 	t.Helper()
 	w := newWorld(t, ctx)
@@ -534,6 +567,138 @@ func TestAttachmentWholeStoreByteAndObjectCapsReconcile(t *testing.T) {
 	}
 	if bytes, objects := f.totalUsage(t, ctx); bytes != 0 || objects != 0 {
 		t.Fatalf("whole-store reconciliation left %d bytes/%d objects", bytes, objects)
+	}
+}
+
+func TestAttachmentWholeStoreCapsSerializeAcrossWorkspaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// Each Workspace has room for a complete reservation. Only the single
+	// whole-store slot decides the outcome, so concurrent requests must not
+	// independently observe that slot as available.
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{
+		WorkspaceQuotaBytes:   MaxAttachmentBytes,
+		WorkspaceQuotaObjects: 1,
+		TotalQuotaBytes:       MaxAttachmentBytes,
+		TotalQuotaObjects:     1,
+	})
+	ws1, ch1 := f.workspaceWithChannel(t, ctx)
+	ws2, err := f.store.CreateWorkspace(ctx, "second", f.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch2, err := f.store.CreateChannel(ctx, ws2.WorkspaceID, "general", "", f.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := []*ScopedStore{
+		f.store.mustScope(t, ctx, ws1.WorkspaceID, f.humanA),
+		f.store.mustScope(t, ctx, ws2.WorkspaceID, f.humanA),
+	}
+	places := []string{ch1.PlaceID, ch2.PlaceID}
+	start := make(chan struct{})
+	results := make(chan error, 24)
+	for i := 0; i < cap(results); i++ {
+		go func(i int) {
+			<-start
+			_, err := scopes[i%len(scopes)].ReserveAttachmentUpload(ctx, places[i%len(places)], fmt.Sprintf("cross-workspace-%d", i), MaxAttachmentBytes)
+			results <- err
+		}(i)
+	}
+	close(start)
+	granted := 0
+	for range cap(results) {
+		err := <-results
+		if err == nil {
+			granted++
+			continue
+		}
+		if !errors.Is(err, ErrAttachmentQuotaExceeded) {
+			t.Fatalf("cross-workspace concurrent reservation: %v", err)
+		}
+	}
+	if granted != 1 {
+		t.Fatalf("granted %d cross-workspace reservations, want exactly one", granted)
+	}
+	if bytes, objects := f.totalUsage(t, ctx); bytes != MaxAttachmentBytes || objects != 1 {
+		t.Fatalf("whole-store usage = %d bytes/%d objects, want %d/1", bytes, objects, MaxAttachmentBytes)
+	}
+}
+
+func TestAttachmentSweepRechecksCrashAfterPublishFinalizer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f := newAttachmentWorld(t, ctx, AttachmentPolicy{})
+	workspace, channel := f.workspaceWithChannel(t, ctx)
+	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
+	data := []byte("published before metadata commit")
+	receipt, err := sender.ReserveAttachmentUpload(ctx, channel.PlaceID, "sweep-finalizer-race", int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := f.blobs.Stage(receipt.Reservation.UploadID, bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	release := make(chan struct{})
+	gate := &commitSweepGate{
+		AttachmentBlobs: f.blobs,
+		committed:       make(chan struct{}),
+		swept:           make(chan struct{}),
+		release:         release,
+		after: func() error {
+			old := time.Now().Add(-time.Minute)
+			return os.Chtimes(f.blobPath(receipt.Reservation.UploadID), old, old)
+		},
+	}
+	f.store.core.blobs = gate
+	finalized := make(chan struct {
+		attachment Attachment
+		created    bool
+		err        error
+	}, 1)
+	go func() {
+		attachment, created, err := sender.FinalizeAttachmentUpload(ctx, channel.PlaceID, StagedAttachment{
+			UploadID: receipt.Reservation.UploadID, StageToken: receipt.Reservation.StageToken,
+			Filename: "doc.txt", MIME: "text/plain", Size: int64(len(data)), SHA256: digest[:], Handle: staged,
+		})
+		finalized <- struct {
+			attachment Attachment
+			created    bool
+			err        error
+		}{attachment, created, err}
+	}()
+	<-gate.committed
+
+	swept := make(chan struct {
+		orphans int
+		missing int
+		err     error
+	}, 1)
+	go func() {
+		orphans, missing, err := f.store.core.sweepAttachmentBlobs(ctx, time.Now())
+		swept <- struct {
+			orphans int
+			missing int
+			err     error
+		}{orphans, missing, err}
+	}()
+	// Sweep has taken its stale filesystem snapshot while the finalizer still
+	// holds the reservation row. Let the finalizer commit before the sweep can
+	// lock and recheck the durable attachment row.
+	<-gate.swept
+	close(release)
+	result := <-finalized
+	if result.err != nil || !result.created {
+		t.Fatalf("finalizer after publish: created=%t err=%v", result.created, result.err)
+	}
+	report := <-swept
+	if report.err != nil || report.orphans != 0 {
+		t.Fatalf("sweep after finalizer commit: %+v", report)
+	}
+	if got := readBlob(t, f.blobs, result.attachment.AttachmentID); !bytes.Equal(got, data) {
+		t.Fatalf("sweep removed live published bytes: %q", got)
 	}
 }
 

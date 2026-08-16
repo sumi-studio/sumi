@@ -411,9 +411,18 @@ func (s *Store) purgeSettledUploadReceipts(ctx context.Context, cutoff time.Time
 	tag, err := s.pool.Exec(ctx, `
 		DELETE FROM message_attachment_uploads
 		WHERE upload_id IN (
-			SELECT upload_id FROM message_attachment_uploads
-			WHERE state <> 'reserved' AND settled_at < $1
-			ORDER BY settled_at, upload_id
+			SELECT u.upload_id FROM message_attachment_uploads u
+			WHERE u.state <> 'reserved' AND u.settled_at < $1
+			  -- A finalized receipt is the permanent logical identity for its
+			  -- uploader/place/nonce while the attachment history row remains.
+			  -- In particular, a tombstoned attachment still owns that unique
+			  -- nonce; dropping its receipt would let a retry reserve quota and
+			  -- then fail finalization on the history-row uniqueness constraint.
+			  AND NOT EXISTS (
+				SELECT 1 FROM message_attachments a
+				WHERE a.attachment_id = u.attachment_id
+			  )
+			ORDER BY u.settled_at, u.upload_id
 			LIMIT $2
 		)`, cutoff, attachmentReconcileBatch)
 	if err != nil {
