@@ -109,7 +109,9 @@ export function ParticipantAppsMenu() {
         {status === "error" && participantApps.length === 0 ? (
           <div className="px-2 py-4 text-center">
             <p role="alert" className="text-muted-foreground text-xs">
-              個人用アプリを読み込めませんでした
+              {errorCode
+                ? `個人用アプリを読み込めませんでした: ${errorCode}`
+                : "個人用アプリを読み込めませんでした"}
             </p>
             <Button
               variant="secondary"
@@ -152,7 +154,7 @@ export function ParticipantAppsMenu() {
 
         {errorCode && participantApps.length > 0 ? (
           <p role="alert" className="px-2 pt-2 pb-1 text-red-600 text-xs">
-            最新の状態を確認できませんでした。再試行してください。
+            最新の状態を確認できませんでした: {errorCode}
           </p>
         ) : null}
       </PopoverContent>

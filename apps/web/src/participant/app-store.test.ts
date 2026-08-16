@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   WorkspaceAPIError,
   WorkspaceAPIUncertainError,
@@ -12,6 +12,7 @@ import type {
 } from "../workspace/model";
 import { appOwnerKey } from "../workspace/model";
 import {
+  createBrowserLifecycleCoordinator,
   createParticipantAppStore,
   inspectParticipantAppLifecycleJournal,
   type ParticipantAppLifecycleCoordinator,
@@ -48,7 +49,125 @@ const MESSAGING: AppDescriptor = {
   workspaceRoleCapabilities: [],
 };
 
+const NOTES: AppDescriptor = {
+  appId: "notes",
+  displayName: "Notes",
+  workspaceOwnerAllowed: false,
+  participantOwnerAllowed: true,
+  workspaceRoleCapabilities: [],
+};
+const TASKS: AppDescriptor = {
+  appId: "tasks",
+  displayName: "Tasks",
+  workspaceOwnerAllowed: false,
+  participantOwnerAllowed: true,
+  workspaceRoleCapabilities: [],
+};
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("Participant app lifecycle store", () => {
+  it("loads Participant apps without Web Locks and serializes same-owner installs in this document", async () => {
+    const directChat = installation(OWNER_A);
+    const notes = {
+      ...installation(OWNER_A, "0198f0f4-9b72-7000-8000-000000000052"),
+      appId: "notes",
+    };
+    const tasks = {
+      ...installation(OWNER_A, "0198f0f4-9b72-7000-8000-000000000053"),
+      appId: "tasks",
+    };
+    const firstInstall = deferred<AppInstallation>();
+    const installsStarted: string[] = [];
+    const installsFinished: string[] = [];
+    let snapshot = [directChat];
+    const listAppCatalog = vi.fn(async () => [DIRECT_CHAT, NOTES, TASKS]);
+    const listInstallations = vi.fn(async () => snapshot);
+    const installApp = vi.fn(async (_owner: AppOwnerRef, appId: string) => {
+      installsStarted.push(appId);
+      if (appId === "notes") {
+        const result = await firstInstall.promise;
+        snapshot = [...snapshot, result];
+        installsFinished.push(appId);
+        return result;
+      }
+      snapshot = [...snapshot, tasks];
+      installsFinished.push(appId);
+      return tasks;
+    });
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("localStorage", memoryStorage());
+    vi.stubGlobal("BroadcastChannel", undefined);
+    const coordinator = createBrowserLifecycleCoordinator();
+    const firstStore = createParticipantAppStore(
+      participantClient({ listAppCatalog, listInstallations, installApp }),
+      coordinator,
+    );
+    const secondStore = createParticipantAppStore(
+      participantClient({ listAppCatalog, listInstallations, installApp }),
+      coordinator,
+    );
+
+    await Promise.all([
+      firstStore.getState().bindParticipant(HUMAN_A),
+      secondStore.getState().bindParticipant(HUMAN_A),
+    ]);
+
+    expect(coordinator.coordination).toBe("document-only");
+    expect(firstStore.getState().coordination).toBe("document-only");
+    expect(listAppCatalog).toHaveBeenCalledTimes(2);
+    expect(listInstallations).toHaveBeenCalledTimes(2);
+    expect(firstStore.getState().installations).toContainEqual(directChat);
+
+    const first = firstStore.getState().installApp("notes");
+    const second = secondStore.getState().installApp("tasks");
+    await vi.waitFor(() => expect(installsStarted).toEqual(["notes"]));
+
+    firstInstall.resolve(notes);
+    await Promise.all([first, second]);
+
+    expect(installsStarted).toEqual(["notes", "tasks"]);
+    expect(installsFinished).toEqual(["notes", "tasks"]);
+  });
+
+  it("continues to use Web Locks when they are available", async () => {
+    const locks = {
+      request: vi.fn(
+        async <T>(
+          _name: string,
+          _options: LockOptions,
+          operation: () => Promise<T>,
+        ) => operation(),
+      ),
+    };
+    const listAppCatalog = vi.fn(async () => [DIRECT_CHAT]);
+    const listInstallations = vi.fn(async () => [installation(OWNER_A)]);
+    vi.stubGlobal("navigator", { locks });
+    vi.stubGlobal("localStorage", memoryStorage());
+    vi.stubGlobal("BroadcastChannel", undefined);
+    const coordinator = createBrowserLifecycleCoordinator();
+    const store = createParticipantAppStore(
+      participantClient({ listAppCatalog, listInstallations }),
+      coordinator,
+    );
+
+    await store.getState().bindParticipant(HUMAN_A);
+
+    expect(coordinator.coordination).toBe("web-locks");
+    expect(store.getState().coordination).toBe("web-locks");
+    expect(locks.request).toHaveBeenCalledWith(
+      `sumi:participant-app-lifecycle:owner:${appOwnerKey(OWNER_A)}`,
+      { mode: "exclusive" },
+      expect.any(Function),
+    );
+    expect(store.getState()).toMatchObject({
+      status: "ready",
+      installations: [installation(OWNER_A)],
+    });
+  });
+
   it("distinguishes an absent journal from every present malformed entry", () => {
     const ownerKey = appOwnerKey(OWNER_A);
     const valid = unsettledSetStateNotice(installation(OWNER_A));
@@ -1401,11 +1520,13 @@ describe("Participant app lifecycle store", () => {
 });
 
 function participantClient({
+  listAppCatalog = vi.fn(async () => [DIRECT_CHAT, MESSAGING]),
   listInstallations = vi.fn(async () => []),
   installApp = vi.fn(async () => installation(OWNER_A)),
   setInstallationState = vi.fn(async () => installation(OWNER_A)),
   uninstallApp = vi.fn(async () => undefined),
 }: {
+  listAppCatalog?: () => Promise<AppDescriptor[]>;
   listInstallations?: (owner: AppOwnerRef) => Promise<AppInstallation[]>;
   installApp?: (
     owner: AppOwnerRef,
@@ -1420,12 +1541,36 @@ function participantClient({
   uninstallApp?: (installationId: string) => Promise<void>;
 } = {}): WorkspaceControlClient {
   return {
-    listAppCatalog: vi.fn(async () => [DIRECT_CHAT, MESSAGING]),
+    listAppCatalog,
     listInstallations,
     installApp,
     setInstallationState,
     uninstallApp,
   } as unknown as WorkspaceControlClient;
+}
+
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear() {
+      values.clear();
+    },
+    getItem(key) {
+      return values.get(key) ?? null;
+    },
+    key(index) {
+      return [...values.keys()][index] ?? null;
+    },
+    removeItem(key) {
+      values.delete(key);
+    },
+    setItem(key, value) {
+      values.set(key, value);
+    },
+  };
 }
 
 function installation(
