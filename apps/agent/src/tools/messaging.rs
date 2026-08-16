@@ -12,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -21,23 +22,31 @@ use uuid::{Uuid, Variant, Version};
 use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi,
-        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, WriteMessagingMessageRequest,
+        CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi, MessagingApiFailure,
+        MessagingApiFailureClass, MessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+        OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
+        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+        UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
     },
+    approval::authority::MessagingSourceSigningContinuation,
     provider::types::{ToolDefinition, UserContent},
     tools::{
         AdapterIdentity, AppActionDescriptor, AppPrecondition, BoundExecutionArguments,
         BoundToolAdapter, BoundToolCtx, BoundToolExecutionOutcome, CapabilityClass, DescribeError,
         LiveAppPostCommit, LiveAppPostCommitOutcome, ResourceScope, ReviewProjection, Tool,
         ToolBindCtx, ToolBinding, ToolCtx, ToolError, ToolOutput, ToolRisk,
+        executor::{
+            ExecutorClient, TransferredSource, normalize_workspace_path, validate_source_paths,
+        },
     },
 };
 
 const TOOL_NAME: &str = "messaging";
 const BINDING_ADAPTER_ID: &str = "sumi.messaging";
-const BINDING_ADAPTER_VERSION: u32 = 2;
+const BINDING_ADAPTER_VERSION: u32 = 3;
 const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
+const ATTACHMENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-attachment-upload-v1";
+const SOURCE_EXECUTION_ID_DOMAIN: &[u8] = b"sumi-messaging-source-execution-v1";
 const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
@@ -58,6 +67,8 @@ const MESSAGING_APP_ID: &str = "messaging";
 // handful of Workspace installations at once. Sixteen retains ample locality
 // while bounding stale uninstall/reinstall and Workspace churn.
 const MAX_CACHED_MESSAGING_VIEWS: usize = 16;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
+const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MessagingProposal {
@@ -81,12 +92,17 @@ enum MessagingAction {
     },
     /// Write in the place currently open in this view.
     Write {
+        #[serde(default)]
         content: String,
+        #[serde(default)]
+        attachments: Vec<String>,
         #[serde(default)]
         urgency: MessagingUrgency,
         #[serde(default)]
         reply_to: Option<String>,
     },
+    /// Open one attachment already visible in the currently open page.
+    OpenAttachment { attachment_id: String },
     /// Toggle an emoji reaction on a message visible in the open place.
     React {
         #[serde(default)]
@@ -136,9 +152,16 @@ enum BoundMessagingAction {
     Write {
         place_id: String,
         content: String,
+        #[serde(default)]
+        attachment_paths: Vec<String>,
         urgency: MessagingUrgency,
         #[serde(default)]
         reply_to: Option<String>,
+    },
+    OpenAttachment {
+        place_id: String,
+        message_id: String,
+        attachment: MessagingAttachmentMetadata,
     },
     React {
         place_id: String,
@@ -191,8 +214,16 @@ struct ExactMessagingExecutionContext<'a> {
 }
 
 struct ExactMessagingOutcome {
-    response: Value,
+    response: ExactMessagingResponse,
     live_post_commit: Option<LiveAppPostCommit>,
+}
+
+enum ExactMessagingResponse {
+    Json(Value),
+    Attachment {
+        metadata: MessagingAttachmentMetadata,
+        response: OpenMessagingAttachmentResponse,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -221,6 +252,7 @@ enum MessagingStatus {
 struct VisibleMessage {
     message_id: String,
     seq: Option<u64>,
+    attachments: Vec<MessagingAttachmentMetadata>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -264,6 +296,7 @@ struct OpenMessageWire {
     created_at: String,
     edited_at: Value,
     deleted: bool,
+    attachments: Vec<MessagingAttachmentMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,13 +397,43 @@ impl MessagingViewCache {
 
 pub(crate) struct MessagingTool {
     api: Arc<dyn MessagingApi>,
+    source_transfer: Arc<dyn MessagingSourceTransfer>,
     views: Arc<Mutex<MessagingViewCache>>,
 }
 
+#[async_trait]
+trait MessagingSourceTransfer: Send + Sync {
+    async fn transfer(
+        &self,
+        paths: Vec<String>,
+        execution_id: String,
+        continuation: MessagingSourceSigningContinuation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<TransferredSource>, ToolError>;
+}
+
+#[async_trait]
+impl MessagingSourceTransfer for ExecutorClient {
+    async fn transfer(
+        &self,
+        paths: Vec<String>,
+        execution_id: String,
+        continuation: MessagingSourceSigningContinuation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<TransferredSource>, ToolError> {
+        self.execute_source_transfer(paths, execution_id, continuation, cancel)
+            .await
+    }
+}
+
 impl MessagingTool {
-    pub(crate) fn new(api: Arc<dyn MessagingApi>) -> Self {
+    pub(crate) fn with_executor(
+        api: Arc<dyn MessagingApi>,
+        source_transfer: Arc<ExecutorClient>,
+    ) -> Self {
         Self {
             api,
+            source_transfer,
             views: Arc::new(Mutex::new(MessagingViewCache::default())),
         }
     }
@@ -433,6 +496,47 @@ impl MessagingTool {
     }
 }
 
+#[cfg(test)]
+struct UnavailableMessagingSourceTransfer;
+
+#[cfg(test)]
+#[async_trait]
+impl MessagingSourceTransfer for UnavailableMessagingSourceTransfer {
+    async fn transfer(
+        &self,
+        _paths: Vec<String>,
+        _execution_id: String,
+        _continuation: MessagingSourceSigningContinuation,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<TransferredSource>, ToolError> {
+        Err(ToolError::Protocol(
+            "test Messaging source transfer was not configured".to_owned(),
+        ))
+    }
+}
+
+#[cfg(test)]
+impl MessagingTool {
+    fn new(api: Arc<dyn MessagingApi>) -> Self {
+        Self {
+            api,
+            source_transfer: Arc::new(UnavailableMessagingSourceTransfer),
+            views: Arc::new(Mutex::new(MessagingViewCache::default())),
+        }
+    }
+
+    fn with_source_for_test(
+        api: Arc<dyn MessagingApi>,
+        source_transfer: Arc<dyn MessagingSourceTransfer>,
+    ) -> Self {
+        Self {
+            api,
+            source_transfer,
+            views: Arc::new(Mutex::new(MessagingViewCache::default())),
+        }
+    }
+}
+
 fn messaging_parameters_schema() -> Value {
     serde_json::json!({
         "type": "object",
@@ -440,7 +544,9 @@ fn messaging_parameters_schema() -> Value {
             "Choose an explicit workspace_id and one messaging action, then include only the ",
             "fields used by that action. No current or default Workspace is inferred. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
-            "or limit; write requires content and may include urgency or reply_to; react ",
+            "or limit; write requires content, attachments, or both and may include urgency ",
+            "or reply_to; open_attachment requires one attachment_id already visible in the ",
+            "open page; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
@@ -456,13 +562,14 @@ fn messaging_parameters_schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": [
-                    "overview", "open", "write", "react",
+                    "overview", "open", "write", "open_attachment", "react",
                     "status", "reply_later", "resolve_reply_later"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
                     "shows one place and focuses it for later writes; write sends a message to ",
-                    "the currently open place; react toggles an emoji reaction on a message ",
+                    "the currently open place; open_attachment reads an attachment already ",
+                    "visible there; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept."
@@ -485,7 +592,17 @@ fn messaging_parameters_schema() -> Value {
             },
             "content": {
                 "type": "string",
-                "description": "Required for write and omitted for other actions. Message text to send to the currently open place."
+                "description": "Optional for write and omitted for other actions. Message text to send; attachments may make an empty string valid."
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+                "description": "Optional for write and omitted for other actions. Ordered Foundation Workspace file paths to attach."
+            },
+            "attachment_id": {
+                "type": "string",
+                "description": "Required for open_attachment and omitted for other actions. The exact attachment already visible in the currently open page."
             },
             "urgency": {
                 "type": "string",
@@ -653,16 +770,28 @@ impl BoundToolAdapter for MessagingTool {
             }
             MessagingAction::Write {
                 content,
+                attachments,
                 urgency,
                 reply_to,
             } => {
                 let state = view.lock().await;
                 let place_id = focused_place_for_binding(&state, "write")?;
                 drop(state);
+                let mut attachment_paths = Vec::with_capacity(attachments.len());
+                for path in attachments {
+                    attachment_paths.push(normalize_workspace_path(&path, ctx.workspace)?);
+                }
+                if !attachment_paths.is_empty() {
+                    validate_source_paths(&attachment_paths)
+                        .map_err(|_| DescribeError::InvalidArguments)?;
+                }
                 let mut scopes = vec![ResourceScope::resource("messaging", "place", &place_id)];
                 if let Some(reply_to) = &reply_to {
                     scopes.push(ResourceScope::resource("messaging", "message", reply_to));
                 }
+                scopes.extend(attachment_paths.iter().map(|path| {
+                    ResourceScope::resource("sumi.foundation.workspace", "path", path)
+                }));
                 let mut review_projection = object([
                     ("action", Value::String("write".to_owned())),
                     ("place_id", Value::String(place_id.clone())),
@@ -673,12 +802,30 @@ impl BoundToolAdapter for MessagingTool {
                         "content_characters",
                         Value::from(content.chars().count() as u64),
                     ),
+                    (
+                        "attachments",
+                        Value::Array(
+                            attachment_paths
+                                .iter()
+                                .cloned()
+                                .map(Value::String)
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "attachment_count",
+                        Value::from(attachment_paths.len() as u64),
+                    ),
                 ]);
                 insert_optional_string(&mut review_projection, "reply_to", reply_to.clone());
                 let mut arguments = Map::new();
                 arguments.insert("action".to_owned(), Value::String("write".to_owned()));
                 arguments.insert("place_id".to_owned(), Value::String(place_id));
                 arguments.insert("content".to_owned(), Value::String(content));
+                arguments.insert(
+                    "attachment_paths".to_owned(),
+                    Value::Array(attachment_paths.into_iter().map(Value::String).collect()),
+                );
                 arguments.insert(
                     "urgency".to_owned(),
                     Value::String(urgency_text(urgency).to_owned()),
@@ -690,6 +837,36 @@ impl BoundToolAdapter for MessagingTool {
                     CapabilityClass::Mutate,
                     scopes,
                     review_projection,
+                    arguments,
+                )
+            }
+            MessagingAction::OpenAttachment { attachment_id } => {
+                let state = view.lock().await;
+                let place_id = focused_place_for_binding(&state, "open_attachment")?;
+                let (message_id, attachment) =
+                    visible_attachment_for_binding(&state, &attachment_id)?;
+                let attachment_value = serde_json::to_value(&attachment)
+                    .map_err(|_| DescribeError::BindingInternal)?;
+                let arguments = object([
+                    ("action", Value::String("open_attachment".to_owned())),
+                    ("place_id", Value::String(place_id.clone())),
+                    ("message_id", Value::String(message_id.clone())),
+                    ("attachment", attachment_value),
+                ]);
+                messaging_binding(
+                    &scope,
+                    "open_attachment",
+                    CapabilityClass::Read,
+                    vec![
+                        ResourceScope::resource("messaging", "place", &place_id),
+                        ResourceScope::resource("messaging", "message", &message_id),
+                        ResourceScope::resource(
+                            "messaging",
+                            "attachment",
+                            &attachment.attachment_id,
+                        ),
+                    ],
+                    arguments.clone(),
                     arguments,
                 )
             }
@@ -864,33 +1041,69 @@ impl BoundToolAdapter for MessagingTool {
         };
         validate_exact_scope(&scope)?;
         validate_bound_action(&invocation.action)?;
+        let BoundToolCtx {
+            flow_id,
+            call_id,
+            committed_effect_permit,
+            cancel,
+            ..
+        } = ctx;
 
         // Exact bound execution performs only the sealed app operation. It
         // does not flush delayed reads, initialize membership through an
         // overview, or reinterpret a target from current view state.
         let view = self.view_for(&scope).await;
         let mut state = view.lock().await;
-        if ctx.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let effect_receipt = ctx
-            .committed_effect_permit
-            .begin_local_effect()
-            .complete(|| {
-                self.execute_exact_action(
-                    &scope,
-                    view.clone(),
-                    &mut state,
-                    invocation.action,
-                    ExactMessagingExecutionContext {
-                        flow_id: ctx.flow_id,
-                        call_id: ctx.call_id,
-                        cancel: &ctx.cancel,
-                        post_commit_mode: PostCommitMode::ReturnLiveHook,
-                    },
-                )
-            })
-            .await?;
+        let effect_receipt = match invocation.action {
+            BoundMessagingAction::Write {
+                place_id,
+                content,
+                attachment_paths,
+                urgency,
+                reply_to,
+            } if !attachment_paths.is_empty() => {
+                committed_effect_permit
+                    .begin_messaging_workspace_send_effect()
+                    .complete(|continuation| {
+                        self.execute_attachment_write(
+                            &scope,
+                            &mut state,
+                            place_id,
+                            content,
+                            attachment_paths,
+                            urgency,
+                            reply_to,
+                            flow_id,
+                            call_id,
+                            continuation,
+                            &cancel,
+                        )
+                    })
+                    .await?
+            }
+            action => {
+                committed_effect_permit
+                    .begin_local_effect()
+                    .complete(|| {
+                        self.execute_exact_action(
+                            &scope,
+                            view.clone(),
+                            &mut state,
+                            action,
+                            ExactMessagingExecutionContext {
+                                flow_id,
+                                call_id,
+                                cancel: &cancel,
+                                post_commit_mode: PostCommitMode::ReturnLiveHook,
+                            },
+                        )
+                    })
+                    .await?
+            }
+        };
         let effect_receipt = effect_receipt.try_map(|outcome| {
             Ok::<_, ToolError>((
                 render_messaging_output(outcome.response)?,
@@ -946,8 +1159,8 @@ impl MessagingTool {
     }
 
     /// Execute exactly one already-resolved Messaging action. Raw and bound
-    /// paths share this single seven-arm implementation; only the admission
-    /// delivery mode differs. No pre-action maintenance belongs here.
+    /// paths share this single implementation; only the admission delivery
+    /// mode differs. No pre-action maintenance belongs here.
     async fn execute_exact_action(
         &self,
         scope: &ExactMessagingScope,
@@ -956,6 +1169,40 @@ impl MessagingTool {
         action: BoundMessagingAction,
         execution: ExactMessagingExecutionContext<'_>,
     ) -> Result<ExactMessagingOutcome, ToolError> {
+        if let BoundMessagingAction::OpenAttachment {
+            place_id,
+            message_id,
+            attachment,
+        } = &action
+        {
+            let response = tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.open_attachment(scope, OpenMessagingAttachmentRequest {
+                    place_id,
+                    message_id,
+                    attachment_id: &attachment.attachment_id,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?;
+            if response.attachment.attachment_id != attachment.attachment_id
+                || response.attachment.filename != attachment.filename
+                || response.attachment.mime != attachment.mime
+                || response.attachment.size_bytes != attachment.size_bytes
+                || response.attachment.sha256 != attachment.sha256
+            {
+                return Err(ToolError::Protocol(
+                    "Messaging attachment bytes do not match the sealed visible metadata"
+                        .to_owned(),
+                ));
+            }
+            return Ok(ExactMessagingOutcome {
+                response: ExactMessagingResponse::Attachment {
+                    metadata: attachment.clone(),
+                    response,
+                },
+                live_post_commit: None,
+            });
+        }
         let mut live_post_commit = None;
         let response = match action {
             BoundMessagingAction::Overview {} => {
@@ -963,7 +1210,7 @@ impl MessagingTool {
                     _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.overview(scope) => result,
                 }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                .map_err(map_messaging_api_error)?;
                 admit_overview_snapshot(state, &response);
                 response
             }
@@ -980,7 +1227,7 @@ impl MessagingTool {
                         limit,
                     }) => result,
                 }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                .map_err(map_messaging_api_error)?;
                 let admission = validate_open_response(&response, &place_id, before_seq, limit)?;
                 state.focused_place_id = Some(place_id.clone());
                 state.visible_messages = admission.visible_messages;
@@ -1001,9 +1248,15 @@ impl MessagingTool {
             BoundMessagingAction::Write {
                 place_id,
                 content,
+                attachment_paths,
                 urgency,
                 reply_to,
             } => {
+                if !attachment_paths.is_empty() {
+                    return Err(ToolError::Protocol(
+                        "attachment write bypassed its composite effect boundary".to_owned(),
+                    ));
+                }
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
                 let response = tokio::select! {
                     _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
@@ -1013,18 +1266,22 @@ impl MessagingTool {
                         urgency: urgency_text(urgency),
                         reply_to: reply_to.as_deref(),
                         client_nonce: &nonce,
+                        attachments: &[],
                     }) => result,
                 }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
-                if state.focused_place_id.as_deref() == Some(place_id.as_str())
-                    && let Some(message_id) = response.get("message_id").and_then(Value::as_str)
-                {
-                    state.visible_messages.push(VisibleMessage {
-                        message_id: message_id.to_owned(),
-                        seq: response.get("seq").and_then(Value::as_u64),
-                    });
+                .map_err(map_messaging_api_error)?;
+                if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
+                    upsert_visible_message(
+                        state,
+                        VisibleMessage {
+                            message_id: response.message_id.clone(),
+                            seq: Some(response.seq),
+                            attachments: Vec::new(),
+                        },
+                    );
                 }
-                response
+                serde_json::to_value(response)
+                    .map_err(|error| ToolError::Protocol(error.to_string()))?
             }
             BoundMessagingAction::React {
                 place_id,
@@ -1096,20 +1353,201 @@ impl MessagingTool {
                     .retain(|marker| marker.marker_id != marker_id);
                 response
             }
+            BoundMessagingAction::OpenAttachment { .. } => {
+                unreachable!("open_attachment returned before the JSON action match")
+            }
         };
         Ok(ExactMessagingOutcome {
-            response,
+            response: ExactMessagingResponse::Json(response),
             live_post_commit,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_attachment_write(
+        &self,
+        scope: &ExactMessagingScope,
+        state: &mut MessagingViewState,
+        place_id: String,
+        content: String,
+        attachment_paths: Vec<String>,
+        urgency: MessagingUrgency,
+        reply_to: Option<String>,
+        flow_id: &str,
+        call_id: &str,
+        continuation: MessagingSourceSigningContinuation,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ExactMessagingOutcome, ToolError> {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let sources = self
+            .source_transfer
+            .transfer(
+                attachment_paths.clone(),
+                source_execution_id(flow_id, call_id),
+                continuation,
+                cancel.clone(),
+            )
+            .await?;
+        if sources.len() != attachment_paths.len() {
+            return Err(ToolError::Protocol(
+                "executor source count differs from sealed attachment paths".to_owned(),
+            ));
+        }
+
+        let mut attachment_ids = Vec::with_capacity(sources.len());
+        let mut attachments = Vec::with_capacity(sources.len());
+        let mut seen_ids = BTreeSet::new();
+        for (index, (path, source)) in attachment_paths.iter().zip(sources).enumerate() {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            if source.manifest().path != *path {
+                return Err(ToolError::Protocol(
+                    "executor source order differs from sealed attachment paths".to_owned(),
+                ));
+            }
+            let filename = crate::apiclient::messaging::canonical_attachment_filename(
+                &source.manifest().filename,
+            );
+            let declared_mime = declared_attachment_mime(&filename);
+            // Once a mutation request has been emitted, dropping its future on
+            // cancellation would discard the only receipt that distinguishes a
+            // committed effect from an abandoned one. Observe cancellation at
+            // the next operation boundary instead.
+            let upload = self
+                .api
+                .upload_attachment(
+                    scope,
+                    UploadMessagingAttachmentRequest::from_executor_source(
+                        place_id.clone(),
+                        attachment_client_nonce(flow_id, call_id, index),
+                        filename,
+                        Some(declared_mime),
+                        source,
+                    ),
+                )
+                .await
+                .map_err(map_messaging_api_error)?;
+            if !seen_ids.insert(upload.attachment.attachment_id.clone())
+                || (!upload.created
+                    && upload.attachment.position != 0
+                    && upload.attachment.position as usize != index)
+            {
+                return Err(ToolError::Protocol(
+                    "Messaging attachment upload replay does not match the sealed order".to_owned(),
+                ));
+            }
+            attachment_ids.push(upload.attachment.attachment_id.clone());
+            attachments.push(upload.attachment);
+        }
+
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let nonce = client_nonce(flow_id, call_id);
+        // The final write owns the composite outcome. After emission it must
+        // settle to a receipt (or an indeterminate error), even if the caller is
+        // cancelled while the server is committing it.
+        let receipt = self
+            .api
+            .write(
+                scope,
+                WriteMessagingMessageRequest {
+                    place_id: &place_id,
+                    content: &content,
+                    urgency: urgency_text(urgency),
+                    reply_to: reply_to.as_deref(),
+                    client_nonce: &nonce,
+                    attachments: &attachment_ids,
+                },
+            )
+            .await
+            .map_err(map_messaging_api_error)?;
+
+        for (index, attachment) in attachments.iter_mut().enumerate() {
+            attachment.position = index as u8;
+        }
+        if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
+            upsert_visible_message(
+                state,
+                VisibleMessage {
+                    message_id: receipt.message_id.clone(),
+                    seq: Some(receipt.seq),
+                    attachments,
+                },
+            );
+        }
+        let response = serde_json::to_value(receipt)
+            .map_err(|error| ToolError::Protocol(error.to_string()))?;
+        Ok(ExactMessagingOutcome {
+            response: ExactMessagingResponse::Json(response),
+            live_post_commit: None,
         })
     }
 }
 
-fn render_messaging_output(response: Value) -> Result<ToolOutput, ToolError> {
-    let rendered = serde_json::to_string_pretty(&response)
-        .map_err(|error| ToolError::Protocol(error.to_string()))?;
+fn render_messaging_output(response: ExactMessagingResponse) -> Result<ToolOutput, ToolError> {
+    match response {
+        ExactMessagingResponse::Json(response) => {
+            let rendered = serde_json::to_string_pretty(&response)
+                .map_err(|error| ToolError::Protocol(error.to_string()))?;
+            Ok(ToolOutput {
+                content: vec![UserContent::Text { text: rendered }],
+                details: response,
+                is_error: false,
+            })
+        }
+        ExactMessagingResponse::Attachment { metadata, response } => {
+            render_attachment_output(metadata, response)
+        }
+    }
+}
+
+fn map_messaging_api_error(error: anyhow::Error) -> ToolError {
+    match error
+        .downcast_ref::<MessagingApiFailure>()
+        .map(|error| error.class())
+    {
+        Some(MessagingApiFailureClass::Indeterminate) => {
+            ToolError::RpcIndeterminate(error.to_string())
+        }
+        Some(MessagingApiFailureClass::Terminal) | None => ToolError::Rpc(error.to_string()),
+    }
+}
+
+fn render_attachment_output(
+    metadata: MessagingAttachmentMetadata,
+    response: OpenMessagingAttachmentResponse,
+) -> Result<ToolOutput, ToolError> {
+    let details = serde_json::json!({"attachment": &metadata});
+    let content = if is_safe_inline_image_mime(&metadata.mime) {
+        vec![UserContent::Image {
+            data: BASE64_STANDARD.encode(response.bytes.as_slice()),
+            mime_type: metadata.mime.clone(),
+        }]
+    } else if metadata.mime.starts_with("text/") || metadata.mime == "application/json" {
+        match String::from_utf8(response.bytes.as_slice().to_vec()) {
+            Ok(text) => vec![UserContent::Text { text }],
+            Err(_) => vec![UserContent::Text {
+                text: format!(
+                    "Attachment {} is {} bytes of {} and is not valid UTF-8.",
+                    metadata.filename, metadata.size_bytes, metadata.mime
+                ),
+            }],
+        }
+    } else {
+        vec![UserContent::Text {
+            text: format!(
+                "Attachment {} is {} bytes of {} (sha256 {}).",
+                metadata.filename, metadata.size_bytes, metadata.mime, metadata.sha256
+            ),
+        }]
+    };
     Ok(ToolOutput {
-        content: vec![UserContent::Text { text: rendered }],
-        details: response,
+        content,
+        details,
         is_error: false,
     })
 }
@@ -1231,6 +1669,7 @@ fn resolve_raw_action(
         }),
         MessagingAction::Write {
             content,
+            attachments,
             urgency,
             reply_to,
         } => Ok(BoundMessagingAction::Write {
@@ -1241,9 +1680,36 @@ fn resolve_raw_action(
                 )
             })?,
             content,
+            attachment_paths: if attachments.is_empty() {
+                Vec::new()
+            } else {
+                return Err(ToolError::Protocol(
+                    "Workspace attachments require a bound composite Messaging invocation"
+                        .to_owned(),
+                ));
+            },
             urgency,
             reply_to,
         }),
+        MessagingAction::OpenAttachment { attachment_id } => {
+            let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                ToolError::Protocol(
+                    "open a messaging place before opening an attachment".to_owned(),
+                )
+            })?;
+            let (message_id, attachment) = visible_attachment(state, &attachment_id).ok_or_else(
+                || {
+                    ToolError::Protocol(
+                        "that attachment is not visible in the currently open place".to_owned(),
+                    )
+                },
+            )?;
+            Ok(BoundMessagingAction::OpenAttachment {
+                place_id,
+                message_id,
+                attachment,
+            })
+        }
         MessagingAction::React {
             message_id,
             seq,
@@ -1370,6 +1836,19 @@ fn visible_reply_later_marker_for_binding(
     })
 }
 
+fn visible_attachment_for_binding(
+    state: &MessagingViewState,
+    attachment_id: &str,
+) -> Result<(String, MessagingAttachmentMetadata), DescribeError> {
+    visible_attachment(state, attachment_id).ok_or_else(|| {
+        app_precondition(
+            "visible_attachment_required",
+            "the attachment must already be visible in the currently open Messaging page"
+                .to_owned(),
+        )
+    })
+}
+
 fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
     match action {
         MessagingAction::Overview {} => Ok(()),
@@ -1383,10 +1862,24 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             Ok(())
         }
         MessagingAction::Write {
-            content, reply_to, ..
+            content,
+            attachments,
+            reply_to,
+            ..
         } => {
-            if content.is_empty() || content.len() > MAX_CONTENT_BYTES {
+            if content.len() > MAX_CONTENT_BYTES
+                || content.contains('\0')
+                || (content.is_empty() && attachments.is_empty())
+                || attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE
+            {
                 return Err(ToolError::InvalidArguments);
+            }
+            let mut seen = BTreeSet::new();
+            for path in attachments {
+                if !is_bounded_nonempty(path, 4 * 1024) || path.contains('\0') || !seen.insert(path)
+                {
+                    return Err(ToolError::InvalidArguments);
+                }
             }
             if reply_to
                 .as_deref()
@@ -1395,6 +1888,9 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
                 return Err(ToolError::InvalidArguments);
             }
             Ok(())
+        }
+        MessagingAction::OpenAttachment { attachment_id } => {
+            validate_canonical_uuid_v7(attachment_id)
         }
         MessagingAction::React {
             message_id,
@@ -1481,15 +1977,29 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
         BoundMessagingAction::Write {
             place_id,
             content,
+            attachment_paths,
             urgency,
             reply_to,
         } => {
             validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            if !attachment_paths.is_empty() {
+                validate_source_paths(attachment_paths)?;
+            }
             validate_action(&MessagingAction::Write {
                 content: content.clone(),
+                attachments: attachment_paths.clone(),
                 urgency: *urgency,
                 reply_to: reply_to.clone(),
             })
+        }
+        BoundMessagingAction::OpenAttachment {
+            place_id,
+            message_id,
+            attachment,
+        } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            validate_bounded_nonempty(message_id, MAX_MESSAGE_ID_BYTES)?;
+            validate_attachment_metadata(attachment, None)
         }
         BoundMessagingAction::React {
             place_id,
@@ -1604,6 +2114,20 @@ fn find_visible_target(
         .cloned()
 }
 
+fn visible_attachment(
+    state: &MessagingViewState,
+    attachment_id: &str,
+) -> Option<(String, MessagingAttachmentMetadata)> {
+    state.visible_messages.iter().find_map(|message| {
+        message
+            .attachments
+            .iter()
+            .find(|attachment| attachment.attachment_id == attachment_id)
+            .cloned()
+            .map(|attachment| (message.message_id.clone(), attachment))
+    })
+}
+
 fn visible_reply_later_marker(
     state: &MessagingViewState,
     marker_id: &str,
@@ -1688,6 +2212,16 @@ fn upsert_visible_reply_later_marker(
     state.visible_reply_later_markers.push(marker);
 }
 
+fn upsert_visible_message(state: &mut MessagingViewState, message: VisibleMessage) {
+    state
+        .visible_messages
+        .retain(|known| known.message_id != message.message_id);
+    state.visible_messages.push(message);
+    state
+        .visible_messages
+        .sort_by_key(|known| known.seq.unwrap_or(u64::MAX));
+}
+
 /// Authenticate one complete Messaging screen before any of it becomes local
 /// view state or read evidence. The API returns dense per-place history in
 /// ascending order even though it pages backwards; accepting a looser shape
@@ -1727,6 +2261,7 @@ fn validate_open_response(
     }
 
     let mut message_ids = BTreeSet::new();
+    let mut attachment_ids = BTreeSet::new();
     let mut visible_messages = Vec::with_capacity(page.messages.len());
     let mut previous_seq: Option<u64> = None;
     for message in &page.messages {
@@ -1748,7 +2283,7 @@ fn validate_open_response(
                 "Messaging open message belongs to a different place".to_owned(),
             ));
         }
-        validate_open_message(message)?;
+        validate_open_message(message, &mut attachment_ids)?;
         if !message_ids.insert(message.message_id.as_str()) {
             return Err(ToolError::Protocol(
                 "Messaging open contains a duplicate message_id".to_owned(),
@@ -1757,6 +2292,7 @@ fn validate_open_response(
         visible_messages.push(VisibleMessage {
             message_id: message.message_id.clone(),
             seq: Some(message.seq),
+            attachments: message.attachments.clone(),
         });
         previous_seq = Some(message.seq);
     }
@@ -1794,7 +2330,10 @@ fn validate_open_place(place: &OpenPlaceWire, requested_place_id: &str) -> Resul
     Ok(())
 }
 
-fn validate_open_message(message: &OpenMessageWire) -> Result<(), ToolError> {
+fn validate_open_message(
+    message: &OpenMessageWire,
+    attachment_ids: &mut BTreeSet<String>,
+) -> Result<(), ToolError> {
     if !is_bounded_nonempty(&message.message_id, MAX_MESSAGE_ID_BYTES) {
         return Err(ToolError::Protocol(
             "Messaging open message has an invalid message_id".to_owned(),
@@ -1836,21 +2375,82 @@ fn validate_open_message(message: &OpenMessageWire) -> Result<(), ToolError> {
         }
     }
 
+    if message.attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(ToolError::Protocol(
+            "Messaging open message has too many attachments".to_owned(),
+        ));
+    }
+    for (position, attachment) in message.attachments.iter().enumerate() {
+        validate_attachment_metadata(attachment, Some(position))?;
+        if !attachment_ids.insert(attachment.attachment_id.clone()) {
+            return Err(ToolError::Protocol(
+                "Messaging open contains a duplicate attachment_id".to_owned(),
+            ));
+        }
+    }
+
     if message.deleted {
         if !message.content.is_empty()
             || !message.mentions.is_empty()
             || !message.reactions.is_empty()
+            || !message.attachments.is_empty()
         {
             return Err(ToolError::Protocol(
                 "Messaging open tombstone still carries removed experience data".to_owned(),
             ));
         }
-    } else if message.content.is_empty() || message.content.len() > MAX_CONTENT_BYTES {
+    } else if (message.content.is_empty() && message.attachments.is_empty())
+        || message.content.len() > MAX_CONTENT_BYTES
+        || message.content.contains('\0')
+    {
         return Err(ToolError::Protocol(
             "Messaging open live message has invalid content".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn validate_attachment_metadata(
+    attachment: &MessagingAttachmentMetadata,
+    expected_position: Option<usize>,
+) -> Result<(), ToolError> {
+    validate_canonical_uuid_v7(&attachment.attachment_id)
+        .map_err(|_| ToolError::Protocol("invalid Messaging attachment identity".to_owned()))?;
+    let mime_is_canonical = attachment.mime.parse::<mime::Mime>().is_ok_and(|parsed| {
+        parsed.params().next().is_none()
+            && parsed.to_string() == attachment.mime
+            && (!attachment.mime.starts_with("image/")
+                || is_safe_inline_image_mime(&attachment.mime))
+    });
+    if attachment.filename.is_empty()
+        || attachment.filename.len() > 255
+        || crate::apiclient::messaging::canonical_attachment_filename(&attachment.filename)
+            != attachment.filename
+        || attachment.mime.is_empty()
+        || attachment.mime.len() > 255
+        || !mime_is_canonical
+        || attachment.size_bytes == 0
+        || attachment.size_bytes > MAX_ATTACHMENT_BYTES
+        || attachment.sha256.len() != 64
+        || !attachment
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || attachment.position as usize >= MAX_ATTACHMENTS_PER_MESSAGE
+        || expected_position.is_some_and(|position| attachment.position as usize != position)
+    {
+        return Err(ToolError::Protocol(
+            "invalid Messaging attachment metadata".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_safe_inline_image_mime(value: &str) -> bool {
+    matches!(
+        value,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
 }
 
 fn valid_nullable_string(value: &Value, max_bytes: usize) -> bool {
@@ -1926,14 +2526,52 @@ fn client_nonce(flow_id: &str, call_id: &str) -> String {
     nonce
 }
 
+fn attachment_client_nonce(flow_id: &str, call_id: &str, index: usize) -> String {
+    let mut digest = Sha256::new();
+    digest.update(ATTACHMENT_NONCE_DOMAIN);
+    digest.update((flow_id.len() as u64).to_be_bytes());
+    digest.update(flow_id.as_bytes());
+    digest.update((call_id.len() as u64).to_be_bytes());
+    digest.update(call_id.as_bytes());
+    digest.update((index as u64).to_be_bytes());
+    format!("att-{:x}", digest.finalize())
+}
+
+fn source_execution_id(flow_id: &str, call_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(SOURCE_EXECUTION_ID_DOMAIN);
+    digest.update((flow_id.len() as u64).to_be_bytes());
+    digest.update(flow_id.as_bytes());
+    digest.update((call_id.len() as u64).to_be_bytes());
+    digest.update(call_id.as_bytes());
+    format!("src-{:x}", digest.finalize())
+}
+
+fn declared_attachment_mime(filename: &str) -> String {
+    let guessed = mime_guess::from_path(filename)
+        .first_raw()
+        .unwrap_or("application/octet-stream");
+    if guessed.starts_with("image/") && !is_safe_inline_image_mime(guessed) {
+        "application/octet-stream".to_owned()
+    } else {
+        guessed.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Duration};
+    use std::{
+        collections::VecDeque,
+        ffi::CString,
+        io::{Read, Seek, SeekFrom, Write},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        time::Duration,
+    };
 
     use anyhow::{Result, anyhow};
     use chrono::Utc;
     use serde_json::json;
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1941,6 +2579,10 @@ mod tests {
     use crate::{
         apiclient::apps::{
             AppInstallationResolutionResult, AppInstallationResolver, ResolvedAppInstallation,
+        },
+        apiclient::messaging::{
+            MessagingWriteReceipt, OpenMessagingAttachmentMetadata,
+            UploadMessagingAttachmentResponse,
         },
         approval::{
             authority::PolicyDecisionRecord,
@@ -1957,7 +2599,7 @@ mod tests {
         store::Redactor,
         tools::{
             BoundExecutionError, BoundToolInvocation, ToolRegistry, ToolRegistryBuilder,
-            WorkspacePaths,
+            WorkspacePaths, executor::SourceFileManifest,
         },
     };
 
@@ -1986,7 +2628,8 @@ mod tests {
             "client_nonce": format!("nonce-{seq}"),
             "created_at": "2026-08-12T00:00:00Z",
             "edited_at": null,
-            "deleted": deleted
+            "deleted": deleted,
+            "attachments": []
         })
     }
 
@@ -2028,6 +2671,147 @@ mod tests {
 
     type RecordedStatus = (String, Option<String>, Option<u32>);
     type RecordedReplyLater = (String, String, Option<String>, Option<u32>);
+    type RecordedWrite = (String, String, String, Vec<String>);
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedUpload {
+        place_id: String,
+        client_nonce: String,
+        filename: String,
+        declared_mime: Option<String>,
+        bytes: Vec<u8>,
+        sha256: String,
+    }
+
+    #[derive(Clone)]
+    struct TestSourceSpec {
+        path: String,
+        filename: String,
+        bytes: Vec<u8>,
+    }
+
+    struct FakeMessagingSourceTransfer {
+        specs: Vec<TestSourceSpec>,
+        calls: AsyncMutex<Vec<(Vec<String>, String)>>,
+        fail: bool,
+    }
+
+    impl FakeMessagingSourceTransfer {
+        fn new(specs: Vec<TestSourceSpec>) -> Self {
+            Self {
+                specs,
+                calls: AsyncMutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                specs: Vec::new(),
+                calls: AsyncMutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MessagingSourceTransfer for FakeMessagingSourceTransfer {
+        async fn transfer(
+            &self,
+            paths: Vec<String>,
+            execution_id: String,
+            _continuation: MessagingSourceSigningContinuation,
+            cancel: CancellationToken,
+        ) -> Result<Vec<TransferredSource>, ToolError> {
+            self.calls.lock().await.push((paths.clone(), execution_id));
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            if self.fail {
+                return Err(ToolError::Rpc("source transfer failed".to_owned()));
+            }
+            if paths
+                != self
+                    .specs
+                    .iter()
+                    .map(|spec| spec.path.clone())
+                    .collect::<Vec<_>>()
+            {
+                return Err(ToolError::Protocol(
+                    "test source order differs from the sealed request".to_owned(),
+                ));
+            }
+            self.specs.iter().map(test_transferred_source).collect()
+        }
+    }
+
+    fn test_transferred_source(spec: &TestSourceSpec) -> Result<TransferredSource, ToolError> {
+        let name = CString::new("sumi-messaging-test-source").expect("static memfd name");
+        // SAFETY: `name` is NUL-terminated and the returned descriptor is
+        // immediately transferred into OwnedFd.
+        let raw = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        if raw < 0 {
+            return Err(ToolError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: memfd_create returned a new owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut file = std::fs::File::from(descriptor.try_clone()?);
+        file.write_all(&spec.bytes)?;
+        file.flush()?;
+        file.seek(SeekFrom::Start(0))?;
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        // SAFETY: `descriptor` is a memfd created with MFD_ALLOW_SEALING.
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(ToolError::Io(std::io::Error::last_os_error()));
+        }
+        let sha256 = format!("{:x}", Sha256::digest(&spec.bytes));
+        let manifest = SourceFileManifest {
+            path: spec.path.clone(),
+            filename: spec.filename.clone(),
+            size_bytes: spec.bytes.len() as u64,
+            sha256,
+        };
+        Ok(TransferredSource::for_test(manifest, descriptor))
+    }
+
+    fn test_source_specs() -> Vec<TestSourceSpec> {
+        vec![
+            TestSourceSpec {
+                path: "docs/report.txt".to_owned(),
+                filename: "report.txt".to_owned(),
+                bytes: b"attachment text".to_vec(),
+            },
+            TestSourceSpec {
+                path: "images/pixel.png".to_owned(),
+                filename: "pixel.png".to_owned(),
+                bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            },
+        ]
+    }
+
+    fn test_attachment_id(index: usize) -> String {
+        format!("0198f0f4-9b72-7000-8000-0000000004{index:02x}")
+    }
+
+    fn test_attachment_metadata(
+        index: usize,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+        position: u8,
+    ) -> MessagingAttachmentMetadata {
+        MessagingAttachmentMetadata {
+            attachment_id: test_attachment_id(index),
+            filename: filename.to_owned(),
+            mime: mime.to_owned(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            position,
+        }
+    }
 
     #[derive(Default)]
     struct FakeMessagingApi {
@@ -2037,7 +2821,16 @@ mod tests {
         resolution_failures: AsyncMutex<VecDeque<AppInstallationResolutionError>>,
         resolved_installation_override: AsyncMutex<Option<String>>,
         reads: AsyncMutex<Vec<(String, u64)>>,
-        writes: AsyncMutex<Vec<(String, String, String)>>,
+        writes: AsyncMutex<Vec<RecordedWrite>>,
+        written_nonces: AsyncMutex<BTreeSet<String>>,
+        uploads: AsyncMutex<Vec<RecordedUpload>>,
+        uploaded_by_nonce: AsyncMutex<BTreeMap<String, MessagingAttachmentMetadata>>,
+        upload_failure_on_call: AsyncMutex<Option<usize>>,
+        upload_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
+        write_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
+        write_gate: AsyncMutex<Option<Arc<Semaphore>>>,
+        attachment_reads: AsyncMutex<Vec<(String, String, String)>>,
+        open_attachment_response: AsyncMutex<Option<(OpenMessagingAttachmentMetadata, Vec<u8>)>>,
         reacts: AsyncMutex<Vec<(String, String, String)>>,
         statuses: AsyncMutex<Vec<RecordedStatus>>,
         promises: AsyncMutex<Vec<RecordedReplyLater>>,
@@ -2126,23 +2919,141 @@ mod tests {
             &self,
             scope: &ExactMessagingScope,
             request: WriteMessagingMessageRequest<'_>,
-        ) -> Result<Value> {
+        ) -> Result<MessagingWriteReceipt> {
             self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
                 .push(format!("write:{}", request.place_id));
+            if let Some(gate) = self.write_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("test write gate remains open")
+                    .forget();
+            }
             self.writes.lock().await.push((
                 request.place_id.to_owned(),
                 request.content.to_owned(),
                 request.client_nonce.to_owned(),
+                request.attachments.to_vec(),
             ));
-            Ok(json!({
-                "client_nonce": request.client_nonce,
-                "message_id": "m8",
-                "seq": 8,
-                "created": true
-            }))
+            if let Some(class) = *self.write_failure_class.lock().await {
+                let failure = match class {
+                    MessagingApiFailureClass::Terminal => {
+                        MessagingApiFailure::terminal("test write", "configured terminal failure")
+                    }
+                    MessagingApiFailureClass::Indeterminate => MessagingApiFailure::indeterminate(
+                        "test write",
+                        "configured indeterminate failure",
+                    ),
+                };
+                return Err(failure.into());
+            }
+            if !request.attachments.is_empty() {
+                let mut uploads = self.uploaded_by_nonce.lock().await;
+                for (position, attachment_id) in request.attachments.iter().enumerate() {
+                    let attachment = uploads
+                        .values_mut()
+                        .find(|attachment| attachment.attachment_id == *attachment_id)
+                        .expect("write attachment was uploaded by this fixture");
+                    attachment.position = position as u8;
+                }
+            }
+            let created = self
+                .written_nonces
+                .lock()
+                .await
+                .insert(request.client_nonce.to_owned());
+            Ok(MessagingWriteReceipt {
+                client_nonce: request.client_nonce.to_owned(),
+                message_id: "m8".to_owned(),
+                seq: 8,
+                created,
+            })
+        }
+
+        async fn upload_attachment(
+            &self,
+            scope: &ExactMessagingScope,
+            request: UploadMessagingAttachmentRequest,
+        ) -> Result<UploadMessagingAttachmentResponse> {
+            self.record_scope(scope).await;
+            let (place_id, client_nonce, filename, size_bytes, sha256, declared_mime, descriptor) =
+                request.into_parts();
+            let mut file = std::fs::File::from(descriptor);
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            assert_eq!(bytes.len() as u64, size_bytes);
+            let call_index = self.uploads.lock().await.len();
+            self.uploads.lock().await.push(RecordedUpload {
+                place_id,
+                client_nonce: client_nonce.clone(),
+                filename: filename.clone(),
+                declared_mime: declared_mime.clone(),
+                bytes,
+                sha256: sha256.clone(),
+            });
+            if *self.upload_failure_on_call.lock().await == Some(call_index) {
+                let class = self
+                    .upload_failure_class
+                    .lock()
+                    .await
+                    .unwrap_or(MessagingApiFailureClass::Terminal);
+                let failure = match class {
+                    MessagingApiFailureClass::Terminal => {
+                        MessagingApiFailure::terminal("test upload", "configured terminal failure")
+                    }
+                    MessagingApiFailureClass::Indeterminate => MessagingApiFailure::indeterminate(
+                        "test upload",
+                        "configured indeterminate failure",
+                    ),
+                };
+                return Err(failure.into());
+            }
+            let mut by_nonce = self.uploaded_by_nonce.lock().await;
+            if let Some(existing) = by_nonce.get(&client_nonce) {
+                return Ok(UploadMessagingAttachmentResponse {
+                    attachment: existing.clone(),
+                    created: false,
+                });
+            }
+            let attachment = MessagingAttachmentMetadata {
+                attachment_id: format!("0198f0f4-9b72-7000-8000-0000000004{call_index:02x}"),
+                filename,
+                mime: declared_mime.unwrap_or_else(|| "application/octet-stream".to_owned()),
+                size_bytes,
+                sha256,
+                position: 0,
+            };
+            by_nonce.insert(client_nonce, attachment.clone());
+            Ok(UploadMessagingAttachmentResponse {
+                attachment,
+                created: true,
+            })
+        }
+
+        async fn open_attachment(
+            &self,
+            scope: &ExactMessagingScope,
+            request: OpenMessagingAttachmentRequest<'_>,
+        ) -> Result<OpenMessagingAttachmentResponse> {
+            self.record_scope(scope).await;
+            self.attachment_reads.lock().await.push((
+                request.place_id.to_owned(),
+                request.message_id.to_owned(),
+                request.attachment_id.to_owned(),
+            ));
+            let (attachment, bytes) = self
+                .open_attachment_response
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| anyhow!("attachment read fixture is not configured"))?;
+            Ok(OpenMessagingAttachmentResponse {
+                attachment,
+                bytes: zeroize::Zeroizing::new(bytes),
+            })
         }
 
         async fn react(
@@ -2396,10 +3307,12 @@ mod tests {
                 VisibleMessage {
                     message_id: "message-6".to_owned(),
                     seq: Some(6),
+                    attachments: Vec::new(),
                 },
                 VisibleMessage {
                     message_id: "message-7".to_owned(),
                     seq: Some(7),
+                    attachments: Vec::new(),
                 },
             ];
             state.self_participant = Some(ParticipantIdentity {
@@ -2427,6 +3340,34 @@ mod tests {
         (api, tool, builder.build())
     }
 
+    async fn attachment_binding_fixture(
+        specs: Vec<TestSourceSpec>,
+    ) -> (
+        Arc<FakeMessagingApi>,
+        Arc<FakeMessagingSourceTransfer>,
+        Arc<MessagingTool>,
+        ToolRegistry,
+    ) {
+        let api = Arc::new(FakeMessagingApi::default());
+        let source = Arc::new(FakeMessagingSourceTransfer::new(specs));
+        let tool = Arc::new(MessagingTool::with_source_for_test(
+            api.clone(),
+            source.clone(),
+        ));
+        {
+            let mut state = default_state(&tool).await;
+            state.focused_place_id = Some("place-a".to_owned());
+            state.visible_messages = vec![VisibleMessage {
+                message_id: "message-7".to_owned(),
+                seq: Some(7),
+                attachments: Vec::new(),
+            }];
+        }
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).expect("register Messaging");
+        (api, source, tool, builder.build())
+    }
+
     #[tokio::test]
     async fn real_bindings_send_exact_human_projection_to_both_reviewers() {
         const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
@@ -2447,6 +3388,14 @@ mod tests {
             (
                 "write-secret",
                 json!({"action":"write", "content":INVITE_CODE_SENTINEL}),
+            ),
+            (
+                "write-attachment-secret",
+                json!({
+                    "action":"write",
+                    "content":"",
+                    "attachments":[format!("private/{INVITE_CODE_SENTINEL}.txt")]
+                }),
             ),
             (
                 "status-secret",
@@ -2644,6 +3593,7 @@ mod tests {
                 "overview",
                 "open",
                 "write",
+                "open_attachment",
                 "react",
                 "status",
                 "reply_later",
@@ -2674,8 +3624,29 @@ mod tests {
             schema["properties"]
                 .as_object()
                 .expect("properties must be an object")
-                .len(),
-            16
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "action",
+                "attachment_id",
+                "attachments",
+                "before_seq",
+                "content",
+                "emoji",
+                "expires_in_minutes",
+                "limit",
+                "marker_id",
+                "message_id",
+                "note",
+                "place_id",
+                "remind_in_minutes",
+                "reply_to",
+                "seq",
+                "status",
+                "urgency",
+                "workspace_id",
+            ])
         );
     }
 
@@ -3261,7 +4232,8 @@ mod tests {
             MessagingAction::Write {
                 content,
                 urgency: MessagingUrgency::Fyi,
-                reply_to: Some(reply_to)
+                reply_to: Some(reply_to),
+                ..
             } if content == "hello" && reply_to == "message-1"
         ));
 
@@ -3398,6 +4370,8 @@ mod tests {
                 "content": "hello",
                 "content_bytes": 5,
                 "content_characters": 5,
+                "attachments": [],
+                "attachment_count": 0,
                 "reply_to": "message-6"
             }))
         );
@@ -3408,6 +4382,7 @@ mod tests {
                 "action": "write",
                 "place_id": "place-a",
                 "content": "hello",
+                "attachment_paths": [],
                 "urgency": "urgent",
                 "reply_to": "message-6"
             }))
@@ -3571,6 +4546,551 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_attachment_write_transfers_uploads_in_order_then_commits_once() {
+        let (api, source, tool, registry) = attachment_binding_fixture(test_source_specs()).await;
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "write-attachments",
+                    json!({
+                        "action": "write",
+                        "content": "",
+                        "attachments": ["./docs/report.txt", "images/pixel.png"]
+                    }),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind ordered attachment write");
+        let bound = registry
+            .validate_bound(&sealed)
+            .expect("validate ordered attachment write");
+        assert_eq!(
+            bound.execution_arguments.as_object()["attachment_paths"],
+            json!(["docs/report.txt", "images/pixel.png"])
+        );
+        assert_eq!(bound.review_projection.as_object()["attachment_count"], 2);
+        for path in ["docs/report.txt", "images/pixel.png"] {
+            assert!(
+                bound
+                    .descriptor
+                    .resource_scopes
+                    .contains(&ResourceScope::resource(
+                        "sumi.foundation.workspace",
+                        "path",
+                        path
+                    ))
+            );
+        }
+
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let outcome = registry
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
+            .await
+            .expect("execute ordered attachment write");
+        assert!(outcome.live_post_commit.is_none());
+        assert_eq!(outcome.output.details["created"], true);
+        assert_eq!(
+            source.calls.lock().await.as_slice(),
+            &[(
+                vec!["docs/report.txt".to_owned(), "images/pixel.png".to_owned()],
+                source_execution_id("flow", "write-attachments")
+            )]
+        );
+        let uploads = api.uploads.lock().await;
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0].place_id, "place-a");
+        assert_eq!(
+            uploads[0].client_nonce,
+            attachment_client_nonce("flow", "write-attachments", 0)
+        );
+        assert_eq!(uploads[0].filename, "report.txt");
+        assert_eq!(uploads[0].declared_mime.as_deref(), Some("text/plain"));
+        assert_eq!(uploads[0].bytes, b"attachment text");
+        assert_eq!(
+            uploads[1].client_nonce,
+            attachment_client_nonce("flow", "write-attachments", 1)
+        );
+        assert_eq!(uploads[1].filename, "pixel.png");
+        assert_eq!(uploads[1].declared_mime.as_deref(), Some("image/png"));
+        drop(uploads);
+        assert_eq!(
+            api.writes.lock().await.as_slice(),
+            &[(
+                "place-a".to_owned(),
+                String::new(),
+                client_nonce("flow", "write-attachments"),
+                vec![test_attachment_id(0), test_attachment_id(1)]
+            )]
+        );
+        let state = default_state(&tool).await;
+        let written = state
+            .visible_messages
+            .iter()
+            .find(|message| message.message_id == "m8")
+            .expect("committed attachment message enters the focused view");
+        assert_eq!(
+            written
+                .attachments
+                .iter()
+                .map(|attachment| (attachment.attachment_id.clone(), attachment.position,))
+                .collect::<Vec<_>>(),
+            vec![(test_attachment_id(0), 0), (test_attachment_id(1), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_failures_never_create_a_successful_bound_outcome() {
+        for (case, upload_failure, write_failure) in [
+            (
+                "second-upload",
+                Some((1, MessagingApiFailureClass::Indeterminate)),
+                None,
+            ),
+            (
+                "final-write",
+                None,
+                Some(MessagingApiFailureClass::Indeterminate),
+            ),
+        ] {
+            let (api, _source, tool, registry) =
+                attachment_binding_fixture(test_source_specs()).await;
+            if let Some((call, class)) = upload_failure {
+                *api.upload_failure_on_call.lock().await = Some(call);
+                *api.upload_failure_class.lock().await = Some(class);
+            }
+            *api.write_failure_class.lock().await = write_failure;
+            let error = match execute_bound_action(
+                &registry,
+                case,
+                json!({
+                    "action": "write",
+                    "content": "with files",
+                    "attachments": ["docs/report.txt", "images/pixel.png"]
+                }),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("indeterminate mutation must not mint a bound receipt"),
+            };
+            assert!(matches!(
+                error,
+                BoundExecutionError::Tool(ToolError::RpcIndeterminate(_))
+            ));
+            if upload_failure.is_some() {
+                assert!(api.writes.lock().await.is_empty());
+            } else {
+                assert_eq!(api.writes.lock().await.len(), 1);
+            }
+            assert!(
+                default_state(&tool)
+                    .await
+                    .visible_messages
+                    .iter()
+                    .all(|message| message.message_id != "m8"),
+                "{case} must not admit an unreceipted message"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_write_accepts_unbound_same_request_receipt_without_source_replay() {
+        let specs = test_source_specs();
+        let second = specs[1].clone();
+        let (api, source, tool, registry) = attachment_binding_fixture(specs).await;
+        let call_id = "attachment-unbound-receipt";
+        let second_nonce = attachment_client_nonce("flow", call_id, 1);
+        api.uploaded_by_nonce.lock().await.insert(
+            second_nonce.clone(),
+            test_attachment_metadata(1, &second.filename, "image/png", &second.bytes, 0),
+        );
+
+        let outcome = execute_bound_action(
+            &registry,
+            call_id,
+            json!({
+                "action": "write",
+                "content": "same-request HTTP replay",
+                "attachments": ["docs/report.txt", "images/pixel.png"]
+            }),
+        )
+        .await
+        .expect("an unbound position-zero upload receipt is valid at any sealed index");
+
+        assert_eq!(outcome.output.details["created"], true);
+        assert_eq!(source.calls.lock().await.len(), 1);
+        assert_eq!(api.uploads.lock().await.len(), 2);
+        assert_eq!(api.writes.lock().await.len(), 1);
+        assert_eq!(
+            api.uploaded_by_nonce
+                .lock()
+                .await
+                .get(&second_nonce)
+                .expect("same-request upload receipt remains recorded")
+                .position,
+            1,
+            "the final write binds the previously unbound receipt at its sealed index"
+        );
+        assert_eq!(
+            default_state(&tool)
+                .await
+                .visible_messages
+                .iter()
+                .filter(|message| message.message_id == "m8")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_attachment_write_spends_no_source_or_local_effect() {
+        let (api, source, _tool, registry) = attachment_binding_fixture(test_source_specs()).await;
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "cancelled-attachment",
+                    json!({
+                        "action": "write",
+                        "content": "",
+                        "attachments": ["docs/report.txt"]
+                    }),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind attachment write");
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = match registry
+            .execute_bound(authorized, cancel, Arc::new(|_| {}))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("pre-effect cancellation must fail"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+        assert!(source.calls.lock().await.is_empty());
+        assert!(api.uploads.lock().await.is_empty());
+        assert!(api.writes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_path_sets_fail_before_scope_resolution_or_source_effect() {
+        let (api, source, _tool, registry) = attachment_binding_fixture(test_source_specs()).await;
+        let eleven = (0..11)
+            .map(|index| format!("docs/{index}.txt"))
+            .collect::<Vec<_>>();
+        let cases = [
+            json!({"action":"write", "content":"", "attachments":[]}),
+            json!({"action":"write", "content":"hello", "attachments":eleven}),
+            json!({
+                "action":"write",
+                "content":"hello",
+                "attachments":["docs/report.txt", "docs/../docs/report.txt"]
+            }),
+            json!({"action":"write", "content":"hello", "attachments":["../secret"]}),
+            json!({"action":"write", "content":"hello", "attachments":["/etc/passwd"]}),
+        ];
+        for (index, action) in cases.into_iter().enumerate() {
+            let error = bind_action(&registry, &format!("invalid-paths-{index}"), action)
+                .await
+                .expect_err("invalid attachment path set must not bind");
+            assert!(
+                matches!(error, DescribeError::InvalidArguments),
+                "case {index}: {error:?}"
+            );
+        }
+        assert!(api.calls.lock().await.is_empty());
+        assert!(source.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_attachment_write_cannot_bypass_the_bound_composite_authority() {
+        let (api, source, tool, _registry) = attachment_binding_fixture(test_source_specs()).await;
+        let error = execute(
+            &tool,
+            json!({
+                "action":"write",
+                "content":"hello",
+                "attachments":["docs/report.txt"]
+            }),
+            "raw-attachment",
+        )
+        .await
+        .expect_err("raw invocation has no composite authority continuation");
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert!(source.calls.lock().await.is_empty());
+        assert!(api.uploads.lock().await.is_empty());
+        assert!(api.writes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn composite_receipt_remains_unavailable_until_the_final_message_write_returns() {
+        let (api, _source, _tool, registry) = attachment_binding_fixture(test_source_specs()).await;
+        let gate = Arc::new(Semaphore::new(0));
+        *api.write_gate.lock().await = Some(gate.clone());
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "write-barrier",
+                    json!({
+                        "action": "write",
+                        "content": "",
+                        "attachments": ["docs/report.txt", "images/pixel.png"]
+                    }),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind attachment write");
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let registry = Arc::new(registry);
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .execute_bound(authorized, cancel, Arc::new(|_| {}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api.uploads.lock().await.len() == 2
+                    && api
+                        .calls
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|call| call == "write:place-a")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("uploads finish and final write reaches its barrier");
+        assert!(!execution.is_finished());
+        assert!(api.writes.lock().await.is_empty());
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !execution.is_finished(),
+            "post-emission cancellation must not discard an ambiguous commit receipt"
+        );
+        gate.add_permits(1);
+        execution
+            .await
+            .expect("execution task joins")
+            .expect("final write receipt closes the composite effect");
+        assert_eq!(api.writes.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_attachment_binds_only_visible_exact_metadata_and_rejects_response_drift() {
+        let bytes = b"visible attachment".to_vec();
+        let attachment = test_attachment_metadata(5, "visible.txt", "text/plain", &bytes, 0);
+        let (api, tool, registry) = binding_fixture().await;
+        {
+            let mut state = default_state(&tool).await;
+            state.visible_messages[1].attachments = vec![attachment.clone()];
+        }
+        let unavailable = bind_action(
+            &registry,
+            "unseen-attachment",
+            json!({"action":"open_attachment", "attachment_id":test_attachment_id(9)}),
+        )
+        .await
+        .expect_err("unseen attachment cannot reach review");
+        assert!(matches!(
+            unavailable,
+            DescribeError::AppPrecondition { precondition }
+                if precondition.code == "visible_attachment_required"
+        ));
+        assert!(api.attachment_reads.lock().await.is_empty());
+
+        let bound = bind_action(
+            &registry,
+            "visible-attachment",
+            json!({"action":"open_attachment", "attachment_id":attachment.attachment_id}),
+        )
+        .await
+        .expect("visible attachment binds");
+        assert_eq!(bound.descriptor.operation, "open_attachment");
+        assert_eq!(bound.descriptor.capability, CapabilityClass::Read);
+        for scope in [
+            ResourceScope::resource("messaging", "place", "place-a"),
+            ResourceScope::resource("messaging", "message", "message-7"),
+            ResourceScope::resource("messaging", "attachment", &attachment.attachment_id),
+        ] {
+            assert!(bound.descriptor.resource_scopes.contains(&scope));
+        }
+        assert_eq!(
+            bound.execution_arguments.as_object()["attachment"],
+            serde_json::to_value(&attachment).expect("attachment metadata")
+        );
+
+        *api.open_attachment_response.lock().await = Some((
+            OpenMessagingAttachmentMetadata {
+                attachment_id: attachment.attachment_id.clone(),
+                filename: attachment.filename.clone(),
+                mime: attachment.mime.clone(),
+                size_bytes: attachment.size_bytes,
+                sha256: attachment.sha256.clone(),
+            },
+            bytes.clone(),
+        ));
+        let outcome = execute_bound_action(
+            &registry,
+            "visible-attachment",
+            json!({"action":"open_attachment", "attachment_id":attachment.attachment_id}),
+        )
+        .await
+        .expect("open exact visible attachment");
+        assert!(matches!(
+            outcome.output.content.as_slice(),
+            [UserContent::Text { text }] if text == "visible attachment"
+        ));
+        assert_eq!(
+            api.attachment_reads.lock().await.as_slice(),
+            &[(
+                "place-a".to_owned(),
+                "message-7".to_owned(),
+                attachment.attachment_id.clone()
+            )]
+        );
+
+        *api.open_attachment_response.lock().await = Some((
+            OpenMessagingAttachmentMetadata {
+                attachment_id: attachment.attachment_id.clone(),
+                filename: "different.txt".to_owned(),
+                mime: attachment.mime.clone(),
+                size_bytes: attachment.size_bytes,
+                sha256: attachment.sha256.clone(),
+            },
+            bytes,
+        ));
+        let error = match execute_bound_action(
+            &registry,
+            "drifted-attachment",
+            json!({"action":"open_attachment", "attachment_id":attachment.attachment_id}),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("response metadata drift must fail closed"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn attachment_rendering_exposes_safe_content_without_putting_bytes_in_details() {
+        let cases = [
+            ("pixel.png", "image/png", b"png".as_slice(), "image"),
+            ("note.txt", "text/plain", b"hello".as_slice(), "text"),
+            (
+                "archive.bin",
+                "application/octet-stream",
+                b"\0\x01".as_slice(),
+                "metadata",
+            ),
+        ];
+        for (index, (filename, mime, bytes, expected)) in cases.into_iter().enumerate() {
+            let metadata = test_attachment_metadata(index + 10, filename, mime, bytes, 0);
+            let response = OpenMessagingAttachmentResponse {
+                attachment: OpenMessagingAttachmentMetadata {
+                    attachment_id: metadata.attachment_id.clone(),
+                    filename: metadata.filename.clone(),
+                    mime: metadata.mime.clone(),
+                    size_bytes: metadata.size_bytes,
+                    sha256: metadata.sha256.clone(),
+                },
+                bytes: zeroize::Zeroizing::new(bytes.to_vec()),
+            };
+            let output = render_attachment_output(metadata.clone(), response)
+                .expect("render accepted attachment");
+            assert_eq!(output.details, json!({"attachment":metadata}));
+            assert!(!output.details.to_string().contains("aGVsbG8="));
+            match (expected, output.content.as_slice()) {
+                ("image", [UserContent::Image { data, mime_type }]) => {
+                    assert_eq!(data, &BASE64_STANDARD.encode(bytes));
+                    assert_eq!(mime_type, mime);
+                }
+                ("text", [UserContent::Text { text }]) => assert_eq!(text, "hello"),
+                ("metadata", [UserContent::Text { text }]) => {
+                    assert!(text.contains(filename));
+                    assert!(text.contains("application/octet-stream"));
+                    assert!(!text.contains("\0\x01"));
+                }
+                other => panic!("unexpected attachment rendering {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn strict_open_attachment_admission_preserves_attachment_only_messages() {
+        let bytes = b"x";
+        let attachment = test_attachment_metadata(20, "x.txt", "text/plain", bytes, 0);
+        let mut valid = test_open_response("general", 1, 0, 1, 1, None);
+        valid["messages"][0]["content"] = json!("");
+        valid["messages"][0]["attachments"] =
+            json!([serde_json::to_value(&attachment).expect("attachment wire")]);
+        let admission = validate_open_response(&valid, "general", None, None)
+            .expect("attachment-only live message is valid");
+        assert_eq!(
+            admission.visible_messages[0].attachments,
+            vec![attachment.clone()]
+        );
+
+        let mut missing = valid.clone();
+        missing["messages"][0]
+            .as_object_mut()
+            .expect("message object")
+            .remove("attachments");
+        let mut wrong_position = valid.clone();
+        wrong_position["messages"][0]["attachments"][0]["position"] = json!(1);
+        let mut duplicate = valid.clone();
+        let duplicate_value = duplicate["messages"][0]["attachments"][0].clone();
+        duplicate["messages"][0]["attachments"]
+            .as_array_mut()
+            .expect("attachments array")
+            .push(duplicate_value);
+        duplicate["messages"][0]["attachments"][1]["position"] = json!(1);
+        let mut tombstone = valid.clone();
+        tombstone["messages"][0]["deleted"] = json!(true);
+        for (case, malformed) in [
+            ("missing", missing),
+            ("wrong-position", wrong_position),
+            ("duplicate", duplicate),
+            ("tombstone", tombstone),
+        ] {
+            assert!(
+                matches!(
+                    validate_open_response(&malformed, "general", None, None),
+                    Err(ToolError::Protocol(_))
+                ),
+                "{case} attachment evidence must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bound_write_keeps_place_a_after_the_view_focuses_place_b() {
         let (api, tool, registry) = binding_fixture().await;
         let proposal = json!({"action": "write", "content": "hello"});
@@ -3649,7 +5169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_and_bound_paths_share_one_exact_executor_for_all_seven_actions() {
+    async fn raw_and_bound_paths_share_one_exact_executor_for_non_attachment_actions() {
         let cases = [
             ("overview", json!({"action": "overview"})),
             (
@@ -3748,7 +5268,8 @@ mod tests {
             &[(
                 ("place-a").to_owned(),
                 "hello".to_owned(),
-                client_nonce("flow", "write-a")
+                client_nonce("flow", "write-a"),
+                Vec::new()
             )]
         );
         let state = default_state(&tool).await;
@@ -4049,6 +5570,7 @@ mod tests {
             state.visible_messages = vec![VisibleMessage {
                 message_id: "old-message".to_owned(),
                 seq: Some(9),
+                attachments: Vec::new(),
             }];
             state.pending_read_through.insert("old-place".to_owned(), 9);
         }

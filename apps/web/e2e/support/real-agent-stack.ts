@@ -27,6 +27,9 @@ export const secondUserMessage = "real browser turn two";
 export const firstProviderResponse = "real-agent-turn-one";
 export const secondProviderResponse = "real-agent-turn-two-context-ok";
 export const executorAuthorityProbeFile = "executor-authority-probe.txt";
+export const humanMessagingAttachmentFile = "human-messaging-e2e.txt";
+export const humanMessagingAttachmentContents =
+  "exact Human Messaging attachment bytes\n";
 
 const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001";
 const realAgentHumanID = "0198f0f4-9b72-7000-8000-000000000002";
@@ -39,6 +42,14 @@ const invitationListToolCallID = "call-real-agent-invitation-list";
 const invitationAcceptToolCallID = "call-real-agent-invitation-accept";
 const workspaceListToolCallID = "call-real-agent-workspace-list";
 const executorToolCallID = "call-real-agent-list-dir";
+const messagingOverviewToolCallID = "call-real-agent-messaging-overview";
+const messagingOpenHumanToolCallID = "call-real-agent-messaging-open-human";
+const messagingOpenHumanAttachmentToolCallID =
+  "call-real-agent-messaging-open-human-attachment";
+const messagingWriteToolCallID = "call-real-agent-messaging-write";
+const messagingOpenAgentToolCallID = "call-real-agent-messaging-open-agent";
+const messagingOpenAgentAttachmentToolCallID =
+  "call-real-agent-messaging-open-agent-attachment";
 const executorAuthorityProbeContents = "exact executor authority probe\n";
 
 export interface RealAgentBuild {
@@ -70,6 +81,13 @@ export class LoopbackChatProvider {
   invitationID: string | undefined;
   workspaceID: string | undefined;
   workspaceName: string | undefined;
+  messagingVerified = false;
+  private messagingChannelID: string | undefined;
+  private humanAttachmentID: string | undefined;
+  private humanAttachmentDigest: string | undefined;
+  private agentMessageID: string | undefined;
+  private agentAttachmentID: string | undefined;
+  private agentAttachmentDigest: string | undefined;
   url = "";
 
   private readonly apiKey: string;
@@ -89,6 +107,23 @@ export class LoopbackChatProvider {
       throw new Error("loopback provider did not expose a TCP address");
     }
     this.url = `http://127.0.0.1:${address.port}`;
+  }
+
+  get reviewerForbiddenValues(): readonly string[] {
+    return [
+      this.workspaceID,
+      this.workspaceName,
+      this.messagingChannelID,
+      this.humanAttachmentID,
+      this.humanAttachmentDigest,
+      this.agentMessageID,
+      this.agentAttachmentID,
+      this.agentAttachmentDigest,
+      humanMessagingAttachmentFile,
+      humanMessagingAttachmentContents,
+      executorAuthorityProbeFile,
+      executorAuthorityProbeContents,
+    ].filter((value): value is string => typeof value === "string");
   }
 
   async stop(): Promise<void> {
@@ -271,6 +306,219 @@ export class LoopbackChatProvider {
           return;
         }
         this.contextVerified = true;
+        // The focused provider/config contract deliberately exercises the
+        // pre-Messaging conversation surface. The real stack proves the v3
+        // attachment sequence below whenever the registered tool is present.
+        if (!hasProviderTool(raw.tools, "messaging")) {
+          respondSSE(response, turn, secondProviderResponse);
+          return;
+        }
+        if (!this.workspaceID) {
+          respondJSON(response, 422, {
+            error: "workspace_missing_for_messaging",
+          });
+          return;
+        }
+        respondToolCallSSE(
+          response,
+          turn,
+          messagingOverviewToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "overview",
+          },
+        );
+        return;
+      }
+      if (turn === 7) {
+        const overview = exactToolResultJSON(
+          messages,
+          messagingOverviewToolCallID,
+          "messaging",
+          { workspace_id: this.workspaceID, action: "overview" },
+        );
+        const channel = exactSingleMessagingChannel(overview, this.workspaceID);
+        if (!channel || !this.workspaceID) {
+          respondJSON(response, 422, {
+            error: "exact_messaging_overview_result_missing",
+          });
+          return;
+        }
+        this.messagingChannelID = channel.channelID;
+        respondToolCallSSE(
+          response,
+          turn,
+          messagingOpenHumanToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open",
+            place_id: channel.channelID,
+          },
+        );
+        return;
+      }
+      if (turn === 8) {
+        const open = exactToolResultJSON(
+          messages,
+          messagingOpenHumanToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open",
+            place_id: this.messagingChannelID,
+          },
+        );
+        const attachment = exactHumanMessagingAttachment(open);
+        if (!attachment || !this.workspaceID || !this.messagingChannelID) {
+          respondJSON(response, 422, {
+            error: "exact_human_attachment_metadata_missing",
+          });
+          return;
+        }
+        this.humanAttachmentID = attachment.attachmentID;
+        this.humanAttachmentDigest = attachment.sha256;
+        respondToolCallSSE(
+          response,
+          turn,
+          messagingOpenHumanAttachmentToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open_attachment",
+            attachment_id: attachment.attachmentID,
+          },
+        );
+        return;
+      }
+      if (turn === 9) {
+        const bytes = exactToolResultContent(
+          messages,
+          messagingOpenHumanAttachmentToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open_attachment",
+            attachment_id: this.humanAttachmentID,
+          },
+        );
+        if (
+          !this.workspaceID ||
+          !this.messagingChannelID ||
+          !this.humanAttachmentID ||
+          bytes !== humanMessagingAttachmentContents
+        ) {
+          respondJSON(response, 422, {
+            error: "exact_human_attachment_bytes_missing",
+          });
+          return;
+        }
+        respondToolCallSSE(
+          response,
+          turn,
+          messagingWriteToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "write",
+            content: "",
+            attachments: [executorAuthorityProbeFile],
+          },
+        );
+        return;
+      }
+      if (turn === 10) {
+        const writeContent = exactToolResultContent(
+          messages,
+          messagingWriteToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "write",
+            content: "",
+            attachments: [executorAuthorityProbeFile],
+          },
+        );
+        const receipt = exactMessagingWriteReceipt(
+          parseJSONOrUndefined(writeContent),
+        );
+        if (!receipt || !this.workspaceID || !this.messagingChannelID) {
+          respondJSON(response, 422, {
+            error: "exact_messaging_write_receipt_missing",
+          });
+          return;
+        }
+        this.agentMessageID = receipt.messageID;
+        respondToolCallSSE(
+          response,
+          turn,
+          messagingOpenAgentToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open",
+            place_id: this.messagingChannelID,
+          },
+        );
+        return;
+      }
+      if (turn === 11) {
+        const open = exactToolResultJSON(
+          messages,
+          messagingOpenAgentToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open",
+            place_id: this.messagingChannelID,
+          },
+        );
+        const attachment = this.agentMessageID
+          ? exactAgentMessagingAttachment(open, this.agentMessageID)
+          : undefined;
+        if (!attachment || !this.workspaceID || !this.agentMessageID) {
+          respondJSON(response, 422, {
+            error: "exact_agent_attachment_metadata_missing",
+          });
+          return;
+        }
+        this.agentAttachmentID = attachment.attachmentID;
+        this.agentAttachmentDigest = attachment.sha256;
+        respondToolCallSSE(
+          response,
+          turn,
+          messagingOpenAgentAttachmentToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open_attachment",
+            attachment_id: attachment.attachmentID,
+          },
+        );
+        return;
+      }
+      if (turn === 12) {
+        const bytes = exactToolResultContent(
+          messages,
+          messagingOpenAgentAttachmentToolCallID,
+          "messaging",
+          {
+            workspace_id: this.workspaceID,
+            action: "open_attachment",
+            attachment_id: this.agentAttachmentID,
+          },
+        );
+        if (
+          !this.agentAttachmentID ||
+          bytes !== executorAuthorityProbeContents
+        ) {
+          respondJSON(response, 422, {
+            error: "exact_agent_attachment_bytes_missing",
+          });
+          return;
+        }
+        this.messagingVerified = true;
         respondSSE(response, turn, secondProviderResponse);
         return;
       }
@@ -855,6 +1103,7 @@ async function startRealAgentStackOnce(
       gatewayState: join(runtimeDirectory, "gateway-state"),
       agentState: join(runtimeDirectory, "agent-state"),
       workspace: join(runtimeDirectory, "workspace"),
+      messagingAttachmentRoot: join(runtimeDirectory, "messaging-attachments"),
       ipc: join(runtimeDirectory, "ipc"),
       localControl: join(runtimeDirectory, "local-control"),
     };
@@ -939,6 +1188,11 @@ async function startRealAgentStackOnce(
         SUMI_PUBLIC_LOOPBACK_LISTEN: `127.0.0.1:${publicPort}`,
         SUMI_COMMAND_LOG_DIR: paths.commandLog,
         SUMI_AGENT_RUNTIME_STATE_DIR: paths.gatewayState,
+        SUMI_MESSAGING_ATTACHMENT_ROOT: paths.messagingAttachmentRoot,
+        SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES: "20971520",
+        SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS: "10",
+        SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES: "41943040",
+        SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS: "100",
         SUMI_AGENT_TOKEN_SECRET: agentTokenSecret,
         SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
         SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
@@ -1598,6 +1852,15 @@ function exactToolResultJSON(
   }
 }
 
+function parseJSONOrUndefined(content: string | undefined): unknown {
+  if (content === undefined) return undefined;
+  try {
+    return JSON.parse(content) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 function exactShallowObject(
   actual: Record<string, unknown>,
   expected: Record<string, unknown>,
@@ -1608,9 +1871,22 @@ function exactShallowObject(
     keys.length === expectedKeys.length &&
     keys.every(
       (key, index) =>
-        key === expectedKeys[index] && actual[key] === expected[key],
+        key === expectedKeys[index] &&
+        exactJSONValue(actual[key], expected[key]),
     )
   );
+}
+
+function exactJSONValue(actual: unknown, expected: unknown): boolean {
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) &&
+      Array.isArray(expected) &&
+      actual.length === expected.length &&
+      actual.every((entry, index) => exactJSONValue(entry, expected[index]))
+    );
+  }
+  return actual === expected;
 }
 
 function exactSingleInvitation(value: unknown):
@@ -1686,6 +1962,200 @@ function exactWorkspaceMembershipList(
     workspace.workspace_id === workspaceID &&
     workspace.name === workspaceName
   );
+}
+
+function exactSingleMessagingChannel(
+  value: unknown,
+  workspaceID: string | undefined,
+): { channelID: string } | undefined {
+  if (!workspaceID || !isRecord(value)) return undefined;
+  if (
+    Object.keys(value).sort().join("\0") !==
+      "channels\0dms\0members\0read_markers\0reply_later_markers\0self\0unread_summaries\0workspaces" ||
+    !Array.isArray(value.workspaces) ||
+    value.workspaces.length !== 1 ||
+    !Array.isArray(value.channels) ||
+    value.channels.length !== 1 ||
+    !Array.isArray(value.dms) ||
+    value.dms.length !== 0
+  ) {
+    return undefined;
+  }
+  const workspace = value.workspaces[0];
+  const channel = value.channels[0];
+  if (
+    !isRecord(workspace) ||
+    Object.keys(workspace).sort().join("\0") !== "name\0workspace_id" ||
+    workspace.workspace_id !== workspaceID ||
+    typeof workspace.name !== "string" ||
+    workspace.name.length === 0 ||
+    !isRecord(channel) ||
+    Object.keys(channel).sort().join("\0") !==
+      "channel_id\0name\0topic\0visibility\0workspace_id" ||
+    !isCanonicalUUIDv7(channel.channel_id) ||
+    channel.workspace_id !== workspaceID ||
+    typeof channel.name !== "string" ||
+    channel.name.length === 0 ||
+    typeof channel.topic !== "string" ||
+    typeof channel.visibility !== "string"
+  ) {
+    return undefined;
+  }
+  return { channelID: channel.channel_id };
+}
+
+function exactHumanMessagingAttachment(
+  value: unknown,
+): { attachmentID: string; sha256: string } | undefined {
+  const matches = exactOpenMessages(value).flatMap((message) =>
+    message.author.kind === "human" &&
+    message.author.id === realAgentHumanID &&
+    message.attachments.length === 1
+      ? [{ message, attachment: message.attachments[0] }]
+      : [],
+  );
+  if (matches.length !== 1) return undefined;
+  const { message, attachment } = matches[0];
+  if (
+    message.content !== "" ||
+    attachment.filename !== humanMessagingAttachmentFile ||
+    attachment.mime !== "text/plain" ||
+    attachment.sizeBytes !==
+      Buffer.byteLength(humanMessagingAttachmentContents) ||
+    attachment.position !== 0
+  ) {
+    return undefined;
+  }
+  return { attachmentID: attachment.attachmentID, sha256: attachment.sha256 };
+}
+
+function exactAgentMessagingAttachment(
+  value: unknown,
+  messageID: string,
+): { attachmentID: string; sha256: string } | undefined {
+  const matches = exactOpenMessages(value).flatMap((message) =>
+    message.messageID === messageID &&
+    message.author.kind === "personality_agent" &&
+    message.attachments.length === 1
+      ? [{ message, attachment: message.attachments[0] }]
+      : [],
+  );
+  if (matches.length !== 1) return undefined;
+  const { message, attachment } = matches[0];
+  if (
+    message.content !== "" ||
+    attachment.filename !== executorAuthorityProbeFile ||
+    attachment.mime !== "text/plain" ||
+    attachment.sizeBytes !==
+      Buffer.byteLength(executorAuthorityProbeContents) ||
+    attachment.position !== 0
+  ) {
+    return undefined;
+  }
+  return { attachmentID: attachment.attachmentID, sha256: attachment.sha256 };
+}
+
+function exactMessagingWriteReceipt(
+  value: unknown,
+): { messageID: string } | undefined {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).sort().join("\0") !==
+      "client_nonce\0created\0message_id\0seq" ||
+    typeof value.client_nonce !== "string" ||
+    value.client_nonce.length === 0 ||
+    value.created !== true ||
+    !isCanonicalUUIDv7(value.message_id) ||
+    !Number.isSafeInteger(value.seq) ||
+    value.seq <= 0
+  ) {
+    return undefined;
+  }
+  return { messageID: value.message_id };
+}
+
+function exactOpenMessages(value: unknown): Array<{
+  messageID: string;
+  content: string;
+  author: { kind: string; id: string };
+  attachments: Array<{
+    attachmentID: string;
+    filename: string;
+    mime: string;
+    sizeBytes: number;
+    position: number;
+    sha256: string;
+  }>;
+}> {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).sort().join("\0") !==
+      "last_read_seq\0latest_seq\0members\0messages\0place" ||
+    !Array.isArray(value.messages)
+  ) {
+    return [];
+  }
+  const messages = value.messages.flatMap((entry) => {
+    if (
+      !isRecord(entry) ||
+      Object.keys(entry).sort().join("\0") !==
+        "attachments\0author\0client_nonce\0content\0created_at\0deleted\0edited_at\0mentions\0message_id\0place\0reactions\0reply_to\0seq\0urgency" ||
+      !isCanonicalUUIDv7(entry.message_id) ||
+      typeof entry.content !== "string" ||
+      !isRecord(entry.author) ||
+      !Array.isArray(entry.attachments)
+    ) {
+      return [];
+    }
+    const author = entry.author;
+    const authorID =
+      author.kind === "human" ? author.human_id : author.personality_agent_id;
+    if (
+      (author.kind !== "human" && author.kind !== "personality_agent") ||
+      typeof authorID !== "string" ||
+      authorID.length === 0
+    ) {
+      return [];
+    }
+    const attachments = entry.attachments.flatMap((attachment) => {
+      if (
+        !isRecord(attachment) ||
+        Object.keys(attachment).sort().join("\0") !==
+          "attachment_id\0filename\0mime\0position\0sha256\0size_bytes" ||
+        !isCanonicalUUIDv7(attachment.attachment_id) ||
+        typeof attachment.filename !== "string" ||
+        typeof attachment.mime !== "string" ||
+        !Number.isSafeInteger(attachment.size_bytes) ||
+        attachment.size_bytes < 1 ||
+        !Number.isSafeInteger(attachment.position) ||
+        attachment.position < 0 ||
+        typeof attachment.sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(attachment.sha256)
+      ) {
+        return [];
+      }
+      return [
+        {
+          attachmentID: attachment.attachment_id,
+          filename: attachment.filename,
+          mime: attachment.mime,
+          sizeBytes: attachment.size_bytes,
+          position: attachment.position,
+          sha256: attachment.sha256,
+        },
+      ];
+    });
+    if (attachments.length !== entry.attachments.length) return [];
+    return [
+      {
+        messageID: entry.message_id,
+        content: entry.content,
+        author: { kind: author.kind, id: authorID },
+        attachments,
+      },
+    ];
+  });
+  return messages.length === value.messages.length ? messages : [];
 }
 
 function isCanonicalUUIDv7(value: unknown): value is string {

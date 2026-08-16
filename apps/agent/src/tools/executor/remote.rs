@@ -685,7 +685,7 @@ fn validate_workspace_selector(value: &str, max_bytes: usize) -> Result<(), Desc
 /// executor workspace. This deliberately performs no filesystem lookup: the
 /// executor remains responsible for `openat2`/no-symlink enforcement when the
 /// operation is eventually run.
-fn normalize_workspace_path(
+pub(crate) fn normalize_workspace_path(
     input: &str,
     workspace: &WorkspacePaths,
 ) -> Result<String, DescribeError> {

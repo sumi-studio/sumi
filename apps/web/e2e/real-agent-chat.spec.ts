@@ -9,8 +9,11 @@ import {
 } from "@playwright/test";
 import {
   buildRealAgentStack,
+  executorAuthorityProbeFile,
   firstProviderResponse,
   firstUserMessage,
+  humanMessagingAttachmentContents,
+  humanMessagingAttachmentFile,
   type RealAgentBuild,
   removeRealAgentBuild,
   secondProviderResponse,
@@ -164,6 +167,56 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     );
     await expect(
       page.getByText("招待済み・承諾待ち", { exact: true }),
+    ).toBeVisible();
+
+    // This uses the actual Workspace composer path, including its hidden file
+    // input and server-side attachment upload, before the PA ever receives a
+    // Direct Chat command. The provider must discover every resulting ID from
+    // its own Messaging tool results rather than from this browser evidence.
+    await page.getByRole("button", { name: "アプリ", exact: true }).click();
+    const messagingInstallResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === "/app-installations",
+    );
+    await page
+      .getByRole("button", { name: "インストール", exact: true })
+      .click();
+    expect((await messagingInstallResponse).status()).toBe(201);
+    await page.getByRole("button", { name: "開く", exact: true }).click();
+    const channelName = "agent-attachment-e2e";
+    await page.getByTitle("チャンネルを作成").click();
+    const channelDialog = page.getByRole("dialog", {
+      name: "チャンネルを作成",
+    });
+    await channelDialog
+      .getByRole("textbox", { name: "名前", exact: true })
+      .fill(channelName);
+    await channelDialog
+      .getByRole("button", { name: "作成", exact: true })
+      .click();
+    const messagingComposer = page.getByRole("textbox", {
+      name: `#${channelName} へメッセージ`,
+    });
+    const uploadResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        /\/messaging\/places\/[^/]+\/attachments$/.test(
+          new URL(response.url()).pathname,
+        ),
+    );
+    await page.getByTestId("composer-file-input").setInputFiles({
+      name: humanMessagingAttachmentFile,
+      mimeType: "text/plain",
+      buffer: Buffer.from(humanMessagingAttachmentContents),
+    });
+    expect((await uploadResponse).status()).toBe(201);
+    await expect(page.getByTestId("composer-attachments")).toContainText(
+      humanMessagingAttachmentFile,
+    );
+    await messagingComposer.press("Enter");
+    await expect(
+      page.locator(`a[download="${humanMessagingAttachmentFile}"]`),
     ).toBeVisible();
 
     const installResponse = page.waitForResponse(isInstallResponse);
@@ -484,16 +537,65 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     await expect
       .poll(() => assistantMessageEndSequence.get(secondProviderResponse))
       .toBeGreaterThan(0);
-    expect(stack.provider.requestCount).toBe(6);
-    expect(stack.provider.requests).toHaveLength(6);
+    expect(stack.provider.requestCount).toBe(12);
+    expect(stack.provider.requests).toHaveLength(12);
     expect(stack.provider.executorToolVerified).toBe(true);
-    expect(stack.executionReviewCount).toBe(1);
+    expect(stack.provider.messagingVerified).toBe(true);
+    // Invitation accept and the one attachment-bearing Messaging write are
+    // the only normal mutations. Messaging overview/open/open_attachment use
+    // the built-in Read fast path and never reach either reviewer.
+    expect(stack.executionReviewCount).toBe(2);
     expect(stack.escalationReviewCount).toBe(0);
+    expect(stack.executionReviewRequests).toHaveLength(2);
+    const messagingReviewerWire = JSON.stringify(
+      stack.executionReviewRequests[1],
+    );
+    expect(messagingReviewerWire).toContain("messaging_v3");
+    expect(messagingReviewerWire).toContain("write");
+    expect(messagingReviewerWire).toContain("foundation_workspace");
+    for (const forbidden of [
+      ...stack.provider.reviewerForbiddenValues,
+      "invitation_id",
+      "workspace_id",
+      "attachment_id",
+      "attachment_ids",
+      "attachment_paths",
+      "execution_arguments",
+      "proposal_digest",
+      "descriptor_digest",
+      "bound_evidence_digest",
+    ]) {
+      expect(messagingReviewerWire).not.toContain(forbidden);
+    }
     expect(stack.provider.contextVerified).toBe(true);
     expect(
       assistantMessageEndSequence.get(secondProviderResponse),
     ).toBeGreaterThan(
       assistantMessageEndSequence.get(firstProviderResponse) ?? 0,
+    );
+
+    // The Human browser receives the agent's rendered attachment card and
+    // reads it through the normal scoped production download route.
+    await page.goto(`${stack.webURL}/w/${workspaceID}/messaging`);
+    await page.getByText("agent-attachment-e2e", { exact: true }).click();
+    const agentAttachment = page.locator(
+      `a[download="${executorAuthorityProbeFile}"]`,
+    );
+    await expect(agentAttachment).toBeVisible({ timeout: 30_000 });
+    const agentDownload = await page.evaluate(async (filename) => {
+      const link = document.querySelector<HTMLAnchorElement>(
+        `a[download="${CSS.escape(filename)}"]`,
+      );
+      if (!link) throw new Error("agent attachment link was not rendered");
+      const response = await fetch(link.href, { credentials: "include" });
+      return {
+        status: response.status,
+        bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+      };
+    }, executorAuthorityProbeFile);
+    expect(agentDownload.status).toBe(200);
+    expect(Buffer.from(agentDownload.bytes)).toEqual(
+      Buffer.from("exact executor authority probe\n"),
     );
 
     for (const observation of socketObservations) {
@@ -674,7 +776,7 @@ async function expectNormalSession(
 async function openParticipantApps(page: Page) {
   const settings = page.getByRole("dialog", { name: "設定" });
   if (!(await settings.isVisible().catch(() => false))) {
-    await page.getByRole("button", { name: "設定" }).click();
+    await page.getByRole("button", { name: "設定", exact: true }).click();
     await expect(settings).toBeVisible();
   }
   const apps = page.getByRole("dialog", { name: "個人用アプリ" });

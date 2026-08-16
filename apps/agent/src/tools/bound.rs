@@ -171,6 +171,7 @@ pub(crate) enum ProviderReviewIdentity {
     /// It is deliberately absent from `from_local`: new bindings are V2 only.
     MessagingV1,
     MessagingV2,
+    MessagingV3,
     WorkspaceReadFileV1,
     WorkspaceListDirV1,
     WorkspaceGlobV1,
@@ -199,7 +200,7 @@ impl ProviderReviewIdentity {
             ("workspace_invitation_accept", "sumi.workspace.invitation.accept", 1) => {
                 Self::WorkspaceInvitationAcceptV1
             }
-            ("messaging", "sumi.messaging", 2) => Self::MessagingV2,
+            ("messaging", "sumi.messaging", 3) => Self::MessagingV3,
             ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
             ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
             ("glob", "sumi.foundation.workspace", 1) => Self::WorkspaceGlobV1,
@@ -234,6 +235,7 @@ pub(crate) enum ProviderReviewOperation {
     AcceptInvitation,
     Overview,
     Open,
+    OpenAttachment,
     Write,
     React,
     Status,
@@ -277,6 +279,7 @@ pub(crate) enum ProviderReviewResourceKind {
     Message,
     Participant,
     ReplyLaterMarker,
+    Attachment,
     Path,
     GlobSelector,
     #[cfg(test)]
@@ -377,17 +380,40 @@ fn provider_review_operation(
         (Identity::WorkspaceInvitationAcceptV1, "accept_invitation", Mutate) => {
             Operation::AcceptInvitation
         }
-        (Identity::MessagingV1 | Identity::MessagingV2, "overview", Read) => Operation::Overview,
-        (Identity::MessagingV1 | Identity::MessagingV2, "open", Read) => Operation::Open,
-        (Identity::MessagingV1 | Identity::MessagingV2, "write", Mutate) => Operation::Write,
-        (Identity::MessagingV1 | Identity::MessagingV2, "react", Mutate) => Operation::React,
-        (Identity::MessagingV1 | Identity::MessagingV2, "status", Mutate) => Operation::Status,
-        (Identity::MessagingV1 | Identity::MessagingV2, "reply_later", Mutate) => {
-            Operation::ReplyLater
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "overview",
+            Read,
+        ) => Operation::Overview,
+        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "open", Read) => {
+            Operation::Open
         }
-        (Identity::MessagingV1 | Identity::MessagingV2, "resolve_reply_later", Mutate) => {
-            Operation::ResolveReplyLater
-        }
+        (Identity::MessagingV3, "open_attachment", Read) => Operation::OpenAttachment,
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "write",
+            Mutate,
+        ) => Operation::Write,
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "react",
+            Mutate,
+        ) => Operation::React,
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "status",
+            Mutate,
+        ) => Operation::Status,
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "reply_later",
+            Mutate,
+        ) => Operation::ReplyLater,
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "resolve_reply_later",
+            Mutate,
+        ) => Operation::ResolveReplyLater,
         (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
         (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
         (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
@@ -448,27 +474,48 @@ fn provider_review_scope(
         (Identity::WorkspaceInvitationAcceptV1, Resource, "workspace", "membership") => {
             (Resource, Namespace::Workspace, Kind::Membership)
         }
-        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "workspace", "workspace") => {
-            (Resource, Namespace::Workspace, Kind::Workspace)
-        }
-        (Identity::MessagingV1 | Identity::MessagingV2, Collection, "messaging", "place") => {
-            (Collection, Namespace::Messaging, Kind::Place)
-        }
-        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "messaging", "place") => {
-            (Resource, Namespace::Messaging, Kind::Place)
-        }
-        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "messaging", "message") => {
-            (Resource, Namespace::Messaging, Kind::Message)
-        }
-        (Identity::MessagingV1 | Identity::MessagingV2, Resource, "messaging", "participant") => {
-            (Resource, Namespace::Messaging, Kind::Participant)
-        }
         (
-            Identity::MessagingV1 | Identity::MessagingV2,
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Resource,
+            "workspace",
+            "workspace",
+        ) => (Resource, Namespace::Workspace, Kind::Workspace),
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Collection,
+            "messaging",
+            "place",
+        ) => (Collection, Namespace::Messaging, Kind::Place),
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Resource,
+            "messaging",
+            "place",
+        ) => (Resource, Namespace::Messaging, Kind::Place),
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Resource,
+            "messaging",
+            "message",
+        ) => (Resource, Namespace::Messaging, Kind::Message),
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Resource,
+            "messaging",
+            "participant",
+        ) => (Resource, Namespace::Messaging, Kind::Participant),
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
             Resource,
             "messaging",
             "reply_later_marker",
         ) => (Resource, Namespace::Messaging, Kind::ReplyLaterMarker),
+        (Identity::MessagingV3, Resource, "messaging", "attachment") => {
+            (Resource, Namespace::Messaging, Kind::Attachment)
+        }
+        (Identity::MessagingV3, Resource, "sumi.foundation.workspace", "path") => {
+            (Resource, Namespace::FoundationWorkspace, Kind::Path)
+        }
         (
             Identity::WorkspaceReadFileV1
             | Identity::WorkspaceListDirV1
@@ -1517,23 +1564,31 @@ mod tests {
     }
 
     #[test]
-    fn messaging_v1_recovers_but_only_v2_can_be_newly_bound() {
+    fn messaging_v1_and_v2_recover_but_only_v3_can_be_newly_bound() {
         assert_eq!(
             serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v1\"").unwrap(),
             ProviderReviewIdentity::MessagingV1,
             "durable v1 evidence must remain decodable during recovery"
         );
-        let v2 = AdapterIdentity::new("sumi.messaging", 2).unwrap();
         assert_eq!(
-            ProviderReviewIdentity::from_local("messaging", &v2).unwrap(),
-            ProviderReviewIdentity::MessagingV2
+            serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v2\"").unwrap(),
+            ProviderReviewIdentity::MessagingV2,
+            "durable v2 evidence must remain decodable during recovery"
+        );
+        let v3 = AdapterIdentity::new("sumi.messaging", 3).unwrap();
+        assert_eq!(
+            ProviderReviewIdentity::from_local("messaging", &v3).unwrap(),
+            ProviderReviewIdentity::MessagingV3
         );
         let v1 = AdapterIdentity::new("sumi.messaging", 1).unwrap();
         assert!(ProviderReviewIdentity::from_local("messaging", &v1).is_err());
+        let v2 = AdapterIdentity::new("sumi.messaging", 2).unwrap();
+        assert!(ProviderReviewIdentity::from_local("messaging", &v2).is_err());
 
         for identity in [
             ProviderReviewIdentity::MessagingV1,
             ProviderReviewIdentity::MessagingV2,
+            ProviderReviewIdentity::MessagingV3,
         ] {
             assert!(
                 provider_review_operation(
@@ -1547,6 +1602,28 @@ mod tests {
                     .is_ok()
             );
         }
+        assert!(
+            provider_review_operation(
+                ProviderReviewIdentity::MessagingV3,
+                &AppActionDescriptor::new("open_attachment", CapabilityClass::Read, vec![],)
+                    .unwrap(),
+            )
+            .is_ok()
+        );
+        assert!(
+            provider_review_scope(
+                ProviderReviewIdentity::MessagingV3,
+                &ResourceScope::resource("sumi.foundation.workspace", "path", "secret.txt"),
+            )
+            .is_ok()
+        );
+        assert!(
+            provider_review_scope(
+                ProviderReviewIdentity::MessagingV2,
+                &ResourceScope::resource("sumi.foundation.workspace", "path", "secret.txt"),
+            )
+            .is_err()
+        );
     }
 
     #[test]

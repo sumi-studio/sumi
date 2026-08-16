@@ -9,8 +9,7 @@
 //! is the ancillary array order; the count is checked against the manifest.
 
 use std::{
-    io,
-    mem,
+    io, mem,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr,
 };
@@ -53,11 +52,7 @@ pub(super) fn sendmsg_with_fds(socket: RawFd, bytes: &[u8], fds: &[RawFd]) -> io
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as _;
-            ptr::copy_nonoverlapping(
-                fds.as_ptr() as *const u8,
-                libc::CMSG_DATA(cmsg),
-                fd_bytes,
-            );
+            ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cmsg), fd_bytes);
         }
     }
     // SAFETY: header and its buffers are valid for the call duration.
@@ -145,7 +140,10 @@ pub(super) async fn send_frame_with_fds(
         match guard.try_io(|inner| sendmsg_with_fds(inner.as_raw_fd(), &bytes[written..], attach)) {
             Ok(Ok(sent)) => {
                 if sent == 0 {
-                    return Err(io::Error::new(io::ErrorKind::WriteZero, "socket accepted no bytes"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "socket accepted no bytes",
+                    ));
                 }
                 written += sent;
             }

@@ -1621,12 +1621,13 @@ async fn run_critical_executor_exchange(
                     pending.promote(permit)?
                 }
             };
-            let outcome = start_critical_source_transfer_execution(execution, fs, blocking_fs, operation)
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::error!(%error, "critical source transfer ownership task stopped");
-                    Err(bounded_error("rpc_indeterminate"))
-                });
+            let outcome =
+                start_critical_source_transfer_execution(execution, fs, blocking_fs, operation)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, "critical source transfer ownership task stopped");
+                        Err(bounded_error("rpc_indeterminate"))
+                    });
             match outcome {
                 Ok((response, descriptors)) => {
                     let frame = RpcFrame::Terminal {
@@ -1643,7 +1644,9 @@ async fn run_critical_executor_exchange(
                         super::descriptor_transfer::send_frame_with_fds(&channel, &bytes, &raw),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("source transfer terminal write deadline elapsed"))??;
+                    .map_err(|_| {
+                        anyhow::anyhow!("source transfer terminal write deadline elapsed")
+                    })??;
                     drop(descriptors);
                 }
                 Err(error) => {

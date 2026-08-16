@@ -848,9 +848,7 @@ impl CommittedExecutionPermit {
     /// the message, and mints the only receipt after the message commit. It
     /// cannot be combined with `begin_local_effect` or `begin_executor_effect`
     /// because all three consume `self`.
-    pub(crate) fn begin_messaging_workspace_send_effect(
-        self,
-    ) -> MessagingWorkspaceSendEffectStart {
+    pub(crate) fn begin_messaging_workspace_send_effect(self) -> MessagingWorkspaceSendEffectStart {
         MessagingWorkspaceSendEffectStart { permit: self }
     }
 

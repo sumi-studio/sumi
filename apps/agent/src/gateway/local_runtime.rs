@@ -11,7 +11,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::{Seek as _, SeekFrom};
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
@@ -22,8 +24,13 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, watch};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Mutex, watch},
+};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -41,9 +48,13 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi, OpenMessagingPlaceRequest,
-    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
-    SetMessagingStatusRequest, WriteMessagingMessageRequest,
+    CreateMessagingReplyLaterRequest, ExactMessagingScope, MessagingApi, MessagingApiFailure,
+    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
+    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
+    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
+    WriteMessagingMessageRequest, canonical_attachment_filename,
 };
 use crate::apiclient::workspace::{
     WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceInvitationApi,
@@ -61,6 +72,13 @@ const MAX_WORKSPACE_LIST_PAGE_ITEMS: usize = 32;
 // list. Keep that cohesive response bounded independently without widening the
 // credential and runtime-state control-plane boundary above.
 const MAX_MESSAGING_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MESSAGING_ATTACHMENT_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_MESSAGING_ATTACHMENT_FETCH_BYTES: usize = 2 * 1024 * 1024;
+const MESSAGING_ATTACHMENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(135);
+// The server applies the exact idempotency key before executing either of
+// these mutations. One bounded replay resolves a response loss without asking
+// the one-shot executor capability to open or transfer the source again.
+const MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS: usize = 2;
 const MAX_LOCAL_CONTROL_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
@@ -97,8 +115,26 @@ struct EmptyMessagingOperation {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AppResolutionErrorResponse {
+struct LocalControlErrorResponse {
     error: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingAttachmentWire {
+    attachment_id: String,
+    filename: String,
+    mime: String,
+    size_bytes: u64,
+    sha256: String,
+    position: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingAttachmentUploadWire {
+    attachment: MessagingAttachmentWire,
+    created: bool,
 }
 
 /// Short-lived credential accepted only by the local-control transport.
@@ -622,7 +658,7 @@ impl AppInstallationResolver for LocalControlHttpClient {
             }
             return Ok(resolved);
         }
-        let rejection: AppResolutionErrorResponse = serde_json::from_slice(body.as_slice())
+        let rejection: LocalControlErrorResponse = serde_json::from_slice(body.as_slice())
             .map_err(|_| AppInstallationResolutionError::Protocol)?;
         match (status, rejection.error.as_str()) {
             (reqwest::StatusCode::FORBIDDEN, "forbidden") => {
@@ -680,12 +716,227 @@ impl MessagingApi for LocalControlHttpClient {
         &self,
         scope: &ExactMessagingScope,
         request: WriteMessagingMessageRequest<'_>,
-    ) -> Result<serde_json::Value> {
-        self.post_json(
-            "/local-control/v1/messaging:write",
-            &ScopedMessagingRequest::new(scope, request),
-        )
-        .await
+    ) -> Result<MessagingWriteReceipt> {
+        validate_messaging_write_request(&request)?;
+        let expected_nonce = request.client_nonce.to_owned();
+        let mut first_indeterminate = None;
+        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
+            // Rebuild the wire request for each attempt, preserving the exact
+            // scope, body, attachments, and idempotency nonce.
+            let result = async {
+                let (status, body) = self
+                    .post_json_bounded_raw(
+                        "/local-control/v1/messaging:write",
+                        &ScopedMessagingRequest::new(
+                            scope,
+                            WriteMessagingMessageRequest {
+                                place_id: request.place_id,
+                                content: request.content,
+                                urgency: request.urgency,
+                                reply_to: request.reply_to,
+                                client_nonce: request.client_nonce,
+                                attachments: request.attachments,
+                            },
+                        ),
+                        MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging write",
+                            format!("transport or response framing failed: {error}"),
+                        )
+                    })?;
+                validate_messaging_write_response(status, body.as_slice(), &expected_nonce)
+            }
+            .await;
+            match result {
+                Ok(receipt) => return Ok(receipt),
+                Err(error)
+                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
+                        && is_indeterminate_messaging_failure(&error) =>
+                {
+                    first_indeterminate = Some(error);
+                    continue;
+                }
+                Err(_replay_error) if first_indeterminate.is_some() => {
+                    return Err(first_indeterminate
+                        .take()
+                        .expect("only a replay has an initial indeterminate result"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded Messaging retry loop always returns")
+    }
+
+    async fn upload_attachment(
+        &self,
+        scope: &ExactMessagingScope,
+        request: UploadMessagingAttachmentRequest,
+    ) -> Result<UploadMessagingAttachmentResponse> {
+        validate_sealed_attachment_source(&request)?;
+        let (place_id, client_nonce, filename, size_bytes, sha256, declared_mime, descriptor) =
+            request.into_parts();
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let mut url = self
+            .base_url
+            .join("/local-control/v1/messaging/places/")
+            .context("construct Messaging attachment upload URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Messaging attachment upload URL cannot carry segments"))?
+            .pop_if_empty()
+            .push(&place_id)
+            .push("attachments");
+
+        let encoded_filename = utf8_percent_encode(&filename, NON_ALPHANUMERIC).to_string();
+        let declared_mime = declared_mime
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let mut first_indeterminate = None;
+        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
+            // Keep the executor-provided sealed descriptor alive, and only
+            // duplicate/rewind that immutable descriptor for a replay. This
+            // cannot re-open a Workspace path or consume a new executor grant.
+            let result = async {
+                let mut std_file = std::fs::File::from(duplicate_owned_fd(&descriptor)?);
+                std_file
+                    .seek(SeekFrom::Start(0))
+                    .context("rewind sealed Messaging attachment source")?;
+                let body_stream =
+                    bounded_file_stream(tokio::fs::File::from_std(std_file), size_bytes);
+                let mut builder = http
+                    .post(url.clone())
+                    .bearer_auth(self.credential.token.as_str())
+                    .header("X-Sumi-Workspace-Id", &scope.workspace_id)
+                    .header("X-Sumi-Installation-Id", &scope.installation_id)
+                    .header("X-Sumi-Authority-Epoch", &scope.authority_epoch)
+                    .header("Idempotency-Key", &client_nonce)
+                    .header("X-Sumi-Attachment-Filename", &encoded_filename)
+                    .header(reqwest::header::CONTENT_TYPE, declared_mime)
+                    .header(reqwest::header::CONTENT_LENGTH, size_bytes)
+                    .timeout(MESSAGING_ATTACHMENT_UPLOAD_TIMEOUT)
+                    .body(reqwest::Body::wrap_stream(body_stream));
+                if unix_endpoint.is_some() {
+                    builder = builder.header(reqwest::header::CONNECTION, "close");
+                }
+                let built = builder
+                    .build()
+                    .context("build Messaging attachment upload request")?;
+                if let Some(endpoint) = unix_endpoint {
+                    endpoint.revalidate()?;
+                }
+                let response = http.execute(built).await.map_err(|error| {
+                    MessagingApiFailure::indeterminate(
+                        "Messaging attachment upload",
+                        format!("transport failed after request admission: {error}"),
+                    )
+                })?;
+                let status = response.status();
+                let body =
+                    read_response_bounded(response, MAX_MESSAGING_ATTACHMENT_UPLOAD_RESPONSE_BYTES)
+                        .await
+                        .map_err(|error| {
+                            MessagingApiFailure::indeterminate(
+                                "Messaging attachment upload",
+                                format!("response body was incomplete or exceeded bounds: {error}"),
+                            )
+                        })?;
+                validate_messaging_attachment_upload_response(
+                    status,
+                    body.as_slice(),
+                    &filename,
+                    size_bytes,
+                    &sha256,
+                )
+            }
+            .await;
+            match result {
+                Ok(upload) => return Ok(upload),
+                Err(error)
+                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
+                        && is_indeterminate_messaging_failure(&error) =>
+                {
+                    first_indeterminate = Some(error);
+                    continue;
+                }
+                Err(_replay_error) if first_indeterminate.is_some() => {
+                    return Err(first_indeterminate
+                        .take()
+                        .expect("only a replay has an initial indeterminate result"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded Messaging retry loop always returns")
+    }
+
+    async fn open_attachment(
+        &self,
+        scope: &ExactMessagingScope,
+        request: OpenMessagingAttachmentRequest<'_>,
+    ) -> Result<OpenMessagingAttachmentResponse> {
+        if !is_canonical_uuid_v7(request.place_id)
+            || !is_canonical_uuid_v7(request.message_id)
+            || !is_canonical_uuid_v7(request.attachment_id)
+        {
+            bail!("invalid Messaging attachment read request");
+        }
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let url = self
+            .base_url
+            .join("/local-control/v1/messaging:attachment")
+            .context("construct Messaging attachment read URL")?;
+        let scoped = ScopedMessagingRequest::new(scope, request);
+        let mut builder = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .json(&scoped);
+        if unix_endpoint.is_some() {
+            builder = builder.header(reqwest::header::CONNECTION, "close");
+        }
+        let built = builder
+            .build()
+            .context("build Messaging attachment read request")?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint.revalidate()?;
+        }
+        let response = http
+            .execute(built)
+            .await
+            .context("Messaging attachment read failed")?;
+        let status = response.status();
+        if status != reqwest::StatusCode::OK {
+            let body =
+                read_response_bounded(response, MAX_MESSAGING_ATTACHMENT_UPLOAD_RESPONSE_BYTES)
+                    .await?;
+            return Err(local_control_rejection(
+                status,
+                body.as_slice(),
+                "Messaging attachment read",
+            ));
+        }
+        let headers = response.headers().clone();
+        let bytes = read_response_bounded(response, MAX_MESSAGING_ATTACHMENT_FETCH_BYTES).await?;
+        let attachment = messaging_attachment_from_headers(&headers, &bytes)?;
+        if attachment.attachment_id != request.attachment_id {
+            bail!("Messaging attachment response identity mismatch");
+        }
+        Ok(OpenMessagingAttachmentResponse { attachment, bytes })
     }
 
     async fn react(
@@ -751,6 +1002,442 @@ impl MessagingApi for LocalControlHttpClient {
         )
         .await
     }
+}
+
+fn validate_sealed_attachment_source(request: &UploadMessagingAttachmentRequest) -> Result<()> {
+    const MAX_SOURCE_BYTES: u64 = 20 * 1024 * 1024;
+    let (place_id, client_nonce, filename, size_bytes, sha256, declared_mime, descriptor) =
+        request.as_parts();
+    if !is_canonical_uuid_v7(place_id)
+        || client_nonce.is_empty()
+        || client_nonce.len() > 128
+        || filename.is_empty()
+        || filename.len() > 255
+        || canonical_attachment_filename(filename) != filename
+        || size_bytes == 0
+        || size_bytes > MAX_SOURCE_BYTES
+        || sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid sealed Messaging attachment source");
+    }
+    if declared_mime.is_some_and(|value| value.len() > 255 || !is_canonical_attachment_mime(value))
+    {
+        bail!("invalid sealed Messaging attachment declared MIME");
+    }
+    let metadata = std::fs::File::from(descriptor.try_clone()?)
+        .metadata()
+        .context("inspect sealed Messaging attachment source")?;
+    if !metadata.is_file() || metadata.len() != size_bytes {
+        bail!("sealed Messaging attachment source size or type mismatch");
+    }
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: the descriptor is owned and valid for this synchronous query.
+    let seals = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required {
+        bail!("Messaging attachment source descriptor is not sealed immutable");
+    }
+    use std::os::unix::fs::FileExt as _;
+    let file = std::fs::File::from(descriptor.try_clone()?);
+    let mut digest = Sha256::new();
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; 256 * 1024];
+    while offset < size_bytes {
+        let remaining = (size_bytes - offset).min(buffer.len() as u64) as usize;
+        let read = file.read_at(&mut buffer[..remaining], offset)?;
+        if read == 0 {
+            bail!("sealed Messaging attachment source ended before its manifest size");
+        }
+        digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    let actual = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual != sha256 {
+        bail!("sealed Messaging attachment source digest differs from its manifest");
+    }
+    Ok(())
+}
+
+fn validate_messaging_write_request(request: &WriteMessagingMessageRequest<'_>) -> Result<()> {
+    let mut attachment_ids = std::collections::BTreeSet::new();
+    if !is_canonical_uuid_v7(request.place_id)
+        || request.content.len() > 64 * 1024
+        || request.content.contains('\0')
+        || (request.content.is_empty() && request.attachments.is_empty())
+        || !matches!(request.urgency, "urgent" | "normal" | "fyi")
+        || request
+            .reply_to
+            .is_some_and(|message_id| !is_canonical_uuid_v7(message_id))
+        || request.client_nonce.is_empty()
+        || request.client_nonce.len() > 128
+        || request.client_nonce.chars().any(char::is_control)
+        || request.attachments.len() > 10
+        || request.attachments.iter().any(|attachment_id| {
+            !is_canonical_uuid_v7(attachment_id) || !attachment_ids.insert(attachment_id)
+        })
+    {
+        bail!("invalid Messaging write request");
+    }
+    Ok(())
+}
+
+fn validate_messaging_write_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    expected_nonce: &str,
+) -> Result<MessagingWriteReceipt> {
+    const OPERATION: &str = "Messaging write";
+    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
+        return Err(messaging_mutation_rejection(status, body, OPERATION));
+    }
+    let receipt: MessagingWriteReceipt = serde_json::from_slice(body).map_err(|error| {
+        MessagingApiFailure::indeterminate(
+            OPERATION,
+            format!("committed success receipt was malformed: {error}"),
+        )
+    })?;
+    if receipt.client_nonce != expected_nonce
+        || !is_canonical_uuid_v7(&receipt.message_id)
+        || receipt.seq == 0
+        || receipt.seq > i64::MAX as u64
+        || (status == reqwest::StatusCode::CREATED) != receipt.created
+    {
+        return Err(MessagingApiFailure::indeterminate(
+            OPERATION,
+            "committed success receipt does not match its exact request or status",
+        )
+        .into());
+    }
+    Ok(receipt)
+}
+
+fn is_indeterminate_messaging_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<MessagingApiFailure>()
+        .is_some_and(|failure| failure.class() == MessagingApiFailureClass::Indeterminate)
+}
+
+fn duplicate_owned_fd(descriptor: &OwnedFd) -> Result<OwnedFd> {
+    // SAFETY: descriptor is an owned live descriptor. F_DUPFD_CLOEXEC creates
+    // a second owned reference to the same immutable memfd without traversing
+    // any Workspace path.
+    let duplicate = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("duplicate sealed Messaging attachment source for retry");
+    }
+    // SAFETY: fcntl returned a new owned file descriptor on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+fn bounded_file_stream(
+    file: tokio::fs::File,
+    size: u64,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+    futures_util::stream::try_unfold((file, size), |(mut file, remaining)| async move {
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let mut chunk = vec![0u8; remaining.min(64 * 1024) as usize];
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sealed attachment source ended before its manifest size",
+            ));
+        }
+        chunk.truncate(read);
+        Ok(Some((chunk, (file, remaining - read as u64))))
+    })
+}
+
+async fn read_response_bounded(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("local control response exceeds bounded size");
+    }
+    let mut body = Zeroizing::new(Vec::new());
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read local control response")?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            bail!("local control response exceeds bounded size");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn local_control_rejection(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    operation: &str,
+) -> anyhow::Error {
+    match serde_json::from_slice::<LocalControlErrorResponse>(body) {
+        Ok(rejection)
+            if !rejection.error.is_empty()
+                && rejection.error.len() <= 128
+                && rejection
+                    .error
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_') =>
+        {
+            anyhow::anyhow!(
+                "{operation} was rejected with status {status}: {}",
+                rejection.error
+            )
+        }
+        _ => {
+            anyhow::anyhow!("{operation} returned status {status} with a malformed rejection body")
+        }
+    }
+}
+
+fn messaging_mutation_rejection(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    operation: &'static str,
+) -> anyhow::Error {
+    let parsed = serde_json::from_slice::<LocalControlErrorResponse>(body).ok();
+    let code = parsed
+        .as_ref()
+        .map(|rejection| rejection.error.as_str())
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 128
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        });
+    let detail = match code {
+        Some(code) => format!("server rejected the exact request with status {status}: {code}"),
+        None => format!("server returned status {status} with a malformed rejection body"),
+    };
+    let explicitly_terminal_server_error = matches!(
+        code,
+        Some(
+            "attachments_unavailable"
+                | "upload_deadline_unavailable"
+                | "messaging_unavailable"
+                | "attachment_quota_exceeded"
+        )
+    );
+    if status.is_server_error() && !explicitly_terminal_server_error {
+        MessagingApiFailure::indeterminate(operation, detail).into()
+    } else {
+        MessagingApiFailure::terminal(operation, detail).into()
+    }
+}
+
+fn validate_messaging_attachment_upload_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    expected_filename: &str,
+    expected_size_bytes: u64,
+    expected_sha256: &str,
+) -> Result<UploadMessagingAttachmentResponse> {
+    const OPERATION: &str = "Messaging attachment upload";
+    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
+        return Err(messaging_mutation_rejection(status, body, OPERATION));
+    }
+    let wire: MessagingAttachmentUploadWire = serde_json::from_slice(body).map_err(|error| {
+        MessagingApiFailure::indeterminate(
+            OPERATION,
+            format!("committed success receipt was malformed: {error}"),
+        )
+    })?;
+    if (status == reqwest::StatusCode::CREATED) != wire.created {
+        return Err(MessagingApiFailure::indeterminate(
+            OPERATION,
+            "committed success status and created receipt disagree",
+        )
+        .into());
+    }
+    let attachment = messaging_attachment_from_wire(wire.attachment).map_err(|error| {
+        MessagingApiFailure::indeterminate(
+            OPERATION,
+            format!("committed attachment receipt was invalid: {error}"),
+        )
+    })?;
+    if wire.created && attachment.position != 0 {
+        return Err(MessagingApiFailure::indeterminate(
+            OPERATION,
+            "fresh committed attachment receipt has a nonzero position",
+        )
+        .into());
+    }
+    if attachment.filename != expected_filename
+        || attachment.size_bytes != expected_size_bytes
+        || attachment.sha256 != expected_sha256
+    {
+        return Err(MessagingApiFailure::indeterminate(
+            OPERATION,
+            "committed attachment receipt does not match the sealed source",
+        )
+        .into());
+    }
+    Ok(UploadMessagingAttachmentResponse {
+        attachment,
+        created: wire.created,
+    })
+}
+
+fn messaging_attachment_from_wire(
+    wire: MessagingAttachmentWire,
+) -> Result<MessagingAttachmentMetadata> {
+    validate_attachment_metadata_fields(
+        &wire.attachment_id,
+        &wire.filename,
+        &wire.mime,
+        wire.size_bytes,
+        &wire.sha256,
+    )?;
+    if wire.position >= 10 {
+        bail!("invalid Messaging attachment position");
+    }
+    Ok(MessagingAttachmentMetadata {
+        attachment_id: wire.attachment_id,
+        filename: wire.filename,
+        mime: wire.mime,
+        size_bytes: wire.size_bytes,
+        sha256: wire.sha256,
+        position: wire.position,
+    })
+}
+
+fn validate_attachment_metadata_fields(
+    attachment_id: &str,
+    filename: &str,
+    mime: &str,
+    size_bytes: u64,
+    sha256: &str,
+) -> Result<()> {
+    const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+    if !is_canonical_uuid_v7(attachment_id)
+        || filename.is_empty()
+        || filename.len() > 255
+        || canonical_attachment_filename(filename) != filename
+        || mime.is_empty()
+        || mime.len() > 255
+        || !is_canonical_attachment_mime(mime)
+        || size_bytes == 0
+        || size_bytes > MAX_ATTACHMENT_BYTES
+        || sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid Messaging attachment metadata");
+    }
+    Ok(())
+}
+
+fn single_attachment_header<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<&'a str> {
+    let values = headers.get_all(name);
+    if values.iter().count() != 1 {
+        bail!("Messaging attachment response has a missing or duplicate {name} header");
+    }
+    values
+        .iter()
+        .next()
+        .expect("exactly one header was counted")
+        .to_str()
+        .with_context(|| format!("Messaging attachment {name} header is not ASCII"))
+}
+
+fn messaging_attachment_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    bytes: &[u8],
+) -> Result<OpenMessagingAttachmentMetadata> {
+    let attachment_id = single_attachment_header(headers, "X-Sumi-Attachment-Id")?.to_owned();
+    let mime = single_attachment_header(headers, "X-Sumi-Attachment-Mime")?.to_owned();
+    let size_bytes = single_attachment_header(headers, "X-Sumi-Attachment-Size")?
+        .parse::<u64>()
+        .context("Messaging attachment size header is invalid")?;
+    let sha256 = single_attachment_header(headers, "X-Sumi-Attachment-Sha256")?.to_owned();
+    let encoded_filename = single_attachment_header(headers, "X-Sumi-Attachment-Filename")?;
+    if !has_valid_percent_encoding(encoded_filename) {
+        bail!("Messaging attachment filename header has malformed percent encoding");
+    }
+    let filename = percent_decode_str(encoded_filename)
+        .decode_utf8()
+        .context("Messaging attachment filename header is invalid UTF-8")?
+        .into_owned();
+    validate_attachment_metadata_fields(&attachment_id, &filename, &mime, size_bytes, &sha256)?;
+    if single_attachment_header(headers, reqwest::header::CONTENT_TYPE.as_str())?
+        != "application/octet-stream"
+    {
+        bail!("Messaging attachment response Content-Type is inconsistent with metadata");
+    }
+    let content_length =
+        single_attachment_header(headers, reqwest::header::CONTENT_LENGTH.as_str())?
+            .parse::<u64>()
+            .context("Messaging attachment Content-Length is invalid")?;
+    if content_length != size_bytes || bytes.len() as u64 != size_bytes {
+        bail!("Messaging attachment body size differs from its metadata");
+    }
+    let digest = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if digest != sha256 {
+        bail!("Messaging attachment body digest differs from its metadata");
+    }
+    Ok(OpenMessagingAttachmentMetadata {
+        attachment_id,
+        filename,
+        mime,
+        size_bytes,
+        sha256,
+    })
+}
+
+fn has_valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || !bytes[index + 1].is_ascii_hexdigit()
+            || !bytes[index + 2].is_ascii_hexdigit()
+        {
+            return false;
+        }
+        index += 3;
+    }
+    true
+}
+
+fn is_canonical_attachment_mime(value: &str) -> bool {
+    value.parse::<mime::Mime>().is_ok_and(|parsed| {
+        parsed.params().next().is_none()
+            && parsed.to_string() == value
+            && (!value.starts_with("image/") || is_inline_attachment_image_mime(value))
+    })
+}
+
+fn is_inline_attachment_image_mime(value: &str) -> bool {
+    matches!(
+        value,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
 }
 
 #[derive(Deserialize)]
@@ -1867,7 +2554,10 @@ fn system_time_from_unix(seconds: i64) -> Result<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::ffi::CString;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd, OwnedFd};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Mutex as StdMutex;
 
@@ -1882,9 +2572,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::apiclient::messaging::MessagingApiFailureClass;
     use crate::runtime::contracts::{
         GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease, RpcBootNonce,
     };
+    use crate::tools::executor::{SourceFileManifest, TransferredSource};
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
@@ -3100,6 +3792,169 @@ mod tests {
         request_body: Arc<StdMutex<Option<Vec<u8>>>>,
     }
 
+    #[derive(Clone)]
+    struct MessagingMutationFixtureResponse {
+        status: StatusCode,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MessagingReplayFixtureState {
+        requests: Arc<StdMutex<Vec<(String, String, Vec<u8>)>>>,
+    }
+
+    fn committed_response_loss() -> Response {
+        // The fixture has recorded the exact committed request but terminates
+        // the response before its declared body completes. This exercises the
+        // production client's post-emission response-loss path.
+        Response::builder()
+            .status(StatusCode::CREATED)
+            .header(reqwest::header::CONTENT_LENGTH, "4096")
+            .body(axum::body::Body::from_stream(futures_util::stream::once(
+                async {
+                    Err::<Bytes, std::io::Error>(std::io::Error::other(
+                        "fixture drops committed response",
+                    ))
+                },
+            )))
+            .expect("incomplete fixture response")
+    }
+
+    async fn upload_response_loss_then_replay_fixture(
+        State(state): State<MessagingReplayFixtureState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let nonce = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let mut requests = state.requests.lock().unwrap();
+        requests.push((
+            nonce,
+            headers
+                .get("x-sumi-attachment-filename")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+            body.to_vec(),
+        ));
+        if requests.len() == 1 {
+            return committed_response_loss();
+        }
+        drop(requests);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "attachment": {
+                    "attachment_id": "0198f0f4-9b72-7000-8000-000000000499",
+                    "filename": "retry.txt",
+                    "mime": "text/plain",
+                    "size_bytes": 13,
+                    "sha256": format!("{:x}", Sha256::digest(b"retry payload")),
+                    "position": 0
+                },
+                "created": false
+            })),
+        )
+            .into_response()
+    }
+
+    async fn write_response_loss_then_replay_fixture(
+        State(state): State<MessagingReplayFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("strict JSON write");
+        let nonce = request["client_nonce"]
+            .as_str()
+            .expect("write nonce")
+            .to_owned();
+        let mut requests = state.requests.lock().unwrap();
+        requests.push((nonce.clone(), "write".to_owned(), body.to_vec()));
+        if requests.len() == 1 {
+            return committed_response_loss();
+        }
+        drop(requests);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "client_nonce": nonce,
+                "message_id": "0198f0f4-9b72-7000-8000-000000000599",
+                "seq": 9,
+                "created": false
+            })),
+        )
+            .into_response()
+    }
+
+    #[derive(Clone)]
+    struct CountedMutationFixture {
+        status: StatusCode,
+        body: serde_json::Value,
+        attempts: Arc<StdMutex<usize>>,
+    }
+
+    async fn counted_mutation_fixture(State(fixture): State<CountedMutationFixture>) -> Response {
+        *fixture.attempts.lock().unwrap() += 1;
+        (fixture.status, Json(fixture.body)).into_response()
+    }
+
+    #[derive(Clone)]
+    struct SequencedMutationFixture {
+        responses: Arc<StdMutex<VecDeque<(StatusCode, serde_json::Value)>>>,
+        attempts: Arc<StdMutex<usize>>,
+    }
+
+    async fn sequenced_mutation_fixture(
+        State(fixture): State<SequencedMutationFixture>,
+    ) -> Response {
+        *fixture.attempts.lock().unwrap() += 1;
+        let (status, body) = fixture
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("fixture has one response per bounded attempt");
+        (status, Json(body)).into_response()
+    }
+
+    fn fixture_upload_request(client_nonce: &str) -> UploadMessagingAttachmentRequest {
+        let bytes = b"retry payload";
+        let name = CString::new("sumi-local-control-retry").expect("static memfd name");
+        // SAFETY: `name` is NUL-terminated and the result is owned below.
+        let raw = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        assert!(raw >= 0, "memfd fixture must be available");
+        // SAFETY: memfd_create returned a new owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut file = std::fs::File::from(descriptor.try_clone().expect("clone fixture fd"));
+        file.write_all(bytes).expect("write fixture bytes");
+        file.flush().expect("flush fixture bytes");
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        // SAFETY: this descriptor is a memfd created with MFD_ALLOW_SEALING.
+        assert!(unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_ADD_SEALS, seals) } >= 0);
+        let source = TransferredSource::for_test(
+            SourceFileManifest {
+                path: "retry.txt".to_owned(),
+                filename: "retry.txt".to_owned(),
+                size_bytes: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            },
+            descriptor,
+        );
+        UploadMessagingAttachmentRequest::from_executor_source(
+            "01900000-0000-7000-8000-000000000002".to_owned(),
+            client_nonce.to_owned(),
+            "retry.txt".to_owned(),
+            Some("text/plain".to_owned()),
+            source,
+        )
+    }
+
     #[derive(Clone, Default)]
     struct AppResolutionFixtureState {
         request_body: Arc<StdMutex<Option<Vec<u8>>>>,
@@ -3223,6 +4078,60 @@ mod tests {
         ))
     }
 
+    async fn messaging_mutation_fixture(
+        State(response): State<MessagingMutationFixtureResponse>,
+    ) -> Response {
+        Response::builder()
+            .status(response.status)
+            .header("content-type", response.content_type)
+            .body(axum::body::Body::from(response.body))
+            .expect("fixture response")
+    }
+
+    async fn write_with_fixture_response(
+        response: MessagingMutationFixtureResponse,
+    ) -> anyhow::Result<MessagingWriteReceipt> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:write",
+                post(messaging_mutation_fixture),
+            )
+            .with_state(response);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let result = client
+            .write(
+                &messaging_scope(),
+                WriteMessagingMessageRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    content: "hello",
+                    urgency: "normal",
+                    reply_to: None,
+                    client_nonce: "nonce-a",
+                    attachments: &[],
+                },
+            )
+            .await;
+        server.abort();
+        result
+    }
+
     #[tokio::test]
     async fn messaging_write_observes_a_compact_receipt_for_max_escaped_content() {
         let state = CompactWriteFixtureState::default();
@@ -3262,15 +4171,15 @@ mod tests {
                     urgency: "normal",
                     reply_to: None,
                     client_nonce: "nonce-max-escaped",
+                    attachments: &[],
                 },
             )
             .await
             .expect("a legal maximum write must be observed as success");
 
-        assert_eq!(receipt["client_nonce"], "nonce-max-escaped");
-        assert_eq!(receipt["seq"], 7);
-        assert_eq!(receipt["created"], true);
-        assert!(receipt.get("message").is_none());
+        assert_eq!(receipt.client_nonce, "nonce-max-escaped");
+        assert_eq!(receipt.seq, 7);
+        assert!(receipt.created);
         let raw = state.request_body.lock().unwrap().take().unwrap();
         assert!(raw.len() > 2 * 64 * 1024);
         let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
@@ -3283,6 +4192,559 @@ mod tests {
             64 * 1024
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_attachment_upload_retries_committed_response_loss_with_same_nonce_and_bytes()
+    {
+        let state = MessagingReplayFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging/places/01900000-0000-7000-8000-000000000002/attachments",
+                post(upload_response_loss_then_replay_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+
+        let upload = client
+            .upload_attachment(
+                &messaging_scope(),
+                fixture_upload_request("attachment-nonce-2"),
+            )
+            .await
+            .expect("same-nonce replay resolves the committed upload");
+        assert!(!upload.created);
+        assert_eq!(upload.attachment.position, 0);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1], "replay must be wire-identical");
+        assert_eq!(requests[0].0, "attachment-nonce-2");
+        assert_eq!(requests[0].2, b"retry payload");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_write_retries_committed_response_loss_with_same_nonce_and_wire_body() {
+        let state = MessagingReplayFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:write",
+                post(write_response_loss_then_replay_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let attachments = vec!["0198f0f4-9b72-7000-8000-000000000499".to_owned()];
+
+        let receipt = client
+            .write(
+                &messaging_scope(),
+                WriteMessagingMessageRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    content: "commit once",
+                    urgency: "normal",
+                    reply_to: None,
+                    client_nonce: "message-nonce-2",
+                    attachments: &attachments,
+                },
+            )
+            .await
+            .expect("same-nonce replay resolves the committed message");
+        assert!(!receipt.created);
+        assert_eq!(receipt.client_nonce, "message-nonce-2");
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1], "replay must be wire-identical");
+        assert_eq!(requests[0].0, "message-nonce-2");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_mutation_retry_stops_on_terminal_and_after_second_indeterminate() {
+        for (status, body, expected_attempts, expected_class) in [
+            (
+                StatusCode::CONFLICT,
+                serde_json::json!({"error":"conflict"}),
+                1,
+                MessagingApiFailureClass::Terminal,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error":"internal"}),
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+        ] {
+            let attempts = Arc::new(StdMutex::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:write",
+                    post(counted_mutation_fixture),
+                )
+                .with_state(CountedMutationFixture {
+                    status,
+                    body,
+                    attempts: attempts.clone(),
+                });
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error = client
+                .write(
+                    &messaging_scope(),
+                    WriteMessagingMessageRequest {
+                        place_id: "01900000-0000-7000-8000-000000000002",
+                        content: "bounded retry",
+                        urgency: "normal",
+                        reply_to: None,
+                        client_nonce: "bounded-retry-nonce",
+                        attachments: &[],
+                    },
+                )
+                .await
+                .expect_err("fixture must not succeed");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                expected_class
+            );
+            assert_eq!(*attempts.lock().unwrap(), expected_attempts);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_replay_cannot_turn_an_indeterminate_first_attempt_into_terminal_failure() {
+        let write_attempts = Arc::new(StdMutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:write",
+                post(sequenced_mutation_fixture),
+            )
+            .with_state(SequencedMutationFixture {
+                responses: Arc::new(StdMutex::new(VecDeque::from([
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({"error":"internal"}),
+                    ),
+                    (
+                        StatusCode::CONFLICT,
+                        serde_json::json!({"error":"conflict"}),
+                    ),
+                ]))),
+                attempts: write_attempts.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let error = client
+            .write(
+                &messaging_scope(),
+                WriteMessagingMessageRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    content: "uncertain write",
+                    urgency: "normal",
+                    reply_to: None,
+                    client_nonce: "uncertain-write-nonce",
+                    attachments: &[],
+                },
+            )
+            .await
+            .expect_err("replay terminal response cannot settle the first attempt");
+        assert_eq!(
+            error
+                .downcast_ref::<MessagingApiFailure>()
+                .expect("typed Messaging failure")
+                .class(),
+            MessagingApiFailureClass::Indeterminate
+        );
+        assert_eq!(*write_attempts.lock().unwrap(), 2);
+        server.abort();
+
+        let upload_attempts = Arc::new(StdMutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging/places/01900000-0000-7000-8000-000000000002/attachments",
+                post(sequenced_mutation_fixture),
+            )
+            .with_state(SequencedMutationFixture {
+                responses: Arc::new(StdMutex::new(VecDeque::from([
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({"error":"internal"}),
+                    ),
+                    (
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        serde_json::json!({"error":"attachment_quota_exceeded"}),
+                    ),
+                ]))),
+                attempts: upload_attempts.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let error = client
+            .upload_attachment(
+                &messaging_scope(),
+                fixture_upload_request("uncertain-upload-nonce"),
+            )
+            .await
+            .expect_err("replay terminal response cannot settle the first upload");
+        assert_eq!(
+            error
+                .downcast_ref::<MessagingApiFailure>()
+                .expect("typed Messaging failure")
+                .class(),
+            MessagingApiFailureClass::Indeterminate
+        );
+        assert_eq!(*upload_attempts.lock().unwrap(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_write_classifies_terminal_and_indeterminate_outcomes() {
+        let terminal_cases = [
+            (
+                StatusCode::CONFLICT,
+                serde_json::json!({"error":"conflict"}),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error":"messaging_unavailable"}),
+            ),
+            (
+                StatusCode::GONE,
+                serde_json::json!({"error":"attachment_upload_retired"}),
+            ),
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                serde_json::json!({"error":"attachment_quota_exceeded"}),
+            ),
+        ];
+        for (status, body) in terminal_cases {
+            let error = write_with_fixture_response(MessagingMutationFixtureResponse {
+                status,
+                content_type: "application/json",
+                body: serde_json::to_vec(&body).unwrap(),
+            })
+            .await
+            .expect_err("exact server rejection must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                MessagingApiFailureClass::Terminal
+            );
+        }
+
+        let indeterminate_cases = [
+            MessagingMutationFixtureResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                content_type: "application/json",
+                body: serde_json::to_vec(&serde_json::json!({"error":"internal"})).unwrap(),
+            },
+            MessagingMutationFixtureResponse {
+                status: StatusCode::CREATED,
+                content_type: "application/json",
+                body: b"not-json".to_vec(),
+            },
+            MessagingMutationFixtureResponse {
+                status: StatusCode::CREATED,
+                content_type: "application/json",
+                body: serde_json::to_vec(&serde_json::json!({
+                    "client_nonce":"wrong",
+                    "message_id":"0198f0f4-9b72-7000-8000-000000000099",
+                    "seq":7,
+                    "created":true
+                }))
+                .unwrap(),
+            },
+            MessagingMutationFixtureResponse {
+                status: StatusCode::CREATED,
+                content_type: "application/json",
+                body: serde_json::to_vec(&serde_json::json!({
+                    "client_nonce":"nonce-a",
+                    "message_id":"0198f0f4-9b72-7000-8000-000000000099",
+                    "seq":9223372036854775808_u64,
+                    "created":true
+                }))
+                .unwrap(),
+            },
+        ];
+        for response in indeterminate_cases {
+            let error = write_with_fixture_response(response)
+                .await
+                .expect_err("ambiguous or malformed success must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                MessagingApiFailureClass::Indeterminate
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let error = client
+            .write(
+                &messaging_scope(),
+                WriteMessagingMessageRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    content: "hello",
+                    urgency: "normal",
+                    reply_to: None,
+                    client_nonce: "nonce-a",
+                    attachments: &[],
+                },
+            )
+            .await
+            .expect_err("post-admission transport loss is indeterminate");
+        assert_eq!(
+            error
+                .downcast_ref::<MessagingApiFailure>()
+                .expect("typed Messaging failure")
+                .class(),
+            MessagingApiFailureClass::Indeterminate
+        );
+    }
+
+    #[test]
+    fn messaging_attachment_upload_requires_the_exact_status_created_position_contract() {
+        let filename = "report.txt";
+        let size_bytes = 10_u64;
+        let sha256 = "11".repeat(32);
+        let receipt = |created: bool, position: u8| {
+            serde_json::to_vec(&serde_json::json!({
+                "attachment": {
+                    "attachment_id": "0198f0f4-9b72-7000-8000-000000000499",
+                    "filename": filename,
+                    "mime": "text/plain",
+                    "size_bytes": size_bytes,
+                    "sha256": sha256,
+                    "position": position
+                },
+                "created": created
+            }))
+            .unwrap()
+        };
+
+        let fresh = validate_messaging_attachment_upload_response(
+            reqwest::StatusCode::CREATED,
+            &receipt(true, 0),
+            filename,
+            size_bytes,
+            &sha256,
+        )
+        .expect("201/created fresh upload at position zero");
+        assert!(fresh.created);
+        assert_eq!(fresh.attachment.position, 0);
+
+        let replay = validate_messaging_attachment_upload_response(
+            reqwest::StatusCode::OK,
+            &receipt(false, 9),
+            filename,
+            size_bytes,
+            &sha256,
+        )
+        .expect("200/replay may expose its bound position");
+        assert!(!replay.created);
+        assert_eq!(replay.attachment.position, 9);
+
+        for (case, status, created, position) in [
+            (
+                "fresh-nonzero-position",
+                reqwest::StatusCode::CREATED,
+                true,
+                1,
+            ),
+            (
+                "created-status-replay-body",
+                reqwest::StatusCode::CREATED,
+                false,
+                0,
+            ),
+            ("ok-status-fresh-body", reqwest::StatusCode::OK, true, 0),
+            ("position-out-of-range", reqwest::StatusCode::OK, false, 10),
+        ] {
+            let error = validate_messaging_attachment_upload_response(
+                status,
+                &receipt(created, position),
+                filename,
+                size_bytes,
+                &sha256,
+            )
+            .expect_err("malformed committed success must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .unwrap_or_else(|| panic!("{case} must preserve indeterminate classification"))
+                    .class(),
+                MessagingApiFailureClass::Indeterminate,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn messaging_attachment_headers_are_exact_and_consistent_with_the_body() {
+        let bytes = b"attachment";
+        let attachment_id = "0198f0f4-9b72-7000-8000-000000000499";
+        let digest = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let valid_headers = || {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("X-Sumi-Attachment-Id", attachment_id.parse().unwrap());
+            headers.insert("X-Sumi-Attachment-Filename", "report.txt".parse().unwrap());
+            headers.insert("X-Sumi-Attachment-Mime", "text/plain".parse().unwrap());
+            headers.insert(
+                "X-Sumi-Attachment-Size",
+                bytes.len().to_string().parse().unwrap(),
+            );
+            headers.insert("X-Sumi-Attachment-Sha256", digest.parse().unwrap());
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                "application/octet-stream".parse().unwrap(),
+            );
+            headers.insert(
+                reqwest::header::CONTENT_LENGTH,
+                bytes.len().to_string().parse().unwrap(),
+            );
+            headers
+        };
+        let metadata = messaging_attachment_from_headers(&valid_headers(), bytes)
+            .expect("exact attachment response");
+        assert_eq!(metadata.attachment_id, attachment_id);
+        assert_eq!(metadata.filename, "report.txt");
+        assert_eq!(metadata.mime, "text/plain");
+
+        let mut cases = Vec::new();
+        let mut missing = valid_headers();
+        missing.remove("X-Sumi-Attachment-Sha256");
+        cases.push(("missing", missing, bytes.as_slice()));
+        let mut duplicate = valid_headers();
+        duplicate.append("X-Sumi-Attachment-Mime", "text/plain".parse().unwrap());
+        cases.push(("duplicate", duplicate, bytes.as_slice()));
+        let mut bad_percent = valid_headers();
+        bad_percent.insert("X-Sumi-Attachment-Filename", "%zz".parse().unwrap());
+        cases.push(("bad-percent", bad_percent, bytes.as_slice()));
+        let mut wrong_content_type = valid_headers();
+        wrong_content_type.insert(reqwest::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        cases.push(("content-type", wrong_content_type, bytes.as_slice()));
+        let mut wrong_length = valid_headers();
+        wrong_length.insert(reqwest::header::CONTENT_LENGTH, "1".parse().unwrap());
+        cases.push(("content-length", wrong_length, bytes.as_slice()));
+        let mut unsafe_image = valid_headers();
+        unsafe_image.insert("X-Sumi-Attachment-Mime", "image/svg+xml".parse().unwrap());
+        cases.push(("unsafe-image", unsafe_image, bytes.as_slice()));
+        let mut bad_digest = valid_headers();
+        bad_digest.insert("X-Sumi-Attachment-Sha256", "00".repeat(32).parse().unwrap());
+        cases.push(("digest", bad_digest, bytes.as_slice()));
+
+        for (case, headers, body) in cases {
+            assert!(
+                messaging_attachment_from_headers(&headers, body).is_err(),
+                "{case} response must fail closed"
+            );
+        }
     }
 
     #[tokio::test]

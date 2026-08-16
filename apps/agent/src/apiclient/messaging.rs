@@ -4,12 +4,52 @@
 //! generation-fenced local-control credential.  None of these requests carry
 //! a Human session or a caller-supplied actor identity.
 
+use std::os::fd::OwnedFd;
+
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use super::apps::AppInstallationResolver;
+use crate::tools::executor::TransferredSource;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessagingApiFailureClass {
+    Terminal,
+    Indeterminate,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}: {detail}")]
+pub(crate) struct MessagingApiFailure {
+    class: MessagingApiFailureClass,
+    operation: &'static str,
+    detail: String,
+}
+
+impl MessagingApiFailure {
+    pub(crate) fn terminal(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            class: MessagingApiFailureClass::Terminal,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn indeterminate(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            class: MessagingApiFailureClass::Indeterminate,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) const fn class(&self) -> MessagingApiFailureClass {
+        self.class
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ExactMessagingScope {
@@ -37,6 +77,153 @@ pub(crate) struct WriteMessagingMessageRequest<'a> {
     pub urgency: &'a str,
     pub reply_to: Option<&'a str>,
     pub client_nonce: &'a str,
+    pub attachments: &'a [String],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingWriteReceipt {
+    pub client_nonce: String,
+    pub message_id: String,
+    pub seq: u64,
+    pub created: bool,
+}
+
+/// One immutable, sealed Workspace source descriptor obtained through the
+/// signed executor operation. The local application sees only its display
+/// metadata and bytes; the private Workspace path never crosses this API.
+pub(crate) struct UploadMessagingAttachmentRequest {
+    place_id: String,
+    client_nonce: String,
+    filename: String,
+    size_bytes: u64,
+    sha256: String,
+    declared_mime: Option<String>,
+    descriptor: OwnedFd,
+}
+
+impl UploadMessagingAttachmentRequest {
+    /// Preserve source provenance: only a descriptor returned by the signed
+    /// executor transfer can become an attachment upload request.
+    pub(crate) fn from_executor_source(
+        place_id: String,
+        client_nonce: String,
+        filename: String,
+        declared_mime: Option<String>,
+        source: TransferredSource,
+    ) -> Self {
+        let (manifest, descriptor) = source.into_parts();
+        Self {
+            place_id,
+            client_nonce,
+            filename,
+            size_bytes: manifest.size_bytes,
+            sha256: manifest.sha256,
+            declared_mime,
+            descriptor,
+        }
+    }
+
+    pub(crate) fn as_parts(&self) -> (&str, &str, &str, u64, &str, Option<&str>, &OwnedFd) {
+        (
+            &self.place_id,
+            &self.client_nonce,
+            &self.filename,
+            self.size_bytes,
+            &self.sha256,
+            self.declared_mime.as_deref(),
+            &self.descriptor,
+        )
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (String, String, String, u64, String, Option<String>, OwnedFd) {
+        (
+            self.place_id,
+            self.client_nonce,
+            self.filename,
+            self.size_bytes,
+            self.sha256,
+            self.declared_mime,
+            self.descriptor,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingAttachmentMetadata {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub position: u8,
+}
+
+/// Metadata proven by the authorized byte response. Position belongs to the
+/// message snapshot, not the download headers, so this type deliberately
+/// cannot manufacture one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenMessagingAttachmentMetadata {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UploadMessagingAttachmentResponse {
+    pub attachment: MessagingAttachmentMetadata,
+    pub created: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenMessagingAttachmentRequest<'a> {
+    pub place_id: &'a str,
+    pub message_id: &'a str,
+    pub attachment_id: &'a str,
+}
+
+pub(crate) struct OpenMessagingAttachmentResponse {
+    pub attachment: OpenMessagingAttachmentMetadata,
+    pub bytes: Zeroizing<Vec<u8>>,
+}
+
+/// Match the Go attachment transport's display-name canonicalization. The
+/// source path itself remains sealed and exact elsewhere; only this non-path
+/// label crosses into Messaging metadata.
+pub(crate) fn canonical_attachment_filename(source: &str) -> String {
+    let slashed = source.replace('\\', "/");
+    let trimmed = slashed.trim();
+    // Go path.Base removes trailing separators before choosing the last
+    // element (except that all-slash input becomes "/"). Mirror that exact
+    // behavior so the server never persists a renamed receipt after upload.
+    let without_trailing = trimmed.trim_end_matches('/');
+    let base = if without_trailing.is_empty() && trimmed.contains('/') {
+        "/"
+    } else {
+        without_trailing.rsplit('/').next().unwrap_or_default()
+    };
+    let mut name = base
+        .chars()
+        .filter(|character| !(*character < '\u{20}' || *character == '\u{7f}'))
+        .collect::<String>();
+    name = name.trim().to_owned();
+    if name.is_empty() || matches!(name.as_str(), "." | ".." | "/") {
+        return "file".to_owned();
+    }
+    while name.len() > 255 {
+        name.pop();
+    }
+    if name.is_empty() {
+        "file".to_owned()
+    } else {
+        name
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -103,7 +290,19 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         &self,
         scope: &ExactMessagingScope,
         request: WriteMessagingMessageRequest<'_>,
-    ) -> Result<Value>;
+    ) -> Result<MessagingWriteReceipt>;
+
+    async fn upload_attachment(
+        &self,
+        scope: &ExactMessagingScope,
+        request: UploadMessagingAttachmentRequest,
+    ) -> Result<UploadMessagingAttachmentResponse>;
+
+    async fn open_attachment(
+        &self,
+        scope: &ExactMessagingScope,
+        request: OpenMessagingAttachmentRequest<'_>,
+    ) -> Result<OpenMessagingAttachmentResponse>;
 
     async fn react(
         &self,
@@ -134,4 +333,36 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         scope: &ExactMessagingScope,
         request: ReadMessagingThroughRequest<'_>,
     ) -> Result<Value>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_attachment_filename;
+
+    #[test]
+    fn attachment_filename_canonicalization_matches_the_go_wire_contract() {
+        for (source, expected) in [
+            (" report.txt ", "report.txt"),
+            ("a\\b.txt", "b.txt"),
+            ("foo/", "foo"),
+            ("a/b/..", "file"),
+            ("///", "file"),
+            ("\u{0001}hello\u{007f}.txt", "hello.txt"),
+            ("\u{2003}wide\u{2003}", "wide"),
+            ("", "file"),
+            (".", "file"),
+            ("..", "file"),
+        ] {
+            assert_eq!(
+                canonical_attachment_filename(source),
+                expected,
+                "{source:?}"
+            );
+        }
+
+        let multibyte = "é".repeat(128);
+        let bounded = canonical_attachment_filename(&multibyte);
+        assert_eq!(bounded.as_bytes().len(), 254);
+        assert_eq!(bounded, "é".repeat(127));
+    }
 }

@@ -182,9 +182,16 @@
   は root とともにすべて必須で、どれかを省略した構成では添付を有効化しない。
 - tombstone はメタデータ行を残したまま bytes を非同期 deletion outbox
   （`blob_state='deleting'`）で削除する。quota は削除確認と同じ transaction でだけ返る。
-- Agent 側の Workspace path 送信と `open_attachment` は次の Agent head で接続する予定で
-  あり、この Human/Core head にはまだ含まれない。PAID-local control の staged upload
-  route はそのための内部 seam で、Human UI の経路ではない。
+- Agent 側も同じ添付を扱う。`messaging` tool の `write` は `attachments` に
+  Foundation Workspace のファイル path を順序付きで最大 10 件取り、`open_attachment`
+  は開いている place で見えている `attachment_id` を 1 件読む。バイトを運ぶのは
+  PAID-local control の staged upload route で、これは Agent 内部の seam であり
+  Human UI の経路ではない。read-only な Workspace mount を持つのは tool executor 側
+  だけなので、executor が policy check 済みの descriptor を SCM_RIGHTS で runtime へ
+  渡し、runtime が exact-scoped upload へ流す（manifest の name/size/sha256 と
+  descriptor 数を受け側で照合する）。
+- REST の `/messaging/*` は OpenAPI 契約（`contracts/openapi.yaml`）にはまだ 1 本も
+  載っておらず、この文書が唯一の契約記述である。添付の 2 route も同じ扱いにしてある。
 
 ## API / event（人間UI側）
 
