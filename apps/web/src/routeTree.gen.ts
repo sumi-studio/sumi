@@ -12,9 +12,6 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as DirectRouteImport } from './routes/direct'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WWorkspaceIdRouteImport } from './routes/w.$workspaceId'
-import { Route as GroupDmIdRouteImport } from './routes/group.$dmId'
-import { Route as DmDmIdRouteImport } from './routes/dm.$dmId'
-import { Route as CChannelIdRouteImport } from './routes/c.$channelId'
 import { Route as WWorkspaceIdIndexRouteImport } from './routes/w.$workspaceId.index'
 import { Route as WWorkspaceIdMessagingRouteImport } from './routes/w.$workspaceId.messaging'
 import { Route as WWorkspaceIdMessagingIndexRouteImport } from './routes/w.$workspaceId.messaging.index'
@@ -35,21 +32,6 @@ const IndexRoute = IndexRouteImport.update({
 const WWorkspaceIdRoute = WWorkspaceIdRouteImport.update({
   id: '/w/$workspaceId',
   path: '/w/$workspaceId',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const GroupDmIdRoute = GroupDmIdRouteImport.update({
-  id: '/group/$dmId',
-  path: '/group/$dmId',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const DmDmIdRoute = DmDmIdRouteImport.update({
-  id: '/dm/$dmId',
-  path: '/dm/$dmId',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const CChannelIdRoute = CChannelIdRouteImport.update({
-  id: '/c/$channelId',
-  path: '/c/$channelId',
   getParentRoute: () => rootRouteImport,
 } as any)
 const WWorkspaceIdIndexRoute = WWorkspaceIdIndexRouteImport.update({
@@ -90,9 +72,6 @@ const WWorkspaceIdMessagingCChannelIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/direct': typeof DirectRoute
-  '/c/$channelId': typeof CChannelIdRoute
-  '/dm/$dmId': typeof DmDmIdRoute
-  '/group/$dmId': typeof GroupDmIdRoute
   '/w/$workspaceId': typeof WWorkspaceIdRouteWithChildren
   '/w/$workspaceId/messaging': typeof WWorkspaceIdMessagingRouteWithChildren
   '/w/$workspaceId/': typeof WWorkspaceIdIndexRoute
@@ -104,9 +83,6 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/direct': typeof DirectRoute
-  '/c/$channelId': typeof CChannelIdRoute
-  '/dm/$dmId': typeof DmDmIdRoute
-  '/group/$dmId': typeof GroupDmIdRoute
   '/w/$workspaceId': typeof WWorkspaceIdIndexRoute
   '/w/$workspaceId/messaging': typeof WWorkspaceIdMessagingIndexRoute
   '/w/$workspaceId/messaging/c/$channelId': typeof WWorkspaceIdMessagingCChannelIdRoute
@@ -117,9 +93,6 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/direct': typeof DirectRoute
-  '/c/$channelId': typeof CChannelIdRoute
-  '/dm/$dmId': typeof DmDmIdRoute
-  '/group/$dmId': typeof GroupDmIdRoute
   '/w/$workspaceId': typeof WWorkspaceIdRouteWithChildren
   '/w/$workspaceId/messaging': typeof WWorkspaceIdMessagingRouteWithChildren
   '/w/$workspaceId/': typeof WWorkspaceIdIndexRoute
@@ -133,9 +106,6 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/direct'
-    | '/c/$channelId'
-    | '/dm/$dmId'
-    | '/group/$dmId'
     | '/w/$workspaceId'
     | '/w/$workspaceId/messaging'
     | '/w/$workspaceId/'
@@ -147,9 +117,6 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/direct'
-    | '/c/$channelId'
-    | '/dm/$dmId'
-    | '/group/$dmId'
     | '/w/$workspaceId'
     | '/w/$workspaceId/messaging'
     | '/w/$workspaceId/messaging/c/$channelId'
@@ -159,9 +126,6 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/direct'
-    | '/c/$channelId'
-    | '/dm/$dmId'
-    | '/group/$dmId'
     | '/w/$workspaceId'
     | '/w/$workspaceId/messaging'
     | '/w/$workspaceId/'
@@ -174,9 +138,6 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   DirectRoute: typeof DirectRoute
-  CChannelIdRoute: typeof CChannelIdRoute
-  DmDmIdRoute: typeof DmDmIdRoute
-  GroupDmIdRoute: typeof GroupDmIdRoute
   WWorkspaceIdRoute: typeof WWorkspaceIdRouteWithChildren
 }
 
@@ -201,27 +162,6 @@ declare module '@tanstack/react-router' {
       path: '/w/$workspaceId'
       fullPath: '/w/$workspaceId'
       preLoaderRoute: typeof WWorkspaceIdRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/group/$dmId': {
-      id: '/group/$dmId'
-      path: '/group/$dmId'
-      fullPath: '/group/$dmId'
-      preLoaderRoute: typeof GroupDmIdRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/dm/$dmId': {
-      id: '/dm/$dmId'
-      path: '/dm/$dmId'
-      fullPath: '/dm/$dmId'
-      preLoaderRoute: typeof DmDmIdRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/c/$channelId': {
-      id: '/c/$channelId'
-      path: '/c/$channelId'
-      fullPath: '/c/$channelId'
-      preLoaderRoute: typeof CChannelIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/w/$workspaceId/': {
@@ -305,9 +245,6 @@ const WWorkspaceIdRouteWithChildren = WWorkspaceIdRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   DirectRoute: DirectRoute,
-  CChannelIdRoute: CChannelIdRoute,
-  DmDmIdRoute: DmDmIdRoute,
-  GroupDmIdRoute: GroupDmIdRoute,
   WWorkspaceIdRoute: WWorkspaceIdRouteWithChildren,
 }
 export const routeTree = rootRouteImport

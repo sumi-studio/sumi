@@ -23,7 +23,6 @@ vi.mock("./store", () => ({
 const authorityBindingA = "A".repeat(43);
 const authorityBindingB = `${"B".repeat(42)}E`;
 const authorityBindingStorageKey = "sumi.direct-chat.authority-binding-v1";
-const legacyAuthorityIdentityStorageKey = "sumi.direct-chat.authority-user";
 
 afterEach(() => {
   clearDirectChatAuthority();
@@ -37,19 +36,11 @@ describe("direct-chat authority binding", () => {
       authorityBindingStorageKey,
       authorityBindingA,
     );
-    globalThis.sessionStorage.setItem(
-      legacyAuthorityIdentityStorageKey,
-      "same-human-user-id",
-    );
 
     bindDirectChatAuthority(authorityBindingA);
     bindDirectChatAuthority(authorityBindingA);
 
     expect(authorityMocks.resetAuthority).not.toHaveBeenCalled();
-    expect(
-      globalThis.sessionStorage.getItem(legacyAuthorityIdentityStorageKey),
-    ).toBeNull();
-
     bindDirectChatAuthority(authorityBindingB);
 
     expect(authorityMocks.resetAuthority).toHaveBeenCalledTimes(1);
@@ -72,18 +63,11 @@ describe("direct-chat authority binding", () => {
       authorityBindingStorageKey,
       authorityBindingA,
     );
-    globalThis.sessionStorage.setItem(
-      legacyAuthorityIdentityStorageKey,
-      "legacy-user",
-    );
     authorityMocks.resetAuthority.mockReturnValueOnce(false);
 
     expect(clearDirectChatAuthority()).toBe(false);
     expect(
       globalThis.sessionStorage.getItem(authorityBindingStorageKey),
-    ).toBeNull();
-    expect(
-      globalThis.sessionStorage.getItem(legacyAuthorityIdentityStorageKey),
     ).toBeNull();
   });
 });

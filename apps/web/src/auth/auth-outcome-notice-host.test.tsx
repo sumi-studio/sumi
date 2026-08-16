@@ -72,7 +72,7 @@ it("keeps one outcome announcement and reading lifetime across a real route tran
   });
   const channelRoute = createRoute({
     getParentRoute: () => rootRoute,
-    path: "/c/$channelId",
+    path: "/w/$workspaceId/messaging/c/$channelId",
     component: () => <RouteMarker label="channel" />,
   });
   const router = createRouter({
@@ -112,8 +112,8 @@ it("keeps one outcome announcement and reading lifetime across a real route tran
 
   await act(async () => {
     await router.navigate({
-      to: "/c/$channelId",
-      params: { channelId: "general" },
+      to: "/w/$workspaceId/messaging/c/$channelId",
+      params: { channelId: "general", workspaceId: "workspace-1" },
     });
   });
 

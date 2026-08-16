@@ -1,7 +1,6 @@
 import { useConversation } from "./store";
 
 const authorityBindingStorageKey = "sumi.direct-chat.authority-binding-v1";
-const legacyAuthorityIdentityStorageKey = "sumi.direct-chat.authority-user";
 let currentBindingID: string | null | undefined;
 
 /**
@@ -27,7 +26,6 @@ export function bindDirectChatAuthority(authorityBindingID: string): void {
       authorityBindingStorageKey,
       authorityBindingID,
     );
-    globalThis.sessionStorage.removeItem(legacyAuthorityIdentityStorageKey);
   } catch {
     // In-memory binding still protects transitions in this document.
   }
@@ -39,7 +37,6 @@ export function clearDirectChatAuthority(): boolean {
   currentBindingID = null;
   try {
     globalThis.sessionStorage.removeItem(authorityBindingStorageKey);
-    globalThis.sessionStorage.removeItem(legacyAuthorityIdentityStorageKey);
   } catch {
     // Storage-key cleanup is best effort; the reset result remains authoritative.
   }
