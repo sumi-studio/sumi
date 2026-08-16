@@ -139,6 +139,11 @@
   `/direct-chat/ws` とは混ぜない（privacy・認可・replay・backpressureの境界が違う）。
 - bootstrap/place一覧は各placeの `latest_seq`、未読数、mention未読数を返す。履歴を
   lazy loadしていても、未訪問placeのバッジを欠落させないための投影である。
+- `GET /messaging/search?q=&place_id=&limit=` は、現在の正確なWorkspace app
+  scopeの中で、閲覧者が今見られるlive messageだけを部分一致検索する。結果は
+  `message_id`、`place`、`seq`、`author`、`created_at` と、全文ではなくサーバー側で
+  切り出したsnippetを返す。指定した `place_id` が閲覧不可なら `404 not_found` とし、
+  placeの存在を明かさない。
 - 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして
   受け取らない。サーバーがadmission時のmembershipからMessageのmentionsを構成する。
 - WS event（durable、place-seq付き）: `message_created`, `message_edited`,

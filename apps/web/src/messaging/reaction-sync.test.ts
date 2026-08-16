@@ -681,6 +681,10 @@ class StubBackend implements MessagingBackend {
     });
   }
 
+  async searchMessages(): Promise<import("./model").MessageSearchResult[]> {
+    return [];
+  }
+
   createChannel = vi.fn();
   ensureDM = vi.fn();
   createGroupDM = vi.fn();

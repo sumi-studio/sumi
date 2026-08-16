@@ -97,6 +97,9 @@ class StubBackend implements MessagingBackend {
   async fetchMessages(): Promise<Message[]> {
     return [];
   }
+  async searchMessages(): Promise<import("./model").MessageSearchResult[]> {
+    return [];
+  }
   async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
     return { statuses: [], replyLaterMarkers: [] };
   }

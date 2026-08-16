@@ -8,6 +8,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   MessagingCapabilities,
   NotificationLevel,
@@ -147,6 +148,7 @@ interface MessagingState {
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannelTopic(channelId: string, topic: string): Promise<void>;
+  searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
   send(content: string, urgency: Urgency): void;
@@ -1316,6 +1318,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           entry.channelId === channel.channelId ? channel : entry,
         ),
       }));
+    },
+
+    async searchMessages(query) {
+      return backend.searchMessages(query);
     },
 
     async loadPlaceAround(key, seq) {

@@ -91,6 +91,16 @@ export interface Message {
   clientNonce?: string;
 }
 
+/** A bounded search projection; full message content is fetched only on jump. */
+export interface MessageSearchResult {
+  messageId: string;
+  place: Place;
+  seq: number;
+  author: ParticipantRef;
+  snippet: string;
+  createdAt: number;
+}
+
 export interface WorkspaceSummary {
   workspaceId: string;
   name: string;
@@ -280,6 +290,10 @@ export interface MessagingBackend {
     place: Place,
     options?: { beforeSeq?: number; limit?: number },
   ): Promise<Message[]>;
+  searchMessages(
+    query: string,
+    options?: { place?: Place; limit?: number },
+  ): Promise<MessageSearchResult[]>;
   createChannel(
     workspaceId: string,
     name: string,

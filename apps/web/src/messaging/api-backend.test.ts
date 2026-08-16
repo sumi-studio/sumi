@@ -117,6 +117,45 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("requests the scoped bounded search projection", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.startsWith("/messaging/search?")) {
+        return json({
+          results: [
+            {
+              message_id: "message-7",
+              place: channelWire(),
+              seq: 7,
+              author: { kind: "human", human_id: "human-1" },
+              snippet: "明日の予定です",
+              created_at: "2026-08-01T11:00:00Z",
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.searchMessages("予定", { place: channel, limit: 2 }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        messageId: "message-7",
+        seq: 7,
+        snippet: "明日の予定です",
+      }),
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath(
+        "/messaging/search?q=%E4%BA%88%E5%AE%9A&place_id=channel-1&limit=2",
+      ),
+      expect.any(Object),
+    );
+  });
+
   it("opens one messaging socket, sends cursors, and projects message_created", async () => {
     vi.stubGlobal(
       "fetch",
