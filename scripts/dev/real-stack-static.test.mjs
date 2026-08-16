@@ -91,6 +91,40 @@ test("runtime provisioner receives a file-scoped Docker config", async () => {
   );
 });
 
+test("the local media server is opt-in and carries no repository credential", async () => {
+  const [local, launcher] = await Promise.all([
+    source("deploy/local/compose.dev.yaml"),
+    source("scripts/dev/compose-stack"),
+  ]);
+  const livekit = local.slice(
+    local.indexOf("  livekit:"),
+    local.indexOf("\n  runtime-provisioner:"),
+  );
+
+  // Nothing here may sign a room token: every LiveKit credential falls back to
+  // empty, and the service exists only in the profile the launcher enables for
+  // exactly the credential pair the API also requires.
+  for (const [, fallback] of local.matchAll(
+    /\$\{SUMI_LIVEKIT_API_(?:KEY|SECRET):-([^}]*)\}/g,
+  )) {
+    assert.equal(fallback, "");
+  }
+  assert.match(livekit, /^\s+profiles: \["calls"\]$/m);
+  assert.match(
+    livekit,
+    /\$\{SUMI_LIVEKIT_API_KEY:-\}: \$\{SUMI_LIVEKIT_API_SECRET:-\}/,
+  );
+  assert.match(
+    livekit,
+    /SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET are required/,
+  );
+  assert.match(launcher, /COMPOSE_PROFILES_ARGUMENTS=\(--profile calls\)/);
+  assert.match(
+    launcher,
+    /fail "SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET must be set together"/,
+  );
+});
+
 test("Jenkins rebuilds the provisioner for every source tree embedded in it", async () => {
   const [jenkinsfile, provisionerDockerfile] = await Promise.all([
     source("Jenkinsfile"),
