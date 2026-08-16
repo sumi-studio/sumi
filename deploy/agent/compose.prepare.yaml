@@ -4,7 +4,7 @@
 services:
   allocator:
     image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
-    pull_policy: always
+    pull_policy: ${SUMI_AGENT_IMAGE_PULL_POLICY:-always}
     user: "0:0"
     command: [allocator]
     network_mode: none
@@ -32,7 +32,7 @@ services:
 
   prepare:
     image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
-    pull_policy: always
+    pull_policy: ${SUMI_AGENT_IMAGE_PULL_POLICY:-always}
     user: "0:0"
     command: [prepare]
     network_mode: none

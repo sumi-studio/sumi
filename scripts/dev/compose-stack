@@ -383,6 +383,13 @@ export SUMI_RPC_NONCE="dev-compose-0001"
 export SUMI_DB_URL="${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}"
 export SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}"
 export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}"
+# How lazily provisioned PersonalityAgent runtimes obtain the agent image.
+# `always` (default) pulls ghcr.io on every spawn; `missing` reuses a locally
+# built image and pulls only when absent — for verifying a branch build without
+# pushing to the registry.
+export SUMI_AGENT_IMAGE_PULL_POLICY="${SUMI_AGENT_IMAGE_PULL_POLICY:-always}"
+[[ "${SUMI_AGENT_IMAGE_PULL_POLICY}" =~ ^(always|missing|never)$ ]] ||
+  fail "SUMI_AGENT_IMAGE_PULL_POLICY must be always, missing, or never"
 export SUMI_AUTH_TENANT_ID="${SUMI_AUTH_TENANT_ID:-sumi-dev}"
 export SUMI_AUTH_FIREBASE_PROJECT_ID="${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}"
 export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-${SUMI_AUTH_FIREBASE_PROJECT_ID}}"
