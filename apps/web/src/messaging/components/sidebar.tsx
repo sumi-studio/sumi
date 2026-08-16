@@ -1,6 +1,16 @@
-import { BellOff, Check, Hash, MoreVertical, Plus, X } from "lucide-react";
+import {
+  BellOff,
+  Check,
+  Hash,
+  MoreVertical,
+  Plus,
+  Volume2,
+  X,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
+import { VoiceChannelMembers } from "../call/voice-channel-members";
+import { VoiceChannelPanel } from "../call/voice-channel-panel";
 import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
 import { parsePlaceKey, participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -283,6 +293,7 @@ function CreateChannelDialog({
   const placeNavigate = usePlaceNavigate();
   const [name, setName] = useState("");
   const [topic, setTopic] = useState("");
+  const [voice, setVoice] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -300,7 +311,12 @@ function CreateChannelDialog({
     setBusy(true);
     setFailed(false);
     try {
-      const key = await createChannel(workspaceId, trimmed, topic.trim());
+      const key = await createChannel(
+        workspaceId,
+        trimmed,
+        topic.trim(),
+        voice,
+      );
       const sessionChanged =
         getMessagingSessionIdentity() !== currentIdentity ||
         useMessaging.getState().selfKey !== expectedSelfKey;
@@ -345,6 +361,21 @@ function CreateChannelDialog({
             placeholder="例: dev"
             className={INPUT_CLASS}
           />
+        </label>
+        <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border/70 p-2.5">
+          <input
+            type="checkbox"
+            checked={voice}
+            disabled={busy}
+            onChange={(event) => setVoice(event.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="block text-[12.5px]">ボイスチャンネル</span>
+            <span className="block text-[11px] text-muted-foreground">
+              テキストを残したまま、いつでも音声で集まれます
+            </span>
+          </span>
         </label>
         <label className="block">
           <span className="mb-1 block text-[11px] text-muted-foreground">
@@ -636,15 +667,28 @@ export function Sidebar({
           const unread = unreadCountByPlace[key] ?? 0;
           const mentions = mentionCountByPlace[key] ?? 0;
           return (
-            <PlaceRow
-              key={key}
-              placeKey={key}
-              selectedPlaceKey={selectedPlaceKey}
-              label={channel.name}
-              icon={<Hash className="size-3.5 shrink-0 opacity-60" />}
-              unread={unread}
-              mentions={mentions}
-            />
+            <div key={key}>
+              <PlaceRow
+                placeKey={key}
+                selectedPlaceKey={selectedPlaceKey}
+                label={channel.name}
+                icon={
+                  channel.voice ? (
+                    <Volume2 className="size-3.5 shrink-0 opacity-70" />
+                  ) : (
+                    <Hash className="size-3.5 shrink-0 opacity-60" />
+                  )
+                }
+                unread={unread}
+                mentions={mentions}
+              />
+              {channel.voice ? (
+                <>
+                  <VoiceChannelMembers placeKey={key} />
+                  <VoiceChannelPanel placeKey={key} />
+                </>
+              ) : null}
+            </div>
           );
         })}
         <div className="pt-4">

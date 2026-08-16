@@ -26,6 +26,7 @@ function channel(channelId: string, topic: string): ChannelSummary {
     name: channelId,
     topic,
     visibility: "public",
+    voice: false,
   };
 }
 

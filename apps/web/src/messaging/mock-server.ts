@@ -67,6 +67,7 @@ const CHANNELS: ChannelSummary[] = [
     name: "general",
     topic: "雑談と全体連絡",
     visibility: "public",
+    voice: false,
   },
   {
     channelId: "ch-dev",
@@ -74,6 +75,7 @@ const CHANNELS: ChannelSummary[] = [
     name: "dev",
     topic: "開発の相談と進捗",
     visibility: "public",
+    voice: false,
   },
   {
     channelId: "ch-design",
@@ -81,6 +83,7 @@ const CHANNELS: ChannelSummary[] = [
     name: "design",
     topic: "デザインレビュー",
     visibility: "public",
+    voice: true,
   },
 ];
 
@@ -502,6 +505,7 @@ export class MockMessagingServer implements MessagingBackend {
     workspaceId: string,
     name: string,
     topic: string,
+    voice: boolean,
   ): Promise<ChannelSummary> {
     const channel: ChannelSummary = {
       channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
@@ -509,6 +513,7 @@ export class MockMessagingServer implements MessagingBackend {
       name,
       topic,
       visibility: "public",
+      voice,
     };
     CHANNELS.push(channel);
     this.emit({ type: "place_created", channel });

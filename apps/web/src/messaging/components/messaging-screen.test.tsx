@@ -68,6 +68,7 @@ function seedCurrentPlace() {
         name: "alpha",
         topic: "",
         visibility: "public",
+        voice: false,
       },
       {
         channelId: "channel-b",
@@ -75,6 +76,7 @@ function seedCurrentPlace() {
         name: "beta",
         topic: "",
         visibility: "public",
+        voice: false,
       },
     ],
     dms: [],
