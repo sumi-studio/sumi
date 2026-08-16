@@ -1,3 +1,5 @@
+import type { CallState } from "./call/model";
+
 /**
  * Messaging domain types, mirroring docs/messaging-contracts-draft.md.
  *
@@ -141,6 +143,8 @@ export interface ChannelSummary {
   name: string;
   topic: string;
   visibility: "public" | "private";
+  /** Voice channels retain the same text timeline and unread semantics. */
+  voice: boolean;
 }
 
 export interface DmSummary {
@@ -264,7 +268,9 @@ export type ServerEvent =
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
   | { type: "place_created"; channel?: ChannelSummary; dm?: DmSummary }
   /** channelのmutable属性（v0: topic）の変更。 */
-  | { type: "place_updated"; channel: ChannelSummary };
+  | { type: "place_updated"; channel: ChannelSummary }
+  /** Volatile presence: reconnect repairs it through GET /messaging/calls. */
+  | { type: "call_state"; call: CallState };
 
 export interface SendMessageInput {
   place: Place;
@@ -345,6 +351,7 @@ export interface MessagingBackend {
     workspaceId: string,
     name: string,
     topic: string,
+    voice: boolean,
   ): Promise<ChannelSummary>;
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;

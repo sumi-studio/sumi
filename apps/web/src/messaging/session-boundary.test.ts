@@ -25,6 +25,7 @@ describe("messaging session boundary", () => {
           name: "A",
           topic: "",
           visibility: "private",
+          voice: false,
         },
       ],
       messagesByPlace: {
@@ -181,9 +182,14 @@ describe("messaging session boundary", () => {
 
     await useMessaging
       .getState()
-      .createChannel("workspace-explicit", "dev", "開発");
+      .createChannel("workspace-explicit", "dev", "開発", true);
 
-    expect(create).toHaveBeenCalledWith("workspace-explicit", "dev", "開発");
+    expect(create).toHaveBeenCalledWith(
+      "workspace-explicit",
+      "dev",
+      "開発",
+      true,
+    );
   });
 
   it("rejects a deferred channel result after the messaging identity changes", async () => {
@@ -205,7 +211,7 @@ describe("messaging session boundary", () => {
 
     const operation = useMessaging
       .getState()
-      .createChannel("workspace-a", "private-a", "A only");
+      .createChannel("workspace-a", "private-a", "A only", false);
     bindMessagingSessionIdentity(null);
     bindMessagingSessionIdentity("human-b");
     resolveChannel({
@@ -214,6 +220,7 @@ describe("messaging session boundary", () => {
       name: "private-a",
       topic: "A only",
       visibility: "private",
+      voice: false,
     });
 
     await expect(operation).rejects.toThrow(

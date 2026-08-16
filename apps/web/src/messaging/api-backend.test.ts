@@ -20,6 +20,7 @@ const bootstrap = {
       name: "general",
       topic: "",
       visibility: "public",
+      voice: false,
     },
   ],
   dms: [],
@@ -334,7 +335,7 @@ describe("ApiMessagingBackend", () => {
         const path = expectScopedMessagingPath(input);
         if (path === "/messaging/bootstrap") return json(bootstrap);
         if (path === "/messaging/channels" && init?.method === "POST") {
-          return json(channelSummaryWire("開発の相談"), 201);
+          return json(channelSummaryWire("開発の相談", true), 201);
         }
         if (path === "/messaging/dms" && init?.method === "POST") {
           return json({
@@ -374,13 +375,14 @@ describe("ApiMessagingBackend", () => {
     await backend.bootstrap();
 
     await expect(
-      backend.createChannel("workspace-1", "dev", "開発の相談"),
+      backend.createChannel("workspace-1", "dev", "開発の相談", true),
     ).resolves.toEqual({
       channelId: "channel-2",
       workspaceId: "workspace-1",
       name: "dev",
       topic: "開発の相談",
       visibility: "public",
+      voice: true,
     });
     expect(fetchMock).toHaveBeenCalledWith(
       scopedMessagingTestPath("/messaging/channels"),
@@ -390,6 +392,7 @@ describe("ApiMessagingBackend", () => {
           workspace_id: "workspace-1",
           name: "dev",
           topic: "開発の相談",
+          voice: true,
         }),
       }),
     );
@@ -798,13 +801,14 @@ function channelWire() {
   return { kind: "channel", channel_id: "channel-1" };
 }
 
-function channelSummaryWire(topic: string) {
+function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
     workspace_id: "workspace-1",
     name: "dev",
     topic,
     visibility: "public",
+    voice,
   };
 }
 
