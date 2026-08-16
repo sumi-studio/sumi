@@ -899,9 +899,14 @@ describe("Workspace control store", () => {
     ).toBeNull();
 
     await store.getState().installApp(APP_ID);
+    // The install carries a caller-minted operation_id so a retried install
+    // resolves to the same installation instead of a second one.
     expect(installApp).toHaveBeenCalledWith(
       { kind: "workspace", workspaceId: WORKSPACE_A_ID },
       APP_ID,
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      ),
     );
     expect(installationForApp(store.getState().installations, APP_ID)).toBe(
       enabled,
