@@ -551,6 +551,7 @@ func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 func liveKitConfigFromEnv() (messaging.LiveKitConfig, bool, error) {
 	config := messaging.LiveKitConfig{
 		URL:       strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_URL")),
+		APIURL:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_URL")),
 		APIKey:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_KEY")),
 		APISecret: strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_SECRET")),
 	}
@@ -563,6 +564,12 @@ func liveKitConfigFromEnv() (messaging.LiveKitConfig, bool, error) {
 	parsed, err := url.Parse(config.URL)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
 		return messaging.LiveKitConfig{}, false, errors.New("SUMI_LIVEKIT_URL must be an absolute ws:// or wss:// URL")
+	}
+	if config.APIURL != "" {
+		apiURL, err := url.Parse(config.APIURL)
+		if err != nil || apiURL.Host == "" || (apiURL.Scheme != "http" && apiURL.Scheme != "https") {
+			return messaging.LiveKitConfig{}, false, errors.New("SUMI_LIVEKIT_API_URL must be an absolute http:// or https:// URL")
+		}
 	}
 	return config, true, nil
 }

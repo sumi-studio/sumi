@@ -381,10 +381,13 @@ function assertSafeSignallingURL(ticket: CallTicket): void {
   if (signalling.protocol !== "ws:" && signalling.protocol !== "wss:") {
     throw new CallConnectionError("connection_failed");
   }
+  const pageHost = globalThis.location?.hostname.toLowerCase();
+  const isLoopbackPage = pageHost === "localhost" || pageHost === "127.0.0.1";
   if (
     (globalThis.location?.protocol === "https:" ||
       globalThis.isSecureContext === true) &&
-    signalling.protocol !== "wss:"
+    signalling.protocol !== "wss:" &&
+    !isLoopbackPage
   ) {
     throw new CallConnectionError("mixed_content");
   }

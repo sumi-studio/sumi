@@ -163,6 +163,9 @@ services:
       # starts the livekit service below for exactly the same credential pair,
       # so calls are opt-in on both sides and never half-enabled.
       SUMI_LIVEKIT_URL: ${SUMI_LIVEKIT_URL:-ws://${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880}
+      # RoomService reconciliation is API-internal: it cannot use the
+      # browser-advertised loopback address from inside this container.
+      SUMI_LIVEKIT_API_URL: ${SUMI_LIVEKIT_API_URL:-http://livekit:7880}
       SUMI_LIVEKIT_API_KEY: ${SUMI_LIVEKIT_API_KEY:-}
       SUMI_LIVEKIT_API_SECRET: ${SUMI_LIVEKIT_API_SECRET:-}
     ports:

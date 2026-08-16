@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -28,7 +29,8 @@ const (
 // LiveKitConfig describes the browser-facing SFU endpoint and the shared
 // signing credentials. Media never passes through this service (ADR 0012).
 type LiveKitConfig struct {
-	URL       string
+	URL       string // Browser-facing ws:// or wss:// signalling endpoint.
+	APIURL    string // Optional API endpoint; defaults to URL with an HTTP scheme.
 	APIKey    string
 	APISecret string
 }
@@ -50,8 +52,9 @@ type CallState struct {
 	Participants []CallParticipant
 }
 
-// CallRegistry is deliberately volatile. LiveKit webhooks rebuild it after an
-// API restart, while clients repair missed frames with GET /messaging/calls.
+// CallRegistry is deliberately volatile. On its first call-state read after an
+// API restart, the service reconciles it from LiveKit's RoomService; webhooks
+// keep that projection current afterwards.
 type CallRegistry struct {
 	mu    sync.Mutex
 	rooms map[string]*CallState
@@ -80,6 +83,16 @@ func (r *CallRegistry) active() []CallState {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PlaceID < out[j].PlaceID })
 	return out
+}
+
+func (r *CallRegistry) replace(states []CallState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rooms = make(map[string]*CallState, len(states))
+	for _, state := range states {
+		copy := cloneCallState(&state)
+		r.rooms[state.PlaceID] = &copy
+	}
 }
 
 func cloneCallState(state *CallState) CallState {
@@ -203,14 +216,21 @@ func callStateToWire(place Place, state CallState) callStateWire {
 }
 
 type CallService struct {
-	Server   *Server
-	LiveKit  LiveKitConfig
-	Registry *CallRegistry
-	Now      func() time.Time
+	Server      *Server
+	LiveKit     LiveKitConfig
+	Registry    *CallRegistry
+	RoomService liveKitRoomService
+	Now         func() time.Time
+
+	rebuildMu   sync.Mutex
+	rebuiltOnce bool
 }
 
 func NewCallService(server *Server, livekit LiveKitConfig) *CallService {
-	return &CallService{Server: server, LiveKit: livekit, Registry: NewCallRegistry()}
+	return &CallService{
+		Server: server, LiveKit: livekit, Registry: NewCallRegistry(),
+		RoomService: newLiveKitRoomService(livekit),
+	}
 }
 
 func (c *CallService) now() time.Time {
@@ -277,6 +297,9 @@ func (c *CallService) serveCallToken(w http.ResponseWriter, r *http.Request) {
 	tokenFailed := false
 	done, err := c.Server.mutate(w, r, claims, func() error {
 		return store.withCallAdmission(r.Context(), r.PathValue("place_id"), func(place Place, displayName string) error {
+			if place.Kind == PlaceChannel && !place.Voice {
+				return ErrForbidden
+			}
 			token, err := c.LiveKit.accessToken(place.PlaceID, store.Scope.Actor.Key(), displayName, c.now(), CallTokenTTL)
 			if err != nil {
 				tokenFailed = true
@@ -322,6 +345,9 @@ func (c *CallService) visibleCalls(ctx context.Context, store *ScopedStore) ([]c
 	if err := store.authorize(ctx); err != nil {
 		return nil, err
 	}
+	if err := c.rebuildRegistry(ctx); err != nil {
+		return nil, fmt.Errorf("reconcile livekit call state: %w", err)
+	}
 	out := []callStateWire{}
 	for _, state := range c.Registry.active() {
 		place, err := store.PlaceFor(ctx, state.PlaceID)
@@ -342,9 +368,11 @@ func (c *CallService) serveWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-	token, found := strings.CutPrefix(authorization, "Bearer ")
-	if !found || token == "" || c.LiveKit.verifyWebhookToken(token, body, c.now()) != nil {
+	token := strings.TrimSpace(r.Header.Get("Authorization"))
+	if bearer, found := strings.CutPrefix(token, "Bearer "); found {
+		token = strings.TrimSpace(bearer)
+	}
+	if token == "" || c.LiveKit.verifyWebhookToken(token, body, c.now()) != nil {
 		writeError(w, http.StatusUnauthorized, "invalid_webhook_token")
 		return
 	}
@@ -468,9 +496,193 @@ func participantFromIdentity(identity string) (ParticipantRef, error) {
 	return ref, nil
 }
 
+// liveKitRoomService is intentionally small: room reconciliation is the only
+// server-control API this boundary needs, so keeping it on net/http avoids
+// pulling the LiveKit protobuf/gRPC dependency graph into the API.
+type liveKitRoomService interface {
+	ListRooms(context.Context) ([]liveKitRoom, error)
+	ListParticipants(context.Context, string) ([]liveKitParticipant, error)
+}
+
+type liveKitRoom struct {
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"creationTime"`
+}
+
+type liveKitParticipant struct {
+	Identity string `json:"identity"`
+	JoinedAt int64  `json:"joinedAt"`
+	Tracks   []struct {
+		Source string `json:"source"`
+	} `json:"tracks"`
+}
+
+type liveKitRoomServiceClient struct {
+	baseURL string
+	config  LiveKitConfig
+	client  *http.Client
+}
+
+func newLiveKitRoomService(config LiveKitConfig) liveKitRoomService {
+	baseURL, err := config.roomServiceURL()
+	if err != nil {
+		return unavailableLiveKitRoomService{err: err}
+	}
+	return &liveKitRoomServiceClient{
+		baseURL: baseURL, config: config, client: &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+type unavailableLiveKitRoomService struct{ err error }
+
+func (s unavailableLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom, error) {
+	return nil, s.err
+}
+
+func (s unavailableLiveKitRoomService) ListParticipants(context.Context, string) ([]liveKitParticipant, error) {
+	return nil, s.err
+}
+
+func (c LiveKitConfig) roomServiceURL() (string, error) {
+	endpoint := c.APIURL
+	if endpoint == "" {
+		endpoint = c.URL
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
+		return "", errors.New("livekit room service URL is invalid")
+	}
+	switch parsed.Scheme {
+	case "ws":
+		parsed.Scheme = "http"
+	case "wss":
+		parsed.Scheme = "https"
+	case "http", "https":
+	default:
+		return "", errors.New("livekit room service URL must use HTTP or WebSocket")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func (c *liveKitRoomServiceClient) ListRooms(ctx context.Context) ([]liveKitRoom, error) {
+	var response struct {
+		Rooms []liveKitRoom `json:"rooms"`
+	}
+	token, err := c.config.roomServiceToken(time.Now(), livekitVideoGrant{RoomList: true})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.call(ctx, "ListRooms", struct{}{}, &response, token); err != nil {
+		return nil, err
+	}
+	return response.Rooms, nil
+}
+
+func (c *liveKitRoomServiceClient) ListParticipants(ctx context.Context, room string) ([]liveKitParticipant, error) {
+	var response struct {
+		Participants []liveKitParticipant `json:"participants"`
+	}
+	token, err := c.config.roomServiceToken(time.Now(), livekitVideoGrant{Room: room, RoomAdmin: true})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.call(ctx, "ListParticipants", struct {
+		Room string `json:"room"`
+	}{Room: room}, &response, token); err != nil {
+		return nil, err
+	}
+	return response.Participants, nil
+}
+
+func (c *liveKitRoomServiceClient) call(ctx context.Context, method string, request, response any, token string) error {
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/twirp/livekit.RoomService/"+method, strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("livekit RoomService %s returned %s", method, resp.Status)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCallWebhookBytes)).Decode(response); err != nil {
+		return fmt.Errorf("decode LiveKit RoomService %s response: %w", method, err)
+	}
+	return nil
+}
+
+func (c *CallService) rebuildRegistry(ctx context.Context) error {
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
+	if c.rebuiltOnce {
+		return nil
+	}
+	if c.RoomService == nil {
+		return errors.New("LiveKit RoomService is unavailable")
+	}
+	rooms, err := c.RoomService.ListRooms(ctx)
+	if err != nil {
+		return err
+	}
+	states := make([]CallState, 0, len(rooms))
+	for _, room := range rooms {
+		if room.Name == "" {
+			continue
+		}
+		participants, err := c.RoomService.ListParticipants(ctx, room.Name)
+		if err != nil {
+			return err
+		}
+		startedAt := time.Unix(room.CreatedAt, 0)
+		if room.CreatedAt == 0 {
+			startedAt = c.now()
+		}
+		state := CallState{PlaceID: room.Name, Active: true, StartedAt: startedAt}
+		for _, participant := range participants {
+			ref, err := participantFromIdentity(participant.Identity)
+			if err != nil {
+				continue
+			}
+			joinedAt := time.Unix(participant.JoinedAt, 0)
+			if participant.JoinedAt == 0 {
+				joinedAt = startedAt
+			}
+			entry := CallParticipant{Participant: ref, JoinedAt: joinedAt}
+			for _, track := range participant.Tracks {
+				if track.Source == "SCREEN_SHARE" {
+					entry.ScreenShare = true
+					break
+				}
+			}
+			state.Participants = append(state.Participants, entry)
+		}
+		sort.SliceStable(state.Participants, func(i, j int) bool {
+			if state.Participants[i].JoinedAt.Equal(state.Participants[j].JoinedAt) {
+				return state.Participants[i].Participant.Key() < state.Participants[j].Participant.Key()
+			}
+			return state.Participants[i].JoinedAt.Before(state.Participants[j].JoinedAt)
+		})
+		states = append(states, state)
+	}
+	c.Registry.replace(states)
+	c.rebuiltOnce = true
+	return nil
+}
+
 type livekitVideoGrant struct {
 	Room           string `json:"room"`
 	RoomJoin       bool   `json:"roomJoin"`
+	RoomList       bool   `json:"roomList"`
+	RoomAdmin      bool   `json:"roomAdmin"`
 	CanPublish     bool   `json:"canPublish"`
 	CanSubscribe   bool   `json:"canSubscribe"`
 	CanPublishData bool   `json:"canPublishData"`
@@ -497,6 +709,17 @@ func (c LiveKitConfig) accessToken(room, identity, name string, now time.Time, t
 			Room: room, RoomJoin: true, CanPublish: true,
 			CanSubscribe: true, CanPublishData: true,
 		},
+	}, c.APISecret)
+}
+
+func (c LiveKitConfig) roomServiceToken(now time.Time, grant livekitVideoGrant) (string, error) {
+	if !c.configured() {
+		return "", errors.New("livekit room service configuration is incomplete")
+	}
+	return signJWT(livekitClaims{
+		Issuer: c.APIKey, NotBefore: now.Add(-callWebhookLeeway).Unix(),
+		Expiry: now.Add(callWebhookLeeway).Unix(),
+		Video:  grant,
 	}, c.APISecret)
 }
 

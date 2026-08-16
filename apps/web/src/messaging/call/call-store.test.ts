@@ -96,6 +96,7 @@ describe("call degradation", () => {
   });
 
   it("does not attempt mixed-content signalling from HTTPS", async () => {
+    vi.stubGlobal("location", new URL("https://sumi.example.test/"));
     vi.mocked(fetchCallTicket).mockResolvedValue({
       ...ticket,
       url: "ws://livekit.internal:7880",
@@ -105,6 +106,22 @@ describe("call degradation", () => {
     await useCall.getState().join(PLACE);
     expect(useCall.getState().failure).toBe("mixed_content");
     expect(created.connect).not.toHaveBeenCalled();
+  });
+
+  it("allows loopback ws signalling from a secure local-development page", async () => {
+    vi.stubGlobal("location", new URL("http://localhost:5173/"));
+    vi.mocked(fetchCallTicket).mockResolvedValue({
+      ...ticket,
+      url: "ws://127.0.0.1:7880",
+    });
+    const created = transport();
+    installCallTransportFactory(() => created);
+    await useCall.getState().join(PLACE);
+    expect(created.connect).toHaveBeenCalledWith({
+      ...ticket,
+      url: "ws://127.0.0.1:7880",
+    });
+    expect(useCall.getState().failure).toBeNull();
   });
 
   it("reports LiveKit/API downtime without affecting messaging state", async () => {
