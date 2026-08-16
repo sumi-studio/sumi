@@ -840,6 +840,20 @@ impl CommittedExecutionPermit {
         ExecutorCommittedEffectStart { permit: self }
     }
 
+    /// Third closed effect shape: one Messaging send whose attachment bytes
+    /// come from the Workspace through the executor. It consumes the permit
+    /// exactly once, yields exactly one signing continuation for exactly one
+    /// executor source operation, keeps the root effect unsettled while the
+    /// runtime transfers those sources into exact-scoped uploads and commits
+    /// the message, and mints the only receipt after the message commit. It
+    /// cannot be combined with `begin_local_effect` or `begin_executor_effect`
+    /// because all three consume `self`.
+    pub(crate) fn begin_messaging_workspace_send_effect(
+        self,
+    ) -> MessagingWorkspaceSendEffectStart {
+        MessagingWorkspaceSendEffectStart { permit: self }
+    }
+
     #[cfg(test)]
     pub(crate) fn into_executor_parts_for_test(self) -> CommittedExecutionPermitParts {
         self.begin_executor_effect()
@@ -926,6 +940,49 @@ impl ExecutorCommittedEffectStart {
         ExecutorCommittedExecutionPermit {
             permit: self.permit,
         }
+    }
+}
+
+/// Opaque composite effect start for a Messaging Workspace send (see
+/// [`CommittedExecutionPermit::begin_messaging_workspace_send_effect`]).
+pub(crate) struct MessagingWorkspaceSendEffectStart {
+    permit: CommittedExecutionPermit,
+}
+
+/// The one signing continuation the composite effect may spend on its single
+/// executor source operation. It is move-only and cannot be split, cloned, or
+/// converted back into a local or generic executor start.
+pub(crate) struct MessagingSourceSigningContinuation {
+    permit: ExecutorCommittedExecutionPermit,
+}
+
+impl MessagingSourceSigningContinuation {
+    /// Spend the continuation on exactly one executor operation signing.
+    pub(crate) fn into_executor_permit(self) -> ExecutorCommittedExecutionPermit {
+        self.permit
+    }
+}
+
+impl MessagingWorkspaceSendEffectStart {
+    /// Give the single source-signing continuation to exactly one effect
+    /// future. The future owns the executor source transfer, every upload,
+    /// and the message write; a receipt exists only if that whole future
+    /// succeeds. Intermediate steps cannot construct one.
+    pub(crate) async fn complete<F, Fut, T, E>(
+        self,
+        effect: F,
+    ) -> Result<CommittedEffectReceipt<T>, E>
+    where
+        F: FnOnce(MessagingSourceSigningContinuation) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        effect(MessagingSourceSigningContinuation {
+            permit: ExecutorCommittedExecutionPermit {
+                permit: self.permit,
+            },
+        })
+        .await
+        .map(|value| CommittedEffectReceipt { value })
     }
 }
 

@@ -635,6 +635,7 @@ pub(crate) fn is_production_read_operation(operation: &ExecutorOperation) -> boo
             | ExecutorOperation::ListDir { .. }
             | ExecutorOperation::Glob { .. }
             | ExecutorOperation::Grep { .. }
+            | ExecutorOperation::OpenSourceFiles { .. }
     )
 }
 
@@ -647,6 +648,7 @@ pub(crate) fn operation_execution_id(operation: &ExecutorOperation) -> Option<&s
         | ExecutorOperation::ListDir { execution_id, .. }
         | ExecutorOperation::Glob { execution_id, .. }
         | ExecutorOperation::Grep { execution_id, .. }
+        | ExecutorOperation::OpenSourceFiles { execution_id, .. }
         | ExecutorOperation::Bash { execution_id, .. }
         | ExecutorOperation::Cancel { execution_id } => Some(execution_id),
         ExecutorOperation::Health { .. } => None,

@@ -166,9 +166,82 @@ pub enum ExecutorOperation {
         command: String,
         execution_id: String,
     },
+    /// Open an exact ordered list of Workspace regular files for a Messaging
+    /// attachment send. The terminal frame carries one manifest per path and
+    /// the read-only descriptors ride on that same frame as SCM_RIGHTS
+    /// ancillary data, in the same order.
+    OpenSourceFiles {
+        paths: Vec<String>,
+        execution_id: String,
+    },
     Cancel {
         execution_id: String,
     },
+}
+
+/// Bounds for one OpenSourceFiles operation. They mirror the Messaging
+/// attachment limits so a source that can never be sent is refused at the
+/// executor instead of after transfer.
+pub const MAX_SOURCE_FILES_PER_OPERATION: usize = 10;
+pub const MAX_SOURCE_FILE_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_SOURCE_FILES_TOTAL_BYTES: u64 =
+    MAX_SOURCE_FILES_PER_OPERATION as u64 * MAX_SOURCE_FILE_BYTES;
+const MAX_SOURCE_PATH_BYTES: usize = 4 * 1024;
+
+/// One opened Workspace source. `path` echoes the requested path; `filename`
+/// is its final component; `sha256` is the hex digest of the exact bytes the
+/// executor read while holding the descriptor open.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceFileManifest {
+    pub path: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+impl SourceFileManifest {
+    pub fn validate(&self) -> Result<(), ToolError> {
+        validate_bounded_text(&self.path, "source path", MAX_SOURCE_PATH_BYTES)?;
+        validate_bounded_text(&self.filename, "source filename", 255)?;
+        if self.filename.contains('/') || self.filename == "." || self.filename == ".." {
+            return Err(ToolError::Protocol(
+                "source filename must be a single path component".to_owned(),
+            ));
+        }
+        if self.size_bytes == 0 || self.size_bytes > MAX_SOURCE_FILE_BYTES {
+            return Err(ToolError::Protocol(
+                "source file size is outside the attachment bounds".to_owned(),
+            ));
+        }
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ToolError::Protocol(
+                "source digest must be lowercase hex sha256".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate the ordered path list of one OpenSourceFiles operation.
+pub fn validate_source_paths(paths: &[String]) -> Result<(), ToolError> {
+    if paths.is_empty() || paths.len() > MAX_SOURCE_FILES_PER_OPERATION {
+        return Err(ToolError::InvalidArguments);
+    }
+    let mut seen = HashSet::with_capacity(paths.len());
+    for path in paths {
+        validate_bounded_text(path, "source path", MAX_SOURCE_PATH_BYTES)?;
+        validate_workspace_input(path, "path")?;
+        if path.starts_with('/') || path.contains('\0') {
+            return Err(ToolError::InvalidPath(
+                "source path must be workspace-relative".to_owned(),
+            ));
+        }
+        if !seen.insert(path.as_str()) {
+            return Err(ToolError::InvalidArguments);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -176,6 +249,7 @@ pub enum ExecutorOperation {
 pub enum ExecutorResponse {
     Healthy { service_role: ExecutorServiceRole },
     ReadFile { result: TruncationResult },
+    SourceFiles { files: Vec<SourceFileManifest> },
     Written {},
     Edited {},
     Removed {},
@@ -275,6 +349,13 @@ impl RpcOperationValidation for ExecutorOperation {
                 execution_id,
             } => {
                 validate_workspace_input(pattern, "pattern")?;
+                validate_executor_execution_id(execution_id)
+            }
+            Self::OpenSourceFiles {
+                paths,
+                execution_id,
+            } => {
+                validate_source_paths(paths)?;
                 validate_executor_execution_id(execution_id)
             }
             Self::Bash { execution_id, .. } | Self::Cancel { execution_id } => {
