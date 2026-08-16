@@ -18,11 +18,21 @@ use crate::{
     approval::{
         ApprovalBroker,
         action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
+        authority::{DENIAL_EVIDENCE_VERSION_V1, PolicyDecisionRecord},
         policy::Policy,
         prompt::{ReviewerPrompt, ReviewerRole, TrustedEnvironment},
         reviewer::{
             Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
             ReviewerTrustSet,
+        },
+        route_policy::{PolicySnapshot, PolicySourceState},
+        route_reviewer::{
+            ESCALATION_PROMPT_VERSION_V5, ESCALATION_REVIEWER_VERSION_V5,
+            ESCALATION_SCHEMA_VERSION_V5, EXECUTION_PROMPT_VERSION_V5,
+            EXECUTION_REVIEWER_VERSION_V5, EXECUTION_SCHEMA_VERSION_V5, EscalationReviewDecision,
+            EscalationReviewEvidence, EscalationReviewOutcome, ExecutionReviewDecision,
+            ExecutionReviewEvidence, ExecutionReviewOutcome, ReviewerBudgetEvidence,
+            ReviewerTerminalClass, RiskLevel,
         },
     },
     gateway::{ApprovalDecision, CommandEnvelope, CommandId},
@@ -430,6 +440,140 @@ fn call(id: &str) -> ToolCall {
         arguments: serde_json::from_value::<ValidatedToolArguments>(json!({"id": id}))
             .expect("arguments"),
     }
+}
+
+fn execution_review_denial(terminal: ReviewerTerminalClass) -> ToolExecutionDenialEvidence {
+    let rationale = if terminal.is_judged() {
+        "招待先と依頼の対応を確認できません".to_owned()
+    } else {
+        "安全確認（レビュー）が時間内に完了せず、実行しませんでした（reviewer attempt_timeout）。もう一度試すか、本人に確認してください".to_owned()
+    };
+    ToolExecutionDenialEvidence {
+        evidence_version: DENIAL_EVIDENCE_VERSION_V1.to_owned(),
+        tool_call_id: "review-call".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
+        proposal_digest: "proposal".to_owned(),
+        descriptor_digest: "descriptor".to_owned(),
+        bound_evidence_digest: "bound".to_owned(),
+        policy: PolicySnapshot {
+            source: PolicySourceState::BaselineOnly {
+                baseline_version: "built-in-policy/v1".to_owned(),
+            },
+            source_digest: "policy".to_owned(),
+            evaluated_at: timestamp(),
+            valid_until: None,
+            bundle_version: None,
+        },
+        policy_decision: PolicyDecisionRecord::Unmatched,
+        execution_review: Some(ExecutionReviewEvidence {
+            reviewer_version: EXECUTION_REVIEWER_VERSION_V5.to_owned(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V5.to_owned(),
+            schema_version: EXECUTION_SCHEMA_VERSION_V5.to_owned(),
+            model_id: "reviewer".to_owned(),
+            model_binding_digest: "binding".to_owned(),
+            budget: ReviewerBudgetEvidence {
+                version: "reviewer-budget/v1".to_owned(),
+                digest: "budget".to_owned(),
+                attempts: 1,
+                terminal,
+            },
+            decision: ExecutionReviewDecision {
+                outcome: ExecutionReviewOutcome::Block,
+                risk: RiskLevel::High,
+                rationale: rationale.clone(),
+            },
+        }),
+        escalation_review: None,
+        reason: rationale,
+    }
+}
+
+fn escalation_review_denial() -> ToolExecutionDenialEvidence {
+    let rationale = "承認要求の対象が曖昧です".to_owned();
+    ToolExecutionDenialEvidence {
+        evidence_version: DENIAL_EVIDENCE_VERSION_V1.to_owned(),
+        tool_call_id: "review-call".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Elevated,
+        proposal_digest: "proposal".to_owned(),
+        descriptor_digest: "descriptor".to_owned(),
+        bound_evidence_digest: "bound".to_owned(),
+        policy: PolicySnapshot {
+            source: PolicySourceState::BaselineOnly {
+                baseline_version: "built-in-policy/v1".to_owned(),
+            },
+            source_digest: "policy".to_owned(),
+            evaluated_at: timestamp(),
+            valid_until: None,
+            bundle_version: None,
+        },
+        policy_decision: PolicyDecisionRecord::ElevatedPreflight,
+        execution_review: None,
+        escalation_review: Some(EscalationReviewEvidence {
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V5.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V5.to_owned(),
+            schema_version: ESCALATION_SCHEMA_VERSION_V5.to_owned(),
+            model_id: "reviewer".to_owned(),
+            model_binding_digest: "binding".to_owned(),
+            budget: ReviewerBudgetEvidence {
+                version: "reviewer-budget/v1".to_owned(),
+                digest: "budget".to_owned(),
+                attempts: 1,
+                terminal: ReviewerTerminalClass::ValidDecision,
+            },
+            decision: EscalationReviewDecision {
+                outcome: EscalationReviewOutcome::Block,
+                risk: RiskLevel::Medium,
+                misunderstanding: Some("対象不明".to_owned()),
+                rationale: rationale.clone(),
+            },
+        }),
+        reason: rationale,
+    }
+}
+
+#[test]
+fn route_denial_tool_result_distinguishes_judged_and_technical_review_blocks() {
+    let call = call("review-call");
+    let judged = route_denial_tool_result(
+        &call,
+        &execution_review_denial(ReviewerTerminalClass::ValidDecision),
+    );
+    let [UserContent::Text { text }] = judged.content.as_slice() else {
+        panic!("judged denial text")
+    };
+    assert_eq!(
+        text,
+        "安全確認（レビュー）で実行が止まりました。理由: 招待先と依頼の対応を確認できません"
+    );
+    assert_eq!(judged.details["error"], "execution_review_blocked");
+    assert_eq!(judged.details["reason"], text.as_str());
+    assert_eq!(judged.details["review"]["judged"], true);
+    assert!(judged.details["review"].get("terminal").is_none());
+
+    let technical = route_denial_tool_result(
+        &call,
+        &execution_review_denial(ReviewerTerminalClass::AttemptTimeout),
+    );
+    let [UserContent::Text { text }] = technical.content.as_slice() else {
+        panic!("technical denial text")
+    };
+    assert!(text.contains("時間内に完了せず"));
+    assert!(text.contains("reviewer attempt_timeout"));
+    assert_eq!(technical.details["reason"], text.as_str());
+    assert_eq!(technical.details["review"]["judged"], false);
+    assert_eq!(technical.details["review"]["terminal"], "attempt_timeout");
+
+    let escalation = route_denial_tool_result(&call, &escalation_review_denial());
+    let [UserContent::Text { text }] = escalation.content.as_slice() else {
+        panic!("escalation denial text")
+    };
+    assert_eq!(
+        text,
+        "本人へ確認を出す前のレビューで止まりました。理由: 承認要求の対象が曖昧です"
+    );
+    assert_eq!(escalation.details["error"], "escalation_review_blocked");
+    assert_eq!(escalation.details["review"]["outcome"], "block");
+    assert_eq!(escalation.details["review"]["judged"], true);
 }
 
 fn rejected(id: &str) -> RejectedToolCall {

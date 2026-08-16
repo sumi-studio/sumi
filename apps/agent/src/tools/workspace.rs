@@ -587,6 +587,7 @@ mod tests {
         )
         .expect("Workspace cursor reviewer inputs");
         let request = EscalationReviewRequest {
+            participants: None,
             transcript,
             action,
             policy: policy_evidence,

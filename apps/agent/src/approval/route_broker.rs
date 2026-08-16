@@ -34,9 +34,9 @@ use crate::{
             EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewRequest,
             EscalationReviewResult, EscalationReviewer, ExecutionReviewEvidence,
             ExecutionReviewOutcome, ExecutionReviewRequest, ExecutionReviewResult,
-            ExecutionReviewer, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4, REVIEW_TRUNCATION_MARKER,
-            ReviewerActionEvidence, ReviewerPolicyEvidence, ReviewerTerminalClass,
-            ReviewerTranscript, ReviewerTranscriptEntry,
+            ExecutionReviewer, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5, REVIEW_TRUNCATION_MARKER,
+            ReviewerActionEvidence, ReviewerParticipants, ReviewerPolicyEvidence,
+            ReviewerTerminalClass, ReviewerTranscript, ReviewerTranscriptEntry,
         },
     },
     provider::types::{PublicAssistantContent, PublicMessage, ToolInvocationRoute, UserContent},
@@ -50,6 +50,9 @@ const MAX_CONTEXT_USER_TOTAL_CHARS: usize = 24_000;
 const MAX_CONTEXT_TOOL_CALLS: usize = 40;
 const MAX_CONTEXT_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_CONTEXT_TOOL_TOTAL_CHARS: usize = 16_000;
+const MAX_CONTEXT_TOOL_RESULTS: usize = 40;
+const MAX_CONTEXT_TOOL_RESULT_CHARS: usize = 2_000;
+const MAX_CONTEXT_TOOL_RESULT_TOTAL_CHARS: usize = 16_000;
 pub(crate) const MAX_NORMAL_ROUTE_AUTHORIZATION_ATTEMPTS: usize = 3;
 
 pub(crate) const fn normal_reauthorization_exhausted(attempts: usize) -> bool {
@@ -170,6 +173,18 @@ pub(crate) struct ApprovalPrincipalScope {
     pub tenant_id: String,
     pub personality_agent_id: String,
     pub human_principal_id: String,
+}
+
+impl ApprovalPrincipalScope {
+    fn reviewer_participants(&self) -> Option<ReviewerParticipants> {
+        let personality_agent_id = (!self.personality_agent_id.trim().is_empty())
+            .then(|| self.personality_agent_id.clone());
+        personality_agent_id.map(|personality_agent_id| ReviewerParticipants {
+            human_display_name: None,
+            personality_agent_display_name: None,
+            personality_agent_id: Some(personality_agent_id),
+        })
+    }
 }
 
 impl ApprovalPrincipalScope {
@@ -419,6 +434,7 @@ impl RouteApprovalBroker {
                             .execution_reviewer
                             .review(
                                 ExecutionReviewRequest {
+                                    participants: scope.reviewer_participants(),
                                     transcript,
                                     action,
                                     policy,
@@ -517,6 +533,7 @@ impl RouteApprovalBroker {
                     .escalation_reviewer
                     .review(
                         EscalationReviewRequest {
+                            participants: scope.reviewer_participants(),
                             transcript,
                             action,
                             policy,
@@ -898,7 +915,9 @@ fn bounded_reviewer_transcript(
     pending_tool_call_id: &str,
 ) -> Result<ReviewerTranscript> {
     let mut users = Vec::<(usize, String)>::new();
-    let mut tools = Vec::<(usize, ReviewerTranscriptEntry)>::new();
+    let mut tools = Vec::<ReviewerToolCandidate>::new();
+    let mut results = Vec::<(usize, String, ReviewerTranscriptEntry)>::new();
+    let mut recorded_tool_calls = HashMap::<String, String>::new();
     let mut ordinal = 0;
     let mut reached_pending_tool_call = false;
 
@@ -953,21 +972,88 @@ fn bounded_reviewer_transcript(
                         PublicAssistantContent::Text { .. }
                         | PublicAssistantContent::Thinking { .. } => continue,
                     };
-                    tools.push((ordinal, entry));
+                    let tool_call_id = match content {
+                        PublicAssistantContent::ToolCall { tool_call, .. } => {
+                            recorded_tool_calls
+                                .insert(tool_call.id.clone(), tool_call.name.clone());
+                            Some(tool_call.id.clone())
+                        }
+                        _ => None,
+                    };
+                    tools.push(ReviewerToolCandidate {
+                        ordinal,
+                        tool_call_id,
+                        entry,
+                    });
                     ordinal += 1;
                 }
+            }
+            PublicMessage::ToolResult(result) if !reached_pending_tool_call => {
+                let Some(tool) = recorded_tool_calls.get(&result.tool_call_id) else {
+                    continue;
+                };
+                let content = reviewer_tool_result_content(result, redactor)?;
+                let (content, truncated) =
+                    truncate_context_text(&content, MAX_CONTEXT_TOOL_RESULT_CHARS);
+                results.push((
+                    ordinal,
+                    result.tool_call_id.clone(),
+                    ReviewerTranscriptEntry::ToolResult {
+                        tool: tool.clone(),
+                        tool_call_id: (!result.tool_call_id.is_empty())
+                            .then(|| result.tool_call_id.clone()),
+                        is_error: result.is_error,
+                        content,
+                        truncated,
+                    },
+                ));
+                ordinal += 1;
             }
             PublicMessage::ToolResult(_) => {}
         }
     }
 
     let mut entries = select_user_entries(&users);
-    entries.extend(select_tool_entries(&tools)?);
+    let (tool_entries, selected_tool_call_ids) = select_tool_entries(&tools)?;
+    entries.extend(tool_entries);
+    entries.extend(select_tool_result_entries(
+        &results,
+        &selected_tool_call_ids,
+    )?);
     entries.sort_by_key(|(ordinal, _)| *ordinal);
     Ok(ReviewerTranscript {
-        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4,
+        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5,
         entries: entries.into_iter().map(|(_, entry)| entry).collect(),
     })
+}
+
+#[derive(Clone)]
+struct ReviewerToolCandidate {
+    ordinal: usize,
+    tool_call_id: Option<String>,
+    entry: ReviewerTranscriptEntry,
+}
+
+fn reviewer_tool_result_content(
+    result: &crate::provider::types::ToolResultMessage,
+    redactor: &Redactor,
+) -> Result<String> {
+    let mut parts = result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            UserContent::Text { text } => Some(redactor.redact_text(text)),
+            UserContent::Image { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if !result.details.is_null() {
+        let details = redactor.redact_value(&result.details)?;
+        parts.push(
+            serde_json::to_string(&details)
+                .context("serialize structured reviewer tool-result evidence")?,
+        );
+    }
+    Ok(parts.join("\n"))
 }
 
 fn select_user_entries(users: &[(usize, String)]) -> Vec<(usize, ReviewerTranscriptEntry)> {
@@ -1039,16 +1125,16 @@ fn push_user_entry(
 }
 
 fn select_tool_entries(
-    tools: &[(usize, ReviewerTranscriptEntry)],
-) -> Result<Vec<(usize, ReviewerTranscriptEntry)>> {
+    tools: &[ReviewerToolCandidate],
+) -> Result<(Vec<(usize, ReviewerTranscriptEntry)>, HashSet<String>)> {
     let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
     let mut remaining = MAX_CONTEXT_TOOL_TOTAL_CHARS;
 
-    for (index, (ordinal, entry)) in tools.iter().enumerate().rev() {
+    for (index, candidate) in tools.iter().enumerate().rev() {
         if selected.len() >= MAX_CONTEXT_TOOL_CALLS || remaining == 0 {
             break;
         }
-        let entry_chars = serde_json::to_string(entry)
+        let entry_chars = serde_json::to_string(&candidate.entry)
             .context("serialize reviewer tool-call transcript entry")?
             .chars()
             .count();
@@ -1056,7 +1142,7 @@ fn select_tool_entries(
             break;
         }
         remaining -= entry_chars;
-        selected.push((index, *ordinal, entry.clone()));
+        selected.push((index, candidate.ordinal, candidate.entry.clone()));
     }
 
     let selected_indices = selected
@@ -1072,11 +1158,64 @@ fn select_tool_entries(
         .into_iter()
         .map(|(_, ordinal, entry)| (ordinal, entry))
         .collect::<Vec<_>>();
-    if let Some((_, (ordinal, _))) = omitted.first() {
+    if let Some((_, candidate)) = omitted.first() {
         entries.push((
-            *ordinal,
+            candidate.ordinal,
             ReviewerTranscriptEntry::ToolCallOmission {
                 omitted_tool_calls: omitted.len(),
+                marker: REVIEW_TRUNCATION_MARKER,
+            },
+        ));
+    }
+    let selected_tool_call_ids = selected_indices
+        .iter()
+        .filter_map(|index| tools[*index].tool_call_id.clone())
+        .collect();
+    Ok((entries, selected_tool_call_ids))
+}
+
+fn select_tool_result_entries(
+    results: &[(usize, String, ReviewerTranscriptEntry)],
+    selected_tool_call_ids: &HashSet<String>,
+) -> Result<Vec<(usize, ReviewerTranscriptEntry)>> {
+    let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
+    let mut remaining = MAX_CONTEXT_TOOL_RESULT_TOTAL_CHARS;
+    for (index, (ordinal, tool_call_id, entry)) in results.iter().enumerate().rev() {
+        if !selected_tool_call_ids.contains(tool_call_id) {
+            continue;
+        }
+        if selected.len() >= MAX_CONTEXT_TOOL_RESULTS || remaining == 0 {
+            break;
+        }
+        let entry_chars = serde_json::to_string(entry)
+            .context("serialize reviewer tool-result transcript entry")?
+            .chars()
+            .count();
+        if entry_chars > remaining {
+            break;
+        }
+        remaining -= entry_chars;
+        selected.push((index, *ordinal, entry.clone()));
+    }
+
+    let selected_indices = selected
+        .iter()
+        .map(|(index, _, _)| *index)
+        .collect::<HashSet<_>>();
+    let omitted = results
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected_indices.contains(index))
+        .collect::<Vec<_>>();
+    let mut entries = selected
+        .into_iter()
+        .map(|(_, ordinal, entry)| (ordinal, entry))
+        .collect::<Vec<_>>();
+    if let Some((_, (ordinal, _, _))) = omitted.first() {
+        entries.push((
+            *ordinal,
+            ReviewerTranscriptEntry::ToolResultOmission {
+                omitted_tool_results: omitted.len(),
                 marker: REVIEW_TRUNCATION_MARKER,
             },
         ));
@@ -1444,11 +1583,20 @@ mod tests {
     }
 
     fn tool_result_message(text: impl Into<String>) -> PublicMessage {
+        tool_result_for("prior-call", "prior-tool", text, Value::Null)
+    }
+
+    fn tool_result_for(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        text: impl Into<String>,
+        details: Value,
+    ) -> PublicMessage {
         PublicMessage::ToolResult(ToolResultMessage {
-            tool_call_id: "prior-call".to_owned(),
-            tool_name: "prior-tool".to_owned(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
             content: vec![UserContent::Text { text: text.into() }],
-            details: Value::Null,
+            details,
             is_error: false,
             timestamp: Utc::now(),
         })
@@ -1883,25 +2031,42 @@ mod tests {
     #[test]
     fn bounded_transcript_includes_redacted_capped_tool_history_with_separate_omissions() {
         const SECRET: &str = "tool-argument-secret-must-be-redacted";
-        const TOOL_RESULT: &str = "tool-result-must-not-appear";
+        const SECRET_RESULT: &str = "tool-result-secret-must-be-redacted";
+        const POST_PENDING_RESULT: &str = "post-pending-result-must-not-appear";
         let mut transcript = (0..14)
             .map(|index| user_message(format!("user-turn<{index}>")))
             .collect::<Vec<_>>();
-        transcript.extend((0..42).map(|index| {
-            prior_tool_call(
-                format!("prior_tool_{index}"),
+        for index in 0..42 {
+            let id = format!("prior-call-{index}");
+            let tool = format!("prior_tool_{index}");
+            transcript.push(tool_call_message(
+                &id,
+                &tool,
                 ToolInvocationRoute::Normal,
                 json!({"index": index}),
-            )
-        }));
+            ));
+            transcript.push(tool_result_for(
+                id,
+                tool,
+                format!("result-{index}"),
+                json!({"index": index}),
+            ));
+        }
         transcript.push(rejected_tool_call(
             "broken_tool",
             ToolArgumentError::SchemaViolation,
         ));
-        transcript.push(prior_tool_call(
+        transcript.push(tool_call_message(
+            "secret-call",
             "secret_tool",
             ToolInvocationRoute::Elevated,
             json!({"api_key": SECRET, "payload": "x".repeat(4_000)}),
+        ));
+        transcript.push(tool_result_for(
+            "secret-call",
+            "secret_tool",
+            format!("api_key={SECRET_RESULT}\npayload={}", "y".repeat(4_000)),
+            json!({"api_key": SECRET_RESULT}),
         ));
         transcript.push(tool_call_message(
             "pending-call",
@@ -1914,14 +2079,19 @@ mod tests {
             ToolInvocationRoute::Normal,
             json!({"later":"arguments-must-not-appear"}),
         ));
-        transcript.push(tool_result_message(TOOL_RESULT));
+        transcript.push(tool_result_for(
+            "pending-call",
+            "pending-tool-must-not-appear",
+            POST_PENDING_RESULT,
+            Value::Null,
+        ));
 
         let bounded = bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call")
             .expect("bounded reviewer transcript");
         let value = serde_json::to_value(&bounded).expect("serialize bounded transcript");
         let encoded = value.to_string();
 
-        assert_eq!(value["schema_version"], REVIEW_TRANSCRIPT_SCHEMA_VERSION_V4);
+        assert_eq!(value["schema_version"], REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5);
         assert!(encoded.contains("secret_tool"));
         assert!(encoded.contains("\"route\":\"elevated\""));
         assert!(encoded.contains("[REDACTED:secret]"));
@@ -1933,11 +2103,16 @@ mod tests {
         assert!(encoded.contains("schema_violation"));
         assert!(encoded.contains("omitted_user_turns"));
         assert!(encoded.contains("omitted_tool_calls"));
+        assert!(encoded.contains("tool_result"));
+        assert!(encoded.contains("omitted_tool_results"));
+        assert!(encoded.contains("result-41"));
+        assert!(encoded.contains("[REDACTED:secret]"));
+        assert!(!encoded.contains(SECRET_RESULT));
         assert!(!encoded.contains("prior_tool_0"));
         assert!(!encoded.contains("pending-tool-must-not-appear"));
         assert!(!encoded.contains("later-tool-must-not-appear"));
         assert!(!encoded.contains("arguments-must-not-appear"));
-        assert!(!encoded.contains(TOOL_RESULT));
+        assert!(!encoded.contains(POST_PENDING_RESULT));
 
         let entries = value["entries"].as_array().expect("transcript entries");
         let selected_tool_calls = entries
@@ -1961,6 +2136,31 @@ mod tests {
             .map(|entry| entry.to_string().chars().count())
             .sum::<usize>();
         assert!(selected_tool_chars <= MAX_CONTEXT_TOOL_TOTAL_CHARS);
+        let selected_results = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "tool_result")
+            .collect::<Vec<_>>();
+        assert!(selected_results.len() <= MAX_CONTEXT_TOOL_RESULTS);
+        assert!(selected_results.iter().all(|entry| {
+            entry["content"]
+                .as_str()
+                .expect("tool result content")
+                .chars()
+                .count()
+                <= MAX_CONTEXT_TOOL_RESULT_CHARS
+        }));
+        assert!(
+            selected_results
+                .iter()
+                .map(|entry| entry.to_string().chars().count())
+                .sum::<usize>()
+                <= MAX_CONTEXT_TOOL_RESULT_TOTAL_CHARS
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { entry["kind"] != "tool_result" || entry.get("text").is_none() })
+        );
         let secret_arguments = entries
             .iter()
             .find(|entry| entry["tool"] == "secret_tool")
@@ -2058,7 +2258,10 @@ mod tests {
             assert!(!encoded.contains(IMAGE_SENTINEL));
             assert!(!encoded.contains(ASSISTANT_SENTINEL));
             assert!(!encoded.contains(TOOL_RESULT_SENTINEL));
-            for forbidden in ["context_version", "tenant-1", "agent-1", "human-1"] {
+            assert!(encoded.contains("\"personality_agent_id\":\"agent-1\""));
+            assert!(!encoded.contains("human_display_name"));
+            assert!(!encoded.contains("personality_agent_display_name"));
+            for forbidden in ["context_version", "tenant-1", "human-1"] {
                 assert!(
                     !encoded.contains(forbidden),
                     "leaked reviewer field: {forbidden}"
