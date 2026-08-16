@@ -1969,7 +1969,7 @@ mod tests {
     fn structured_output_incompatible_reviewer_fails_startup() {
         let conversation =
             distinct_model("openai-responses", "conversation", "conversation-account");
-        let unsupported = ModelSpec::preset("opencode-go").expect("OpenCode fixture preset");
+        let unsupported = ModelSpec::preset("umans").expect("umans fixture preset");
         let escalation = distinct_model("glm-5.2", "escalation", "escalation-account");
 
         assert!(matches!(
