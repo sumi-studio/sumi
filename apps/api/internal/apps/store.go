@@ -2,6 +2,7 @@ package apps
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -386,6 +387,57 @@ func (s *Store) InstallAtOperation(ctx context.Context, owner OwnerRef, actor pa
 	return s.install(ctx, owner, actor, appID, operationID)
 }
 
+// InstallAtOperationInTx is the transaction-scoped counterpart to
+// InstallAtOperation. Callers which create an owner and its first app binding
+// together use it so neither record can commit without the other. It retains
+// the normal descriptor, owner authorization, receipt, lifecycle fence, and
+// authority-epoch rules; the caller owns the transaction commit.
+func (s *Store) InstallAtOperationInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	owner OwnerRef,
+	actor participant.Ref,
+	appID,
+	operationID string,
+) (Installation, error) {
+	if err := ValidateInstallOperationID(operationID); err != nil {
+		return Installation{}, err
+	}
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
+	if err != nil {
+		return Installation{}, err
+	}
+	defer releaseLifecycle()
+	return s.installAtOperationInTx(ctx, tx, owner, actor, appID, operationID)
+}
+
+// InstallDirectChatForNewHumanInTx installs the Human's initial Direct Chat
+// binding. The operation identity is deterministic per Human so a retry of a
+// provisioning transaction retains the durable app-install outcome.
+func (s *Store) InstallDirectChatForNewHumanInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	humanID string,
+) (Installation, error) {
+	actor := participant.Human(humanID)
+	return s.InstallAtOperationInTx(
+		ctx,
+		tx,
+		ParticipantOwner(actor),
+		actor,
+		directchat.AppID,
+		directChatProvisionOperationID(humanID),
+	)
+}
+
+func directChatProvisionOperationID(humanID string) string {
+	digest := sha256.Sum256([]byte("sumi:direct-chat-provision:v1:" + humanID))
+	hex := fmt.Sprintf("%x", digest[:])
+	// The receipts table intentionally accepts UUIDv4 operation identities.
+	// Preserve that contract while deriving a stable identity from the Human.
+	return hex[:8] + "-" + hex[8:12] + "-4" + hex[13:16] + "-8" + hex[17:20] + "-" + hex[20:32]
+}
+
 func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.Ref, appID, operationID string) (Installation, error) {
 	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, appID)
 	if err != nil {
@@ -400,6 +452,24 @@ func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.R
 	if err := s.authorizeMutation(ctx, tx, owner, actor); err != nil {
 		return Installation{}, err
 	}
+	installation, err := s.installAtOperationInTxAfterAuthorization(ctx, tx, owner, appID, operationID)
+	if err != nil && !errors.Is(err, ErrInstallIntentAlreadyInstalled) {
+		return Installation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Installation{}, fmt.Errorf("commit install app: %w", err)
+	}
+	return installation, err
+}
+
+func (s *Store) installAtOperationInTx(ctx context.Context, tx pgx.Tx, owner OwnerRef, actor participant.Ref, appID, operationID string) (Installation, error) {
+	if err := s.authorizeMutation(ctx, tx, owner, actor); err != nil {
+		return Installation{}, err
+	}
+	return s.installAtOperationInTxAfterAuthorization(ctx, tx, owner, appID, operationID)
+}
+
+func (s *Store) installAtOperationInTxAfterAuthorization(ctx context.Context, tx pgx.Tx, owner OwnerRef, appID, operationID string) (Installation, error) {
 	// A terminal receipt is the historical truth for this exact operation,
 	// even if the catalog has changed since the original request. Read it
 	// before current descriptor validation. If no receipt exists, the later
@@ -451,9 +521,6 @@ func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.R
 		); err != nil {
 			return Installation{}, err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return Installation{}, fmt.Errorf("commit existing app install intent: %w", err)
-		}
 		return Installation{}, ErrInstallIntentAlreadyInstalled
 	}
 	if err != nil {
@@ -466,9 +533,6 @@ func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.R
 		ctx, tx, storageKind, storageID, operationID, installation, now,
 	); err != nil {
 		return Installation{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Installation{}, fmt.Errorf("commit exact app install intent: %w", err)
 	}
 	return installation, nil
 }

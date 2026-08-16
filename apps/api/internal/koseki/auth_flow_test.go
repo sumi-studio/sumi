@@ -102,6 +102,7 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if got, _ := store.HumanDisplayName(ctx, result.HumanID); got != "New Human" {
 			t.Fatalf("new account display name = %q", got)
 		}
+		assertEnabledDirectChatInstallation(t, ctx, store, result.HumanID)
 	})
 
 	t.Run("sign in unknown requires create confirmation", func(t *testing.T) {
@@ -129,6 +130,7 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 			t.Fatalf("confirmation lost verified display name: %q", got)
 		}
 		assertRegistryCounts(t, ctx, store, 1, 1)
+		assertEnabledDirectChatInstallation(t, ctx, store, result.HumanID)
 	})
 
 	t.Run("sign up existing requires sign in confirmation", func(t *testing.T) {
@@ -163,6 +165,24 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		}
 		assertRegistryCounts(t, ctx, store, 1, 1)
 	})
+}
+
+func assertEnabledDirectChatInstallation(t *testing.T, ctx context.Context, store *Store, humanID string) {
+	t.Helper()
+	var installationID string
+	var enabled bool
+	var authorityEpoch int64
+	err := store.pool.QueryRow(ctx, `
+		SELECT installation_id, enabled, authority_epoch
+		FROM app_installations
+		WHERE owner_kind='human' AND owner_id=$1 AND app_id='direct-chat'`, humanID,
+	).Scan(&installationID, &enabled, &authorityEpoch)
+	if err != nil {
+		t.Fatalf("load initial direct-chat installation: %v", err)
+	}
+	if installationID == "" || !enabled || authorityEpoch != 1 {
+		t.Fatalf("initial direct-chat installation = id=%q enabled=%v epoch=%d", installationID, enabled, authorityEpoch)
+	}
 }
 
 func assertRegistryCounts(t *testing.T, ctx context.Context, store *Store, humans, agents int) {
