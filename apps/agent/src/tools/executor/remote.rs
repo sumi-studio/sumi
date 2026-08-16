@@ -2363,6 +2363,7 @@ mod tests {
             )
             .expect("remote reviewer inputs");
             let request = EscalationReviewRequest {
+                participants: None,
                 transcript,
                 action,
                 policy: policy_evidence,

@@ -1565,7 +1565,7 @@ impl Runner {
                             RouteExecutionDisposition::Reauthorize { sealed: next } => {
                                 if normal_reauthorization_exhausted(authorization_attempts) {
                                     let RouteApprovalOutcome::Denied {
-                                        reason,
+                                        reason: _,
                                         evidence,
                                         bound,
                                     } = broker
@@ -1585,11 +1585,7 @@ impl Runner {
                                             "reauthorization exhaustion only returns a denial"
                                         )
                                     };
-                                    let result = route_denial_tool_result(
-                                        call,
-                                        evidence.error_code(),
-                                        &reason,
-                                    );
+                                    let result = route_denial_tool_result(call, evidence.as_ref());
                                     let waiter = self
                                         .emit_route_denied_result_message(
                                             assistant_message_id,
@@ -1608,11 +1604,11 @@ impl Runner {
                         }
                     }
                     RouteCallDisposition::Denied {
-                        reason,
+                        reason: _,
                         evidence,
                         bound,
                     } => {
-                        let result = route_denial_tool_result(call, evidence.error_code(), &reason);
+                        let result = route_denial_tool_result(call, evidence.as_ref());
                         let waiter = self
                             .emit_route_denied_result_message(
                                 assistant_message_id,
@@ -4429,17 +4425,66 @@ fn error_tool_result(call: &ToolCall, message: &str) -> ToolResultMessage {
     }
 }
 
-fn route_denial_tool_result(call: &ToolCall, error_code: &str, reason: &str) -> ToolResultMessage {
+fn route_denial_tool_result(
+    call: &ToolCall,
+    evidence: &ToolExecutionDenialEvidence,
+) -> ToolResultMessage {
+    let error_code = evidence.error_code();
+    let (text, review) = if let Some(review) = evidence.execution_review.as_ref() {
+        let judged = review.budget.terminal.is_judged();
+        let text = if judged {
+            format!(
+                "安全確認（レビュー）で実行が止まりました。理由: {}",
+                review.decision.rationale
+            )
+        } else {
+            review.decision.rationale.clone()
+        };
+        let mut details = json!({
+            "outcome": review.decision.outcome,
+            "risk": review.decision.risk,
+            "rationale": review.decision.rationale,
+            "judged": judged,
+        });
+        if !judged {
+            details["terminal"] = json!(review.budget.terminal.as_str());
+        }
+        (text, Some(details))
+    } else if let Some(review) = evidence.escalation_review.as_ref() {
+        let judged = review.budget.terminal.is_judged();
+        let text = if judged {
+            format!(
+                "本人へ確認を出す前のレビューで止まりました。理由: {}",
+                review.decision.rationale
+            )
+        } else {
+            review.decision.rationale.clone()
+        };
+        let mut details = json!({
+            "outcome": review.decision.outcome,
+            "risk": review.decision.risk,
+            "rationale": review.decision.rationale,
+            "judged": judged,
+        });
+        if !judged {
+            details["terminal"] = json!(review.budget.terminal.as_str());
+        }
+        (text, Some(details))
+    } else {
+        (evidence.reason.clone(), None)
+    };
+    let mut details = json!({
+        "error": error_code,
+        "reason": text,
+    });
+    if let Some(review) = review {
+        details["review"] = review;
+    }
     ToolResultMessage {
         tool_call_id: call.id.clone(),
         tool_name: call.name.clone(),
-        content: vec![UserContent::Text {
-            text: reason.to_owned(),
-        }],
-        details: json!({
-            "error": error_code,
-            "reason": reason,
-        }),
+        content: vec![UserContent::Text { text }],
+        details,
         is_error: true,
         timestamp: Utc::now(),
     }

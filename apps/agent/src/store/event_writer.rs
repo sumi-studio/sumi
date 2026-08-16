@@ -8204,17 +8204,66 @@ fn validate_typed_route_denial_tool_result(
     let Some(details) = result.details.as_object() else {
         bail!("route denial ToolResult details must be an object");
     };
-    if details.len() != 2
-        || details.get("error").and_then(Value::as_str) != Some(error_code)
-        || details.get("reason").and_then(Value::as_str) != Some(evidence.reason.as_str())
-    {
-        bail!("route denial ToolResult details differ from its private evidence");
-    }
     let [crate::provider::types::UserContent::Text { text }] = result.content.as_slice() else {
         bail!("route denial ToolResult must contain exactly one text reason");
     };
-    if text != &evidence.reason {
-        bail!("route denial ToolResult text differs from its private evidence");
+    if details.get("error").and_then(Value::as_str) != Some(error_code)
+        || details.get("reason").and_then(Value::as_str) != Some(text.as_str())
+    {
+        bail!("route denial ToolResult reason differs from its content or private evidence");
+    }
+
+    let review_evidence = evidence
+        .execution_review
+        .as_ref()
+        .map(|review| {
+            (
+                serde_json::to_value(review.decision.outcome),
+                serde_json::to_value(review.decision.risk),
+                review.decision.rationale.as_str(),
+                review.budget.terminal,
+                "安全確認（レビュー）で実行が止まりました。理由: ",
+            )
+        })
+        .or_else(|| {
+            evidence.escalation_review.as_ref().map(|review| {
+                (
+                    serde_json::to_value(review.decision.outcome),
+                    serde_json::to_value(review.decision.risk),
+                    review.decision.rationale.as_str(),
+                    review.budget.terminal,
+                    "本人へ確認を出す前のレビューで止まりました。理由: ",
+                )
+            })
+        });
+    let Some((outcome, risk, rationale, terminal, judged_prefix)) = review_evidence else {
+        if details.len() != 2 || text != &evidence.reason {
+            bail!("non-review denial ToolResult differs from its private evidence");
+        }
+        return Ok(());
+    };
+    let review = details
+        .get("review")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("review denial ToolResult lacks review details"))?;
+    let judged = terminal.is_judged();
+    if details.len() != 3
+        || review.get("outcome") != Some(&outcome?)
+        || review.get("risk") != Some(&risk?)
+        || review.get("rationale").and_then(Value::as_str) != Some(rationale)
+        || review.get("judged").and_then(Value::as_bool) != Some(judged)
+    {
+        bail!("route denial review details differ from its private evidence");
+    }
+    if judged {
+        if review.len() != 4 || text != &format!("{judged_prefix}{rationale}") {
+            bail!("judged review denial wording differs from its private evidence");
+        }
+    } else if review.len() != 5
+        || review.get("terminal").and_then(Value::as_str) != Some(terminal.as_str())
+        || text != rationale
+    {
+        bail!("technical review denial wording differs from its private evidence");
     }
     Ok(())
 }
@@ -14902,8 +14951,8 @@ mod tests {
             },
             route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
             route_reviewer::{
-                ESCALATION_PROMPT_VERSION_V4, ESCALATION_REVIEWER_VERSION_V4,
-                ESCALATION_SCHEMA_VERSION_V4, EscalationReviewDecision, EscalationReviewEvidence,
+                ESCALATION_PROMPT_VERSION_V5, ESCALATION_REVIEWER_VERSION_V5,
+                ESCALATION_SCHEMA_VERSION_V5, EscalationReviewDecision, EscalationReviewEvidence,
                 EscalationReviewOutcome, ReviewerBudgetV1, ReviewerTerminalClass, RiskLevel,
             },
         },
@@ -15335,9 +15384,9 @@ mod tests {
 
     fn escalation_ask_human_evidence() -> EscalationReviewEvidence {
         EscalationReviewEvidence {
-            reviewer_version: ESCALATION_REVIEWER_VERSION_V4.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V4.to_owned(),
-            schema_version: ESCALATION_SCHEMA_VERSION_V4.to_owned(),
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V5.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V5.to_owned(),
+            schema_version: ESCALATION_SCHEMA_VERSION_V5.to_owned(),
             model_id: "fixture-reviewer".to_owned(),
             model_binding_digest: "fixture-model-binding".to_owned(),
             budget: ReviewerBudgetV1::escalation()

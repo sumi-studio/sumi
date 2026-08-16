@@ -2529,6 +2529,7 @@ mod tests {
                 )
                 .expect("Execution reviewer inputs");
             let execution_request = ExecutionReviewRequest {
+                participants: None,
                 transcript: execution_transcript,
                 action: execution_action,
                 policy: execution_policy,
@@ -2549,6 +2550,7 @@ mod tests {
                 )
                 .expect("Escalation reviewer inputs");
             let escalation_request = EscalationReviewRequest {
+                participants: None,
                 transcript: escalation_transcript,
                 action: escalation_action,
                 policy: escalation_policy,
