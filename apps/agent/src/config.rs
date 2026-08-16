@@ -178,12 +178,21 @@ impl Config {
         // *different* preset keeps that preset's own default model id and key —
         // sending the conversation model's id to another provider's endpoint
         // would fail every review closed.
-        let same_preset = match (reviewer.preset.as_deref(), self.model.preset.as_deref()) {
-            (None, _) => true,
-            (Some(reviewer_preset), Some(conversation_preset)) => {
-                reviewer_preset == conversation_preset
+        // Compare the *resolved* presets (default preset when omitted, aliases
+        // such as opencode-go / opencode-zen-go) by provider identity, not by
+        // the raw preset string.
+        let same_preset = match reviewer.preset.as_deref() {
+            None => true,
+            Some(reviewer_preset) => {
+                let conversation_preset =
+                    self.model.preset.as_deref().unwrap_or(DEFAULT_MODEL_PRESET);
+                let conversation_default = ModelSpec::preset(conversation_preset)
+                    .with_context(|| format!("unknown model preset {conversation_preset}"))?;
+                let reviewer_default = ModelSpec::preset(reviewer_preset)
+                    .with_context(|| format!("unknown model preset {reviewer_preset}"))?;
+                reviewer_default.provider_instance_id()
+                    == conversation_default.provider_instance_id()
             }
-            (Some(_), None) => false,
         };
         if same_preset {
             if reviewer.id.is_none() {
@@ -1413,6 +1422,33 @@ default_output_tokens = 16000
         assert_eq!(execution.id, "custom-conversation-model");
         assert_eq!(execution.api_key_env, "SUMI_CUSTOM_KEY");
         assert_eq!(execution, conversation);
+
+        // Implicit default preset on the conversation, an alias on the reviewer:
+        // still the same provider → inherit the conversation's overrides.
+        let config = Config::resolve(
+            FileConfig {
+                model: ModelConfig {
+                    id: Some("custom-default-provider-model".to_owned()),
+                    api_key_env: Some("SUMI_DEFAULT_PROVIDER_KEY".to_owned()),
+                    ..ModelConfig::default()
+                },
+                reviewers: ReviewerModelsConfig {
+                    execution: Some(ModelConfig {
+                        preset: Some("opencode-zen-go".to_owned()),
+                        ..ModelConfig::default()
+                    }),
+                    escalation: None,
+                },
+                ..FileConfig::default()
+            },
+            identity_overrides(),
+        )
+        .expect("alias reviewer config");
+        let execution = config
+            .execution_reviewer_model_spec()
+            .expect("Execution reviewer on an alias of the default preset");
+        assert_eq!(execution.id, "custom-default-provider-model");
+        assert_eq!(execution.api_key_env, "SUMI_DEFAULT_PROVIDER_KEY");
     }
 
     #[test]
