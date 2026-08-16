@@ -1078,7 +1078,10 @@ async fn run_after_not_ready(
             ExecutorHealthPolicy::PRODUCTION,
         )
         .await?;
-        let messaging_tool: Arc<dyn Tool> = Arc::new(MessagingTool::new(messaging_api));
+        let messaging_tool: Arc<dyn Tool> = Arc::new(MessagingTool::with_executor(
+            messaging_api,
+            executor_client.clone(),
+        ));
         let workspace_list_tool: Arc<dyn Tool> = Arc::new(WorkspaceListTool::new(workspace_api));
         let workspace_invitation_list_tool: Arc<dyn Tool> = Arc::new(
             WorkspaceInvitationListTool::new(workspace_invitation_api.clone()),

@@ -20,6 +20,7 @@ pub(crate) use call_authority::{
     VerifiedCallAuthority, call_authority_key_id, decode_hex_32,
 };
 pub use client::ArtifactBrokerClient;
+pub(crate) use executor_client::TransferredSource;
 #[allow(unused_imports)]
 pub use executor_client::{ExecutorClient, ExecutorErrorClassification, classify_executor_error};
 #[allow(unused_imports)]
@@ -27,10 +28,11 @@ pub use protocol::{
     ArtifactOperation, ExecutorOperation, ExecutorResponse, ExecutorRpcRequest,
     ExecutorServiceRole, InputRoute, MAX_ATTACHMENT_CHUNK_BYTES, MAX_RPC_LINE_BYTES,
     MAX_RPC_READ_BYTES, MAX_SOURCE_FILE_BYTES, MAX_SOURCE_FILES_PER_OPERATION,
-    MAX_SOURCE_FILES_TOTAL_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
-    RpcOperationValidation, RpcRequest, SourceFileManifest, decode_executor_rpc_line,
-    decode_rpc_frame, decode_rpc_line, encode_rpc_frame, resolve_input, validate_source_paths,
+    MAX_SOURCE_FILES_TOTAL_BYTES, RpcError, RpcFrame, RpcLifecycleTracker, RpcOperationValidation,
+    RpcRequest, SourceFileManifest, decode_executor_rpc_line, decode_rpc_frame, decode_rpc_line,
+    encode_rpc_frame, resolve_input, validate_source_paths,
 };
+pub(crate) use remote::normalize_workspace_path;
 #[allow(unused_imports)]
 pub use remote::remote_executor_registry;
 pub(crate) use remote::remote_executor_registry_with_tools;

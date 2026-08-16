@@ -214,7 +214,12 @@ impl SourceFileManifest {
                 "source file size is outside the attachment bounds".to_owned(),
             ));
         }
-        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(ToolError::Protocol(
                 "source digest must be lowercase hex sha256".to_owned(),
             ));

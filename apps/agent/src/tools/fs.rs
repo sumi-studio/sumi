@@ -841,14 +841,14 @@ impl WorkspaceFs {
         Ok(matches)
     }
 
-    /// Open an exact ordered list of regular Workspace files read-only for a
+    /// Snapshot an exact ordered list of regular Workspace files for a
     /// Messaging attachment send. Each path is resolved beneath the Workspace
-    /// root with symlinks and magic links refused, must be a regular file
-    /// within the attachment size bounds, and is digested through the very
-    /// descriptor that is returned (positional reads leave its offset at 0
-    /// for the receiving process). A file whose identity, size, or times
-    /// change while it is digested is refused as ambiguous rather than
-    /// guessed at.
+    /// root with symlinks and magic links refused and must be a regular file
+    /// within the attachment size bounds. The executor copies each source into
+    /// a write/grow/shrink/seal-protected memfd while hashing it, then rechecks
+    /// the source version before returning the immutable snapshot descriptor.
+    /// A later Workspace write therefore cannot change the bytes represented
+    /// by the signed manifest while the runtime uploads them.
     pub fn open_source_files(
         &self,
         paths: &[String],
@@ -873,9 +873,7 @@ impl WorkspaceFs {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-                .ok_or_else(|| {
-                    ToolError::InvalidPath("source path has no file name".to_owned())
-                })?
+                .ok_or_else(|| ToolError::InvalidPath("source path has no file name".to_owned()))?
                 .to_owned();
             let fd = openat2(
                 self.root.as_raw_fd(),
@@ -905,6 +903,22 @@ impl WorkspaceFs {
                     observed: total.saturating_add(size),
                     limit: MAX_SOURCE_FILES_TOTAL_BYTES,
                 }))?;
+            let snapshot_name =
+                CString::new("sumi-messaging-source").expect("static memfd name has no NUL");
+            // SAFETY: snapshot_name is a valid NUL-terminated string and the
+            // returned descriptor is immediately owned below.
+            let snapshot_raw = unsafe {
+                libc::memfd_create(
+                    snapshot_name.as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            if snapshot_raw < 0 {
+                return Err(ToolError::Io(std::io::Error::last_os_error()));
+            }
+            // SAFETY: memfd_create returned a fresh owned descriptor.
+            let snapshot = unsafe { OwnedFd::from_raw_fd(snapshot_raw) };
+            let mut snapshot_file = File::from(snapshot.try_clone()?);
             let mut digest = Sha256::new();
             let mut buffer = vec![0u8; 256 * 1024];
             let mut offset: u64 = 0;
@@ -914,12 +928,28 @@ impl WorkspaceFs {
                     break;
                 }
                 digest.update(&buffer[..read]);
+                snapshot_file.write_all(&buffer[..read])?;
                 offset += read as u64;
             }
             let after = file.metadata()?;
             if offset != size || !same_file_version(&before, &after) {
                 return Err(ToolError::Protocol(
                     "attachment source changed while it was being read".to_owned(),
+                ));
+            }
+            snapshot_file.flush()?;
+            snapshot_file.seek(SeekFrom::Start(0))?;
+            let required_seals =
+                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            // SAFETY: snapshot is a valid memfd created with MFD_ALLOW_SEALING.
+            if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, required_seals) } < 0 {
+                return Err(ToolError::Io(std::io::Error::last_os_error()));
+            }
+            // SAFETY: F_GET_SEALS reads the seal bitset from a valid memfd.
+            let installed_seals = unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_GET_SEALS) };
+            if installed_seals < 0 || installed_seals & required_seals != required_seals {
+                return Err(ToolError::Protocol(
+                    "attachment source snapshot was not sealed immutable".to_owned(),
                 ));
             }
             let mut sha256 = String::with_capacity(64);
@@ -934,7 +964,7 @@ impl WorkspaceFs {
                 sha256,
             };
             manifest.validate()?;
-            opened.push((fd, manifest));
+            opened.push((snapshot, manifest));
         }
         Ok(opened)
     }

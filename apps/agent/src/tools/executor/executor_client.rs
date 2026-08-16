@@ -33,6 +33,7 @@ use super::{
 };
 use crate::approval::authority::{
     CommittedEffectReceipt, CommittedExecutionPermit, ExecutorCommittedExecutionPermit,
+    MessagingSourceSigningContinuation,
 };
 use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity};
 use crate::tools::{
@@ -106,8 +107,83 @@ impl Default for Deadlines {
 /// manifest and the read-only descriptor the executor opened under the
 /// Workspace policy. The runtime never opens Workspace paths itself.
 pub(crate) struct TransferredSource {
-    pub manifest: super::SourceFileManifest,
-    pub descriptor: std::os::fd::OwnedFd,
+    manifest: super::SourceFileManifest,
+    descriptor: std::os::fd::OwnedFd,
+}
+
+impl TransferredSource {
+    pub(crate) fn manifest(&self) -> &super::SourceFileManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn into_parts(self) -> (super::SourceFileManifest, std::os::fd::OwnedFd) {
+        (self.manifest, self.descriptor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        manifest: super::SourceFileManifest,
+        descriptor: std::os::fd::OwnedFd,
+    ) -> Self {
+        Self {
+            manifest,
+            descriptor,
+        }
+    }
+}
+
+fn validate_transferred_source(
+    manifest: &super::SourceFileManifest,
+    descriptor: &std::os::fd::OwnedFd,
+) -> Result<(), ToolError> {
+    use std::os::{fd::AsRawFd, unix::fs::FileExt};
+
+    use sha2::{Digest, Sha256};
+
+    manifest.validate()?;
+    let file = std::fs::File::from(descriptor.try_clone()?);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != manifest.size_bytes {
+        return Err(ToolError::Protocol(
+            "executor source descriptor size or type differs from its manifest".to_owned(),
+        ));
+    }
+    let required_seals =
+        libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: descriptor is an owned live descriptor and F_GET_SEALS has no
+    // pointer arguments.
+    let seals = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & required_seals != required_seals {
+        return Err(ToolError::Protocol(
+            "executor source descriptor is not an immutable sealed snapshot".to_owned(),
+        ));
+    }
+
+    let mut digest = Sha256::new();
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; 256 * 1024];
+    while offset < manifest.size_bytes {
+        let remaining = (manifest.size_bytes - offset).min(buffer.len() as u64) as usize;
+        let read = file.read_at(&mut buffer[..remaining], offset)?;
+        if read == 0 {
+            return Err(ToolError::Protocol(
+                "executor source descriptor ended before its manifest size".to_owned(),
+            ));
+        }
+        digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    let actual = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual != manifest.sha256 {
+        return Err(ToolError::Protocol(
+            "executor source descriptor digest differs from its manifest".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// A single-operation client. Each call gets an isolated Unix service session;
@@ -250,7 +326,7 @@ impl ExecutorClient {
         &self,
         paths: Vec<String>,
         execution_id: String,
-        permit: ExecutorCommittedExecutionPermit,
+        continuation: MessagingSourceSigningContinuation,
         cancel: CancellationToken,
     ) -> Result<Vec<TransferredSource>, ToolError> {
         let operation = ExecutorOperation::OpenSourceFiles {
@@ -263,9 +339,15 @@ impl ExecutorClient {
             .call_authority_issuer
             .as_ref()
             .ok_or_else(|| {
-                ToolError::Protocol("executor exact-call authority signer is unavailable".to_owned())
+                ToolError::Protocol(
+                    "executor exact-call authority signer is unavailable".to_owned(),
+                )
             })?
-            .issue(request_id.clone(), operation.clone(), permit)
+            .issue(
+                request_id.clone(),
+                operation.clone(),
+                continuation.into_executor_permit(),
+            )
             .map_err(ToolError::from)?;
         let encoded = encode_request(
             &self.identity,
@@ -292,7 +374,13 @@ impl ExecutorClient {
             let mut descriptors = Vec::new();
             let terminal_line = loop {
                 if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-                    let line = buffer.drain(..=newline).collect::<Vec<u8>>();
+                    let mut line = buffer.drain(..=newline).collect::<Vec<u8>>();
+                    let terminator = line.pop();
+                    if terminator != Some(b'\n') || line.iter().any(|byte| *byte == b'\r') {
+                        return Err(indeterminate(
+                            "executor source transfer terminal has invalid framing",
+                        ));
+                    }
                     if !buffer.is_empty() {
                         return Err(indeterminate(
                             "executor emitted bytes after the source transfer terminal",
@@ -301,7 +389,9 @@ impl ExecutorClient {
                     break line;
                 }
                 if buffer.len() > MAX_RPC_LINE_BYTES {
-                    return Err(indeterminate("executor source transfer frame exceeds bounds"));
+                    return Err(indeterminate(
+                        "executor source transfer frame exceeds bounds",
+                    ));
                 }
                 let read = timeout(
                     self.deadlines.frame,
@@ -315,16 +405,20 @@ impl ExecutorClient {
                 .map_err(|_| indeterminate("executor response frame deadline elapsed"))?
                 .map_err(|error| as_indeterminate(ToolError::Io(error)))?;
                 if read == 0 {
-                    return Err(indeterminate("executor closed before the source transfer terminal"));
+                    return Err(indeterminate(
+                        "executor closed before the source transfer terminal",
+                    ));
                 }
                 buffer.extend_from_slice(&chunk[..read]);
             };
             let frame = decode_rpc_frame::<ExecutorResponse>(&terminal_line, &self.identity)
                 .map_err(as_indeterminate)?;
             let result = match frame {
-                RpcFrame::Terminal { request_id: frame_id, result, .. } if frame_id == request_id => {
-                    result
-                }
+                RpcFrame::Terminal {
+                    request_id: frame_id,
+                    result,
+                    ..
+                } if frame_id == request_id => result,
                 RpcFrame::Terminal { .. } => {
                     return Err(indeterminate("executor terminal request_id mismatch"));
                 }
@@ -341,7 +435,9 @@ impl ExecutorClient {
             )
             .map_err(as_indeterminate)?;
             let ExecutorResponse::SourceFiles { files } = response else {
-                return Err(indeterminate("executor returned a non-source-file response"));
+                return Err(indeterminate(
+                    "executor returned a non-source-file response",
+                ));
             };
             if files.len() != descriptors.len() {
                 return Err(ToolError::Protocol(format!(
@@ -350,14 +446,17 @@ impl ExecutorClient {
                     files.len()
                 )));
             }
-            Ok(files
+            files
                 .into_iter()
                 .zip(descriptors)
-                .map(|(manifest, descriptor)| TransferredSource {
-                    manifest,
-                    descriptor,
+                .map(|(manifest, descriptor)| {
+                    validate_transferred_source(&manifest, &descriptor)?;
+                    Ok(TransferredSource {
+                        manifest,
+                        descriptor,
+                    })
                 })
-                .collect())
+                .collect()
         };
         match timeout(self.deadlines.overall, exchange).await {
             Ok(result) => result,
@@ -1766,30 +1865,35 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = ExecutorClient::new(&socket, identity())
+        let client = ExecutorClient::new(&socket, identity())
             .with_call_authority_signing_key(Zeroizing::new([7; 32]))
             .unwrap()
-            .with_deadlines(test_deadlines())
-            .execute_source_transfer(
-                paths,
-                "source-transfer".to_owned(),
-                CommittedExecutionPermit::executor_fixture(
-                    "grant-source-transfer",
-                    ToolInvocationRoute::Normal,
-                    ExecutionAuthorityProvenance::AgentOwn,
+            .with_deadlines(test_deadlines());
+        let result = CommittedExecutionPermit::executor_fixture(
+            "grant-source-transfer",
+            ToolInvocationRoute::Normal,
+            ExecutionAuthorityProvenance::AgentOwn,
+        )
+        .begin_messaging_workspace_send_effect()
+        .complete(|continuation| async move {
+            client
+                .execute_source_transfer(
+                    paths,
+                    "source-transfer".to_owned(),
+                    continuation,
+                    CancellationToken::new(),
                 )
-                .begin_executor_effect()
-                .into_permit_for_test(),
-                CancellationToken::new(),
-            )
-            .await;
+                .await
+        })
+        .await
+        .map(|receipt| receipt.into_inner());
         server.await.unwrap();
         result
     }
 
     #[tokio::test]
     async fn signed_source_transfer_delivers_ordered_descriptors_with_manifests() {
-        use std::io::Read as _;
+        use std::io::{Read as _, Seek as _, Write as _};
 
         let root = temp_root("st");
         let workspace = root.join("workspace");
@@ -1810,9 +1914,17 @@ mod tests {
         assert_eq!(sources[0].manifest.size_bytes, 70_000);
         assert_eq!(sources[1].manifest.filename, "one.txt");
         assert_eq!(sources[1].manifest.size_bytes, 11);
+        std::fs::write(workspace.join("docs/one.txt"), b"changed after transfer").unwrap();
         for source in &sources {
             let mut file = std::fs::File::from(source.descriptor.try_clone().unwrap());
+            assert_eq!(
+                file.write_all(b"must fail")
+                    .expect_err("sealed descriptor must reject writes")
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
             let mut content = Vec::new();
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
             file.read_to_end(&mut content).unwrap();
             assert_eq!(content.len() as u64, source.manifest.size_bytes);
             let digest = {
@@ -1825,8 +1937,17 @@ mod tests {
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
             };
-            assert_eq!(digest, source.manifest.sha256, "descriptor bytes match the manifest");
+            assert_eq!(
+                digest, source.manifest.sha256,
+                "descriptor bytes match the manifest"
+            );
         }
+        let one = &sources[1];
+        let mut file = std::fs::File::from(one.descriptor.try_clone().unwrap());
+        let mut content = Vec::new();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"first bytes");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1842,7 +1963,10 @@ mod tests {
         for (label, paths) in [
             ("symlink", vec!["escape.txt".to_owned()]),
             ("traversal", vec!["../outside.txt".to_owned()]),
-            ("absolute", vec![root.join("outside.txt").to_string_lossy().into_owned()]),
+            (
+                "absolute",
+                vec![root.join("outside.txt").to_string_lossy().into_owned()],
+            ),
             ("directory", vec!["dir".to_owned()]),
             ("magic link", vec!["/proc/self/exe".to_owned()]),
             ("empty file", vec!["empty.txt".to_owned()]),
