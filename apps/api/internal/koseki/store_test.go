@@ -124,48 +124,11 @@ func TestHumanDisplayNameValidationAndExplicitOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SeedHumanDisplayName(ctx, registration.HumanID, "  Initial Human  "); err != nil {
-		t.Fatal(err)
-	}
 	if got, _ := store.HumanDisplayName(ctx, registration.HumanID); got != "Sumi" {
-		t.Fatalf("new account without provider name was later synced: %q", got)
+		t.Fatalf("new account without provider name = %q", got)
 	}
-	literal, err := store.AutoRegisterWithDisplayName(ctx, "firebase", "literal-sumi-owner", "Sumi")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SeedHumanDisplayName(ctx, literal.HumanID, "Must Not Replace Literal Sumi"); err != nil {
-		t.Fatal(err)
-	}
-	var literalInitialized bool
-	if err := pool.QueryRow(ctx, "SELECT display_name_initialized FROM humans WHERE human_id=$1", literal.HumanID).Scan(&literalInitialized); err != nil || !literalInitialized {
-		t.Fatalf("literal Sumi initialization=%v err=%v", literalInitialized, err)
-	}
-
-	historical, err := store.AutoRegister(ctx, "firebase", "historical-display-owner")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, "UPDATE humans SET display_name_initialized=false WHERE human_id=$1", historical.HumanID); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SeedHumanDisplayName(ctx, historical.HumanID, "  Initial Human  "); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SeedHumanDisplayName(ctx, historical.HumanID, "Later Provider Name"); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := store.HumanDisplayName(ctx, historical.HumanID); err != nil || got != "Initial Human" {
-		t.Fatalf("initial-only seed = %q, %v", got, err)
-	}
-	if got, err := store.UpdateHumanDisplayName(ctx, historical.HumanID, "Sumi"); err != nil || got != "Sumi" {
+	if got, err := store.UpdateHumanDisplayName(ctx, registration.HumanID, "Sumi"); err != nil || got != "Sumi" {
 		t.Fatalf("explicit literal sentinel = %q, %v", got, err)
-	}
-	if err := store.SeedHumanDisplayName(ctx, historical.HumanID, "Must Not Win"); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := store.HumanDisplayName(ctx, historical.HumanID); got != "Sumi" {
-		t.Fatalf("provider overwrote explicit name: %q", got)
 	}
 }
 

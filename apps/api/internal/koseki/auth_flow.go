@@ -263,9 +263,6 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 		}
 		switch {
 		case flow.Intent == IntentSignIn && exists:
-			if err := seedHumanDisplayNameTx(ctx, tx, humanID, identity.DisplayName); err != nil {
-				return AuthFlow{}, fmt.Errorf("seed returning Human display name: %w", err)
-			}
 			if flow.Channel == ChannelProvider {
 				if err := syncVerifiedProviderTx(ctx, tx, humanID, flow.ExpectedProvider, identity.ProviderSubject, "provider_sign_in"); err != nil {
 					return AuthFlow{}, err
@@ -321,9 +318,6 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 		} else {
 			if !exists {
 				return AuthFlow{}, ErrAuthProofMismatch
-			}
-			if err := seedHumanDisplayNameTx(ctx, tx, humanID, flow.VerifiedDisplayName); err != nil {
-				return AuthFlow{}, fmt.Errorf("seed confirmed Human display name: %w", err)
 			}
 			if flow.Channel == ChannelProvider {
 				if err := syncVerifiedProviderTx(ctx, tx, humanID, flow.ExpectedProvider, flow.VerifiedProviderSubject, "provider_sign_in"); err != nil {

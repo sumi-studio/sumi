@@ -63,9 +63,6 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.pool.Exec(ctx, "UPDATE humans SET display_name_initialized=false WHERE human_id=$1", registered.HumanID); err != nil {
-			t.Fatal(err)
-		}
 		nonce := testNonce(t)
 		flow := startEmailFlow(t, ctx, store, IntentSignIn, "Person@Example.com", nonce)
 		proof := emailProof("known-sign-in", "person@example.com")
@@ -77,8 +74,9 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if result.TerminalOutcome != OutcomeSignedIn || result.HumanID != registered.HumanID || result.AgentID != registered.AgentID {
 			t.Fatalf("unexpected result: %+v", result)
 		}
-		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Known Human" {
-			t.Fatalf("returning sentinel upgrade = %q", got)
+		// Provider profile metadata never mutates an existing Human's name.
+		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Sumi" {
+			t.Fatalf("returning sign-in mutated display name = %q", got)
 		}
 	})
 
@@ -139,9 +137,6 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.pool.Exec(ctx, "UPDATE humans SET display_name_initialized=false WHERE human_id=$1", registered.HumanID); err != nil {
-			t.Fatal(err)
-		}
 		nonce := testNonce(t)
 		flow := startEmailFlow(t, ctx, store, IntentSignUp, "known@example.com", nonce)
 		proof := emailProof("known-sign-up", "known@example.com")
@@ -163,8 +158,8 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if result.TerminalOutcome != OutcomeSignedIn || result.HumanID != registered.HumanID {
 			t.Fatalf("unexpected result: %+v", result)
 		}
-		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Confirmed Existing Human" {
-			t.Fatalf("confirmed existing seed = %q", got)
+		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Sumi" {
+			t.Fatalf("confirmed sign-in mutated display name = %q", got)
 		}
 		assertRegistryCounts(t, ctx, store, 1, 1)
 	})

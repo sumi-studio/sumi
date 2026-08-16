@@ -43,9 +43,6 @@ func (r *kosekiIdentityBindingResolver) ResolveIdentity(
 	}
 	humanID, err := r.store.ResolveCredential(ctx, r.provider, identity.UID)
 	if err == nil {
-		if err := r.store.SeedHumanDisplayName(ctx, humanID, identity.DisplayName); err != nil {
-			return agentevents.UserSessionClaims{}, fmt.Errorf("seed Human display name: %w", err)
-		}
 		agentID, aerr := r.store.AgentForHuman(ctx, humanID)
 		if aerr != nil {
 			return agentevents.UserSessionClaims{}, fmt.Errorf("resolve secretary for human %s: %w", humanID, aerr)

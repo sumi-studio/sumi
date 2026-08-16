@@ -1,0 +1,2 @@
+-- Irreversible: the prior uninitialized sentinel state was consumed by a
+-- runtime compatibility path that no longer exists.

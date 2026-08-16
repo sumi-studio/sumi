@@ -90,31 +90,3 @@ func (s *Store) UpdateHumanDisplayName(ctx context.Context, humanID, raw string)
 	}
 	return stored, nil
 }
-
-// SeedHumanDisplayName upgrades only the historical creation sentinel and only
-// while no explicit Sumi settings choice exists. Provider profile metadata is
-// therefore an initial label, never identity and never a durable override.
-func (s *Store) SeedHumanDisplayName(ctx context.Context, humanID, raw string) error {
-	name := initialHumanDisplayName(raw)
-	if name == "" {
-		return nil
-	}
-	_, err := s.pool.Exec(ctx, `UPDATE humans SET display_name=$2, display_name_initialized=true
-		WHERE human_id=$1 AND NOT display_name_customized
-		  AND NOT display_name_initialized AND display_name='Sumi'`, humanID, name)
-	if err != nil {
-		return fmt.Errorf("seed Human display name: %w", err)
-	}
-	return nil
-}
-
-func seedHumanDisplayNameTx(ctx context.Context, tx pgx.Tx, humanID, raw string) error {
-	name := initialHumanDisplayName(raw)
-	if name == "" {
-		return nil
-	}
-	_, err := tx.Exec(ctx, `UPDATE humans SET display_name=$2, display_name_initialized=true
-		WHERE human_id=$1 AND NOT display_name_customized
-		  AND NOT display_name_initialized AND display_name='Sumi'`, humanID, name)
-	return err
-}
