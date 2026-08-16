@@ -38,7 +38,13 @@ test("Compose pulls published Sumi images from GHCR", async () => {
     assert.doesNotMatch(compose, /^\s+build:/m);
     const ghcrImages =
       compose.match(/^\s+image: ghcr\.io\/sumi-studio\//gm) ?? [];
-    const alwaysPulls = compose.match(/^\s+pull_policy: always$/gm) ?? [];
+    // Every GHCR image is pulled on start. The per-agent compose files let a
+    // developer opt into reusing a pinned local build
+    // (SUMI_AGENT_IMAGE_PULL_POLICY, default always); production keeps always.
+    const alwaysPulls =
+      compose.match(
+        /^\s+pull_policy: (?:always|\$\{SUMI_AGENT_IMAGE_PULL_POLICY:-always\})$/gm,
+      ) ?? [];
     assert.ok(ghcrImages.length > 0);
     assert.equal(alwaysPulls.length, ghcrImages.length);
   }
