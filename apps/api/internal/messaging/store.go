@@ -47,6 +47,10 @@ type Store struct {
 	pool       *pgxpool.Pool
 	workspaces WorkspaceAuthority
 	apps       AppAuthority
+	// blobs and attachmentPolicy are set by ConfigureAttachments. A nil blobs
+	// keeps every attachment operation failing closed.
+	blobs            AttachmentBlobs
+	attachmentPolicy AttachmentPolicy
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to

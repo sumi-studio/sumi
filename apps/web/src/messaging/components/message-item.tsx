@@ -25,6 +25,7 @@ import {
 import { memo, type ReactNode, useMemo } from "react";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
+import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -264,6 +265,9 @@ export const MessageItem = memo(function MessageItem({
               trailer={editedTrailer}
             />
           </div>
+          {message.deleted ? null : (
+            <MessageAttachments attachments={message.attachments} />
+          )}
           {allowReactions ? (
             <ReactionChips
               message={message}

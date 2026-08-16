@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,11 +22,16 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 	default:
 		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
-	if in.Content == "" {
+	// Empty text is valid only when at least one attachment binds; the
+	// deferred database trigger enforces the same rule at commit.
+	if in.Content == "" && len(in.AttachmentIDs) == 0 {
 		return Message{}, false, errors.New("content must not be empty")
 	}
 	if !messageContentFitsStorage(in.Content) {
 		return Message{}, false, fmt.Errorf("content is not storable or exceeds %d bytes", MaxContentBytes)
+	}
+	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
+		return Message{}, false, ErrTooManyAttachments
 	}
 	if in.ClientNonce == "" || len(in.ClientNonce) > 128 {
 		return Message{}, false, errors.New("client nonce must be 1..128 bytes")
@@ -42,6 +48,32 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 		return Message{}, false, fmt.Errorf("idempotent re-read found no message for nonce %q", in.ClientNonce)
 	}
 	return existing, false, nil
+}
+
+// requestMatchesReplay compares the incoming request against the durable
+// receipt of the message that already owns its nonce. A changed request under
+// the same nonce is a conflict, never a silent replay of the first message.
+func requestMatchesReplay(in AppendInput, existing Message, storedDigest []byte) bool {
+	incoming := messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs)
+	if storedDigest != nil {
+		return bytes.Equal(incoming, storedDigest)
+	}
+	// Rows written before request digests existed compare structurally.
+	if existing.Deleted {
+		return len(in.AttachmentIDs) == 0
+	}
+	if existing.Content != in.Content || existing.Urgency != in.Urgency || existing.ReplyTo != in.ReplyTo {
+		return false
+	}
+	if len(existing.Attachments) != len(in.AttachmentIDs) {
+		return false
+	}
+	for i, att := range existing.Attachments {
+		if att.AttachmentID != in.AttachmentIDs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ScopedStore) authorizedMessageByNonce(ctx context.Context, in AppendInput) (Message, bool, error) {
@@ -61,12 +93,15 @@ func (s *ScopedStore) authorizedMessageByNonce(ctx context.Context, in AppendInp
 	if err != nil {
 		return Message{}, false, err
 	}
-	message, found, err := s.messageByNonce(ctx, tx, in)
+	message, digest, found, err := s.messageByNonce(ctx, tx, in)
 	if err != nil {
 		return Message{}, false, err
 	}
 	if found && message.Seq < access.VisibleFromSeq {
 		return Message{}, false, ErrMessageNotFound
+	}
+	if found && !requestMatchesReplay(in, message, digest) {
+		return Message{}, false, ErrIdempotencyConflict
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit idempotent scoped re-read: %w", err)
@@ -91,11 +126,14 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	if err != nil {
 		return Message{}, false, err
 	}
-	if existing, found, err := s.messageByNonce(ctx, tx, in); err != nil {
+	if existing, digest, found, err := s.messageByNonce(ctx, tx, in); err != nil {
 		return Message{}, false, err
 	} else if found {
 		if existing.Seq < access.VisibleFromSeq {
 			return Message{}, false, ErrMessageNotFound
+		}
+		if !requestMatchesReplay(in, existing, digest) {
+			return Message{}, false, ErrIdempotencyConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return Message{}, false, fmt.Errorf("commit idempotent scoped append: %w", err)
@@ -140,14 +178,24 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO messages
 			(message_id, workspace_id, place_id, seq, author_kind, author_id,
-			 content, urgency, reply_to, client_nonce)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 content, urgency, reply_to, client_nonce, request_digest)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING created_at`,
 		message.MessageID, s.Scope.WorkspaceID, message.PlaceID, message.Seq,
 		message.Author.Kind, message.Author.ID, message.Content, message.Urgency,
-		replyTo, message.ClientNonce).Scan(&message.CreatedAt); err != nil {
+		replyTo, message.ClientNonce,
+		messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs),
+	).Scan(&message.CreatedAt); err != nil {
 		return Message{}, false, fmt.Errorf("insert scoped message: %w", err)
 	}
+	// Attachment binds share the message transaction and snapshot: a miss on
+	// any of them rolls back the message, its mentions, its seq, and its
+	// notification intents together.
+	attachments, err := s.bindAttachmentsInTx(ctx, tx, in.PlaceID, message.MessageID, in.AttachmentIDs)
+	if err != nil {
+		return Message{}, false, err
+	}
+	message.Attachments = attachments
 	if err := insertMentions(ctx, tx, message.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
@@ -162,7 +210,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	return message, true, nil
 }
 
-func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendInput) (Message, bool, error) {
+func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendInput) (Message, []byte, bool, error) {
 	rows, err := q.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
 		       reply_to, client_nonce, created_at, edited_at, deleted_at
@@ -171,19 +219,25 @@ func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendIn
 		  AND author_kind = $3 AND author_id = $4 AND client_nonce = $5`,
 		s.Scope.WorkspaceID, in.PlaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, in.ClientNonce)
 	if err != nil {
-		return Message{}, false, fmt.Errorf("query scoped message by nonce: %w", err)
+		return Message{}, nil, false, fmt.Errorf("query scoped message by nonce: %w", err)
 	}
 	messages, err := scanMessages(rows)
 	if err != nil {
-		return Message{}, false, err
+		return Message{}, nil, false, err
 	}
 	if len(messages) == 0 {
-		return Message{}, false, nil
+		return Message{}, nil, false, nil
 	}
 	if err := attachMessagePartsWith(ctx, q, messages); err != nil {
-		return Message{}, false, err
+		return Message{}, nil, false, err
 	}
-	return messages[0], true, nil
+	var digest []byte
+	if err := q.QueryRow(ctx, `
+		SELECT request_digest FROM messages WHERE workspace_id = $1 AND message_id = $2`,
+		s.Scope.WorkspaceID, messages[0].MessageID).Scan(&digest); err != nil {
+		return Message{}, nil, false, fmt.Errorf("load scoped request digest: %w", err)
+	}
+	return messages[0], digest, true, nil
 }
 
 func (s *ScopedStore) History(ctx context.Context, placeID string, opt HistoryOptions) ([]Message, error) {
@@ -417,6 +471,11 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 		WHERE workspace_id = $1 AND message_id = $2`, s.Scope.WorkspaceID, messageID); err != nil {
 		return Message{}, fmt.Errorf("tombstone scoped message: %w", err)
 	}
+	// Bytes leave through the durable deletion outbox after commit; the
+	// attachment rows stay as the record of what the message carried.
+	if err := enqueueAttachmentDeletionsInTx(ctx, tx, s.Scope.WorkspaceID, messageID); err != nil {
+		return Message{}, err
+	}
 	for _, statement := range []string{
 		"DELETE FROM message_mentions WHERE message_id = $1",
 		"DELETE FROM message_reactions WHERE message_id = $1",
@@ -428,7 +487,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped delete: %w", err)
 	}
-	message.Content, message.Mentions, message.Reactions, message.Deleted = "", nil, nil, true
+	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Deleted = "", nil, nil, nil, true
 	return message, nil
 }
 
@@ -619,7 +678,10 @@ func attachMessagePartsWith(ctx context.Context, q querier, messages []Message) 
 	if err := attachMentionsWith(ctx, q, messages); err != nil {
 		return err
 	}
-	return attachReactionsWith(ctx, q, messages)
+	if err := attachReactionsWith(ctx, q, messages); err != nil {
+		return err
+	}
+	return attachAttachmentsWith(ctx, q, messages)
 }
 
 func attachMentionsWith(ctx context.Context, q querier, messages []Message) error {

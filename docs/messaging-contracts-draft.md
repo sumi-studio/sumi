@@ -130,6 +130,57 @@
   混ぜない。未読の正本はmuteしても数え続けるが、mute中はsidebarとtab titleの
   バッジへ提示しない。muteを解除すれば、その間の未読も再び見える。
 
+### Attachment — メッセージが運ぶファイル・画像（追補）
+
+```json
+{
+  "attachment_id": "<UUIDv7>",
+  "filename": "表示名（storage path ではない）",
+  "mime": "サーバーがバイト先頭を sniff して決めた型",
+  "size_bytes": 12345,
+  "sha256": "<hex>",
+  "position": 0
+}
+```
+
+- `Message.attachments` は送信者が選んだ順序で最大 10 件。1 ファイルは最大 20 MiB。
+  `content` が空でも attachments が 1 件以上あれば有効なメッセージである
+  （DB の deferred trigger が同じ規則を commit 時に強制する）。
+- upload は message より先に行い、`POST /messaging/places/{place_id}/attachments`
+  に生バイトを送る。メタデータは header で運ぶ: `Idempotency-Key`（ファイルごとに
+  安定な nonce）、`Content-Length`（宣言サイズ・必須）、`Content-Type`（ヒント）、
+  `X-Sumi-Attachment-Filename`（percent-encoded UTF-8）。応答は
+  `{ "attachment": Attachment, "created": bool }`。同じ nonce の再送は最初の受領を返す。
+  宣言サイズや本体が異なる再送は `409 attachment_upload_conflict`。
+- upload は 3 段階で進む: (1) exact scope・place・nonce 受領・quota reservation を
+  session lease 内で行う → (2) body を lease なしで staging file へ書き fsync する →
+  (3) exact scope と reservation を再検証し、blob を no-replace rename で公開し、
+  metadata を同じ transaction で記録する。reservation は installation/epoch に fence
+  され、disable/re-enable・membership 喪失・session 失効・runtime 世代交代のあとは
+  finalize が閉じる（`410 attachment_upload_expired` または 401）。
+- 送信 `POST /messaging/places/{place_id}/messages` の body に
+  `attachments: [attachment_id, ...]` を順序付きで載せる。bind は message insert・
+  mention・seq 割当・notification intent と同じ transaction で行われ、1 件でも
+  bind できなければ全部 rollback する（`404 not_found`）。bind できるのは同じ
+  Workspace・place で自分が upload した未 bind の attachment だけである。
+- nonce 再送は canonical request digest（text・urgency・reply_to・順序付き attachment
+  identity）で比較され、同じ nonce で違う request は `409 idempotency_conflict`。
+- download は `GET /messaging/attachments/{attachment_id}`（exact scope query 付き）。
+  現在の membership・installation epoch・place visibility・`visible_from_seq`・
+  tombstone で毎回再認可する。存在しない・他人の・見えない・削除済み・stale scope は
+  すべて `404 not_found`。応答は `Cache-Control: private, no-store`、`nosniff`、
+  `CSP sandbox`、`CORP same-origin` を持ち、inline 表示は png/jpeg/gif/webp だけ。
+- 未送信 draft は uploader ごと・place ごとに 10 件 / 200 MiB（1 メッセージ分）に
+  制限され、Workspace 全体は運用者が明示した byte cap（`SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES`、
+  未設定なら添付機能そのものが無効）で reserved+unbound+bound の合計を制限する。
+- tombstone はメタデータ行を残したまま bytes を非同期 deletion outbox
+  （`blob_state='deleting'`）で削除する。quota は削除確認と同じ transaction でだけ返る。
+- Agent 側: `messaging` tool の `write` は Workspace 内の path を `attachments` に列挙
+  でき、`open_attachment` で「今開いている place に見えている」attachment を読む。
+  transport は PAID-local control socket の staged upload
+  （`/local-control/v1/messaging/places/{place_id}/attachments`）と
+  `messaging:attachment` で、Human と同じ Store 規則を通る。
+
 ## API / event（人間UI側）
 
 - REST: place一覧、履歴取得（seqベースのpagination）、read marker更新、

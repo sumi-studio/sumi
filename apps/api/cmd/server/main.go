@@ -217,8 +217,11 @@ type application struct {
 	database      *db.Pool
 	spawnManager  *spawn.Manager
 	localRuntimes *agentevents.LocalControlListenerRegistry
-	closeOnce     sync.Once
-	closeErr      error
+	// stopBackground cancels process-lifetime workers such as the attachment
+	// reconciler.
+	stopBackground context.CancelFunc
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 type browserSessionConnectionClosers []agentevents.BrowserSessionConnectionCloser
@@ -236,6 +239,9 @@ func (a *application) Close() error {
 		return nil
 	}
 	a.closeOnce.Do(func() {
+		if a.stopBackground != nil {
+			a.stopBackground()
+		}
 		if a.browser != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
@@ -378,6 +384,10 @@ func newApplicationFromEnv() (*application, error) {
 		log.Print("workspace and app lifecycle routes ready")
 
 		messagingStore := messaging.New(database.Pool, workspaceStore, appStore)
+		if err := configureMessagingAttachmentsFromEnv(messagingStore); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("messaging attachments: %w", err)
+		}
 		messagingHub := messaging.NewHub(messagingStore)
 		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins
@@ -448,16 +458,56 @@ func newApplicationFromEnv() (*application, error) {
 		browser.SetSpawner(spawnManager)
 	}
 	mux.HandleFunc("GET /health", handler.Health)
+	backgroundCtx, stopBackground := context.WithCancel(context.Background())
+	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
+		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
+	}
 	return &application{
-		publicMux:     mux,
-		localMux:      localMux,
-		localListener: localListener,
-		store:         store,
-		browser:       browser,
-		database:      database,
-		spawnManager:  spawnManager,
-		localRuntimes: localRuntimes,
+		publicMux:      mux,
+		localMux:       localMux,
+		localListener:  localListener,
+		store:          store,
+		browser:        browser,
+		database:       database,
+		spawnManager:   spawnManager,
+		localRuntimes:  localRuntimes,
+		stopBackground: stopBackground,
 	}, nil
+}
+
+// Messaging attachment storage is opt-in and fails closed. Both variables must
+// be set together: an API-owned persistent root and an explicit per-Workspace
+// byte cap. Attachments stay disabled (uploads answer 503) when either is
+// missing, rather than silently accepting bytes nothing can serve or running
+// without a storage bound.
+const (
+	messagingAttachmentRootEnv  = "SUMI_MESSAGING_ATTACHMENT_ROOT"
+	messagingAttachmentQuotaEnv = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES"
+)
+
+func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
+	root := strings.TrimSpace(os.Getenv(messagingAttachmentRootEnv))
+	quotaRaw := strings.TrimSpace(os.Getenv(messagingAttachmentQuotaEnv))
+	if root == "" && quotaRaw == "" {
+		log.Print("messaging attachments disabled: no attachment root configured")
+		return nil
+	}
+	if root == "" || quotaRaw == "" {
+		return fmt.Errorf("%s and %s must be set together", messagingAttachmentRootEnv, messagingAttachmentQuotaEnv)
+	}
+	quota, err := strconv.ParseInt(quotaRaw, 10, 64)
+	if err != nil || quota <= 0 {
+		return fmt.Errorf("%s must be a positive byte count", messagingAttachmentQuotaEnv)
+	}
+	blobs, err := messaging.NewDiskAttachments(root)
+	if err != nil {
+		return err
+	}
+	if err := store.ConfigureAttachments(blobs, messaging.AttachmentPolicy{WorkspaceQuotaBytes: quota}); err != nil {
+		return err
+	}
+	log.Printf("messaging attachments ready at %s (workspace quota %d bytes)", blobs.RootPath(), quota)
+	return nil
 }
 
 // databaseFromEnv opens and migrates the control-plane Postgres database when

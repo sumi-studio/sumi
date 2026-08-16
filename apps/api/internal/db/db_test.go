@@ -1005,3 +1005,199 @@ func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		}
 	}
 }
+
+func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 20)
+
+	readMigration := func(name string) string {
+		t.Helper()
+		content, err := migrationFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(content)
+	}
+	up := readMigration("0023_message_attachments.up.sql")
+	down := readMigration("0023_message_attachments.down.sql")
+	for _, step := range []struct{ name, sql string }{{"up", up}, {"down", down}, {"re-up", up}} {
+		if _, err := pool.Exec(ctx, step.sql); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+	}
+	// After down the attachment tables and the messages column are gone; after
+	// re-up they exist again with the same shape.
+	var tables int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('message_attachments','message_attachment_uploads','message_attachment_quotas')`).Scan(&tables); err != nil || tables != 3 {
+		t.Fatalf("attachment tables after re-up: %d %v", tables, err)
+	}
+	if _, err := pool.Exec(ctx, down); err != nil {
+		t.Fatalf("second down: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_name IN ('message_attachments','message_attachment_uploads','message_attachment_quotas')`).Scan(&tables); err != nil || tables != 0 {
+		t.Fatalf("attachment tables after down: %d %v", tables, err)
+	}
+	var column int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name='messages' AND column_name='request_digest'`).Scan(&column); err != nil || column != 0 {
+		t.Fatalf("request_digest after down: %d %v", column, err)
+	}
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("final up: %v", err)
+	}
+
+	// Constraint fixture: two Workspaces, one place each, one message each.
+	const (
+		humanID      = "0198f0f4-9b72-7000-8000-000000000401"
+		wsA          = "0198f0f4-9b72-7000-8000-000000000402"
+		wsB          = "0198f0f4-9b72-7000-8000-000000000403"
+		memberA      = "0198f0f4-9b72-7000-8000-000000000404"
+		memberB      = "0198f0f4-9b72-7000-8000-000000000405"
+		placeA       = "0198f0f4-9b72-7000-8000-000000000406"
+		placeB       = "0198f0f4-9b72-7000-8000-000000000407"
+		messageA     = "0198f0f4-9b72-7000-8000-000000000408"
+		messageB     = "0198f0f4-9b72-7000-8000-000000000409"
+		attachmentID = "0198f0f4-9b72-7000-8000-00000000040a"
+		uploadID     = "0198f0f4-9b72-7000-8000-00000000040b"
+	)
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatal(err)
+	}
+	for _, ws := range [][3]string{{wsA, memberA, placeA}, {wsB, memberB, placeB}} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspaces (workspace_id, name, owner_workspace_member_id) VALUES ($1, 'w', $2)`, ws[0], ws[1]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_members (workspace_member_id, workspace_id, member_kind, member_id) VALUES ($1, $2, 'human', $3)`, ws[1], ws[0], humanID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO places (place_id, kind, workspace_id, name) VALUES ($1, 'channel', $2, 'general')`, ws[2], ws[0]); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, m := range [][3]string{{messageA, wsA, placeA}, {messageB, wsB, placeB}} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
+			VALUES ($1, $2, $3, 1, 'human', $4, 'hello', 'n')`, m[0], m[1], m[2], humanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertAttachment := `
+		INSERT INTO message_attachments
+			(attachment_id, workspace_id, place_id, uploader_kind, uploader_id, client_nonce,
+			 filename, mime, size_bytes, sha256)
+		VALUES ($1, $2, $3, 'human', $4, 'nonce', 'f.txt', 'text/plain', $5, decode(repeat('ab', 32), 'hex'))`
+	// Size and digest checks.
+	if _, err := pool.Exec(ctx, insertAttachment, attachmentID, wsA, placeA, humanID, 20971521); err == nil {
+		t.Fatal("size above 20 MiB accepted")
+	}
+	if _, err := pool.Exec(ctx, insertAttachment, attachmentID, wsA, placeA, humanID, 0); err == nil {
+		t.Fatal("zero size accepted")
+	}
+	if _, err := pool.Exec(ctx, insertAttachment, attachmentID, wsA, placeA, humanID, 5); err != nil {
+		t.Fatalf("valid attachment: %v", err)
+	}
+	// Cross-workspace/place binds are rejected by the composite foreign key.
+	if _, err := pool.Exec(ctx, `UPDATE message_attachments SET message_id=$1, bound_at=now() WHERE attachment_id=$2`, messageB, attachmentID); err == nil {
+		t.Fatal("cross-workspace bind accepted")
+	}
+	// bound_at and message_id must move together.
+	if _, err := pool.Exec(ctx, `UPDATE message_attachments SET message_id=$1 WHERE attachment_id=$2`, messageA, attachmentID); err == nil {
+		t.Fatal("message_id without bound_at accepted")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE message_attachments SET message_id=$1, bound_at=now() WHERE attachment_id=$2`, messageA, attachmentID); err != nil {
+		t.Fatalf("same-workspace bind: %v", err)
+	}
+	// Position uniqueness per message.
+	second := "0198f0f4-9b72-7000-8000-00000000040c"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_attachments
+			(attachment_id, workspace_id, place_id, message_id, bound_at, uploader_kind, uploader_id, client_nonce,
+			 filename, mime, size_bytes, sha256, position)
+		VALUES ($1, $2, $3, $4, now(), 'human', $5, 'nonce-2', 'g.txt', 'text/plain', 5, decode(repeat('ab', 32), 'hex'), 0)`,
+		second, wsA, placeA, messageA, humanID); err == nil {
+		t.Fatal("duplicate position accepted")
+	}
+	// Uploader nonce uniqueness within a place.
+	if _, err := pool.Exec(ctx, insertAttachment, second, wsA, placeA, humanID, 5); err == nil {
+		t.Fatal("duplicate nonce accepted")
+	}
+	// Empty content requires a bound attachment at commit; a message that
+	// binds one in the same transaction is fine.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
+		VALUES ('0198f0f4-9b72-7000-8000-00000000040d', $1, $2, 2, 'human', $3, '', 'empty')`, wsA, placeA, humanID); err == nil {
+		t.Fatal("empty message without attachments accepted")
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
+		VALUES ('0198f0f4-9b72-7000-8000-00000000040e', $1, $2, 3, 'human', $3, '', 'empty-ok')`, wsA, placeA, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_attachments
+			(attachment_id, workspace_id, place_id, message_id, bound_at, uploader_kind, uploader_id, client_nonce,
+			 filename, mime, size_bytes, sha256, position)
+		VALUES ($1, $2, $3, '0198f0f4-9b72-7000-8000-00000000040e', now(), 'human', $4, 'nonce-3', 'g.txt', 'text/plain', 5, decode(repeat('ab', 32), 'hex'), 0)`,
+		second, wsA, placeA, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("empty message with attachment: %v", err)
+	}
+	// Reservation checks and quota non-negativity.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_attachment_uploads
+			(upload_id, workspace_id, place_id, uploader_kind, uploader_id, client_nonce, installation_id,
+			 authority_epoch, declared_bytes, expires_at)
+		VALUES ($1, $2, $3, 'human', $4, 'r', 'inst', 0, 5, now() + interval '1 minute')`, uploadID, wsA, placeA, humanID); err == nil {
+		t.Fatal("authority_epoch 0 accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_attachment_uploads
+			(upload_id, workspace_id, place_id, uploader_kind, uploader_id, client_nonce, installation_id,
+			 authority_epoch, declared_bytes, expires_at)
+		VALUES ($1, $2, $3, 'human', $4, 'r', 'inst', 1, 5, now() + interval '1 minute')`, uploadID, wsA, placeA, humanID); err != nil {
+		t.Fatalf("valid reservation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE message_attachment_uploads SET state='finalized' WHERE upload_id=$1`, uploadID); err == nil {
+		t.Fatal("finalized without attachment_id accepted")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO message_attachment_quotas (workspace_id, used_bytes) VALUES ($1, -1)`, wsB); err == nil {
+		t.Fatal("negative quota accepted")
+	}
+	// The blob inventory view excludes deleted rows only.
+	if _, err := pool.Exec(ctx, `UPDATE message_attachments SET blob_state='deleting' WHERE attachment_id=$1`, attachmentID); err != nil {
+		t.Fatal(err)
+	}
+	var inventory int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM message_attachment_blob_inventory").Scan(&inventory); err != nil || inventory != 2 {
+		t.Fatalf("inventory with a deleting row: %d %v", inventory, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE message_attachments SET blob_state='deleted' WHERE attachment_id=$1`, attachmentID); err == nil {
+		t.Fatal("deleted without blob_deleted_at accepted")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE message_attachments SET blob_state='deleted', blob_deleted_at=now() WHERE attachment_id=$1`, attachmentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM message_attachment_blob_inventory").Scan(&inventory); err != nil || inventory != 1 {
+		t.Fatalf("inventory with a deleted row: %d %v", inventory, err)
+	}
+}

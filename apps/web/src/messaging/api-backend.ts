@@ -1,4 +1,5 @@
 import type {
+  Attachment,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -22,8 +23,10 @@ import type {
   ServerEvent,
   StatusKind,
   UnreadSummary,
+  UploadAttachmentInput,
+  UploadAttachmentReceipt,
 } from "./model";
-import { MAX_SEQ, parsePlaceKey } from "./model";
+import { MAX_ATTACHMENT_BYTES, MAX_SEQ, parsePlaceKey } from "./model";
 import {
   bindMessagingScopeToURL,
   type MessagingScope,
@@ -32,6 +35,8 @@ import {
 } from "./scope";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+/** 20 MiBを遅い回線で送り切る猶予。サーバーの130秒より短く保つ。 */
+const UPLOAD_TIMEOUT_MS = 120_000;
 
 export class MessagingAPIError extends Error {
   readonly code: string;
@@ -214,6 +219,7 @@ export class ApiMessagingBackend implements MessagingBackend {
             urgency: input.urgency,
             reply_to: input.replyTo ?? "",
             client_nonce: input.clientNonce,
+            attachments: input.attachments,
           },
         },
       ),
@@ -224,6 +230,62 @@ export class ApiMessagingBackend implements MessagingBackend {
       seq: asSeq(body.seq),
       created: asBoolean(body.created),
     };
+  }
+
+  async uploadAttachment(
+    input: UploadAttachmentInput,
+  ): Promise<UploadAttachmentReceipt> {
+    if (input.body.size <= 0 || input.body.size > MAX_ATTACHMENT_BYTES) {
+      throw new MessagingAPIError("attachment_too_large", 413);
+    }
+    const signals = [
+      this.abortController.signal,
+      AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+    ];
+    if (input.signal) signals.push(input.signal);
+    // 生バイトを本文に、メタデータをheaderに。Content-Lengthはブラウザが
+    // Blobから確定するので、サーバーはbodyを読む前に宣言サイズでquotaを予約できる。
+    const response = await fetch(
+      scopedMessagingPath(
+        `/messaging/places/${encodeURIComponent(placeID(input.place))}/attachments`,
+        this.scope,
+      ),
+      {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": input.contentType || "application/octet-stream",
+          "Idempotency-Key": input.clientNonce,
+          "X-Sumi-Attachment-Filename": encodeURIComponent(input.filename),
+        },
+        body: input.body,
+        signal: AbortSignal.any(signals),
+      },
+    );
+    if (!response.ok) {
+      let code = "attachment_upload_failed";
+      try {
+        const body = asRecord(await response.json());
+        if (typeof body.error === "string") code = body.error;
+      } catch {
+        // Status remains the authoritative non-sensitive signal.
+      }
+      throw new MessagingAPIError(code, response.status);
+    }
+    const body = asRecord(await response.json());
+    return {
+      attachment: parseAttachment(body.attachment),
+      created: asBoolean(body.created),
+    };
+  }
+
+  attachmentURL(attachmentId: string): string {
+    return scopedMessagingPath(
+      `/messaging/attachments/${encodeURIComponent(attachmentId)}`,
+      this.scope,
+    );
   }
 
   async editMessage(
@@ -720,12 +782,30 @@ function parseMessage(value: unknown): Message {
     mentions: asArray(wire.mentions).map(parseParticipant),
     urgency: asUrgency(wire.urgency),
     reactions: asArray(wire.reactions).map(parseReaction),
+    attachments: asArray(wire.attachments ?? []).map(parseAttachment),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
     deleted: asBoolean(wire.deleted),
+  };
+}
+
+function parseAttachment(value: unknown): Attachment {
+  const wire = asRecord(value);
+  const sizeBytes = asSeq(wire.size_bytes);
+  const position = asSeq(wire.position);
+  if (sizeBytes <= 0 || sizeBytes > MAX_ATTACHMENT_BYTES) {
+    throw new Error("invalid attachment size");
+  }
+  return {
+    attachmentId: asString(wire.attachment_id),
+    filename: asString(wire.filename),
+    mime: asString(wire.mime),
+    sizeBytes,
+    sha256: asString(wire.sha256),
+    position,
   };
 }
 

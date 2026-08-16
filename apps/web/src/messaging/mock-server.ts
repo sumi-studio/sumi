@@ -1,6 +1,7 @@
 import { secureRandomUUID } from "../lib/random-uuid";
 import { hasDisplayMention } from "./mention";
 import type {
+  Attachment,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -23,6 +24,8 @@ import type {
   ServerEvent,
   StatusKind,
   UnreadSummary,
+  UploadAttachmentInput,
+  UploadAttachmentReceipt,
   WorkspaceSummary,
 } from "./model";
 import {
@@ -142,6 +145,7 @@ function seedMessages(place: Place, specs: SeedSpec[]): Message[] {
     mentions: spec.mentions ?? [],
     urgency: spec.urgency ?? "normal",
     reactions: spec.reactions ?? [],
+    attachments: [],
     replyTo: null,
     createdAt: now - spec.minutesAgo * 60_000,
     editedAt: null,
@@ -532,6 +536,10 @@ export class MockMessagingServer implements MessagingBackend {
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
+          attachments: input.attachments
+            .map((id) => this.uploads.get(id))
+            .filter((entry): entry is Attachment => entry !== undefined)
+            .map((entry, position) => ({ ...entry, position })),
         });
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
         this.emit({
@@ -548,6 +556,32 @@ export class MockMessagingServer implements MessagingBackend {
         });
       }, SEND_LATENCY_MS);
     });
+  }
+
+  private readonly uploads = new Map<string, Attachment>();
+  private readonly uploadsByNonce = new Map<string, Attachment>();
+
+  uploadAttachment(
+    input: UploadAttachmentInput,
+  ): Promise<UploadAttachmentReceipt> {
+    const existing = this.uploadsByNonce.get(input.clientNonce);
+    if (existing)
+      return Promise.resolve({ attachment: existing, created: false });
+    const attachment: Attachment = {
+      attachmentId: secureRandomUUID(),
+      filename: input.filename,
+      mime: input.contentType || "application/octet-stream",
+      sizeBytes: input.body.size,
+      sha256: "",
+      position: 0,
+    };
+    this.uploads.set(attachment.attachmentId, attachment);
+    this.uploadsByNonce.set(input.clientNonce, attachment);
+    return Promise.resolve({ attachment, created: true });
+  }
+
+  attachmentURL(attachmentId: string): string {
+    return `/mock/attachments/${encodeURIComponent(attachmentId)}`;
   }
 
   async editMessage(
@@ -735,6 +769,7 @@ export class MockMessagingServer implements MessagingBackend {
     urgency: Message["urgency"];
     replyTo: string | null;
     clientNonce?: string;
+    attachments?: Attachment[];
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -748,6 +783,7 @@ export class MockMessagingServer implements MessagingBackend {
       mentions: input.mentions,
       urgency: input.urgency,
       reactions: [],
+      attachments: input.attachments ?? [],
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,

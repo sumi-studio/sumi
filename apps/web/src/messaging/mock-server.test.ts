@@ -22,6 +22,7 @@ describe("MockMessagingServer admission", () => {
       urgency: "normal",
       replyTo: null,
       clientNonce: "partial-mention",
+      attachments: [],
     });
     await vi.advanceTimersByTimeAsync(200);
     const receipt = await receiptPromise;
@@ -43,6 +44,7 @@ describe("MockMessagingServer admission", () => {
       urgency: "normal",
       replyTo: null,
       clientNonce: "exact-mention",
+      attachments: [],
     });
     await vi.advanceTimersByTimeAsync(200);
     const receipt = await receiptPromise;

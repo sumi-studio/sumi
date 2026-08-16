@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import type { DraftAttachment } from "./draft-attachments";
+import { attachmentUploadFailureCode } from "./draft-attachments";
 import { hasDisplayMention } from "./mention";
 import type {
   ChannelSummary,
@@ -24,7 +26,13 @@ import type {
   Urgency,
   WorkspaceSummary,
 } from "./model";
-import { parsePlaceKey, participantKey, placeKey } from "./model";
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  parsePlaceKey,
+  participantKey,
+  placeKey,
+} from "./model";
 import {
   isNotificationSoundEnabled,
   isTabActive,
@@ -85,6 +93,31 @@ function unboundMessagingBackend(): MessagingBackend {
 
 let backend: MessagingBackend = unboundMessagingBackend();
 
+/**
+ * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
+ * Fileと AbortController はここで持つ。resetで必ず全部止めて捨てる。
+ */
+const draftFiles = new Map<
+  string,
+  { file: File; controller: AbortController | null }
+>();
+
+function rememberDraftFile(clientNonce: string, file: File): void {
+  draftFiles.set(clientNonce, { file, controller: null });
+}
+
+function releaseDraftFile(clientNonce: string): void {
+  const entry = draftFiles.get(clientNonce);
+  if (!entry) return;
+  entry.controller?.abort();
+  draftFiles.delete(clientNonce);
+}
+
+function releaseAllDraftFiles(): void {
+  for (const clientNonce of [...draftFiles.keys()])
+    releaseDraftFile(clientNonce);
+}
+
 /** Tests and explicit development harnesses may replace the transport before init. */
 export function installMessagingBackend(override: MessagingBackend): void {
   if (initialized) throw new Error("Messaging backend is already initialized");
@@ -112,6 +145,11 @@ interface MessagingState {
   /** placeへ入った時点のlastReadのスナップショット。離れるまで動かさない。 */
   unreadLineByPlace: Record<PlaceKey, number | null>;
   draftByPlace: Record<PlaceKey, string>;
+  /**
+   * composerに積まれた添付。placeごと・現在のscopeとsessionだけに属し、
+   * scope/session切替のresetで消える。bytesはここではなくモジュール内に置く。
+   */
+  draftAttachmentsByPlace: Record<PlaceKey, DraftAttachment[]>;
   typingByPlace: Record<PlaceKey, Record<ParticipantKey, number>>;
   replyLaterById: Record<string, ReplyLaterMarker>;
   /** 自分の通知設定。正本はサーバーで、ここはその写し。 */
@@ -149,8 +187,14 @@ interface MessagingState {
   updateChannelTopic(channelId: string, topic: string): Promise<void>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
+  /** 選択・貼り付け・ドロップされたファイルを現在のplaceのdraftへ積み、uploadを始める。 */
+  addDraftAttachments(files: File[]): void;
+  removeDraftAttachment(clientNonce: string): void;
+  retryDraftAttachment(clientNonce: string): void;
+  /** 添付付き送信の可否: 本文か添付があり、uploadが全部終わっているとき。 */
   send(content: string, urgency: Urgency): void;
   retrySend(clientNonce: string): void;
+  attachmentURL(attachmentId: string): string;
   startEdit(messageId: string): void;
   cancelEdit(): void;
   submitEdit(content: string): void;
@@ -989,6 +1033,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         urgency: pending.urgency,
         replyTo: pending.replyTo,
         clientNonce: pending.clientNonce,
+        attachments: pending.attachments.map((entry) => entry.attachmentId),
       })
       .then(async (receipt) => {
         let confirmed = (get().messagesByPlace[key] ?? []).some(
@@ -1039,6 +1084,64 @@ export const useMessaging = create<MessagingState>((set, get) => {
             ),
           },
         }));
+      });
+  };
+
+  // upload結果はscope/session/backend世代とdraftの存在を全部確かめてから反映する。
+  // 別のWorkspaceに切り替わったあとに戻ってきた受領は、前のplaceの添付として
+  // 別のメッセージへ載る危険があるので捨てる。
+  const dispatchUpload = (
+    key: PlaceKey,
+    place: Place,
+    draft: DraftAttachment,
+  ) => {
+    const entry = draftFiles.get(draft.clientNonce);
+    if (!entry) return;
+    const controller = new AbortController();
+    entry.controller = controller;
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const stillLive = () =>
+      backend === currentBackend &&
+      messagingSessionGeneration === sessionGeneration &&
+      (get().draftAttachmentsByPlace[key] ?? []).some(
+        (candidate) => candidate.clientNonce === draft.clientNonce,
+      );
+    const patch = (next: Partial<DraftAttachment>) =>
+      set((current) => ({
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: (current.draftAttachmentsByPlace[key] ?? []).map(
+            (candidate) =>
+              candidate.clientNonce === draft.clientNonce
+                ? { ...candidate, ...next }
+                : candidate,
+          ),
+        },
+      }));
+    currentBackend
+      .uploadAttachment({
+        place,
+        clientNonce: draft.clientNonce,
+        filename: draft.filename,
+        contentType: draft.contentType,
+        body: entry.file,
+        signal: controller.signal,
+      })
+      .then((receipt) => {
+        if (!stillLive()) return;
+        patch({
+          status: "ready",
+          attachment: receipt.attachment,
+          errorCode: undefined,
+        });
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || !stillLive()) return;
+        patch({
+          status: "failed",
+          errorCode: attachmentUploadFailureCode(error),
+        });
       });
   };
 
@@ -1127,6 +1230,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     mentionCountByPlace: {},
     unreadLineByPlace: {},
     draftByPlace: {},
+    draftAttachmentsByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
     notificationDefaultLevel: "all",
@@ -1352,24 +1456,123 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       const trimmed = content.trim();
-      if (!key || !place || !trimmed || !state.self) return;
+      if (!key || !place || !state.self) return;
+      const drafts = state.draftAttachmentsByPlace[key] ?? [];
+      // 添付が1件でも上がりきっていなければ送らない。半端な添付で送るくらいなら
+      // 送信ボタンを押せない方が正直である。
+      if (drafts.some((entry) => entry.status !== "ready")) return;
+      const attachments = drafts.flatMap((entry) =>
+        entry.attachment ? [entry.attachment] : [],
+      );
+      if (!trimmed && attachments.length === 0) return;
       const pending: PendingMessage = {
         clientNonce: secureRandomUUID(),
         content: trimmed,
         mentions: resolveMentions(trimmed, state.membersByKey, state.selfKey),
         urgency,
         replyTo: state.replyTargetId,
+        attachments,
         createdAt: Date.now(),
       };
+      for (const entry of drafts) releaseDraftFile(entry.clientNonce);
       set((current) => ({
         pendingByPlace: {
           ...current.pendingByPlace,
           [key]: [...(current.pendingByPlace[key] ?? []), pending],
         },
         draftByPlace: { ...current.draftByPlace, [key]: "" },
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: [],
+        },
         replyTargetId: null,
       }));
       dispatchSend(key, pending);
+    },
+
+    addDraftAttachments(files) {
+      const state = get();
+      const key = state.activePlaceKey;
+      const place = key ? parsePlaceKey(key) : null;
+      if (!key || !place || files.length === 0) return;
+      const existing = state.draftAttachmentsByPlace[key] ?? [];
+      const room = MAX_ATTACHMENTS_PER_MESSAGE - existing.length;
+      const accepted = files.slice(0, Math.max(0, room));
+      const added: DraftAttachment[] = accepted.map((file) => {
+        const clientNonce = secureRandomUUID();
+        const draft: DraftAttachment = {
+          clientNonce,
+          filename: file.name || "file",
+          sizeBytes: file.size,
+          contentType: file.type,
+          status: "uploading",
+        };
+        if (file.size <= 0) {
+          return { ...draft, status: "failed", errorCode: "attachment_empty" };
+        }
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          return {
+            ...draft,
+            status: "failed",
+            errorCode: "attachment_too_large",
+          };
+        }
+        rememberDraftFile(clientNonce, file);
+        return draft;
+      });
+      set((current) => ({
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: [...(current.draftAttachmentsByPlace[key] ?? []), ...added],
+        },
+      }));
+      for (const draft of added) {
+        if (draft.status === "uploading") dispatchUpload(key, place, draft);
+      }
+    },
+
+    removeDraftAttachment(clientNonce) {
+      const key = get().activePlaceKey;
+      if (!key) return;
+      releaseDraftFile(clientNonce);
+      set((current) => ({
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: (current.draftAttachmentsByPlace[key] ?? []).filter(
+            (entry) => entry.clientNonce !== clientNonce,
+          ),
+        },
+      }));
+    },
+
+    retryDraftAttachment(clientNonce) {
+      const key = get().activePlaceKey;
+      const place = key ? parsePlaceKey(key) : null;
+      if (!key || !place) return;
+      const draft = (get().draftAttachmentsByPlace[key] ?? []).find(
+        (entry) => entry.clientNonce === clientNonce,
+      );
+      if (draft?.status !== "failed" || !draftFiles.has(clientNonce)) {
+        return;
+      }
+      const retried: DraftAttachment = {
+        ...draft,
+        status: "uploading",
+        errorCode: undefined,
+      };
+      set((current) => ({
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+            entry.clientNonce === clientNonce ? retried : entry,
+          ),
+        },
+      }));
+      dispatchUpload(key, place, retried);
+    },
+
+    attachmentURL(attachmentId) {
+      return backend.attachmentURL(attachmentId);
     },
 
     retrySend(clientNonce) {
@@ -1674,6 +1877,7 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
 function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
   reactionProjectionByPlace.clear();
+  releaseAllDraftFiles();
   backend.dispose();
   backend = nextBackend;
   initialized = false;
@@ -1702,6 +1906,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     mentionCountByPlace: {},
     unreadLineByPlace: {},
     draftByPlace: {},
+    draftAttachmentsByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
     notificationDefaultLevel: "all",

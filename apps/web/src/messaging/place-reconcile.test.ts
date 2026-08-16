@@ -119,6 +119,12 @@ class FakeBackend implements MessagingBackend {
   async updateChannelTopic(): Promise<ChannelSummary> {
     throw new Error("unused");
   }
+  async uploadAttachment(): Promise<never> {
+    throw new Error("uploadAttachment is not part of this test");
+  }
+  attachmentURL(attachmentId: string): string {
+    return `/test/attachments/${attachmentId}`;
+  }
   async sendMessage() {
     return {
       clientNonce: "unused",

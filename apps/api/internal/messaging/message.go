@@ -44,7 +44,8 @@ type Message struct {
 	Urgency     string
 	Mentions    []ParticipantRef
 	Reactions   []ReactionSummary
-	ReplyTo     string // empty when not a reply
+	Attachments []Attachment // sender-ordered; empty for tombstones
+	ReplyTo     string       // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
 	EditedAt    *time.Time
@@ -61,6 +62,9 @@ type AppendInput struct {
 	Urgency     string // empty means normal
 	ReplyTo     string // optional message_id in the same place
 	ClientNonce string
+	// AttachmentIDs are the author's own finalized uploads in the sender's
+	// order. They bind inside the send transaction; any miss rolls it back.
+	AttachmentIDs []string
 }
 
 type HistoryOptions struct {

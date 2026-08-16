@@ -58,6 +58,7 @@ function targetMessage(): Message {
     mentions: [],
     urgency: "normal",
     reactions: [],
+    attachments: [],
     replyTo: null,
     createdAt: 0,
     editedAt: null,
@@ -148,6 +149,12 @@ class FakePresenceBackend implements MessagingBackend {
     MessagingBackend["updateChannelTopic"]
   > {
     throw new Error("unused");
+  }
+  async uploadAttachment(): Promise<never> {
+    throw new Error("uploadAttachment is not part of this test");
+  }
+  attachmentURL(attachmentId: string): string {
+    return `/test/attachments/${attachmentId}`;
   }
   async sendMessage(): Promise<SendReceipt> {
     throw new Error("unused");
