@@ -158,6 +158,11 @@ services:
       SUMI_ESCALATION_REVIEWER_MODEL_ID: ${SUMI_ESCALATION_REVIEWER_MODEL_ID:-}
       SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL: ${SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL:-}
       SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE: ${SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE:-}
+      # The URL is browser-facing. Empty credentials deliberately leave call
+      # routes unmounted while text messaging continues normally.
+      SUMI_LIVEKIT_URL: ${SUMI_LIVEKIT_URL:-ws://${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880}
+      SUMI_LIVEKIT_API_KEY: ${SUMI_LIVEKIT_API_KEY:-}
+      SUMI_LIVEKIT_API_SECRET: ${SUMI_LIVEKIT_API_SECRET:-}
     ports:
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080:8080"
     volumes:
@@ -192,6 +197,41 @@ services:
       start_period: 5s
     restart: "no"
     stop_grace_period: 2m
+
+  # LiveKit carries media only; API-issued room tokens retain admission
+  # authority. rtc-mux keeps local UDP exposure to one port (ADR 0012).
+  livekit:
+    image: livekit/livekit-server:v1.8
+    pull_policy: missing
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: info
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: false
+        keys:
+          ${SUMI_LIVEKIT_API_KEY:-sumi-local}: ${SUMI_LIVEKIT_API_SECRET:-sumi-local-dev-secret-change-me}
+        webhook:
+          api_key: ${SUMI_LIVEKIT_API_KEY:-sumi-local}
+          urls:
+            - http://api:8080/messaging/livekit/webhook
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'printf %s "$$LIVEKIT_CONFIG" > /etc/livekit.yaml && exec /livekit-server --config /etc/livekit.yaml'
+    ports:
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880:7880"
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7882:7882/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7880"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
 
   # This is the sole Docker authority. API/runtime/executor/broker containers
   # have no Docker socket, client, or host-process execution capability.

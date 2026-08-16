@@ -628,7 +628,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 			  AND (p.kind = 'channel' OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.name, vp.topic,
-		       vp.visibility, vp.last_seq, COALESCE(rm.last_read_seq, 0),
+		       vp.visibility, vp.last_seq, vp.voice, COALESCE(rm.last_read_seq, 0),
 		       (SELECT count(*) FROM messages m
 		        WHERE m.workspace_id = $1 AND m.place_id = vp.place_id
 		          AND m.seq >= vp.visible_from_seq AND m.seq > COALESCE(rm.last_read_seq, 0)
@@ -656,7 +656,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 		var name *string
 		if err := rows.Scan(&summary.Place.PlaceID, &summary.Place.Kind,
 			&summary.Place.WorkspaceID, &name, &summary.Place.Topic,
-			&summary.Place.Visibility, &summary.Place.LastSeq, &summary.LastReadSeq,
+			&summary.Place.Visibility, &summary.Place.LastSeq, &summary.Place.Voice, &summary.LastReadSeq,
 			&summary.UnreadCount, &summary.MentionCount); err != nil {
 			return nil, fmt.Errorf("scan scoped unread summary: %w", err)
 		}

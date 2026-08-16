@@ -1013,11 +1013,30 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 		}
 		if exists != want {
 			t.Fatalf("messages_content_trgm exists=%v, want %v", exists, want)
+=======
+	up := read("0025_voice_channels.up.sql")
+	down := read("0025_voice_channels.down.sql")
+	assertUp := func(phase string) {
+		t.Helper()
+		var voice bool
+		if err := pool.QueryRow(ctx, "SELECT voice FROM places WHERE place_id=$1", channelID).Scan(&voice); err != nil {
+			t.Fatalf("%s read default: %v", phase, err)
+		}
+		if voice {
+			t.Fatalf("%s changed an existing channel into voice", phase)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE places SET voice=true WHERE place_id=$1", channelID); err != nil {
+			t.Fatalf("%s mark channel voice: %v", phase, err)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE places SET voice=true WHERE place_id=$1", dmID); err == nil {
+			t.Fatalf("%s allowed a DM to become a voice channel", phase)
+>>>>>>> a069f60d (feat(messaging): add scoped LiveKit calls)
 		}
 	}
 	if _, err := pool.Exec(ctx, up); err != nil {
 		t.Fatalf("upgrade: %v", err)
 	}
+<<<<<<< HEAD
 	assertIndex(true)
 	if _, err := pool.Exec(ctx, down); err != nil {
 		t.Fatalf("downgrade: %v", err)
@@ -1027,6 +1046,98 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 		t.Fatalf("re-upgrade: %v", err)
 	}
 	assertIndex(true)
+}
+
+func TestVoiceChannelMigrationRoundTrip(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 22)
+
+	const (
+		humanID      = "0198f0f4-9b72-7000-8000-000000000401"
+		workspaceID  = "0198f0f4-9b72-7000-8000-000000000402"
+		membershipID = "0198f0f4-9b72-7000-8000-000000000403"
+		channelID    = "0198f0f4-9b72-7000-8000-000000000404"
+		dmID         = "0198f0f4-9b72-7000-8000-000000000405"
+	)
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspaces (workspace_id, name, owner_workspace_member_id)
+		VALUES ($1, 'voice migration', $2)`, workspaceID, membershipID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspace_members
+			(workspace_member_id, workspace_id, member_kind, member_id)
+		VALUES ($1, $2, 'human', $3)`, membershipID, workspaceID, humanID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO places (place_id, kind, workspace_id, name) VALUES
+			($1, 'channel', $3, 'talk'), ($2, 'group_dm', $3, NULL)`,
+		channelID, dmID, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+
+	read := func(name string) string {
+		t.Helper()
+		content, err := migrationFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(content)
+	}
+	up := read("0025_voice_channels.up.sql")
+	down := read("0025_voice_channels.down.sql")
+	assertUp := func(phase string) {
+		t.Helper()
+		var voice bool
+		if err := pool.QueryRow(ctx, "SELECT voice FROM places WHERE place_id=$1", channelID).Scan(&voice); err != nil {
+			t.Fatalf("%s read default: %v", phase, err)
+		}
+		if voice {
+			t.Fatalf("%s changed an existing channel into voice", phase)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE places SET voice=true WHERE place_id=$1", channelID); err != nil {
+			t.Fatalf("%s mark channel voice: %v", phase, err)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE places SET voice=true WHERE place_id=$1", dmID); err == nil {
+			t.Fatalf("%s allowed a DM to become a voice channel", phase)
+		}
+	}
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	assertUp("upgrade")
+	if _, err := pool.Exec(ctx, down); err != nil {
+		t.Fatalf("downgrade: %v", err)
+	}
+	var columns int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema=current_schema() AND table_name='places' AND column_name='voice'`,
+	).Scan(&columns); err != nil {
+		t.Fatal(err)
+	}
+	if columns != 0 {
+		t.Fatal("down migration left places.voice behind")
+	}
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("re-upgrade: %v", err)
+	}
+	assertUp("re-upgrade")
 }
 
 func TestSplitSQLStatements(t *testing.T) {

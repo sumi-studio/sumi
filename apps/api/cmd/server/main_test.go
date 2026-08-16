@@ -518,6 +518,29 @@ func TestBrowserAuthPartialConfigurationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestLiveKitConfigIsOptionalButNeverPartial(t *testing.T) {
+	for _, name := range []string{"SUMI_LIVEKIT_URL", "SUMI_LIVEKIT_API_KEY", "SUMI_LIVEKIT_API_SECRET"} {
+		t.Setenv(name, "")
+	}
+	if _, enabled, err := liveKitConfigFromEnv(); err != nil || enabled {
+		t.Fatalf("empty config: enabled=%v err=%v", enabled, err)
+	}
+	t.Setenv("SUMI_LIVEKIT_URL", "wss://calls.sumi.test")
+	t.Setenv("SUMI_LIVEKIT_API_KEY", "key")
+	if _, _, err := liveKitConfigFromEnv(); err == nil {
+		t.Fatal("partial config was accepted")
+	}
+	t.Setenv("SUMI_LIVEKIT_API_SECRET", "secret")
+	config, enabled, err := liveKitConfigFromEnv()
+	if err != nil || !enabled || config.URL != "wss://calls.sumi.test" {
+		t.Fatalf("complete config: %+v enabled=%v err=%v", config, enabled, err)
+	}
+	t.Setenv("SUMI_LIVEKIT_URL", "https://calls.sumi.test")
+	if _, _, err := liveKitConfigFromEnv(); err == nil {
+		t.Fatal("non-WebSocket signalling URL was accepted")
+	}
+}
+
 func TestAuthSessionTTLFromEnvIsShortAndBounded(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		t.Setenv("SUMI_AUTH_SESSION_TTL", "")
