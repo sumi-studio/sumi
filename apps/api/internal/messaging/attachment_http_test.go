@@ -265,6 +265,74 @@ func TestAttachmentHTTPUploadSendAndSafeDownload(t *testing.T) {
 	}
 }
 
+func TestAttachmentHTTPTombstonedNonceSurvivesReceiptGC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f, ts := newAttachmentTestServer(t, ctx)
+	workspace, channel := f.workspaceWithChannel(t, ctx)
+	data := []byte("permanent nonce identity")
+
+	resp, body := rawUpload(t, ts, f.humanA.ID, channel.PlaceID, "retired-after-gc", "doc.txt", "text/plain", data, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("initial upload: %d %v", resp.StatusCode, body)
+	}
+	attachmentID := body["attachment"].(map[string]any)["attachment_id"].(string)
+	sender := f.store.mustScope(t, ctx, workspace.WorkspaceID, f.humanA)
+	msg, _, err := sender.AppendMessage(ctx, AppendInput{
+		PlaceID: channel.PlaceID, Content: "doc", ClientNonce: "retire-message", AttachmentIDs: []string{attachmentID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.DeleteMessage(ctx, channel.PlaceID, msg.MessageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.core.ReconcileAttachments(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Force the receipt beyond its normal TTL and make the next reconciliation
+	// exercise receipt GC after the attachment has been tombstoned and its blob
+	// removed. The history row must retain the permanent nonce identity.
+	f.store.core.attachmentPolicy.UnboundTTL = time.Millisecond
+	if _, err := f.store.core.pool.Exec(ctx, `
+		UPDATE message_attachment_uploads
+		SET settled_at = NOW() - INTERVAL '1 hour'
+		WHERE attachment_id = $1`, attachmentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.core.ReconcileAttachments(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var receiptRows int
+	if err := f.store.core.pool.QueryRow(ctx, "SELECT count(*) FROM message_attachment_uploads WHERE attachment_id = $1", attachmentID).Scan(&receiptRows); err != nil {
+		t.Fatal(err)
+	}
+	if receiptRows != 1 {
+		t.Fatalf("receipt GC removed historical nonce identity: %d rows", receiptRows)
+	}
+	beforeBytes, beforeObjects := f.totalUsage(t, ctx)
+	beforeStaging, err := filepath.Glob(filepath.Join(f.root, "*", "*", ".staging-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body = rawUpload(t, ts, f.humanA.ID, channel.PlaceID, "retired-after-gc", "doc.txt", "text/plain", data, nil)
+	if resp.StatusCode != http.StatusGone || body["error"] != "attachment_upload_retired" {
+		t.Fatalf("retry after receipt GC: %d %v", resp.StatusCode, body)
+	}
+	afterBytes, afterObjects := f.totalUsage(t, ctx)
+	afterStaging, err := filepath.Glob(filepath.Join(f.root, "*", "*", ".staging-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterBytes != beforeBytes || afterObjects != beforeObjects {
+		t.Fatalf("retired retry changed quota from %d/%d to %d/%d", beforeBytes, beforeObjects, afterBytes, afterObjects)
+	}
+	if len(afterStaging) != len(beforeStaging) {
+		t.Fatalf("retired retry changed staging artifacts from %v to %v", beforeStaging, afterStaging)
+	}
+}
+
 func TestAttachmentHTTPWithoutStorageFailsClosed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
