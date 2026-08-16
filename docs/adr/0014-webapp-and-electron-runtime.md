@@ -37,9 +37,13 @@ Electron desktopで共通する唯一のrenderer実装にする。同じscreen�
 loading/error/reconnect、Approval、attachmentの認知体験を使い、Electron専用のapplication
 forkを作らない。
 
-mobileの現在のproduct surfaceはresponsive WebAppである。Tauri mobile、Capacitor、React
-Native等のnative mobile shellは選定しない。APNs専用機能やLive Activitiesを将来必要と
-する場合は、WebAppとdesktop shellへ暗黙に混ぜず、別ADRでnative companionの責務を決める。
+mobileは当面PWA（同じ`apps/web`をスマートフォンで開き、ホーム画面に置ける形）で届け、
+最終的にはちゃんとしたアプリにする（Founder、2026-08-16）。「レスポンシブ」は目標の言葉ではない:
+画面幅で折り返すことではなく、desktopと同じ認知上の操作空間を保ったまま、タッチ端末に合った
+見せ方と入力へ変換すること（参考: Discordのスマホ版とPC版で操作空間が同一）（2026-08-12）。
+最終形のnative shell（Tauri mobile、Capacitor、React Native等）はまだ選定していない — mobile
+着手時に別ADRで決める。APNs専用機能やLive Activitiesが必要になる場合も、WebAppとdesktop shellへ
+暗黙に混ぜず、そのADRでnative companionの責務を決める。
 
 ### 2. desktop shellと将来のbrowser chassisはElectronにする
 
@@ -143,7 +147,7 @@ Electronを無理にChrome化せず、Chromium/CEF等を含む別のruntime判�
 - core Goal後のdesktop handoffはTauriではなくElectronを対象にする。Kazuiは`apps/desktop`、
   bundled renderer、auth/transport、native notification/file integration、browser chassisの順に
   実装し、Hosted Webと別のdomain/UIを作らない。
-- responsive mobile WebAppは自律Goalの外で、core実装後にHumanが実viewport/実機を観測しながら
+- mobile（当面PWA、スマホアプリとしての操作空間）は自律Goalの外で、core実装後にHumanが実viewport/実機を観測しながら
   仕上げる。desktop-only productへ縮退したという意味ではない。
 
 ## Consequences
