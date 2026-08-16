@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -155,20 +156,20 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	if err != nil {
 		t.Fatalf("auto-register second: %v", err)
 	}
-	firstInstallation, err := appStore.Install(
+	firstInstallation, err := appStore.InstallAtOperation(
 		ctx,
 		applicationapps.ParticipantOwner(participant.Human(first.HumanID)),
 		participant.Human(first.HumanID),
-		"direct-chat",
+		"direct-chat", uuid.NewString(),
 	)
 	if err != nil {
 		t.Fatalf("install first direct chat: %v", err)
 	}
-	secondInstallation, err := appStore.Install(
+	secondInstallation, err := appStore.InstallAtOperation(
 		ctx,
 		applicationapps.ParticipantOwner(participant.Human(second.HumanID)),
 		participant.Human(second.HumanID),
-		"direct-chat",
+		"direct-chat", uuid.NewString(),
 	)
 	if err != nil {
 		t.Fatalf("install second direct chat: %v", err)
@@ -178,11 +179,11 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	if err := authorizeDirectChatWithFence(ctx, lifecycle, authorizer, first.HumanID, first.AgentID, firstInstallation.InstallationID, func() error { return nil }); err != nil {
 		t.Fatalf("owner should be authorized for own secretary: %v", err)
 	}
-	alarmInstallation, err := appStore.Install(
+	alarmInstallation, err := appStore.InstallAtOperation(
 		ctx,
 		applicationapps.ParticipantOwner(participant.Human(first.HumanID)),
 		participant.Human(first.HumanID),
-		"alarm",
+		"alarm", uuid.NewString(),
 	)
 	if err != nil {
 		t.Fatalf("install alarm: %v", err)
@@ -251,7 +252,7 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	actor := participant.Human(registration.HumanID)
-	installation, err := appStore.Install(ctx, applicationapps.ParticipantOwner(actor), actor, "direct-chat")
+	installation, err := appStore.InstallAtOperation(ctx, applicationapps.ParticipantOwner(actor), actor, "direct-chat", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,11 +417,11 @@ func TestDirectChatProcessFenceSurvivesBackendLossAfterAuthorizationCommit(t *te
 		t.Fatal(err)
 	}
 	actor := participant.Human(first.HumanID)
-	installation, err := appStore.Install(
+	installation, err := appStore.InstallAtOperation(
 		ctx,
 		applicationapps.ParticipantOwner(actor),
 		actor,
-		directchat.AppID,
+		directchat.AppID, uuid.NewString(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -628,14 +629,14 @@ func TestDirectChatAuthorizerUninstallReinstallDoesNotReviveStaleInstallation(t 
 	}
 	actor := participant.Human(registration.HumanID)
 	owner := applicationapps.ParticipantOwner(actor)
-	oldInstallation, err := appStore.Install(ctx, owner, actor, "direct-chat")
+	oldInstallation, err := appStore.InstallAtOperation(ctx, owner, actor, "direct-chat", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := appStore.UninstallByID(ctx, oldInstallation.InstallationID, actor); err != nil {
 		t.Fatal(err)
 	}
-	newInstallation, err := appStore.Install(ctx, owner, actor, "direct-chat")
+	newInstallation, err := appStore.InstallAtOperation(ctx, owner, actor, "direct-chat", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
