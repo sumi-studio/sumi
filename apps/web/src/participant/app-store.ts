@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { secureRandomUUID } from "../lib/random-uuid";
 import {
   WorkspaceAPIError,
   WorkspaceAPIUncertainError,
@@ -13,7 +14,6 @@ import type {
   ParticipantRef,
 } from "../workspace/model";
 import { appOwnerKey, isOwnedBy } from "../workspace/model";
-import { secureRandomUUID } from "../lib/random-uuid";
 
 export type ParticipantAppStatus = "idle" | "loading" | "ready" | "error";
 export type ParticipantAppCoordination = "web-locks" | "document-only";

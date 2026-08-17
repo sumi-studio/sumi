@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { secureRandomUUID } from "../lib/random-uuid";
 import {
   WorkspaceAPIError,
   WorkspaceApiClient,
@@ -25,7 +26,6 @@ import {
   participantKey,
   WORKSPACE_PERMISSIONS,
 } from "./model";
-import { secureRandomUUID } from "../lib/random-uuid";
 
 export type WorkspaceListStatus = "idle" | "loading" | "ready" | "error";
 const INVITE_AUTHORITY_CONTRADICTION =
