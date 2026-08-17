@@ -15,6 +15,7 @@ vi.mock("./call-api", async () => {
 });
 
 const PLACE: PlaceKey = "dm:dm-1";
+const OTHER_PLACE: PlaceKey = "dm:dm-2";
 const ticket = {
   url: "wss://livekit.example.test",
   token: "signed-token",
@@ -22,7 +23,11 @@ const ticket = {
   identity: "human:h-1",
 };
 
-function transport(): CallTransport {
+function transport(): CallTransport & {
+  setMicrophoneEnabled: ReturnType<typeof vi.fn>;
+  setCameraEnabled: ReturnType<typeof vi.fn>;
+  setScreenShareEnabled: ReturnType<typeof vi.fn>;
+} {
   return {
     connect: vi.fn().mockResolvedValue(undefined),
     setMicrophoneEnabled: vi.fn().mockResolvedValue(undefined),
@@ -31,6 +36,35 @@ function transport(): CallTransport {
     resumeAudio: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
   };
+}
+
+const mediaToggles = [
+  {
+    name: "microphone",
+    localKey: "micEnabled" as const,
+    transportMethod: "setMicrophoneEnabled" as const,
+    toggle: () => useCall.getState().toggleMicrophone(),
+  },
+  {
+    name: "camera",
+    localKey: "cameraEnabled" as const,
+    transportMethod: "setCameraEnabled" as const,
+    toggle: () => useCall.getState().toggleCamera(),
+  },
+  {
+    name: "screen share",
+    localKey: "screenShareEnabled" as const,
+    transportMethod: "setScreenShareEnabled" as const,
+    toggle: () => useCall.getState().toggleScreenShare(),
+  },
+];
+
+function deferred() {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((_resolve, rejectPromise) => {
+    reject = rejectPromise;
+  });
+  return { promise, reject };
 }
 
 function mediaPermission(result: "allowed" | "denied" = "allowed") {
@@ -58,6 +92,83 @@ beforeEach(() => {
     value: true,
   });
   mediaPermission();
+});
+
+describe("optimistic media toggles", () => {
+  it.each(mediaToggles)(
+    "does not roll back $name after leaving the call",
+    async ({ localKey, transportMethod, toggle }) => {
+      const created = transport();
+      const pending = deferred();
+      created[transportMethod].mockReturnValueOnce(pending.promise);
+      installCallTransportFactory(() => created);
+      await useCall.getState().join(PLACE);
+
+      toggle();
+      await useCall.getState().leave();
+      const listener = vi.fn();
+      const unsubscribe = useCall.subscribe(listener);
+
+      pending.reject(new Error("media unavailable"));
+      await pending.promise.catch(() => undefined);
+      await Promise.resolve();
+
+      expect(useCall.getState().local[localKey]).toBe(
+        localKey === "micEnabled",
+      );
+      expect(listener).not.toHaveBeenCalled();
+      unsubscribe();
+    },
+  );
+
+  it.each(mediaToggles)(
+    "does not roll back $name in a later call",
+    async ({ localKey, transportMethod, toggle }) => {
+      const first = transport();
+      const second = transport();
+      const pending = deferred();
+      first[transportMethod].mockReturnValueOnce(pending.promise);
+      installCallTransportFactory(
+        vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second),
+      );
+      await useCall.getState().join(PLACE);
+
+      toggle();
+      await useCall.getState().join(OTHER_PLACE);
+      toggle();
+      expect(useCall.getState().local[localKey]).toBe(
+        localKey !== "micEnabled",
+      );
+
+      pending.reject(new Error("media unavailable"));
+      await pending.promise.catch(() => undefined);
+      await Promise.resolve();
+
+      expect(useCall.getState().local[localKey]).toBe(
+        localKey !== "micEnabled",
+      );
+    },
+  );
+
+  it.each(mediaToggles)(
+    "rolls back $name in the same call",
+    async ({ localKey, transportMethod, toggle }) => {
+      const created = transport();
+      const pending = deferred();
+      created[transportMethod].mockReturnValueOnce(pending.promise);
+      installCallTransportFactory(() => created);
+      await useCall.getState().join(PLACE);
+
+      toggle();
+      pending.reject(new Error("media unavailable"));
+      await pending.promise.catch(() => undefined);
+      await Promise.resolve();
+
+      expect(useCall.getState().local[localKey]).toBe(
+        localKey === "micEnabled",
+      );
+    },
+  );
 });
 
 describe("call degradation", () => {
