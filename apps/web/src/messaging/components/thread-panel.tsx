@@ -1,5 +1,5 @@
 import { MessagesSquare, Plus, X } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { PlaceKey } from "../model";
 import { placeKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -16,16 +16,26 @@ export function ThreadPanel({
   const createThread = useMessaging((state) => state.createThread);
   const navigate = usePlaceNavigate();
   const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
   const threads = Object.values(threadsById)
     .filter((thread) => placeKey(thread.parentPlace) === parentKey)
     .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
   const submit = async () => {
+    if (creatingRef.current) return;
     const trimmed = name.trim();
     if (!trimmed) return;
-    const key = await createThread(parentKey, trimmed, null);
-    setName("");
-    navigate(key);
-    onClose();
+    creatingRef.current = true;
+    setCreating(true);
+    try {
+      const key = await createThread(parentKey, trimmed, null);
+      setName("");
+      navigate(key);
+      onClose();
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
+    }
   };
   return (
     <aside className="flex w-72 shrink-0 flex-col border-border/70 border-l bg-muted/20">
@@ -48,12 +58,14 @@ export function ThreadPanel({
           value={name}
           onChange={(event) => setName(event.target.value)}
           placeholder="スレッド名"
+          disabled={creating}
         />
         <button
           type="button"
           aria-label="スレッドを作成"
           className="rounded border px-2"
           onClick={() => void submit()}
+          disabled={creating}
         >
           <Plus className="size-4" />
         </button>

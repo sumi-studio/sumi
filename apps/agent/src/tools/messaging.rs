@@ -581,7 +581,9 @@ fn messaging_parameters_schema() -> Value {
             "or reply_to; open_attachment requires one attachment_id already visible in the ",
             "open page; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
-            "one of message_id or seq and may include note or remind_in_minutes; status requires ",
+            "one of message_id or seq and may include note or remind_in_minutes; create_thread ",
+            "may include exactly one of message_id or seq to use a visible message as its origin; ",
+            "status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
             "marker_id; get_call_state may include place_id. Write, react and reply_later act ",
             "on the place most recently opened in this tool view; status and get_call_state ",
@@ -658,17 +660,20 @@ fn messaging_parameters_schema() -> Value {
             "message_id": {
                 "type": "string",
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "message_id. Provide exactly one of message_id or seq; the message must be ",
-                    "visible in the currently open place."
+                    "For react, reply_later, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by message_id. React and reply_later ",
+                    "require exactly one of message_id or seq; create_thread may omit both or use ",
+                    "exactly one. The message must be visible in the currently open place."
                 )
             },
             "seq": {
                 "type": "integer",
                 "minimum": 1,
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "its seq in the currently open place. Provide exactly one of message_id or seq."
+                    "For react, reply_later, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by its seq in the currently open ",
+                    "place. React and reply_later require exactly one of message_id or seq; ",
+                    "create_thread may omit both or use exactly one."
                 )
             },
             "emoji": {
@@ -3898,6 +3903,15 @@ mod tests {
         assert_eq!(schema["properties"]["seq"]["minimum"], 1);
         assert_eq!(schema["properties"]["emoji"]["type"], "string");
         assert_eq!(schema["properties"]["message_id"]["type"], "string");
+        for field in ["message_id", "seq"] {
+            assert!(
+                schema["properties"][field]["description"]
+                    .as_str()
+                    .expect("field description")
+                    .contains("create_thread"),
+                "{field} must advertise create_thread origin support"
+            );
+        }
         assert_eq!(
             schema["properties"]["status"]["enum"],
             json!(["available", "busy", "away"])
