@@ -178,7 +178,7 @@ func TestPollHTTPCreateAndVoteReturnWholeMessage(t *testing.T) {
 			"question": "bad\x00question", "options": []string{"A", "B"},
 		},
 	})
-	if resp.StatusCode != http.StatusBadRequest || body["code"] != "invalid_poll" {
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_poll" {
 		t.Fatalf("NUL poll status %d body %v", resp.StatusCode, body)
 	}
 }
