@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -487,6 +488,9 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		err = s.Spawner.EnsureRunning(spawnContext, claims.PersonalityAgentID)
 		cancelSpawn()
 		if err != nil {
+			// The browser only sees 503; the operator needs the cause (the
+			// provisioner's diagnostic is already secret-redacted).
+			log.Printf("direct chat lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
 			http.Error(w, "agent runtime unavailable", http.StatusServiceUnavailable)
 			return
 		}
