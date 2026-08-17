@@ -1445,6 +1445,11 @@ func (g *DurableGateway) state(ctx context.Context, personalityAgentID string) (
 	if state.Generation > maxProcessGeneration {
 		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
 	}
+	if state.LocalControl != nil {
+		if err := validateLocalControlStateVersion(state.LocalControl); err != nil {
+			return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)
+		}
+	}
 	needsResign, err := g.verifyLocalControlRuntimeStateIntegrity(state)
 	if err != nil {
 		return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)

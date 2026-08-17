@@ -103,6 +103,37 @@ func (w world) send(t *testing.T, ctx context.Context, placeID string, author Pa
 	return msg
 }
 
+func TestDeletedMessageReplayUsesRequestDigest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	sender := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	request := AppendInput{
+		PlaceID:     channel.PlaceID,
+		Content:     "original",
+		Urgency:     UrgencyUrgent,
+		ClientNonce: "deleted-replay",
+	}
+	created, fresh, err := sender.AppendMessage(ctx, request)
+	if err != nil || !fresh {
+		t.Fatalf("create message: created=%t err=%v", fresh, err)
+	}
+	if _, err := sender.DeleteMessage(ctx, channel.PlaceID, created.MessageID); err != nil {
+		t.Fatal(err)
+	}
+
+	replayed, fresh, err := sender.AppendMessage(ctx, request)
+	if err != nil || fresh || replayed.MessageID != created.MessageID || !replayed.Deleted {
+		t.Fatalf("exact deleted replay: message=%+v created=%t err=%v", replayed, fresh, err)
+	}
+	changed := request
+	changed.Content = "changed"
+	if _, _, err := sender.AppendMessage(ctx, changed); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed deleted replay: got %v, want ErrIdempotencyConflict", err)
+	}
+}
+
 func TestMemberProfilesQualifyCanonicalSumiByStableHuman(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

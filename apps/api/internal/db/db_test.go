@@ -143,8 +143,16 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 			len(exactContent), len(overContent), len(exactNonce), len(overNonce))
 	}
 
+	requestDigestRequired := false
 	insertMessage := func(messageID string, seq int, content, nonce string) error {
 		t.Helper()
+		if requestDigestRequired {
+			_, err := pool.Exec(ctx, `INSERT INTO messages
+				(message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+				VALUES ($1, $2, $3, $4, 'human', $5, $6, $7, decode(repeat('ab', 32), 'hex'))`,
+				messageID, workspaceID, placeID, seq, authorID, content, nonce)
+			return err
+		}
 		_, err := pool.Exec(ctx, `INSERT INTO messages
 			(message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
 			VALUES ($1, $2, $3, $4, 'human', $5, $6, $7)`,
@@ -186,6 +194,7 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("apply byte-constraint migration: %v", err)
 	}
+	requestDigestRequired = true
 
 	if err := insertMessage(
 		"0198f0f4-9b72-7000-8000-000000000105", 2, exactContent, "content-exact",
@@ -1485,6 +1494,15 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 			t.Fatalf("%s: %v", step.name, err)
 		}
 	}
+	var nullable string
+	if err := pool.QueryRow(ctx, `
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_name='messages' AND column_name='request_digest'`).Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != "NO" {
+		t.Fatalf("request_digest nullable = %q, want NO", nullable)
+	}
 	// After down the attachment tables and the messages column are gone; after
 	// re-up they exist again with the same shape.
 	var tables int
@@ -1548,8 +1566,8 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	}
 	for _, m := range [][3]string{{messageA, wsA, placeA}, {messageB, wsB, placeB}} {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
-			VALUES ($1, $2, $3, 1, 'human', $4, 'hello', 'n')`, m[0], m[1], m[2], humanID); err != nil {
+			INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+			VALUES ($1, $2, $3, 1, 'human', $4, 'hello', 'n', decode(repeat('ab', 32), 'hex'))`, m[0], m[1], m[2], humanID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1596,8 +1614,8 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	// Empty content requires a bound attachment at commit; a message that
 	// binds one in the same transaction is fine.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
-		VALUES ('0198f0f4-9b72-7000-8000-00000000040d', $1, $2, 2, 'human', $3, '', 'empty')`, wsA, placeA, humanID); err == nil {
+		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+		VALUES ('0198f0f4-9b72-7000-8000-00000000040d', $1, $2, 2, 'human', $3, '', 'empty', decode(repeat('ab', 32), 'hex'))`, wsA, placeA, humanID); err == nil {
 		t.Fatal("empty message without attachments accepted")
 	}
 	tx, err := pool.Begin(ctx)
@@ -1605,8 +1623,8 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
-		VALUES ('0198f0f4-9b72-7000-8000-00000000040e', $1, $2, 3, 'human', $3, '', 'empty-ok')`, wsA, placeA, humanID); err != nil {
+		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+		VALUES ('0198f0f4-9b72-7000-8000-00000000040e', $1, $2, 3, 'human', $3, '', 'empty-ok', decode(repeat('ab', 32), 'hex'))`, wsA, placeA, humanID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `

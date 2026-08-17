@@ -142,8 +142,8 @@ CREATE INDEX message_attachment_uploads_settled
 -- replay so a changed request under the same nonce is a conflict, never a
 -- silent replay of the first message.
 ALTER TABLE messages
-    ADD COLUMN request_digest bytea
-        CHECK (request_digest IS NULL OR octet_length(request_digest) = 32);
+    ADD COLUMN request_digest bytea NOT NULL
+        CHECK (octet_length(request_digest) = 32);
 
 -- Empty text is valid only when at least one attachment binds in the same
 -- transaction. The trigger is deferred so the message insert can precede its

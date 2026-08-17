@@ -53,27 +53,9 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 // requestMatchesReplay compares the incoming request against the durable
 // receipt of the message that already owns its nonce. A changed request under
 // the same nonce is a conflict, never a silent replay of the first message.
-func requestMatchesReplay(in AppendInput, existing Message, storedDigest []byte) bool {
+func requestMatchesReplay(in AppendInput, storedDigest []byte) bool {
 	incoming := messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs)
-	if storedDigest != nil {
-		return bytes.Equal(incoming, storedDigest)
-	}
-	// Rows written before request digests existed compare structurally.
-	if existing.Deleted {
-		return len(in.AttachmentIDs) == 0
-	}
-	if existing.Content != in.Content || existing.Urgency != in.Urgency || existing.ReplyTo != in.ReplyTo {
-		return false
-	}
-	if len(existing.Attachments) != len(in.AttachmentIDs) {
-		return false
-	}
-	for i, att := range existing.Attachments {
-		if att.AttachmentID != in.AttachmentIDs[i] {
-			return false
-		}
-	}
-	return true
+	return bytes.Equal(incoming, storedDigest)
 }
 
 func (s *ScopedStore) authorizedMessageByNonce(ctx context.Context, in AppendInput) (Message, bool, error) {
@@ -100,7 +82,7 @@ func (s *ScopedStore) authorizedMessageByNonce(ctx context.Context, in AppendInp
 	if found && message.Seq < access.VisibleFromSeq {
 		return Message{}, false, ErrMessageNotFound
 	}
-	if found && !requestMatchesReplay(in, message, digest) {
+	if found && !requestMatchesReplay(in, digest) {
 		return Message{}, false, ErrIdempotencyConflict
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -132,7 +114,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		if existing.Seq < access.VisibleFromSeq {
 			return Message{}, false, ErrMessageNotFound
 		}
-		if !requestMatchesReplay(in, existing, digest) {
+		if !requestMatchesReplay(in, digest) {
 			return Message{}, false, ErrIdempotencyConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
