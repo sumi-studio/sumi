@@ -2,7 +2,6 @@ package apps
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -412,30 +411,63 @@ func (s *Store) InstallAtOperationInTx(
 }
 
 // InstallDirectChatForNewHumanInTx installs the Human's initial Direct Chat
-// binding. The operation identity is deterministic per Human so a retry of a
-// provisioning transaction retains the durable app-install outcome.
+// binding. The UUIDv5 operation identity is deterministic within one install
+// attempt, while the durable receipt history assigns a new sequence after an
+// uninstall. A retry therefore reuses its receipt and a later install does not.
 func (s *Store) InstallDirectChatForNewHumanInTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	humanID string,
 ) (Installation, error) {
 	actor := participant.Human(humanID)
-	return s.InstallAtOperationInTx(
-		ctx,
-		tx,
-		ParticipantOwner(actor),
-		actor,
-		directchat.AppID,
-		directChatProvisionOperationID(humanID),
-	)
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, directchat.AppID)
+	if err != nil {
+		return Installation{}, err
+	}
+	defer releaseLifecycle()
+	operationID, err := directChatProvisionOperationIDForActiveOrNextAttempt(ctx, tx, humanID)
+	if err != nil {
+		return Installation{}, err
+	}
+	if err := ValidateInstallOperationID(operationID); err != nil {
+		return Installation{}, err
+	}
+	return s.installAtOperationInTx(ctx, tx, ParticipantOwner(actor), actor, directchat.AppID, operationID)
 }
 
-func directChatProvisionOperationID(humanID string) string {
-	digest := sha256.Sum256([]byte("sumi:direct-chat-provision:v1:" + humanID))
-	hex := fmt.Sprintf("%x", digest[:])
-	// The receipts table intentionally accepts UUIDv4 operation identities.
-	// Preserve that contract while deriving a stable identity from the Human.
-	return hex[:8] + "-" + hex[8:12] + "-4" + hex[13:16] + "-8" + hex[17:20] + "-" + hex[20:32]
+func directChatProvisionOperationIDForActiveOrNextAttempt(ctx context.Context, tx pgx.Tx, humanID string) (string, error) {
+	var operationID string
+	err := tx.QueryRow(ctx, `
+		SELECT receipt.operation_id::text
+		FROM app_installations AS installation
+		JOIN app_install_operation_receipts AS receipt
+		  ON receipt.owner_kind = installation.owner_kind
+		 AND receipt.owner_id = installation.owner_id
+		 AND receipt.app_id = installation.app_id
+		 AND receipt.installation_id = installation.installation_id
+		WHERE installation.owner_kind = 'human'
+		  AND installation.owner_id = $1
+		  AND installation.app_id = $2`, humanID, directchat.AppID).Scan(&operationID)
+	if err == nil {
+		return operationID, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("read current direct-chat install operation: %w", err)
+	}
+
+	var completedAttempts int64
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM app_install_operation_receipts
+		WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = $2`,
+		humanID, directchat.AppID,
+	).Scan(&completedAttempts); err != nil {
+		return "", fmt.Errorf("count direct-chat install attempts: %w", err)
+	}
+	return uuid.NewSHA1(
+		uuid.NameSpaceURL,
+		[]byte(fmt.Sprintf("sumi:direct-chat-provision:v2:%s:%d", humanID, completedAttempts+1)),
+	).String(), nil
 }
 
 func (s *Store) install(ctx context.Context, owner OwnerRef, actor participant.Ref, appID, operationID string) (Installation, error) {

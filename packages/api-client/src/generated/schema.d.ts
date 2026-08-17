@@ -468,8 +468,18 @@ export interface components {
     schemas: {
         /** Format: uuid */
         UUIDv7: string;
-        /** Format: uuid */
+        /**
+         * Format: uuid
+         * @description Random, client-chosen canonical RFC 4122 UUIDv4.
+         */
         UUIDv4: string;
+        /**
+         * Format: uuid
+         * @description Deterministic, server-derived canonical RFC 4122 UUIDv5. It is not accepted from client install request boundaries.
+         */
+        UUIDv5: string;
+        /** @description Durable install identity. Client requests use UUIDv4; trusted server provisioning may use a declared UUIDv5 derivation. */
+        InstallOperationID: components["schemas"]["UUIDv4"] | components["schemas"]["UUIDv5"];
         APIError: {
             /** @enum {string} */
             error: "invalid_request" | "invalid_session" | "missing_session" | "duplicate_session_cookies" | "origin_not_allowed" | "forbidden" | "owner_protected" | "membership_not_active" | "last_administrator" | "not_found" | "conflict" | "install_intent_already_installed" | "idempotency_conflict" | "stale_authority" | "unavailable" | "internal_error";
@@ -620,7 +630,7 @@ export interface components {
             app_id: components["schemas"]["AppId"];
             operation_id: components["schemas"]["UUIDv4"];
         };
-        /** @description Strict owner-discriminated install intent with a durable UUIDv4 operation identity. */
+        /** @description Strict owner-discriminated install intent with a durable client-chosen UUIDv4 operation identity. Trusted server provisioning may use the documented UUIDv5 derived form internally. */
         AppInstallRequest: components["schemas"]["WorkspaceAppInstallRequest"] | components["schemas"]["ParticipantAppInstallRequest"];
         AppDescriptor: {
             app_id: components["schemas"]["AppId"];

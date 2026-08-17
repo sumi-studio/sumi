@@ -81,9 +81,22 @@ var (
 	ErrAppDisabled                   = errors.New("app installation is disabled")
 )
 
-// ValidateInstallOperationID accepts only the canonical UUIDv4 emitted by the
-// browser's durable lifecycle journal.
+// ValidateInstallOperationID accepts canonical RFC 4122 UUIDv4 client intents
+// and UUIDv5 server-derived lifecycle identities. UUIDv5 makes deterministic
+// provisioning operations explicit instead of presenting them as random.
 func ValidateInstallOperationID(value string) error {
+	id, err := uuid.Parse(value)
+	if err != nil || id.String() != value || id.Variant() != uuid.RFC4122 ||
+		(id.Version() != 4 && id.Version() != 5) {
+		return ErrInstallOperationInvalid
+	}
+	return nil
+}
+
+// ValidateClientInstallOperationID accepts only the random canonical UUIDv4
+// that a browser or local runtime may choose for an install intent. Server
+// derived UUIDv5 identities are never accepted from those request boundaries.
+func ValidateClientInstallOperationID(value string) error {
 	id, err := uuid.Parse(value)
 	if err != nil || id.String() != value || id.Version() != 4 || id.Variant() != uuid.RFC4122 {
 		return ErrInstallOperationInvalid

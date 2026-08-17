@@ -63,7 +63,7 @@ func (s *Server) serveInstallApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operationID, operationPresent, operationValid := optionalNonEmptyString(request.OperationID)
-	if !operationPresent || !operationValid || applicationapps.ValidateInstallOperationID(operationID) != nil {
+	if !operationPresent || !operationValid || applicationapps.ValidateClientInstallOperationID(operationID) != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
