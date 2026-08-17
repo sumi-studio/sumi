@@ -3,6 +3,9 @@ package agentevents
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +80,93 @@ func TestLocalControlRuntimeUpdateFlockHonorsCancellation(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("canceled local-control lock wait returned too slowly: %v", elapsed)
+	}
+}
+
+func TestLocalControlRejectsV1StateAndPersistsRetiredThrough(t *testing.T) {
+	runtimeDir := privateRuntimeDir(t)
+	_, gateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		7,
+		"boot-a",
+	)
+	control, _ := newLocalControlHTTPServer(t, gateway, authorization)
+	if _, err := control.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	path := gateway.statePath(localControlTestPAID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"retired_through":0`)) {
+		t.Fatalf("v2 state omitted retired_through: %s", raw)
+	}
+	state, err := gateway.state(context.Background(), localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the exact pre-compaction local-control shape: version 1 had no
+	// retired_through field, and its integrity MAC covered that omission.
+	type v1LocalControlState struct {
+		Version            uint8                             `json:"version"`
+		RPCBootNonce       string                            `json:"rpc_boot_nonce"`
+		Revision           uint64                            `json:"revision"`
+		State              LocalRuntimePublicationState      `json:"state"`
+		Reason             LocalRuntimePublicationReason     `json:"reason"`
+		Publications       map[string]localPublicationRecord `json:"publications"`
+		CredentialRequests map[string]localCredentialRecord  `json:"credential_requests"`
+		Integrity          *localControlStateIntegrity       `json:"integrity,omitempty"`
+	}
+	type v1RuntimeState struct {
+		Generation               uint64               `json:"generation"`
+		HydrationReceiptIdentity *string              `json:"hydration_receipt_identity"`
+		LocalControl             *v1LocalControlState `json:"local_control,omitempty"`
+	}
+	v1 := v1RuntimeState{
+		Generation:               state.Generation,
+		HydrationReceiptIdentity: state.HydrationReceiptIdentity,
+		LocalControl: &v1LocalControlState{
+			Version:            1,
+			RPCBootNonce:       state.LocalControl.RPCBootNonce,
+			Revision:           state.LocalControl.Revision,
+			State:              state.LocalControl.State,
+			Reason:             state.LocalControl.Reason,
+			Publications:       state.LocalControl.Publications,
+			CredentialRequests: state.LocalControl.CredentialRequests,
+		},
+	}
+	unsigned, err := json.Marshal(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := deriveLocalControlIntegrityKey(localControlTestSigningSecret)
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("sumi-local-control-runtime-state/v1"))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(unsigned)
+	v1.LocalControl.Integrity = &localControlStateIntegrity{
+		Version: localControlIntegrityVersion,
+		KeyID:   deriveLocalControlIntegrityKeyID(key),
+		MAC:     hex.EncodeToString(mac.Sum(nil)),
+	}
+	raw, err = json.Marshal(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.state(context.Background(), localControlTestPAID); err == nil ||
+		!strings.Contains(err.Error(), "unsupported local control state version 1; delete the state file to reset it") {
+		t.Fatalf("v1 state error = %v, want reset instruction", err)
 	}
 }
 

@@ -33,7 +33,7 @@ const (
 	maxLocalControlBodyBytes             int64 = 32 * 1024
 	maxLocalControlDurableStateBytes           = 8 * 1024 * 1024
 	maxLocalControlRecords                     = 1024
-	localControlStateVersion                   = 1
+	localControlStateVersion                   = 2
 	localControlIntegrityVersion               = 1
 	maxLocalControlPreviousIntegrityKeys       = 2
 	maxOpaqueRuntimeIDBytes                    = 128
@@ -133,9 +133,8 @@ type localControlDurableState struct {
 	// RetiredThrough is the highest revision whose publication record has been
 	// compacted away at an epoch boundary. The retained history therefore
 	// covers revisions RetiredThrough+1..Revision and still has to be a
-	// gap-free chain. Absent (0) in states written before compaction existed,
-	// which is exactly "nothing retired yet" — so their MAC still verifies.
-	RetiredThrough     uint64                            `json:"retired_through,omitempty"`
+	// gap-free chain.
+	RetiredThrough     uint64                            `json:"retired_through"`
 	State              LocalRuntimePublicationState      `json:"state"`
 	Reason             LocalRuntimePublicationReason     `json:"reason"`
 	Publications       map[string]localPublicationRecord `json:"publications"`
@@ -1299,8 +1298,8 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 	if control == nil {
 		return nil
 	}
-	if control.Version != localControlStateVersion {
-		return fmt.Errorf("unsupported local control state version %d", control.Version)
+	if err := validateLocalControlStateVersion(control); err != nil {
+		return err
 	}
 	if err := validateOpaqueRuntimeID(control.RPCBootNonce, "RPC boot nonce"); err != nil {
 		return err
@@ -1448,6 +1447,16 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 		if err := validateCredentialIssueRequest(record.Request); err != nil {
 			return fmt.Errorf("invalid durable credential request record: %w", err)
 		}
+	}
+	return nil
+}
+
+func validateLocalControlStateVersion(control *localControlDurableState) error {
+	if control.Version != localControlStateVersion {
+		return fmt.Errorf(
+			"unsupported local control state version %d; delete the state file to reset it",
+			control.Version,
+		)
 	}
 	return nil
 }
