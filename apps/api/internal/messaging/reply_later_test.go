@@ -104,6 +104,60 @@ func TestReplyLaterRefusesInvisiblePlacesAndTombstones(t *testing.T) {
 	}
 }
 
+func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "あとで返信", "")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "この枝をあとで見ます")
+
+	viewer := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
+	if _, err := viewer.ThreadFor(ctx, thread.Place.PlaceID); err != nil {
+		t.Fatalf("open thread as workspace member: %v", err)
+	}
+	if threads, err := viewer.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("opened thread made viewer a participant: threads=%+v err=%v", threads, err)
+	}
+
+	path := "/messaging/places/" + thread.Place.PlaceID + "/messages/" + message.MessageID + "/reply-later"
+	resp, body := call(t, ts, http.MethodPost, path, w.humanB.ID, map[string]any{
+		"remind_at": time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339Nano),
+	})
+	if resp.StatusCode != http.StatusCreated || body["created"] != true {
+		t.Fatalf("create thread reply-later: status %d body %v", resp.StatusCode, body)
+	}
+	markerID := body["marker"].(map[string]any)["marker_id"]
+
+	resp, body = call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanB.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bootstrap after thread reply-later: status %d body %v", resp.StatusCode, body)
+	}
+	markers := body["reply_later_markers"].([]any)
+	if len(markers) != 1 || markers[0].(map[string]any)["marker_id"] != markerID {
+		t.Fatalf("bootstrap markers = %v, want durable thread marker %v", markers, markerID)
+	}
+	place := markers[0].(map[string]any)["place"].(map[string]any)
+	if place["thread_id"] != thread.Place.PlaceID {
+		t.Fatalf("bootstrap marker place = %v, want thread %s", place, thread.Place.PlaceID)
+	}
+
+	for _, raw := range body["unread_summaries"].([]any) {
+		summary := raw.(map[string]any)
+		if summary["place"].(map[string]any)["thread_id"] == thread.Place.PlaceID {
+			if summary["unread_count"] != float64(1) || summary["mention_count"] != float64(0) {
+				t.Fatalf("thread unread summary = %v", summary)
+			}
+			return
+		}
+	}
+	t.Fatalf("bootstrap unread summaries omitted visible thread: %v", body["unread_summaries"])
+}
+
 func TestReplyLaterRemindAtNeverLeavesTheOwnersWire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

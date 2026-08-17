@@ -338,9 +338,9 @@ func (s *ScopedStore) ReplyLaterMarkersFor(ctx context.Context) ([]ReplyLaterMar
 		WITH visible_places AS (
 			SELECT p.place_id, p.kind FROM places p
 			LEFT JOIN place_members pm ON pm.workspace_id = p.workspace_id
-			 AND pm.place_id = p.place_id AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
+				 AND pm.place_id = p.place_id AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			 AND (p.kind = 'channel' OR (p.kind IN ('dm','group_dm','thread') AND pm.place_member_id IS NOT NULL))
+				 AND (p.kind IN ('channel', 'thread') OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT rl.marker_id, rl.member_kind, rl.member_id, rl.place_id, vp.kind,
 		       rl.message_id, rl.note, rl.remind_at

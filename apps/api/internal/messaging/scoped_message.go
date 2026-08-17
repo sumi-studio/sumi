@@ -622,7 +622,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 			  ON pm.workspace_id = p.workspace_id AND pm.place_id = p.place_id
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			  AND (p.kind = 'channel' OR (p.kind IN ('dm', 'group_dm', 'thread') AND pm.place_member_id IS NOT NULL))
+			  AND (p.kind IN ('channel', 'thread') OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.name, vp.topic,
 		       vp.visibility, vp.last_seq, vp.voice, COALESCE(rm.last_read_seq, 0),
