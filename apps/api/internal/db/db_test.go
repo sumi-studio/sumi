@@ -1140,6 +1140,14 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 	}
 	up := readMigration("0024_message_search.up.sql")
 	down := readMigration("0024_message_search.down.sql")
+	execStatements := func(label, sql string) {
+		t.Helper()
+		for _, stmt := range splitSQLStatements(sql) {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("%s: %v", label, err)
+			}
+		}
+	}
 	assertIndex := func(want bool) {
 		t.Helper()
 		var exists bool
@@ -1152,17 +1160,13 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 			t.Fatalf("messages_content_trgm exists=%v, want %v", exists, want)
 		}
 	}
-	if _, err := pool.Exec(ctx, up); err != nil {
-		t.Fatalf("upgrade: %v", err)
-	}
+	execStatements("upgrade", up)
 	assertIndex(true)
-	if _, err := pool.Exec(ctx, down); err != nil {
-		t.Fatalf("downgrade: %v", err)
-	}
+	execStatements("retry upgrade", up)
+	assertIndex(true)
+	execStatements("downgrade", down)
 	assertIndex(false)
-	if _, err := pool.Exec(ctx, up); err != nil {
-		t.Fatalf("re-upgrade: %v", err)
-	}
+	execStatements("re-upgrade", up)
 	assertIndex(true)
 }
 
@@ -1256,71 +1260,6 @@ func TestVoiceChannelMigrationRoundTrip(t *testing.T) {
 		t.Fatalf("re-upgrade: %v", err)
 	}
 	assertUp("re-upgrade")
-}
-
-func TestMessageSearchConcurrentIndexMigration(t *testing.T) {
-	pool := testdb.Create(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	applyMigrationsThrough(t, ctx, pool, 26)
-
-	var exists, valid bool
-	if err := pool.QueryRow(ctx, `
-		SELECT c.oid IS NOT NULL, COALESCE(i.indisvalid, false)
-		FROM (SELECT 1) AS singleton
-		LEFT JOIN pg_class c ON c.oid = to_regclass('public.messages_content_trgm')
-		LEFT JOIN pg_index i ON i.indexrelid = c.oid
-	`).Scan(&exists, &valid); err != nil {
-		t.Fatal(err)
-	}
-	if !exists || !valid {
-		t.Fatalf("messages_content_trgm exists=%v valid=%v, want a valid index", exists, valid)
-	}
-
-	// Rollback composes with 0024: 0026's down leaves the index 0024 owns in
-	// place (valid), 0024's down then removes it, and 0026's up rebuilds it.
-	readMigration := func(name string) string {
-		t.Helper()
-		content, err := migrationFS.ReadFile("migrations/" + name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		return string(content)
-	}
-	execStatements := func(label, sql string) {
-		t.Helper()
-		for _, stmt := range splitSQLStatements(sql) {
-			if _, err := pool.Exec(ctx, stmt); err != nil {
-				t.Fatalf("%s: %v", label, err)
-			}
-		}
-	}
-	indexState := func() (bool, bool) {
-		t.Helper()
-		var exists, valid bool
-		if err := pool.QueryRow(ctx, `
-			SELECT c.oid IS NOT NULL, COALESCE(i.indisvalid, false)
-			FROM (SELECT 1) AS singleton
-			LEFT JOIN pg_class c ON c.oid = to_regclass('public.messages_content_trgm')
-			LEFT JOIN pg_index i ON i.indexrelid = c.oid
-		`).Scan(&exists, &valid); err != nil {
-			t.Fatal(err)
-		}
-		return exists, valid
-	}
-	execStatements("0026 down", readMigration("0026_message_search_concurrent_index.down.sql"))
-	if exists, valid := indexState(); !exists || !valid {
-		t.Fatalf("after 0026 down: exists=%v valid=%v, want the 0024 index still present and valid", exists, valid)
-	}
-	execStatements("0024 down", readMigration("0024_message_search.down.sql"))
-	if exists, _ := indexState(); exists {
-		t.Fatalf("after 0024 down: index still exists")
-	}
-	execStatements("0026 up", readMigration("0026_message_search_concurrent_index.up.sql"))
-	if exists, valid := indexState(); !exists || !valid {
-		t.Fatalf("after 0026 re-up: exists=%v valid=%v, want a valid index", exists, valid)
-	}
 }
 
 func TestSplitSQLStatements(t *testing.T) {
