@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -28,6 +29,7 @@ const migrationsDir = "migrations"
 const migrationAdvisoryLockID = int64(0x534d4944) // "SMID"
 
 var upMigrationRe = regexp.MustCompile(`^(\d+)_[^/]+\.up\.sql$`)
+var noTransactionMigrationRe = regexp.MustCompile(`(?m)^-- \+no-transaction\s*$`)
 
 // ErrPreCutoverResetRequired marks the one intentional destructive migration
 // boundary. Version 0008 was replaced before dogfooding data became durable;
@@ -56,9 +58,10 @@ type migrationDB interface {
 }
 
 type pendingMigration struct {
-	version int
-	name    string
-	content string
+	version       int
+	name          string
+	content       string
+	noTransaction bool
 }
 
 // Migrate applies every embedded up-migration that has not yet been recorded in
@@ -199,6 +202,15 @@ func pendingMigrations(ctx context.Context, db migrationDB) ([]pendingMigration,
 }
 
 func applyMigration(ctx context.Context, db migrationDB, m pendingMigration) error {
+	if m.noTransaction {
+		for _, statement := range splitSQLStatements(m.content) {
+			if _, err := db.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("apply non-transactional migration %d (%s): %w", m.version, m.name, err)
+			}
+		}
+		return recordMigration(ctx, db, m)
+	}
+
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin migration %d: %w", m.version, err)
@@ -207,13 +219,22 @@ func applyMigration(ctx context.Context, db migrationDB, m pendingMigration) err
 	if _, err := tx.Exec(ctx, m.content); err != nil {
 		return fmt.Errorf("apply migration %d (%s): %w", m.version, m.name, err)
 	}
-	if _, err := tx.Exec(ctx,
-		"INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)",
-		m.version, migrationChecksum(m.content)); err != nil {
-		return fmt.Errorf("record migration %d: %w", m.version, err)
+	if err := recordMigration(ctx, tx, m); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit migration %d: %w", m.version, err)
+	}
+	return nil
+}
+
+func recordMigration(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, m pendingMigration) error {
+	if _, err := db.Exec(ctx,
+		"INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)",
+		m.version, migrationChecksum(m.content)); err != nil {
+		return fmt.Errorf("record migration %d: %w", m.version, err)
 	}
 	return nil
 }
@@ -247,10 +268,172 @@ func embeddedUpMigrations() ([]pendingMigration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read embedded migration %s: %w", entry.Name(), err)
 		}
-		out = append(out, pendingMigration{version: version, name: entry.Name(), content: string(content)})
+		out = append(out, pendingMigration{
+			version:       version,
+			name:          entry.Name(),
+			content:       string(content),
+			noTransaction: migrationDirectives(string(content)),
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
 	return out, nil
+}
+
+func migrationDirectives(content string) bool {
+	return noTransactionMigrationRe.MatchString(content)
+}
+
+// splitSQLStatements separates semicolon-delimited SQL while preserving text
+// inside PostgreSQL strings, identifiers, dollar-quoted bodies, and comments.
+func splitSQLStatements(sql string) []string {
+	const (
+		normal = iota
+		singleQuoted
+		doubleQuoted
+		lineComment
+		blockComment
+		dollarQuoted
+	)
+
+	var statements []string
+	var statement strings.Builder
+	state := normal
+	blockDepth := 0
+	dollarTag := ""
+
+	appendStatement := func() {
+		if text := strings.TrimSpace(statement.String()); text != "" {
+			statements = append(statements, text)
+		}
+		statement.Reset()
+	}
+
+	for i := 0; i < len(sql); {
+		switch state {
+		case normal:
+			switch {
+			case sql[i] == '\'':
+				statement.WriteByte(sql[i])
+				state = singleQuoted
+				i++
+			case sql[i] == '"':
+				statement.WriteByte(sql[i])
+				state = doubleQuoted
+				i++
+			case strings.HasPrefix(sql[i:], "--"):
+				statement.WriteString("--")
+				state = lineComment
+				i += 2
+			case strings.HasPrefix(sql[i:], "/*"):
+				statement.WriteString("/*")
+				state = blockComment
+				blockDepth = 1
+				i += 2
+			case sql[i] == '$':
+				if tag := dollarQuoteTag(sql[i:]); tag != "" {
+					statement.WriteString(tag)
+					dollarTag = tag
+					state = dollarQuoted
+					i += len(tag)
+				} else {
+					statement.WriteByte(sql[i])
+					i++
+				}
+			case sql[i] == ';':
+				appendStatement()
+				i++
+			default:
+				statement.WriteByte(sql[i])
+				i++
+			}
+		case singleQuoted:
+			statement.WriteByte(sql[i])
+			if sql[i] == '\'' {
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					statement.WriteByte(sql[i+1])
+					i += 2
+					continue
+				}
+				state = normal
+			}
+			i++
+		case doubleQuoted:
+			statement.WriteByte(sql[i])
+			if sql[i] == '"' {
+				if i+1 < len(sql) && sql[i+1] == '"' {
+					statement.WriteByte(sql[i+1])
+					i += 2
+					continue
+				}
+				state = normal
+			}
+			i++
+		case lineComment:
+			statement.WriteByte(sql[i])
+			if sql[i] == '\n' {
+				state = normal
+			}
+			i++
+		case blockComment:
+			switch {
+			case strings.HasPrefix(sql[i:], "/*"):
+				statement.WriteString("/*")
+				blockDepth++
+				i += 2
+			case strings.HasPrefix(sql[i:], "*/"):
+				statement.WriteString("*/")
+				blockDepth--
+				if blockDepth == 0 {
+					state = normal
+				}
+				i += 2
+			default:
+				statement.WriteByte(sql[i])
+				i++
+			}
+		case dollarQuoted:
+			if strings.HasPrefix(sql[i:], dollarTag) {
+				statement.WriteString(dollarTag)
+				i += len(dollarTag)
+				state = normal
+			} else {
+				statement.WriteByte(sql[i])
+				i++
+			}
+		}
+	}
+	appendStatement()
+	return statements
+}
+
+func dollarQuoteTag(sql string) string {
+	if !strings.HasPrefix(sql, "$") {
+		return ""
+	}
+	for i := 1; i < len(sql); i++ {
+		if sql[i] == '$' {
+			if i == 1 || isDollarTagStart(sql[1]) {
+				return sql[:i+1]
+			}
+			return ""
+		}
+		if i == 1 {
+			if !isDollarTagStart(sql[i]) {
+				return ""
+			}
+		} else if !isDollarTagContinue(sql[i]) {
+			return ""
+		}
+	}
+	return ""
+}
+
+func isDollarTagStart(b byte) bool {
+	return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+func isDollarTagContinue(b byte) bool {
+	return isDollarTagStart(b) || b >= '0' && b <= '9'
 }
 
 // LatestAppliedVersion returns the highest version recorded in schema_migrations,
