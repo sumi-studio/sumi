@@ -156,7 +156,7 @@ exec /usr/bin/stat "$@"
 		t.Fatal(err)
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
-	emptyObservation := strings.Index(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
 	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("reconcile did not observe empty before deriving its durable generation:\n%s", calls)
@@ -226,13 +226,167 @@ exec /usr/bin/stat "$@"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(calls), "compose.lifecycle.yaml down") {
-		t.Fatalf("already-empty project unexpectedly ran teardown:\n%s", calls)
-	}
-	emptyObservation := strings.Index(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
+	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
 	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
-	if emptyObservation < 0 || durableGeneration <= emptyObservation {
+	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("reconcile did not verify emptiness before re-attesting the durable generation:\n%s", calls)
+	}
+}
+
+func TestSupervisorReconcileRemovesAllocatorOnlyProjectBeforeReattesting(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	dockerState := filepath.Join(testRoot, "project-down")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  *"compose.lifecycle.yaml ps --all --quiet runtime"*|*"compose.lifecycle.yaml ps --all --quiet executor"*|*"compose.lifecycle.yaml ps --all --quiet broker"*|*"compose.lifecycle.yaml ps --all --quiet prepare"*)
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet allocator"*)
+    [ -e "$SUMI_FAKE_DOCKER_STATE" ] || printf '0123456789ab\n'
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet"*)
+    [ -e "$SUMI_FAKE_DOCKER_STATE" ] || printf '0123456789ab\n'
+    ;;
+  *"compose.lifecycle.yaml down"*)
+    : > "$SUMI_FAKE_DOCKER_STATE"
+    exit 17
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=allocator-only-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" reconcile`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_FAKE_DOCKER_STATE=" + dockerState,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reconcile allocator-only project failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"phase":"unknown","reaped_through_generation":7`) {
+		t.Fatalf("allocator-only reconcile omitted the observed-empty receipt: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
+	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
+	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
+		t.Fatalf("allocator-only reconcile did not tear down and observe empty before re-attesting:\n%s", calls)
+	}
+}
+
+func TestSupervisorReconcileKeepsFullyRunningProjectActive(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  *"compose.lifecycle.yaml ps --status running --quiet runtime"*|*"compose.lifecycle.yaml ps --status running --quiet executor"*|*"compose.lifecycle.yaml ps --status running --quiet broker"*)
+    printf '0123456789ab\n'
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=active-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" reconcile`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reconcile fully running project failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"phase":"active","generation":7,"rpc_boot_nonce":"active-nonce"`) {
+		t.Fatalf("fully running reconcile did not preserve active attestation: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "compose.lifecycle.yaml down") {
+		t.Fatalf("fully running project unexpectedly ran teardown:\n%s", calls)
 	}
 }
 

@@ -966,13 +966,12 @@ case "${action}" in
       inspect_epoch
     else
       # This branch also covers a provisioner crash after a verified stop or
-      # abort: Compose is already empty, but the daemon had no chance to
-      # publish its local receipt. Re-read the allocator's durable last epoch
-      # only after observing that this PAID's project is empty.
-      if [[ "${running}" != 0 ]] || long_lived_containers_exist; then
-        lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-          >/dev/null 2>&1 || true
-      fi
+      # abort: Compose can already be empty, but the daemon had no chance to
+      # publish its local receipt. `down` is a no-op in that case; always run
+      # it so every other leftover container shape is removed before the
+      # observed-empty check and any durable re-attestation.
+      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1 || true
       cleanup_project_is_empty || fail "reconcile did not leave an observed-empty Compose project"
       if epoch_identity; then
         reaped_generation="${EPOCH_GENERATION}"
