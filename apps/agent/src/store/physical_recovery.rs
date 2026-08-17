@@ -6,8 +6,6 @@
 //! physical proof; it only validates and idempotently applies receipts that
 //! T27 has already persisted.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
@@ -45,8 +43,10 @@ pub(crate) struct PhysicalRecoveryIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PhysicalRecoveryIntentRequest {
     pub tool_call_id: String,
+    pub tool_name: String,
     pub command_id: String,
     pub run_id: String,
+    pub assistant_message_id: String,
     pub executor_generation: ProcessGeneration,
 }
 

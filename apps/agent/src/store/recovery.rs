@@ -21,7 +21,9 @@ use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease}
 
 use super::{
     ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
+    HydrationReceiptIdentity, PhysicalRecoveryIntent, PhysicalRecoveryIntentRequest,
     PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter, RunPhase, Store,
+    ToolExecutionMutation,
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
@@ -38,6 +40,7 @@ const PROCESS_RESTARTED_TOOL_RESULT: &str = "process restarted before tool execu
 const APPROVAL_CANCELLED_ERROR_CODE: &str = "approval_cancelled";
 const APPROVAL_CANCELLED_TOOL_RESULT: &str =
     "approval was cancelled after process restart before tool execution";
+const PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT: &str = "ツールの実行中にプロセスが停止したため、実行結果は不明です。処理が完了している可能性と、完了していない可能性があります。";
 
 /// Typed identity for one durably pending approval whose prepared tool must be
 /// closed during logical suffix recovery.
@@ -787,10 +790,6 @@ pub(crate) enum ResumeDirective {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HydrationOutcome {
-    #[allow(
-        dead_code,
-        reason = "T26 bootstrap composition will pass these immutable physical attestations to T27; T17 must keep this variant fail-closed until then"
-    )]
     PhysicalRecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
     LogicalRecoveryRequired {
         // T26 owns applying this suffix. Until then this variant deliberately
@@ -821,11 +820,163 @@ struct PendingCommand {
 pub(crate) struct SuffixRecovery;
 
 impl SuffixRecovery {
+    /// Reap boot-only physical intents whose executor generation has already
+    /// been fenced out by bootstrap, then durably record the honest unknown
+    /// outcome. The previous generation's executor, broker, and runtime
+    /// containers no longer exist once a fresh generation lease/fence reaches
+    /// this composition point, so the physical kill itself is an already-done
+    /// no-op. That proves only that execution cannot still be live; it cannot
+    /// prove whether the external effect happened, so every terminal is
+    /// `indeterminate`, never success or failure.
+    pub(crate) async fn apply_boot_physical_receipt(
+        store: &Store,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        requests: &[PhysicalRecoveryIntentRequest],
+    ) -> Result<(ApplyReceiptOutcome, PhysicalRecoveryReceipt)> {
+        if requests.is_empty() {
+            bail!("boot physical recovery requires at least one intent");
+        }
+
+        // Boot is still NotReady and the epoch fence has removed all older
+        // containers, so no producer can advance this Store between this head
+        // read and the EventWriter transaction. EventWriter revalidates the
+        // exact contiguous suffix and receipt binding before commit.
+        let head: Option<i64> = sqlx::query_scalar("SELECT last_seq FROM event_log_heads")
+            .fetch_optional(store.pool())
+            .await
+            .context("read event-log head for boot physical recovery")?;
+        let first_seq = u64::try_from(head.unwrap_or(0))
+            .context("event-log head is outside the physical recovery sequence range")?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("physical recovery first sequence overflow"))?;
+        let event_count = requests
+            .len()
+            .checked_mul(3)
+            .ok_or_else(|| anyhow::anyhow!("physical recovery event count overflow"))?;
+        let last_seq = first_seq
+            .checked_add(
+                u64::try_from(event_count - 1)
+                    .context("physical recovery event count exceeds u64")?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("physical recovery last sequence overflow"))?;
+
+        let mut writes = Vec::with_capacity(event_count);
+        let mut intents = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            let terminal_seq = first_seq
+                .checked_add(
+                    u64::try_from(index)
+                        .context("physical recovery intent index exceeds u64")?
+                        .checked_mul(3)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("physical recovery terminal sequence overflow")
+                        })?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("physical recovery terminal sequence overflow"))?;
+            let result = ToolResultMessage {
+                tool_call_id: request.tool_call_id.clone(),
+                tool_name: request.tool_name.clone(),
+                content: vec![UserContent::Text {
+                    text: PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT.to_owned(),
+                }],
+                details: json!({
+                    "error": "indeterminate",
+                    "outcome": "indeterminate",
+                    "message": PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT,
+                }),
+                is_error: true,
+                timestamp: Utc::now(),
+            };
+            let message = PublicMessage::ToolResult(result.clone());
+            let message_id =
+                tool_result_message_id(&request.assistant_message_id, &request.tool_call_id);
+            writes.extend([
+                EventWrite {
+                    event: Some(super::DurableEvent::tool_execution_end(
+                        request.tool_call_id.clone(),
+                        serde_json::to_value(&result)?,
+                        true,
+                        "indeterminate".to_owned(),
+                        Some("indeterminate".to_owned()),
+                    )?),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: request.tool_call_id.clone(),
+                        expected: "running",
+                        state: "indeterminate",
+                        error_code: Some("indeterminate"),
+                    })],
+                },
+                EventWrite {
+                    event: Some(super::DurableEvent::message(
+                        "message_start",
+                        &message_id,
+                        &message,
+                    )?),
+                    projections: Vec::new(),
+                },
+                EventWrite {
+                    event: Some(super::DurableEvent::message(
+                        "message_end",
+                        &message_id,
+                        &message,
+                    )?),
+                    projections: vec![Projection::MessageEnd {
+                        message_id,
+                        role: "tool_result",
+                        message,
+                        append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
+                    }],
+                },
+            ]);
+            intents.push(PhysicalRecoveryIntent {
+                tool_call_id: request.tool_call_id.clone(),
+                command_id: request.command_id.clone(),
+                run_id: request.run_id.clone(),
+                executor_generation: request.executor_generation,
+                indeterminate_terminal_seq: terminal_seq,
+            });
+        }
+
+        let identity = HydrationReceiptIdentity {
+            personality_agent_id: lease.personality_agent_id().clone(),
+            lease_id: lease.lease_id().to_owned(),
+            generation: lease.generation(),
+            fence_id: fence.fence_id().to_owned(),
+            intent_count: intents.len(),
+        };
+        let mut receipt = PhysicalRecoveryReceipt {
+            receipt_id: format!("physical-recovery-{}", identity.stable_id()),
+            lease: lease.clone(),
+            fence: fence.clone(),
+            intents,
+            logical_suffix_first_seq: first_seq,
+            logical_suffix_last_seq: last_seq,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.canonical_digest();
+
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let (outcome, _) = Self::apply_physical_receipt(
+            &writer,
+            lease,
+            fence,
+            receipt.clone(),
+            EventBatch {
+                writes,
+                injected_commands: Vec::new(),
+            },
+        )
+        .await?;
+        Ok((outcome, receipt))
+    }
+
     /// Complete a T17 hydration suffix after T27 has supplied an authenticated
     /// physical recovery receipt.  EventWriter owns the transaction boundary;
     /// this wrapper intentionally does not kill/reap processes or persist the
     /// T27 proof store.
-    #[allow(dead_code, reason = "T26 hydration composes this T17 boundary")]
     pub(crate) async fn apply_physical_receipt(
         writer: &EventWriter,
         lease: &ProcessGenerationLease,
@@ -1818,7 +1969,7 @@ async fn durable_event_evidence(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use anyhow::{Result, bail};
@@ -1962,12 +2113,11 @@ mod tests {
         })
     }
 
-    async fn persist_terminal_tool(
+    async fn persist_running_tool(
         writer: &EventWriter,
         tool_call_id: &str,
         tool_name: &str,
         slot: u32,
-        is_error: bool,
     ) {
         let generation = test_generation();
         writer
@@ -2010,7 +2160,17 @@ mod tests {
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("prepare and start terminal ToolCall fixture");
+            .expect("prepare and start ToolCall fixture");
+    }
+
+    async fn persist_terminal_tool(
+        writer: &EventWriter,
+        tool_call_id: &str,
+        tool_name: &str,
+        slot: u32,
+        is_error: bool,
+    ) {
+        persist_running_tool(writer, tool_call_id, tool_name, slot).await;
 
         let result = ToolResultMessage {
             tool_call_id: tool_call_id.to_owned(),
@@ -2342,6 +2502,63 @@ mod tests {
         for (tool_call_id, tool_name, slot, is_error) in terminal_tools {
             persist_terminal_tool(writer, tool_call_id, tool_name, *slot, *is_error).await;
         }
+    }
+
+    async fn seed_boot_running_tools(writer: &EventWriter, calls: &[(&str, &str, u32)]) {
+        seed_tool_use_restart_seam_with_assistant(
+            writer,
+            false,
+            tool_use_recovery_assistant_with_calls(calls),
+            &[],
+        )
+        .await;
+        for (tool_call_id, tool_name, slot) in calls {
+            persist_running_tool(writer, tool_call_id, tool_name, *slot).await;
+        }
+    }
+
+    pub(crate) async fn setup_boot_running_tools(
+        calls: &[(&str, &str, u32)],
+    ) -> (Arc<Store>, EventWriter) {
+        let (store, writer) = setup().await;
+        seed_boot_running_tools(&writer, calls).await;
+        (store, writer)
+    }
+
+    pub(crate) async fn assert_indeterminate_surface(store: &Store, tool_call_id: &str) {
+        let (state, error_code): (String, Option<String>) =
+            sqlx::query_as("SELECT state, error_code FROM tool_executions WHERE tool_call_id = ?")
+                .bind(tool_call_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load physically recovered tool state");
+        assert_eq!(state, "indeterminate");
+        assert_eq!(error_code.as_deref(), Some("indeterminate"));
+
+        let envelope: String = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events
+             WHERE event_type = 'message_end'
+               AND json_extract(envelope, '$.message.role') = 'tool_result'
+               AND json_extract(envelope, '$.message.tool_call_id') = ?",
+        )
+        .bind(tool_call_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("load physical recovery ToolResult");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&envelope).expect("decode ToolResult event");
+        assert_eq!(
+            envelope
+                .pointer("/message/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some(PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT)
+        );
+        assert_eq!(
+            envelope
+                .pointer("/message/details/error")
+                .and_then(|v| v.as_str()),
+            Some("indeterminate")
+        );
     }
 
     async fn seed_pending_messaging_approval(writer: &EventWriter, turn_id: &str) {

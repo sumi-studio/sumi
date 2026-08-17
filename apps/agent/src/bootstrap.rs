@@ -66,6 +66,7 @@ use crate::{
     store::{
         AgentScope, EnvironmentKeyProvider, HydratedRunState, HydrationOutcome,
         LogicalRecoveryExecutor as StoreLogicalRecoveryExecutor, RecoveryStep, Redactor, Store,
+        SuffixRecovery,
     },
     tools::{
         Tool, WorkspacePaths,
@@ -350,6 +351,7 @@ async fn hydrate_to_fixed_point(
     recovery: &dyn LogicalRecoveryExecutor,
 ) -> Result<HydratedRunState> {
     let mut previous_plan = None;
+    let mut previous_physical_intents = None;
     loop {
         match store
             .hydrate(authority.lease(), authority.fence())
@@ -358,10 +360,42 @@ async fn hydrate_to_fixed_point(
         {
             HydrationOutcome::Complete(hydrated) => return Ok(hydrated),
             HydrationOutcome::PhysicalRecoveryRequired(intents) => {
-                bail!(
-                    "physical recovery is required for {} execution(s); runtime remains NotReady",
-                    intents.len()
+                if intents.is_empty() {
+                    bail!("hydration returned an empty PhysicalRecoveryRequired intent set");
+                }
+                if previous_physical_intents.as_ref() == Some(&intents) {
+                    bail!(
+                        "boot physical recovery returned success without advancing the authenticated intent set"
+                    );
+                }
+                for intent in &intents {
+                    if intent.executor_generation >= authority.generation() {
+                        bail!(
+                            "boot physical recovery refuses live-or-future execution {} at generation {}; current generation is {}; runtime remains NotReady",
+                            intent.tool_call_id,
+                            intent.executor_generation,
+                            authority.generation()
+                        );
+                    }
+                }
+
+                // The allocator gives every boot a fresh, strictly greater
+                // generation, and its epoch fence removes the older executor,
+                // broker, and runtime containers before this NotReady boot can
+                // hydrate. Therefore the process that could execute each call
+                // provably no longer exists and the physical reap is already a
+                // no-op. The fence says nothing about whether an external
+                // effect committed before death, so recovery must record the
+                // existing `indeterminate` terminal, never success or failure.
+                previous_physical_intents = Some(intents.clone());
+                SuffixRecovery::apply_boot_physical_receipt(
+                    store,
+                    authority.lease(),
+                    authority.fence(),
+                    &intents,
                 )
+                .await
+                .context("apply fenced boot physical recovery receipt")?;
             }
             HydrationOutcome::LogicalRecoveryRequired { steps } => {
                 if steps.is_empty() {
@@ -380,6 +414,14 @@ async fn hydrate_to_fixed_point(
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn hydrate_store_to_fixed_point_for_test(
+    store: &Store,
+    authority: &RuntimeEpochAuthority,
+) -> Result<HydratedRunState> {
+    hydrate_to_fixed_point(store, authority, &StoreLogicalRecoveryExecutor).await
 }
 
 const EXECUTOR_STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2155,7 +2197,10 @@ mod tests {
     use crate::gateway::stdio::InjectedStdioGateway;
     use crate::provider::ModelSpec;
     use crate::runtime::contracts::RpcIdentity;
-    use crate::store::HydrationReceiptIdentity;
+    use crate::store::{
+        ApplyReceiptOutcome, EventBatch, HydrationReceiptIdentity, assert_indeterminate_surface,
+        setup_boot_running_tools,
+    };
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
 
@@ -2262,6 +2307,27 @@ mod tests {
 
     fn parse(map: &HashMap<String, OsString>) -> Result<BootstrapContext> {
         BootstrapContext::from_source(|name| map.get(name).cloned())
+    }
+
+    fn authority_for_generation(generation: u64) -> RuntimeEpochAuthority {
+        let mut env = valid_env();
+        env.insert(
+            "SUMI_RPC_GENERATION".to_owned(),
+            generation.to_string().into(),
+        );
+        env.insert(
+            "SUMI_RPC_NONCE".to_owned(),
+            format!("boot-{generation}").into(),
+        );
+        env.insert(
+            "SUMI_PROCESS_GENERATION_LEASE_ID".to_owned(),
+            format!("lease-{generation}").into(),
+        );
+        env.insert(
+            "SUMI_GENERATION_RECOVERY_FENCE_ID".to_owned(),
+            format!("fence-{generation}").into(),
+        );
+        parse(&env).expect("boot generation authority").authority
     }
 
     fn startup_probe_worker(identity: RpcIdentity) -> Arc<dyn RunWorker> {
@@ -2888,6 +2954,130 @@ mod tests {
             .expect_err("bootstrap must not invent approval cancellation events");
         assert!(error.to_string().contains("LogicalRecoveryExecutor"));
         assert!(error.to_string().contains("1 ordered step"));
+    }
+
+    #[tokio::test]
+    async fn boot_reaps_older_running_execution_and_hydrates_to_completion() {
+        let (store, _writer) = setup_boot_running_tools(&[("tool-boot-old", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+
+        let hydrated = hydrate_store_to_fixed_point_for_test(&store, &authority)
+            .await
+            .expect("older physical intent reaches a hydrated fixed point");
+        assert_eq!(
+            hydrated.resume,
+            crate::store::ResumeDirective::AdmitCommands
+        );
+        assert_indeterminate_surface(&store, "tool-boot-old").await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count physical receipts"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM physical_recovery_receipt_intents",)
+                .fetch_one(store.pool())
+                .await
+                .expect("count physical receipt intents"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_covers_two_older_executions_with_one_receipt() {
+        let (store, _writer) = setup_boot_running_tools(&[
+            ("tool-boot-one", "read_file", 0),
+            ("tool-boot-two", "write_file", 1),
+        ])
+        .await;
+
+        hydrate_store_to_fixed_point_for_test(&store, &authority_for_generation(8))
+            .await
+            .expect("two older physical intents reach one hydrated fixed point");
+        assert_indeterminate_surface(&store, "tool-boot-one").await;
+        assert_indeterminate_surface(&store, "tool-boot-two").await;
+        let (receipts, intents): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT COUNT(*) FROM physical_recovery_receipt_intents)",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count grouped physical recovery ledger");
+        assert_eq!((receipts, intents), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn boot_refuses_running_execution_from_current_generation() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-live", "read_file", 0)]).await;
+
+        let error = hydrate_store_to_fixed_point_for_test(&store, &authority_for_generation(7))
+            .await
+            .expect_err("current-generation execution must remain live and fail closed");
+        assert!(format!("{error:#}").contains("refuses live-or-future execution"));
+        assert!(format!("{error:#}").contains("current generation is 7"));
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM tool_executions WHERE tool_call_id = 'tool-boot-live'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load refused live tool");
+        assert_eq!(state, "running");
+    }
+
+    #[tokio::test]
+    async fn physical_receipt_replay_after_committed_apply_is_idempotent_and_next_boot_completes() {
+        let (store, writer) =
+            setup_boot_running_tools(&[("tool-boot-replay", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+        let intents = match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate running replay fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("replay fixture must require physical recovery: {other:?}"),
+        };
+        let (outcome, receipt) = SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &intents,
+        )
+        .await
+        .expect("apply physical receipt before simulated crash");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+
+        let replay = SuffixRecovery::apply_physical_receipt(
+            &writer,
+            authority.lease(),
+            authority.fence(),
+            receipt,
+            EventBatch::default(),
+        )
+        .await
+        .expect("replay exact committed receipt after simulated crash");
+        assert_eq!(replay.0, ApplyReceiptOutcome::AlreadyApplied);
+        assert!(replay.1.is_empty());
+
+        hydrate_store_to_fixed_point_for_test(&store, &authority_for_generation(9))
+            .await
+            .expect("next boot converges after committed receipt replay");
+        assert_indeterminate_surface(&store, "tool-boot-replay").await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count replayed receipt"),
+            1
+        );
     }
 
     #[tokio::test]

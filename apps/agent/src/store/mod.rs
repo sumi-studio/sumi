@@ -122,6 +122,8 @@ pub(crate) use memory_state::{
     MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryJobStatus,
     MemoryLayer,
 };
+#[cfg(test)]
+pub(crate) use recovery::tests::{assert_indeterminate_surface, setup_boot_running_tools};
 #[allow(
     unused_imports,
     reason = "T12 exposes the recovery plan boundary consumed by T15"
@@ -1481,7 +1483,7 @@ impl Store {
                     row.try_get("executor_generation")?,
                 )
                 .map_err(|error| anyhow!("invalid persisted executor generation: {error}"))?;
-                event_writer::authenticate_running_tool_intent(
+                let evidence = event_writer::authenticate_running_tool_intent(
                     self,
                     transaction,
                     &tool_call_id,
@@ -1492,8 +1494,10 @@ impl Store {
                 .await?;
                 intents.push(PhysicalRecoveryIntentRequest {
                     tool_call_id,
+                    tool_name: evidence.tool_name,
                     command_id,
                     run_id,
+                    assistant_message_id: evidence.assistant_message_id,
                     executor_generation: generation,
                 });
             }

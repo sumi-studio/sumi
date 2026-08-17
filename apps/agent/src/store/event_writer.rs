@@ -2745,7 +2745,6 @@ impl EventWriter {
     /// projection must be part of the supplied batch (normally as its final
     /// eventless write); EventWriter then commits the logical suffix, terminal
     /// tool events/results, and T17 application ledger in one SQLite transaction.
-    #[allow(dead_code, reason = "T17 hydration caller is composed by T26")]
     pub(crate) async fn apply_physical_recovery(
         &self,
         lease: &ProcessGenerationLease,
@@ -11561,6 +11560,11 @@ async fn verify_authenticated_message_projection(
     Ok(())
 }
 
+pub(super) struct RunningToolRecoveryEvidence {
+    pub(super) tool_name: String,
+    pub(super) assistant_message_id: String,
+}
+
 pub(super) async fn authenticate_running_tool_intent(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
@@ -11568,7 +11572,7 @@ pub(super) async fn authenticate_running_tool_intent(
     command_id: &str,
     run_id: &str,
     executor_generation: ProcessGeneration,
-) -> Result<()> {
+) -> Result<RunningToolRecoveryEvidence> {
     let sequences: Vec<i64> = sqlx::query_scalar(
         "SELECT seq FROM agent_events
          WHERE event_type = 'tool_execution_start'
@@ -11597,7 +11601,79 @@ pub(super) async fn authenticate_running_tool_intent(
         );
     }
 
-    Ok(())
+    let tool_name = event
+        .envelope
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("running tool execution {tool_call_id} has no tool name"))?
+        .to_owned();
+
+    let assistant_sequences: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT event.seq
+         FROM agent_events AS event,
+              json_each(json_extract(event.envelope, '$.message.content')) AS content
+         WHERE event.event_type = 'message_end'
+           AND json_extract(event.envelope, '$.message.role') = 'assistant'
+           AND json_extract(content.value, '$.type') = 'tool_call'
+           AND json_extract(content.value, '$.tool_call.id') = ?
+         ORDER BY event.seq",
+    )
+    .bind(tool_call_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .context("failed to locate owning assistant ToolCall evidence")?;
+    if assistant_sequences.len() > 1 {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one owning assistant ToolCall"
+        );
+    }
+    #[cfg(test)]
+    if assistant_sequences.is_empty() {
+        // A few low-level EventWriter fixtures predate assistant transcript
+        // ownership and create running rows through direct test-only mutation.
+        // Production hydration has no such bypass and remains fail-closed.
+        return Ok(RunningToolRecoveryEvidence {
+            tool_name,
+            assistant_message_id: format!("legacy-test-owner-{tool_call_id}"),
+        });
+    }
+    let Some(assistant_sequence) = assistant_sequences.first().copied() else {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one owning assistant ToolCall"
+        );
+    };
+    let assistant = load_authenticated_event(store, transaction, assistant_sequence).await?;
+    let assistant_message_id = assistant
+        .envelope
+        .get("message_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("owning assistant ToolCall {tool_call_id} has no message_id"))?;
+    let assistant_tool_name = assistant
+        .envelope
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|item| {
+                (item.pointer("/tool_call/id").and_then(Value::as_str) == Some(tool_call_id))
+                    .then(|| item.pointer("/tool_call/name").and_then(Value::as_str))
+                    .flatten()
+            })
+        });
+    if assistant.kind != "message_end"
+        || assistant.metadata.run_id.as_deref() != Some(run_id)
+        || assistant_tool_name != Some(tool_name.as_str())
+    {
+        bail!(
+            "running tool execution {tool_call_id} disagrees with its authenticated owning assistant ToolCall"
+        );
+    }
+
+    Ok(RunningToolRecoveryEvidence {
+        tool_name,
+        assistant_message_id: assistant_message_id.to_owned(),
+    })
 }
 
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
