@@ -96,7 +96,7 @@ func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.Lifecy
 // Human row. Account provisioning — Secretary, employment, secrets, credential
 // and the default Direct Chat installation — happens in the auth-flow and
 // auto-registration paths; a Human minted here has no Direct Chat until it goes
-// through one of those, or the 0022 backfill runs.
+// through one of those.
 func (s *Store) MintHuman(ctx context.Context) (string, error) {
 	humanID := newUUIDv7()
 	_, err := s.pool.Exec(ctx,
