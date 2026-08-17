@@ -204,7 +204,8 @@ services:
     stop_grace_period: 2m
 
   # LiveKit carries media only; API-issued room tokens retain admission
-  # authority. rtc-mux keeps local UDP exposure to one port (ADR 0012).
+  # authority. Port 7880 is signalling, 7881 is TCP media fallback, and
+  # rtc-mux keeps local UDP exposure to port 7882 (ADR 0012).
   #
   # Calls are opt-in and this repository holds no media credential. The service
   # lives in the `calls` profile, which scripts/dev/compose-stack enables only
@@ -250,6 +251,7 @@ services:
         exec /livekit-server --config /etc/livekit.yaml
     ports:
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7880:7880"
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7881:7881"
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:7882:7882/udp"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7880"]

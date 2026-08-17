@@ -543,12 +543,12 @@ type liveKitRoomService interface {
 
 type liveKitRoom struct {
 	Name      string `json:"name"`
-	CreatedAt int64  `json:"creationTime"`
+	CreatedAt int64  `json:"creation_time,string"`
 }
 
 type liveKitParticipant struct {
 	Identity string `json:"identity"`
-	JoinedAt int64  `json:"joinedAt"`
+	JoinedAt int64  `json:"joined_at,string"`
 	Tracks   []struct {
 		Source string `json:"source"`
 	} `json:"tracks"`
