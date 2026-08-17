@@ -429,6 +429,9 @@ func (s *Store) InstallDirectChatForNewHumanInTx(
 	if err != nil {
 		return Installation{}, err
 	}
+	if err := ValidateInstallOperationID(operationID); err != nil {
+		return Installation{}, err
+	}
 	return s.installAtOperationInTx(ctx, tx, ParticipantOwner(actor), actor, directchat.AppID, operationID)
 }
 
