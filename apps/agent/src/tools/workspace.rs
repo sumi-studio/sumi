@@ -567,6 +567,8 @@ mod tests {
             ToolInvocationRoute::Elevated,
             bound,
             &Redactor::v1(),
+            None,
+            None,
         )
         .expect("Human cursor request")
         .public_request();

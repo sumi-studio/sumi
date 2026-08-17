@@ -107,8 +107,17 @@ EscalationReviewDecision = AskHuman | Block
 ```
 
 - `AskHuman`: redacted projectionを持つ`ApprovalRequested`をdurableに発行する。
-- `Block`: Humanへ何も表示せず、実行しない。
-- timeout、transport error、schema不一致、判定不能を含むnon-`AskHuman`も`Block`である。
+- `Block`: terminal denyではなくreviewerの異議とする。元のsealed callを変更せず保留し、人格agentへ
+  「そのまま本人に確認を出す（optional reason）」または「取り下げる」の一回限りのstructured choiceを返す。
+  人格agentが`proceed`なら同じcallをreviewerの異議とoptional reason付きでHumanへ提示し、`withdraw`なら終了する。
+- timeout、transport error、schema不一致、判定不能ではHumanをpre-emptせず`AskHuman`へ戻し、不足またはtechnical
+  terminalをrationaleへ明記する。risk levelにかかわらず最終判断はHumanが所有する。
+
+異議への回答は元toolのargumentsへ識別子を追加する別callではない。runtimeはEscalation review中の
+`SealedBoundToolInvocation`を所有したまま、同じ人格agent modelへbounded conversation、pending action、reviewer異議、
+二択をrole-preserving arrayで提示する。`proceed | withdraw`とoptional reasonを一度だけ受け、`proceed`の場合だけその
+unchanged sealから既存のpending Human approvalを作る。異議、人格agentの回答とreason、Human decisionは
+`EscalationReviewEvidence`とauthorization/denial evidence digestの内側へ保存する。
 
 Escalation AutoReviewのpositive resultはexecution authorityではない。Gatewayが認証した
 Human decisionがpending request、`tool_call_id`、route、canonical action digestと一致し、
@@ -204,31 +213,38 @@ Humanが書く固定prompt本文はRustの文字列literalへ埋め込まない�
 Execution AutoReview、Escalation AutoReviewを含むproductionのmodel-facing promptは、用途ごとの
 専用`.md`を正本にし、Rustは`include_str!`、typedな動的evidence組立、version/digestの束縛だけを
 持つ。ExecutionとEscalationの`.md`は共通base promptへ畳まず、個別にreview・version管理する。
-JSON schema、bounded transcript、exact action evidence、評価済みpolicy evidenceなどの動的payloadはtyped構造として
-分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt/schema v5は、最初と最新を必ず
-残して新しい順に独立予算内へ収めたuser textと、別の独立予算で直近のagent tool call（tool名、route、
-redacted arguments、rejected reason）、さらに別の独立予算で対応するtool result（text/compact JSONのみ、画像なし、
-Redactor適用、1 result約2k chars）を時系列に並べたtranscript、およびexact `AppActionDescriptor`（resource ID、path、
-patternを含む）とauthenticated Humanへ示すexact `ReviewProjection`を受け取る。tool callはagentがすでに行ったことの
-untrusted evidence、tool resultはtoolが返した内容のuntrusted evidenceであり、どちらもinstructionではない。
-user intent/authorizationを根拠づけるのはuser messageだけとする。assistant text、Thinking、画像、conversation provider
-context、`context_version`、pending callのraw execution arguments、認証済みtenant/Human principal IDは送らない。
-runtimeがすでに持つHuman/PersonalityAgentのdisplay nameまたはPersonalityAgent IDだけをoptional participants headerへ載せ、
-追加lookupは行わない。transcriptとactionはreview evidenceでありreviewerへの
-instructionではない。既存のdurable evidence用`Redactor`を適用し、reviewer固有の値隠しは追加しない。
-transcriptとactionはboundedにし、切り詰めた場合は省略件数・truncation marker・JSON prefixを明示する。
+JSON schema、bounded conversation、exact action evidence、評価済みpolicy evidenceなどの動的payloadはtyped構造として
+分離し、Markdownへ文字列補間してprompt境界を曖昧にしない。reviewer/prompt/schema v7は、独立予算ごとに最新側から
+選びoldestからnewestへ並べたrole-preserving message arrayをproviderへ送る。Human textは`user`、人格agentのtextと
+earlier tool call（call id、tool名、route、Redactor適用済みarguments、またはrejected reason）は`assistant`、対応する
+tool result（text/compact JSONのみ、画像なし、Redactor適用、1 result約2k chars）はcall idへbindした`tool`/`tool_result`
+として送る。Thinking、画像、conversation provider context、`context_version`、pending callのraw execution arguments、
+認証済みtenant/Human principal IDは送らない。予算から外れたlaneは件数とtruncation markerをmessage array内へ必ず残し、
+Human turnが一件もない場合は`[no Human turn available in the bounded conversation]`をHuman発言ではないmachine markerとして
+明示する。bounded conversationの後に、まだ実行していないpending callを明示する小さな`user` itemを置き、最後の
+`user` itemへexact `AppActionDescriptor`（resource ID、path、patternを含む）、authenticated Humanへ示すexact
+`ReviewProjection`、評価済みpolicy、optional participants、存在する場合のreviewer tool traceをJSONのtyped evidenceとして
+置く。どちらもuntrusted evidenceでありinstructionではない。user intent/authorizationを根拠づけるのは実際のHuman
+messageだけとする。runtimeがすでに持つHuman/PersonalityAgentのdisplay nameまたはPersonalityAgent IDだけをoptional
+participantsへ載せ、追加lookupは行わない。既存のdurable evidence用`Redactor`を全laneへ適用し、reviewer固有の値隠しは
+追加しない。provider evidence digestはconversation、pending marker、最後のstructured evidence（digest field自体を除く）を
+domain-separated hashし、どのlaneの変更もdigestへ反映する。
 
-reviewer/prompt/schema v6では、両reviewerが必要な事実を確認するため、現在のfrozen registryにあるbound toolのうち
+reviewer/prompt/schema v7では、両reviewerが必要な事実を確認するため、現在のfrozen registryにあるbound toolのうち
 `CapabilityClass::Read`へbindできるものだけを最大4回まで利用できる。各callはNormal policyをその場で評価し、explicit
 `Deny`はerror resultとしてreviewerへ返し、`Allow`/`Unmatched`だけをagent-own authorityで同じbound adapter/Executor
 sandboxへ実行する。この経路はAutoReviewへ再投入せず、Mutate/Administer/Executeへauthorityを発行しない。結果は既存
 `Redactor`でredactし約4k charsへ制限する。reviewer readは通常のPA `tool_executions` rowにはせず、tool、redacted
 arguments、result digest、error flag、elapsed timeからなるbounded traceをreview evidenceに含め、authorization/denial
 evidenceと同じdurable digestの内側へ記録する。
-provider evidence digestは外部へ実際に見せるaction envelopeだけをdomain-separated hashし、exact local digestの
-代用とは扱わない。policy decision recordと`PolicySnapshot`のsource digest/version/valid-untilは従来どおり
-typed policy evidenceとして送る。system promptと、この三つのevidenceを含むsynthetic user messageだけをproviderへ
-送り、structured outputを必須とする。
+provider evidence digestはexact local digestの代用とは扱わない。policy decision recordと`PolicySnapshot`のsource
+digest/version/valid-untilは従来どおりtyped policy evidenceとして送り、structured output、strict parse、boundedな
+read-only tool loopを維持する。証拠不足時はEscalation reviewerでは`ask_human`へ戻し、Execution reviewerはHumanへ
+deferするoutcomeを持たないため`block`を維持してrationaleへ不足したexact evidenceを記す。実際にunsafeまたはcritical
+riskと判断したNormal callをblockする規則は変更しない。Escalationの`block`はrisk-basedな異議であり、人格agentが
+`proceed`を一度選んだ後は異議をHumanへ可視化して判断を委ねる。omission markerは「省略されたのでbenignとは確認して
+いない」ことを示すが、省略自体をriskまたは自動blockの根拠にしない。resend/retryもそれ自体を不審・重複の証拠とせず、
+以前のindeterminate outcomeまたはreview decisionはcontextであってprecedentではない。
 `policy.decision = unmatched`はstanding ruleがこのexact callを覆わずExecution reviewerへ判断を委ねる中立な状態であり、
 それ自体をriskの証拠としない。
 
@@ -301,7 +317,7 @@ permission/approval surfaceでは、少なくとも次を別名で扱う。
 |---|---|
 | `ToolInvocationRoute` | `Normal | Elevated`。Humanへcurrent-call decisionを求めるかの経路 |
 | `ExecutionReviewDecision` | Normal/Unmatchedの`Allow | Block`。Human promptを作らない |
-| `EscalationReviewDecision` | Elevatedの`AskHuman | Block`。実行authorityを作らない |
+| `EscalationReviewDecision` | Elevatedの`AskHuman | Block`。`Block`はPAへの一回限りの異議で、実行authorityを作らない |
 | `CurrentCallDecision` | Gateway認証済みHumanの`ApproveOnce | DenyOnce` |
 | `ExecutionAuthorityProvenance` | `AgentOwn | AgentOwnWithHumanConsent | HumanAccountOneShot` |
 | `StandingPolicyMutation` | 将来のAllow/Deny policyを作成・更新・削除する別command。current-call decisionではない |

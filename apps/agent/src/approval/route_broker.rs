@@ -31,12 +31,14 @@ use crate::{
             RoutePolicy,
         },
         route_reviewer::{
+            EscalationObjectionOutcome, EscalationObjectionRequest, EscalationObjectionResponder,
             EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewRequest,
             EscalationReviewResult, EscalationReviewer, ExecutionReviewEvidence,
             ExecutionReviewOutcome, ExecutionReviewRequest, ExecutionReviewResult,
-            ExecutionReviewer, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5, REVIEW_TRUNCATION_MARKER,
-            ReviewerActionEvidence, ReviewerParticipants, ReviewerPolicyEvidence,
-            ReviewerTerminalClass, ReviewerTranscript, ReviewerTranscriptEntry,
+            ExecutionReviewer, REVIEW_NO_HUMAN_TURN_MARKER, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V7,
+            REVIEW_TRUNCATION_MARKER, ReviewerActionEvidence, ReviewerParticipants,
+            ReviewerPolicyEvidence, ReviewerRejectedToolCallEvidence, ReviewerTerminalClass,
+            ReviewerToolCallEvidence, ReviewerTranscript, ReviewerTranscriptEntry,
         },
     },
     provider::types::{PublicAssistantContent, PublicMessage, ToolInvocationRoute, UserContent},
@@ -47,6 +49,9 @@ use crate::{
 const MAX_CONTEXT_USER_MESSAGES: usize = 12;
 const MAX_CONTEXT_USER_TEXT_CHARS: usize = 4_000;
 const MAX_CONTEXT_USER_TOTAL_CHARS: usize = 24_000;
+const MAX_CONTEXT_ASSISTANT_MESSAGES: usize = 12;
+const MAX_CONTEXT_ASSISTANT_TEXT_CHARS: usize = 4_000;
+const MAX_CONTEXT_ASSISTANT_TOTAL_CHARS: usize = 16_000;
 const MAX_CONTEXT_TOOL_CALLS: usize = 40;
 const MAX_CONTEXT_TOOL_ARGUMENT_CHARS: usize = 2_000;
 const MAX_CONTEXT_TOOL_TOTAL_CHARS: usize = 16_000;
@@ -114,6 +119,8 @@ pub(crate) struct PendingApprovalRequest {
     pub adapter_version: u32,
     pub descriptor: Value,
     pub review_projection: Value,
+    pub reviewer_objection: Option<String>,
+    pub pa_reason: Option<String>,
 }
 
 impl PendingApprovalRequest {
@@ -122,6 +129,8 @@ impl PendingApprovalRequest {
         route: ToolInvocationRoute,
         bound: &BoundToolInvocation,
         redactor: &Redactor,
+        reviewer_objection: Option<String>,
+        pa_reason: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             id,
@@ -139,6 +148,8 @@ impl PendingApprovalRequest {
             )?,
             review_projection: redactor
                 .redact_value(&Value::Object(bound.review_projection.as_object().clone()))?,
+            reviewer_objection,
+            pa_reason,
         })
     }
 
@@ -152,7 +163,20 @@ impl PendingApprovalRequest {
             tool_name: self.tool_name.clone(),
             action: ReviewProjection::Reviewable(self.descriptor.clone()),
             args_summary: self.review_projection.clone(),
-            reason: Some("This exact operation requires one-time approval.".to_owned()),
+            reason: Some(
+                match (
+                    self.reviewer_objection.as_deref(),
+                    self.pa_reason.as_deref(),
+                ) {
+                    (Some(objection), Some(pa_reason)) => format!(
+                        "The PA chose to proceed after AutoReview objected. Reviewer objection: {objection} PA reason: {pa_reason}"
+                    ),
+                    (Some(objection), None) => format!(
+                        "The PA chose to proceed after AutoReview objected. Reviewer objection: {objection}"
+                    ),
+                    (None, _) => "This exact operation requires one-time approval.".to_owned(),
+                },
+            ),
             audit: None,
         }
     }
@@ -176,9 +200,9 @@ pub(crate) struct ApprovalPrincipalScope {
 }
 
 impl ApprovalPrincipalScope {
-    fn reviewer_participants(&self) -> Option<ReviewerParticipants> {
+    fn reviewer_participants(&self, redactor: &Redactor) -> Option<ReviewerParticipants> {
         let personality_agent_id = (!self.personality_agent_id.trim().is_empty())
-            .then(|| self.personality_agent_id.clone());
+            .then(|| redactor.redact_text(&self.personality_agent_id));
         personality_agent_id.map(|personality_agent_id| ReviewerParticipants {
             human_display_name: None,
             personality_agent_display_name: None,
@@ -262,6 +286,7 @@ pub(crate) struct RouteApprovalBroker {
     redactor: Arc<Redactor>,
     execution_reviewer: Arc<ExecutionReviewer>,
     escalation_reviewer: Arc<EscalationReviewer>,
+    escalation_objection_responder: Option<Arc<EscalationObjectionResponder>>,
     pending: Arc<Mutex<HashMap<String, PendingEntry>>>,
     resolving: Arc<Mutex<HashSet<String>>>,
 }
@@ -293,6 +318,14 @@ impl RouteApprovalBroker {
         )
     }
 
+    pub(crate) fn with_escalation_objection_responder(
+        mut self,
+        responder: Arc<EscalationObjectionResponder>,
+    ) -> Self {
+        self.escalation_objection_responder = Some(responder);
+        self
+    }
+
     pub(crate) fn with_shared_policy(
         policy: Arc<RwLock<RoutePolicy>>,
         redactor: Redactor,
@@ -305,6 +338,7 @@ impl RouteApprovalBroker {
             redactor: Arc::new(redactor),
             execution_reviewer,
             escalation_reviewer,
+            escalation_objection_responder: None,
             pending: Arc::new(Mutex::new(HashMap::new())),
             resolving: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -448,7 +482,8 @@ impl RouteApprovalBroker {
                             .execution_reviewer
                             .review(
                                 ExecutionReviewRequest {
-                                    participants: scope.reviewer_participants(),
+                                    participants: scope
+                                        .reviewer_participants(self.redactor.as_ref()),
                                     transcript,
                                     action,
                                     policy,
@@ -531,7 +566,29 @@ impl RouteApprovalBroker {
                         let review = self
                             .escalation_reviewer
                             .block_without_call(ReviewerTerminalClass::InsufficientEvidence);
-                        let reason = review.decision.rationale.clone();
+                        return self
+                            .make_pending(sealed, route, scope, run_id, turn_id, snapshot, review);
+                    }
+                };
+                let review_request = EscalationReviewRequest {
+                    participants: scope.reviewer_participants(self.redactor.as_ref()),
+                    transcript,
+                    action,
+                    policy,
+                };
+                let review = self
+                    .escalation_reviewer
+                    .review(review_request.clone(), cancel.clone())
+                    .await;
+                let mut review = match review {
+                    EscalationReviewResult::AskHuman(review)
+                    | EscalationReviewResult::Block(review) => review,
+                };
+                if review.decision.outcome == EscalationReviewOutcome::AskHuman {
+                    self.make_pending(sealed, route, scope, run_id, turn_id, snapshot, review)
+                } else {
+                    let Some(responder) = self.escalation_objection_responder.as_ref() else {
+                        let reason = "The held call was withdrawn because the PA objection-response channel is unavailable".to_owned();
                         return self.deny(
                             bound,
                             route,
@@ -541,38 +598,41 @@ impl RouteApprovalBroker {
                             Some(review),
                             reason,
                         );
-                    }
-                };
-                let review = self
-                    .escalation_reviewer
-                    .review(
-                        EscalationReviewRequest {
-                            participants: scope.reviewer_participants(),
-                            transcript,
-                            action,
-                            policy,
+                    };
+                    let response = Box::pin(responder.answer(
+                        EscalationObjectionRequest {
+                            review: review_request,
+                            reviewer_objection: review.decision.rationale.clone(),
                         },
                         cancel,
-                    )
+                    ))
                     .await;
-                match review {
-                    EscalationReviewResult::AskHuman(review)
-                        if review.decision.outcome == EscalationReviewOutcome::AskHuman =>
-                    {
-                        self.make_pending(sealed, route, scope, run_id, turn_id, snapshot, review)
-                    }
-                    EscalationReviewResult::AskHuman(review)
-                    | EscalationReviewResult::Block(review) => {
-                        let reason = review.decision.rationale.clone();
-                        self.deny(
+                    let answer = response.answer.clone();
+                    review.pa_objection_response = Some(Box::new(response));
+                    match answer.map(|answer| answer.outcome) {
+                        Some(EscalationObjectionOutcome::Proceed) => self.make_pending(
+                            sealed, route, scope, run_id, turn_id, snapshot, review,
+                        ),
+                        Some(EscalationObjectionOutcome::Withdraw) => self.deny(
                             bound,
                             route,
                             snapshot,
                             PolicyDecisionRecord::ElevatedPreflight,
                             None,
                             Some(review),
-                            reason,
-                        )
+                            "The PA withdrew the held call after receiving the AutoReview objection"
+                                .to_owned(),
+                        ),
+                        None => self.deny(
+                            bound,
+                            route,
+                            snapshot,
+                            PolicyDecisionRecord::ElevatedPreflight,
+                            None,
+                            Some(review),
+                            "The held call was withdrawn because the PA did not produce a valid objection answer"
+                                .to_owned(),
+                        ),
                     }
                 }
             }
@@ -673,11 +733,24 @@ impl RouteApprovalBroker {
             escalation_review: escalation_review.clone(),
         };
         let request_id = Uuid::now_v7().to_string();
+        let reviewer_objection =
+            (escalation_review.decision.outcome == EscalationReviewOutcome::Block).then(|| {
+                self.redactor
+                    .redact_text(&escalation_review.decision.rationale)
+            });
+        let pa_reason = escalation_review
+            .pa_objection_response
+            .as_ref()
+            .and_then(|response| response.answer.as_ref())
+            .and_then(|answer| answer.reason.as_deref())
+            .map(|reason| self.redactor.redact_text(reason));
         let request = PendingApprovalRequest::from_bound(
             request_id.clone(),
             route,
             bound,
             self.redactor.as_ref(),
+            reviewer_objection,
+            pa_reason,
         )?;
         let (sender, receiver) = oneshot::channel();
         self.pending
@@ -918,7 +991,13 @@ fn review_inputs(
         redactor.redact_value(&Value::Object(bound.review_projection.as_object().clone()))?;
     Ok((
         bounded_reviewer_transcript(transcript, redactor, &bound.tool_call_id)?,
-        ReviewerActionEvidence::new(route, descriptor, review_projection)?,
+        ReviewerActionEvidence::new(
+            bound.tool_call_id.clone(),
+            redactor.redact_text(&bound.tool_name),
+            route,
+            descriptor,
+            review_projection,
+        )?,
         ReviewerPolicyEvidence::from_snapshot(route, decision, snapshot),
     ))
 }
@@ -929,13 +1008,15 @@ fn bounded_reviewer_transcript(
     pending_tool_call_id: &str,
 ) -> Result<ReviewerTranscript> {
     let mut users = Vec::<(usize, String)>::new();
+    let mut assistants = Vec::<(usize, usize, String)>::new();
     let mut tools = Vec::<ReviewerToolCandidate>::new();
     let mut results = Vec::<(usize, String, ReviewerTranscriptEntry)>::new();
     let mut recorded_tool_calls = HashMap::<String, String>::new();
+    let mut orphan_tool_results = Vec::<usize>::new();
     let mut ordinal = 0;
     let mut reached_pending_tool_call = false;
 
-    for message in transcript {
+    for (turn_id, message) in transcript.iter().enumerate() {
         match message {
             PublicMessage::User(message) => {
                 let text = message
@@ -953,13 +1034,16 @@ fn bounded_reviewer_transcript(
                 }
             }
             PublicMessage::Assistant(message) => {
+                let message_ordinal = ordinal;
+                ordinal += 1;
+                let mut text_parts = Vec::new();
                 for content in &message.content {
                     let entry = match content {
                         PublicAssistantContent::ToolCall { tool_call, .. }
                             if tool_call.id == pending_tool_call_id =>
                         {
                             reached_pending_tool_call = true;
-                            continue;
+                            break;
                         }
                         PublicAssistantContent::ToolCall { .. }
                         | PublicAssistantContent::RejectedToolCall { .. }
@@ -971,20 +1055,37 @@ fn bounded_reviewer_transcript(
                             let arguments = redactor.redact_value(&Value::Object(
                                 tool_call.arguments.as_object().clone(),
                             ))?;
-                            ReviewerTranscriptEntry::ToolCall {
-                                tool: tool_call.name.clone(),
-                                route: tool_call.route,
-                                arguments: capped_tool_arguments(arguments)?,
+                            ReviewerTranscriptEntry::Assistant {
+                                turn_id,
+                                text: None,
+                                text_truncated: false,
+                                tool_calls: vec![ReviewerToolCallEvidence {
+                                    id: tool_call.id.clone(),
+                                    tool: tool_call.name.clone(),
+                                    route: tool_call.route,
+                                    arguments: capped_tool_arguments(arguments)?,
+                                }],
+                                rejected_tool_calls: Vec::new(),
                             }
                         }
                         PublicAssistantContent::RejectedToolCall { rejected, .. } => {
-                            ReviewerTranscriptEntry::RejectedToolCall {
-                                tool: rejected.name.clone(),
-                                reason: rejected.error,
+                            ReviewerTranscriptEntry::Assistant {
+                                turn_id,
+                                text: None,
+                                text_truncated: false,
+                                tool_calls: Vec::new(),
+                                rejected_tool_calls: vec![ReviewerRejectedToolCallEvidence {
+                                    id: rejected.id.clone(),
+                                    tool: rejected.name.clone(),
+                                    reason: rejected.error,
+                                }],
                             }
                         }
-                        PublicAssistantContent::Text { .. }
-                        | PublicAssistantContent::Thinking { .. } => continue,
+                        PublicAssistantContent::Text { text, .. } => {
+                            text_parts.push(text.as_str());
+                            continue;
+                        }
+                        PublicAssistantContent::Thinking { .. } => continue,
                     };
                     let tool_call_id = match content {
                         PublicAssistantContent::ToolCall { tool_call, .. } => {
@@ -995,15 +1096,20 @@ fn bounded_reviewer_transcript(
                         _ => None,
                     };
                     tools.push(ReviewerToolCandidate {
-                        ordinal,
+                        ordinal: message_ordinal,
                         tool_call_id,
                         entry,
                     });
-                    ordinal += 1;
+                }
+                let text = text_parts.join("\n\n");
+                if !text.is_empty() {
+                    assistants.push((message_ordinal, turn_id, redactor.redact_text(&text)));
                 }
             }
-            PublicMessage::ToolResult(result) if !reached_pending_tool_call => {
+            PublicMessage::ToolResult(result) => {
                 let Some(tool) = recorded_tool_calls.get(&result.tool_call_id) else {
+                    orphan_tool_results.push(ordinal);
+                    ordinal += 1;
                     continue;
                 };
                 let content = reviewer_tool_result_content(result, redactor)?;
@@ -1023,20 +1129,40 @@ fn bounded_reviewer_transcript(
                 ));
                 ordinal += 1;
             }
-            PublicMessage::ToolResult(_) => {}
         }
     }
 
     let mut entries = select_user_entries(&users);
+    entries.extend(select_assistant_entries(&assistants));
     let (tool_entries, selected_tool_call_ids) = select_tool_entries(&tools)?;
     entries.extend(tool_entries);
     entries.extend(select_tool_result_entries(
         &results,
         &selected_tool_call_ids,
     )?);
+    if let Some(ordinal) = orphan_tool_results.first() {
+        entries.push((
+            *ordinal,
+            ReviewerTranscriptEntry::OrphanToolResultOmission {
+                omitted_orphan_tool_results: orphan_tool_results.len(),
+                marker: REVIEW_TRUNCATION_MARKER,
+            },
+        ));
+    }
     entries.sort_by_key(|(ordinal, _)| *ordinal);
+    if users.is_empty() {
+        entries.insert(
+            0,
+            (
+                0,
+                ReviewerTranscriptEntry::NoHumanTurn {
+                    marker: REVIEW_NO_HUMAN_TURN_MARKER,
+                },
+            ),
+        );
+    }
     Ok(ReviewerTranscript {
-        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5,
+        schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V7,
         entries: entries.into_iter().map(|(_, entry)| entry).collect(),
     })
 }
@@ -1074,15 +1200,7 @@ fn select_user_entries(users: &[(usize, String)]) -> Vec<(usize, ReviewerTranscr
     let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
     let mut remaining = MAX_CONTEXT_USER_TOTAL_CHARS;
 
-    if let Some((ordinal, text)) = users.first() {
-        push_user_entry(&mut selected, &mut remaining, 0, *ordinal, text);
-    }
-    if users.len() > 1 {
-        let index = users.len() - 1;
-        let (ordinal, text) = &users[index];
-        push_user_entry(&mut selected, &mut remaining, index, *ordinal, text);
-    }
-    for index in (1..users.len().saturating_sub(1)).rev() {
+    for index in (0..users.len()).rev() {
         if selected.len() >= MAX_CONTEXT_USER_MESSAGES || remaining == 0 {
             break;
         }
@@ -1108,6 +1226,60 @@ fn select_user_entries(users: &[(usize, String)]) -> Vec<(usize, ReviewerTranscr
             *ordinal,
             ReviewerTranscriptEntry::UserOmission {
                 omitted_user_turns: omitted.len(),
+                marker: REVIEW_TRUNCATION_MARKER,
+            },
+        ));
+    }
+    entries
+}
+
+fn select_assistant_entries(
+    assistants: &[(usize, usize, String)],
+) -> Vec<(usize, ReviewerTranscriptEntry)> {
+    let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
+    let mut remaining = MAX_CONTEXT_ASSISTANT_TOTAL_CHARS;
+    for index in (0..assistants.len()).rev() {
+        if selected.len() >= MAX_CONTEXT_ASSISTANT_MESSAGES || remaining == 0 {
+            break;
+        }
+        let (ordinal, turn_id, text) = &assistants[index];
+        let limit = remaining.min(MAX_CONTEXT_ASSISTANT_TEXT_CHARS);
+        if text.chars().count() > limit && limit < REVIEW_TRUNCATION_MARKER.chars().count() {
+            continue;
+        }
+        let (text, text_truncated) = truncate_context_text(text, limit);
+        remaining = remaining.saturating_sub(text.chars().count());
+        selected.push((
+            index,
+            *ordinal,
+            ReviewerTranscriptEntry::Assistant {
+                turn_id: *turn_id,
+                text: Some(text),
+                text_truncated,
+                tool_calls: Vec::new(),
+                rejected_tool_calls: Vec::new(),
+            },
+        ));
+    }
+
+    let selected_indices = selected
+        .iter()
+        .map(|(index, _, _)| *index)
+        .collect::<HashSet<_>>();
+    let omitted = assistants
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected_indices.contains(index))
+        .collect::<Vec<_>>();
+    let mut entries = selected
+        .into_iter()
+        .map(|(_, ordinal, entry)| (ordinal, entry))
+        .collect::<Vec<_>>();
+    if let Some((_, (ordinal, _, _))) = omitted.first() {
+        entries.push((
+            *ordinal,
+            ReviewerTranscriptEntry::AssistantOmission {
+                omitted_assistant_turns: omitted.len(),
                 marker: REVIEW_TRUNCATION_MARKER,
             },
         ));
@@ -1322,12 +1494,14 @@ mod tests {
     use crate::{
         approval::{
             authority::{
-                GrantRevalidation, executor_authorization_projection_digest, executor_grant_digest,
+                GrantRevalidation, authorization_evidence_digest,
+                executor_authorization_projection_digest, executor_grant_digest,
             },
             route_reviewer::{
-                EscalationReviewerPrompt, EscalationReviewerTransport, ExecutionReviewerPrompt,
-                ExecutionReviewerTransport, ReviewerBudgetV1, ReviewerModelSpec,
-                ReviewerTransportError, ReviewerTrustSet,
+                EscalationObjectionPrompt, EscalationObjectionResponder,
+                EscalationObjectionResponderTransport, EscalationReviewerPrompt,
+                EscalationReviewerTransport, ExecutionReviewerPrompt, ExecutionReviewerTransport,
+                ReviewerBudgetV1, ReviewerModelSpec, ReviewerTransportError, ReviewerTrustSet,
             },
         },
         provider::types::{
@@ -1448,6 +1622,39 @@ mod tests {
         prompts: Mutex<Vec<Value>>,
     }
 
+    struct ObjectionFake {
+        model: ReviewerModelSpec,
+        response: String,
+        calls: AtomicUsize,
+        prompts: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl EscalationObjectionResponderTransport for ObjectionFake {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &self.model
+        }
+
+        async fn complete(
+            &self,
+            prompt: &EscalationObjectionPrompt,
+            _cancel: CancellationToken,
+        ) -> std::result::Result<
+            crate::approval::route_reviewer::ReviewerTransportOutput,
+            ReviewerTransportError,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.prompts
+                .lock()
+                .expect("objection prompts")
+                .push(serde_json::to_value(prompt).expect("serialize objection prompt"));
+            Ok(crate::approval::route_reviewer::ReviewerTransportOutput {
+                text: self.response.clone(),
+                tool_trace: Vec::new(),
+            })
+        }
+    }
+
     #[async_trait]
     impl EscalationReviewerTransport for EscalationFake {
         fn model_spec(&self) -> &ReviewerModelSpec {
@@ -1530,6 +1737,30 @@ mod tests {
             ),
             execution_transport,
             escalation_transport,
+        )
+    }
+
+    fn with_objection_answer(
+        broker: RouteApprovalBroker,
+        response: Value,
+    ) -> (RouteApprovalBroker, Arc<ObjectionFake>) {
+        let transport = Arc::new(ObjectionFake {
+            model: model(),
+            response: response.to_string(),
+            calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let responder = Arc::new(
+            EscalationObjectionResponder::new(
+                model(),
+                transport.clone(),
+                ReviewerBudgetV1::escalation(),
+            )
+            .expect("objection responder"),
+        );
+        (
+            broker.with_escalation_objection_responder(responder),
+            transport,
         )
     }
 
@@ -1968,6 +2199,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escalation_objection_holds_same_call_and_pa_proceed_reaches_human_with_exchange() {
+        let (broker, _, _) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"block",
+                "risk":"critical",
+                "misunderstanding":"target may be broader than intended",
+                "rationale":"reviewer-objection-sentinel"
+            }),
+        );
+        let (broker, responder) = with_objection_answer(
+            broker,
+            json!({
+                "outcome":"proceed",
+                "reason":"pa-reason-sentinel"
+            }),
+        );
+        let sealed = sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await;
+        let original_call_id = sealed.invocation().tool_call_id.clone();
+        let original_evidence_digest = sealed.evidence_digest().to_hex();
+        let outcome = broker
+            .start_request(
+                sealed,
+                ToolInvocationRoute::Elevated,
+                &[user_message("Please ask me before changing the title")],
+                scope(),
+                "run-held",
+                "turn-held",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("held objection flow");
+        let RouteApprovalOutcome::Pending { mut pending } = outcome else {
+            panic!("PA proceed must send the unchanged held call to Human")
+        };
+        assert_eq!(pending.request().tool_call_id, original_call_id);
+        assert_eq!(
+            pending.request().bound_evidence_digest,
+            original_evidence_digest,
+            "the held call must not be rebound or resubmitted"
+        );
+        let public =
+            serde_json::to_string(&pending.request().public_request()).expect("Human request");
+        assert!(public.contains("reviewer-objection-sentinel"));
+        assert!(public.contains("pa-reason-sentinel"));
+        let review = &pending.durable_evidence().escalation_review;
+        assert_eq!(review.decision.outcome, EscalationReviewOutcome::Block);
+        assert_eq!(
+            review
+                .pa_objection_response
+                .as_ref()
+                .and_then(|response| response.answer.as_ref())
+                .map(|answer| answer.outcome),
+            Some(EscalationObjectionOutcome::Proceed)
+        );
+        assert_eq!(responder.calls.load(Ordering::Relaxed), 1);
+        let held_bound = pending.durable_evidence().bound.clone();
+
+        let resolution = broker
+            .resolve(
+                &pending.request().id,
+                command(CurrentCallDecision::ApproveOnce),
+            )
+            .await
+            .expect("Human resolves held call");
+        let CurrentCallResolution::Approved { grant, .. } = resolution else {
+            panic!("Human approval is final authority for the held call")
+        };
+        assert_eq!(grant.evidence().tool_call_id, original_call_id);
+        assert_eq!(
+            grant
+                .evidence()
+                .escalation_review
+                .as_ref()
+                .and_then(|review| review.pa_objection_response.as_ref())
+                .and_then(|response| response.answer.as_ref())
+                .map(|answer| answer.reason.as_deref()),
+            Some(Some("pa-reason-sentinel"))
+        );
+        let baseline_digest = authorization_evidence_digest(grant.evidence(), &held_bound)
+            .expect("held exchange digest");
+        let mut changed_exchange = grant.evidence().clone();
+        changed_exchange
+            .escalation_review
+            .as_mut()
+            .and_then(|review| review.pa_objection_response.as_mut())
+            .and_then(|response| response.answer.as_mut())
+            .expect("PA response evidence")
+            .reason = Some("different optional reason".to_owned());
+        let changed_digest = authorization_evidence_digest(&changed_exchange, &held_bound)
+            .expect("changed held exchange digest");
+        assert_ne!(baseline_digest, changed_digest);
+        assert!(matches!(
+            pending.receiver_mut().await.expect("waiter result"),
+            WaiterResult::Resolved
+        ));
+    }
+
+    #[tokio::test]
+    async fn escalation_objection_pa_withdraw_ends_held_call_once_without_human_request() {
+        let (broker, _, escalation) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"block",
+                "risk":"high",
+                "misunderstanding":null,
+                "rationale":"do not send this"
+            }),
+        );
+        let (broker, responder) =
+            with_objection_answer(broker, json!({"outcome":"withdraw","reason":null}));
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[user_message("consider changing the title")],
+                scope(),
+                "run-withdraw",
+                "turn-withdraw",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("withdraw objection flow");
+        let RouteApprovalOutcome::Denied { evidence, .. } = outcome else {
+            panic!("withdraw must end the held call without asking Human")
+        };
+        assert_eq!(evidence.error_code(), "escalation_review_blocked");
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(responder.calls.load(Ordering::Relaxed), 1);
+        assert!(!broker.any_pending());
+    }
+
+    #[tokio::test]
     async fn elevated_resolution_ignores_a_different_human_without_consuming_pending() {
         let (broker, _, _) = broker(
             json!({"outcome":"block","risk":"high","rationale":"unused"}),
@@ -2035,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_transcript_keeps_first_and_latest_user_turns_and_marks_omissions() {
+    fn bounded_transcript_omits_oldest_content_keeps_latest_human_and_marks_omissions() {
         let mut transcript = (0..14)
             .map(|index| user_message(format!("user-turn<{index}>")))
             .collect::<Vec<_>>();
@@ -2046,14 +2410,15 @@ mod tests {
                 .expect("bounded transcript");
         let encoded = serde_json::to_string(&bounded).expect("bounded transcript");
 
-        assert!(encoded.contains("user-turn<0>"));
+        assert!(!encoded.contains("user-turn<0>"));
         assert!(encoded.contains("user-turn<13>"));
         assert!(!encoded.contains("user-turn<1>"));
-        assert!(!encoded.contains("user-turn<2>"));
+        assert!(encoded.contains("user-turn<2>"));
         assert!(encoded.contains("omitted_user_turns"));
         assert!(encoded.contains(REVIEW_TRUNCATION_MARKER));
-        assert!(!encoded.contains("assistant-text-must-not-appear"));
+        assert!(encoded.contains("assistant-text-must-not-appear"));
         assert!(!encoded.contains("tool-result-must-not-appear"));
+        assert!(encoded.contains("omitted_orphan_tool_results"));
     }
 
     #[test]
@@ -2119,7 +2484,7 @@ mod tests {
         let value = serde_json::to_value(&bounded).expect("serialize bounded transcript");
         let encoded = value.to_string();
 
-        assert_eq!(value["schema_version"], REVIEW_TRANSCRIPT_SCHEMA_VERSION_V5);
+        assert_eq!(value["schema_version"], REVIEW_TRANSCRIPT_SCHEMA_VERSION_V7);
         assert!(encoded.contains("secret_tool"));
         assert!(encoded.contains("\"route\":\"elevated\""));
         assert!(encoded.contains("[REDACTED:secret]"));
@@ -2145,20 +2510,20 @@ mod tests {
         let entries = value["entries"].as_array().expect("transcript entries");
         let selected_tool_calls = entries
             .iter()
-            .filter(|entry| {
-                matches!(
-                    entry["kind"].as_str(),
-                    Some("tool_call" | "rejected_tool_call")
-                )
+            .map(|entry| {
+                entry["tool_calls"].as_array().map_or(0, Vec::len)
+                    + entry["rejected_tool_calls"].as_array().map_or(0, Vec::len)
             })
-            .count();
+            .sum::<usize>();
         assert!(selected_tool_calls <= MAX_CONTEXT_TOOL_CALLS);
         let selected_tool_chars = entries
             .iter()
-            .filter(|entry| {
-                matches!(
-                    entry["kind"].as_str(),
-                    Some("tool_call" | "rejected_tool_call")
+            .flat_map(|entry| {
+                entry["tool_calls"].as_array().into_iter().flatten().chain(
+                    entry["rejected_tool_calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten(),
                 )
             })
             .map(|entry| entry.to_string().chars().count())
@@ -2191,14 +2556,107 @@ mod tests {
         );
         let secret_arguments = entries
             .iter()
-            .find(|entry| entry["tool"] == "secret_tool")
-            .and_then(|entry| entry.get("arguments"))
+            .flat_map(|entry| entry["tool_calls"].as_array().into_iter().flatten())
+            .find(|call| call["tool"] == "secret_tool")
+            .and_then(|call| call.get("arguments"))
             .expect("latest tool arguments");
         assert!(secret_arguments.to_string().chars().count() <= MAX_CONTEXT_TOOL_ARGUMENT_CHARS);
     }
 
+    #[test]
+    fn bounded_current_turn_keeps_assistant_text_and_settled_sibling_result_before_pending_call() {
+        let transcript = vec![
+            user_message("Please inspect, then update the exact record"),
+            assistant_contents(vec![
+                PublicAssistantContent::Text {
+                    text: "I checked the target and will now request the update".to_owned(),
+                    wire_item_index: 0,
+                },
+                PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "sibling-read".to_owned(),
+                        name: "workspace_list".to_owned(),
+                        route: ToolInvocationRoute::Normal,
+                        arguments: serde_json::from_value(json!({"limit":1}))
+                            .expect("sibling args"),
+                    },
+                    wire_item_index: 1,
+                },
+                PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "pending-update".to_owned(),
+                        name: "app_action".to_owned(),
+                        route: ToolInvocationRoute::Elevated,
+                        arguments: serde_json::from_value(json!({"title":"new"}))
+                            .expect("pending args"),
+                    },
+                    wire_item_index: 2,
+                },
+            ]),
+            tool_result_for(
+                "sibling-read",
+                "workspace_list",
+                "exact target exists",
+                json!({"count":1}),
+            ),
+        ];
+        let bounded = bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-update")
+            .expect("bounded current turn");
+        let encoded = serde_json::to_string(&bounded).expect("current turn evidence");
+        assert!(encoded.contains("I checked the target"));
+        assert!(encoded.contains("sibling-read"));
+        assert!(encoded.contains("exact target exists"));
+        assert!(!encoded.contains("pending-update"));
+        assert!(!encoded.contains("\"title\":\"new\""));
+    }
+
+    #[test]
+    fn bounded_transcript_redacts_human_assistant_tool_call_and_tool_result_lanes() {
+        let transcript = vec![
+            user_message("Human context api_key=human-secret-value"),
+            assistant_contents(vec![
+                PublicAssistantContent::Text {
+                    text: "Assistant context access_token=assistant-secret-value".to_owned(),
+                    wire_item_index: 0,
+                },
+                PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "secret-read".to_owned(),
+                        name: "workspace_list".to_owned(),
+                        route: ToolInvocationRoute::Normal,
+                        arguments: serde_json::from_value(
+                            json!({"api_key":"tool-argument-secret-value"}),
+                        )
+                        .expect("secret args"),
+                    },
+                    wire_item_index: 1,
+                },
+            ]),
+            tool_result_for(
+                "secret-read",
+                "workspace_list",
+                "secret=tool-result-secret-value",
+                json!({"refresh_token":"structured-result-secret-value"}),
+            ),
+        ];
+        let bounded =
+            bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call-not-present")
+                .expect("redacted transcript");
+        let encoded = serde_json::to_string(&bounded).expect("redacted evidence");
+        for secret in [
+            "human-secret-value",
+            "assistant-secret-value",
+            "tool-argument-secret-value",
+            "tool-result-secret-value",
+            "structured-result-secret-value",
+        ] {
+            assert!(!encoded.contains(secret), "secret leaked: {secret}");
+        }
+        assert!(encoded.matches("[REDACTED:secret]").count() >= 5);
+    }
+
     #[tokio::test]
-    async fn route_reviewers_receive_user_intent_and_exact_action_without_non_user_text() {
+    async fn route_reviewers_receive_role_preserved_text_and_exact_action() {
         const INVITE_CODE_SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
         const USER_SENTINEL: &str = "user-intent-review-sentinel";
         const IMAGE_SENTINEL: &str = "image-data-must-not-reach-reviewer";
@@ -2284,7 +2742,7 @@ mod tests {
             assert!(encoded.contains(INVITE_CODE_SENTINEL));
             assert!(encoded.contains(USER_SENTINEL));
             assert!(!encoded.contains(IMAGE_SENTINEL));
-            assert!(!encoded.contains(ASSISTANT_SENTINEL));
+            assert!(encoded.contains(ASSISTANT_SENTINEL));
             assert!(!encoded.contains(TOOL_RESULT_SENTINEL));
             assert!(encoded.contains("\"personality_agent_id\":\"agent-1\""));
             assert!(!encoded.contains("human_display_name"));

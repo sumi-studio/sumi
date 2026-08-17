@@ -25,14 +25,20 @@ use crate::{
             Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
             ReviewerTrustSet,
         },
-        route_policy::{PolicySnapshot, PolicySourceState},
+        route_broker::RouteApprovalBroker,
+        route_policy::{PolicySnapshot, PolicySourceState, RoutePolicy},
         route_reviewer::{
-            ESCALATION_PROMPT_VERSION_V6, ESCALATION_REVIEWER_VERSION_V6,
-            ESCALATION_SCHEMA_VERSION_V6, EXECUTION_PROMPT_VERSION_V6,
-            EXECUTION_REVIEWER_VERSION_V6, EXECUTION_SCHEMA_VERSION_V6, EscalationReviewDecision,
-            EscalationReviewEvidence, EscalationReviewOutcome, ExecutionReviewDecision,
-            ExecutionReviewEvidence, ExecutionReviewOutcome, ReviewerBudgetEvidence,
-            ReviewerTerminalClass, RiskLevel,
+            ESCALATION_PROMPT_VERSION_V7, ESCALATION_REVIEWER_VERSION_V7,
+            ESCALATION_SCHEMA_VERSION_V7, EXECUTION_PROMPT_VERSION_V7,
+            EXECUTION_REVIEWER_VERSION_V7, EXECUTION_SCHEMA_VERSION_V7, EscalationReviewDecision,
+            EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewer,
+            EscalationReviewerPrompt, EscalationReviewerTransport, ExecutionReviewDecision,
+            ExecutionReviewEvidence, ExecutionReviewOutcome, ExecutionReviewer,
+            ExecutionReviewerPrompt, ExecutionReviewerTransport, ReviewerBudgetEvidence,
+            ReviewerBudgetV1, ReviewerModelSpec as RouteReviewerModelSpec, ReviewerTerminalClass,
+            ReviewerTransportError as RouteReviewerTransportError, ReviewerTransportOutput,
+            ReviewerTrustSet as RouteReviewerTrustSet, RiskLevel,
+            execution_provider_wire_bodies_for_test,
         },
     },
     gateway::{ApprovalDecision, CommandEnvelope, CommandId},
@@ -44,16 +50,21 @@ use crate::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObserver, RequestOptions,
         assembler::ResponseBudget,
         types::{
-            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, PromptContext,
-            ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
+            PromptContext, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
             ProviderContextPayload, ProviderEventStream, ProviderOrigin, ProviderOutput,
             PublicAssistantMessage, RejectedToolCall, SuccessTerminalCommit, ToolArgumentError,
-            Usage, ValidatedToolArguments,
+            Usage, UserContent, UserMessage, ValidatedToolArguments,
         },
     },
     runtime::contracts::ProcessGeneration,
     store::Redactor,
-    tools::{ToolError, ToolRegistryBuilder, WorkspacePaths},
+    tools::{
+        AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
+        BoundToolCtx, BoundToolExecutionOutcome, CapabilityClass, DescribeError, ResourceScope,
+        ReviewProjection as ToolReviewProjection, Tool, ToolBindCtx, ToolBinding, ToolCtx,
+        ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk, WorkspacePaths,
+    },
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -466,9 +477,9 @@ fn execution_review_denial(terminal: ReviewerTerminalClass) -> ToolExecutionDeni
         },
         policy_decision: PolicyDecisionRecord::Unmatched,
         execution_review: Some(ExecutionReviewEvidence {
-            reviewer_version: EXECUTION_REVIEWER_VERSION_V6.to_owned(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V6.to_owned(),
-            schema_version: EXECUTION_SCHEMA_VERSION_V6.to_owned(),
+            reviewer_version: EXECUTION_REVIEWER_VERSION_V7.to_owned(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V7.to_owned(),
+            schema_version: EXECUTION_SCHEMA_VERSION_V7.to_owned(),
             model_id: "reviewer".to_owned(),
             model_binding_digest: "binding".to_owned(),
             budget: ReviewerBudgetEvidence {
@@ -510,9 +521,9 @@ fn escalation_review_denial() -> ToolExecutionDenialEvidence {
         policy_decision: PolicyDecisionRecord::ElevatedPreflight,
         execution_review: None,
         escalation_review: Some(EscalationReviewEvidence {
-            reviewer_version: ESCALATION_REVIEWER_VERSION_V6.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V6.to_owned(),
-            schema_version: ESCALATION_SCHEMA_VERSION_V6.to_owned(),
+            reviewer_version: ESCALATION_REVIEWER_VERSION_V7.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V7.to_owned(),
+            schema_version: ESCALATION_SCHEMA_VERSION_V7.to_owned(),
             model_id: "reviewer".to_owned(),
             model_binding_digest: "binding".to_owned(),
             budget: ReviewerBudgetEvidence {
@@ -528,6 +539,7 @@ fn escalation_review_denial() -> ToolExecutionDenialEvidence {
                 misunderstanding: Some("対象不明".to_owned()),
                 rationale: rationale.clone(),
             },
+            pa_objection_response: None,
         }),
         reason: rationale,
     }
@@ -569,10 +581,7 @@ fn route_denial_tool_result_distinguishes_judged_and_technical_review_blocks() {
     let [UserContent::Text { text }] = escalation.content.as_slice() else {
         panic!("escalation denial text")
     };
-    assert_eq!(
-        text,
-        "本人へ確認を出す前のレビューで止まりました。理由: 承認要求の対象が曖昧です"
-    );
+    assert_eq!(text, "承認要求の対象が曖昧です");
     assert_eq!(escalation.details["error"], "escalation_review_blocked");
     assert_eq!(escalation.details["review"]["outcome"], "block");
     assert_eq!(escalation.details["review"]["judged"], true);
@@ -846,6 +855,241 @@ fn bound_core_with_runtime_shutdown(seq: u64, shutdown: &CancellationToken) -> R
     let mut core = bound_core(seq);
     core.runtime_shutdown = shutdown.child_token();
     core
+}
+
+struct RunLoopRouteTool;
+
+#[async_trait]
+impl Tool for RunLoopRouteTool {
+    fn def(&self) -> crate::provider::types::ToolDefinition {
+        crate::provider::types::ToolDefinition {
+            name: "fixture_tool".to_owned(),
+            description: "run-loop route review fixture".to_owned(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Mutating
+    }
+
+    fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+        Some(self)
+    }
+
+    async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+        unreachable!("run-loop review fixture never executes the raw tool")
+    }
+}
+
+#[async_trait]
+impl BoundToolAdapter for RunLoopRouteTool {
+    fn identity(&self) -> AdapterIdentity {
+        AdapterIdentity::new("sumi.fixture", 1).expect("fixture adapter")
+    }
+
+    async fn bind(&self, _ctx: ToolBindCtx<'_>) -> Result<ToolBinding, DescribeError> {
+        Ok(ToolBinding::new(
+            AppActionDescriptor::new(
+                "fixture.operation",
+                CapabilityClass::Mutate,
+                vec![ResourceScope::resource("fixture", "record", "one")],
+            )?,
+            ToolReviewProjection::from_value(json!({
+                "operation":"fixture.operation",
+                "target":"one"
+            }))?,
+            BoundExecutionArguments::from_value(json!({"target":"one"}))?,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        _ctx: BoundToolCtx<'_>,
+    ) -> Result<BoundToolExecutionOutcome, ToolError> {
+        unreachable!("run-loop route review fixture does not execute")
+    }
+}
+
+struct RunLoopExecutionReviewTransport {
+    model: RouteReviewerModelSpec,
+    prompts: Mutex<Vec<ExecutionReviewerPrompt>>,
+}
+
+#[async_trait]
+impl ExecutionReviewerTransport for RunLoopExecutionReviewTransport {
+    fn model_spec(&self) -> &RouteReviewerModelSpec {
+        &self.model
+    }
+
+    async fn complete(
+        &self,
+        prompt: &ExecutionReviewerPrompt,
+        _tool_call_offset: usize,
+        _cancel: CancellationToken,
+    ) -> std::result::Result<ReviewerTransportOutput, RouteReviewerTransportError> {
+        self.prompts
+            .lock()
+            .expect("run-loop prompts")
+            .push(prompt.clone());
+        Ok(ReviewerTransportOutput {
+            text: r#"{"outcome":"allow","risk":"low","rationale":"current turn visible"}"#
+                .to_owned(),
+            tool_trace: Vec::new(),
+        })
+    }
+}
+
+struct RunLoopEscalationReviewTransport {
+    model: RouteReviewerModelSpec,
+}
+
+#[async_trait]
+impl EscalationReviewerTransport for RunLoopEscalationReviewTransport {
+    fn model_spec(&self) -> &RouteReviewerModelSpec {
+        &self.model
+    }
+
+    async fn complete(
+        &self,
+        _prompt: &EscalationReviewerPrompt,
+        _tool_call_offset: usize,
+        _cancel: CancellationToken,
+    ) -> std::result::Result<ReviewerTransportOutput, RouteReviewerTransportError> {
+        Ok(ReviewerTransportOutput {
+            text: r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":"unused"}"#
+                .to_owned(),
+            tool_trace: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn route_run_loop_sends_human_and_current_assistant_pending_call_to_reviewer_wire() {
+    const HUMAN_SENTINEL: &str = "run-loop-human-turn-sentinel";
+    const ASSISTANT_SENTINEL: &str = "run-loop-current-assistant-sentinel";
+    const CALL_ID: &str = "run-loop-current-pending-call";
+
+    let model = RouteReviewerModelSpec::new(
+        "run-loop-reviewer",
+        "fixture",
+        "https://reviewer.invalid",
+        "fixture-account",
+        "fixture-trust",
+        "fixture-policy",
+    );
+    let execution_transport = Arc::new(RunLoopExecutionReviewTransport {
+        model: model.clone(),
+        prompts: Mutex::new(Vec::new()),
+    });
+    let trust = RouteReviewerTrustSet::new(vec![model.clone()]);
+    let execution = Arc::new(
+        ExecutionReviewer::new(
+            model.clone(),
+            trust.clone(),
+            execution_transport.clone(),
+            ReviewerBudgetV1::execution(),
+        )
+        .expect("execution reviewer"),
+    );
+    let escalation = Arc::new(
+        EscalationReviewer::new(
+            model.clone(),
+            trust,
+            Arc::new(RunLoopEscalationReviewTransport { model }),
+            ReviewerBudgetV1::escalation(),
+        )
+        .expect("escalation reviewer"),
+    );
+    let broker = Arc::new(RouteApprovalBroker::new(
+        RoutePolicy::baseline_only_v1(),
+        Redactor::v1(),
+        execution,
+        escalation,
+    ));
+
+    let call = ToolCall {
+        id: CALL_ID.to_owned(),
+        name: "fixture_tool".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
+        arguments: serde_json::from_value(json!({"target":"one"})).expect("validated fixture args"),
+    };
+    let mut registry_builder = ToolRegistryBuilder::default();
+    registry_builder
+        .register(Arc::new(RunLoopRouteTool))
+        .expect("register run-loop tool");
+    let sealed = registry_builder
+        .build()
+        .bind(
+            &call,
+            "run-loop-flow",
+            &WorkspacePaths::new("/workspace").expect("workspace"),
+        )
+        .await
+        .expect("bind current pending call");
+
+    let mut core = bound_core(1);
+    core.runtime_context.push(ContextMessage::Synthetic {
+        message: Message::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: HUMAN_SENTINEL.to_owned(),
+            }],
+            timestamp: timestamp(),
+        }),
+    });
+    core.set_approval(broker.clone());
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let current_turn = PublicMessage::Assistant(PublicAssistantMessage {
+        content: vec![
+            PublicAssistantContent::Text {
+                text: ASSISTANT_SENTINEL.to_owned(),
+                wire_item_index: 0,
+            },
+            PublicAssistantContent::ToolCall {
+                tool_call: call,
+                wire_item_index: 1,
+            },
+        ],
+        model: "fixture".to_owned(),
+        provider: "fixture".to_owned(),
+        origin: ProviderOrigin {
+            provider_instance_id: "fixture".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "fixture".to_owned(),
+        },
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        provider_code: None,
+        interrupted: false,
+        timestamp: timestamp(),
+    });
+    let disposition = runner
+        .evaluate_route_call(
+            broker,
+            sealed,
+            crate::provider::types::ToolInvocationRoute::Normal,
+            &[current_turn],
+        )
+        .await
+        .expect("route review from run loop");
+    assert!(matches!(disposition, RouteCallDisposition::Allowed { .. }));
+
+    let prompts = execution_transport
+        .prompts
+        .lock()
+        .expect("run-loop prompts");
+    assert_eq!(prompts.len(), 1);
+    for (_, body) in execution_provider_wire_bodies_for_test(prompts[0].request.clone()) {
+        let encoded = body.to_string();
+        assert!(encoded.contains(HUMAN_SENTINEL));
+        assert!(encoded.contains(ASSISTANT_SENTINEL));
+        assert!(encoded.contains(CALL_ID));
+        assert!(encoded.contains("pending_action_under_review"));
+    }
 }
 
 #[tokio::test]
