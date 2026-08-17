@@ -420,18 +420,16 @@ func (s *Store) InstallDirectChatForNewHumanInTx(
 	humanID string,
 ) (Installation, error) {
 	actor := participant.Human(humanID)
+	releaseLifecycle, err := s.acquireLifecycleMutation(ctx, directchat.AppID)
+	if err != nil {
+		return Installation{}, err
+	}
+	defer releaseLifecycle()
 	operationID, err := directChatProvisionOperationIDForActiveOrNextAttempt(ctx, tx, humanID)
 	if err != nil {
 		return Installation{}, err
 	}
-	return s.InstallAtOperationInTx(
-		ctx,
-		tx,
-		ParticipantOwner(actor),
-		actor,
-		directchat.AppID,
-		operationID,
-	)
+	return s.installAtOperationInTx(ctx, tx, ParticipantOwner(actor), actor, directchat.AppID, operationID)
 }
 
 func directChatProvisionOperationIDForActiveOrNextAttempt(ctx context.Context, tx pgx.Tx, humanID string) (string, error) {
