@@ -71,18 +71,29 @@ func pollMatchesInput(poll *Poll, input *PollInput) bool {
 }
 
 func (in *PollInput) Validate(now time.Time) error {
+	if err := in.validateFields(); err != nil {
+		return err
+	}
+	return in.validateDeadline(now)
+}
+
+// validateFields normalizes and validates the durable poll payload. It is
+// deliberately separate from validateDeadline: an idempotent retry must still
+// be able to compare its normalized request with the receipt after the poll
+// has closed.
+func (in *PollInput) validateFields() error {
 	if in == nil {
 		return ErrInvalidPoll
 	}
 	in.Question = strings.TrimSpace(in.Question)
-	if in.Question == "" || utf8.RuneCountInString(in.Question) > MaxPollQuestionChars {
+	if in.Question == "" || strings.ContainsRune(in.Question, '\x00') || utf8.RuneCountInString(in.Question) > MaxPollQuestionChars {
 		return fmt.Errorf("%w: question must be 1..%d characters", ErrInvalidPoll, MaxPollQuestionChars)
 	}
 	options := make([]string, 0, len(in.Options))
 	seen := map[string]bool{}
 	for _, option := range in.Options {
 		option = strings.TrimSpace(option)
-		if option == "" || utf8.RuneCountInString(option) > MaxPollOptionChars {
+		if option == "" || strings.ContainsRune(option, '\x00') || utf8.RuneCountInString(option) > MaxPollOptionChars {
 			return fmt.Errorf("%w: option must be 1..%d characters", ErrInvalidPoll, MaxPollOptionChars)
 		}
 		if seen[option] {
@@ -95,6 +106,10 @@ func (in *PollInput) Validate(now time.Time) error {
 		return fmt.Errorf("%w: a poll needs %d..%d options", ErrInvalidPoll, MinPollOptions, MaxPollOptions)
 	}
 	in.Options = options
+	return nil
+}
+
+func (in *PollInput) validateDeadline(now time.Time) error {
 	if in.ClosesAt != nil {
 		if !in.ClosesAt.After(now) || in.ClosesAt.After(now.Add(MaxPollDuration)) {
 			return fmt.Errorf("%w: closing time is outside the accepted range", ErrInvalidPoll)

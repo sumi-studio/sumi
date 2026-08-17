@@ -438,7 +438,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       request: Promise<boolean>;
     }
   >();
-  const pollProjectionVersions = new Map<PlaceKey, number>();
+  // Poll snapshots arrive both via HTTP and WebSocket without a wire revision.
+  // Their freshness therefore belongs to the message, not the place: a vote on
+  // one poll must not invalidate a resync snapshot for another poll.
+  const pollProjectionVersions = new Map<string, number>();
 
   const invalidateThreadSummary = (threadId: string): number => {
     const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
@@ -772,15 +775,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const resyncReactions = (place: Place): Promise<void> =>
     enqueueReactionProjection(place, async (resyncBackend, isCurrent) => {
       const key = placeKey(place);
-      const pollVersion = pollProjectionVersions.get(key) ?? 0;
       const loaded = get().messagesByPlace[key];
       if (!loaded || loaded.length === 0) return () => undefined;
       const reactionsById = new Map<string, ReactionSummary[]>();
       const pollsById = new Map<string, Message["poll"]>();
+      const pollVersionsById = new Map<string, number>();
       const ranges: { oldestSeq: number; newestSeq: number }[] = [];
       for (const message of [...loaded].sort(
         (left, right) => left.seq - right.seq,
       )) {
+        pollVersionsById.set(
+          message.messageId,
+          pollProjectionVersions.get(message.messageId) ?? 0,
+        );
         const current = ranges[ranges.length - 1];
         if (current && message.seq <= current.newestSeq + 1) {
           current.newestSeq = Math.max(current.newestSeq, message.seq);
@@ -828,7 +835,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
               reactionsFingerprint(reactions) !==
               reactionsFingerprint(message.reactions);
             const pollCanApply =
-              (pollProjectionVersions.get(key) ?? 0) === pollVersion &&
+              (pollProjectionVersions.get(message.messageId) ?? 0) ===
+                (pollVersionsById.get(message.messageId) ?? 0) &&
               pollsById.has(message.messageId);
             if (!reactionsChanged && !pollCanApply) return message;
             const poll = pollCanApply
@@ -948,8 +956,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     if (event.type === "poll_updated") {
       const key = placeKey(event.message.place);
       pollProjectionVersions.set(
-        key,
-        (pollProjectionVersions.get(key) ?? 0) + 1,
+        event.message.messageId,
+        (pollProjectionVersions.get(event.message.messageId) ?? 0) + 1,
       );
       set((state) => {
         const current = state.messagesByPlace[key];
@@ -2211,6 +2219,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
       if (!currentBackend.votePoll) return;
+      const projectionVersion =
+        pollProjectionVersions.get(message.messageId) ?? 0;
       void currentBackend
         .votePoll(message.place, message.messageId, optionIds)
         .then((canonical) => {
@@ -2222,16 +2232,26 @@ export const useMessaging = create<MessagingState>((set, get) => {
             return;
           }
           const key = placeKey(message.place);
-          set((state) => ({
-            messagesByPlace: {
-              ...state.messagesByPlace,
-              [key]: (state.messagesByPlace[key] ?? []).map((entry) =>
-                entry.messageId === canonical.messageId && !entry.deleted
-                  ? { ...entry, poll: canonical.poll ?? null }
-                  : entry,
-              ),
-            },
-          }));
+          set((state) => {
+            // A live snapshot received while this request was in flight is
+            // newer than this acknowledgement. HTTP and WS have no ordering.
+            if (
+              (pollProjectionVersions.get(message.messageId) ?? 0) !==
+              projectionVersion
+            ) {
+              return {};
+            }
+            return {
+              messagesByPlace: {
+                ...state.messagesByPlace,
+                [key]: (state.messagesByPlace[key] ?? []).map((entry) =>
+                  entry.messageId === canonical.messageId && !entry.deleted
+                    ? { ...entry, poll: canonical.poll ?? null }
+                    : entry,
+                ),
+              },
+            };
+          });
         })
         .catch(() => undefined);
     },

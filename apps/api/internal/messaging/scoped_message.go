@@ -34,7 +34,7 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 		return Message{}, false, ErrTooManyAttachments
 	}
 	if in.Poll != nil {
-		if err := in.Poll.Validate(time.Now()); err != nil {
+		if err := in.Poll.validateFields(); err != nil {
 			return Message{}, false, err
 		}
 	}
@@ -127,6 +127,13 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 			return Message{}, false, fmt.Errorf("commit idempotent scoped append: %w", err)
 		}
 		return existing, false, nil
+	}
+	// A closing time only controls creation. Existing nonce receipts above are
+	// recoverable indefinitely, including after the poll has closed.
+	if in.Poll != nil {
+		if err := in.Poll.validateDeadline(time.Now()); err != nil {
+			return Message{}, false, err
+		}
 	}
 	if in.ReplyTo != "" {
 		var samePlace bool

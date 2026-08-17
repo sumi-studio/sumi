@@ -61,6 +61,41 @@ func TestPollLifecycleUsesMessageTransactionAndWholeVoteReplacement(t *testing.T
 	}
 }
 
+func TestPollRetryAfterClosingTimeReturnsOriginalReceipt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	a := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	closesAt := time.Now().Add(100 * time.Millisecond).UTC().Truncate(time.Microsecond)
+	input := AppendInput{
+		PlaceID: channel.PlaceID, ClientNonce: "retry-after-close",
+		Poll: &PollInput{Question: "締切後も再試行できる？", Options: []string{"はい", "いいえ"}, ClosesAt: &closesAt},
+	}
+	created, didCreate, err := a.AppendMessage(ctx, input)
+	if err != nil || !didCreate {
+		t.Fatalf("create poll: created=%v err=%v", didCreate, err)
+	}
+	time.Sleep(time.Until(closesAt) + 20*time.Millisecond)
+	replayed, didCreate, err := a.AppendMessage(ctx, input)
+	if err != nil || didCreate || replayed.MessageID != created.MessageID {
+		t.Fatalf("retry after close = %+v created=%v err=%v", replayed, didCreate, err)
+	}
+}
+
+func TestPollInputRejectsNULText(t *testing.T) {
+	for name, input := range map[string]PollInput{
+		"question": {Question: "bad\x00question", Options: []string{"A", "B"}},
+		"option":   {Question: "question", Options: []string{"bad\x00option", "B"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := input.Validate(time.Now()); !errors.Is(err, ErrInvalidPoll) {
+				t.Fatalf("Validate() error = %v, want invalid poll", err)
+			}
+		})
+	}
+}
+
 func TestPollDeadlineProjectionPreservationAndTombstone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -134,5 +169,13 @@ func TestPollHTTPCreateAndVoteReturnWholeMessage(t *testing.T) {
 	voters := voted["options"].([]any)[0].(map[string]any)["voters"].([]any)
 	if len(voters) != 1 {
 		t.Fatalf("visible voters = %v", voters)
+	}
+	resp, body = call(t, server, http.MethodPost, path, w.humanA.ID, map[string]any{
+		"content": "", "client_nonce": "nul-poll", "poll": map[string]any{
+			"question": "bad\x00question", "options": []string{"A", "B"},
+		},
+	})
+	if resp.StatusCode != http.StatusBadRequest || body["code"] != "invalid_poll" {
+		t.Fatalf("NUL poll status %d body %v", resp.StatusCode, body)
 	}
 }

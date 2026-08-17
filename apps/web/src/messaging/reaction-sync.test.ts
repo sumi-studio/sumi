@@ -662,6 +662,7 @@ class StubBackend implements MessagingBackend {
     | ReactionMutationResult
     | Promise<ReactionMutationResult>
   )[] = [];
+  readonly pollVoteResults: (Message | Promise<Message>)[] = [];
   holdFetches = false;
   private heldFetches: {
     response: Message[];
@@ -790,7 +791,7 @@ class StubBackend implements MessagingBackend {
   );
   votePoll = vi.fn(
     async (_place: Place, _messageId: string, _optionIds: string[]) =>
-      message(1, "message"),
+      await (this.pollVoteResults.shift() ?? message(1, "message")),
   );
   async setNotificationSetting(): ReturnType<
     MessagingBackend["setNotificationSetting"]
@@ -869,5 +870,108 @@ describe("poll convergence in the messaging store", () => {
     expect(projected?.content).toBe("edited content");
     expect(projected?.editedAt).toBe(99);
     expect(projected?.poll?.options[0]?.voters).toEqual([self]);
+  });
+
+  it("still applies a missed poll snapshot when a different poll changes live", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const first = {
+      ...message(1, "first"),
+      poll: {
+        question: "first?",
+        allowMulti: false,
+        closesAt: null,
+        options: [{ optionId: "first-option", text: "A", voters: [] }],
+      },
+    };
+    const second = {
+      ...message(2, "second"),
+      poll: {
+        question: "second?",
+        allowMulti: false,
+        closesAt: null,
+        options: [{ optionId: "second-option", text: "B", voters: [] }],
+      },
+    };
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [first, second] } });
+    harness.history = [
+      {
+        ...first,
+        poll: {
+          ...first.poll,
+          options: [{ optionId: "first-option", text: "A", voters: [self] }],
+        },
+      },
+      second,
+    ];
+    harness.holdFetches = true;
+
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    harness.emit({
+      type: "poll_updated",
+      message: {
+        ...second,
+        poll: {
+          ...second.poll,
+          options: [
+            { optionId: "second-option", text: "B", voters: [other] },
+          ],
+        },
+      },
+    });
+    harness.releaseFetches();
+    await harness.settle();
+
+    const projected = useMessaging.getState().messagesByPlace[placeKey] ?? [];
+    expect(projected[0]?.poll?.options[0]?.voters).toEqual([self]);
+    expect(projected[1]?.poll?.options[0]?.voters).toEqual([other]);
+  });
+
+  it("does not let a delayed vote acknowledgement roll back a live poll update", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<Message>();
+    harness.pollVoteResults.push(acknowledgement.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = {
+      ...message(1, "poll"),
+      poll: {
+        question: "which?",
+        allowMulti: false,
+        closesAt: null,
+        options: [{ optionId: "option", text: "A", voters: [] }],
+      },
+    };
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
+
+    useMessaging.getState().votePoll(initial, ["option"]);
+    await harness.settle();
+    harness.emit({
+      type: "poll_updated",
+      message: {
+        ...initial,
+        poll: {
+          ...initial.poll,
+          options: [{ optionId: "option", text: "A", voters: [other] }],
+        },
+      },
+    });
+    acknowledgement.resolve({
+      ...initial,
+      poll: {
+        ...initial.poll,
+        options: [{ optionId: "option", text: "A", voters: [self] }],
+      },
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll?.options[0]
+        ?.voters,
+    ).toEqual([other]);
   });
 });
