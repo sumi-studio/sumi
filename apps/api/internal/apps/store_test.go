@@ -556,11 +556,12 @@ func TestDurableInstallOperationReceiptSurvivesUninstall(t *testing.T) {
 func TestInstallDirectChatForNewHumanInTxCreatesEnabledEpochOneBinding(t *testing.T) {
 	w := newAppWorld(t)
 	ctx := context.Background()
+	directChatApps := applicationapps.New(w.pool, w.workspaces, directchat.NewLifecycleFence())
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	installed, err := applicationapps.New(w.pool, w.workspaces, directchat.NewLifecycleFence()).InstallDirectChatForNewHumanInTx(
+	installed, err := directChatApps.InstallDirectChatForNewHumanInTx(
 		ctx, tx, testHumanMember,
 	)
 	if err != nil {
@@ -573,12 +574,24 @@ func TestInstallDirectChatForNewHumanInTxCreatesEnabledEpochOneBinding(t *testin
 	if installed.AppID != directchat.AppID || installed.State != applicationapps.StateEnabled || installed.AuthorityEpoch != 1 {
 		t.Fatalf("initial direct-chat installation = %#v", installed)
 	}
+	var firstOperationID string
+	if err := w.pool.QueryRow(ctx, `
+		SELECT operation_id::text
+		FROM app_install_operation_receipts
+		WHERE installation_id = $1`, installed.InstallationID,
+	).Scan(&firstOperationID); err != nil {
+		t.Fatal(err)
+	}
+	firstOperationUUID, err := uuid.Parse(firstOperationID)
+	if err != nil || firstOperationUUID.Version() != 5 {
+		t.Fatalf("initial direct-chat operation id = %q, %v; want canonical UUIDv5", firstOperationID, err)
+	}
 
 	tx, err = w.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := applicationapps.New(w.pool, w.workspaces, directchat.NewLifecycleFence()).InstallDirectChatForNewHumanInTx(
+	replayed, err := directChatApps.InstallDirectChatForNewHumanInTx(
 		ctx, tx, testHumanMember,
 	)
 	if err != nil {
@@ -590,6 +603,50 @@ func TestInstallDirectChatForNewHumanInTxCreatesEnabledEpochOneBinding(t *testin
 	}
 	if replayed != installed {
 		t.Fatalf("deterministic installation replay = %#v, want %#v", replayed, installed)
+	}
+	var receiptCount int
+	if err := w.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM app_install_operation_receipts
+		WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = $2`,
+		testHumanMember, directchat.AppID,
+	).Scan(&receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if receiptCount != 1 {
+		t.Fatalf("retried initial Direct Chat receipt count = %d, want 1", receiptCount)
+	}
+
+	if err := directChatApps.UninstallByID(ctx, installed.InstallationID, w.member); err != nil {
+		t.Fatalf("uninstall initial Direct Chat: %v", err)
+	}
+	tx, err = w.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reinstalled, err := directChatApps.InstallDirectChatForNewHumanInTx(
+		ctx, tx, testHumanMember,
+	)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("reinstall Direct Chat after uninstall: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if reinstalled.InstallationID == installed.InstallationID {
+		t.Fatalf("reinstall reused installation id %s", reinstalled.InstallationID)
+	}
+	var secondOperationID string
+	if err := w.pool.QueryRow(ctx, `
+		SELECT operation_id::text
+		FROM app_install_operation_receipts
+		WHERE installation_id = $1`, reinstalled.InstallationID,
+	).Scan(&secondOperationID); err != nil {
+		t.Fatal(err)
+	}
+	if secondOperationID == firstOperationID {
+		t.Fatalf("reinstall reused direct-chat operation id %q", secondOperationID)
 	}
 }
 

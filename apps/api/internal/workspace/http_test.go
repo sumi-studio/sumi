@@ -810,6 +810,7 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		{name: "null", operationField: `,"operation_id":null`},
 		{name: "empty", operationField: `,"operation_id":""`},
 		{name: "malformed", operationField: `,"operation_id":"not-a-uuid"`},
+		{name: "derived", operationField: `,"operation_id":"00000000-0000-5000-8000-000000000202"`},
 	} {
 		invalid := browserCall(mux, http.MethodPost, "/app-installations", fmt.Sprintf(
 			`{"owner":{"kind":"participant","participant":{"kind":"human","human_id":%q}},"app_id":"alarm"%s}`,
@@ -832,6 +833,11 @@ func TestHumanAndAgentTransportsConvergeOnRoleAndAppLifecycle(t *testing.T) {
 		agentWorkspace.WorkspaceID), w.agentA.ID)
 	if agentInstall.Code != http.StatusCreated {
 		t.Fatalf("Agent app install status = %d, body=%s", agentInstall.Code, agentInstall.Body.String())
+	}
+	if derived := invokeLocal(server.localInstallApp, fmt.Sprintf(
+		`{"owner":{"kind":"workspace","workspace_id":%q},"app_id":"messaging","operation_id":"00000000-0000-5000-8000-000000000203"}`,
+		agentWorkspace.WorkspaceID), w.agentA.ID); derived.Code != http.StatusBadRequest {
+		t.Fatalf("Agent app install with derived operation id = %d, body=%s", derived.Code, derived.Body.String())
 	}
 	installations := make(map[string]appInstallationWire, 2)
 	for label, response := range map[string]*httptest.ResponseRecorder{

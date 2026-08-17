@@ -21,9 +21,12 @@ func TestAppInstallationUniqueConstraintClassificationIsExact(t *testing.T) {
 	}
 }
 
-func TestInstallOperationIDRequiresCanonicalUUIDv4(t *testing.T) {
+func TestInstallOperationIDAcceptsCanonicalUUIDv4OrDerivedUUIDv5(t *testing.T) {
 	if err := ValidateInstallOperationID("00000000-0000-4000-8000-000000000101"); err != nil {
 		t.Fatalf("canonical UUIDv4 rejected: %v", err)
+	}
+	if err := ValidateInstallOperationID("00000000-0000-5000-8000-000000000101"); err != nil {
+		t.Fatalf("derived UUIDv5 rejected: %v", err)
 	}
 	for _, value := range []string{
 		"00000000-0000-7000-8000-000000000101",
@@ -37,9 +40,11 @@ func TestInstallOperationIDRequiresCanonicalUUIDv4(t *testing.T) {
 	}
 }
 
-func TestDirectChatProvisionOperationIDIsCanonicalUUIDv4(t *testing.T) {
-	operationID := directChatProvisionOperationID("0198f0f4-9b72-7000-8000-000000000202")
-	if err := ValidateInstallOperationID(operationID); err != nil {
-		t.Fatalf("direct-chat provision operation id %q rejected: %v", operationID, err)
+func TestClientInstallOperationIDRequiresCanonicalUUIDv4(t *testing.T) {
+	if err := ValidateClientInstallOperationID("00000000-0000-4000-8000-000000000101"); err != nil {
+		t.Fatalf("canonical UUIDv4 rejected: %v", err)
+	}
+	if err := ValidateClientInstallOperationID("00000000-0000-5000-8000-000000000101"); err != ErrInstallOperationInvalid {
+		t.Fatalf("derived UUIDv5 client operation = %v", err)
 	}
 }

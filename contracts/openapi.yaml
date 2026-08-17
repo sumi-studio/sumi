@@ -940,6 +940,17 @@ components:
       type: string
       format: uuid
       pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      description: Random, client-chosen canonical RFC 4122 UUIDv4.
+    UUIDv5:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      description: Deterministic, server-derived canonical RFC 4122 UUIDv5. It is not accepted from client install request boundaries.
+    InstallOperationID:
+      description: Durable install identity. Client requests use UUIDv4; trusted server provisioning may use a declared UUIDv5 derivation.
+      oneOf:
+        - $ref: "#/components/schemas/UUIDv4"
+        - $ref: "#/components/schemas/UUIDv5"
     APIError:
       type: object
       required: [error]
@@ -1251,7 +1262,7 @@ components:
         operation_id:
           $ref: "#/components/schemas/UUIDv4"
     AppInstallRequest:
-      description: Strict owner-discriminated install intent with a durable UUIDv4 operation identity.
+      description: Strict owner-discriminated install intent with a durable client-chosen UUIDv4 operation identity. Trusted server provisioning may use the documented UUIDv5 derived form internally.
       oneOf:
         - $ref: "#/components/schemas/WorkspaceAppInstallRequest"
         - $ref: "#/components/schemas/ParticipantAppInstallRequest"

@@ -797,7 +797,7 @@ func (s *Server) localInstallApp(w http.ResponseWriter, r *http.Request, authori
 	}
 	owner, err := request.Owner.ref()
 	operationID, present, valid := optionalNonEmptyString(request.OperationID)
-	if err != nil || request.AppID == "" || !present || !valid || applicationapps.ValidateInstallOperationID(operationID) != nil {
+	if err != nil || request.AppID == "" || !present || !valid || applicationapps.ValidateClientInstallOperationID(operationID) != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
