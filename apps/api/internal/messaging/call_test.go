@@ -338,6 +338,7 @@ func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
 func TestCallRegistryRebuildPreservesWebhookAppliedDuringSnapshot(t *testing.T) {
 	now := time.Unix(1_780_000_100, 0)
 	registry := NewCallRegistry()
+	snapshotParticipant := Human("01900000-0000-7000-8000-0000000000aa")
 	webhookParticipant := Human("01900000-0000-7000-8000-0000000000bb")
 	service := &CallService{
 		Registry: registry,
@@ -358,12 +359,35 @@ func TestCallRegistryRebuildPreservesWebhookAppliedDuringSnapshot(t *testing.T) 
 		t.Fatal(err)
 	}
 	state, ok := registry.snapshot("place-1")
-	if !ok || len(state.Participants) != 1 || state.Participants[0].Participant != webhookParticipant {
-		t.Fatalf("newer webhook state was overwritten by snapshot: %+v", state)
+	if !ok || state.StartedAt.Unix() != 1_780_000_000 || len(state.Participants) != 2 ||
+		state.Participants[0].Participant != snapshotParticipant || state.Participants[1].Participant != webhookParticipant {
+		t.Fatalf("snapshot and newer webhook participants were not merged: %+v", state)
 	}
 }
 
-func TestCallServiceRemovesClosedWorkspaceMemberFromLiveKitRooms(t *testing.T) {
+func TestCallRegistryRebuildDoesNotResurrectFinishedRoom(t *testing.T) {
+	registry := NewCallRegistry()
+	service := &CallService{
+		Registry: registry,
+		RoomService: stubLiveKitRoomService{
+			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			participants: map[string][]liveKitParticipant{
+				"place-1": {{Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001}},
+			},
+			onListParticipants: func(string) {
+				registry.close("place-1")
+			},
+		},
+	}
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state, ok := registry.snapshot("place-1"); ok {
+		t.Fatalf("finished room was resurrected by snapshot: %+v", state)
+	}
+}
+
+func TestCallServiceRemovesClosedWorkspaceMemberPublishesOnceAndIgnoresWebhookDuplicate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
@@ -374,8 +398,11 @@ func TestCallServiceRemovesClosedWorkspaceMemberFromLiveKitRooms(t *testing.T) {
 		t.Fatal(err)
 	}
 	removed := [][2]string{}
+	hub := NewHub(w.store.core)
+	server := NewServer(w.store.core, stubSessions{})
+	server.Hub = hub
 	service := &CallService{
-		Server:   NewServer(w.store.core, nil),
+		Server:   server,
 		Registry: NewCallRegistry(),
 		RoomService: stubLiveKitRoomService{
 			rooms: []liveKitRoom{{Name: channel.PlaceID}, {Name: "01900000-0000-7000-8000-0000000000ff"}},
@@ -385,11 +412,45 @@ func TestCallServiceRemovesClosedWorkspaceMemberFromLiveKitRooms(t *testing.T) {
 			removed: &removed,
 		},
 	}
+	service.Registry.join(channel.PlaceID, w.humanB, time.Unix(1_780_000_000, 0))
+	subscriber := hub.subscribe(owner)
+	defer hub.unsubscribe(subscriber)
 	if err := service.RemoveWorkspaceParticipant(ctx, fixture.workspace.WorkspaceID, w.humanB); err != nil {
 		t.Fatal(err)
 	}
 	if len(removed) != 1 || removed[0] != [2]string{channel.PlaceID, w.humanB.Key()} {
 		t.Fatalf("RemoveParticipant calls = %+v", removed)
+	}
+	select {
+	case frame := <-subscriber.send:
+		var envelope struct {
+			Type  string `json:"type"`
+			Event struct {
+				Type string         `json:"type"`
+				Call map[string]any `json:"call"`
+			} `json:"event"`
+		}
+		if err := json.Unmarshal(frame.payload, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Type != "event" || envelope.Event.Type != EventCallState {
+			t.Fatalf("event = %s", frame.payload)
+		}
+		if participants, ok := envelope.Event.Call["participants"].([]any); !ok || len(participants) != 0 {
+			t.Fatalf("removed participant remained in projection: %s", frame.payload)
+		}
+	case <-ctx.Done():
+		t.Fatal("forced removal did not publish call_state")
+	}
+
+	event := livekitWebhookEvent{Event: "participant_left"}
+	event.Room.Name = channel.PlaceID
+	event.Participant.Identity = w.humanB.Key()
+	service.applyWebhook(ctx, event)
+	select {
+	case frame := <-subscriber.send:
+		t.Fatalf("duplicate participant_left republished state: %s", frame.payload)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

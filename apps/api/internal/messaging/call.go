@@ -92,16 +92,21 @@ func (r *CallRegistry) active() []CallState {
 	return out
 }
 
-// replaceSnapshot applies a RoomService snapshot without losing any room that
-// received a newer webhook while the snapshot was being read. roomSequence
-// retains tombstones too, so a room_finished webhook cannot be resurrected by
-// a stale snapshot.
+// replaceSnapshot applies a RoomService snapshot without losing participant
+// deltas from webhooks received while the snapshot was being read. RoomService
+// is authoritative for the room-level projection, while webhook participants
+// are newer than the snapshot. roomSequence retains tombstones too, so a
+// room_finished webhook cannot be resurrected by a stale snapshot.
 func (r *CallRegistry) replaceSnapshot(states []CallState, snapshotSequence uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	next := make(map[string]*CallState, len(states))
 	for _, state := range states {
 		if r.roomSequence[state.PlaceID] > snapshotSequence {
+			if current, ok := r.rooms[state.PlaceID]; ok {
+				merged := mergeCallSnapshot(state, *current)
+				next[state.PlaceID] = &merged
+			}
 			continue
 		}
 		copy := cloneCallState(&state)
@@ -109,10 +114,35 @@ func (r *CallRegistry) replaceSnapshot(states []CallState, snapshotSequence uint
 	}
 	for placeID, state := range r.rooms {
 		if r.roomSequence[placeID] > snapshotSequence {
-			next[placeID] = state
+			if _, alreadyMerged := next[placeID]; !alreadyMerged {
+				copy := cloneCallState(state)
+				next[placeID] = &copy
+			}
 		}
 	}
 	r.rooms = next
+}
+
+func mergeCallSnapshot(snapshot, newer CallState) CallState {
+	merged := cloneCallState(&snapshot)
+	participants := make(map[ParticipantRef]CallParticipant, len(snapshot.Participants)+len(newer.Participants))
+	for _, participant := range snapshot.Participants {
+		participants[participant.Participant] = participant
+	}
+	for _, participant := range newer.Participants {
+		participants[participant.Participant] = participant
+	}
+	merged.Participants = make([]CallParticipant, 0, len(participants))
+	for _, participant := range participants {
+		merged.Participants = append(merged.Participants, participant)
+	}
+	sort.SliceStable(merged.Participants, func(i, j int) bool {
+		if merged.Participants[i].JoinedAt.Equal(merged.Participants[j].JoinedAt) {
+			return merged.Participants[i].Participant.Key() < merged.Participants[j].Participant.Key()
+		}
+		return merged.Participants[i].JoinedAt.Before(merged.Participants[j].JoinedAt)
+	})
+	return merged
 }
 
 func (r *CallRegistry) snapshotSequence() uint64 {
@@ -189,14 +219,14 @@ func (r *CallRegistry) leave(placeID string, participant ParticipantRef) (CallSt
 	if !ok {
 		return CallState{}, false
 	}
-	r.changed(placeID)
 	for i, existing := range state.Participants {
 		if existing.Participant == participant {
 			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
+			r.changed(placeID)
 			return cloneCallState(state), true
 		}
 	}
-	return cloneCallState(state), true
+	return cloneCallState(state), false
 }
 
 func (r *CallRegistry) setScreenShare(placeID string, participant ParticipantRef, sharing bool) (CallState, bool) {
@@ -779,10 +809,11 @@ func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceI
 		if err := c.RoomService.RemoveParticipant(ctx, room.Name, participant.Key()); err != nil {
 			return fmt.Errorf("remove LiveKit participant from room %s: %w", room.Name, err)
 		}
-		// The corresponding webhook normally publishes the projection update.
-		// Update local reads immediately as well, and leave duplicate webhook
-		// delivery idempotent.
-		c.Registry.leave(room.Name, participant)
+		// Publish the local projection immediately; participant_left delivery is
+		// idempotent and therefore does not emit a second state change.
+		if state, changed := c.Registry.leave(room.Name, participant); changed {
+			c.publishCallState(ctx, state)
+		}
 	}
 	return nil
 }
