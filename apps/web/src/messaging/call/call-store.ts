@@ -266,30 +266,42 @@ export const useCall = create<CallStoreState>((set, get) => {
     },
 
     toggleMicrophone() {
+      const current = transport;
+      const generation = joinGeneration;
       const next = !get().local.micEnabled;
       set((state) => ({ local: { ...state.local, micEnabled: next } }));
-      void transport?.setMicrophoneEnabled(next).catch(() => {
-        set((state) => ({ local: { ...state.local, micEnabled: !next } }));
+      void current?.setMicrophoneEnabled(next).catch(() => {
+        if (joinGeneration === generation && transport === current) {
+          set((state) => ({ local: { ...state.local, micEnabled: !next } }));
+        }
       });
     },
 
     toggleCamera() {
+      const current = transport;
+      const generation = joinGeneration;
       const next = !get().local.cameraEnabled;
       set((state) => ({ local: { ...state.local, cameraEnabled: next } }));
-      void transport?.setCameraEnabled(next).catch(() => {
-        set((state) => ({ local: { ...state.local, cameraEnabled: !next } }));
+      void current?.setCameraEnabled(next).catch(() => {
+        if (joinGeneration === generation && transport === current) {
+          set((state) => ({ local: { ...state.local, cameraEnabled: !next } }));
+        }
       });
     },
 
     toggleScreenShare() {
+      const current = transport;
+      const generation = joinGeneration;
       const next = !get().local.screenShareEnabled;
       set((state) => ({
         local: { ...state.local, screenShareEnabled: next },
       }));
-      void transport?.setScreenShareEnabled(next).catch(() => {
-        set((state) => ({
-          local: { ...state.local, screenShareEnabled: !next },
-        }));
+      void current?.setScreenShareEnabled(next).catch(() => {
+        if (joinGeneration === generation && transport === current) {
+          set((state) => ({
+            local: { ...state.local, screenShareEnabled: !next },
+          }));
+        }
       });
     },
 
