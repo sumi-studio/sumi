@@ -86,6 +86,8 @@ export interface MessagePoll {
   question: string;
   allowMulti: boolean;
   closesAt: number | null;
+  /** Monotonically increasing committed vote snapshot version. */
+  revision?: number;
   options: PollOption[];
 }
 

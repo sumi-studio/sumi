@@ -37,7 +37,10 @@ type Poll struct {
 	Question   string
 	AllowMulti bool
 	ClosesAt   *time.Time
-	Options    []PollOption
+	// Revision advances with every committed vote and makes snapshots safe to
+	// apply even when WebSocket delivery arrives out of commit order.
+	Revision int64
+	Options  []PollOption
 }
 
 func (p Poll) Closed(now time.Time) bool {
@@ -177,9 +180,10 @@ func (s *ScopedStore) VotePoll(ctx context.Context, placeID, messageID string, o
 	}
 	var allowMulti bool
 	var closesAt *time.Time
+	var revision int64
 	err = tx.QueryRow(ctx, `
-		SELECT allow_multi, closes_at FROM message_polls
-		WHERE workspace_id=$1 AND message_id=$2 FOR UPDATE`, s.Scope.WorkspaceID, messageID).Scan(&allowMulti, &closesAt)
+		SELECT allow_multi, closes_at, revision FROM message_polls
+		WHERE workspace_id=$1 AND message_id=$2 FOR UPDATE`, s.Scope.WorkspaceID, messageID).Scan(&allowMulti, &closesAt, &revision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Message{}, ErrPollNotFound
 	}
@@ -219,10 +223,20 @@ func (s *ScopedStore) VotePoll(ctx context.Context, placeID, messageID string, o
 			return Message{}, fmt.Errorf("insert scoped poll vote: %w", err)
 		}
 	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE message_polls SET revision=$3
+		WHERE workspace_id=$1 AND message_id=$2`,
+		s.Scope.WorkspaceID, messageID, revision+1); err != nil {
+		return Message{}, fmt.Errorf("advance scoped poll revision: %w", err)
+	}
 	parts := []Message{message}
 	if err := attachMessagePartsWith(ctx, tx, s.Scope.WorkspaceID, parts); err != nil {
 		return Message{}, err
 	}
+	if parts[0].Poll == nil {
+		return Message{}, fmt.Errorf("load scoped poll vote projection: missing poll")
+	}
+	parts[0].Poll.Revision = revision + 1
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped poll vote: %w", err)
 	}
@@ -239,7 +253,7 @@ func attachPollsWith(ctx context.Context, q querier, workspaceID string, message
 		ids[i], index[message.MessageID] = message.MessageID, i
 	}
 	rows, err := q.Query(ctx, `
-		SELECT message_id, question, allow_multi, closes_at FROM message_polls
+		SELECT message_id, question, allow_multi, closes_at, revision FROM message_polls
 		WHERE workspace_id=$1 AND message_id=ANY($2)`, workspaceID, ids)
 	if err != nil {
 		return fmt.Errorf("query scoped polls: %w", err)
@@ -247,7 +261,7 @@ func attachPollsWith(ctx context.Context, q querier, workspaceID string, message
 	for rows.Next() {
 		var messageID string
 		poll := &Poll{}
-		if err := rows.Scan(&messageID, &poll.Question, &poll.AllowMulti, &poll.ClosesAt); err != nil {
+		if err := rows.Scan(&messageID, &poll.Question, &poll.AllowMulti, &poll.ClosesAt, &poll.Revision); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan scoped poll: %w", err)
 		}

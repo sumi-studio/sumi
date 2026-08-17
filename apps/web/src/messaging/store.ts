@@ -955,6 +955,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "poll_updated") {
       const key = placeKey(event.message.place);
+      const incomingPoll = event.message.poll;
       pollProjectionVersions.set(
         event.message.messageId,
         (pollProjectionVersions.get(event.message.messageId) ?? 0) + 1,
@@ -966,8 +967,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const messages = current.map((message) => {
           if (message.messageId !== event.message.messageId || message.deleted)
             return message;
+          if (
+            incomingPoll !== null &&
+            incomingPoll !== undefined &&
+            message.poll !== null &&
+            message.poll !== undefined &&
+            incomingPoll.revision !== undefined &&
+            message.poll.revision !== undefined &&
+            incomingPoll.revision < message.poll.revision
+          ) {
+            return message;
+          }
           changed = true;
-          return { ...message, poll: event.message.poll ?? null };
+          return { ...message, poll: incomingPoll ?? null };
         });
         return changed
           ? { messagesByPlace: { ...state.messagesByPlace, [key]: messages } }
@@ -2233,11 +2245,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
           }
           const key = placeKey(message.place);
           set((state) => {
-            // A live snapshot received while this request was in flight is
-            // newer than this acknowledgement. HTTP and WS have no ordering.
+            const current = (state.messagesByPlace[key] ?? []).find(
+              (entry) => entry.messageId === canonical.messageId,
+            );
+            const currentRevision = current?.poll?.revision;
+            const acknowledgementRevision = canonical.poll?.revision;
+            // Live and HTTP delivery have no ordering. Prefer the server's
+            // committed revision when both snapshots carry one; retain the
+            // projection fallback for legacy/mock snapshots without it.
             if (
-              (pollProjectionVersions.get(message.messageId) ?? 0) !==
-              projectionVersion
+              currentRevision !== undefined &&
+              acknowledgementRevision !== undefined
+                ? acknowledgementRevision < currentRevision
+                : (pollProjectionVersions.get(message.messageId) ?? 0) !==
+                  projectionVersion
             ) {
               return {};
             }

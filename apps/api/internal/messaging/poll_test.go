@@ -40,18 +40,18 @@ func TestPollLifecycleUsesMessageTransactionAndWholeVoteReplacement(t *testing.T
 	first := message.Poll.Options[0].OptionID
 	second := message.Poll.Options[1].OptionID
 	voted, err := b.VotePoll(ctx, channel.PlaceID, message.MessageID, []string{first})
-	if err != nil || len(voted.Poll.Options[0].Voters) != 1 {
+	if err != nil || voted.Poll.Revision != 1 || len(voted.Poll.Options[0].Voters) != 1 {
 		t.Fatalf("first vote = %+v err=%v", voted.Poll, err)
 	}
 	if _, err := b.VotePoll(ctx, channel.PlaceID, message.MessageID, []string{first, second}); !errors.Is(err, ErrPollSingleChoice) {
 		t.Fatalf("single-choice multi vote error = %v", err)
 	}
 	voted, err = b.VotePoll(ctx, channel.PlaceID, message.MessageID, []string{second})
-	if err != nil || len(voted.Poll.Options[0].Voters) != 0 || len(voted.Poll.Options[1].Voters) != 1 {
+	if err != nil || voted.Poll.Revision != 2 || len(voted.Poll.Options[0].Voters) != 0 || len(voted.Poll.Options[1].Voters) != 1 {
 		t.Fatalf("replacement vote = %+v err=%v", voted.Poll, err)
 	}
 	voted, err = b.VotePoll(ctx, channel.PlaceID, message.MessageID, nil)
-	if err != nil {
+	if err != nil || voted.Poll.Revision != 3 {
 		t.Fatalf("withdraw vote: %v", err)
 	}
 	for _, option := range voted.Poll.Options {
@@ -166,6 +166,9 @@ func TestPollHTTPCreateAndVoteReturnWholeMessage(t *testing.T) {
 		t.Fatalf("vote status %d body %v", resp.StatusCode, body)
 	}
 	voted := body["message"].(map[string]any)["poll"].(map[string]any)
+	if revision, ok := voted["revision"].(float64); !ok || revision != 1 {
+		t.Fatalf("vote revision = %#v", voted["revision"])
+	}
 	voters := voted["options"].([]any)[0].(map[string]any)["voters"].([]any)
 	if len(voters) != 1 {
 		t.Fatalf("visible voters = %v", voters)

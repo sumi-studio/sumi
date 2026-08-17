@@ -928,6 +928,7 @@ function parsePoll(value: unknown): Message["poll"] {
     question: asString(wire.question),
     allowMulti: asBoolean(wire.allow_multi),
     closesAt: wire.closes_at == null ? null : asTimestamp(wire.closes_at),
+    revision: asSeq(wire.revision),
     options: asArray(wire.options).map((entry) => {
       const option = asRecord(entry);
       return {

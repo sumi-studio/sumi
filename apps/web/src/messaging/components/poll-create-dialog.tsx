@@ -14,6 +14,11 @@ const DEADLINES = [
 
 export function PollCreateDialog({ onClose }: { onClose: () => void }) {
   const send = useMessaging((state) => state.send);
+  const draft = useMessaging((state) =>
+    state.activePlaceKey
+      ? (state.draftByPlace[state.activePlaceKey] ?? "")
+      : "",
+  );
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState(["", ""]);
   const [allowMulti, setAllowMulti] = useState(false);
@@ -40,7 +45,10 @@ export function PollCreateDialog({ onClose }: { onClose: () => void }) {
         onSubmit={(event) => {
           event.preventDefault();
           if (!ready) return;
-          send("", "normal", {
+          // A poll is sent as one message with the text already composed for
+          // this place. This makes the composer clear only after its draft has
+          // become part of the outgoing message, rather than silently losing it.
+          send(draft, "normal", {
             question: question.trim(),
             options: filled,
             allowMulti,

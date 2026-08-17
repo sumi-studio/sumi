@@ -916,9 +916,7 @@ describe("poll convergence in the messaging store", () => {
         ...second,
         poll: {
           ...second.poll,
-          options: [
-            { optionId: "second-option", text: "B", voters: [other] },
-          ],
+          options: [{ optionId: "second-option", text: "B", voters: [other] }],
         },
       },
     });
@@ -973,5 +971,51 @@ describe("poll convergence in the messaging store", () => {
       useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll?.options[0]
         ?.voters,
     ).toEqual([other]);
+  });
+
+  it("ignores a delayed earlier vote snapshot after a later revision", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = {
+      ...message(1, "poll"),
+      poll: {
+        question: "which?",
+        allowMulti: false,
+        closesAt: null,
+        revision: 0,
+        options: [{ optionId: "option", text: "A", voters: [] }],
+      },
+    };
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
+
+    harness.emit({
+      type: "poll_updated",
+      message: {
+        ...initial,
+        poll: {
+          ...initial.poll,
+          revision: 2,
+          options: [{ optionId: "option", text: "A", voters: [other] }],
+        },
+      },
+    });
+    harness.emit({
+      type: "poll_updated",
+      message: {
+        ...initial,
+        poll: {
+          ...initial.poll,
+          revision: 1,
+          options: [{ optionId: "option", text: "A", voters: [self] }],
+        },
+      },
+    });
+
+    const projected =
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll;
+    expect(projected?.revision).toBe(2);
+    expect(projected?.options[0]?.voters).toEqual([other]);
   });
 });

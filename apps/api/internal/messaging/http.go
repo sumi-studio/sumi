@@ -218,6 +218,7 @@ type pollWire struct {
 	Question   string           `json:"question"`
 	AllowMulti bool             `json:"allow_multi"`
 	ClosesAt   *time.Time       `json:"closes_at"`
+	Revision   int64            `json:"revision"`
 	Options    []pollOptionWire `json:"options"`
 }
 
@@ -229,7 +230,7 @@ func pollToWire(poll *Poll) *pollWire {
 	for i, option := range poll.Options {
 		options[i] = pollOptionWire{OptionID: option.OptionID, Text: option.Text, Voters: participantsToWire(option.Voters)}
 	}
-	return &pollWire{Question: poll.Question, AllowMulti: poll.AllowMulti, ClosesAt: poll.ClosesAt, Options: options}
+	return &pollWire{Question: poll.Question, AllowMulti: poll.AllowMulti, ClosesAt: poll.ClosesAt, Revision: poll.Revision, Options: options}
 }
 
 type pollRequestWire struct {
