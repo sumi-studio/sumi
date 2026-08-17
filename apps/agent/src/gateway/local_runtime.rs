@@ -48,8 +48,8 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-    MessagingApi, MessagingApiFailure,
+    CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest, ExactMessagingScope,
+    GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure,
     MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
     OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
@@ -709,6 +709,32 @@ impl MessagingApi for LocalControlHttpClient {
             "/local-control/v1/messaging:open",
             &ScopedMessagingRequest::new(scope, request),
             MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn threads(
+        &self,
+        scope: &ExactMessagingScope,
+        request: ListMessagingThreadsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:threads",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_thread(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingThreadRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:create-thread",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
         )
         .await
     }

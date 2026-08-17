@@ -94,7 +94,7 @@ func (s *ScopedStore) SearchMessages(
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
 			  AND (p.kind = 'channel' OR
-			       (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
+			       (p.kind IN ('dm', 'group_dm', 'thread') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT m.message_id, m.place_id, m.seq, m.author_kind, m.author_id,
 		       m.content, m.created_at,

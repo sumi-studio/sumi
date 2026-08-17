@@ -314,7 +314,7 @@ func (s *ScopedStore) loadScopedPlaceWithClause(
 
 func (s *ScopedStore) placeAccessAfterAuthorization(ctx context.Context, q querier, place Place, actor ParticipantRef) (PlaceAccess, error) {
 	var access PlaceAccess
-	if place.Kind == PlaceChannel {
+	if place.Kind == PlaceChannel || place.Kind == PlaceThread {
 		err := q.QueryRow(ctx, `
 			SELECT wm.workspace_member_id,
 			       COALESCE(pm.place_member_id::text, ''), COALESCE(pm.visible_from_seq, 1)
@@ -386,9 +386,10 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 	condition := `pm.workspace_id = $1 AND pm.place_id = $2
 		AND pm.left_at IS NULL AND wm.left_at IS NULL`
 	args := []any{s.Scope.WorkspaceID, place.PlaceID}
-	if place.Kind == PlaceChannel {
-		// A channel admits every Workspace member; the place-scoped join above
-		// still needs its place argument, so both branches pass the same args.
+	if place.Kind == PlaceChannel || place.Kind == PlaceThread {
+		// A channel and a thread under one both admit every Workspace member;
+		// the place-scoped join above still needs its place argument, so both
+		// branches pass the same args.
 		condition = `wm.workspace_id = $1 AND wm.left_at IS NULL`
 	}
 	rows, err := q.Query(ctx, `

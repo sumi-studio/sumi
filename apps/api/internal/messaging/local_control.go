@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -17,6 +18,8 @@ import (
 const (
 	LocalOverviewPath          = "/local-control/v1/messaging:overview"
 	LocalOpenPath              = "/local-control/v1/messaging:open"
+	LocalThreadsPath           = "/local-control/v1/messaging:threads"
+	LocalCreateThreadPath      = "/local-control/v1/messaging:create-thread"
 	LocalWritePath             = "/local-control/v1/messaging:write"
 	LocalReactPath             = "/local-control/v1/messaging:react"
 	LocalStatusPath            = "/local-control/v1/messaging:status"
@@ -69,6 +72,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 	}{
 		{"POST " + LocalOverviewPath, s.localOverview},
 		{"POST " + LocalOpenPath, s.localOpen},
+		{"POST " + LocalThreadsPath, s.localThreads},
+		{"POST " + LocalCreateThreadPath, s.localCreateThread},
 		{"POST " + LocalWritePath, s.localWrite},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
@@ -90,6 +95,60 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		}
 	}
 	return control.RegisterStagedAuthorizedRoute("POST "+LocalUploadAttachmentPattern, s.localUploadAttachment)
+}
+
+func (s *Server) localThreads(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		ParentPlaceID string `json:"parent_place_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.ParentPlaceID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	threads, err := store.ThreadsIn(r.Context(), request.ParentPlaceID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Threads []threadWire `json:"threads"`
+	}{threadsToWire(threads)})
+}
+
+func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		ParentPlaceID   string `json:"parent_place_id"`
+		Name            string `json:"name"`
+		ParentMessageID string `json:"parent_message_id,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.ParentPlaceID == "" || strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > MaxThreadNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	thread, err := store.CreateThread(r.Context(), request.ParentPlaceID, request.Name, request.ParentMessageID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := threadToWire(thread)
+	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire})
+	writeJSON(w, http.StatusCreated, wire)
 }
 
 func (c *CallService) localCallState(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
@@ -262,13 +321,24 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	for i, profile := range snapshot.Members {
 		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
 	}
+	var thread *threadWire
+	if snapshot.Place.Kind == PlaceThread {
+		summary, err := store.ThreadFor(r.Context(), snapshot.Place.PlaceID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		wire := threadToWire(summary)
+		thread = &wire
+	}
 	writeJSON(w, http.StatusOK, struct {
 		Place       placeWire     `json:"place"`
 		LatestSeq   int64         `json:"latest_seq"`
 		LastReadSeq int64         `json:"last_read_seq"`
 		Members     []memberWire  `json:"members"`
 		Messages    []messageWire `json:"messages"`
-	}{placeToWire(snapshot.Place), snapshot.Place.LastSeq, snapshot.LastReadSeq, members, wires})
+		Thread      *threadWire   `json:"thread,omitempty"`
+	}{placeToWire(snapshot.Place), snapshot.Place.LastSeq, snapshot.LastReadSeq, members, wires, thread})
 }
 
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

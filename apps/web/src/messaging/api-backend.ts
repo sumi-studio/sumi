@@ -24,6 +24,7 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
   UploadAttachmentInput,
   UploadAttachmentReceipt,
@@ -59,6 +60,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -99,6 +101,9 @@ export class ApiMessagingBackend implements MessagingBackend {
     const dms: DmSummary[] = asArray(body.dms).map((entry) =>
       this.registerDm(entry),
     );
+    const threads: ThreadSummary[] = asArray(body.threads ?? []).map((entry) =>
+      this.registerThread(entry),
+    );
     const members: MemberProfile[] = asArray(body.members).map((entry) => {
       const value = asRecord(entry);
       return {
@@ -135,6 +140,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       workspaces,
       channels,
       dms,
+      threads,
       members,
       statuses: presence.statuses,
       readMarkers,
@@ -220,6 +226,37 @@ export class ApiMessagingBackend implements MessagingBackend {
       { method: "PATCH", body: { topic } },
     );
     return this.registerChannel(body);
+  }
+
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      ),
+    );
+    return asArray(body.threads).map((entry) => this.registerThread(entry));
+  }
+
+  async fetchThread(threadId: string): Promise<ThreadSummary> {
+    const body = asRecord(
+      await this.request(`/messaging/places/${encodeURIComponent(threadId)}`),
+    );
+    return this.registerThread(body.thread);
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      {
+        method: "POST",
+        body: { name, parent_message_id: originMessageId ?? "" },
+      },
+    );
+    return this.registerThread(body);
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -558,12 +595,14 @@ export class ApiMessagingBackend implements MessagingBackend {
       parsed = { type: "call_state", call: parseCallState(wire.call) };
     } else if (eventType === "place_created") {
       parsed =
-        wire.channel === undefined || wire.channel === null
-          ? { type: "place_created", dm: this.registerDm(wire.dm) }
-          : {
-              type: "place_created",
-              channel: this.registerChannel(wire.channel),
-            };
+        wire.thread != null
+          ? { type: "place_created", thread: this.registerThread(wire.thread) }
+          : wire.channel == null
+            ? { type: "place_created", dm: this.registerDm(wire.dm) }
+            : {
+                type: "place_created",
+                channel: this.registerChannel(wire.channel),
+              };
     } else if (eventType === "place_updated") {
       parsed = {
         type: "place_updated",
@@ -611,6 +650,35 @@ export class ApiMessagingBackend implements MessagingBackend {
     if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
     this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
     return dm;
+  }
+
+  private registerThread(value: unknown): ThreadSummary {
+    const wire = asRecord(value);
+    const parent = parsePlace(wire.parent_place);
+    if (parent.kind !== "channel") throw new Error("invalid thread parent");
+    const thread: ThreadSummary = {
+      threadId: asString(wire.thread_id),
+      parentPlace: parent,
+      parentMessageId:
+        wire.parent_message_id == null
+          ? null
+          : asString(wire.parent_message_id),
+      workspaceId: asString(wire.workspace_id),
+      name: asString(wire.name),
+      messageCount: asSeq(wire.message_count),
+      lastMessageAt:
+        wire.last_message_at == null ? null : asTimestamp(wire.last_message_at),
+      lastMessage: asString(wire.last_message),
+      participants: asArray(wire.participants).map(parseParticipant),
+      latestSeq: asSeq(wire.latest_seq),
+    };
+    this.places.set(thread.threadId, {
+      kind: "thread",
+      threadId: thread.threadId,
+    });
+    if (!this.cursors.has(thread.threadId))
+      this.cursors.set(thread.threadId, 0);
+    return thread;
   }
 
   private stopSocket(): void {
@@ -663,6 +731,7 @@ export class ApiMessagingBackend implements MessagingBackend {
 }
 
 function placeID(place: Place): string {
+  if (place.kind === "thread") return place.threadId;
   return place.kind === "channel" ? place.channelId : place.dmId;
 }
 
@@ -676,6 +745,8 @@ function participantToWire(ref: ParticipantRef): Record<string, string> {
 }
 
 function placeToWire(place: Place): Record<string, string> {
+  if (place.kind === "thread")
+    return { kind: place.kind, thread_id: place.threadId };
   return place.kind === "channel"
     ? { kind: place.kind, channel_id: place.channelId }
     : { kind: place.kind, dm_id: place.dmId };
@@ -785,6 +856,7 @@ function parsePlace(value: unknown): Place {
   if (kind === "dm" || kind === "group_dm") {
     return { kind, dmId: asString(wire.dm_id) };
   }
+  if (kind === "thread") return { kind, threadId: asString(wire.thread_id) };
   throw new Error("invalid place");
 }
 

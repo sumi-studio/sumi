@@ -27,6 +27,7 @@ import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
+import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 
@@ -268,6 +269,7 @@ export const MessageItem = memo(function MessageItem({
           {message.deleted ? null : (
             <MessageAttachments attachments={message.attachments} />
           )}
+          <MessageThreadChip message={message} />
           {allowReactions ? (
             <ReactionChips
               message={message}
@@ -333,6 +335,7 @@ export const MessageItem = memo(function MessageItem({
           <ToolbarButton label="返信" onClick={() => onReply(message)}>
             <CornerUpLeft className="size-3.5" />
           </ToolbarButton>
+          <MessageThreadAction message={message} />
           {own || !allowReplyLater ? null : (
             <Popover>
               <PopoverTrigger

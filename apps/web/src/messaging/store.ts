@@ -25,6 +25,7 @@ import type {
   ReplyLaterMarker,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   Urgency,
   WorkspaceSummary,
 } from "./model";
@@ -76,6 +77,7 @@ const UNBOUND_CAPABILITIES: MessagingCapabilities = {
   replyLater: false,
   reactions: false,
   notifications: false,
+  threads: false,
 };
 
 function unboundMessagingBackend(): MessagingBackend {
@@ -137,6 +139,8 @@ interface MessagingState {
   workspaces: WorkspaceSummary[];
   channels: ChannelSummary[];
   dms: DmSummary[];
+  threadsById: Record<string, ThreadSummary>;
+  threadsLoadedForPlace: Record<PlaceKey, boolean>;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -190,6 +194,13 @@ interface MessagingState {
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannelTopic(channelId: string, topic: string): Promise<void>;
+  loadThreads(parentKey: PlaceKey): Promise<void>;
+  loadThread(threadId: string): Promise<boolean>;
+  createThread(
+    parentKey: PlaceKey,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
@@ -388,6 +399,111 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+  const threadProjectionVersions = new Map<string, number>();
+  const appliedThreadDeletions = new Set<string>();
+
+  const advanceThreadProjection = (message: Message): number | null => {
+    if (message.place.kind !== "thread") return null;
+    const threadId = message.place.threadId;
+    const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
+    threadProjectionVersions.set(threadId, version);
+    return version;
+  };
+
+  const refreshThreadSummary = async (message: Message, version: number) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    const thread = get().threadsById[threadId];
+    const fetchThreads = backend.fetchThreads;
+    if (!thread || !fetchThreads) return;
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const parentKey = placeKey(thread.parentPlace);
+    try {
+      const summaries = await fetchThreads.call(
+        currentBackend,
+        thread.parentPlace,
+      );
+      if (
+        backend !== currentBackend ||
+        messagingSessionGeneration !== sessionGeneration ||
+        threadProjectionVersions.get(threadId) !== version
+      ) {
+        return;
+      }
+      const refreshed = summaries.find((entry) => entry.threadId === threadId);
+      if (!refreshed) return;
+      set((state) => ({
+        threadsById: { ...state.threadsById, [threadId]: refreshed },
+      }));
+    } catch {
+      if (
+        backend !== currentBackend ||
+        messagingSessionGeneration !== sessionGeneration ||
+        threadProjectionVersions.get(threadId) !== version
+      ) {
+        return;
+      }
+      set((state) => ({
+        threadsLoadedForPlace: {
+          ...state.threadsLoadedForPlace,
+          [parentKey]: false,
+        },
+      }));
+    }
+  };
+
+  const noteThreadActivity = (message: Message) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    set((state) => {
+      const thread = state.threadsById[threadId];
+      if (!thread) return {};
+      const known = thread.participants.some(
+        (participant) =>
+          participantKey(participant) === participantKey(message.author),
+      );
+      return {
+        threadsById: {
+          ...state.threadsById,
+          [threadId]: {
+            ...thread,
+            messageCount: thread.messageCount + (message.deleted ? 0 : 1),
+            lastMessageAt: message.createdAt,
+            lastMessage: message.content,
+            latestSeq: Math.max(thread.latestSeq, message.seq),
+            participants: known
+              ? thread.participants
+              : [...thread.participants, message.author],
+          },
+        },
+      };
+    });
+  };
+
+  const applyThreadDeletionSummary = (message: Message) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    const deletionKey = `${threadId}:${message.messageId}`;
+    if (!appliedThreadDeletions.has(deletionKey)) {
+      appliedThreadDeletions.add(deletionKey);
+      set((state) => {
+        const thread = state.threadsById[threadId];
+        if (!thread) return {};
+        return {
+          threadsById: {
+            ...state.threadsById,
+            [threadId]: {
+              ...thread,
+              messageCount: Math.max(0, thread.messageCount - 1),
+            },
+          },
+        };
+      });
+    }
+    const version = advanceThreadProjection(message);
+    if (version !== null) void refreshThreadSummary(message, version);
+  };
   const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
     const key = placeKey(event.place);
     // reactionだけを差し替える。message全体を置き換えると、同時に届いた
@@ -842,7 +958,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
-      if (event.type === "message_created") presentNotification(event);
+      if (event.type === "message_created") {
+        advanceThreadProjection(event.message);
+        noteThreadActivity(event.message);
+        presentNotification(event);
+      } else {
+        const version = advanceThreadProjection(event.message);
+        if (version !== null) void refreshThreadSummary(event.message, version);
+      }
       return;
     }
     if (event.type === "message_deleted") {
@@ -881,6 +1004,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      applyThreadDeletionSummary(event.message);
       return;
     }
     if (event.type === "typing") {
@@ -914,8 +1038,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "place_created") {
-      const { channel, dm } = event;
+      const { channel, dm, thread } = event;
       set((state) => {
+        if (thread)
+          return {
+            threadsById: { ...state.threadsById, [thread.threadId]: thread },
+          };
         if (channel) {
           return state.channels.some(
             (entry) => entry.channelId === channel.channelId,
@@ -1231,6 +1359,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -1261,6 +1391,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
+      threadProjectionVersions.clear();
+      appliedThreadDeletions.clear();
       void backend
         .bootstrap()
         .then((snapshot) => {
@@ -1299,6 +1431,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
             workspaces: snapshot.workspaces,
             channels: snapshot.channels,
             dms: snapshot.dms,
+            threadsById: Object.fromEntries(
+              (snapshot.threads ?? []).map((thread) => [
+                thread.threadId,
+                thread,
+              ]),
+            ),
+            threadsLoadedForPlace: {},
             membersByKey,
             statusByKey,
             lastReadByPlace,
@@ -1344,9 +1483,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ? state.channels.some(
               (channel) => channel.channelId === place.channelId,
             )
-          : state.dms.some(
-              (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
-            );
+          : place.kind === "thread"
+            ? state.threadsById[place.threadId] !== undefined
+            : state.dms.some(
+                (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
+              );
       if (!known) return;
       set((state) => ({
         activePlaceKey: key,
@@ -1433,6 +1574,80 @@ export const useMessaging = create<MessagingState>((set, get) => {
           entry.channelId === channel.channelId ? channel : entry,
         ),
       }));
+    },
+
+    async loadThreads(parentKey) {
+      if (!get().capabilities.threads) return;
+      if (get().threadsLoadedForPlace[parentKey]) return;
+      const parent = parsePlaceKey(parentKey);
+      if (!parent || parent.kind !== "channel") return;
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const versions = new Map(threadProjectionVersions);
+      const threads = (await currentBackend.fetchThreads?.(parent)) ?? [];
+      if (
+        backend !== currentBackend ||
+        messagingSessionGeneration !== sessionGeneration
+      ) {
+        return;
+      }
+      let raced = false;
+      set((state) => ({
+        threadsById: {
+          ...state.threadsById,
+          ...Object.fromEntries(
+            threads
+              .filter((thread) => {
+                const unchanged =
+                  (threadProjectionVersions.get(thread.threadId) ?? 0) ===
+                  (versions.get(thread.threadId) ?? 0);
+                if (!unchanged) raced = true;
+                return unchanged;
+              })
+              .map((thread) => [thread.threadId, thread]),
+          ),
+        },
+        threadsLoadedForPlace: {
+          ...state.threadsLoadedForPlace,
+          [parentKey]: !raced,
+        },
+      }));
+    },
+
+    async loadThread(threadId) {
+      if (get().threadsById[threadId]) return true;
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      if (!get().capabilities.threads || !currentBackend.fetchThread) {
+        return false;
+      }
+      try {
+        const thread = await currentBackend.fetchThread(threadId);
+        if (
+          backend !== currentBackend ||
+          messagingSessionGeneration !== sessionGeneration
+        ) {
+          return false;
+        }
+        set((state) => ({
+          threadsById: { ...state.threadsById, [thread.threadId]: thread },
+        }));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    async createThread(parentKey, name, originMessageId) {
+      const parent = parsePlaceKey(parentKey);
+      if (!parent || parent.kind !== "channel")
+        throw new Error("Threads require a channel parent");
+      if (!backend.createThread) throw new Error("Threads are unavailable");
+      const thread = await backend.createThread(parent, name, originMessageId);
+      set((state) => ({
+        threadsById: { ...state.threadsById, [thread.threadId]: thread },
+      }));
+      return `thread:${thread.threadId}`;
     },
 
     async searchMessages(query) {
@@ -1924,6 +2139,8 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},

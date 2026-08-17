@@ -97,7 +97,8 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		return Message{}, false, fmt.Errorf("begin scoped append: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
+	if err != nil {
 		return Message{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, in.PlaceID)
@@ -180,6 +181,15 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	message.Attachments = attachments
 	if err := insertMentions(ctx, tx, message.MessageID, mentions); err != nil {
 		return Message{}, false, err
+	}
+	if place.Kind == PlaceThread {
+		if err := s.joinThreadParticipants(ctx, tx, place.PlaceID, actorMembership, mentions); err != nil {
+			return Message{}, false, err
+		}
+		members, err = s.threadNotificationMembers(ctx, tx, place.PlaceID, members)
+		if err != nil {
+			return Message{}, false, err
+		}
 	}
 	// Notification intent issuance is part of the same commit. Delivery remains
 	// post-commit/best-effort, but authoritative recipient intent never is.
@@ -445,7 +455,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if message.Deleted {
 		return message, tx.Commit(ctx)
 	}
-	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel {
+	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel && place.Kind != PlaceThread {
 		return Message{}, ErrForbidden
 	}
 	if _, err := tx.Exec(ctx, `
@@ -519,6 +529,11 @@ func (s *ScopedStore) ReadThrough(ctx context.Context, placeID string, seq int64
 		return ErrSeqBeyondLatest
 	}
 	if access.PlaceMemberID == "" {
+		// Merely reading a thread does not make someone a participant. Thread
+		// participation is reserved for writing or being mentioned.
+		if place.Kind == PlaceThread {
+			return tx.Commit(ctx)
+		}
 		if err := admitPlaceTenure(ctx, tx, placeID, membership, 1); err != nil {
 			return err
 		}
@@ -607,7 +622,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 			  ON pm.workspace_id = p.workspace_id AND pm.place_id = p.place_id
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			  AND (p.kind = 'channel' OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
+			  AND (p.kind = 'channel' OR (p.kind IN ('dm', 'group_dm', 'thread') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.name, vp.topic,
 		       vp.visibility, vp.last_seq, vp.voice, COALESCE(rm.last_read_seq, 0),

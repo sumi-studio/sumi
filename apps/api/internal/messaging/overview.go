@@ -7,6 +7,7 @@ type overviewWire struct {
 	Workspaces        []workspaceWire     `json:"workspaces"`
 	Channels          []channelWire       `json:"channels"`
 	DMs               []dmWire            `json:"dms"`
+	Threads           []threadWire        `json:"threads"`
 	Members           []memberWire        `json:"members"`
 	ReadMarkers       []readMarkerWire    `json:"read_markers"`
 	UnreadSummaries   []unreadSummaryWire `json:"unread_summaries"`
@@ -52,6 +53,9 @@ func (s *Server) buildOverview(ctx context.Context, store *ScopedStore) (overvie
 			channels = append(channels, channelToWire(summary.Place))
 			continue
 		}
+		if summary.Place.Kind == PlaceThread {
+			continue
+		}
 		profiles, err := store.ActiveMembers(ctx, summary.Place.PlaceID)
 		if err != nil {
 			return overviewWire{}, err
@@ -75,11 +79,16 @@ func (s *Server) buildOverview(ctx context.Context, store *ScopedStore) (overvie
 	for i, marker := range markers {
 		markerWires[i] = replyLaterToWire(marker, viewer)
 	}
+	threads, err := store.ThreadsFor(ctx)
+	if err != nil {
+		return overviewWire{}, err
+	}
 	return overviewWire{
 		Self:              participantToWire(viewer),
 		Workspaces:        workspaceWires,
 		Channels:          channels,
 		DMs:               dms,
+		Threads:           threadsToWire(threads),
 		Members:           members,
 		ReadMarkers:       readMarkers,
 		UnreadSummaries:   unread,

@@ -22,6 +22,7 @@ type Event struct {
 	Actor    *participantWire    `json:"actor,omitempty"`
 	Channel  *channelWire        `json:"channel,omitempty"`
 	DM       *dmWire             `json:"dm,omitempty"`
+	Thread   *threadWire         `json:"thread,omitempty"`
 	Status   *statusWire         `json:"status,omitempty"`
 	Marker   *replyLaterWire     `json:"marker,omitempty"`
 	Call     *callStateWire      `json:"call,omitempty"`

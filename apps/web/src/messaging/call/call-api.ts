@@ -24,6 +24,7 @@ export class CallAPIError extends Error {
 }
 
 function placeID(place: Place): string {
+  if (place.kind === "thread") return place.threadId;
   return place.kind === "channel" ? place.channelId : place.dmId;
 }
 

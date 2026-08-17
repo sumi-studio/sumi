@@ -6,6 +6,7 @@ describe("placePath", () => {
     ["channel:channel-1", "/w/workspace-1/messaging/c/channel-1"],
     ["dm:dm-1", "/w/workspace-1/messaging/dm/dm-1"],
     ["group_dm:group-1", "/w/workspace-1/messaging/group/group-1"],
+    ["thread:thread-1", "/w/workspace-1/messaging/t/thread-1"],
   ] as const)("keeps %s inside its exact Workspace", (place, expected) => {
     expect(placePath("workspace-1", place)).toBe(expected);
   });

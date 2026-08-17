@@ -148,4 +148,32 @@ describe("MessagingScreen route-owned current place", () => {
       "unselected",
     );
   });
+
+  it("opens a known thread route with its parent channel context", () => {
+    useMessaging.setState({
+      threadsById: {
+        "thread-a": {
+          threadId: "thread-a",
+          parentPlace: { kind: "channel", channelId: "channel-a" },
+          parentMessageId: "message-a",
+          workspaceId: "workspace-a",
+          name: "認証リダイレクト",
+          messageCount: 2,
+          lastMessageAt: null,
+          lastMessage: "",
+          participants: [SELF],
+          latestSeq: 2,
+        },
+      },
+    });
+
+    render(<MessagingScreen placeKey="thread:thread-a" />);
+
+    expect(screen.getByTestId("sidebar-selection")).toHaveTextContent(
+      "thread:thread-a",
+    );
+    expect(screen.getByText("認証リダイレクト")).toBeInTheDocument();
+    expect(screen.getByText("親: #alpha")).toBeInTheDocument();
+    expect(useMessaging.getState().activePlaceKey).toBe("thread:thread-a");
+  });
 });

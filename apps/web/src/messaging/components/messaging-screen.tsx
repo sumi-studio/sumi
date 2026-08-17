@@ -1,4 +1,13 @@
-import { Bell, Clock, Hash, Pencil, Users, X } from "lucide-react";
+import {
+  ArrowLeft,
+  Bell,
+  Clock,
+  Hash,
+  MessagesSquare,
+  Pencil,
+  Users,
+  X,
+} from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -13,7 +22,12 @@ import { CallFailureNotice } from "../call/call-failure-notice";
 import { CallStage } from "../call/call-stage";
 import { CallStartButtons } from "../call/call-start-buttons";
 import { IncomingCall } from "../call/incoming-call";
-import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
+import {
+  type PlaceKey,
+  participantKey,
+  placeKey as keyForPlace,
+  type ReplyLaterMarker,
+} from "../model";
 import {
   dismissPermissionPrompt,
   isPermissionPromptDismissed,
@@ -37,6 +51,7 @@ import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
 import { Sidebar } from "./sidebar";
+import { ThreadPanel } from "./thread-panel";
 
 interface PendingJump {
   placeKey: PlaceKey;
@@ -301,11 +316,7 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
                     onClick={() => {
                       setOpen(false);
                       onJump({
-                        placeKey: `${marker.place.kind}:${
-                          marker.place.kind === "channel"
-                            ? marker.place.channelId
-                            : marker.place.dmId
-                        }`,
+                        placeKey: keyForPlace(marker.place),
                         messageId: marker.messageId,
                       });
                     }}
@@ -382,11 +393,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
           type="button"
           onClick={() =>
             onJump({
-              placeKey: `${marker.place.kind}:${
-                marker.place.kind === "channel"
-                  ? marker.place.channelId
-                  : marker.place.dmId
-              }`,
+              placeKey: keyForPlace(marker.place),
               messageId: marker.messageId,
             })
           }
@@ -432,13 +439,21 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   );
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
+  const threadsById = useMessaging((state) => state.threadsById);
+  const loadThreads = useMessaging((state) => state.loadThreads);
+  const loadThread = useMessaging((state) => state.loadThread);
   const workspaces = useMessaging((state) => state.workspaces);
   const selectedPlaceKey =
     placeKey &&
     (channels.some((channel) => placeKey === `channel:${channel.channelId}`) ||
-      dms.some((dm) => placeKey === `${dm.kind}:${dm.dmId}`))
+      dms.some((dm) => placeKey === `${dm.kind}:${dm.dmId}`) ||
+      (placeKey.startsWith("thread:") &&
+        threadsById[placeKey.slice("thread:".length)] !== undefined))
       ? placeKey
       : null;
+  const requestedThreadId = placeKey?.startsWith("thread:")
+    ? placeKey.slice("thread:".length)
+    : null;
   const display = usePlaceDisplay(selectedPlaceKey);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
   const notificationLevelByPlace = useMessaging(
@@ -449,6 +464,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   );
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
+  const [threadsOpen, setThreadsOpen] = useState(false);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
 
   // URLが現在地の正本。route paramのplaceをstoreへ同期する。
@@ -469,6 +485,21 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     selectPlace,
     clearPlaceSelection,
   ]);
+
+  useEffect(() => {
+    if (selectedPlaceKey?.startsWith("channel:"))
+      void loadThreads(selectedPlaceKey);
+  }, [selectedPlaceKey, loadThreads]);
+
+  useEffect(() => {
+    if (
+      ready &&
+      requestedThreadId &&
+      threadsById[requestedThreadId] === undefined
+    ) {
+      void loadThread(requestedThreadId);
+    }
+  }, [ready, requestedThreadId, threadsById, loadThread]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
@@ -553,13 +584,19 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     );
   }
 
-  const hasSelectablePlace = channels.length > 0 || dms.length > 0;
+  const hasSelectablePlace =
+    channels.length > 0 ||
+    dms.length > 0 ||
+    Object.keys(threadsById).length > 0;
   const selectedPlaceIsLoaded =
     selectedPlaceKey !== null && activePlaceKey === selectedPlaceKey;
   const selectedChannel = selectedPlaceKey?.startsWith("channel:")
     ? channels.find(
         (channel) => `channel:${channel.channelId}` === selectedPlaceKey,
       )
+    : undefined;
+  const selectedThread = selectedPlaceKey?.startsWith("thread:")
+    ? threadsById[selectedPlaceKey.slice("thread:".length)]
     : undefined;
 
   return (
@@ -573,12 +610,33 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <NotificationPermissionBanner />
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
+          {selectedThread ? (
+            <button
+              type="button"
+              title="親チャンネルへ戻る"
+              onClick={() =>
+                placeNavigate(keyForPlace(selectedThread.parentPlace))
+              }
+              className="rounded p-1 text-muted-foreground hover:bg-accent"
+            >
+              <ArrowLeft className="size-4" />
+            </button>
+          ) : null}
           {display?.kind === "channel" ? (
             <Hash className="size-4 shrink-0 text-muted-foreground" />
           ) : null}
           <span className="truncate font-semibold text-[14.5px]">
             {display?.name ?? "メッセージ"}
           </span>
+          {selectedThread ? (
+            <span className="truncate text-xs text-muted-foreground">
+              親: #
+              {channels.find(
+                (channel) =>
+                  channel.channelId === selectedThread.parentPlace.channelId,
+              )?.name ?? "チャンネル"}
+            </span>
+          ) : null}
           {display?.kind === "channel" && selectedPlaceKey ? (
             <ChannelTopic
               channelId={selectedPlaceKey.slice("channel:".length)}
@@ -594,8 +652,19 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           ) : null}
           <span className="ml-auto flex items-center gap-1">
             <MessageSearch onJump={requestJump} />
+            {selectedPlaceKey?.startsWith("channel:") ? (
+              <button
+                type="button"
+                title="スレッド"
+                onClick={() => setThreadsOpen((value) => !value)}
+                className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-accent"
+              >
+                <MessagesSquare className="size-4" />
+              </button>
+            ) : null}
             {selectedPlaceIsLoaded &&
             selectedPlaceKey &&
+            display?.kind !== "thread" &&
             (display?.kind !== "channel" || selectedChannel?.voice) ? (
               <CallStartButtons placeKey={selectedPlaceKey} />
             ) : null}
@@ -651,6 +720,12 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             )}
           </main>
           {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
+          {threadsOpen && selectedPlaceKey?.startsWith("channel:") ? (
+            <ThreadPanel
+              parentKey={selectedPlaceKey}
+              onClose={() => setThreadsOpen(false)}
+            />
+          ) : null}
         </div>
       </div>
       <IncomingCall />

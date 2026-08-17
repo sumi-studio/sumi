@@ -24,6 +24,7 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
   UploadAttachmentInput,
   UploadAttachmentReceipt,
@@ -344,12 +345,14 @@ export class MockMessagingServer implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
+  private readonly threads = new Map<string, ThreadSummary>();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
     owner: SELF,
@@ -405,6 +408,7 @@ export class MockMessagingServer implements MessagingBackend {
       workspaces: WORKSPACES,
       channels: CHANNELS,
       dms: DMS,
+      threads: [...this.threads.values()],
       members: MEMBERS,
       statuses: [...this.statuses.values()],
       readMarkers,
@@ -434,7 +438,8 @@ export class MockMessagingServer implements MessagingBackend {
     );
     const level = override?.level ?? this.notificationSetting.defaults.level;
     if (level === "mute") return null;
-    if (message.place.kind !== "channel") return { reason: "dm" };
+    if (message.place.kind === "dm" || message.place.kind === "group_dm")
+      return { reason: "dm" };
     if (message.mentions.some((ref) => sameParticipant(ref, SELF))) {
       return { reason: "mention" };
     }
@@ -557,6 +562,46 @@ export class MockMessagingServer implements MessagingBackend {
     channel.topic = topic;
     this.emit({ type: "place_updated", channel });
     return channel;
+  }
+
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    return [...this.threads.values()].filter(
+      (thread) => placeKey(thread.parentPlace) === placeKey(parent),
+    );
+  }
+
+  async fetchThread(threadId: string): Promise<ThreadSummary> {
+    const thread = this.threads.get(threadId);
+    if (!thread) throw new Error("Thread not found");
+    return structuredClone(thread);
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    if (parent.kind !== "channel")
+      throw new Error("threads require channel parent");
+    const threadId = `thread-${secureRandomUUID().slice(0, 8)}`;
+    const thread: ThreadSummary = {
+      threadId,
+      parentPlace: parent,
+      parentMessageId: originMessageId,
+      workspaceId:
+        CHANNELS.find((channel) => channel.channelId === parent.channelId)
+          ?.workspaceId ?? "",
+      name,
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [SELF],
+      latestSeq: 0,
+    };
+    this.threads.set(threadId, thread);
+    this.history.set(`thread:${threadId}`, []);
+    this.emit({ type: "place_created", thread });
+    return thread;
   }
 
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {
