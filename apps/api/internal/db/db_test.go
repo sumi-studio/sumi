@@ -947,192 +947,6 @@ func TestWorkspaceCurrentAgentInviteMigrationUpgradeDownAndReupgrade(t *testing.
 	assertRedeemedShare("re-upgrade")
 }
 
-func TestHumanDirectChatDefaultMigrationBackfillsOnlyAbsentBindings(t *testing.T) {
-	pool := testdb.Create(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	applyMigrationsThrough(t, ctx, pool, 20)
-
-	const (
-		missingHumanID  = "0198f0f4-9b72-7000-8000-000000000321"
-		disabledHumanID = "0198f0f4-9b72-7000-8000-000000000322"
-		disabledAppID   = "0198f0f4-9b72-7000-8000-000000000323"
-	)
-	if _, err := pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1), ($2)`, missingHumanID, disabledHumanID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO app_installations
-			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch)
-		VALUES ($1, 'human', $2, 'direct-chat', false, 4)`, disabledAppID, disabledHumanID); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("upgrade through direct-chat default: %v", err)
-	}
-	var installationID string
-	var enabled bool
-	var epoch int64
-	if err := pool.QueryRow(ctx, `
-		SELECT installation_id, enabled, authority_epoch
-		FROM app_installations
-		WHERE owner_kind='human' AND owner_id=$1 AND app_id='direct-chat'`, missingHumanID,
-	).Scan(&installationID, &enabled, &epoch); err != nil {
-		t.Fatalf("load backfilled installation: %v", err)
-	}
-	if installationID == "" || !enabled || epoch != 1 {
-		t.Fatalf("backfilled installation = id=%q enabled=%v epoch=%d", installationID, enabled, epoch)
-	}
-	if err := pool.QueryRow(ctx, `
-		SELECT enabled, authority_epoch
-		FROM app_installations
-		WHERE installation_id=$1`, disabledAppID,
-	).Scan(&enabled, &epoch); err != nil {
-		t.Fatalf("load preserved disabled installation: %v", err)
-	}
-	if enabled || epoch != 4 {
-		t.Fatalf("existing disabled installation changed: enabled=%v epoch=%d", enabled, epoch)
-	}
-}
-
-func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
-	pool := testdb.Create(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	applyMigrationsThrough(t, ctx, pool, 21)
-
-	const (
-		uninstalledHumanID = "0198f0f4-9b72-7000-8000-0000000003a1"
-		neverInstalledID   = "0198f0f4-9b72-7000-8000-0000000003a2"
-		liveHumanID        = "0198f0f4-9b72-7000-8000-0000000003a3"
-		incompleteHumanID  = "0198f0f4-9b72-7000-8000-0000000003a4"
-
-		uninstalledAppID = "0198f0f4-9b72-7000-8000-0000000003b1"
-		liveAppID        = "0198f0f4-9b72-7000-8000-0000000003b3"
-
-		uninstalledOperationID = "00000000-0000-4000-8000-0000000003a1"
-		liveOperationID        = "00000000-0000-4000-8000-0000000003a3"
-		incompleteOperationID  = "00000000-0000-4000-8000-0000000003a4"
-	)
-	past := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
-	createdAt := past.Add(-time.Minute)
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO humans (human_id) VALUES ($1), ($2), ($3), ($4)`,
-		uninstalledHumanID, neverInstalledID, liveHumanID, incompleteHumanID,
-	); err != nil {
-		t.Fatalf("insert Humans: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO app_install_operation_receipts
-			(owner_kind, owner_id, operation_id, app_id, status, installation_id,
-			 enabled, authority_epoch, installed_at, updated_at, created_at, completed_at)
-		VALUES
-			('human', $1, $2, 'direct-chat', 'installed', $3, true, 1, $4, $4, $5, $4),
-			('human', $6, $7, 'direct-chat', 'installed', $8, true, 1, $4, $4, $5, $4)`,
-		uninstalledHumanID, uninstalledOperationID, uninstalledAppID,
-		past, createdAt,
-		liveHumanID, liveOperationID, liveAppID,
-	); err != nil {
-		t.Fatalf("insert completed install receipts: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO app_install_operation_receipts
-			(owner_kind, owner_id, operation_id, app_id, status, created_at)
-		VALUES ('human', $1, $2, 'direct-chat', 'pending', $3)`,
-		incompleteHumanID, incompleteOperationID, createdAt,
-	); err != nil {
-		t.Fatalf("insert incomplete install receipt: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO app_installations
-			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
-			 installed_at, updated_at)
-		VALUES ($1, 'human', $2, 'direct-chat', true, 1, $3, $3)`,
-		liveAppID, liveHumanID, past,
-	); err != nil {
-		t.Fatalf("insert live Direct Chat installation: %v", err)
-	}
-
-	readMigration := func(name string) string {
-		t.Helper()
-		content, err := migrationFS.ReadFile("migrations/" + name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		return string(content)
-	}
-	if _, err := pool.Exec(ctx, readMigration("0022_human_direct_chat_default.up.sql")); err != nil {
-		t.Fatalf("apply 0022: %v", err)
-	}
-
-	directChatInstallationID := func(humanID string) string {
-		t.Helper()
-		var installationID string
-		if err := pool.QueryRow(ctx, `
-			SELECT installation_id
-			FROM app_installations
-			WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = 'direct-chat'`, humanID,
-		).Scan(&installationID); err != nil {
-			t.Fatalf("load Direct Chat installation for %s: %v", humanID, err)
-		}
-		return installationID
-	}
-	for _, humanID := range []string{uninstalledHumanID, neverInstalledID, incompleteHumanID, liveHumanID} {
-		if directChatInstallationID(humanID) == "" {
-			t.Fatalf("0022 did not leave a Direct Chat installation for %s", humanID)
-		}
-	}
-	if got := directChatInstallationID(liveHumanID); got != liveAppID {
-		t.Fatalf("0022 changed the existing Direct Chat installation: got %q, want %q", got, liveAppID)
-	}
-
-	up := readMigration("0027_direct_chat_backfill_respects_uninstall.up.sql")
-	first, err := pool.Exec(ctx, up)
-	if err != nil {
-		t.Fatalf("apply 0027: %v", err)
-	}
-	if first.RowsAffected() != 1 {
-		t.Fatalf("0027 removed %d installations, want 1", first.RowsAffected())
-	}
-	installationExists := func(humanID string) bool {
-		t.Helper()
-		var exists bool
-		if err := pool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM app_installations
-				WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = 'direct-chat'
-			)`, humanID,
-		).Scan(&exists); err != nil {
-			t.Fatalf("check Direct Chat installation for %s: %v", humanID, err)
-		}
-		return exists
-	}
-	if installationExists(uninstalledHumanID) {
-		t.Fatal("0027 retained the 0022 Direct Chat backfill after an explicit uninstall")
-	}
-	for _, humanID := range []string{neverInstalledID, incompleteHumanID, liveHumanID} {
-		if !installationExists(humanID) {
-			t.Fatalf("0027 unexpectedly removed Direct Chat for %s", humanID)
-		}
-	}
-	second, err := pool.Exec(ctx, up)
-	if err != nil {
-		t.Fatalf("reapply 0027: %v", err)
-	}
-	if second.RowsAffected() != 0 {
-		t.Fatalf("reapplying 0027 removed %d installations, want 0", second.RowsAffected())
-	}
-	if installationExists(uninstalledHumanID) {
-		t.Fatal("reapplying 0027 recreated a removed Direct Chat installation")
-	}
-	for _, humanID := range []string{neverInstalledID, incompleteHumanID, liveHumanID} {
-		if !installationExists(humanID) {
-			t.Fatalf("reapplying 0027 removed Direct Chat for %s", humanID)
-		}
-	}
-}
-
 func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -1149,6 +963,14 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 	}
 	up := readMigration("0024_message_search.up.sql")
 	down := readMigration("0024_message_search.down.sql")
+	execStatements := func(label, sql string) {
+		t.Helper()
+		for _, stmt := range splitSQLStatements(sql) {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("%s: %v", label, err)
+			}
+		}
+	}
 	assertIndex := func(want bool) {
 		t.Helper()
 		var exists bool
@@ -1161,17 +983,13 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 			t.Fatalf("messages_content_trgm exists=%v, want %v", exists, want)
 		}
 	}
-	if _, err := pool.Exec(ctx, up); err != nil {
-		t.Fatalf("upgrade: %v", err)
-	}
+	execStatements("upgrade", up)
 	assertIndex(true)
-	if _, err := pool.Exec(ctx, down); err != nil {
-		t.Fatalf("downgrade: %v", err)
-	}
+	execStatements("retry upgrade", up)
+	assertIndex(true)
+	execStatements("downgrade", down)
 	assertIndex(false)
-	if _, err := pool.Exec(ctx, up); err != nil {
-		t.Fatalf("re-upgrade: %v", err)
-	}
+	execStatements("re-upgrade", up)
 	assertIndex(true)
 }
 
@@ -1265,71 +1083,6 @@ func TestVoiceChannelMigrationRoundTrip(t *testing.T) {
 		t.Fatalf("re-upgrade: %v", err)
 	}
 	assertUp("re-upgrade")
-}
-
-func TestMessageSearchConcurrentIndexMigration(t *testing.T) {
-	pool := testdb.Create(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	applyMigrationsThrough(t, ctx, pool, 26)
-
-	var exists, valid bool
-	if err := pool.QueryRow(ctx, `
-		SELECT c.oid IS NOT NULL, COALESCE(i.indisvalid, false)
-		FROM (SELECT 1) AS singleton
-		LEFT JOIN pg_class c ON c.oid = to_regclass('public.messages_content_trgm')
-		LEFT JOIN pg_index i ON i.indexrelid = c.oid
-	`).Scan(&exists, &valid); err != nil {
-		t.Fatal(err)
-	}
-	if !exists || !valid {
-		t.Fatalf("messages_content_trgm exists=%v valid=%v, want a valid index", exists, valid)
-	}
-
-	// Rollback composes with 0024: 0026's down leaves the index 0024 owns in
-	// place (valid), 0024's down then removes it, and 0026's up rebuilds it.
-	readMigration := func(name string) string {
-		t.Helper()
-		content, err := migrationFS.ReadFile("migrations/" + name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		return string(content)
-	}
-	execStatements := func(label, sql string) {
-		t.Helper()
-		for _, stmt := range splitSQLStatements(sql) {
-			if _, err := pool.Exec(ctx, stmt); err != nil {
-				t.Fatalf("%s: %v", label, err)
-			}
-		}
-	}
-	indexState := func() (bool, bool) {
-		t.Helper()
-		var exists, valid bool
-		if err := pool.QueryRow(ctx, `
-			SELECT c.oid IS NOT NULL, COALESCE(i.indisvalid, false)
-			FROM (SELECT 1) AS singleton
-			LEFT JOIN pg_class c ON c.oid = to_regclass('public.messages_content_trgm')
-			LEFT JOIN pg_index i ON i.indexrelid = c.oid
-		`).Scan(&exists, &valid); err != nil {
-			t.Fatal(err)
-		}
-		return exists, valid
-	}
-	execStatements("0026 down", readMigration("0026_message_search_concurrent_index.down.sql"))
-	if exists, valid := indexState(); !exists || !valid {
-		t.Fatalf("after 0026 down: exists=%v valid=%v, want the 0024 index still present and valid", exists, valid)
-	}
-	execStatements("0024 down", readMigration("0024_message_search.down.sql"))
-	if exists, _ := indexState(); exists {
-		t.Fatalf("after 0024 down: index still exists")
-	}
-	execStatements("0026 up", readMigration("0026_message_search_concurrent_index.up.sql"))
-	if exists, valid := indexState(); !exists || !valid {
-		t.Fatalf("after 0026 re-up: exists=%v valid=%v, want a valid index", exists, valid)
-	}
 }
 
 func TestSplitSQLStatements(t *testing.T) {

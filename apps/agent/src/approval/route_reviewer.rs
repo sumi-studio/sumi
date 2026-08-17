@@ -1343,10 +1343,6 @@ pub struct ExecutionReviewEvidence {
     pub model_id: String,
     pub model_binding_digest: String,
     pub budget: ReviewerBudgetEvidence,
-    /// Empty when the reviewer verified nothing with tools. Serialized as an
-    /// absent field in that case so evidence written before the tool loop
-    /// existed (no `tool_trace` key) hydrates and keeps its recorded digest.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_trace: Vec<ReviewerToolTrace>,
     pub decision: ExecutionReviewDecision,
 }
@@ -1366,8 +1362,6 @@ pub struct EscalationReviewEvidence {
     pub model_id: String,
     pub model_binding_digest: String,
     pub budget: ReviewerBudgetEvidence,
-    /// See `ExecutionReviewEvidence::tool_trace`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_trace: Vec<ReviewerToolTrace>,
     pub decision: EscalationReviewDecision,
 }
