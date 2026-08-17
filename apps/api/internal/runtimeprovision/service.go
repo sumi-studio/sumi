@@ -13,8 +13,13 @@ var ErrConflict = errors.New("runtime provision state conflict")
 // retries idempotent before delegating to the machine backend.
 type Service struct {
 	backend Backend
+	reaps   *durableReapState
 	mu      sync.Mutex
 	entries map[string]*serviceEntry
+}
+
+type ServiceConfig struct {
+	StateDirectory string
 }
 
 type serviceEntry struct {
@@ -27,11 +32,15 @@ type serviceEntry struct {
 	reapedThrough  *uint64
 }
 
-func NewService(backend Backend) (*Service, error) {
+func NewService(backend Backend, config ServiceConfig) (*Service, error) {
 	if backend == nil {
 		return nil, errors.New("runtime provision service requires a backend")
 	}
-	return &Service{backend: backend, entries: make(map[string]*serviceEntry)}, nil
+	reaps, err := newDurableReapState(config.StateDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("initialize durable reap state: %w", err)
+	}
+	return &Service{backend: backend, reaps: reaps, entries: make(map[string]*serviceEntry)}, nil
 }
 
 func (service *Service) entry(personalityAgentID string) *serviceEntry {
@@ -69,6 +78,9 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	}
 	if err := inspection.Validate(); err != nil {
 		return PreparedEpoch{}, fmt.Errorf("backend returned invalid inspection: %w", err)
+	}
+	if err := service.attachDurableReap(&inspection); err != nil {
+		return PreparedEpoch{}, err
 	}
 	if inspection.Phase == PhasePrepared || inspection.Phase == PhaseActive {
 		entry.known = true
@@ -147,6 +159,9 @@ func (service *Service) Abort(ctx context.Context, request AbortRequest) (Inspec
 	if err := validateExactReapInspection(inspection, entry.epoch); err != nil {
 		return Inspection{}, err
 	}
+	if err := service.reaps.record(inspection.PersonalityAgentID, *inspection.ReapedThroughGeneration); err != nil {
+		return Inspection{}, fmt.Errorf("persist verified abort reap: %w", err)
+	}
 	entry.phase = PhaseUnknown
 	entry.stopped = false
 	entry.recordReap(*inspection.ReapedThroughGeneration)
@@ -166,6 +181,9 @@ func (service *Service) Inspect(ctx context.Context, request InspectRequest) (In
 	}
 	if err := inspection.Validate(); err != nil {
 		return Inspection{}, fmt.Errorf("backend returned invalid inspection: %w", err)
+	}
+	if err := service.attachDurableReap(&inspection); err != nil {
+		return Inspection{}, err
 	}
 	entry.setInspection(inspection)
 	return inspection, nil
@@ -197,6 +215,9 @@ func (service *Service) Stop(ctx context.Context, request StopRequest) (Inspecti
 	if err := validateExactReapInspection(inspection, entry.epoch); err != nil {
 		return Inspection{}, err
 	}
+	if err := service.reaps.record(inspection.PersonalityAgentID, *inspection.ReapedThroughGeneration); err != nil {
+		return Inspection{}, fmt.Errorf("persist verified stop reap: %w", err)
+	}
 	entry.phase = PhaseUnknown
 	entry.stopped = true
 	entry.recordReap(*inspection.ReapedThroughGeneration)
@@ -217,11 +238,10 @@ func (service *Service) Reconcile(ctx context.Context, request ReconcileRequest)
 	if err := inspection.Validate(); err != nil {
 		return Inspection{}, fmt.Errorf("backend returned invalid reconciliation: %w", err)
 	}
-	entry.setInspection(inspection)
-	if inspection.Phase == PhaseUnknown && inspection.ReapedThroughGeneration == nil && entry.reapedThrough != nil {
-		reaped := *entry.reapedThrough
-		inspection.ReapedThroughGeneration = &reaped
+	if err := service.attachDurableReap(&inspection); err != nil {
+		return Inspection{}, err
 	}
+	entry.setInspection(inspection)
 	return inspection, nil
 }
 
@@ -236,7 +256,26 @@ func (service *Service) hydrateEntry(ctx context.Context, personalityAgentID str
 	if err := inspection.Validate(); err != nil {
 		return fmt.Errorf("backend returned invalid inspection: %w", err)
 	}
+	if err := service.attachDurableReap(&inspection); err != nil {
+		return err
+	}
 	entry.setInspection(inspection)
+	return nil
+}
+
+func (service *Service) attachDurableReap(inspection *Inspection) error {
+	if inspection.Phase != PhaseUnknown {
+		return nil
+	}
+	if inspection.ReapedThroughGeneration != nil {
+		if err := service.reaps.record(inspection.PersonalityAgentID, *inspection.ReapedThroughGeneration); err != nil {
+			return fmt.Errorf("persist reconciled reap: %w", err)
+		}
+		return nil
+	}
+	if reaped, ok := service.reaps.lookup(inspection.PersonalityAgentID); ok {
+		inspection.ReapedThroughGeneration = &reaped
+	}
 	return nil
 }
 

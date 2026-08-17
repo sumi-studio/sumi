@@ -964,9 +964,12 @@ case "${action}" in
     if [[ "${running}" != 0 && "${running}" != 3 ]] ||
       { [[ "${running}" == 0 ]] && long_lived_containers_exist; }; then
       lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-        >/dev/null 2>&1
+        >/dev/null 2>&1 || true
+      cleanup_project_is_empty || fail "reconcile did not leave an observed-empty Compose project"
+      epoch_identity || fail "observed-empty project has no coherent last allocated epoch"
+      reaped_generation="${EPOCH_GENERATION}"
       remove_runtime_secret_tree
-      print_unknown_json
+      print_reaped_json "${reaped_generation}"
     else
       inspect_epoch
     fi

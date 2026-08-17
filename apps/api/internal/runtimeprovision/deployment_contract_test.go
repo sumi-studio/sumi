@@ -83,6 +83,108 @@ exec /usr/bin/stat "$@"
 	}
 }
 
+func TestSupervisorReconcileAttestsPartialProjectOnlyAfterObservedEmpty(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	dockerState := filepath.Join(testRoot, "project-down")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  *"compose.lifecycle.yaml ps --status running --quiet runtime"*)
+    [ -e "$SUMI_FAKE_DOCKER_STATE" ] || printf '0123456789ab\n'
+    ;;
+  *"compose.lifecycle.yaml down"*)
+    : > "$SUMI_FAKE_DOCKER_STATE"
+    exit 17
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=reconciled-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" reconcile`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_FAKE_DOCKER_STATE=" + dockerState,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real supervisor reconcile failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"phase":"unknown","reaped_through_generation":7`) {
+		t.Fatalf("reconcile cleanup omitted the observed-empty receipt: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
+	emptyObservation := strings.Index(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
+	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
+		t.Fatalf("reconcile did not observe empty before deriving its durable generation:\n%s", calls)
+	}
+}
+
+func TestSupervisorReconcileCleanupReceiptContractIsFailClosed(t *testing.T) {
+	supervisor := readDeploymentFile(t, "supervisor")
+	reconcileStart := strings.Index(supervisor, "  reconcile)")
+	if reconcileStart < 0 {
+		t.Fatal("supervisor has no reconcile action")
+	}
+	reconcile := supervisor[reconcileStart:]
+	for _, required := range []string{
+		"cleanup_project_is_empty || fail",
+		"epoch_identity || fail",
+		`print_reaped_json "${reaped_generation}"`,
+	} {
+		if !strings.Contains(reconcile, required) {
+			t.Fatalf("reconcile cleanup omits %q:\n%s", required, reconcile)
+		}
+	}
+	if strings.Index(reconcile, "cleanup_project_is_empty") > strings.Index(reconcile, "epoch_identity") ||
+		strings.Index(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
+		t.Fatalf("reconcile can attest before observed-empty verification and durable generation recovery:\n%s", reconcile)
+	}
+}
+
 func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	prepare := readDeploymentFile(t, "compose.prepare.yaml")
 	for _, service := range []string{"runtime", "executor", "broker"} {
@@ -259,6 +361,8 @@ func TestLocalProvisionerForwardsPinnedAgentImageTag(t *testing.T) {
 	}
 	for _, required := range []string{
 		"DOCKER_CONFIG: /run/sumi/docker-config",
+		"- -state-dir",
+		"- /run/sumi/runtime-provisioner/state",
 		"source: ${SUMI_DOCKER_CONFIG_FILE:?SUMI_DOCKER_CONFIG_FILE is required}",
 		"target: /run/sumi/docker-config/config.json",
 		"read_only: true",

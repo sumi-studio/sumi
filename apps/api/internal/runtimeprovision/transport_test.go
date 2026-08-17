@@ -10,7 +10,7 @@ import (
 
 func TestUnixTransportRoundTrip(t *testing.T) {
 	backend := newFakeBackend()
-	service, _ := NewService(backend)
+	service := newTestService(t, backend)
 	handler, _ := NewHandler(service)
 	socketPath := filepath.Join(t.TempDir(), "provisioner.sock")
 	listener, err := ListenUnix(UnixListenerConfig{

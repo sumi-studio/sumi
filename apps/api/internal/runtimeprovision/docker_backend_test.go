@@ -118,6 +118,20 @@ func TestDockerBackendRejectsTeardownWithoutExactObservedEmptyReceipt(t *testing
 	}
 }
 
+func TestDockerBackendReconcileReturnsObservedEmptyReceipt(t *testing.T) {
+	runner := &recordingRunner{outputs: map[string]string{
+		"reconcile": `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":7}`,
+	}}
+	backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}
+	inspection, err := backend.Reconcile(context.Background(), testPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != 7 {
+		t.Fatalf("reconcile lost the supervisor's observed-empty receipt: %#v", inspection)
+	}
+}
+
 func TestDockerBackendPassesPinnedAgentImageTagToSupervisor(t *testing.T) {
 	const tag = "a1b2c3d4e5f6"
 	runner := &recordingRunner{outputs: map[string]string{

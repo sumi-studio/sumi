@@ -2,8 +2,12 @@ package runtimeprovision
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -86,6 +90,7 @@ type fakeBackend struct {
 	abortCalls     map[string]int
 	stopCalls      map[string]int
 	privateVolumes map[string]bool
+	reconcileReaps map[string]uint64
 }
 
 func newFakeBackend() *fakeBackend {
@@ -97,6 +102,7 @@ func newFakeBackend() *fakeBackend {
 		abortCalls:     make(map[string]int),
 		stopCalls:      make(map[string]int),
 		privateVolumes: make(map[string]bool),
+		reconcileReaps: make(map[string]uint64),
 	}
 }
 
@@ -167,6 +173,14 @@ func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) (Inspec
 }
 
 func (backend *fakeBackend) Reconcile(ctx context.Context, personalityAgentID string) (Inspection, error) {
+	backend.mu.Lock()
+	if generation, ok := backend.reconcileReaps[personalityAgentID]; ok {
+		backend.mu.Unlock()
+		inspection := unknownInspection(personalityAgentID)
+		inspection.ReapedThroughGeneration = &generation
+		return inspection, nil
+	}
+	backend.mu.Unlock()
 	return backend.Inspect(ctx, personalityAgentID)
 }
 
@@ -175,15 +189,25 @@ func cloneInspection(inspection Inspection) Inspection {
 		epoch := *inspection.Epoch
 		inspection.Epoch = &epoch
 	}
+	if inspection.ReapedThroughGeneration != nil {
+		reaped := *inspection.ReapedThroughGeneration
+		inspection.ReapedThroughGeneration = &reaped
+	}
 	return inspection
+}
+
+func newTestService(t *testing.T, backend Backend) *Service {
+	t.Helper()
+	service, err := NewService(backend, ServiceConfig{StateDirectory: filepath.Join(t.TempDir(), "state")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func TestServiceFakeBackendContract(t *testing.T) {
 	backend := newFakeBackend()
-	service, err := NewService(backend)
-	if err != nil {
-		t.Fatal(err)
-	}
+	service := newTestService(t, backend)
 	request := PrepareRequest{Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "request-1"}
 
 	const callers = 24
@@ -280,7 +304,7 @@ func TestPrepareRecoversCommittedBackendEpochWithoutAllocatingAgain(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, _ := NewService(backend)
+	service := newTestService(t, backend)
 	recovered, err := service.Prepare(context.Background(), PrepareRequest{
 		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "retry-after-daemon-restart",
 	})
@@ -294,10 +318,7 @@ func TestPrepareRecoversCommittedBackendEpochWithoutAllocatingAgain(t *testing.T
 
 func TestStaleStopCannotTearDownReplacementEpoch(t *testing.T) {
 	backend := newFakeBackend()
-	service, err := NewService(backend)
-	if err != nil {
-		t.Fatal(err)
-	}
+	service := newTestService(t, backend)
 	request := PrepareRequest{
 		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "epoch-n",
 	}
@@ -360,5 +381,149 @@ func TestStableNamespaceDependsOnlyOnCanonicalPAID(t *testing.T) {
 	}
 	if first.Project != "sumi-0198f0f49b7270008000000000000001" {
 		t.Fatalf("unexpected canonical project: %s", first.Project)
+	}
+}
+
+func TestVerifiedStopReapAttestationSurvivesProvisionerRestart(t *testing.T) {
+	backend := newFakeBackend()
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	first, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := first.Prepare(context.Background(), PrepareRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Activate(context.Background(), ActivateRequest{
+		Version: ProtocolVersion, PreparedEpoch: epoch, Activation: testActivationConfig(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Stop(context.Background(), StopRequest{
+		Version: ProtocolVersion, PreparedEpoch: epoch,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := restarted.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != epoch.Generation {
+		t.Fatalf("restarted provisioner lost verified reap: %#v", inspection)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(stateDirectory, reapStateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document reapStateDocument
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.PersonalityAgents) != 1 ||
+		document.PersonalityAgents[testPAID].ReapedThroughGeneration == nil ||
+		*document.PersonalityAgents[testPAID].ReapedThroughGeneration != epoch.Generation {
+		t.Fatalf("durable reap state has the wrong per-PA shape: %s", raw)
+	}
+}
+
+func TestDurableReapStateRejectsMissingGeneration(t *testing.T) {
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	malformed := `{"version":1,"personality_agents":{"` + testPAID + `":{}}}`
+	if err := os.WriteFile(filepath.Join(stateDirectory, reapStateFileName), []byte(malformed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewService(newFakeBackend(), ServiceConfig{StateDirectory: stateDirectory}); err == nil || !strings.Contains(err.Error(), "reaped_through_generation is required") {
+		t.Fatalf("missing durable reap generation was accepted: %v", err)
+	}
+}
+
+func TestReconcileObservedEmptyReapIsPersistedAcrossRestart(t *testing.T) {
+	backend := newFakeBackend()
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	backend.reconcileReaps[testPAID] = 7
+	first, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := first.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil || inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != 7 {
+		t.Fatalf("reconcile cleanup receipt was not accepted: %#v %v", inspection, err)
+	}
+	delete(backend.reconcileReaps, testPAID)
+
+	restarted, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = restarted.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil || inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != 7 {
+		t.Fatalf("reconcile cleanup receipt did not survive restart: %#v %v", inspection, err)
+	}
+}
+
+func TestDurableReapAttestationNeverLeaksAcrossPersonalityAgents(t *testing.T) {
+	backend := newFakeBackend()
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	backend.reconcileReaps[testPAID] = 11
+	first, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	delete(backend.reconcileReaps, testPAID)
+
+	restarted, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := restarted.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.ReapedThroughGeneration != nil {
+		t.Fatalf("PA %s received PA %s's reap attestation: %#v", testPAID2, testPAID, other)
+	}
+	original, err := restarted.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil || original.ReapedThroughGeneration == nil || *original.ReapedThroughGeneration != 11 {
+		t.Fatalf("original PA lost its isolated reap attestation: %#v %v", original, err)
+	}
+}
+
+func TestUnknownRuntimeWithoutDurableReapAttestationStaysUnattested(t *testing.T) {
+	service := newTestService(t, newFakeBackend())
+	inspection, err := service.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.ReapedThroughGeneration != nil {
+		t.Fatalf("unknown runtime fabricated a reap attestation: %#v", inspection)
 	}
 }
