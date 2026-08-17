@@ -938,6 +938,57 @@ describe("Workspace control store", () => {
     ).toBeNull();
   });
 
+  it("mints the install operation id on an origin without randomUUID", async () => {
+    // A plain-HTTP origin is not a secure context, so crypto.randomUUID does
+    // not exist there. Installing must still carry a caller-minted operation
+    // id instead of throwing before the request is sent.
+    const enabled = installation(
+      WORKSPACE_A_ID,
+      "enabled",
+      "2026-08-10T06:07:08.901Z",
+    );
+    const installApp = vi.fn(async () => enabled);
+    const store = createWorkspaceControlStore(
+      clientWith({
+        listWorkspaces: async () => [WORKSPACE_A],
+        getWorkspace: async () => WORKSPACE_A,
+        listMembers: async () => [MEMBER_A],
+        listRoles: async () => [ROLE_A],
+        listAppCatalog: async () => [APP],
+        listInstallations: async () => [],
+        installApp,
+      }),
+    );
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await store.getState().init();
+    await store.getState().selectWorkspace(WORKSPACE_A_ID);
+
+    vi.stubGlobal("crypto", {
+      getRandomValues: (bytes: Uint8Array) => {
+        for (let index = 0; index < bytes.length; index += 1) {
+          bytes[index] = index;
+        }
+        return bytes;
+      },
+    });
+    try {
+      await store.getState().installApp(APP_ID);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(installApp).toHaveBeenCalledWith(
+      { kind: "workspace", workspaceId: WORKSPACE_A_ID },
+      APP_ID,
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    );
+    expect(installationForApp(store.getState().installations, APP_ID)).toBe(
+      enabled,
+    );
+  });
+
   it("ends the install mutation even when the reconciliation read fails", async () => {
     const installApp = vi.fn(async () => {
       throw new WorkspaceAPIError("install_intent_already_installed", 409);

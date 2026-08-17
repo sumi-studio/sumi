@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { secureRandomUUID } from "../lib/random-uuid";
 import {
   WorkspaceAPIError,
   WorkspaceApiClient,
@@ -890,7 +891,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           const installation = await client.installApp(
             { kind: "workspace", workspaceId: token.workspaceId },
             appId,
-            crypto.randomUUID(),
+            secureRandomUUID(),
           );
           if (!isCurrentScope(token)) return installation;
           validateInstallation(token.workspaceId, installation, appId);

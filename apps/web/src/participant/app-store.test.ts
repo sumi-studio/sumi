@@ -874,6 +874,46 @@ describe("Participant app lifecycle store", () => {
     expect(coordinators[1].journal(ownerKey)).toBe("{corrupted");
   });
 
+  it("mints the lifecycle operation id on an origin without randomUUID", async () => {
+    // Plain-HTTP origins are not secure contexts, so crypto.randomUUID is
+    // absent there. A lifecycle mutation must still announce a durable
+    // operation id instead of throwing before it reaches the journal.
+    const installed = installation(OWNER_A);
+    let snapshot: AppInstallation[] = [];
+    const installApp = vi.fn(async () => {
+      snapshot = [installed];
+      return installed;
+    });
+    const coordinators = lifecycleCoordinatorPair();
+    const store = createParticipantAppStore(
+      participantClient({
+        installApp,
+        listInstallations: async () => snapshot,
+      }),
+      coordinators[0],
+    );
+    await store.getState().bindParticipant(HUMAN_A);
+
+    vi.stubGlobal("crypto", {
+      getRandomValues: (bytes: Uint8Array) => {
+        for (let index = 0; index < bytes.length; index += 1) {
+          bytes[index] = index;
+        }
+        return bytes;
+      },
+    });
+    await store.getState().installApp("direct-chat");
+
+    expect(installApp).toHaveBeenCalledWith(
+      OWNER_A,
+      "direct-chat",
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    );
+    expect(store.getState().installations).toEqual([installed]);
+  });
+
   it("recovers a durable install intent when a new document binds later", async () => {
     const installed = installation(OWNER_A);
     const coordinators = lifecycleCoordinatorPair();

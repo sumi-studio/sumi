@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { secureRandomUUID } from "../lib/random-uuid";
 import {
   WorkspaceAPIError,
   WorkspaceAPIUncertainError,
@@ -739,7 +740,7 @@ export function createParticipantAppStore(
       const notice: ParticipantAppLifecycleUnsettledNotice = {
         version: 2,
         ownerKey: token.ownerKey,
-        operationId: globalThis.crypto.randomUUID(),
+        operationId: secureRandomUUID(),
         phase: "unsettled",
         intent,
       };
