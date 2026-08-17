@@ -25,6 +25,7 @@ import {
   participantKey,
   WORKSPACE_PERMISSIONS,
 } from "./model";
+import { secureRandomUUID } from "../lib/random-uuid";
 
 export type WorkspaceListStatus = "idle" | "loading" | "ready" | "error";
 const INVITE_AUTHORITY_CONTRADICTION =
@@ -890,7 +891,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           const installation = await client.installApp(
             { kind: "workspace", workspaceId: token.workspaceId },
             appId,
-            crypto.randomUUID(),
+            secureRandomUUID(),
           );
           if (!isCurrentScope(token)) return installation;
           validateInstallation(token.workspaceId, installation, appId);

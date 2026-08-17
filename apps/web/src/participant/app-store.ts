@@ -13,6 +13,7 @@ import type {
   ParticipantRef,
 } from "../workspace/model";
 import { appOwnerKey, isOwnedBy } from "../workspace/model";
+import { secureRandomUUID } from "../lib/random-uuid";
 
 export type ParticipantAppStatus = "idle" | "loading" | "ready" | "error";
 export type ParticipantAppCoordination = "web-locks" | "document-only";
@@ -739,7 +740,7 @@ export function createParticipantAppStore(
       const notice: ParticipantAppLifecycleUnsettledNotice = {
         version: 2,
         ownerKey: token.ownerKey,
-        operationId: globalThis.crypto.randomUUID(),
+        operationId: secureRandomUUID(),
         phase: "unsettled",
         intent,
       };
