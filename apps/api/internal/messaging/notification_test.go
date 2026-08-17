@@ -497,3 +497,54 @@ func TestLocalNotificationSettingsUseTheSharedStore(t *testing.T) {
 		t.Fatal("an unknown level must be a request error, not an internal one")
 	}
 }
+
+// A channel message must issue exactly one notification intent per recipient.
+// The member query left-joined place_members without binding it to the place,
+// so a member who also belonged to other places came back once per place and
+// the intent insert hit message_notification_intents_pkey — a 500 that made
+// the PersonalityAgent's write RPC indeterminate and killed its runtime.
+func TestChannelNotificationIntentsAreIssuedOncePerRecipient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+
+	// humanB and the agent gain a second place: a DM with each other. That is
+	// ordinary usage, and it must not change what a channel message issues.
+	if _, _, err := w.store.EnsureDM(ctx, w.humanB, w.agent); err != nil {
+		t.Fatalf("ensure dm: %v", err)
+	}
+	if _, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB); err != nil {
+		t.Fatalf("ensure second dm: %v", err)
+	}
+
+	msg := w.send(t, ctx, ch.PlaceID, w.agent, "チャンネルへの投稿です")
+
+	rows, err := w.store.pool.Query(ctx, `
+		SELECT recipient_kind, recipient_id, count(*)
+		FROM message_notification_intents
+		WHERE message_id = $1
+		GROUP BY recipient_kind, recipient_id`, msg.MessageID)
+	if err != nil {
+		t.Fatalf("read intents: %v", err)
+	}
+	defer rows.Close()
+	recipients := 0
+	for rows.Next() {
+		var kind, id string
+		var count int
+		if err := rows.Scan(&kind, &id, &count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("recipient %s/%s has %d intents, want exactly 1", kind, id, count)
+		}
+		recipients++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if recipients != 2 {
+		t.Fatalf("channel message reached %d recipients, want humanA and humanB", recipients)
+	}
+}
