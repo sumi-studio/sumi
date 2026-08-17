@@ -13,8 +13,12 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
-use crate::runtime::contracts::{
-    GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
+use crate::runtime::{
+    authority::RuntimeEpochAuthority,
+    contracts::{
+        GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
+        RpcBootNonce,
+    },
 };
 
 use super::Store;
@@ -59,6 +63,85 @@ pub(crate) struct HydrationReceiptIdentity {
     pub intent_count: usize,
 }
 
+/// Authenticated control-plane statement delivered in the exact replacement
+/// epoch's activation material. Its canonical meaning is: the host supervisor
+/// observed no runtime project containers for this PAID through
+/// `reaped_through_generation`. It intentionally says nothing about whether an
+/// external tool effect committed before those processes exited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalReapAttestation {
+    pub personality_agent_id: PersonalityAgentId,
+    pub epoch_generation: ProcessGeneration,
+    pub rpc_boot_nonce: RpcBootNonce,
+    pub reaped_through_generation: ProcessGeneration,
+}
+
+impl PhysicalReapAttestation {
+    pub(crate) fn from_wire(
+        personality_agent_id: &str,
+        epoch_generation: u64,
+        rpc_boot_nonce: String,
+        reaped_through_generation: u64,
+    ) -> Result<Self> {
+        let personality_agent_id = PersonalityAgentId::parse(personality_agent_id)
+            .context("reap attestation personality_agent_id is not canonical")?;
+        let epoch_generation = ProcessGeneration::from_wire(epoch_generation).context(
+            "reap attestation epoch generation is outside the process-generation domain",
+        )?;
+        let rpc_boot_nonce = RpcBootNonce::new(rpc_boot_nonce)
+            .context("reap attestation RPC boot nonce is invalid")?;
+        let reaped_through_generation = ProcessGeneration::from_wire(reaped_through_generation)
+            .context("reaped-through generation is outside the process-generation domain")?;
+        if reaped_through_generation >= epoch_generation {
+            bail!("reap attestation may cover only generations older than its bound epoch");
+        }
+        Ok(Self {
+            personality_agent_id,
+            epoch_generation,
+            rpc_boot_nonce,
+            reaped_through_generation,
+        })
+    }
+
+    pub(crate) fn validate_for(&self, authority: &RuntimeEpochAuthority) -> Result<()> {
+        if &self.personality_agent_id != authority.personality_agent_id()
+            || self.epoch_generation != authority.generation()
+            || &self.rpc_boot_nonce != authority.nonce()
+        {
+            bail!("reap attestation is not bound to this PersonalityAgent runtime epoch");
+        }
+        if self.reaped_through_generation >= self.epoch_generation {
+            bail!("reap attestation covers its bound epoch or a future generation");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn covers(&self, generation: ProcessGeneration) -> bool {
+        generation <= self.reaped_through_generation
+    }
+
+    pub(crate) fn canonical_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        fn field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        field(
+            &mut hasher,
+            b"sumi-control-plane-observed-empty-reap-attestation/v1",
+        );
+        field(&mut hasher, self.personality_agent_id.as_str().as_bytes());
+        hasher.update(self.epoch_generation.as_i64().to_be_bytes());
+        field(&mut hasher, self.rpc_boot_nonce.as_str().as_bytes());
+        hasher.update(self.reaped_through_generation.as_i64().to_be_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
 impl HydrationReceiptIdentity {
     pub(crate) fn stable_id(&self) -> String {
         let mut hasher = Sha256::new();
@@ -87,6 +170,7 @@ pub(crate) struct PhysicalRecoveryReceipt {
     pub receipt_id: String,
     pub lease: ProcessGenerationLease,
     pub fence: GenerationRecoveryFence,
+    pub reap_attestation: PhysicalReapAttestation,
     pub intents: Vec<PhysicalRecoveryIntent>,
     pub logical_suffix_first_seq: u64,
     pub logical_suffix_last_seq: u64,
@@ -102,7 +186,7 @@ impl PhysicalRecoveryReceipt {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value);
         }
-        field(&mut hasher, b"sumi-physical-recovery-receipt/v2");
+        field(&mut hasher, b"sumi-physical-recovery-receipt/v3");
         field(&mut hasher, self.receipt_id.as_bytes());
         field(
             &mut hasher,
@@ -111,6 +195,10 @@ impl PhysicalRecoveryReceipt {
         field(&mut hasher, self.lease.lease_id().as_bytes());
         hasher.update(self.lease.generation().as_i64().to_be_bytes());
         field(&mut hasher, self.fence.fence_id().as_bytes());
+        field(
+            &mut hasher,
+            self.reap_attestation.canonical_digest().as_bytes(),
+        );
         hasher.update(self.logical_suffix_first_seq.to_be_bytes());
         hasher.update(self.logical_suffix_last_seq.to_be_bytes());
 
@@ -148,6 +236,15 @@ impl PhysicalRecoveryReceipt {
         self.fence
             .validate_exact(&self.lease, self.fence.fence_id())
             .map_err(|error| anyhow::anyhow!("physical recovery fence/lease mismatch: {error}"))?;
+        if self.reap_attestation.personality_agent_id != *self.lease.personality_agent_id()
+            || self.reap_attestation.epoch_generation != self.lease.generation()
+        {
+            bail!("physical recovery reap attestation is not bound to the receipt lease");
+        }
+        if self.reap_attestation.reaped_through_generation >= self.reap_attestation.epoch_generation
+        {
+            bail!("physical recovery reap attestation covers its bound or a future epoch");
+        }
 
         let ids: BTreeSet<_> = self.intents.iter().map(|i| &i.tool_call_id).collect();
         if ids.len() != self.intents.len() {
@@ -164,6 +261,12 @@ impl PhysicalRecoveryReceipt {
             if intent.indeterminate_terminal_seq == 0 {
                 bail!(
                     "physical recovery intent {} must reference a positive terminal sequence",
+                    intent.tool_call_id
+                );
+            }
+            if !self.reap_attestation.covers(intent.executor_generation) {
+                bail!(
+                    "physical recovery intent {} generation exceeds the attested reap bound",
                     intent.tool_call_id
                 );
             }
@@ -200,6 +303,19 @@ impl PhysicalRecoveryReceipt {
             .map_err(|error| {
                 anyhow::anyhow!("physical recovery receipt fence mismatch: {error}")
             })?;
+        if self.reap_attestation.personality_agent_id != *lease.personality_agent_id()
+            || self.reap_attestation.epoch_generation != lease.generation()
+        {
+            bail!("physical recovery reap attestation does not match the injected lease");
+        }
+        for intent in &self.intents {
+            if !self.reap_attestation.covers(intent.executor_generation) {
+                bail!(
+                    "physical recovery intent {} generation exceeds the attested reap bound",
+                    intent.tool_call_id
+                );
+            }
+        }
         Ok(())
     }
 
@@ -311,6 +427,8 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             if stored_intents != expected_intents {
                 bail!("conflicting physical recovery receipt intent set");
             }
+            self.validate_existing_attestation(&mut transaction, receipt)
+                .await?;
 
             transaction.commit().await?;
             return Ok(ApplyReceiptOutcome::AlreadyApplied);
@@ -399,6 +517,8 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         .execute(&mut *transaction)
         .await
         .context("failed to insert physical recovery receipt application")?;
+
+        self.insert_attestation(&mut transaction, receipt).await?;
 
         for intent in &receipt.intents {
             sqlx::query(
@@ -573,6 +693,8 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         if stored != expected {
             bail!("conflicting physical recovery receipt intent set");
         }
+        self.validate_existing_attestation(transaction, receipt)
+            .await?;
         Ok(())
     }
 
@@ -608,6 +730,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         .bind(Utc::now().to_rfc3339())
         .execute(&mut **transaction)
         .await?;
+        self.insert_attestation(transaction, receipt).await?;
         let mut intents = receipt.intents.clone();
         intents.sort_by(|a, b| a.tool_call_id.cmp(&b.tool_call_id));
         for intent in intents {
@@ -628,6 +751,59 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             )?)
             .execute(&mut **transaction)
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn insert_attestation(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        receipt: &PhysicalRecoveryReceipt,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO physical_recovery_receipt_reap_attestations(
+                receipt_id, attestation_digest, personality_agent_id,
+                epoch_generation, rpc_boot_nonce, reaped_through_generation
+             ) VALUES(?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&receipt.receipt_id)
+        .bind(receipt.reap_attestation.canonical_digest())
+        .bind(receipt.reap_attestation.personality_agent_id.as_str())
+        .bind(receipt.reap_attestation.epoch_generation.as_i64())
+        .bind(receipt.reap_attestation.rpc_boot_nonce.as_str())
+        .bind(receipt.reap_attestation.reaped_through_generation.as_i64())
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn validate_existing_attestation(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        receipt: &PhysicalRecoveryReceipt,
+    ) -> Result<()> {
+        let stored: Option<(String, String, i64, String, i64)> = sqlx::query_as(
+            "SELECT attestation_digest, personality_agent_id, epoch_generation,
+                    rpc_boot_nonce, reaped_through_generation
+             FROM physical_recovery_receipt_reap_attestations
+             WHERE receipt_id = ?",
+        )
+        .bind(&receipt.receipt_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let expected = (
+            receipt.reap_attestation.canonical_digest(),
+            receipt
+                .reap_attestation
+                .personality_agent_id
+                .as_str()
+                .to_owned(),
+            receipt.reap_attestation.epoch_generation.as_i64(),
+            receipt.reap_attestation.rpc_boot_nonce.as_str().to_owned(),
+            receipt.reap_attestation.reaped_through_generation.as_i64(),
+        );
+        if stored != Some(expected) {
+            bail!("conflicting or missing physical recovery reap attestation");
         }
         Ok(())
     }
@@ -963,15 +1139,23 @@ mod tests {
         tool_call_id: &str,
         terminal_seq: u64,
     ) -> PhysicalRecoveryReceipt {
+        let reap_attestation = PhysicalReapAttestation::from_wire(
+            lease.personality_agent_id().as_str(),
+            lease.generation().as_u64(),
+            format!("boot-{}", lease.generation().as_u64()),
+            1,
+        )
+        .expect("test reap attestation");
         let mut receipt = PhysicalRecoveryReceipt {
             receipt_id: "receipt-1".to_owned(),
             lease: lease.clone(),
             fence: fence.clone(),
+            reap_attestation,
             intents: vec![PhysicalRecoveryIntent {
                 tool_call_id: tool_call_id.to_owned(),
                 command_id: "command-1".to_owned(),
                 run_id: "run-1".to_owned(),
-                executor_generation: lease.generation(),
+                executor_generation: ProcessGeneration::from_wire(1).unwrap(),
                 indeterminate_terminal_seq: terminal_seq,
             }],
             logical_suffix_first_seq: first,
@@ -986,7 +1170,7 @@ mod tests {
     async fn applies_receipt_and_idempotent_replay() {
         let store = test_store().await;
         let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let receipt = receipt(&lease, &fence, first, last, &tool_call_id, 12);
 
@@ -1016,7 +1200,7 @@ mod tests {
         let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
         let wrong_lease = ProcessGenerationLease::new(
             "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ProcessGeneration::from_wire(1).unwrap(),
+            ProcessGeneration::from_wire(2).unwrap(),
             "lease-1",
         )
         .unwrap();
@@ -1053,7 +1237,7 @@ mod tests {
     async fn rejects_conflicting_receipt_id_with_different_digest() {
         let store = test_store().await;
         let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let mut r = receipt(&lease, &fence, first, last, &tool_call_id, 12);
 
@@ -1071,11 +1255,11 @@ mod tests {
     async fn rejects_receipt_bound_to_a_stale_hydration_lease() {
         let store = test_store().await;
         let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
-        let old_lease = test_lease(1);
+        let old_lease = test_lease(2);
         let old_fence = test_fence(&old_lease);
         let receipt = receipt(&old_lease, &old_fence, first, last, &tool_call_id, 12);
 
-        let current_lease = test_lease(2);
+        let current_lease = test_lease(3);
         let current_fence = test_fence(&current_lease);
         assert!(
             receipt
@@ -1094,7 +1278,7 @@ mod tests {
             .await
             .expect("remove tool execution row");
 
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let r = receipt(&lease, &fence, first, last, &tool_call_id, 12);
 
@@ -1107,7 +1291,7 @@ mod tests {
     async fn rejects_missing_suffix_event() {
         let store = test_store().await;
         let (_first, _last, tool_call_id) = seed_events_and_execution(&store).await;
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let r = receipt(&lease, &fence, 99, 99, &tool_call_id, 12);
 
@@ -1119,7 +1303,7 @@ mod tests {
     async fn rejects_wrong_attestation_without_ghost_ledger_rows() {
         let store = test_store().await;
         let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let mut r = receipt(&lease, &fence, first, last, &tool_call_id, 12);
         r.intents[0].command_id = "other-command".to_owned();
@@ -1145,7 +1329,7 @@ mod tests {
     #[tokio::test]
     async fn empty_hydration_returns_only_complete_fenced_receipt_identity() {
         let store = test_store().await;
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let HydrationOutcome::Complete(state) = store
             .hydrate(&lease, &fence)
@@ -1254,7 +1438,7 @@ mod tests {
         .await
         .expect("seed tool execution");
 
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let r = receipt(
             &lease,
@@ -1342,7 +1526,7 @@ mod tests {
         .await
         .expect("seed tool execution");
 
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         let r = receipt(
             &lease,

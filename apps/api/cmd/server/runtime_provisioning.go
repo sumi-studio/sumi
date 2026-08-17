@@ -101,7 +101,8 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	if err := runtimeprovision.ValidateAgentWrappingKeyID(config.WrappingKey.ID); err != nil {
 		return nil, err
 	}
-	if err := s.reconcilePreviousRuntime(ctx, config.AgentID); err != nil {
+	reapedThroughGeneration, err := s.reconcilePreviousRuntime(ctx, config.AgentID)
+	if err != nil {
 		return nil, err
 	}
 	idempotencyKey, err := randomProvisioningSecret()
@@ -179,6 +180,16 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	activation.LocalControlBearerExpiresAtUnix = time.Now().Add(s.config.BearerTTL).Unix()
 	activation.AgentWrappingKey = config.WrappingKey.Bytes
 	activation.AgentWrappingKeyID = config.WrappingKey.ID
+	if reapedThroughGeneration != nil {
+		activation.ReapAttestation = &runtimeprovision.ReapAttestation{
+			PersonalityAgentID:      epoch.PersonalityAgentID,
+			EpochGeneration:         epoch.Generation,
+			RPCBootNonce:            epoch.RPCBootNonce,
+			ReapedThroughGeneration: *reapedThroughGeneration,
+		}
+	} else {
+		activation.ReapAttestation = nil
+	}
 	inspection, err := s.config.Provisioner.Activate(ctx, runtimeprovision.ActivateRequest{
 		Version:       runtimeprovision.ProtocolVersion,
 		PreparedEpoch: epoch,
@@ -267,19 +278,23 @@ func (s *provisionedRuntimeSpawner) requireExactActiveEpoch(
 	return nil
 }
 
-func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) error {
+func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) (*uint64, error) {
 	inspection, err := s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
 		Version:            runtimeprovision.ProtocolVersion,
 		PersonalityAgentID: personalityAgentID,
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile previous runtime: %w", err)
+		return nil, fmt.Errorf("reconcile previous runtime: %w", err)
 	}
 	if inspection.Phase == runtimeprovision.PhaseUnknown {
-		return nil
+		if inspection.ReapedThroughGeneration == nil {
+			return nil, nil
+		}
+		reaped := *inspection.ReapedThroughGeneration
+		return &reaped, nil
 	}
 	if inspection.Epoch == nil {
-		return errors.New("reconcile returned a live phase without an epoch")
+		return nil, errors.New("reconcile returned a live phase without an epoch")
 	}
 	epoch := *inspection.Epoch
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), s.config.TeardownTimeout)
@@ -290,15 +305,16 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 		epoch.Generation,
 		epoch.RPCBootNonce,
 	)
+	var teardown runtimeprovision.Inspection
 	var lifecycleErr error
 	switch inspection.Phase {
 	case runtimeprovision.PhasePrepared:
-		_, lifecycleErr = s.config.Provisioner.Abort(cleanupCtx, runtimeprovision.AbortRequest{
+		teardown, lifecycleErr = s.config.Provisioner.Abort(cleanupCtx, runtimeprovision.AbortRequest{
 			Version:       runtimeprovision.ProtocolVersion,
 			PreparedEpoch: epoch,
 		})
 	case runtimeprovision.PhaseActive:
-		_, lifecycleErr = s.config.Provisioner.Stop(cleanupCtx, runtimeprovision.StopRequest{
+		teardown, lifecycleErr = s.config.Provisioner.Stop(cleanupCtx, runtimeprovision.StopRequest{
 			Version:       runtimeprovision.ProtocolVersion,
 			PreparedEpoch: epoch,
 		})
@@ -310,9 +326,16 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 		listenerErr = s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID)
 	}
 	if err := errors.Join(fenceErr, lifecycleErr, listenerErr); err != nil {
-		return fmt.Errorf("retire reconciled runtime: %w", err)
+		return nil, fmt.Errorf("retire reconciled runtime: %w", err)
 	}
-	return nil
+	if teardown.Phase != runtimeprovision.PhaseUnknown ||
+		teardown.PersonalityAgentID != epoch.PersonalityAgentID ||
+		teardown.ReapedThroughGeneration == nil ||
+		*teardown.ReapedThroughGeneration != epoch.Generation {
+		return nil, errors.New("retired runtime did not return an exact observed-empty reap receipt")
+	}
+	reaped := *teardown.ReapedThroughGeneration
+	return &reaped, nil
 }
 
 type provisionedProcess struct {

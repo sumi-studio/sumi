@@ -24,6 +24,7 @@ type serviceEntry struct {
 	epoch          PreparedEpoch
 	idempotencyKey string
 	stopped        bool
+	reapedThrough  *uint64
 }
 
 func NewService(backend Backend) (*Service, error) {
@@ -128,23 +129,28 @@ func (service *Service) Abort(ctx context.Context, request AbortRequest) (Inspec
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.known && entry.phase == PhaseUnknown && entry.epoch == request.PreparedEpoch {
-		return unknownInspection(request.PersonalityAgentID), nil
+		return entry.unknownInspection(request.PersonalityAgentID), nil
 	}
 	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
 		return Inspection{}, err
 	}
 	if entry.known && entry.phase == PhaseUnknown {
-		return unknownInspection(request.PersonalityAgentID), nil
+		return entry.unknownInspection(request.PersonalityAgentID), nil
 	}
 	if !entry.known || entry.phase == PhaseUnknown || entry.epoch != request.PreparedEpoch {
 		return Inspection{}, fmt.Errorf("%w: abort does not match the prepared epoch", ErrConflict)
 	}
-	if err := service.backend.Abort(ctx, entry.epoch); err != nil {
+	inspection, err := service.backend.Abort(ctx, entry.epoch)
+	if err != nil {
+		return Inspection{}, err
+	}
+	if err := validateExactReapInspection(inspection, entry.epoch); err != nil {
 		return Inspection{}, err
 	}
 	entry.phase = PhaseUnknown
 	entry.stopped = false
-	return unknownInspection(request.PersonalityAgentID), nil
+	entry.recordReap(*inspection.ReapedThroughGeneration)
+	return inspection, nil
 }
 
 func (service *Service) Inspect(ctx context.Context, request InspectRequest) (Inspection, error) {
@@ -173,23 +179,28 @@ func (service *Service) Stop(ctx context.Context, request StopRequest) (Inspecti
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.known && entry.phase == PhaseUnknown && entry.epoch == request.PreparedEpoch {
-		return unknownInspection(request.PersonalityAgentID), nil
+		return entry.unknownInspection(request.PersonalityAgentID), nil
 	}
 	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
 		return Inspection{}, err
 	}
 	if entry.known && entry.phase == PhaseUnknown {
-		return unknownInspection(request.PersonalityAgentID), nil
+		return entry.unknownInspection(request.PersonalityAgentID), nil
 	}
 	if !entry.known || entry.phase != PhaseActive || entry.epoch != request.PreparedEpoch {
 		return Inspection{}, fmt.Errorf("%w: stop does not match the active epoch", ErrConflict)
 	}
-	if err := service.backend.Stop(ctx, entry.epoch); err != nil {
+	inspection, err := service.backend.Stop(ctx, entry.epoch)
+	if err != nil {
+		return Inspection{}, err
+	}
+	if err := validateExactReapInspection(inspection, entry.epoch); err != nil {
 		return Inspection{}, err
 	}
 	entry.phase = PhaseUnknown
 	entry.stopped = true
-	return unknownInspection(request.PersonalityAgentID), nil
+	entry.recordReap(*inspection.ReapedThroughGeneration)
+	return inspection, nil
 }
 
 func (service *Service) Reconcile(ctx context.Context, request ReconcileRequest) (Inspection, error) {
@@ -207,6 +218,10 @@ func (service *Service) Reconcile(ctx context.Context, request ReconcileRequest)
 		return Inspection{}, fmt.Errorf("backend returned invalid reconciliation: %w", err)
 	}
 	entry.setInspection(inspection)
+	if inspection.Phase == PhaseUnknown && inspection.ReapedThroughGeneration == nil && entry.reapedThrough != nil {
+		reaped := *entry.reapedThrough
+		inspection.ReapedThroughGeneration = &reaped
+	}
 	return inspection, nil
 }
 
@@ -232,6 +247,25 @@ func (entry *serviceEntry) setInspection(inspection Inspection) {
 	if inspection.Epoch != nil {
 		entry.epoch = *inspection.Epoch
 	}
+	if inspection.ReapedThroughGeneration != nil {
+		entry.recordReap(*inspection.ReapedThroughGeneration)
+	}
+}
+
+func (entry *serviceEntry) recordReap(generation uint64) {
+	if entry.reapedThrough == nil || generation > *entry.reapedThrough {
+		reaped := generation
+		entry.reapedThrough = &reaped
+	}
+}
+
+func (entry *serviceEntry) unknownInspection(personalityAgentID string) Inspection {
+	inspection := unknownInspection(personalityAgentID)
+	if entry.reapedThrough != nil {
+		reaped := *entry.reapedThrough
+		inspection.ReapedThroughGeneration = &reaped
+	}
+	return inspection
 }
 
 func inspectionOf(entry *serviceEntry) Inspection {
@@ -241,4 +275,16 @@ func inspectionOf(entry *serviceEntry) Inspection {
 
 func unknownInspection(personalityAgentID string) Inspection {
 	return Inspection{PersonalityAgentID: personalityAgentID, Phase: PhaseUnknown}
+}
+
+func validateExactReapInspection(inspection Inspection, epoch PreparedEpoch) error {
+	if err := inspection.Validate(); err != nil {
+		return fmt.Errorf("backend returned invalid reap inspection: %w", err)
+	}
+	if inspection.PersonalityAgentID != epoch.PersonalityAgentID ||
+		inspection.Phase != PhaseUnknown || inspection.ReapedThroughGeneration == nil ||
+		*inspection.ReapedThroughGeneration != epoch.Generation {
+		return errors.New("backend teardown did not attest the exact retired generation")
+	}
+	return nil
 }

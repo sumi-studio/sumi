@@ -51,9 +51,11 @@ type fakeRuntimeProvisioner struct {
 	aborts          map[string]int
 	stops           map[string]int
 	activations     map[string]runtimeprovision.ActivationConfig
+	reapedThrough   map[string]uint64
 	activationErr   error
 	mismatchActive  bool
 	dropBeforeReady bool
+	omitReapReceipt bool
 }
 
 func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvisioner {
@@ -64,6 +66,7 @@ func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvi
 		aborts:         make(map[string]int),
 		stops:          make(map[string]int),
 		activations:    make(map[string]runtimeprovision.ActivationConfig),
+		reapedThrough:  make(map[string]uint64),
 	}
 }
 
@@ -112,7 +115,7 @@ func (p *fakeRuntimeProvisioner) Abort(_ context.Context, request runtimeprovisi
 	}
 	p.aborts[request.PersonalityAgentID]++
 	delete(p.epochs, request.PersonalityAgentID)
-	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	return p.reapInspection(request.PreparedEpoch), nil
 }
 
 func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovision.StopRequest) (runtimeprovision.Inspection, error) {
@@ -125,7 +128,22 @@ func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovisio
 	}
 	p.stops[request.PersonalityAgentID]++
 	delete(p.epochs, request.PersonalityAgentID)
-	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	return p.reapInspection(request.PreparedEpoch), nil
+}
+
+func (p *fakeRuntimeProvisioner) reapInspection(epoch runtimeprovision.PreparedEpoch) runtimeprovision.Inspection {
+	inspection := runtimeprovision.Inspection{
+		PersonalityAgentID: epoch.PersonalityAgentID,
+		Phase:              runtimeprovision.PhaseUnknown,
+	}
+	if !p.omitReapReceipt {
+		reaped := epoch.Generation
+		inspection.ReapedThroughGeneration = &reaped
+		if previous, ok := p.reapedThrough[epoch.PersonalityAgentID]; !ok || reaped > previous {
+			p.reapedThrough[epoch.PersonalityAgentID] = reaped
+		}
+	}
+	return inspection
 }
 
 func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
@@ -134,7 +152,11 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 	defer p.mu.Unlock()
 	epoch, exists := p.epochs[request.PersonalityAgentID]
 	if !exists {
-		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+		inspection := runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}
+		if reaped, ok := p.reapedThrough[request.PersonalityAgentID]; ok {
+			inspection.ReapedThroughGeneration = &reaped
+		}
+		return inspection, nil
 	}
 	if p.dropBeforeReady {
 		delete(p.epochs, request.PersonalityAgentID)
@@ -297,6 +319,9 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 			activation.AgentWrappingKey != provisionedTestWrappingMaterial.Bytes {
 			t.Fatalf("activation split the stored wrapping key pair for %s", paid)
 		}
+		if activation.ReapAttestation != nil {
+			t.Fatalf("initial spawn fabricated a reap attestation for %s: %#v", paid, activation.ReapAttestation)
+		}
 	}
 	for _, paid := range provisionedTestPAIDs {
 		want := []string{"prepare:" + paid, "authorize:" + paid, "listen:" + paid, "activate:" + paid}
@@ -325,6 +350,9 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 	}
 	if got := provisioner.epochs[first].Generation; got != 1 {
 		t.Fatalf("restart generation=%d, want 1", got)
+	}
+	if attestation := provisioner.activations[first].ReapAttestation; attestation == nil || attestation.ReapedThroughGeneration != 0 {
+		t.Fatalf("restart after verified Stop did not consume retained reap receipt: %#v", attestation)
 	}
 	_ = restarted.Stop()
 	for _, paid := range provisionedTestPAIDs[1:] {
@@ -469,6 +497,14 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	if provisioner.stops[paid] != 1 || freshAuthorizations.fences[paid] != 1 {
 		t.Fatalf("surviving active epoch was not fenced/stopped: stops=%d fences=%d", provisioner.stops[paid], freshAuthorizations.fences[paid])
 	}
+	activation := provisioner.activations[paid]
+	if activation.ReapAttestation == nil ||
+		activation.ReapAttestation.PersonalityAgentID != paid ||
+		activation.ReapAttestation.EpochGeneration != 1 ||
+		activation.ReapAttestation.RPCBootNonce != provisioner.epochs[paid].RPCBootNonce ||
+		activation.ReapAttestation.ReapedThroughGeneration != 0 {
+		t.Fatalf("replacement activation omitted or misbound verified reap attestation: %#v", activation.ReapAttestation)
+	}
 	want := []string{
 		"reconcile:" + paid,
 		"fence:" + paid,
@@ -486,6 +522,38 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	}
 	if !containsOrdered(recorder.calls[secondStart:], want) {
 		t.Fatalf("reconcile ordering mismatch: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerRejectsTeardownWithoutObservedEmptyReceipt(t *testing.T) {
+	first, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	if _, err := first.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provisioner.omitReapReceipt = true
+	freshAuthorizations := &fakeAuthorizationController{recorder: recorder, current: make(map[string]agentevents.LocalRuntimeAuthorization), fences: make(map[string]int)}
+	freshListeners := &fakeListenerController{recorder: recorder, active: make(map[string]bool)}
+	restarted, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
+		Provisioner: provisioner, Authorizations: freshAuthorizations, Listeners: freshListeners,
+		Readiness: &fakeRuntimeReadiness{ready: true}, TenantID: "tenant-context",
+		Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
+		TeardownTimeout: time.Second,
+		Activation:      runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = restarted.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "observed-empty reap receipt") {
+		t.Fatalf("unattested teardown was accepted: %v", err)
+	}
+	if containsOrdered(recorder.calls, []string{"stop:" + paid, "prepare:" + paid}) {
+		t.Fatalf("replacement prepare ran after teardown omitted its proof: %v", recorder.calls)
 	}
 }
 

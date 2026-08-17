@@ -134,12 +134,15 @@ func (backend *fakeBackend) Activate(_ context.Context, request ActivateRequest)
 	return nil
 }
 
-func (backend *fakeBackend) Abort(_ context.Context, epoch PreparedEpoch) error {
+func (backend *fakeBackend) Abort(_ context.Context, epoch PreparedEpoch) (Inspection, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.abortCalls[epoch.PersonalityAgentID]++
+	reaped := epoch.Generation
+	inspection := unknownInspection(epoch.PersonalityAgentID)
+	inspection.ReapedThroughGeneration = &reaped
 	backend.state[epoch.PersonalityAgentID] = unknownInspection(epoch.PersonalityAgentID)
-	return nil
+	return inspection, nil
 }
 
 func (backend *fakeBackend) Inspect(_ context.Context, personalityAgentID string) (Inspection, error) {
@@ -152,12 +155,15 @@ func (backend *fakeBackend) Inspect(_ context.Context, personalityAgentID string
 	return cloneInspection(inspection), nil
 }
 
-func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) error {
+func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) (Inspection, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.stopCalls[epoch.PersonalityAgentID]++
+	reaped := epoch.Generation
+	inspection := unknownInspection(epoch.PersonalityAgentID)
+	inspection.ReapedThroughGeneration = &reaped
 	backend.state[epoch.PersonalityAgentID] = unknownInspection(epoch.PersonalityAgentID)
-	return nil
+	return inspection, nil
 }
 
 func (backend *fakeBackend) Reconcile(ctx context.Context, personalityAgentID string) (Inspection, error) {
@@ -227,8 +233,12 @@ func TestServiceFakeBackendContract(t *testing.T) {
 
 	stop := StopRequest{Version: ProtocolVersion, PreparedEpoch: expected}
 	for range 2 {
-		if _, stopErr := service.Stop(context.Background(), stop); stopErr != nil {
+		inspection, stopErr := service.Stop(context.Background(), stop)
+		if stopErr != nil {
 			t.Fatal(stopErr)
+		}
+		if inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != expected.Generation {
+			t.Fatalf("stop did not retain exact reap receipt: %#v", inspection)
 		}
 	}
 	if backend.stopCalls[testPAID] != 1 {
@@ -236,6 +246,12 @@ func TestServiceFakeBackendContract(t *testing.T) {
 	}
 	if !backend.privateVolumes[testPAID] {
 		t.Fatal("ordinary stop removed the personality agent's private volumes")
+	}
+	reconciled, err := service.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil || reconciled.ReapedThroughGeneration == nil || *reconciled.ReapedThroughGeneration != expected.Generation {
+		t.Fatalf("unknown reconciliation lost highest verified reap: %#v %v", reconciled, err)
 	}
 
 	next := request

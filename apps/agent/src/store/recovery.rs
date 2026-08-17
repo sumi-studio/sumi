@@ -21,9 +21,9 @@ use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease}
 
 use super::{
     ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
-    HydrationReceiptIdentity, PhysicalRecoveryIntent, PhysicalRecoveryIntentRequest,
-    PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter, RunPhase, Store,
-    ToolExecutionMutation,
+    HydrationReceiptIdentity, PhysicalReapAttestation, PhysicalRecoveryIntent,
+    PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter,
+    RunPhase, Store, ToolExecutionMutation,
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
@@ -820,18 +820,16 @@ struct PendingCommand {
 pub(crate) struct SuffixRecovery;
 
 impl SuffixRecovery {
-    /// Reap boot-only physical intents whose executor generation has already
-    /// been fenced out by bootstrap, then durably record the honest unknown
-    /// outcome. The previous generation's executor, broker, and runtime
-    /// containers no longer exist once a fresh generation lease/fence reaches
-    /// this composition point, so the physical kill itself is an already-done
-    /// no-op. That proves only that execution cannot still be live; it cannot
+    /// Consume an authenticated control-plane reap attestation for boot-only
+    /// physical intents, then durably record the honest unknown outcome. The
+    /// attestation proves only that execution cannot still be live; it cannot
     /// prove whether the external effect happened, so every terminal is
     /// `indeterminate`, never success or failure.
     pub(crate) async fn apply_boot_physical_receipt(
         store: &Store,
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
+        reap_attestation: &PhysicalReapAttestation,
         requests: &[PhysicalRecoveryIntentRequest],
     ) -> Result<(ApplyReceiptOutcome, PhysicalRecoveryReceipt)> {
         if requests.is_empty() {
@@ -951,6 +949,7 @@ impl SuffixRecovery {
             receipt_id: format!("physical-recovery-{}", identity.stable_id()),
             lease: lease.clone(),
             fence: fence.clone(),
+            reap_attestation: reap_attestation.clone(),
             intents,
             logical_suffix_first_seq: first_seq,
             logical_suffix_last_seq: last_seq,

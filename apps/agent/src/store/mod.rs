@@ -78,8 +78,9 @@ pub(crate) use self::event_writer::{
 };
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
-    ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
-    PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
+    ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalReapAttestation,
+    PhysicalRecoveryApplier, PhysicalRecoveryIntent, PhysicalRecoveryIntentRequest,
+    PhysicalRecoveryReceipt,
 };
 pub(crate) use self::post_commit::{
     EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability, PostCommitReceiver,
@@ -7856,7 +7857,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18, 19]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",

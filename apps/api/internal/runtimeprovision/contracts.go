@@ -59,29 +59,41 @@ type ActivateRequest struct {
 // ActivationConfig is backend-neutral runtime boot configuration. Keeping it
 // typed prevents an API caller from injecting the root daemon's environment.
 type ActivationConfig struct {
-	GatewayURL                      string `json:"gateway_url"`
-	LocalControlBearer              string `json:"local_control_bearer"`
-	LocalControlBearerExpiresAtUnix int64  `json:"local_control_bearer_expires_at_unix"`
-	LocalControlServerUID           uint32 `json:"local_control_server_uid"`
-	LocalControlSocketGID           uint32 `json:"local_control_socket_gid"`
-	AgentWrappingKey                string `json:"agent_wrapping_key"`
-	AgentWrappingKeyID              string `json:"agent_wrapping_key_id"`
-	ApprovalSecretDigestKey         string `json:"approval_secret_digest_key"`
-	ProviderAPIKey                  string `json:"provider_api_key"`
-	ModelPreset                     string `json:"model_preset,omitempty"`
-	ModelID                         string `json:"model_id,omitempty"`
-	ExecutionReviewerAPIKey         string `json:"execution_reviewer_api_key"`
-	ExecutionReviewerModelPreset    string `json:"execution_reviewer_model_preset"`
-	ExecutionReviewerModelID        string `json:"execution_reviewer_model_id,omitempty"`
-	ExecutionReviewerModelBaseURL   string `json:"execution_reviewer_model_base_url,omitempty"`
-	ExecutionReviewerAccountScope   string `json:"execution_reviewer_account_scope,omitempty"`
-	EscalationReviewerAPIKey        string `json:"escalation_reviewer_api_key"`
-	EscalationReviewerModelPreset   string `json:"escalation_reviewer_model_preset"`
-	EscalationReviewerModelID       string `json:"escalation_reviewer_model_id,omitempty"`
-	EscalationReviewerModelBaseURL  string `json:"escalation_reviewer_model_base_url,omitempty"`
-	EscalationReviewerAccountScope  string `json:"escalation_reviewer_account_scope,omitempty"`
-	AllowInsecureLoopbackGateway    bool   `json:"allow_insecure_loopback_gateway,omitempty"`
-	LogFilter                       string `json:"log_filter,omitempty"`
+	GatewayURL                      string           `json:"gateway_url"`
+	LocalControlBearer              string           `json:"local_control_bearer"`
+	LocalControlBearerExpiresAtUnix int64            `json:"local_control_bearer_expires_at_unix"`
+	LocalControlServerUID           uint32           `json:"local_control_server_uid"`
+	LocalControlSocketGID           uint32           `json:"local_control_socket_gid"`
+	AgentWrappingKey                string           `json:"agent_wrapping_key"`
+	AgentWrappingKeyID              string           `json:"agent_wrapping_key_id"`
+	ApprovalSecretDigestKey         string           `json:"approval_secret_digest_key"`
+	ProviderAPIKey                  string           `json:"provider_api_key"`
+	ModelPreset                     string           `json:"model_preset,omitempty"`
+	ModelID                         string           `json:"model_id,omitempty"`
+	ExecutionReviewerAPIKey         string           `json:"execution_reviewer_api_key"`
+	ExecutionReviewerModelPreset    string           `json:"execution_reviewer_model_preset"`
+	ExecutionReviewerModelID        string           `json:"execution_reviewer_model_id,omitempty"`
+	ExecutionReviewerModelBaseURL   string           `json:"execution_reviewer_model_base_url,omitempty"`
+	ExecutionReviewerAccountScope   string           `json:"execution_reviewer_account_scope,omitempty"`
+	EscalationReviewerAPIKey        string           `json:"escalation_reviewer_api_key"`
+	EscalationReviewerModelPreset   string           `json:"escalation_reviewer_model_preset"`
+	EscalationReviewerModelID       string           `json:"escalation_reviewer_model_id,omitempty"`
+	EscalationReviewerModelBaseURL  string           `json:"escalation_reviewer_model_base_url,omitempty"`
+	EscalationReviewerAccountScope  string           `json:"escalation_reviewer_account_scope,omitempty"`
+	AllowInsecureLoopbackGateway    bool             `json:"allow_insecure_loopback_gateway,omitempty"`
+	LogFilter                       string           `json:"log_filter,omitempty"`
+	ReapAttestation                 *ReapAttestation `json:"reap_attestation,omitempty"`
+}
+
+// ReapAttestation binds a host-observed empty-project teardown to the exact
+// replacement runtime epoch that may consume it. It proves only that runtime
+// processes through ReapedThroughGeneration are gone; it does not attest
+// whether any external tool effect committed before teardown.
+type ReapAttestation struct {
+	PersonalityAgentID      string `json:"personality_agent_id"`
+	EpochGeneration         uint64 `json:"epoch_generation"`
+	RPCBootNonce            string `json:"rpc_boot_nonce"`
+	ReapedThroughGeneration uint64 `json:"reaped_through_generation"`
 }
 
 type AbortRequest struct {
@@ -105,9 +117,10 @@ type ReconcileRequest struct {
 }
 
 type Inspection struct {
-	PersonalityAgentID string         `json:"personality_agent_id"`
-	Phase              Phase          `json:"phase"`
-	Epoch              *PreparedEpoch `json:"epoch,omitempty"`
+	PersonalityAgentID      string         `json:"personality_agent_id"`
+	Phase                   Phase          `json:"phase"`
+	Epoch                   *PreparedEpoch `json:"epoch,omitempty"`
+	ReapedThroughGeneration *uint64        `json:"reaped_through_generation,omitempty"`
 }
 
 type OperationResponse struct {
@@ -216,7 +229,20 @@ func (request ActivateRequest) Validate() error {
 	if err := request.PreparedEpoch.Validate(); err != nil {
 		return err
 	}
-	return request.Activation.Validate()
+	if err := request.Activation.Validate(); err != nil {
+		return err
+	}
+	if attestation := request.Activation.ReapAttestation; attestation != nil {
+		if attestation.PersonalityAgentID != request.PersonalityAgentID ||
+			attestation.EpochGeneration != request.Generation ||
+			attestation.RPCBootNonce != request.RPCBootNonce {
+			return errors.New("reap attestation is not bound to the prepared runtime epoch")
+		}
+		if attestation.ReapedThroughGeneration >= request.Generation {
+			return errors.New("reap attestation must cover only generations older than the prepared runtime epoch")
+		}
+	}
+	return nil
 }
 
 func (config ActivationConfig) Validate() error {
@@ -272,6 +298,18 @@ func (config ActivationConfig) Validate() error {
 			return fmt.Errorf("%s is not a valid activation value", name)
 		}
 	}
+	if attestation := config.ReapAttestation; attestation != nil {
+		if err := ValidatePersonalityAgentID(attestation.PersonalityAgentID); err != nil {
+			return fmt.Errorf("invalid reap attestation personality_agent_id: %w", err)
+		}
+		if attestation.EpochGeneration > MaxProcessGeneration ||
+			attestation.ReapedThroughGeneration > MaxProcessGeneration {
+			return errors.New("reap attestation generation is outside the process-generation domain")
+		}
+		if err := validateOpaque("reap_attestation.rpc_boot_nonce", attestation.RPCBootNonce); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -322,8 +360,14 @@ func (inspection Inspection) Validate() error {
 		if inspection.Epoch.PersonalityAgentID != inspection.PersonalityAgentID {
 			return errors.New("inspection epoch personality_agent_id mismatch")
 		}
+		if inspection.ReapedThroughGeneration != nil {
+			return errors.New("live inspection must not carry a reap receipt")
+		}
 	default:
 		return fmt.Errorf("unknown lifecycle phase %q", inspection.Phase)
+	}
+	if inspection.ReapedThroughGeneration != nil && *inspection.ReapedThroughGeneration > MaxProcessGeneration {
+		return errors.New("reaped_through_generation is outside the process-generation domain")
 	}
 	return nil
 }

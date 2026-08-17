@@ -745,6 +745,12 @@ print_unknown_json() {
   printf '{"personality_agent_id":"%s","phase":"unknown"}\n' "${SUMI_PERSONALITY_AGENT_ID}"
 }
 
+print_reaped_json() {
+  local generation="$1"
+  printf '{"personality_agent_id":"%s","phase":"unknown","reaped_through_generation":%s}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${generation}"
+}
+
 inspect_epoch() {
   local running
   running="$(running_role_count)" || fail "cannot inspect Compose role state"
@@ -912,20 +918,25 @@ case "${action}" in
   abort)
     acquire_supervisor_lock
     require_docker
-    if prepared_containers_exist; then
-      require_expected_epoch
-    fi
+    require_expected_epoch
+    reaped_generation="${EPOCH_GENERATION}"
     lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-      >/dev/null 2>&1
+      >/dev/null 2>&1 || true
+    cleanup_project_is_empty || fail "abort did not leave an observed-empty Compose project"
     remove_runtime_secret_tree
+    print_reaped_json "${reaped_generation}"
     ;;
   stop-epoch)
     acquire_supervisor_lock
     require_docker
     require_expected_epoch
     set_runtime_secret_host_dir "${EPOCH_GENERATION}"
-    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    reaped_generation="${EPOCH_GENERATION}"
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+      >/dev/null 2>&1 || true
+    cleanup_project_is_empty || fail "stop did not leave an observed-empty Compose project"
     remove_runtime_secret_tree
+    print_reaped_json "${reaped_generation}"
     ;;
   stop|down)
     acquire_supervisor_lock

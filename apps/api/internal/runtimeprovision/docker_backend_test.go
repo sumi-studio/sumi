@@ -38,6 +38,7 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 		"prepare":       `{"personality_agent_id":"` + testPAID + `","phase":"prepared","generation":7,"rpc_boot_nonce":"boot-7"}`,
 		"inspect-epoch": `{"personality_agent_id":"` + testPAID + `","phase":"prepared","generation":7,"rpc_boot_nonce":"boot-7"}`,
 		"reconcile":     `{"personality_agent_id":"` + testPAID + `","phase":"active","generation":7,"rpc_boot_nonce":"boot-7"}`,
+		"stop-epoch":    `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":7}`,
 	}}
 	backend := &DockerBackend{supervisor: "/fake/supervisor", baseEnvironment: []string{"PATH=/usr/bin"}, runner: runner}
 	epoch, err := backend.Prepare(context.Background(), PrepareRequest{PersonalityAgentID: testPAID})
@@ -51,15 +52,22 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 	if err != nil || inspection.Epoch == nil || inspection.Epoch.OpaquePreparedHandle != epoch.OpaquePreparedHandle {
 		t.Fatalf("inspect did not reconstruct the coherent handle: %#v %v", inspection, err)
 	}
+	activation := testActivationConfig()
+	activation.ReapAttestation = &ReapAttestation{
+		PersonalityAgentID:      testPAID,
+		EpochGeneration:         7,
+		RPCBootNonce:            "boot-7",
+		ReapedThroughGeneration: 6,
+	}
 	activate := ActivateRequest{
 		Version:       ProtocolVersion,
 		PreparedEpoch: epoch,
-		Activation:    testActivationConfig(),
+		Activation:    activation,
 	}
 	if err := backend.Activate(context.Background(), activate); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Stop(context.Background(), epoch); err != nil {
+	if _, err := backend.Stop(context.Background(), epoch); err != nil {
 		t.Fatal(err)
 	}
 	if len(runner.actions) != 4 || runner.actions[0] != "prepare" || runner.actions[1] != "inspect-epoch" || runner.actions[2] != "activate" || runner.actions[3] != "stop-epoch" {
@@ -77,6 +85,10 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 		"SUMI_ESCALATION_REVIEWER_API_KEY=escalation-reviewer-key",
 		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET=glm-5.2",
 		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV=SUMI_ESCALATION_REVIEWER_API_KEY",
+		"SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_REAP_ATTESTATION_EPOCH_GENERATION=7",
+		"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE=boot-7",
+		"SUMI_REAPED_THROUGH_GENERATION=6",
 	} {
 		if !strings.Contains(joinedEnvironment, expected) {
 			t.Fatalf("activation environment omitted %s: %s", expected, joinedEnvironment)
@@ -87,6 +99,22 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 		if !strings.Contains(stopEnvironment, expected) {
 			t.Fatalf("exact stop environment omitted %s: %s", expected, stopEnvironment)
 		}
+	}
+}
+
+func TestDockerBackendRejectsTeardownWithoutExactObservedEmptyReceipt(t *testing.T) {
+	epoch := PreparedEpoch{PersonalityAgentID: testPAID, Generation: 7, RPCBootNonce: "boot-7", OpaquePreparedHandle: "handle"}
+	for name, output := range map[string]string{
+		"missing": `{"personality_agent_id":"` + testPAID + `","phase":"unknown"}`,
+		"lower":   `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":6}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &recordingRunner{outputs: map[string]string{"stop-epoch": output}}
+			backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}
+			if _, err := backend.Stop(context.Background(), epoch); err == nil || !strings.Contains(err.Error(), "exact observed-empty") {
+				t.Fatalf("invalid teardown output accepted: %v", err)
+			}
+		})
 	}
 }
 

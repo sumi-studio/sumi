@@ -15055,8 +15055,9 @@ mod tests {
         },
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
-            AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
-            PhysicalRecoveryReceipt, RecoveryStep, ResumeDirective, SuffixRecovery,
+            AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider,
+            PhysicalReapAttestation, PhysicalRecoveryIntent, PhysicalRecoveryReceipt, RecoveryStep,
+            ResumeDirective, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -15084,6 +15085,16 @@ mod tests {
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
         GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
+    }
+
+    fn test_reap_attestation(lease: &ProcessGenerationLease) -> PhysicalReapAttestation {
+        PhysicalReapAttestation::from_wire(
+            lease.personality_agent_id().as_str(),
+            lease.generation().as_u64(),
+            format!("boot-{}", lease.generation().as_u64()),
+            1,
+        )
+        .expect("valid test reap attestation")
     }
 
     fn eviction_footprint_for_test(
@@ -31850,7 +31861,7 @@ mod tests {
     ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
         let lease = ProcessGenerationLease::new(
             store.scope().personality_agent_id.clone(),
-            test_process_generation(1),
+            test_process_generation(2),
             "test-lease",
         )
         .expect("test process generation lease");
@@ -31918,6 +31929,7 @@ mod tests {
             receipt_id: format!("receipt-{tool_call_id}"),
             lease: lease.clone(),
             fence: fence.clone(),
+            reap_attestation: test_reap_attestation(lease),
             intents: vec![intent],
             logical_suffix_first_seq: next_seq,
             logical_suffix_last_seq: next_seq + 2,
@@ -32131,7 +32143,7 @@ mod tests {
                 // converge to a committed state.
                 let lease = ProcessGenerationLease::new(
                     reopened.scope().personality_agent_id.clone(),
-                    test_process_generation(1),
+                    test_process_generation(2),
                     "test-lease",
                 )
                 .expect("test lease");
@@ -32180,8 +32192,9 @@ mod tests {
             };
             let mut receipt = PhysicalRecoveryReceipt {
                 receipt_id: "receipt-tool-1".to_owned(),
-                lease: test_lease(1),
-                fence: test_fence(&test_lease(1)),
+                lease: test_lease(2),
+                fence: test_fence(&test_lease(2)),
+                reap_attestation: test_reap_attestation(&test_lease(2)),
                 intents: vec![intent],
                 logical_suffix_first_seq: u64::try_from(first_seq).expect("first seq fits u64"),
                 logical_suffix_last_seq: u64::try_from(last_seq).expect("last seq fits u64"),

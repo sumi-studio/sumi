@@ -8,8 +8,8 @@ import "context"
 type Backend interface {
 	Prepare(context.Context, PrepareRequest) (PreparedEpoch, error)
 	Activate(context.Context, ActivateRequest) error
-	Abort(context.Context, PreparedEpoch) error
+	Abort(context.Context, PreparedEpoch) (Inspection, error)
 	Inspect(context.Context, string) (Inspection, error)
-	Stop(context.Context, PreparedEpoch) error
+	Stop(context.Context, PreparedEpoch) (Inspection, error)
 	Reconcile(context.Context, string) (Inspection, error)
 }

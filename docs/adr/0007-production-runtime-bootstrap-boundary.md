@@ -89,13 +89,7 @@ T17はT16へ依存し、T16はT15へ依存するため、T15でproduction bootst
 - `ProcessGeneration`のdomainは`0..=i64::MAX`で、0も有効である。T26 allocatorはincrement前に最大値を
   検査し、`i64::MAX`後はwrap/reuseせず新bootstrapをfail-closedに拒否する。全componentへのdistributionと
   mismatchをテストする。
-- T27はT17が返した非空physical recovery intentsとT26が発行したleaseを消費し、旧generationのkill/reap、
-  resource quota、execution registry、descendant cleanup、crash recoveryを実行する。完了したintent set・lease・
-  `ProcessGeneration`へ束縛した`PhysicalRecoveryReceipt`を`receipt_id`+digest付きで永続化してT17へ返し、`tool_call_id` canonical keyと親行attestationが同一の
-  再送だけを`already-applied`として受理する。stale、lease/generation・intent set不一致、conflicting receipt、reused ID with
-  different digestは拒否し、T17検証後にT17 application ledgerと同一transactionで`running → indeterminate`を完了する。
-  T27はphysical proof persistenceを所有するが、T17 application ledgerを所有・代替しない。
-  allocator/issuanceは重複実装せず、空intentsのT26 bootstrapを妨げない。
+- T27のcontrol planeは旧epochのlocal-control authorityをfenceした後、host supervisorでkill/reapとdescendant cleanupを実行し、Compose projectが空であることを観測して初めて、そのPAIDについて`reaped_through_generation`までprocessが残存しない事実を次epochのPAID・`ProcessGeneration`・`RpcBootNonce`へ束縛したauthenticated activation materialとして発行する。T17はこのattestationを生成・推測せず、非空physical recovery intentsの`executor_generation`がattested bound以下の場合だけ、attestation（およびそのdigest）を含む`PhysicalRecoveryReceipt`とapplication ledgerをlogical suffixと同一transactionで適用して`running → indeterminate`を完了する。これはexternal effectのcommit有無を証明しないためsuccess/failureへ確定せず、attestationなし・別PAID/epoch・bound不足、stale lease/generation・intent set不一致、conflicting receipt、同一IDの異なるdigestはすべてfail-closedに拒否し、同一receiptの完全一致再送だけを`already-applied`として受理する。allocator/issuanceは重複実装せず、空intentsのT26 bootstrapを妨げない。
 - `HydrationReady`はedge signalではなく`ProcessGeneration`ごとのlatched stateである。current generationは必ず
   `NotReady`から始まり、T17のstable `HydrationReceiptIdentity`へ束縛されたimmutableな
   `Ready { generation, hydration_receipt_identity }`へ一度だけ遷移する。T26はgeneration rollover時に旧Readyを
