@@ -110,7 +110,7 @@ func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
 	w, ts := newTestServer(t, ctx)
 
 	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
-	thread, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "あとで返信", "")
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "あとで返信", "", "thread-reply-later-1")
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}

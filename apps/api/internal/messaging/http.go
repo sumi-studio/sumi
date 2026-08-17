@@ -931,6 +931,7 @@ func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name            string `json:"name"`
 		ParentMessageID string `json:"parent_message_id"`
+		ClientNonce     string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -939,11 +940,16 @@ func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	store := scopedStoreForRequest(r)
 	var thread Thread
+	var created bool
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		thread, opErr = store.CreateThread(r.Context(), r.PathValue("place_id"), req.Name, req.ParentMessageID)
+		thread, created, opErr = store.CreateThread(r.Context(), r.PathValue("place_id"), req.Name, req.ParentMessageID, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -954,10 +960,16 @@ func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := threadToWire(thread)
-	_ = s.Hub.PublishScoped(r.Context(), store, Event{
-		Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire,
-	})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {

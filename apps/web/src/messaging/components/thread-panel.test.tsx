@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ThreadPanel } from "./thread-panel";
 
@@ -47,10 +53,11 @@ describe("ThreadPanel", () => {
       "channel:channel-1",
       "認証リダイレクト",
       null,
+      expect.any(String),
     );
     expect(create).toBeDisabled();
 
-    await act(async () => resolveCreate!("thread:thread-1"));
+    await act(async () => resolveCreate?.("thread:thread-1"));
 
     expect(mocks.navigate).toHaveBeenCalledWith("thread:thread-1");
     expect(onClose).toHaveBeenCalledTimes(1);

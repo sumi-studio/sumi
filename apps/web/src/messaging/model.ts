@@ -386,6 +386,7 @@ export interface MessagingBackend {
     parent: Place,
     name: string,
     originMessageId: string | null,
+    clientNonce: string,
   ): Promise<ThreadSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /** メッセージより先にbytesを預ける。受領したIDをsendMessageのattachmentsへ。 */

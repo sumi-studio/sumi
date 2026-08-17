@@ -1,5 +1,6 @@
 import { MessagesSquare, Plus, X } from "lucide-react";
 import { useRef, useState } from "react";
+import { secureRandomUUID } from "../../lib/random-uuid";
 import type { PlaceKey } from "../model";
 import { placeKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -18,6 +19,7 @@ export function ThreadPanel({
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
   const creatingRef = useRef(false);
+  const createNonceRef = useRef<string | null>(null);
   const threads = Object.values(threadsById)
     .filter((thread) => placeKey(thread.parentPlace) === parentKey)
     .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
@@ -28,7 +30,10 @@ export function ThreadPanel({
     creatingRef.current = true;
     setCreating(true);
     try {
-      const key = await createThread(parentKey, trimmed, null);
+      const nonce = createNonceRef.current ?? secureRandomUUID();
+      createNonceRef.current = nonce;
+      const key = await createThread(parentKey, trimmed, null, nonce);
+      createNonceRef.current = null;
       setName("");
       navigate(key);
       onClose();
@@ -56,7 +61,10 @@ export function ThreadPanel({
           className="min-w-0 flex-1 rounded border bg-background px-2 py-1 text-sm"
           maxLength={100}
           value={name}
-          onChange={(event) => setName(event.target.value)}
+          onChange={(event) => {
+            createNonceRef.current = null;
+            setName(event.target.value);
+          }}
           placeholder="スレッド名"
           disabled={creating}
         />

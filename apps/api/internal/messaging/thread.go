@@ -30,29 +30,47 @@ type Thread struct {
 	Participants       []ParticipantRef
 }
 
-func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, originMessageID string) (Thread, error) {
+func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, originMessageID, clientNonce string) (Thread, bool, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || utf8.RuneCountInString(name) > MaxThreadNameChars {
-		return Thread{}, fmt.Errorf("thread name must be 1..%d characters", MaxThreadNameChars)
+		return Thread{}, false, fmt.Errorf("thread name must be 1..%d characters", MaxThreadNameChars)
+	}
+	if clientNonce == "" || len(clientNonce) > 128 {
+		return Thread{}, false, errors.New("client nonce must be 1..128 bytes")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Thread{}, fmt.Errorf("begin create thread: %w", err)
+		return Thread{}, false, fmt.Errorf("begin create thread: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	membership, err := s.authorizeMutationInTx(ctx, tx)
 	if err != nil {
-		return Thread{}, err
+		return Thread{}, false, err
 	}
 	parent, err := s.loadScopedPlace(ctx, tx, parentPlaceID)
 	if err != nil {
-		return Thread{}, err
+		return Thread{}, false, err
 	}
 	if _, err := s.placeAccessAfterAuthorization(ctx, tx, parent, s.Scope.Actor); err != nil {
-		return Thread{}, err
+		return Thread{}, false, err
 	}
 	if parent.Kind != PlaceChannel {
-		return Thread{}, ErrNotThreadable
+		return Thread{}, false, ErrNotThreadable
+	}
+	// Serialize an operation identity before looking up its receipt. The lock
+	// makes a concurrent retry observe the first committed receipt instead of
+	// racing into a second empty-origin thread.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)",
+		reactionMutationLockKey(s.Scope.Actor, "thread-create:"+s.Scope.WorkspaceID+":"+clientNonce)); err != nil {
+		return Thread{}, false, fmt.Errorf("lock thread creation: %w", err)
+	}
+	if existing, found, err := s.threadCreationReplay(ctx, tx, membership.WorkspaceMemberID, parentPlaceID, name, originMessageID, clientNonce); err != nil {
+		return Thread{}, false, err
+	} else if found {
+		if err := tx.Commit(ctx); err != nil {
+			return Thread{}, false, fmt.Errorf("commit replayed thread creation: %w", err)
+		}
+		return existing, false, nil
 	}
 	var origin *string
 	if originMessageID != "" {
@@ -61,10 +79,10 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 			SELECT EXISTS (SELECT 1 FROM messages
 			 WHERE workspace_id=$1 AND place_id=$2 AND message_id=$3 AND deleted_at IS NULL)`,
 			s.Scope.WorkspaceID, parentPlaceID, originMessageID).Scan(&exists); err != nil {
-			return Thread{}, fmt.Errorf("check thread origin: %w", err)
+			return Thread{}, false, fmt.Errorf("check thread origin: %w", err)
 		}
 		if !exists {
-			return Thread{}, ErrMessageNotFound
+			return Thread{}, false, ErrMessageNotFound
 		}
 		origin = &originMessageID
 	}
@@ -80,17 +98,60 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 		thread.Place.PlaceID, s.Scope.WorkspaceID, name, parentPlaceID, origin)
 	if err != nil {
 		if isUniqueViolation(err) {
-			return Thread{}, ErrThreadExists
+			return Thread{}, false, ErrThreadExists
 		}
-		return Thread{}, fmt.Errorf("insert thread: %w", err)
+		return Thread{}, false, fmt.Errorf("insert thread: %w", err)
 	}
 	if err := joinThread(ctx, tx, thread.Place.PlaceID, membership); err != nil {
-		return Thread{}, err
+		return Thread{}, false, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO thread_creation_receipts
+			(workspace_id, creator_kind, creator_id, client_nonce, thread_id, parent_place_id, parent_message_id, name)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, clientNonce,
+		thread.Place.PlaceID, parentPlaceID, origin, name); err != nil {
+		return Thread{}, false, fmt.Errorf("record thread creation receipt: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Thread{}, fmt.Errorf("commit create thread: %w", err)
+		return Thread{}, false, fmt.Errorf("commit create thread: %w", err)
 	}
-	return thread, nil
+	return thread, true, nil
+}
+
+// threadCreationReplay returns the durable result of this caller's creation
+// nonce. A nonce is an operation identity, so changing any creation input is a
+// conflict rather than a replay of a different request.
+func (s *ScopedStore) threadCreationReplay(ctx context.Context, q querier, workspaceMemberID, parentPlaceID, name, originMessageID, clientNonce string) (Thread, bool, error) {
+	var threadID, storedParent, storedName string
+	var storedOrigin *string
+	err := q.QueryRow(ctx, `
+		SELECT thread_id, parent_place_id, parent_message_id, name
+		FROM thread_creation_receipts
+		WHERE workspace_id=$1 AND creator_kind=$2 AND creator_id=$3 AND client_nonce=$4`,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, clientNonce,
+	).Scan(&threadID, &storedParent, &storedOrigin, &storedName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Thread{}, false, nil
+	}
+	if err != nil {
+		return Thread{}, false, fmt.Errorf("load thread creation receipt: %w", err)
+	}
+	storedOriginID := ""
+	if storedOrigin != nil {
+		storedOriginID = *storedOrigin
+	}
+	if storedParent != parentPlaceID || storedName != name || storedOriginID != originMessageID {
+		return Thread{}, false, ErrIdempotencyConflict
+	}
+	threads, err := s.threadsWhere(ctx, q, workspaceMemberID, "t.place_id = $3", threadID)
+	if err != nil {
+		return Thread{}, false, err
+	}
+	if len(threads) != 1 {
+		return Thread{}, false, fmt.Errorf("thread creation receipt %q has no thread", clientNonce)
+	}
+	return threads[0], true, nil
 }
 
 func joinThread(ctx context.Context, tx pgx.Tx, placeID string, membership workspacecontrol.Membership) error {

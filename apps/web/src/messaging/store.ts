@@ -200,6 +200,7 @@ interface MessagingState {
     parentKey: PlaceKey,
     name: string,
     originMessageId: string | null,
+    clientNonce: string,
   ): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
@@ -467,6 +468,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     set((state) => {
       const thread = state.threadsById[threadId];
       if (!thread) return {};
+      // bootstrap's summary can arrive before the same durable event during
+      // reconnect catch-up. Its latestSeq then already includes this commit,
+      // even though the lazy timeline does not; do not count it twice.
+      if (thread.latestSeq >= message.seq) return {};
       const known = thread.participants.some(
         (participant) =>
           participantKey(participant) === participantKey(message.author),
@@ -1622,7 +1627,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (!get().capabilities.threads) return;
       if (get().threadsLoadedForPlace[parentKey]) return;
       const parent = parsePlaceKey(parentKey);
-      if (!parent || parent.kind !== "channel") return;
+      if (parent?.kind !== "channel") return;
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
       const versions = new Map(threadProjectionVersions);
@@ -1703,12 +1708,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return request;
     },
 
-    async createThread(parentKey, name, originMessageId) {
+    async createThread(parentKey, name, originMessageId, clientNonce) {
       const parent = parsePlaceKey(parentKey);
-      if (!parent || parent.kind !== "channel")
+      if (parent?.kind !== "channel")
         throw new Error("Threads require a channel parent");
       if (!backend.createThread) throw new Error("Threads are unavailable");
-      const thread = await backend.createThread(parent, name, originMessageId);
+      const thread = await backend.createThread(
+        parent,
+        name,
+        originMessageId,
+        clientNonce,
+      );
       set((state) => ({
         threadsById: { ...state.threadsById, [thread.threadId]: thread },
       }));

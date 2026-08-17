@@ -248,12 +248,17 @@ export class ApiMessagingBackend implements MessagingBackend {
     parent: Place,
     name: string,
     originMessageId: string | null,
+    clientNonce: string,
   ): Promise<ThreadSummary> {
     const body = await this.request(
       `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
       {
         method: "POST",
-        body: { name, parent_message_id: originMessageId ?? "" },
+        body: {
+          name,
+          parent_message_id: originMessageId ?? "",
+          client_nonce: clientNonce,
+        },
       },
     );
     return this.registerThread(body);

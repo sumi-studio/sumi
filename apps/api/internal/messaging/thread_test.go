@@ -15,11 +15,14 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	workspace, channel := w.workspaceWithChannel(t, ctx)
 	origin := w.send(t, ctx, channel.PlaceID, w.humanA, "認証の話")
 	a := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
-	thread, err := a.CreateThread(ctx, channel.PlaceID, "認証リダイレクト", origin.MessageID)
+	thread, created, err := a.CreateThread(ctx, channel.PlaceID, "認証リダイレクト", origin.MessageID, "thread-origin-1")
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
-	if _, err := a.CreateThread(ctx, channel.PlaceID, "duplicate", origin.MessageID); !errors.Is(err, ErrThreadExists) {
+	if !created {
+		t.Fatal("first thread creation was replayed")
+	}
+	if _, _, err := a.CreateThread(ctx, channel.PlaceID, "duplicate", origin.MessageID, "thread-origin-2"); !errors.Is(err, ErrThreadExists) {
 		t.Fatalf("duplicate origin error = %v", err)
 	}
 	b := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
@@ -48,7 +51,7 @@ func TestNonparticipantThreadReadMarkerSurvivesBootstrap(t *testing.T) {
 	w, ts := newTestServer(t, ctx)
 
 	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
-	thread, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "閲覧だけ", "")
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "閲覧だけ", "", "thread-viewer-1")
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
@@ -90,7 +93,7 @@ func TestConcurrentThreadParticipantAdmissionIsIdempotent(t *testing.T) {
 	w := newWorldWithMaxConns(t, ctx, 10)
 	workspace, channel := w.workspaceWithChannel(t, ctx)
 	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
-	thread, err := owner.CreateThread(ctx, channel.PlaceID, "同時参加", "")
+	thread, _, err := owner.CreateThread(ctx, channel.PlaceID, "同時参加", "", "thread-admission-1")
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
@@ -145,26 +148,21 @@ func TestConcurrentThreadParticipantAdmissionIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestThreadSearchUsesParticipationProjection(t *testing.T) {
+func TestThreadSearchIncludesWorkspaceVisibleNonparticipantWhenPlaceIsScoped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
 	workspace, channel := w.workspaceWithChannel(t, ctx)
 	a := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
-	thread, err := a.CreateThread(ctx, channel.PlaceID, "検索", "")
+	thread, _, err := a.CreateThread(ctx, channel.PlaceID, "検索", "", "thread-search-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	w.send(t, ctx, thread.Place.PlaceID, w.humanA, "枝だけの合言葉")
 	b := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
-	results, err := b.SearchMessages(ctx, "合言葉", SearchOptions{})
-	if err != nil || len(results) != 0 {
-		t.Fatalf("global search = %+v, %v", results, err)
-	}
-	w.send(t, ctx, thread.Place.PlaceID, w.humanA, "@Haru 参加してください")
-	results, err = b.SearchMessages(ctx, "合言葉", SearchOptions{})
+	results, err := b.SearchMessages(ctx, "合言葉", SearchOptions{PlaceID: thread.Place.PlaceID})
 	if err != nil || len(results) != 1 {
-		t.Fatalf("participant search = %+v, %v", results, err)
+		t.Fatalf("nonparticipant scoped search = %+v, %v", results, err)
 	}
 }
 
@@ -174,11 +172,17 @@ func TestThreadHTTPRoutesReturnParentRelation(t *testing.T) {
 	w, server := newTestServer(t, ctx)
 	resp, body := call(t, server, http.MethodPost,
 		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
-		map[string]any{"name": "HTTP thread", "parent_message_id": ""})
+		map[string]any{"name": "HTTP thread", "parent_message_id": "", "client_nonce": "thread-http-1"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status %d body %v", resp.StatusCode, body)
 	}
 	threadID, _ := body["thread_id"].(string)
+	replayed, replayBody := call(t, server, http.MethodPost,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
+		map[string]any{"name": "HTTP thread", "parent_message_id": "", "client_nonce": "thread-http-1"})
+	if replayed.StatusCode != http.StatusOK || replayBody["thread_id"] != threadID {
+		t.Fatalf("replayed create status %d body %v, want existing %q", replayed.StatusCode, replayBody, threadID)
+	}
 	resp, body = call(t, server, http.MethodGet, "/messaging/places/"+threadID, w.humanB.ID, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("open status %d body %v", resp.StatusCode, body)

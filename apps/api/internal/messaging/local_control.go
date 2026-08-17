@@ -129,11 +129,12 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 		ParentPlaceID   string `json:"parent_place_id"`
 		Name            string `json:"name"`
 		ParentMessageID string `json:"parent_message_id,omitempty"`
+		ClientNonce     string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.ParentPlaceID == "" || strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > MaxThreadNameChars {
+	if request.ParentPlaceID == "" || strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > MaxThreadNameChars || request.ClientNonce == "" || len(request.ClientNonce) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -141,14 +142,20 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 	if !ok {
 		return
 	}
-	thread, err := store.CreateThread(r.Context(), request.ParentPlaceID, request.Name, request.ParentMessageID)
+	thread, created, err := store.CreateThread(r.Context(), request.ParentPlaceID, request.Name, request.ParentMessageID, request.ClientNonce)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	wire := threadToWire(thread)
-	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 func (c *CallService) localCallState(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

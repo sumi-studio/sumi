@@ -211,7 +211,8 @@
 - Thread は通常の place で、`{ "kind": "thread", "thread_id": "..." }` と表す。
   `GET /messaging/places/{channel_id}/threads` は親channelを開いたときの一覧、
   `POST /messaging/places/{channel_id}/threads`（`name`, 任意の
-  `parent_message_id`）は作成である。1 message から作れるthreadは1つだけ。
+  `parent_message_id`, `client_nonce`）は作成である。同じ作成nonceの再送は最初の
+  threadを返す。1 message から作れるthreadは1つだけ。
   bootstrapは閲覧者が参加しているthreadだけを返し、個別open responseは
   `thread` summaryに親channelを含める。Threadのmessageは既存の送信・添付・検索・
   tombstone・read markerをそのまま使う。通知候補は参加者と新しいmention先だけで、

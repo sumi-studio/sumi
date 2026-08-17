@@ -353,6 +353,7 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly statuses = new Map<string, ParticipantStatus>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
   private readonly threads = new Map<string, ThreadSummary>();
+  private readonly threadsByCreateNonce = new Map<string, ThreadSummary>();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
     owner: SELF,
@@ -580,9 +581,12 @@ export class MockMessagingServer implements MessagingBackend {
     parent: Place,
     name: string,
     originMessageId: string | null,
+    clientNonce: string,
   ): Promise<ThreadSummary> {
     if (parent.kind !== "channel")
       throw new Error("threads require channel parent");
+    const existing = this.threadsByCreateNonce.get(clientNonce);
+    if (existing) return structuredClone(existing);
     const threadId = `thread-${secureRandomUUID().slice(0, 8)}`;
     const thread: ThreadSummary = {
       threadId,
@@ -599,6 +603,7 @@ export class MockMessagingServer implements MessagingBackend {
       latestSeq: 0,
     };
     this.threads.set(threadId, thread);
+    this.threadsByCreateNonce.set(clientNonce, thread);
     this.history.set(`thread:${threadId}`, []);
     this.emit({ type: "place_created", thread });
     return thread;

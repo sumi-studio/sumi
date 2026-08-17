@@ -1,5 +1,6 @@
 import { MessagesSquare } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { secureRandomUUID } from "../../lib/random-uuid";
 import type { Message } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
@@ -38,6 +39,7 @@ export function MessageThreadAction({ message }: { message: Message }) {
   const navigate = usePlaceNavigate();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
+  const createNonceRef = useRef<string | null>(null);
   if (
     !canUseThreads ||
     !activePlaceKey?.startsWith("channel:") ||
@@ -47,9 +49,12 @@ export function MessageThreadAction({ message }: { message: Message }) {
     return null;
   const submit = async () => {
     if (!name.trim()) return;
+    const nonce = createNonceRef.current ?? secureRandomUUID();
+    createNonceRef.current = nonce;
     navigate(
-      await createThread(activePlaceKey, name.trim(), message.messageId),
+      await createThread(activePlaceKey, name.trim(), message.messageId, nonce),
     );
+    createNonceRef.current = null;
   };
   return (
     <span className="relative">
@@ -68,10 +73,12 @@ export function MessageThreadAction({ message }: { message: Message }) {
       {open ? (
         <span className="absolute top-full right-0 z-30 flex w-64 gap-1 rounded border bg-background p-2 shadow">
           <input
-            autoFocus
             maxLength={100}
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => {
+              createNonceRef.current = null;
+              setName(event.target.value);
+            }}
             className="min-w-0 flex-1 rounded border px-2 text-xs"
           />
           <button
