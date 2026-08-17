@@ -1013,30 +1013,11 @@ func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 		}
 		if exists != want {
 			t.Fatalf("messages_content_trgm exists=%v, want %v", exists, want)
-=======
-	up := read("0025_voice_channels.up.sql")
-	down := read("0025_voice_channels.down.sql")
-	assertUp := func(phase string) {
-		t.Helper()
-		var voice bool
-		if err := pool.QueryRow(ctx, "SELECT voice FROM places WHERE place_id=$1", channelID).Scan(&voice); err != nil {
-			t.Fatalf("%s read default: %v", phase, err)
-		}
-		if voice {
-			t.Fatalf("%s changed an existing channel into voice", phase)
-		}
-		if _, err := pool.Exec(ctx, "UPDATE places SET voice=true WHERE place_id=$1", channelID); err != nil {
-			t.Fatalf("%s mark channel voice: %v", phase, err)
-		}
-		if _, err := pool.Exec(ctx, "UPDATE places SET voice=true WHERE place_id=$1", dmID); err == nil {
-			t.Fatalf("%s allowed a DM to become a voice channel", phase)
->>>>>>> a069f60d (feat(messaging): add scoped LiveKit calls)
 		}
 	}
 	if _, err := pool.Exec(ctx, up); err != nil {
 		t.Fatalf("upgrade: %v", err)
 	}
-<<<<<<< HEAD
 	assertIndex(true)
 	if _, err := pool.Exec(ctx, down); err != nil {
 		t.Fatalf("downgrade: %v", err)
