@@ -293,20 +293,21 @@ func (s stubLiveKitRoomService) RemoveParticipant(_ context.Context, room, ident
 }
 
 func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
-	service := &CallService{
-		Registry: NewCallRegistry(),
-		Now:      func() time.Time { return time.Unix(1_780_000_100, 0) },
-		RoomService: stubLiveKitRoomService{
-			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
-			participants: map[string][]liveKitParticipant{
-				"place-1": {{
-					Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001,
-					Tracks: []struct {
-						Source string `json:"source"`
-					}{{Source: "SCREEN_SHARE"}},
-				}},
-			},
+	roomService := stubLiveKitRoomService{
+		rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+		participants: map[string][]liveKitParticipant{
+			"place-1": {{
+				Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001,
+				Tracks: []struct {
+					Source string `json:"source"`
+				}{{Source: "SCREEN_SHARE"}},
+			}},
 		},
+	}
+	service := &CallService{
+		Registry:    NewCallRegistry(),
+		Now:         func() time.Time { return time.Unix(1_780_000_100, 0) },
+		RoomService: roomService,
 	}
 	if err := service.rebuildRegistry(context.Background()); err != nil {
 		t.Fatal(err)
@@ -315,6 +316,22 @@ func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
 	if !ok || !state.Active || state.StartedAt.Unix() != 1_780_000_000 || len(state.Participants) != 1 ||
 		!state.Participants[0].ScreenShare || state.Participants[0].JoinedAt.Unix() != 1_780_000_001 {
 		t.Fatalf("rebuilt state = %+v", state)
+	}
+
+	// A registry is deliberately process-local. Its replacement on restart must
+	// retain the timestamps LiveKit reports, rather than stamp the restart time.
+	restarted := &CallService{
+		Registry:    NewCallRegistry(),
+		Now:         func() time.Time { return time.Unix(1_780_100_000, 0) },
+		RoomService: roomService,
+	}
+	if err := restarted.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, ok = restarted.Registry.snapshot("place-1")
+	if !ok || state.StartedAt.Unix() != 1_780_000_000 || len(state.Participants) != 1 ||
+		state.Participants[0].JoinedAt.Unix() != 1_780_000_001 {
+		t.Fatalf("restart rebuilt timestamps = %+v", state)
 	}
 }
 
@@ -376,7 +393,7 @@ func TestCallServiceRemovesClosedWorkspaceMemberFromLiveKitRooms(t *testing.T) {
 	}
 }
 
-func TestCallRegistryRebuildUsesLiveKitTwirpRoomService(t *testing.T) {
+func TestLiveKitRoomServiceDecodesV18ProtoJSONTimestamps(t *testing.T) {
 	now := time.Unix(1_780_000_000, 0)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
@@ -396,12 +413,12 @@ func TestCallRegistryRebuildUsesLiveKitTwirpRoomService(t *testing.T) {
 			if !claims.Video.RoomList || claims.Video.RoomAdmin || claims.Video.Room != "" {
 				t.Fatalf("ListRooms grant = %+v", claims.Video)
 			}
-			_, _ = w.Write([]byte(`{"rooms":[{"name":"place-1","creationTime":1780000000}]}`))
+			_, _ = w.Write([]byte(`{"rooms":[{"name":"place-1","creation_time":"1780000000"}]}`))
 		case "/twirp/livekit.RoomService/ListParticipants":
 			if claims.Video.RoomList || !claims.Video.RoomAdmin || claims.Video.Room != "place-1" {
 				t.Fatalf("ListParticipants grant = %+v", claims.Video)
 			}
-			_, _ = w.Write([]byte(`{"participants":[{"identity":"human:01900000-0000-7000-8000-0000000000aa","joinedAt":1780000001}]}`))
+			_, _ = w.Write([]byte(`{"participants":[{"identity":"human:01900000-0000-7000-8000-0000000000aa","joined_at":"1780000001"}]}`))
 		default:
 			t.Fatalf("unexpected RoomService path %s", r.URL.Path)
 		}
@@ -411,11 +428,19 @@ func TestCallRegistryRebuildUsesLiveKitTwirpRoomService(t *testing.T) {
 		URL: strings.Replace(server.URL, "http://", "ws://", 1), APIKey: testLiveKitKey, APISecret: testLiveKitSecret,
 	})
 	service.Now = func() time.Time { return now }
-	if err := service.rebuildRegistry(context.Background()); err != nil {
+	rooms, err := service.RoomService.ListRooms(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if state, ok := service.Registry.snapshot("place-1"); !ok || len(state.Participants) != 1 {
-		t.Fatalf("twirp rebuilt state = %+v", state)
+	if len(rooms) != 1 || rooms[0].CreatedAt != 1_780_000_000 {
+		t.Fatalf("decoded rooms = %+v", rooms)
+	}
+	participants, err := service.RoomService.ListParticipants(context.Background(), rooms[0].Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 1 || participants[0].JoinedAt != 1_780_000_001 {
+		t.Fatalf("decoded participants = %+v", participants)
 	}
 }
 

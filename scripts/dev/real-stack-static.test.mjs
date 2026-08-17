@@ -118,6 +118,9 @@ test("the local media server is opt-in and carries no repository credential", as
     livekit,
     /SUMI_LIVEKIT_API_KEY and SUMI_LIVEKIT_API_SECRET are required/,
   );
+  assert.match(livekit, /:7880:7880/);
+  assert.match(livekit, /:7881:7881/);
+  assert.match(livekit, /:7882:7882\/udp/);
   assert.match(launcher, /COMPOSE_PROFILES_ARGUMENTS=\(--profile calls\)/);
   assert.match(
     launcher,
