@@ -730,7 +730,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "array",
                 "items": {"type": "string"},
                 "maxItems": 10,
-                "description": "Optional for write and omitted for other actions. Ordered Foundation Workspace file paths to attach."
+                "description": "Optional only for write; prohibited for create_poll and all other actions. Ordered Foundation Workspace file paths to attach."
             },
             "attachment_id": {
                 "type": "string",
@@ -5296,6 +5296,34 @@ mod tests {
         )
         .await
         .expect_err("501 character question must be rejected by the tool");
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert!(api.polls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_poll_rejects_attachments_before_calling_the_server() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .expect("open place");
+
+        let error = execute(
+            &tool,
+            json!({
+                "action": "create_poll",
+                "question": "When?",
+                "options": ["today", "tomorrow"],
+                "attachments": ["/workspace/agenda.txt"]
+            }),
+            "poll-with-attachment",
+        )
+        .await
+        .expect_err("poll attachments are unsupported on every messaging surface");
         assert!(matches!(error, ToolError::InvalidArguments));
         assert!(api.polls.lock().await.is_empty());
     }

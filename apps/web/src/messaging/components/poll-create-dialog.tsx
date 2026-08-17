@@ -19,6 +19,11 @@ export function PollCreateDialog({ onClose }: { onClose: () => void }) {
       ? (state.draftByPlace[state.activePlaceKey] ?? "")
       : "",
   );
+  const hasDraftAttachments = useMessaging((state) =>
+    state.activePlaceKey
+      ? (state.draftAttachmentsByPlace[state.activePlaceKey] ?? []).length > 0
+      : false,
+  );
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState(["", ""]);
   const [allowMulti, setAllowMulti] = useState(false);
@@ -143,13 +148,18 @@ export function PollCreateDialog({ onClose }: { onClose: () => void }) {
         {!distinct ? (
           <p className="mt-2 text-xs text-rose-500">同じ選択肢は作れません</p>
         ) : null}
+        {hasDraftAttachments ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            添付付きの投票は作成できません。添付を外してから送信してください。
+          </p>
+        ) : null}
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" onClick={onClose}>
             キャンセル
           </button>
           <button
             type="submit"
-            disabled={!ready}
+            disabled={!ready || hasDraftAttachments}
             className="rounded bg-primary px-3 py-1.5 text-primary-foreground disabled:opacity-50"
           >
             投票を送信

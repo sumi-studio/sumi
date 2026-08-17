@@ -211,7 +211,7 @@ interface MessagingState {
   addDraftAttachments(files: File[]): void;
   removeDraftAttachment(clientNonce: string): void;
   retryDraftAttachment(clientNonce: string): void;
-  /** 添付付き送信の可否: 本文か添付があり、uploadが全部終わっているとき。 */
+  /** 本文または添付を送る。poll と添付の組み合わせは両 surface で未対応。 */
   send(content: string, urgency: Urgency, poll?: PollInput | null): void;
   retrySend(clientNonce: string): void;
   attachmentURL(attachmentId: string): string;
@@ -1947,6 +1947,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       // 添付が1件でも上がりきっていなければ送らない。半端な添付で送るくらいなら
       // 送信ボタンを押せない方が正直である。
       if (drafts.some((entry) => entry.status !== "ready")) return;
+      // Agent の create_poll も添付を受け付けない。片方だけがこの複合
+      // メッセージを作れる状態にせず、両 surface で明示的に禁止する。
+      if (poll !== null && drafts.length !== 0) return;
       const attachments = drafts.flatMap((entry) =>
         entry.attachment ? [entry.attachment] : [],
       );
