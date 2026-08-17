@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ChannelSummary,
   ConnectionState,
   DmSummary,
+  Message,
   MessagingBackend,
   Place,
   PlaceKey,
@@ -54,7 +55,27 @@ function place(key: PlaceKey): Place {
   const [kind, id] = key.split(":");
   return kind === "channel"
     ? { kind: "channel", channelId: id }
-    : { kind: kind as "dm" | "group_dm", dmId: id };
+    : kind === "thread"
+      ? { kind: "thread", threadId: id }
+      : { kind: kind as "dm" | "group_dm", dmId: id };
+}
+
+function threadMessage(threadId: string, seq: number): Message {
+  return {
+    messageId: `message-${threadId}-${seq}`,
+    place: { kind: "thread", threadId },
+    seq,
+    author: OTHER,
+    content: "新しい返信です",
+    mentions: [SELF],
+    urgency: "normal",
+    reactions: [],
+    attachments: [],
+    replyTo: null,
+    createdAt: seq,
+    editedAt: null,
+    deleted: false,
+  };
 }
 
 function snapshot(options: {
@@ -104,6 +125,7 @@ class FakeBackend implements MessagingBackend {
     replyLater: false,
     reactions: false,
     notifications: false,
+    threads: true,
   } as const;
   next: BootstrapSnapshot;
   bootstrapCalls = 0;
@@ -126,6 +148,9 @@ class FakeBackend implements MessagingBackend {
   async searchMessages() {
     return [];
   }
+  fetchThread = vi.fn(async (_threadId: string): Promise<ThreadSummary> => {
+    throw new Error("unused");
+  });
   async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
     return { statuses: [], replyLaterMarkers: [] };
   }
@@ -204,6 +229,10 @@ class FakeBackend implements MessagingBackend {
   emitConnection(state: ConnectionState): void {
     this.connectionListener?.(state);
   }
+
+  emit(event: ServerEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
 }
 
 /** initとreconcileはmicrotask境界を跨ぐので、決着まで待つ。 */
@@ -214,6 +243,8 @@ async function settle(): Promise<void> {
 const CHANNEL_1: PlaceKey = "channel:channel-1";
 const CHANNEL_2: PlaceKey = "channel:channel-2";
 const DM_9: PlaceKey = "dm:dm-9";
+const THREAD_LIVE: PlaceKey = "thread:thread-live";
+const THREAD_KNOWN: PlaceKey = "thread:thread-known";
 
 const FIRST = snapshot({
   channels: [channel("channel-1", "旧トピック")],
@@ -240,6 +271,30 @@ describe("place lifecycleの再接続突き合わせ", () => {
   it("最初のconnectedではbootstrapを読み直さない", () => {
     expect(backend.bootstrapCalls).toBe(1);
     expect(useMessaging.getState().ready).toBe(true);
+  });
+
+  it("liveイベントで初めて知ったthreadを一度だけhydrateして選べる", async () => {
+    const live = thread("thread-live");
+    backend.fetchThread.mockResolvedValue(live);
+
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(live.threadId, 2),
+      notify: null,
+    });
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(live.threadId, 3),
+      notify: null,
+    });
+    await settle();
+
+    expect(backend.fetchThread).toHaveBeenCalledTimes(1);
+    expect(backend.fetchThread).toHaveBeenCalledWith(live.threadId);
+    expect(useMessaging.getState().threadsById[live.threadId]).toEqual(live);
+
+    useMessaging.getState().selectPlace(THREAD_LIVE);
+    expect(useMessaging.getState().activePlaceKey).toBe(THREAD_LIVE);
   });
 
   it("切断中に作られたplaceとtopic編集を再接続で取り込む", async () => {
@@ -332,6 +387,35 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(state.activePlaceKey).toBe(CHANNEL_1);
     expect(state.unreadLineByPlace[CHANNEL_1]).toBe(0);
     expect(state.messagesByPlace[CHANNEL_1]).toEqual([]);
+  });
+
+  it("既知threadの既読・未読を再接続snapshotで巻き戻さない", async () => {
+    useMessaging.setState((state) => ({
+      threadsById: { "thread-known": thread("thread-known") },
+      lastReadByPlace: { ...state.lastReadByPlace, [THREAD_KNOWN]: 5 },
+      unreadCountByPlace: { ...state.unreadCountByPlace, [THREAD_KNOWN]: 0 },
+      mentionCountByPlace: { ...state.mentionCountByPlace, [THREAD_KNOWN]: 0 },
+    }));
+    backend.next = snapshot({
+      channels: [channel("channel-1", "旧トピック")],
+      dms: [],
+      threads: [thread("thread-known")],
+      unread: {
+        [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 },
+        [THREAD_KNOWN]: { latest: 5, unread: 3, mention: 1 },
+      },
+      lastRead: { [CHANNEL_1]: 0, [THREAD_KNOWN]: 0 },
+    });
+
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    const state = useMessaging.getState();
+    expect(state.lastReadByPlace[THREAD_KNOWN]).toBe(5);
+    expect(state.unreadCountByPlace[THREAD_KNOWN]).toBe(0);
+    expect(state.mentionCountByPlace[THREAD_KNOWN]).toBe(0);
+    expect(backend.cursorCalls).toHaveLength(1);
   });
 
   it("再接続で現れたplaceをURL経由でも選べる", async () => {

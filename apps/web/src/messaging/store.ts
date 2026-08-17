@@ -1,9 +1,9 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
-import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
   ChannelSummary,
@@ -401,6 +401,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
   }
   const threadProjectionVersions = new Map<string, number>();
   const appliedThreadDeletions = new Set<string>();
+  const threadHydrations = new Map<
+    string,
+    {
+      backend: MessagingBackend;
+      sessionGeneration: number;
+      request: Promise<boolean>;
+    }
+  >();
 
   const advanceThreadProjection = (message: Message): number | null => {
     if (message.place.kind !== "thread") return null;
@@ -967,6 +975,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
         } else {
           advanceThreadProjection(event.message);
           noteThreadActivity(event.message);
+          if (
+            event.message.place.kind === "thread" &&
+            !get().threadsById[event.message.place.threadId]
+          ) {
+            // place_created is not replayed. A thread first learned through a
+            // message event still needs its summary before it can be selected
+            // from the route or parent thread panel. loadThread coalesces
+            // repeated messages for the same unknown thread.
+            void get().loadThread(event.message.place.threadId);
+          }
           presentNotification(event);
         }
       } else {
@@ -1110,6 +1128,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ),
       ...state.dms.map((entry) =>
         placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+      ...Object.values(state.threadsById).map((thread) =>
+        placeKey({ kind: "thread", threadId: thread.threadId }),
       ),
     ]);
     const membersByKey: Record<ParticipantKey, MemberProfile> = {};
@@ -1634,24 +1655,47 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (get().threadsById[threadId]) return true;
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
-      if (!get().capabilities.threads || !currentBackend.fetchThread) {
+      const fetchThread = currentBackend.fetchThread;
+      if (!get().capabilities.threads || !fetchThread) {
         return false;
       }
-      try {
-        const thread = await currentBackend.fetchThread(threadId);
-        if (
-          backend !== currentBackend ||
-          messagingSessionGeneration !== sessionGeneration
-        ) {
+      const existing = threadHydrations.get(threadId);
+      if (
+        existing &&
+        existing.backend === currentBackend &&
+        existing.sessionGeneration === sessionGeneration
+      ) {
+        return existing.request;
+      }
+      const hydration = {
+        backend: currentBackend,
+        sessionGeneration,
+        request: Promise.resolve(false),
+      };
+      const request = (async () => {
+        try {
+          const thread = await fetchThread(threadId);
+          if (
+            backend !== currentBackend ||
+            messagingSessionGeneration !== sessionGeneration
+          ) {
+            return false;
+          }
+          set((state) => ({
+            threadsById: { ...state.threadsById, [thread.threadId]: thread },
+          }));
+          return true;
+        } catch {
           return false;
+        } finally {
+          if (threadHydrations.get(threadId) === hydration) {
+            threadHydrations.delete(threadId);
+          }
         }
-        set((state) => ({
-          threadsById: { ...state.threadsById, [thread.threadId]: thread },
-        }));
-        return true;
-      } catch {
-        return false;
-      }
+      })();
+      hydration.request = request;
+      threadHydrations.set(threadId, hydration);
+      return request;
     },
 
     async createThread(parentKey, name, originMessageId) {
