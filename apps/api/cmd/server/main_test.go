@@ -982,7 +982,7 @@ func TestNewRouter_LocalControlRoutesAreAbsentFromPublicMux(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&ack); err != nil {
 		t.Fatal(err)
 	}
-	if ack.Generation != 8 || ack.Revision != 2 || ack.State != "not_ready" {
+	if ack.Generation != 8 || ack.Revision != 1 || ack.State != "not_ready" {
 		t.Fatalf("restart rollover ack mismatch: %+v", ack)
 	}
 }

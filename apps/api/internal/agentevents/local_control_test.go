@@ -83,7 +83,7 @@ func TestLocalControlRuntimeUpdateFlockHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestLocalControlRejectsV1StateAndPersistsRetiredThrough(t *testing.T) {
+func TestLocalControlRejectsV2State(t *testing.T) {
 	runtimeDir := privateRuntimeDir(t)
 	_, gateway := openLocalControlTestGateway(t, runtimeDir)
 	authorization := localControlAuthorization(
@@ -105,36 +105,37 @@ func TestLocalControlRejectsV1StateAndPersistsRetiredThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(raw, []byte(`"retired_through":0`)) {
-		t.Fatalf("v2 state omitted retired_through: %s", raw)
+	if !bytes.Contains(raw, []byte(`"version":3`)) {
+		t.Fatalf("v3 state was not persisted: %s", raw)
 	}
 	state, err := gateway.state(context.Background(), localControlTestPAID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// This is the exact pre-compaction local-control shape: version 1 had no
-	// retired_through field, and its integrity MAC covered that omission.
-	type v1LocalControlState struct {
+	// Version 2 kept a cross-generation revision and retired_through cursor.
+	// Version 3 deliberately drops that history, so v2 states require reset.
+	type v2LocalControlState struct {
 		Version            uint8                             `json:"version"`
 		RPCBootNonce       string                            `json:"rpc_boot_nonce"`
 		Revision           uint64                            `json:"revision"`
+		RetiredThrough     uint64                            `json:"retired_through"`
 		State              LocalRuntimePublicationState      `json:"state"`
 		Reason             LocalRuntimePublicationReason     `json:"reason"`
 		Publications       map[string]localPublicationRecord `json:"publications"`
 		CredentialRequests map[string]localCredentialRecord  `json:"credential_requests"`
 		Integrity          *localControlStateIntegrity       `json:"integrity,omitempty"`
 	}
-	type v1RuntimeState struct {
+	type v2RuntimeState struct {
 		Generation               uint64               `json:"generation"`
 		HydrationReceiptIdentity *string              `json:"hydration_receipt_identity"`
-		LocalControl             *v1LocalControlState `json:"local_control,omitempty"`
+		LocalControl             *v2LocalControlState `json:"local_control,omitempty"`
 	}
-	v1 := v1RuntimeState{
+	v2 := v2RuntimeState{
 		Generation:               state.Generation,
 		HydrationReceiptIdentity: state.HydrationReceiptIdentity,
-		LocalControl: &v1LocalControlState{
-			Version:            1,
+		LocalControl: &v2LocalControlState{
+			Version:            2,
 			RPCBootNonce:       state.LocalControl.RPCBootNonce,
 			Revision:           state.LocalControl.Revision,
 			State:              state.LocalControl.State,
@@ -143,7 +144,7 @@ func TestLocalControlRejectsV1StateAndPersistsRetiredThrough(t *testing.T) {
 			CredentialRequests: state.LocalControl.CredentialRequests,
 		},
 	}
-	unsigned, err := json.Marshal(v1)
+	unsigned, err := json.Marshal(v2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,12 +153,12 @@ func TestLocalControlRejectsV1StateAndPersistsRetiredThrough(t *testing.T) {
 	_, _ = mac.Write([]byte("sumi-local-control-runtime-state/v1"))
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write(unsigned)
-	v1.LocalControl.Integrity = &localControlStateIntegrity{
+	v2.LocalControl.Integrity = &localControlStateIntegrity{
 		Version: localControlIntegrityVersion,
 		KeyID:   deriveLocalControlIntegrityKeyID(key),
 		MAC:     hex.EncodeToString(mac.Sum(nil)),
 	}
-	raw, err = json.Marshal(v1)
+	raw, err = json.Marshal(v2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +166,8 @@ func TestLocalControlRejectsV1StateAndPersistsRetiredThrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := gateway.state(context.Background(), localControlTestPAID); err == nil ||
-		!strings.Contains(err.Error(), "unsupported local control state version 1; delete the state file to reset it") {
-		t.Fatalf("v1 state error = %v, want reset instruction", err)
+		!strings.Contains(err.Error(), "unknown field \"retired_through\"") {
+		t.Fatalf("v2 state error = %v, want strict-format rejection", err)
 	}
 }
 
@@ -392,6 +393,17 @@ func TestLocalControlLifecycleIssuesStrictCredentialAndLatchesReady(t *testing.T
 		claims.Generation != 7 {
 		t.Fatalf("issued token claims were not authorization-bound: %+v", claims)
 	}
+	response, liveDuplicateCredentialBody := postLocalControl(
+		t,
+		server.URL,
+		LocalCredentialIssuePath,
+		localControlTestBearer,
+		credential,
+	)
+	if response.StatusCode != http.StatusOK || !bytes.Equal(body, liveDuplicateCredentialBody) {
+		t.Fatalf("live credential duplicate was not idempotent: status=%d first=%s second=%s",
+			response.StatusCode, body, liveDuplicateCredentialBody)
+	}
 
 	control.now = func() time.Time { return now.Add(defaultLocalCredentialTTL + time.Second) }
 	response, duplicateCredentialBody := postLocalControl(
@@ -401,13 +413,12 @@ func TestLocalControlLifecycleIssuesStrictCredentialAndLatchesReady(t *testing.T
 		localControlTestBearer,
 		credential,
 	)
-	if response.StatusCode != http.StatusOK || !bytes.Equal(body, duplicateCredentialBody) {
-		t.Fatalf("credential duplicate-same was not durable/idempotent: status=%d first=%s second=%s",
-			response.StatusCode, body, duplicateCredentialBody)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expired credential reissue: status=%d body=%s", response.StatusCode, duplicateCredentialBody)
 	}
 	duplicateIssued := decodeLocalControlResponse[LocalCredentialIssueResponse](t, duplicateCredentialBody)
-	if duplicateIssued.ExpiresAtUnix > control.now().Unix() {
-		t.Fatal("test did not exercise an expired idempotent credential response")
+	if duplicateIssued.ExpiresAtUnix <= control.now().Unix() || duplicateIssued.Token == issued.Token {
+		t.Fatalf("expired request ID did not receive a new live credential: old=%+v new=%+v", issued, duplicateIssued)
 	}
 	durableRaw, err := os.ReadFile(gateway.statePath(localControlTestPAID))
 	if err != nil {
@@ -428,8 +439,8 @@ func TestLocalControlLifecycleIssuesStrictCredentialAndLatchesReady(t *testing.T
 			response.StatusCode, refreshedBody)
 	}
 	refreshed := decodeLocalControlResponse[LocalCredentialIssueResponse](t, refreshedBody)
-	if refreshed.ExpiresAtUnix <= duplicateIssued.ExpiresAtUnix || refreshed.Token == duplicateIssued.Token {
-		t.Fatalf("fresh request_id did not produce a fresh short-lived credential: old=%+v new=%+v",
+	if refreshed.ExpiresAtUnix != duplicateIssued.ExpiresAtUnix {
+		t.Fatalf("fresh request_id did not produce a live short-lived credential: old=%+v new=%+v",
 			duplicateIssued, refreshed)
 	}
 
@@ -526,7 +537,7 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 		t.Fatalf("rollover startup: got %d, want 200; body=%s", response.StatusCode, body)
 	}
 	rolloverAck := decodeLocalControlResponse[LocalRuntimeStateAck](t, body)
-	if rolloverAck.Revision != 4 || rolloverAck.State != LocalRuntimeNotReady {
+	if rolloverAck.Revision != 1 || rolloverAck.State != LocalRuntimeNotReady {
 		t.Fatalf("rollover did not publish next NotReady revision: %+v", rolloverAck)
 	}
 	if err := gateway.VerifyGeneration(context.Background(), localControlTestPAID, 7); err == nil {
@@ -547,13 +558,13 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("old idempotent Ready escaped authorization fence: got %d", response.StatusCode)
 	}
-	lateOldReady := readyPublication("late-old-ready", localControlTestPAID, 7, "boot-a", 4, "receipt-old")
+	lateOldReady := readyPublication("late-old-ready", localControlTestPAID, 7, "boot-a", 1, "receipt-old")
 	response, _ = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, lateOldReady)
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("late old Ready was accepted: got %d", response.StatusCode)
 	}
 
-	newReady := readyPublication("new-ready", localControlTestPAID, 8, "boot-b", 4, "receipt-new")
+	newReady := readyPublication("new-ready", localControlTestPAID, 8, "boot-b", 1, "receipt-new")
 	response, body = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlNextBearer, newReady)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("new ready: got %d, want 200; body=%s", response.StatusCode, body)
@@ -1406,11 +1417,9 @@ func TestDurableGatewayObserveDistinguishesStartupFromTerminalNotReady(t *testin
 }
 
 // A PersonalityAgent that restarts many times must keep starting. Each epoch
-// boundary compacts the previous epoch's publication records, so
-// maxLocalControlRecords bounds one epoch rather than the agent's whole life.
-// Before this, an agent whose runtime had published maxLocalControlRecords
-// times could never start again: every startup answered 507 capacity_exhausted.
-func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
+// owns its revision sequence and idempotency records, so neither grows for the
+// PA's whole life.
+func TestLocalControlStartupResetsEpochIdempotencyHistory(t *testing.T) {
 	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
 	control, server := newLocalControlHTTPServer(
 		t,
@@ -1443,6 +1452,7 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 	); status != http.StatusOK {
 		t.Fatalf("seed credential: status=%d body=%s", status, body)
 	}
+	lifetimePublications := 2
 
 	readState := func() runtimeState {
 		t.Helper()
@@ -1468,6 +1478,9 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 	if err := control.InstallLocalRuntimeAuthorization(context.Background(), nextEpoch); err != nil {
 		t.Fatalf("install next-epoch authorization: %v", err)
 	}
+	// Install publishes a terminal fence for the old Ready epoch before the
+	// replacement bearer becomes reachable.
+	lifetimePublications++
 	if status, body := post(
 		localControlNextBearer,
 		LocalRuntimeStatePublishPath,
@@ -1475,6 +1488,7 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 	); status != http.StatusOK {
 		t.Fatalf("next-epoch startup: status=%d body=%s", status, body)
 	}
+	lifetimePublications++
 
 	after := readState()
 	if len(after.LocalControl.Publications) != 1 {
@@ -1483,25 +1497,13 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 	if _, ok := after.LocalControl.Publications["startup-new"]; !ok {
 		t.Fatal("the new epoch's own publication was not recorded")
 	}
-	// Installing the next epoch's authorization fences the old epoch with its
-	// own shutdown publication, so the retained window starts at the startup
-	// that opened the new epoch.
-	if after.LocalControl.RetiredThrough != after.LocalControl.Revision-1 {
-		t.Fatalf(
-			"retired_through=%d revision=%d, want the retained window to hold only the new startup",
-			after.LocalControl.RetiredThrough, after.LocalControl.Revision,
-		)
-	}
-	if after.LocalControl.Revision <= before.LocalControl.Revision {
-		t.Fatalf(
-			"revision did not advance: before=%d after=%d",
-			before.LocalControl.Revision, after.LocalControl.Revision,
-		)
+	if after.LocalControl.Revision != 1 {
+		t.Fatalf("new epoch revision = %d, want 1", after.LocalControl.Revision)
 	}
 	if len(after.LocalControl.CredentialRequests) != 0 {
 		t.Fatalf("credential requests after epoch advance = %d, want 0", len(after.LocalControl.CredentialRequests))
 	}
-	// The chain continues across the compaction boundary.
+	// The complete prefix is scoped to the new epoch.
 	if status, body := post(
 		localControlNextBearer,
 		LocalRuntimeStatePublishPath,
@@ -1516,6 +1518,16 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 	); status != http.StatusOK {
 		t.Fatalf("next-epoch ready: status=%d body=%s", status, body)
 	}
+	lifetimePublications++
+	// A prior-generation publication ID no longer has an idempotent response
+	// once the epoch rolls over; it is stale even when evaluated past HTTP
+	// authorization. This is the intentional boundary of publication replay.
+	if _, err := control.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-old", localControlTestPAID, 7, "boot-a"),
+	); !errors.Is(err, errLocalControlStaleEpoch) {
+		t.Fatalf("retired publication error = %v, want stale epoch", err)
+	}
 	// A retired publication id stays unusable. The old epoch's bearer is
 	// fenced at the door once the next epoch is installed (401), and a replay
 	// that did reach the state logic would be a stale epoch (409) — either way
@@ -1529,7 +1541,7 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 	}
 
 	// Many more restarts than maxLocalControlRecords publications: the agent
-	// keeps starting and the retained history stays one epoch wide.
+	// keeps starting and the current epoch history stays bounded.
 	generation := uint64(8)
 	for i := 0; i < 400; i++ {
 		generation++
@@ -1541,6 +1553,7 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 		); err != nil {
 			t.Fatalf("install authorization for generation %d: %v", generation, err)
 		}
+		lifetimePublications++
 		if status, body := post(
 			bearer,
 			LocalRuntimeStatePublishPath,
@@ -1548,6 +1561,7 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 		); status != http.StatusOK {
 			t.Fatalf("startup at generation %d: status=%d body=%s", generation, status, body)
 		}
+		lifetimePublications++
 		startupRevision := readState().LocalControl.Revision
 		if status, body := post(
 			bearer,
@@ -1563,21 +1577,63 @@ func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
 		); status != http.StatusOK {
 			t.Fatalf("ready at generation %d: status=%d body=%s", generation, status, body)
 		}
+		lifetimePublications++
 	}
 	final := readState()
 	if len(final.LocalControl.Publications) != 2 {
 		t.Fatalf("publications after 400 restarts = %d, want 2 (this epoch's startup and ready)", len(final.LocalControl.Publications))
 	}
-	if final.LocalControl.RetiredThrough != final.LocalControl.Revision-2 {
+	if final.LocalControl.Revision != 2 {
+		t.Fatalf("final epoch revision = %d, want 2", final.LocalControl.Revision)
+	}
+	if lifetimePublications <= maxLocalControlRecords {
 		t.Fatalf(
-			"retired_through=%d revision=%d, want the retained window two revisions wide",
-			final.LocalControl.RetiredThrough, final.LocalControl.Revision,
+			"lifetime publications = %d, want more than the former cap %d",
+			lifetimePublications, maxLocalControlRecords,
 		)
 	}
-	if final.LocalControl.Revision <= uint64(maxLocalControlRecords) {
-		t.Fatalf(
-			"revision = %d, want the run to pass maxLocalControlRecords (%d) so the old lifetime cap would have wedged",
-			final.LocalControl.Revision, maxLocalControlRecords,
-		)
+}
+
+func TestLocalControlCredentialCapacityExpiresRatherThanWedges(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
+	authorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
+	control, err := NewLocalControlServer(gateway, localControlTestSigningSecret, []LocalRuntimeAuthorization{authorization})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	control.now = func() time.Time { return now }
+	if _, err := control.publishRuntimeState(
+		context.Background(), startupPublication("startup", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	for i := 0; i < maxLocalControlRecords; i++ {
+		if _, err := control.issueCredential(
+			context.Background(), authorization,
+			credentialRequest(fmt.Sprintf("credential-%d", i), localControlTestPAID, 7, "boot-a"),
+		); err != nil {
+			t.Fatalf("credential %d: %v", i, err)
+		}
+	}
+	if _, err := control.issueCredential(
+		context.Background(), authorization,
+		credentialRequest("credential-at-capacity", localControlTestPAID, 7, "boot-a"),
+	); !errors.Is(err, errLocalControlCapacity) {
+		t.Fatalf("live credential capacity error = %v, want %v", err, errLocalControlCapacity)
+	}
+	now = now.Add(defaultLocalCredentialTTL)
+	if _, err := control.issueCredential(
+		context.Background(), authorization,
+		credentialRequest("credential-after-expiry", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatalf("expired credential capacity wedged: %v", err)
+	}
+	state, err := gateway.state(context.Background(), localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.LocalControl.CredentialRequests) != 1 {
+		t.Fatalf("credential records after expiry sweep = %d, want 1", len(state.LocalControl.CredentialRequests))
 	}
 }
