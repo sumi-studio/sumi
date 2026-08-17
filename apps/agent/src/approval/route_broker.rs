@@ -1382,6 +1382,12 @@ fn select_tool_pair_entries(
         }
     }
 
+    // Candidates are selected newest-first to retain the most recent history
+    // under the budget, but provider transcript order remains chronological.
+    // Sibling calls from one assistant turn share an ordinal, so restore their
+    // original content index before the later ordinal sort.
+    selected_tools.sort_by_key(|(index, _, _)| *index);
+
     let selected_tool_indices = selected_tools
         .iter()
         .map(|(index, _, _)| *index)
@@ -1521,7 +1527,7 @@ mod tests {
                 EscalationObjectionResponderTransport, EscalationReviewerPrompt,
                 EscalationReviewerTransport, ExecutionReviewerPrompt, ExecutionReviewerTransport,
                 PersonalityAgentPromptContextHandle, ReviewerBudgetV1, ReviewerModelSpec,
-                ReviewerTransportError, ReviewerTrustSet,
+                ReviewerTransportError, ReviewerTrustSet, execution_provider_wire_bodies_for_test,
             },
         },
         provider::types::{
@@ -2359,7 +2365,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_pa_objection_answer_is_visible_to_human_and_does_not_withdraw_held_call() {
+    async fn failed_pa_objection_answer_is_visible_to_human_and_can_be_approved_for_the_held_call()
+    {
         let (broker, _, _) = broker(
             json!({"outcome":"block","risk":"high","rationale":"unused"}),
             json!({
@@ -2382,9 +2389,11 @@ mod tests {
             )
             .await
             .expect("objection failure must remain a Human decision");
-        let RouteApprovalOutcome::Pending { pending } = outcome else {
+        let RouteApprovalOutcome::Pending { mut pending } = outcome else {
             panic!("a missing PA objection answer must not withdraw the held call")
         };
+        let request = pending.request().clone();
+        let held_bound = pending.durable_evidence().bound.clone();
         let public = pending.request().public_request();
         assert!(
             public
@@ -2407,6 +2416,166 @@ mod tests {
             Some(ReviewerTerminalClass::MalformedExhausted)
         );
         assert_eq!(responder.calls.load(Ordering::Relaxed), 2);
+
+        let resolution = broker
+            .resolve(&request.id, command(CurrentCallDecision::ApproveOnce))
+            .await
+            .expect("Human can decide after a recorded PA objection failure");
+        let CurrentCallResolution::Approved { grant, .. } = resolution else {
+            panic!("recorded PA objection failure must not reject Human approval")
+        };
+        let (status, lease, _, _) = grant
+            .authorize(
+                "tool-call-1",
+                "app_action",
+                ToolInvocationRoute::Elevated,
+                "run-objection-failure",
+                "turn-objection-failure",
+            )
+            .await
+            .expect("approved held call remains executable");
+        assert_eq!(status, GrantRevalidation::Valid);
+        drop(lease);
+
+        let mut wrong_call = grant.evidence().clone();
+        wrong_call.tool_call_id = "another-call".to_owned();
+        assert!(wrong_call.validate(&held_bound).is_err());
+        let mut wrong_evidence = grant.evidence().clone();
+        wrong_evidence.bound_evidence_digest = "00".repeat(32);
+        assert!(wrong_evidence.validate(&held_bound).is_err());
+
+        let (sealed, permit) = grant
+            .into_authorized_bound()
+            .into_validated_parts_for_test()
+            .expect("approved held call reaches the execution permit");
+        assert_eq!(sealed.invocation().tool_call_id, "tool-call-1");
+        assert_eq!(permit.route, ToolInvocationRoute::Elevated);
+        assert!(matches!(
+            pending.receiver_mut().await.expect("waiter result"),
+            WaiterResult::Resolved
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_sibling_tool_calls_reach_provider_wires_in_execution_order() {
+        let transcript = vec![
+            assistant_contents(vec![
+                PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "first-call-wire-order".to_owned(),
+                        name: "first_tool_wire_order".to_owned(),
+                        route: ToolInvocationRoute::Normal,
+                        arguments: serde_json::from_value(json!({"position": 1}))
+                            .expect("first arguments"),
+                    },
+                    wire_item_index: 0,
+                },
+                PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "second-call-wire-order".to_owned(),
+                        name: "second_tool_wire_order".to_owned(),
+                        route: ToolInvocationRoute::Normal,
+                        arguments: serde_json::from_value(json!({"position": 2}))
+                            .expect("second arguments"),
+                    },
+                    wire_item_index: 1,
+                },
+            ]),
+            tool_result_for(
+                "first-call-wire-order",
+                "first_tool_wire_order",
+                "first-result-wire-order",
+                json!({"position": 1}),
+            ),
+            tool_result_for(
+                "second-call-wire-order",
+                "second_tool_wire_order",
+                "second-result-wire-order",
+                json!({"position": 2}),
+            ),
+        ];
+        let bounded = bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call")
+            .expect("bounded transcript");
+        let entries = &bounded.entries;
+        let call_ids = entries
+            .iter()
+            .flat_map(|entry| match entry {
+                ReviewerTranscriptEntry::Assistant { tool_calls, .. } => tool_calls
+                    .iter()
+                    .map(|call| call.id.as_str())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let result_ids = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ReviewerTranscriptEntry::ToolResult { tool_call_id, .. } => tool_call_id.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            call_ids,
+            ["first-call-wire-order", "second-call-wire-order"]
+        );
+        assert_eq!(
+            result_ids,
+            ["first-call-wire-order", "second-call-wire-order"]
+        );
+
+        let sealed = sealed(CapabilityClass::Mutate, ToolInvocationRoute::Normal).await;
+        let policy = RoutePolicy::baseline_only_v1();
+        let snapshot = match policy.evaluate_normal(sealed.invocation(), Utc::now()) {
+            PolicyEvaluation::Ready { snapshot, .. } => snapshot,
+            outcome => panic!("expected a reviewer policy snapshot: {outcome:?}"),
+        };
+        let (transcript, action, policy) = provider_review_inputs_for_test(
+            sealed.invocation(),
+            &transcript,
+            ToolInvocationRoute::Normal,
+            PolicyDecisionRecord::Unmatched,
+            &snapshot,
+            &Redactor::v1(),
+        )
+        .expect("review input");
+        let request = ExecutionReviewRequest {
+            participants: None,
+            transcript,
+            action,
+            policy,
+        };
+        for (provider, body) in execution_provider_wire_bodies_for_test(request) {
+            let encoded = body.to_string();
+            let first_call = encoded.find("first_tool_wire_order").expect("first call");
+            let second_call = encoded.find("second_tool_wire_order").expect("second call");
+            let first_result = encoded
+                .find("first-result-wire-order")
+                .expect("first result");
+            let second_result = encoded
+                .find("second-result-wire-order")
+                .expect("second result");
+            assert!(
+                first_call < second_call
+                    && second_call < first_result
+                    && first_result < second_result,
+                "{provider} wire reordered completed sibling calls or results"
+            );
+            match provider {
+                "kimi" | "glm" => {
+                    assert!(encoded.contains("\"tool_call_id\":\"first-call-wire-order\""));
+                    assert!(encoded.contains("\"tool_call_id\":\"second-call-wire-order\""));
+                }
+                "openai-responses" => {
+                    assert!(encoded.contains("\"call_id\":\"first-call-wire-order\""));
+                    assert!(encoded.contains("\"call_id\":\"second-call-wire-order\""));
+                }
+                "anthropic" => {
+                    assert!(encoded.contains("\"tool_use_id\":\"first-call-wire-order\""));
+                    assert!(encoded.contains("\"tool_use_id\":\"second-call-wire-order\""));
+                }
+                other => panic!("unexpected reviewer provider {other}"),
+            }
+        }
     }
 
     #[tokio::test]

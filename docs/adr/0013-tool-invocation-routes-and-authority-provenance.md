@@ -340,15 +340,22 @@ compatibility branchを作らない。
 5. policy bundleがmissing、stale、version mismatchのときのNormal/Elevated別挙動。
 6. standing Allow/Deny policyのscope、語彙、precedence、expiry/revocation、管理UI、正本。
 
-これらが未決でも、non-positive reviewをHumanへfallbackしないこと、routeとauthority sourceを
-同一視しないこと、Human-account one-shotをstanding policyへ変換しないこと、hard deny・
-sandbox・app authorizationを迂回しないことは確定事項である。
+これらが未決でも、Normalのnon-positive Execution AutoReviewをHumanへfallbackせずfail-closedに
+すること、ElevatedのEscalation AutoReviewのtimeout・transport error・schema不一致・判定不能を
+Humanの判断より先にterminal denyへ変換しないこと、routeとauthority sourceを同一視しないこと、
+Human-account one-shotをstanding policyへ変換しないこと、hard deny・sandbox・app authorizationを
+迂回しないことは確定事項である。Elevatedで`Block`へのPA objection responseが取得不能な場合も、
+記録済みの異議とfailureを添えて同じheld callをHumanへ提示し、Humanのexact-call decisionだけが
+進行可否を決める。
 
 ## Consequences
 
 - agent自身の通常行為、Human同意付きのagent行為、Human accountを一回借りた行為をauditで
   区別できる。
-- AutoReviewの停止や判定不能がHumanへの承認通知増加へ変換されない。
+- NormalのExecution AutoReviewの停止や判定不能はHumanへの承認通知増加へ変換されず、fail-closedの
+  ままである。一方ElevatedのEscalation AutoReviewのtimeout・transport error・schema不一致・判定不能、
+  または`Block`後のPA objection response取得不能は、記録されたtechnical rationale/objectionを添えた
+  current-call Human approvalへ戻る。
 - Humanはcurrent callとstanding policy changeの違いを理解したまま判断できる。
 - 既存のglobal `ReviewerMode`、`NeedsApproval → reviewer → manual fallback`、opaqueな
   `ApproveAlways` wire/UI/runtime経路は本決定に適合しないため置換が必要になる。

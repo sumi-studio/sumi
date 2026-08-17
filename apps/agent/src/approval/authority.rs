@@ -233,13 +233,22 @@ impl ToolExecutionAuthorizationEvidence {
                 Some(human),
             ) if (review.decision.outcome == EscalationReviewOutcome::AskHuman
                 || (review.decision.outcome == EscalationReviewOutcome::Block
-                    && review
+                    && (review
                         .pa_objection_response
                         .as_ref()
                         .and_then(|response| response.answer.as_ref())
                         .is_some_and(|answer| {
                             answer.outcome == EscalationObjectionOutcome::Proceed
-                        })))
+                        })
+                        || (review
+                            .pa_objection_failure
+                            .as_deref()
+                            .is_some_and(|failure| !failure.trim().is_empty())
+                            && review
+                                .pa_objection_response
+                                .as_ref()
+                                .and_then(|response| response.answer.as_ref())
+                                .is_none()))))
                 && human.decision == CurrentCallDecision::ApproveOnce
                 && !human.request_id.trim().is_empty()
                 && !human.command_id.trim().is_empty()
