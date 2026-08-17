@@ -387,15 +387,21 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 		AND pm.left_at IS NULL AND wm.left_at IS NULL`
 	args := []any{s.Scope.WorkspaceID, place.PlaceID}
 	if place.Kind == PlaceChannel {
+		// A channel admits every Workspace member; the place-scoped join above
+		// still needs its place argument, so both branches pass the same args.
 		condition = `wm.workspace_id = $1 AND wm.left_at IS NULL`
-		args = []any{s.Scope.WorkspaceID}
 	}
 	rows, err := q.Query(ctx, `
 		SELECT wm.member_kind, wm.member_id,
 		       COALESCE(h.display_name, a.display_name, '') AS display_name
 		FROM workspace_members wm
+		-- Bound to the exact place: without pm.place_id the join multiplies a
+		-- member by every other place they are in, which for a channel (whose
+		-- condition does not constrain pm) returns the same participant once
+		-- per place and made notification-intent issuance insert duplicates.
 		LEFT JOIN place_members pm
 		  ON pm.workspace_id = wm.workspace_id
+		 AND pm.place_id = $2
 		 AND pm.workspace_member_id = wm.workspace_member_id AND pm.left_at IS NULL
 		LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
 		LEFT JOIN agents a ON wm.member_kind = 'personality_agent'
