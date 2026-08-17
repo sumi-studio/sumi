@@ -317,7 +317,13 @@ Calls are opt-in and have no default credential. Setting SUMI_LIVEKIT_API_KEY
 and SUMI_LIVEKIT_API_SECRET together starts the LiveKit media server and mounts
 the API's call routes; leaving both unset starts no media server and keeps the
 API's call routes unmounted. Setting only one is an error. SUMI_LIVEKIT_URL is
-the browser-facing signalling address and defaults to the local media server.
+the browser-facing signalling address and defaults to the local media server
+over ws://. Browsers only expose the microphone on a secure context, so calls
+work from http://127.0.0.1:5173 and from an https origin, not from a plain
+http://<tailnet-ip>:5173 page (the UI says so and refuses before requesting a
+token). When the stack is fronted by HTTPS (SUMI_DEV_PUBLIC_ORIGINS), also front
+LiveKit's signalling port and set SUMI_LIVEKIT_URL to that wss:// address;
+media (UDP 7882, TCP fallback 7881) still goes straight to the bind host.
 
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
 Set SUMI_LOCAL_COMPOSE_PROJECT to target an explicitly named local stack and

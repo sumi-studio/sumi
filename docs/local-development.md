@@ -274,6 +274,28 @@ workspace propagation, startup gates, and the local exact-call executor path.
 They do not perform the final third-party Firebase/provider login and
 billing-bearing model request.
 
+### Calls need a secure origin
+
+Browsers expose the microphone only on a secure context, so DM calls and voice
+channels work from `http://127.0.0.1:5173` (loopback counts as secure) and from
+an `https://` origin, but not from a plain `http://<tailscale-ipv4>:5173` page.
+The UI states this explicitly and refuses to join before requesting a call
+token; text messaging is unaffected. To use calls from another device, front
+the stack with HTTPS instead of the direct Tailnet HTTP endpoint:
+
+- terminate TLS on a name you control (for example Tailscale Serve on the host)
+  and proxy it to the Vite origin; list the origin in `SUMI_DEV_PUBLIC_ORIGINS`
+  (`scripts/dev/compose-stack`), which admits it as a browser origin and Vite
+  host;
+- proxy LiveKit's signalling port (7880) the same way and set `SUMI_LIVEKIT_URL`
+  to that `wss://` address — an `https://` page cannot use `ws://` signalling and
+  the UI reports it as mixed content;
+- add the name to the Firebase project's authorized domains, as for the literal
+  Tailnet IP above.
+
+Media (UDP 7882, TCP fallback 7881) is not proxied; it goes straight to the
+bind host, which the other device reaches over the Tailnet.
+
 ## Disposable generation boundary
 
 `make dev` creates state directories and non-production secrets in one
