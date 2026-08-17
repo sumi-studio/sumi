@@ -2912,6 +2912,94 @@ fn supervisor_rejects_noncanonical_paid_before_touching_docker() {
 }
 
 #[test]
+fn reconcile_reaps_an_orphan_alongside_complete_active_roles() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("reconcile-orphan-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    let script = r#"#!/bin/bash
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version")
+    exit 0
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\n'
+    printf 'bbbbbbbbbbbb\texecutor\n'
+    printf 'cccccccccccc\tbroker\n'
+    printf 'dddddddddddd\torphan-one-off\n'
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet runtime")
+    printf 'aaaaaaaaaaaa\n'
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet executor")
+    printf 'bbbbbbbbbbbb\n'
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet broker")
+    printf 'cccccccccccc\n'
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml down --remove-orphans"*)
+    touch "$SUMI_FAKE_REAPED"
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    exit 0
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    exit 0
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+"#;
+    std::fs::write(&fake_docker, script).unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = root.join("docker.log");
+    let reaped = root.join("reaped");
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut command = Command::new(deploy_dir().join("supervisor"));
+    command
+        .arg("reconcile")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_DOCKER_LOG", &log)
+        .env("SUMI_FAKE_REAPED", &reaped);
+    launch_runtime_env(&mut command, &fixture);
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "reconcile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reaped.exists(),
+        "reconcile reported a complete active project instead of removing the orphan: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"phase\":\"unknown\""),
+        "reconcile did not return an observed-empty reap attestation: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("compose.lifecycle.yaml down --remove-orphans"),
+        "orphan reconciliation skipped Compose cleanup: {calls}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;

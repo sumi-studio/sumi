@@ -22,6 +22,9 @@ type durableReapState struct {
 	directory string
 	path      string
 	entries   map[string]uint64
+	// Kept on the state so tests can deterministically exercise the boundary
+	// after os.Rename has made a new document visible.
+	syncDirectory func(*os.File) error
 }
 
 type reapStateDocument struct {
@@ -57,6 +60,9 @@ func newDurableReapState(directory string) (*durableReapState, error) {
 		directory: directory,
 		path:      filepath.Join(directory, reapStateFileName),
 		entries:   make(map[string]uint64),
+		syncDirectory: func(directory *os.File) error {
+			return directory.Sync()
+		},
 	}
 	if err := state.load(); err != nil {
 		return nil, err
@@ -133,18 +139,28 @@ func (state *durableReapState) record(personalityAgentID string, generation uint
 		return nil
 	}
 	state.entries[personalityAgentID] = generation
-	if err := state.persist(); err != nil {
-		if existed {
-			state.entries[personalityAgentID] = previous
-		} else {
-			delete(state.entries, personalityAgentID)
+	published, err := state.persist()
+	if err != nil {
+		// A failed write before rename leaves the old document authoritative, so
+		// restore the in-memory view. Once rename succeeds, the new document is
+		// already visible even if directory fsync reports an uncertain durability
+		// result; keeping the entry prevents a later write from deleting it.
+		if !published {
+			if existed {
+				state.entries[personalityAgentID] = previous
+			} else {
+				delete(state.entries, personalityAgentID)
+			}
 		}
 		return err
 	}
 	return nil
 }
 
-func (state *durableReapState) persist() (result error) {
+// persist reports whether the document was published with os.Rename before an
+// error. A post-rename error means durable ordering is uncertain, not that the
+// old document is still current.
+func (state *durableReapState) persist() (published bool, result error) {
 	document := reapStateDocument{
 		Version:           reapStateVersion,
 		PersonalityAgents: make(map[string]reapStateAgentRecord, len(state.entries)),
@@ -157,14 +173,14 @@ func (state *durableReapState) persist() (result error) {
 	}
 	encoded, err := encodeReapStateDocument(document)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(encoded) > maxReapStateBytes {
-		return errors.New("durable reap state would exceed the maximum allowed size")
+		return false, errors.New("durable reap state would exceed the maximum allowed size")
 	}
 	temporary, err := os.CreateTemp(state.directory, ".reap-attestations-*")
 	if err != nil {
-		return fmt.Errorf("create temporary reap state: %w", err)
+		return false, fmt.Errorf("create temporary reap state: %w", err)
 	}
 	temporaryPath := temporary.Name()
 	defer func() {
@@ -172,29 +188,29 @@ func (state *durableReapState) persist() (result error) {
 		_ = os.Remove(temporaryPath)
 	}()
 	if err := temporary.Chmod(0o600); err != nil {
-		return fmt.Errorf("protect temporary reap state: %w", err)
+		return false, fmt.Errorf("protect temporary reap state: %w", err)
 	}
 	if _, err := temporary.Write(encoded); err != nil {
-		return fmt.Errorf("write temporary reap state: %w", err)
+		return false, fmt.Errorf("write temporary reap state: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync temporary reap state: %w", err)
+		return false, fmt.Errorf("sync temporary reap state: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary reap state: %w", err)
+		return false, fmt.Errorf("close temporary reap state: %w", err)
 	}
 	if err := os.Rename(temporaryPath, state.path); err != nil {
-		return fmt.Errorf("publish reap state: %w", err)
+		return false, fmt.Errorf("publish reap state: %w", err)
 	}
 	directory, err := os.Open(state.directory)
 	if err != nil {
-		return fmt.Errorf("open reap state directory: %w", err)
+		return true, fmt.Errorf("open reap state directory: %w", err)
 	}
 	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("sync reap state directory: %w", err)
+	if err := state.syncDirectory(directory); err != nil {
+		return true, fmt.Errorf("sync reap state directory: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func encodeReapStateDocument(document reapStateDocument) ([]byte, error) {

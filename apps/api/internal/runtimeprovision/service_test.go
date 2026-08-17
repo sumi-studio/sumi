@@ -459,7 +459,7 @@ func TestDurableReapStateAtMaximumSizeRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	fillReapStateToMaximumSize(t, state)
-	if err := state.persist(); err != nil {
+	if _, err := state.persist(); err != nil {
 		t.Fatalf("persist reap state at maximum size: %v", err)
 	}
 	info, err := os.Stat(state.path)
@@ -486,7 +486,7 @@ func TestDurableReapStateRejectsOversizeBeforePublishing(t *testing.T) {
 		t.Fatal(err)
 	}
 	nextPersonalityAgentID := fillReapStateToMaximumSize(t, state)
-	if err := state.persist(); err != nil {
+	if _, err := state.persist(); err != nil {
 		t.Fatalf("persist reap state at maximum size: %v", err)
 	}
 	if err := state.record(nextPersonalityAgentID, 0); err == nil || !strings.Contains(err.Error(), "would exceed the maximum allowed size") {
@@ -504,6 +504,53 @@ func TestDurableReapStateRejectsOversizeBeforePublishing(t *testing.T) {
 	}
 	if _, err := newDurableReapState(stateDirectory); err != nil {
 		t.Fatalf("state after rejected oversize write no longer loads: %v", err)
+	}
+}
+
+func TestDurableReapStateKeepsPublishedEntryAfterDirectorySyncFailure(t *testing.T) {
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	state, err := newDurableReapState(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.record(testPAID, 3); err != nil {
+		t.Fatalf("record initial reap attestation: %v", err)
+	}
+
+	syncFailure := errors.New("injected directory sync failure")
+	state.syncDirectory = func(*os.File) error { return syncFailure }
+	if err := state.record(testPAID2, 5); !errors.Is(err, syncFailure) {
+		t.Fatalf("post-rename directory sync failure was not returned: %v", err)
+	}
+	if generation, ok := state.lookup(testPAID2); !ok || generation != 5 {
+		t.Fatalf("post-rename entry was rolled back in memory: generation=%d ok=%t", generation, ok)
+	}
+
+	restarted, err := newDurableReapState(stateDirectory)
+	if err != nil {
+		t.Fatalf("published document after directory sync failure no longer loads: %v", err)
+	}
+	if generation, ok := restarted.lookup(testPAID2); !ok || generation != 5 {
+		t.Fatalf("post-rename entry was not present in the published document: generation=%d ok=%t", generation, ok)
+	}
+
+	state.syncDirectory = func(directory *os.File) error { return directory.Sync() }
+	thirdPAID := "0198f0f4-9b72-7000-8000-000000000003"
+	if err := state.record(thirdPAID, 7); err != nil {
+		t.Fatalf("later reap attestation discarded published entry: %v", err)
+	}
+	final, err := newDurableReapState(stateDirectory)
+	if err != nil {
+		t.Fatalf("final reap state does not load: %v", err)
+	}
+	for personalityAgentID, generation := range map[string]uint64{
+		testPAID:  3,
+		testPAID2: 5,
+		thirdPAID: 7,
+	} {
+		if actual, ok := final.lookup(personalityAgentID); !ok || actual != generation {
+			t.Fatalf("final reap state lost %s: generation=%d ok=%t", personalityAgentID, actual, ok)
+		}
 	}
 }
 

@@ -719,6 +719,39 @@ running_role_count() {
   printf '%s\n' "${count}"
 }
 
+# Compose's service-scoped `ps` queries do not include a reliable assertion
+# about every container labelled for this project: an interrupted compose
+# operation can leave a one-off or orphan container beside an otherwise
+# complete generation. Before reporting a project as active or prepared, use
+# Docker's project label to require exactly one container for every expected
+# role and nothing else.
+project_containers_match_expected_roles() {
+  local output line container_id service
+  local -A expected=()
+  local -A observed=()
+  local role
+
+  for role in "$@"; do
+    [[ -z "${expected[${role}]+set}" ]] || return 1
+    expected["${role}"]=1
+  done
+  (( ${#expected[@]} > 0 )) || return 1
+
+  output="$(docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}' 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r container_id service; do
+    [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ && -n "${service}" && \
+      -z "${expected[${service}]+set}" && -z "${observed[${service}]+set}" ]] || return 1
+    observed["${service}"]=1
+  done <<< "${output}"
+
+  (( ${#observed[@]} == ${#expected[@]} )) || return 1
+  for role in "${!expected[@]}"; do
+    [[ -n "${observed[${role}]+set}" ]] || return 1
+  done
+}
+
 prepared_containers_exist() {
   local allocator_id prepare_id
   allocator_id="$(lifecycle_compose ps --all --quiet allocator 2>/dev/null)" || return 1
@@ -755,6 +788,8 @@ inspect_epoch() {
   local running
   running="$(running_role_count)" || fail "cannot inspect Compose role state"
   if [[ "${running}" == 3 ]]; then
+    project_containers_match_expected_roles runtime executor broker ||
+      fail "active project contains containers outside the expected role set; reconcile before reuse"
     epoch_identity || fail "active project has no coherent prepared epoch"
     print_epoch_json active
     return
@@ -763,6 +798,8 @@ inspect_epoch() {
   ! long_lived_containers_exist ||
     fail "project contains a failed active generation; reconcile before reuse"
   if prepared_containers_exist; then
+    project_containers_match_expected_roles allocator prepare ||
+      fail "prepared project contains containers outside the expected role set; reconcile before reuse"
     epoch_identity || fail "prepared project has no coherent epoch"
     print_epoch_json prepared
   else
@@ -961,8 +998,10 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     running="$(running_role_count)" || fail "cannot inspect Compose role state"
-    if [[ "${running}" == 3 ]] ||
-      { [[ "${running}" == 0 ]] && ! long_lived_containers_exist && prepared_containers_exist; }; then
+    if { [[ "${running}" == 3 ]] &&
+      project_containers_match_expected_roles runtime executor broker; } ||
+      { [[ "${running}" == 0 ]] && ! long_lived_containers_exist && prepared_containers_exist &&
+        project_containers_match_expected_roles allocator prepare; }; then
       inspect_epoch
     else
       # This branch also covers a provisioner crash after a verified stop or

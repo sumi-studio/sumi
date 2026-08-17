@@ -12,7 +12,11 @@ func TestUnixTransportRoundTrip(t *testing.T) {
 	backend := newFakeBackend()
 	service := newTestService(t, backend)
 	handler, _ := NewHandler(service)
-	socketPath := filepath.Join(t.TempDir(), "provisioner.sock")
+	socketDirectory := t.TempDir()
+	if err := os.Chmod(socketDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(socketDirectory, "provisioner.sock")
 	listener, err := ListenUnix(UnixListenerConfig{
 		SocketPath:           socketPath,
 		SocketGID:            os.Getegid(),
