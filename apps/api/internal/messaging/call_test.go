@@ -19,6 +19,7 @@ import (
 const (
 	testLiveKitKey    = "sumi-local"
 	testLiveKitSecret = "a-secret-long-enough-for-hs256-signing"
+	testRoomSID       = "RM_test_generation"
 )
 
 func testLiveKit() LiveKitConfig {
@@ -80,7 +81,7 @@ func TestCallWebhookRejectsSignaturesAndRebuildsState(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	service.RegisterRoutes(mux)
-	body := []byte(`{"event":"participant_joined","room":{"name":"place-1"},"participant":{"identity":"human:01900000-0000-7000-8000-0000000000aa"}}`)
+	body := []byte(`{"event":"participant_joined","room":{"name":"place-1","sid":"RM_test_generation"},"participant":{"identity":"human:01900000-0000-7000-8000-0000000000aa"}}`)
 
 	for name, authorization := range map[string]string{
 		"unsigned":          "Bearer not-a-token",
@@ -99,6 +100,10 @@ func TestCallWebhookRejectsSignaturesAndRebuildsState(t *testing.T) {
 	if _, ok := service.Registry.snapshot("place-1"); ok {
 		t.Fatal("rejected webhook changed state")
 	}
+	service.applyWebhook(context.Background(), livekitWebhookEvent{Event: "room_started", Room: struct {
+		Name string `json:"name"`
+		SID  string `json:"sid"`
+	}{Name: "place-1", SID: testRoomSID}})
 
 	for _, authorization := range []string{
 		// livekit-server v1.8 sends the signed JWT directly, while accepting
@@ -126,23 +131,79 @@ func TestCallRegistryFoldsRoomParticipantAndScreenEvents(t *testing.T) {
 	registry := NewCallRegistry()
 	alice := Human("01900000-0000-7000-8000-0000000000aa")
 	bob := Human("01900000-0000-7000-8000-0000000000bb")
-	registry.open("place-1", now)
-	registry.join("place-1", alice, now)
-	state := registry.join("place-1", bob, now.Add(time.Second))
-	state = registry.join("place-1", bob, now.Add(2*time.Second))
+	registry.open("place-1", testRoomSID, now)
+	registry.join("place-1", testRoomSID, alice, now)
+	state, _ := registry.join("place-1", testRoomSID, bob, now.Add(time.Second))
+	state, _ = registry.join("place-1", testRoomSID, bob, now.Add(2*time.Second))
 	if len(state.Participants) != 2 {
 		t.Fatalf("duplicate webhook created %d participants", len(state.Participants))
 	}
-	if _, changed := registry.setScreenShare("place-1", bob, true); !changed {
+	if _, changed := registry.setScreenShare("place-1", testRoomSID, bob, true); !changed {
 		t.Fatal("screen-share publication did not change state")
 	}
-	state, _ = registry.leave("place-1", alice)
+	state, _ = registry.leave("place-1", testRoomSID, alice)
 	if !state.Active || len(state.Participants) != 1 || !state.Participants[0].ScreenShare {
 		t.Fatalf("participant fold = %+v", state)
 	}
-	state = registry.close("place-1")
+	state, _ = registry.close("place-1", testRoomSID)
 	if state.Active {
 		t.Fatal("finished room remained active")
+	}
+}
+
+func TestCallWebhookUsesRoomSIDAsGeneration(t *testing.T) {
+	now := time.Unix(1_780_000_000, 0)
+	service := &CallService{Registry: NewCallRegistry(), Now: func() time.Time { return now }}
+	alice := Human("01900000-0000-7000-8000-0000000000aa")
+	apply := func(event, sid string) {
+		webhook := livekitWebhookEvent{Event: event}
+		webhook.Room.Name, webhook.Room.SID = "place-1", sid
+		webhook.Participant.Identity = alice.Key()
+		service.applyWebhook(context.Background(), webhook)
+	}
+
+	apply("room_started", "RM_old")
+	apply("room_finished", "RM_old")
+	apply("participant_joined", "RM_old")
+	if state, ok := service.Registry.snapshot("place-1"); ok {
+		t.Fatalf("joined-after-finished resurrected room: %+v", state)
+	}
+	if !service.Registry.finished("place-1", "RM_old") {
+		t.Fatal("finished room lost its SID tombstone")
+	}
+
+	apply("room_started", "RM_new")
+	apply("participant_joined", "RM_old")
+	apply("participant_joined", "RM_new")
+	state, ok := service.Registry.snapshot("place-1")
+	if !ok || len(state.Participants) != 1 || state.Participants[0].Participant != alice {
+		t.Fatalf("new generation did not accept only its own join: %+v", state)
+	}
+}
+
+func TestCallWebhookIgnoresFinishedGenerationAndFoldsTrackBeforeJoin(t *testing.T) {
+	service := &CallService{Registry: NewCallRegistry()}
+	alice := Human("01900000-0000-7000-8000-0000000000aa")
+	apply := func(event, sid string) {
+		webhook := livekitWebhookEvent{Event: event}
+		webhook.Room.Name, webhook.Room.SID = "place-1", sid
+		webhook.Participant.Identity = alice.Key()
+		webhook.Track.Source = "SCREEN_SHARE"
+		service.applyWebhook(context.Background(), webhook)
+	}
+
+	apply("room_finished", "RM_finished_first")
+	apply("room_started", "RM_finished_first")
+	if _, ok := service.Registry.snapshot("place-1"); ok {
+		t.Fatal("room_started after matching room_finished reopened a tombstone")
+	}
+	apply("room_started", "RM_current")
+	apply("room_started", "RM_current") // duplicate starts are idempotent.
+	apply("track_published", "RM_current")
+	apply("participant_joined", "RM_current")
+	state, ok := service.Registry.snapshot("place-1")
+	if !ok || len(state.Participants) != 1 || !state.Participants[0].ScreenShare {
+		t.Fatalf("track before join was not folded into participant state: %+v", state)
 	}
 }
 
@@ -341,7 +402,7 @@ func TestCallRegistryRebuildListsParticipantsOnceWithoutWebhook(t *testing.T) {
 	service := &CallService{
 		Registry: NewCallRegistry(),
 		RoomService: stubLiveKitRoomService{
-			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			rooms: []liveKitRoom{{Name: "place-1", SID: testRoomSID, CreatedAt: 1_780_000_000}},
 			participants: map[string][]liveKitParticipant{
 				"place-1": {{Identity: "human:01900000-0000-7000-8000-0000000000aa"}},
 			},
@@ -358,7 +419,7 @@ func TestCallRegistryRebuildListsParticipantsOnceWithoutWebhook(t *testing.T) {
 
 func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
 	roomService := stubLiveKitRoomService{
-		rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+		rooms: []liveKitRoom{{Name: "place-1", SID: testRoomSID, CreatedAt: 1_780_000_000}},
 		participants: map[string][]liveKitParticipant{
 			"place-1": {{
 				Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001,
@@ -412,7 +473,7 @@ func TestCallRegistryRebuildRetriesWebhookAppliedDuringSnapshot(t *testing.T) {
 		Registry: registry,
 		Now:      func() time.Time { return now },
 		RoomService: stubLiveKitRoomService{
-			rooms:        []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			rooms:        []liveKitRoom{{Name: "place-1", SID: testRoomSID, CreatedAt: 1_780_000_000}},
 			participants: participants,
 			onListParticipants: func(string) {
 				if !firstList {
@@ -421,7 +482,8 @@ func TestCallRegistryRebuildRetriesWebhookAppliedDuringSnapshot(t *testing.T) {
 				firstList = false
 				// This is the previously unsafe interleaving: RoomService has
 				// already been read, then LiveKit delivers a newer webhook.
-				registry.join("place-1", webhookParticipant, now)
+				registry.open("place-1", testRoomSID, now)
+				registry.join("place-1", testRoomSID, webhookParticipant, now)
 				participants["place-1"] = append(participants["place-1"], liveKitParticipant{
 					Identity: webhookParticipant.Key(), JoinedAt: now.Unix(),
 				})
@@ -450,14 +512,16 @@ func TestCallRegistryRebuildRetriesParticipantLeftDuringSnapshot(t *testing.T) {
 		Registry: registry,
 		Now:      func() time.Time { return now },
 		RoomService: stubLiveKitRoomService{
-			rooms:        []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			rooms:        []liveKitRoom{{Name: "place-1", SID: testRoomSID, CreatedAt: 1_780_000_000}},
 			participants: participants,
 			onListParticipants: func(string) {
 				if !firstList {
 					return
 				}
 				firstList = false
-				registry.leave("place-1", departed)
+				registry.open("place-1", testRoomSID, now)
+				registry.join("place-1", testRoomSID, departed, now)
+				registry.leave("place-1", testRoomSID, departed)
 				participants["place-1"] = nil
 			},
 		},
@@ -471,17 +535,52 @@ func TestCallRegistryRebuildRetriesParticipantLeftDuringSnapshot(t *testing.T) {
 	}
 }
 
+func TestCallRegistryRebuildDiscardsListingAfterThreeWebhookRaces(t *testing.T) {
+	now := time.Unix(1_780_000_100, 0)
+	registry := NewCallRegistry()
+	departed := Human("01900000-0000-7000-8000-0000000000aa")
+	registry.open("place-1", testRoomSID, now)
+	registry.join("place-1", testRoomSID, departed, now)
+	calls := 0
+	service := &CallService{
+		Registry: registry,
+		RoomService: stubLiveKitRoomService{
+			rooms: []liveKitRoom{{Name: "place-1", SID: testRoomSID, CreatedAt: now.Unix()}},
+			participants: map[string][]liveKitParticipant{
+				"place-1": {{Identity: departed.Key(), JoinedAt: now.Unix()}},
+			},
+			listParticipantCalls: &calls,
+			onListParticipants: func(string) {
+				// Keep changing the room sequence after every stale listing. The
+				// first leave changes membership; later duplicate leaves model
+				// separate webhook deliveries during the remaining attempts.
+				registry.leave("place-1", testRoomSID, departed)
+			},
+		},
+	}
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != callSnapshotAttempts {
+		t.Fatalf("ListParticipants calls=%d, want %d", calls, callSnapshotAttempts)
+	}
+	state, ok := registry.snapshot("place-1")
+	if !ok || len(state.Participants) != 0 {
+		t.Fatalf("stale third listing undid webhook leave: %+v", state)
+	}
+}
+
 func TestCallRegistryRebuildDoesNotResurrectFinishedRoom(t *testing.T) {
 	registry := NewCallRegistry()
 	service := &CallService{
 		Registry: registry,
 		RoomService: stubLiveKitRoomService{
-			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			rooms: []liveKitRoom{{Name: "place-1", SID: testRoomSID, CreatedAt: 1_780_000_000}},
 			participants: map[string][]liveKitParticipant{
 				"place-1": {{Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001}},
 			},
 			onListParticipants: func(string) {
-				registry.close("place-1")
+				registry.close("place-1", testRoomSID)
 			},
 		},
 	}
@@ -511,14 +610,15 @@ func TestCallServiceRemovesClosedWorkspaceMemberPublishesOnceAndIgnoresWebhookDu
 		Server:   server,
 		Registry: NewCallRegistry(),
 		RoomService: stubLiveKitRoomService{
-			rooms: []liveKitRoom{{Name: channel.PlaceID}, {Name: "01900000-0000-7000-8000-0000000000ff"}},
+			rooms: []liveKitRoom{{Name: channel.PlaceID, SID: testRoomSID}, {Name: "01900000-0000-7000-8000-0000000000ff", SID: "RM_unrelated"}},
 			participants: map[string][]liveKitParticipant{
 				channel.PlaceID: {{Identity: w.humanB.Key()}},
 			},
 			removed: &removed,
 		},
 	}
-	service.Registry.join(channel.PlaceID, w.humanB, time.Unix(1_780_000_000, 0))
+	service.Registry.open(channel.PlaceID, testRoomSID, time.Unix(1_780_000_000, 0))
+	service.Registry.join(channel.PlaceID, testRoomSID, w.humanB, time.Unix(1_780_000_000, 0))
 	subscriber := hub.subscribe(owner)
 	defer hub.unsubscribe(subscriber)
 	if err := service.RemoveWorkspaceParticipant(ctx, fixture.workspace.WorkspaceID, w.humanB); err != nil {
@@ -551,6 +651,7 @@ func TestCallServiceRemovesClosedWorkspaceMemberPublishesOnceAndIgnoresWebhookDu
 
 	event := livekitWebhookEvent{Event: "participant_left"}
 	event.Room.Name = channel.PlaceID
+	event.Room.SID = testRoomSID
 	event.Participant.Identity = w.humanB.Key()
 	service.applyWebhook(ctx, event)
 	select {
@@ -580,7 +681,7 @@ func TestLiveKitRoomServiceDecodesV18ProtoJSONTimestamps(t *testing.T) {
 			if !claims.Video.RoomList || claims.Video.RoomAdmin || claims.Video.Room != "" {
 				t.Fatalf("ListRooms grant = %+v", claims.Video)
 			}
-			_, _ = w.Write([]byte(`{"rooms":[{"name":"place-1","creation_time":"1780000000"}]}`))
+			_, _ = w.Write([]byte(`{"rooms":[{"name":"place-1","sid":"RM_test_generation","creation_time":"1780000000"}]}`))
 		case "/twirp/livekit.RoomService/ListParticipants":
 			if claims.Video.RoomList || !claims.Video.RoomAdmin || claims.Video.Room != "place-1" {
 				t.Fatalf("ListParticipants grant = %+v", claims.Video)
@@ -599,7 +700,7 @@ func TestLiveKitRoomServiceDecodesV18ProtoJSONTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rooms) != 1 || rooms[0].CreatedAt != 1_780_000_000 {
+	if len(rooms) != 1 || rooms[0].SID != testRoomSID || rooms[0].CreatedAt != 1_780_000_000 {
 		t.Fatalf("decoded rooms = %+v", rooms)
 	}
 	participants, err := service.RoomService.ListParticipants(context.Background(), rooms[0].Name)
@@ -654,8 +755,8 @@ func TestCallStateReadFiltersInvisiblePlaces(t *testing.T) {
 	calls := NewCallService(server, testLiveKit())
 	calls.RoomService = stubLiveKitRoomService{
 		rooms: []liveKitRoom{
-			{Name: channel.PlaceID, CreatedAt: time.Now().Unix()},
-			{Name: dm.PlaceID, CreatedAt: time.Now().Unix()},
+			{Name: channel.PlaceID, SID: testRoomSID, CreatedAt: time.Now().Unix()},
+			{Name: dm.PlaceID, SID: "RM_dm", CreatedAt: time.Now().Unix()},
 		},
 		participants: map[string][]liveKitParticipant{
 			channel.PlaceID: {{Identity: w.humanA.Key(), JoinedAt: time.Now().Unix()}},
@@ -691,7 +792,9 @@ func TestCallWebhookStatePublishesAsVolatileScopedEvent(t *testing.T) {
 
 	event := livekitWebhookEvent{Event: "participant_joined"}
 	event.Room.Name = channel.PlaceID
+	event.Room.SID = testRoomSID
 	event.Participant.Identity = w.humanA.Key()
+	calls.Registry.open(channel.PlaceID, testRoomSID, time.Unix(1_780_000_000, 0))
 	calls.applyWebhook(ctx, event)
 	select {
 	case frame := <-subscriber.send:

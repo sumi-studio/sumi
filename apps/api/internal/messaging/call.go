@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -63,13 +64,16 @@ type CallRegistry struct {
 	rooms        map[string]*CallState
 	sequence     uint64
 	roomSequence map[string]uint64
-	roomFinished map[string]uint64
+	roomSID      map[string]string
+	finishedSIDs map[string]map[string]struct{}
+	pendingShare map[string]map[ParticipantRef]bool
 }
 
 func NewCallRegistry() *CallRegistry {
 	return &CallRegistry{
 		rooms: map[string]*CallState{}, roomSequence: map[string]uint64{},
-		roomFinished: map[string]uint64{},
+		roomSID:      map[string]string{},
+		finishedSIDs: map[string]map[string]struct{}{}, pendingShare: map[string]map[ParticipantRef]bool{},
 	}
 }
 
@@ -96,21 +100,28 @@ func (r *CallRegistry) active() []CallState {
 
 type callRoomSnapshot struct {
 	state    CallState
+	sid      string
 	sequence uint64
 }
 
 // replaceSnapshot applies a RoomService snapshot. A room snapshot is accepted
 // only when no webhook changed that room while its participants were listed.
-// A room_finished event after the ListRooms read is a tombstone: it always
-// wins over the stale listing that included the room.
+// A finished room SID is a tombstone, so its stale listing can never recreate it.
 func (r *CallRegistry) replaceSnapshot(states []callRoomSnapshot, snapshotSequence uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	next := make(map[string]*CallState, len(states))
 	for _, snapshot := range states {
 		placeID := snapshot.state.PlaceID
-		if r.roomFinished[placeID] > snapshotSequence {
+		if r.finished(placeID, snapshot.sid) {
 			continue
+		}
+		if currentSID := r.roomSID[placeID]; currentSID != "" && currentSID != snapshot.sid {
+			if current, ok := r.rooms[placeID]; ok {
+				copy := cloneCallState(current)
+				next[placeID] = &copy
+				continue
+			}
 		}
 		if r.roomSequence[placeID] > snapshot.sequence {
 			if current, ok := r.rooms[placeID]; ok {
@@ -121,6 +132,7 @@ func (r *CallRegistry) replaceSnapshot(states []callRoomSnapshot, snapshotSequen
 		}
 		copy := cloneCallState(&snapshot.state)
 		next[placeID] = &copy
+		r.roomSID[placeID] = snapshot.sid
 	}
 	for placeID, state := range r.rooms {
 		if r.roomSequence[placeID] > snapshotSequence {
@@ -158,46 +170,77 @@ func cloneCallState(state *CallState) CallState {
 	}
 }
 
-func (r *CallRegistry) open(placeID string, at time.Time) CallState {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	state, ok := r.rooms[placeID]
-	if !ok {
-		state = &CallState{PlaceID: placeID, StartedAt: at}
-		r.rooms[placeID] = state
-	}
-	state.Active = true
-	r.changed(placeID)
-	delete(r.roomFinished, placeID)
-	return cloneCallState(state)
+func (r *CallRegistry) finished(placeID, sid string) bool {
+	_, ok := r.finishedSIDs[placeID][sid]
+	return ok
 }
 
-func (r *CallRegistry) close(placeID string) CallState {
+func (r *CallRegistry) retire(placeID, sid string) {
+	if r.finishedSIDs[placeID] == nil {
+		r.finishedSIDs[placeID] = map[string]struct{}{}
+	}
+	r.finishedSIDs[placeID][sid] = struct{}{}
+}
+
+func (r *CallRegistry) activeSID(placeID, sid string) (*CallState, bool) {
+	state, ok := r.rooms[placeID]
+	return state, ok && r.roomSID[placeID] == sid
+}
+
+func (r *CallRegistry) open(placeID, sid string, at time.Time) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if sid == "" || r.finished(placeID, sid) {
+		return CallState{}, false
+	}
+	if state, ok := r.activeSID(placeID, sid); ok {
+		return cloneCallState(state), false
+	}
+	if previousSID := r.roomSID[placeID]; previousSID != "" && previousSID != sid {
+		// A room name cannot have two live generations. Remember the displaced
+		// one so a delayed room_started for it cannot replace this generation.
+		r.retire(placeID, previousSID)
+	}
+	state := &CallState{PlaceID: placeID, Active: true, StartedAt: at}
+	r.rooms[placeID] = state
+	r.roomSID[placeID] = sid
+	delete(r.pendingShare, placeID)
+	r.changed(placeID)
+	return cloneCallState(state), true
+}
+
+func (r *CallRegistry) close(placeID, sid string) (CallState, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if sid == "" || (r.roomSID[placeID] != "" && r.roomSID[placeID] != sid) || r.finished(placeID, sid) {
+		return CallState{}, false
+	}
 	delete(r.rooms, placeID)
+	delete(r.pendingShare, placeID)
+	r.roomSID[placeID] = sid
+	r.retire(placeID, sid)
 	r.changed(placeID)
-	r.roomFinished[placeID] = r.roomSequence[placeID]
-	return CallState{PlaceID: placeID}
+	return CallState{PlaceID: placeID}, true
 }
 
-func (r *CallRegistry) join(placeID string, participant ParticipantRef, at time.Time) CallState {
+func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, at time.Time) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state, ok := r.rooms[placeID]
+	state, ok := r.activeSID(placeID, sid)
 	if !ok {
-		state = &CallState{PlaceID: placeID, Active: true, StartedAt: at}
-		r.rooms[placeID] = state
+		return CallState{}, false
 	}
-	state.Active = true
-	r.changed(placeID)
 	for _, existing := range state.Participants {
 		if existing.Participant == participant {
-			return cloneCallState(state)
+			return cloneCallState(state), false
 		}
 	}
+	sharing, pending := r.pendingShare[placeID][participant]
+	if pending {
+		delete(r.pendingShare[placeID], participant)
+	}
 	state.Participants = append(state.Participants, CallParticipant{
-		Participant: participant, JoinedAt: at,
+		Participant: participant, JoinedAt: at, ScreenShare: sharing,
 	})
 	sort.SliceStable(state.Participants, func(i, j int) bool {
 		if state.Participants[i].JoinedAt.Equal(state.Participants[j].JoinedAt) {
@@ -205,18 +248,15 @@ func (r *CallRegistry) join(placeID string, participant ParticipantRef, at time.
 		}
 		return state.Participants[i].JoinedAt.Before(state.Participants[j].JoinedAt)
 	})
-	return cloneCallState(state)
+	r.changed(placeID)
+	return cloneCallState(state), true
 }
 
-func (r *CallRegistry) leave(placeID string, participant ParticipantRef) (CallState, bool) {
+func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state, ok := r.rooms[placeID]
+	state, ok := r.activeSID(placeID, sid)
 	if !ok {
-		// A restart may receive participant_left before its first RoomService
-		// snapshot has populated this room. Record the delta so that snapshot
-		// is retried instead of reintroducing the departed participant.
-		r.changed(placeID)
 		return CallState{}, false
 	}
 	for i, existing := range state.Participants {
@@ -230,14 +270,13 @@ func (r *CallRegistry) leave(placeID string, participant ParticipantRef) (CallSt
 	return cloneCallState(state), false
 }
 
-func (r *CallRegistry) setScreenShare(placeID string, participant ParticipantRef, sharing bool) (CallState, bool) {
+func (r *CallRegistry) setScreenShare(placeID, sid string, participant ParticipantRef, sharing bool) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state, ok := r.rooms[placeID]
+	state, ok := r.activeSID(placeID, sid)
 	if !ok {
 		return CallState{}, false
 	}
-	r.changed(placeID)
 	for i := range state.Participants {
 		if state.Participants[i].Participant != participant {
 			continue
@@ -246,7 +285,17 @@ func (r *CallRegistry) setScreenShare(placeID string, participant ParticipantRef
 			return CallState{}, false
 		}
 		state.Participants[i].ScreenShare = sharing
+		r.changed(placeID)
 		return cloneCallState(state), true
+	}
+	if r.pendingShare[placeID] == nil {
+		r.pendingShare[placeID] = map[ParticipantRef]bool{}
+	}
+	if pending, ok := r.pendingShare[placeID][participant]; !ok || pending != sharing {
+		r.pendingShare[placeID][participant] = sharing
+		// Force a concurrent RoomService read to retry; the track may have
+		// appeared after its participant listing.
+		r.changed(placeID)
 	}
 	return CallState{}, false
 }
@@ -464,6 +513,7 @@ type livekitWebhookEvent struct {
 	Event string `json:"event"`
 	Room  struct {
 		Name string `json:"name"`
+		SID  string `json:"sid"`
 	} `json:"room"`
 	Participant struct {
 		Identity string `json:"identity"`
@@ -475,25 +525,25 @@ type livekitWebhookEvent struct {
 
 func (c *CallService) applyWebhook(ctx context.Context, event livekitWebhookEvent) {
 	placeID := event.Room.Name
-	if placeID == "" {
+	if placeID == "" || event.Room.SID == "" {
 		return
 	}
 	var state CallState
 	changed := true
 	switch event.Event {
 	case "room_started":
-		state = c.Registry.open(placeID, c.now())
+		state, changed = c.Registry.open(placeID, event.Room.SID, c.now())
 	case "room_finished":
-		state = c.Registry.close(placeID)
+		state, changed = c.Registry.close(placeID, event.Room.SID)
 	case "participant_joined", "participant_left":
 		participant, err := participantFromIdentity(event.Participant.Identity)
 		if err != nil {
 			return
 		}
 		if event.Event == "participant_joined" {
-			state = c.Registry.join(placeID, participant, c.now())
+			state, changed = c.Registry.join(placeID, event.Room.SID, participant, c.now())
 		} else {
-			state, changed = c.Registry.leave(placeID, participant)
+			state, changed = c.Registry.leave(placeID, event.Room.SID, participant)
 		}
 	case "track_published", "track_unpublished":
 		if event.Track.Source != "SCREEN_SHARE" {
@@ -503,7 +553,7 @@ func (c *CallService) applyWebhook(ctx context.Context, event livekitWebhookEven
 		if err != nil {
 			return
 		}
-		state, changed = c.Registry.setScreenShare(placeID, participant, event.Event == "track_published")
+		state, changed = c.Registry.setScreenShare(placeID, event.Room.SID, participant, event.Event == "track_published")
 	default:
 		return
 	}
@@ -582,6 +632,7 @@ type liveKitRoomService interface {
 
 type liveKitRoom struct {
 	Name      string `json:"name"`
+	SID       string `json:"sid"`
 	CreatedAt int64  `json:"creation_time,string"`
 }
 
@@ -730,7 +781,7 @@ func (c *CallService) rebuildRegistry(ctx context.Context) error {
 	}
 	states := make([]callRoomSnapshot, 0, len(rooms))
 	for _, room := range rooms {
-		if room.Name == "" {
+		if room.Name == "" || room.SID == "" {
 			continue
 		}
 		snapshot, err := c.snapshotRoom(ctx, room)
@@ -760,6 +811,7 @@ func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callR
 		}
 		snapshot = callRoomSnapshot{
 			state:    CallState{PlaceID: room.Name, Active: true, StartedAt: startedAt},
+			sid:      room.SID,
 			sequence: sequence,
 		}
 		for _, participant := range participants {
@@ -791,10 +843,9 @@ func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callR
 			return snapshot, nil
 		}
 		if attempt == callSnapshotAttempts-1 {
-			// Under sustained webhook traffic, retain the final RoomService
-			// response rather than spin forever. A later webhook still has a
-			// newer sequence and therefore applies after this snapshot.
-			snapshot.sequence = after
+			// The final listing raced a webhook, so retain its pre-read sequence.
+			// replaceSnapshot will discard it in favour of the registry state.
+			log.Printf("livekit call snapshot for room %q raced webhooks %d times; discarding stale listing", room.Name, callSnapshotAttempts)
 			return snapshot, nil
 		}
 	}
@@ -847,7 +898,7 @@ func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceI
 		}
 		// Publish the local projection immediately; participant_left delivery is
 		// idempotent and therefore does not emit a second state change.
-		if state, changed := c.Registry.leave(room.Name, participant); changed {
+		if state, changed := c.Registry.leave(room.Name, room.SID, participant); changed {
 			c.publishCallState(ctx, state)
 		}
 	}
