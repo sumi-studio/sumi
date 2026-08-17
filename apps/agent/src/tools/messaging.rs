@@ -3529,6 +3529,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("Human approval request")
             .public_request();

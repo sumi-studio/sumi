@@ -2352,6 +2352,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("exact local Human request")
             .public_request();

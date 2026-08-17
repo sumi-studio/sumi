@@ -1537,10 +1537,6 @@ impl ProviderReviewPrompt for EscalationObjectionPrompt {
             "kind": "escalation_reviewer_objection",
             "trust": UNTRUSTED_EVIDENCE_LABEL,
             "reviewer_objection": self.request.reviewer_objection,
-            // This is a fresh bounded request, not an authenticated replay of
-            // the original send view.  Preserve opaque provider context as
-            // model-visible evidence instead of attaching it as replay state.
-            "personality_agent_provider_context": self.personality_agent_context.provider_context,
             "choices": [
                 "proceed: present the unchanged held call to the Human",
                 "withdraw: end the held call"
@@ -4105,7 +4101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn objection_prompt_carries_pa_context_and_digest_binds_every_part() {
+    async fn objection_prompt_omits_pa_provider_context_and_digest_binds_every_part() {
         let pa_prompt = pa_prompt_context();
         let context = PersonalityAgentPromptContextHandle::new(&pa_prompt);
         let transport = Arc::new(RecordingObjectionTransport {
@@ -4152,7 +4148,8 @@ mod tests {
         .unwrap();
         assert_eq!(provider_prompt.memory_blocks, pa_prompt.memory_blocks);
         let provider_messages = serde_json::to_string(&provider_prompt.messages).unwrap();
-        assert!(provider_messages.contains("pa_provider_context"));
+        assert!(!provider_messages.contains("pa_provider_context"));
+        assert!(!provider_messages.contains("pa-context-fingerprint"));
 
         let baseline = provider_evidence_digest(&prompt).unwrap();
         let mut changed_composed_system = prompt.clone();

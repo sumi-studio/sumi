@@ -570,6 +570,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("Human cursor request")
         .public_request();

@@ -120,6 +120,7 @@ pub(crate) struct PendingApprovalRequest {
     pub descriptor: Value,
     pub review_projection: Value,
     pub reviewer_objection: Option<String>,
+    pub reviewer_technical_failure: Option<String>,
     pub pa_reason: Option<String>,
     pub pa_objection_failure: Option<String>,
 }
@@ -131,6 +132,7 @@ impl PendingApprovalRequest {
         bound: &BoundToolInvocation,
         redactor: &Redactor,
         reviewer_objection: Option<String>,
+        reviewer_technical_failure: Option<String>,
         pa_reason: Option<String>,
         pa_objection_failure: Option<String>,
     ) -> Result<Self> {
@@ -151,6 +153,7 @@ impl PendingApprovalRequest {
             review_projection: redactor
                 .redact_value(&Value::Object(bound.review_projection.as_object().clone()))?,
             reviewer_objection,
+            reviewer_technical_failure,
             pa_reason,
             pa_objection_failure,
         })
@@ -169,19 +172,25 @@ impl PendingApprovalRequest {
             reason: Some(
                 match (
                     self.reviewer_objection.as_deref(),
+                    self.reviewer_technical_failure.as_deref(),
                     self.pa_reason.as_deref(),
                     self.pa_objection_failure.as_deref(),
                 ) {
-                    (Some(objection), Some(pa_reason), _) => format!(
+                    (Some(objection), _, Some(pa_reason), _) => format!(
                         "The PA chose to proceed after AutoReview objected. Reviewer objection: {objection} PA reason: {pa_reason}"
                     ),
-                    (Some(objection), None, Some(failure)) => format!(
+                    (Some(objection), _, None, Some(failure)) => format!(
                         "AutoReview objected, but the PA objection response could not be obtained ({failure}). The unchanged held call is shown to the Human for the final decision. Reviewer objection: {objection}"
                     ),
-                    (Some(objection), None, None) => format!(
+                    (Some(objection), _, None, None) => format!(
                         "The PA chose to proceed after AutoReview objected. Reviewer objection: {objection}"
                     ),
-                    (None, _, _) => "This exact operation requires one-time approval.".to_owned(),
+                    (None, Some(failure), _, _) => format!(
+                        "AutoReview could not complete its technical review ({failure}). The unchanged held call is shown to the Human for the final decision."
+                    ),
+                    (None, None, _, _) => {
+                        "This exact operation requires one-time approval.".to_owned()
+                    }
                 },
             ),
             audit: None,
@@ -744,6 +753,13 @@ impl RouteApprovalBroker {
                 self.redactor
                     .redact_text(&escalation_review.decision.rationale)
             });
+        let reviewer_technical_failure = (escalation_review.decision.outcome
+            == EscalationReviewOutcome::AskHuman
+            && !escalation_review.budget.terminal.is_judged())
+        .then(|| {
+            self.redactor
+                .redact_text(&escalation_review.decision.rationale)
+        });
         let pa_reason = escalation_review
             .pa_objection_response
             .as_ref()
@@ -760,6 +776,7 @@ impl RouteApprovalBroker {
             bound,
             self.redactor.as_ref(),
             reviewer_objection,
+            reviewer_technical_failure,
             pa_reason,
             pa_objection_failure,
         )?;
@@ -2229,6 +2246,61 @@ mod tests {
             pending.receiver_mut().await.expect("waiter result"),
             WaiterResult::Resolved
         ));
+    }
+
+    #[tokio::test]
+    async fn technical_escalation_ask_human_failure_explains_the_failure_to_the_human() {
+        let (broker, _, escalation) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({"not":"a verdict"}),
+        );
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[user_message("ask me if review cannot finish")],
+                scope(),
+                "run-technical-review-failure",
+                "turn-technical-review-failure",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("technical review failure must remain a Human decision");
+        let RouteApprovalOutcome::Pending { pending } = outcome else {
+            panic!("a technical AskHuman result must create a pending request")
+        };
+        assert_eq!(
+            pending
+                .durable_evidence()
+                .escalation_review
+                .decision
+                .outcome,
+            EscalationReviewOutcome::AskHuman
+        );
+        assert_eq!(
+            pending.durable_evidence().escalation_review.budget.terminal,
+            ReviewerTerminalClass::MalformedExhausted
+        );
+        assert!(pending.request().reviewer_objection.is_none());
+        assert!(
+            pending
+                .request()
+                .reviewer_technical_failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("malformed_exhausted"))
+        );
+        assert!(
+            pending
+                .request()
+                .public_request()
+                .reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason.contains("could not complete its technical review")
+                        && reason.contains("malformed_exhausted")
+                })
+        );
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
