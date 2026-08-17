@@ -458,6 +458,28 @@ describe("place lifecycleの再接続突き合わせ", () => {
     });
   });
 
+  it("切断中に作られた非参加threadを再接続後に親一覧から取り込む", async () => {
+    const existing = thread("thread-existing");
+    const offline = thread("thread-created-offline");
+    backend.fetchThreads.mockResolvedValueOnce([existing]);
+    await useMessaging.getState().loadThreads(CHANNEL_1);
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+
+    // Bootstrap carries only participating threads, so this new thread must
+    // come from the parent list fetch that reconnect invalidates and repeats.
+    backend.fetchThreads.mockResolvedValueOnce([existing, offline]);
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    expect(backend.fetchThreads).toHaveBeenCalledTimes(2);
+    expect(useMessaging.getState().threadsById).toMatchObject({
+      [existing.threadId]: existing,
+      [offline.threadId]: offline,
+    });
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+  });
+
   it("進行中の未読・既読・ローカルstateを突き合わせで壊さない", async () => {
     useMessaging.getState().selectPlace(CHANNEL_1);
     useMessaging.getState().setDraft(CHANNEL_1, "書きかけ");

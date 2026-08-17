@@ -192,3 +192,16 @@ func TestThreadHTTPRoutesReturnParentRelation(t *testing.T) {
 		t.Fatalf("thread relation = %v", body)
 	}
 }
+
+func TestThreadHTTPRejectsNULName(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, server := newTestServer(t, ctx)
+
+	resp, body := call(t, server, http.MethodPost,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
+		map[string]any{"name": "bad\x00thread", "client_nonce": "thread-nul-http"})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_name" {
+		t.Fatalf("NUL thread name = %d %v, want 400 invalid_name", resp.StatusCode, body)
+	}
+}

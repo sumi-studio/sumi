@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -134,7 +133,7 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.ParentPlaceID == "" || strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > MaxThreadNameChars || request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+	if request.ParentPlaceID == "" || !threadNameValid(request.Name) || request.ClientNonce == "" || len(request.ClientNonce) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}

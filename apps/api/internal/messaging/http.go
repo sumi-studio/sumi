@@ -936,7 +936,7 @@ func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" || utf8.RuneCountInString(req.Name) > MaxThreadNameChars {
+	if !threadNameValid(req.Name) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}

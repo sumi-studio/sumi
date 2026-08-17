@@ -15,6 +15,13 @@ import (
 const MaxThreadNameChars = 100
 const ThreadPreviewChars = 120
 
+func threadNameValid(name string) bool {
+	name = strings.TrimSpace(name)
+	return name != "" &&
+		utf8.RuneCountInString(name) <= MaxThreadNameChars &&
+		!strings.ContainsRune(name, '\x00')
+}
+
 var (
 	ErrNotThreadable = errors.New("threads can only be created inside a channel")
 	ErrThreadExists  = errors.New("this message already has a thread")
@@ -32,7 +39,7 @@ type Thread struct {
 
 func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, originMessageID, clientNonce string) (Thread, bool, error) {
 	name = strings.TrimSpace(name)
-	if name == "" || utf8.RuneCountInString(name) > MaxThreadNameChars {
+	if !threadNameValid(name) {
 		return Thread{}, false, fmt.Errorf("thread name must be 1..%d characters", MaxThreadNameChars)
 	}
 	if clientNonce == "" || len(clientNonce) > 128 {

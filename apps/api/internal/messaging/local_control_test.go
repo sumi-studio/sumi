@@ -308,6 +308,25 @@ func TestLocalCreateThreadAcceptsAgentNonceAndReplaysIt(t *testing.T) {
 	}
 }
 
+func TestLocalCreateThreadRejectsNULName(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+
+	status, body := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, map[string]any{
+		"workspace_id":    workspace.WorkspaceID,
+		"parent_place_id": channel.PlaceID,
+		"name":            "bad\x00thread",
+		"client_nonce":    "thread-nul-local",
+	}, authorization)
+	if status != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("local NUL thread name = %d %v, want 400 invalid_request", status, body)
+	}
+}
+
 func TestLocalExactCallStateReconcilesAfterRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -1132,6 +1132,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     const state = get();
+    const loadedThreadParents = Object.entries(state.threadsLoadedForPlace)
+      .filter(([, loaded]) => loaded)
+      .map(([parentKey]) => parentKey);
     const known = new Set<PlaceKey>([
       ...state.channels.map((entry) =>
         placeKey({ kind: "channel", channelId: entry.channelId }),
@@ -1175,11 +1178,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
           (snapshot.threads ?? []).map((thread) => [thread.threadId, thread]),
         ),
       },
+      // snapshot.threads only contains participating threads. The parent list
+      // includes all workspace-visible threads, and its lifecycle events are
+      // not replayed, so every list fetched before a disconnect is stale.
+      threadsLoadedForPlace: {},
       membersByKey,
       lastReadByPlace,
       unreadCountByPlace,
       mentionCountByPlace,
     });
+    // The currently mounted parent panel does not re-run its effect merely
+    // because a reconnect completed. Refresh the lists that had been loaded
+    // before the disconnect after invalidating their cache entries above.
+    await Promise.all(
+      loadedThreadParents.map((parentKey) => get().loadThreads(parentKey)),
+    );
     if (Object.keys(sinceByPlace).length > 0) {
       // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
       // durable eventがreplayされるようにする。applyEventは同一参照なので
