@@ -104,6 +104,9 @@ class FakeBackend implements MessagingBackend {
   async fetchMessages() {
     return [];
   }
+  async searchMessages() {
+    return [];
+  }
   async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
     return { statuses: [], replyLaterMarkers: [] };
   }

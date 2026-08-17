@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -52,6 +53,7 @@ func NewServer(store *Store, sessions agentevents.UserSessionAuthorizer) *Server
 // RegisterRoutes mounts the /messaging routes on the public mux.
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /messaging/bootstrap", s.serveBootstrap)
+	mux.HandleFunc("GET /messaging/search", s.serveSearch)
 	mux.HandleFunc("POST /messaging/channels", s.serveCreateChannel)
 	mux.HandleFunc("POST /messaging/dms", s.serveEnsureDM)
 	mux.HandleFunc("POST /messaging/group-dms", s.serveCreateGroupDM)
@@ -150,6 +152,17 @@ type messageWire struct {
 	CreatedAt   time.Time         `json:"created_at"`
 	EditedAt    *time.Time        `json:"edited_at"`
 	Deleted     bool              `json:"deleted"`
+}
+
+// searchResultWire deliberately excludes full message content. A result has
+// enough identity to navigate to the durable message plus a bounded snippet.
+type searchResultWire struct {
+	MessageID string          `json:"message_id"`
+	Place     placeWire       `json:"place"`
+	Seq       int64           `json:"seq"`
+	Author    participantWire `json:"author"`
+	Snippet   string          `json:"snippet"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 // reactionWire matches the web model's ReactionSummary.
@@ -899,6 +912,46 @@ func (s *Server) serveHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Messages []messageWire `json:"messages"`
 	}{Messages: wires})
+}
+
+func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
+	_, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" || len(query) > MaxSearchQueryBytes {
+		writeError(w, http.StatusBadRequest, "invalid_query")
+		return
+	}
+	options := SearchOptions{PlaceID: r.URL.Query().Get("place_id")}
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_limit")
+			return
+		}
+		options.Limit = limit
+	}
+	results, err := scopedStoreForRequest(r).SearchMessages(r.Context(), query, options)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]searchResultWire, len(results))
+	for i, result := range results {
+		wires[i] = searchResultWire{
+			MessageID: result.Message.MessageID,
+			Place:     placeToWire(result.Place),
+			Seq:       result.Message.Seq,
+			Author:    participantToWire(result.Message.Author),
+			Snippet:   result.Snippet,
+			CreatedAt: result.Message.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []searchResultWire `json:"results"`
+	}{Results: wires})
 }
 
 func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
