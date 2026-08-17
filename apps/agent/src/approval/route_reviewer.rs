@@ -3547,6 +3547,67 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_keeps_pending_action_after_fully_omitted_tool_history() {
+        let spec = ModelSpec::preset("openai-responses").expect("Responses reviewer preset");
+        let mut request = execution_request();
+        request.transcript = ReviewerTranscript {
+            schema_version: REVIEW_TRANSCRIPT_SCHEMA_VERSION_V7,
+            entries: vec![
+                ReviewerTranscriptEntry::NoHumanTurn {
+                    marker: REVIEW_NO_HUMAN_TURN_MARKER,
+                },
+                ReviewerTranscriptEntry::ToolCallOmission {
+                    omitted_tool_calls: 40,
+                    marker: REVIEW_TRUNCATION_MARKER,
+                },
+                ReviewerTranscriptEntry::ToolResultOmission {
+                    omitted_tool_results: 40,
+                    marker: REVIEW_TRUNCATION_MARKER,
+                },
+            ],
+        };
+        let prompt = ExecutionReviewerPrompt {
+            system: EXECUTION_SYSTEM_PROMPT,
+            output_schema: ExecutionReviewOutputSchema::v7(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            schema_version: EXECUTION_SCHEMA_VERSION_V7,
+            request,
+            reviewer_tool_trace: Vec::new(),
+            retry_validation_code: None,
+        };
+
+        let (context, _) = build_provider_review_request(
+            &spec,
+            prompt.system,
+            prompt.output_schema.provider_schema(),
+            &prompt,
+            &[],
+            false,
+        )
+        .expect("review request with fully omitted history");
+        let [pending, evidence] = &context.messages[context.messages.len() - 2..] else {
+            panic!("pending action and structured evidence remain final")
+        };
+        let message_json = |message: &ContextMessage| {
+            let ContextMessage::Synthetic {
+                message: Message::User(user),
+            } = message
+            else {
+                panic!("final review message is synthetic user evidence")
+            };
+            let UserContent::Text { text } = &user.content[0] else {
+                panic!("final review message contains JSON text")
+            };
+            serde_json::from_str::<Value>(text).expect("final review message JSON")
+        };
+        let pending = message_json(pending);
+        assert_eq!(pending["kind"], PENDING_ACTION_KIND);
+        assert_eq!(pending["status"], "pending; not yet executed");
+        assert_eq!(pending["tool_call_id"], "tool-call-1");
+        assert_eq!(message_json(evidence)["kind"], STRUCTURED_EVIDENCE_KIND);
+    }
+
+    #[test]
     fn every_provider_wire_keeps_roles_call_binding_and_final_item_order() {
         for (provider, body) in execution_provider_wire_bodies_for_test(execution_request()) {
             let encoded = body.to_string();

@@ -1134,15 +1134,10 @@ fn bounded_reviewer_transcript(
 
     let mut entries = select_user_entries(&users);
     entries.extend(select_assistant_entries(&assistants));
-    let (tool_entries, selected_tool_call_ids) = select_tool_entries(&tools)?;
-    entries.extend(tool_entries);
-    entries.extend(select_tool_result_entries(
-        &results,
-        &selected_tool_call_ids,
-    )?);
-    if let Some(ordinal) = orphan_tool_results.first() {
+    entries.extend(select_tool_pair_entries(&tools, &results, ordinal)?);
+    if !orphan_tool_results.is_empty() {
         entries.push((
-            *ordinal,
+            ordinal,
             ReviewerTranscriptEntry::OrphanToolResultOmission {
                 omitted_orphan_tool_results: orphan_tool_results.len(),
                 marker: REVIEW_TRUNCATION_MARKER,
@@ -1310,98 +1305,111 @@ fn push_user_entry(
     ));
 }
 
-fn select_tool_entries(
+fn select_tool_pair_entries(
     tools: &[ReviewerToolCandidate],
-) -> Result<(Vec<(usize, ReviewerTranscriptEntry)>, HashSet<String>)> {
-    let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
-    let mut remaining = MAX_CONTEXT_TOOL_TOTAL_CHARS;
+    results: &[(usize, String, ReviewerTranscriptEntry)],
+    omission_ordinal: usize,
+) -> Result<Vec<(usize, ReviewerTranscriptEntry)>> {
+    let result_by_tool_call_id = results
+        .iter()
+        .enumerate()
+        .map(|(index, (_, tool_call_id, _))| (tool_call_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut selected_tools = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
+    let mut selected_results = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
+    let mut retained_result_indices = HashSet::new();
+    let mut remaining_tool_chars = MAX_CONTEXT_TOOL_TOTAL_CHARS;
+    let mut remaining_result_chars = MAX_CONTEXT_TOOL_RESULT_TOTAL_CHARS;
 
     for (index, candidate) in tools.iter().enumerate().rev() {
-        if selected.len() >= MAX_CONTEXT_TOOL_CALLS || remaining == 0 {
+        if selected_tools.len() >= MAX_CONTEXT_TOOL_CALLS || remaining_tool_chars == 0 {
             break;
         }
-        let entry_chars = serde_json::to_string(&candidate.entry)
+        let tool_chars = serde_json::to_string(&candidate.entry)
             .context("serialize reviewer tool-call transcript entry")?
             .chars()
             .count();
-        if entry_chars > remaining {
+        if tool_chars > remaining_tool_chars {
             break;
         }
-        remaining -= entry_chars;
-        selected.push((index, candidate.ordinal, candidate.entry.clone()));
+
+        let paired_result = if let Some(tool_call_id) = candidate.tool_call_id.as_deref() {
+            let Some(result_index) = result_by_tool_call_id.get(tool_call_id).copied() else {
+                // A settled historical native call cannot be projected without its result.
+                continue;
+            };
+            if retained_result_indices.contains(&result_index) {
+                continue;
+            }
+            if selected_results.len() >= MAX_CONTEXT_TOOL_RESULTS || remaining_result_chars == 0 {
+                break;
+            }
+            let (result_ordinal, _, result_entry) = &results[result_index];
+            let result_chars = serde_json::to_string(result_entry)
+                .context("serialize reviewer tool-result transcript entry")?
+                .chars()
+                .count();
+            if result_chars > remaining_result_chars {
+                break;
+            }
+            Some((
+                result_index,
+                *result_ordinal,
+                result_entry.clone(),
+                result_chars,
+            ))
+        } else {
+            None
+        };
+
+        remaining_tool_chars -= tool_chars;
+        selected_tools.push((index, candidate.ordinal, candidate.entry.clone()));
+        if let Some((result_index, result_ordinal, result_entry, result_chars)) = paired_result {
+            remaining_result_chars -= result_chars;
+            retained_result_indices.insert(result_index);
+            selected_results.push((result_index, result_ordinal, result_entry));
+        }
     }
 
-    let selected_indices = selected
+    let selected_tool_indices = selected_tools
         .iter()
         .map(|(index, _, _)| *index)
         .collect::<HashSet<_>>();
-    let omitted = tools
+    let omitted_tool_calls = tools
         .iter()
         .enumerate()
-        .filter(|(index, _)| !selected_indices.contains(index))
-        .collect::<Vec<_>>();
-    let mut entries = selected
+        .filter(|(index, _)| !selected_tool_indices.contains(index))
+        .count();
+    let omitted_tool_results = results
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !retained_result_indices.contains(index))
+        .count();
+    let mut entries = selected_tools
         .into_iter()
         .map(|(_, ordinal, entry)| (ordinal, entry))
         .collect::<Vec<_>>();
-    if let Some((_, candidate)) = omitted.first() {
+    entries.extend(
+        selected_results
+            .into_iter()
+            .map(|(_, ordinal, entry)| (ordinal, entry)),
+    );
+    // Tool omission evidence follows all selected settled pairs so it can never
+    // interrupt a native call/result sequence on provider wires.
+    if omitted_tool_calls > 0 {
         entries.push((
-            candidate.ordinal,
+            omission_ordinal,
             ReviewerTranscriptEntry::ToolCallOmission {
-                omitted_tool_calls: omitted.len(),
+                omitted_tool_calls,
                 marker: REVIEW_TRUNCATION_MARKER,
             },
         ));
     }
-    let selected_tool_call_ids = selected_indices
-        .iter()
-        .filter_map(|index| tools[*index].tool_call_id.clone())
-        .collect();
-    Ok((entries, selected_tool_call_ids))
-}
-
-fn select_tool_result_entries(
-    results: &[(usize, String, ReviewerTranscriptEntry)],
-    selected_tool_call_ids: &HashSet<String>,
-) -> Result<Vec<(usize, ReviewerTranscriptEntry)>> {
-    let mut selected = Vec::<(usize, usize, ReviewerTranscriptEntry)>::new();
-    let mut remaining = MAX_CONTEXT_TOOL_RESULT_TOTAL_CHARS;
-    for (index, (ordinal, tool_call_id, entry)) in results.iter().enumerate().rev() {
-        if !selected_tool_call_ids.contains(tool_call_id) {
-            continue;
-        }
-        if selected.len() >= MAX_CONTEXT_TOOL_RESULTS || remaining == 0 {
-            break;
-        }
-        let entry_chars = serde_json::to_string(entry)
-            .context("serialize reviewer tool-result transcript entry")?
-            .chars()
-            .count();
-        if entry_chars > remaining {
-            break;
-        }
-        remaining -= entry_chars;
-        selected.push((index, *ordinal, entry.clone()));
-    }
-
-    let selected_indices = selected
-        .iter()
-        .map(|(index, _, _)| *index)
-        .collect::<HashSet<_>>();
-    let omitted = results
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !selected_indices.contains(index))
-        .collect::<Vec<_>>();
-    let mut entries = selected
-        .into_iter()
-        .map(|(_, ordinal, entry)| (ordinal, entry))
-        .collect::<Vec<_>>();
-    if let Some((_, (ordinal, _, _))) = omitted.first() {
+    if omitted_tool_results > 0 {
         entries.push((
-            *ordinal,
+            omission_ordinal,
             ReviewerTranscriptEntry::ToolResultOmission {
-                omitted_tool_results: omitted.len(),
+                omitted_tool_results,
                 marker: REVIEW_TRUNCATION_MARKER,
             },
         ));
@@ -2408,7 +2416,8 @@ mod tests {
         let bounded =
             bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call-not-present")
                 .expect("bounded transcript");
-        let encoded = serde_json::to_string(&bounded).expect("bounded transcript");
+        let value = serde_json::to_value(&bounded).expect("bounded transcript");
+        let encoded = value.to_string();
 
         assert!(!encoded.contains("user-turn<0>"));
         assert!(encoded.contains("user-turn<13>"));
@@ -2419,6 +2428,112 @@ mod tests {
         assert!(encoded.contains("assistant-text-must-not-appear"));
         assert!(!encoded.contains("tool-result-must-not-appear"));
         assert!(encoded.contains("omitted_orphan_tool_results"));
+        assert_eq!(
+            value["entries"]
+                .as_array()
+                .expect("transcript entries")
+                .iter()
+                .find(|entry| entry["kind"] == "orphan_tool_result_omission")
+                .expect("orphan omission marker")["omitted_orphan_tool_results"],
+            1
+        );
+    }
+
+    #[test]
+    fn bounded_transcript_selects_settled_tool_pairs_atomically_under_result_pressure() {
+        const SETTLED_PAIRS: usize = 12;
+        let mut transcript = vec![user_message("Inspect the history, then perform the update")];
+        for index in 0..SETTLED_PAIRS {
+            let id = format!("large-call-{index}");
+            let tool = format!("large_tool_{index}");
+            transcript.push(tool_call_message(
+                &id,
+                &tool,
+                ToolInvocationRoute::Normal,
+                json!({"index": index}),
+            ));
+            transcript.push(tool_result_for(
+                id,
+                tool,
+                format!(
+                    "result-{index}:{}",
+                    "x".repeat(MAX_CONTEXT_TOOL_RESULT_CHARS)
+                ),
+                Value::Null,
+            ));
+        }
+        transcript.push(tool_call_message(
+            "historical-call-without-result",
+            "unfinished_history",
+            ToolInvocationRoute::Normal,
+            json!({}),
+        ));
+        transcript.push(tool_call_message(
+            "pending-call",
+            "pending_update",
+            ToolInvocationRoute::Elevated,
+            json!({"record":"target"}),
+        ));
+
+        let bounded = bounded_reviewer_transcript(&transcript, &Redactor::v1(), "pending-call")
+            .expect("pair-bounded reviewer transcript");
+        let mut selected_call_ids = HashSet::new();
+        let mut selected_result_ids = HashSet::new();
+        let mut omitted_tool_calls = 0;
+        let mut omitted_tool_results = 0;
+        let mut reached_tool_omission = false;
+        for entry in &bounded.entries {
+            match entry {
+                ReviewerTranscriptEntry::Assistant { tool_calls, .. } => {
+                    assert!(
+                        !reached_tool_omission || tool_calls.is_empty(),
+                        "native calls must precede tool omission evidence"
+                    );
+                    selected_call_ids.extend(tool_calls.iter().map(|call| call.id.clone()));
+                }
+                ReviewerTranscriptEntry::ToolResult {
+                    tool_call_id: Some(tool_call_id),
+                    ..
+                } => {
+                    assert!(
+                        !reached_tool_omission,
+                        "native results must precede tool omission evidence"
+                    );
+                    selected_result_ids.insert(tool_call_id.clone());
+                }
+                ReviewerTranscriptEntry::ToolCallOmission {
+                    omitted_tool_calls: omitted,
+                    ..
+                } => {
+                    reached_tool_omission = true;
+                    omitted_tool_calls += *omitted;
+                }
+                ReviewerTranscriptEntry::ToolResultOmission {
+                    omitted_tool_results: omitted,
+                    ..
+                } => {
+                    reached_tool_omission = true;
+                    omitted_tool_results += *omitted;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(!selected_call_ids.is_empty());
+        assert!(selected_call_ids.len() < SETTLED_PAIRS);
+        assert_eq!(selected_call_ids, selected_result_ids);
+        assert!(selected_call_ids.contains("large-call-11"));
+        assert!(!selected_call_ids.contains("large-call-0"));
+        assert!(!selected_call_ids.contains("historical-call-without-result"));
+        assert!(!selected_call_ids.contains("pending-call"));
+        assert_eq!(
+            omitted_tool_calls,
+            SETTLED_PAIRS + 1 - selected_call_ids.len()
+        );
+        assert_eq!(
+            omitted_tool_results,
+            SETTLED_PAIRS - selected_result_ids.len()
+        );
     }
 
     #[test]
