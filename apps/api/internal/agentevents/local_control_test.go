@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1311,5 +1312,182 @@ func TestDurableGatewayObserveDistinguishesStartupFromTerminalNotReady(t *testin
 	defer cancel()
 	if err := gateway.WaitFor(waitCtx, claims, 7); !errors.Is(err, errHydrationTerminalNotReady) {
 		t.Fatalf("shutdown NotReady did not terminate hydration wait promptly: %v", err)
+	}
+}
+
+// A PersonalityAgent that restarts many times must keep starting. Each epoch
+// boundary compacts the previous epoch's publication records, so
+// maxLocalControlRecords bounds one epoch rather than the agent's whole life.
+// Before this, an agent whose runtime had published maxLocalControlRecords
+// times could never start again: every startup answered 507 capacity_exhausted.
+func TestLocalControlStartupRetiresPreviousEpochRecords(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
+	control, server := newLocalControlHTTPServer(
+		t,
+		gateway,
+		localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a"),
+	)
+	post := func(bearer, path string, payload any) (int, string) {
+		t.Helper()
+		response, body := postLocalControl(t, server.URL, path, bearer, payload)
+		return response.StatusCode, string(body)
+	}
+	if status, body := post(
+		localControlTestBearer,
+		LocalRuntimeStatePublishPath,
+		startupPublication("startup-old", localControlTestPAID, 7, "boot-a"),
+	); status != http.StatusOK {
+		t.Fatalf("seed startup: status=%d body=%s", status, body)
+	}
+	if status, body := post(
+		localControlTestBearer,
+		LocalRuntimeStatePublishPath,
+		readyPublication("ready-old", localControlTestPAID, 7, "boot-a", 1, "receipt-old"),
+	); status != http.StatusOK {
+		t.Fatalf("seed ready: status=%d body=%s", status, body)
+	}
+	if status, body := post(
+		localControlTestBearer,
+		LocalCredentialIssuePath,
+		credentialRequest("credential-old", localControlTestPAID, 7, "boot-a"),
+	); status != http.StatusOK {
+		t.Fatalf("seed credential: status=%d body=%s", status, body)
+	}
+
+	readState := func() runtimeState {
+		t.Helper()
+		raw, err := os.ReadFile(gateway.statePath(localControlTestPAID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var state runtimeState
+		if err := json.Unmarshal(raw, &state); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	before := readState()
+	if len(before.LocalControl.Publications) != 2 || before.LocalControl.Revision != 2 {
+		t.Fatalf(
+			"seeded history: publications=%d revision=%d, want 2 and 2",
+			len(before.LocalControl.Publications), before.LocalControl.Revision,
+		)
+	}
+
+	nextEpoch := localControlAuthorization(localControlNextBearer, localControlTestPAID, 8, "boot-b")
+	if err := control.InstallLocalRuntimeAuthorization(context.Background(), nextEpoch); err != nil {
+		t.Fatalf("install next-epoch authorization: %v", err)
+	}
+	if status, body := post(
+		localControlNextBearer,
+		LocalRuntimeStatePublishPath,
+		startupPublication("startup-new", localControlTestPAID, 8, "boot-b"),
+	); status != http.StatusOK {
+		t.Fatalf("next-epoch startup: status=%d body=%s", status, body)
+	}
+
+	after := readState()
+	if len(after.LocalControl.Publications) != 1 {
+		t.Fatalf("publications after epoch advance = %d, want 1", len(after.LocalControl.Publications))
+	}
+	if _, ok := after.LocalControl.Publications["startup-new"]; !ok {
+		t.Fatal("the new epoch's own publication was not recorded")
+	}
+	// Installing the next epoch's authorization fences the old epoch with its
+	// own shutdown publication, so the retained window starts at the startup
+	// that opened the new epoch.
+	if after.LocalControl.RetiredThrough != after.LocalControl.Revision-1 {
+		t.Fatalf(
+			"retired_through=%d revision=%d, want the retained window to hold only the new startup",
+			after.LocalControl.RetiredThrough, after.LocalControl.Revision,
+		)
+	}
+	if after.LocalControl.Revision <= before.LocalControl.Revision {
+		t.Fatalf(
+			"revision did not advance: before=%d after=%d",
+			before.LocalControl.Revision, after.LocalControl.Revision,
+		)
+	}
+	if len(after.LocalControl.CredentialRequests) != 0 {
+		t.Fatalf("credential requests after epoch advance = %d, want 0", len(after.LocalControl.CredentialRequests))
+	}
+	// The chain continues across the compaction boundary.
+	if status, body := post(
+		localControlNextBearer,
+		LocalRuntimeStatePublishPath,
+		readyPublication(
+			"ready-new",
+			localControlTestPAID,
+			8,
+			"boot-b",
+			after.LocalControl.Revision,
+			"receipt-new",
+		),
+	); status != http.StatusOK {
+		t.Fatalf("next-epoch ready: status=%d body=%s", status, body)
+	}
+	// A retired publication id stays unusable. The old epoch's bearer is
+	// fenced at the door once the next epoch is installed (401), and a replay
+	// that did reach the state logic would be a stale epoch (409) — either way
+	// dropping the record changes nothing an authorized caller can observe.
+	if status, body := post(
+		localControlTestBearer,
+		LocalRuntimeStatePublishPath,
+		startupPublication("startup-old", localControlTestPAID, 7, "boot-a"),
+	); status != http.StatusUnauthorized && status != http.StatusConflict {
+		t.Fatalf("replayed retired publication: status=%d body=%s, want 401 or 409", status, body)
+	}
+
+	// Many more restarts than maxLocalControlRecords publications: the agent
+	// keeps starting and the retained history stays one epoch wide.
+	generation := uint64(8)
+	for i := 0; i < 400; i++ {
+		generation++
+		nonce := fmt.Sprintf("boot-%d", generation)
+		bearer := fmt.Sprintf("local-control-restart-bearer-%016d", generation)
+		if err := control.InstallLocalRuntimeAuthorization(
+			context.Background(),
+			localControlAuthorization(bearer, localControlTestPAID, generation, nonce),
+		); err != nil {
+			t.Fatalf("install authorization for generation %d: %v", generation, err)
+		}
+		if status, body := post(
+			bearer,
+			LocalRuntimeStatePublishPath,
+			startupPublication(fmt.Sprintf("startup-%d", generation), localControlTestPAID, generation, nonce),
+		); status != http.StatusOK {
+			t.Fatalf("startup at generation %d: status=%d body=%s", generation, status, body)
+		}
+		startupRevision := readState().LocalControl.Revision
+		if status, body := post(
+			bearer,
+			LocalRuntimeStatePublishPath,
+			readyPublication(
+				fmt.Sprintf("ready-%d", generation),
+				localControlTestPAID,
+				generation,
+				nonce,
+				startupRevision,
+				fmt.Sprintf("receipt-%d", generation),
+			),
+		); status != http.StatusOK {
+			t.Fatalf("ready at generation %d: status=%d body=%s", generation, status, body)
+		}
+	}
+	final := readState()
+	if len(final.LocalControl.Publications) != 2 {
+		t.Fatalf("publications after 400 restarts = %d, want 2 (this epoch's startup and ready)", len(final.LocalControl.Publications))
+	}
+	if final.LocalControl.RetiredThrough != final.LocalControl.Revision-2 {
+		t.Fatalf(
+			"retired_through=%d revision=%d, want the retained window two revisions wide",
+			final.LocalControl.RetiredThrough, final.LocalControl.Revision,
+		)
+	}
+	if final.LocalControl.Revision <= uint64(maxLocalControlRecords) {
+		t.Fatalf(
+			"revision = %d, want the run to pass maxLocalControlRecords (%d) so the old lifetime cap would have wedged",
+			final.LocalControl.Revision, maxLocalControlRecords,
+		)
 	}
 }

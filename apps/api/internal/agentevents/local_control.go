@@ -127,9 +127,15 @@ type localPublicationRecord struct {
 }
 
 type localControlDurableState struct {
-	Version            uint8                             `json:"version"`
-	RPCBootNonce       string                            `json:"rpc_boot_nonce"`
-	Revision           uint64                            `json:"revision"`
+	Version      uint8  `json:"version"`
+	RPCBootNonce string `json:"rpc_boot_nonce"`
+	Revision     uint64 `json:"revision"`
+	// RetiredThrough is the highest revision whose publication record has been
+	// compacted away at an epoch boundary. The retained history therefore
+	// covers revisions RetiredThrough+1..Revision and still has to be a
+	// gap-free chain. Absent (0) in states written before compaction existed,
+	// which is exactly "nothing retired yet" — so their MAC still verifies.
+	RetiredThrough     uint64                            `json:"retired_through,omitempty"`
 	State              LocalRuntimePublicationState      `json:"state"`
 	Reason             LocalRuntimePublicationReason     `json:"reason"`
 	Publications       map[string]localPublicationRecord `json:"publications"`
@@ -1121,6 +1127,30 @@ func (s *LocalControlServer) publishRuntimeState(
 				ack = record.Ack
 				return false, nil
 			}
+			// A startup publication that advances the epoch retires the
+			// previous epoch's idempotency records. They can no longer answer
+			// any replay — a repeat of an older publication id is rejected as a
+			// stale epoch above, whether or not its record still exists — and
+			// keeping them forever exhausts maxLocalControlRecords, after which
+			// every start fails with capacity_exhausted and the
+			// PersonalityAgent can never run again.
+			if publication.Generation > state.Generation {
+				control.Publications = make(map[string]localPublicationRecord)
+				control.CredentialRequests = make(map[string]localCredentialRecord)
+			}
+			// A startup publication that advances the epoch closes the
+			// previous epoch: its records can no longer answer any replay (a
+			// repeated publication id from an older generation is rejected as a
+			// stale epoch above, record or no record), and keeping them for the
+			// agent's whole life exhausts maxLocalControlRecords — after which
+			// every start fails with capacity_exhausted and the
+			// PersonalityAgent can never run again. Compact at the epoch
+			// boundary and record how far the retained history now starts.
+			if publication.Generation > state.Generation {
+				control.RetiredThrough = control.Revision
+				control.Publications = make(map[string]localPublicationRecord)
+				control.CredentialRequests = make(map[string]localCredentialRecord)
+			}
 			if len(control.Publications) >= maxLocalControlRecords {
 				return false, errLocalControlCapacity
 			}
@@ -1318,7 +1348,10 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 	default:
 		return errors.New("invalid local control state reason")
 	}
-	if uint64(len(control.Publications)) != control.Revision {
+	if control.RetiredThrough > control.Revision {
+		return errors.New("local control retired revision exceeds the current revision")
+	}
+	if uint64(len(control.Publications)) != control.Revision-control.RetiredThrough {
 		return errors.New("durable runtime publication history is not a complete revision prefix")
 	}
 	byRevision := make(map[uint64]localPublicationRecord, len(control.Publications))
@@ -1334,6 +1367,9 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 		if record.Ack.Revision > control.Revision {
 			return errors.New("durable runtime publication revision exceeds current revision")
 		}
+		if record.Ack.Revision <= control.RetiredThrough {
+			return errors.New("durable runtime publication precedes the retained history")
+		}
 		if record.Ack.Generation > state.Generation ||
 			(record.Ack.Generation == state.Generation &&
 				record.Ack.RPCBootNonce != control.RPCBootNonce) {
@@ -1344,12 +1380,15 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 		}
 		byRevision[record.Ack.Revision] = record
 	}
-	for revision := uint64(1); revision <= control.Revision; revision++ {
+	for revision := control.RetiredThrough + 1; revision <= control.Revision; revision++ {
 		record, exists := byRevision[revision]
 		if !exists {
 			return errors.New("durable runtime publication history has a revision gap")
 		}
-		if revision == 1 {
+		// The first retained revision starts the retained window: either the
+		// agent's very first publication, or the startup that opened the epoch
+		// whose predecessor was compacted away. Both must open an epoch.
+		if revision == control.RetiredThrough+1 {
 			if record.Request.Reason != LocalRuntimeStartup ||
 				record.Request.ExpectedRevision != nil {
 				return errors.New("first durable runtime publication must start an epoch")
