@@ -1157,23 +1157,21 @@ mod executor_projection_tests {
         assert_ne!(without_trace, with_trace);
     }
 
-    /// Evidence recorded before the reviewer tool loop existed has no
-    /// `tool_trace` key. It must still hydrate, and an empty trace must
-    /// serialize to the same bytes (absent key) so its recorded digest holds.
     #[test]
-    fn review_evidence_without_tool_trace_key_hydrates_with_the_same_digest() {
-        let review = ExecutionReviewEvidence {
-            reviewer_version: "execution-reviewer/v5".to_owned(),
-            prompt_version: "execution-review-prompt/v5".to_owned(),
-            schema_version: "execution-review-schema/v5".to_owned(),
+    fn review_evidence_requires_tool_trace_key() {
+        let budget = ReviewerBudgetEvidence {
+            version: "reviewer-budget/v1".to_owned(),
+            digest: "fixture-budget".to_owned(),
+            attempts: 1,
+            terminal: ReviewerTerminalClass::ValidDecision,
+        };
+        let execution = ExecutionReviewEvidence {
+            reviewer_version: "execution-reviewer/v6".to_owned(),
+            prompt_version: "execution-review-prompt/v6".to_owned(),
+            schema_version: "execution-review-schema/v6".to_owned(),
             model_id: "fixture".to_owned(),
             model_binding_digest: "fixture-binding".to_owned(),
-            budget: ReviewerBudgetEvidence {
-                version: "reviewer-budget/v1".to_owned(),
-                digest: "fixture-budget".to_owned(),
-                attempts: 1,
-                terminal: ReviewerTerminalClass::ValidDecision,
-            },
+            budget: budget.clone(),
             tool_trace: Vec::new(),
             decision: ExecutionReviewDecision {
                 outcome: ExecutionReviewOutcome::Block,
@@ -1181,32 +1179,18 @@ mod executor_projection_tests {
                 rationale: "unverified".to_owned(),
             },
         };
-        let encoded = serde_json::to_value(&review).unwrap();
-        assert!(
-            encoded.get("tool_trace").is_none(),
-            "an empty trace must serialize as an absent key: {encoded}"
-        );
-        // Bytes as an older runtime wrote them (no tool_trace key at all):
-        // hydrating them and re-serializing must reproduce the same bytes,
-        // which is what keeps the recorded evidence digest valid.
-        let legacy = serde_json::to_vec(&review).unwrap();
-        assert!(!String::from_utf8_lossy(&legacy).contains("tool_trace"));
-        let hydrated: ExecutionReviewEvidence = serde_json::from_slice(&legacy).unwrap();
-        assert_eq!(hydrated, review);
-        assert_eq!(serde_json::to_vec(&hydrated).unwrap(), legacy);
+        let mut encoded = serde_json::to_value(execution).unwrap();
+        assert_eq!(encoded.get("tool_trace"), Some(&serde_json::json!([])));
+        encoded.as_object_mut().unwrap().remove("tool_trace");
+        assert!(serde_json::from_value::<ExecutionReviewEvidence>(encoded).is_err());
 
         let escalation = EscalationReviewEvidence {
-            reviewer_version: "escalation-reviewer/v5".to_owned(),
-            prompt_version: "escalation-review-prompt/v5".to_owned(),
-            schema_version: "escalation-review-schema/v5".to_owned(),
+            reviewer_version: "escalation-reviewer/v6".to_owned(),
+            prompt_version: "escalation-review-prompt/v6".to_owned(),
+            schema_version: "escalation-review-schema/v6".to_owned(),
             model_id: "fixture".to_owned(),
             model_binding_digest: "fixture-binding".to_owned(),
-            budget: ReviewerBudgetEvidence {
-                version: "reviewer-budget/v1".to_owned(),
-                digest: "fixture-budget".to_owned(),
-                attempts: 1,
-                terminal: ReviewerTerminalClass::ValidDecision,
-            },
+            budget,
             tool_trace: Vec::new(),
             decision: EscalationReviewDecision {
                 outcome: EscalationReviewOutcome::AskHuman,
@@ -1215,21 +1199,10 @@ mod executor_projection_tests {
                 rationale: "ask".to_owned(),
             },
         };
-        let encoded = serde_json::to_value(&escalation).unwrap();
-        assert!(encoded.get("tool_trace").is_none());
-        let hydrated: EscalationReviewEvidence =
-            serde_json::from_value(encoded.clone()).unwrap();
-        assert_eq!(hydrated, escalation);
-        // A non-empty trace is still serialized and still changes the bytes.
-        let mut traced = review.clone();
-        traced.tool_trace.push(ReviewerToolTrace {
-            tool: "workspace_invitation_list".to_owned(),
-            arguments: serde_json::json!({}),
-            result_digest: "ab".repeat(32),
-            is_error: false,
-            elapsed_ms: 4,
-        });
-        assert!(serde_json::to_value(&traced).unwrap().get("tool_trace").is_some());
+        let mut encoded = serde_json::to_value(escalation).unwrap();
+        assert_eq!(encoded.get("tool_trace"), Some(&serde_json::json!([])));
+        encoded.as_object_mut().unwrap().remove("tool_trace");
+        assert!(serde_json::from_value::<EscalationReviewEvidence>(encoded).is_err());
     }
 
     #[test]
