@@ -5,6 +5,9 @@ CREATE TABLE message_polls (
     question     text        NOT NULL CHECK (length(question) BETWEEN 1 AND 500),
     allow_multi  boolean     NOT NULL DEFAULT false,
     closes_at    timestamptz,
+    -- Poll snapshots can arrive after a later committed vote. Consumers use
+    -- this monotonic value to reject those stale snapshots.
+    revision     bigint      NOT NULL DEFAULT 0,
     created_at   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (workspace_id, message_id),
     FOREIGN KEY (workspace_id, message_id)

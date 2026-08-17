@@ -74,6 +74,8 @@ const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_THREAD_NAME_CHARS: usize = 100;
 const MAX_POLL_QUESTION_BYTES: usize = 2_000;
 const MAX_POLL_OPTION_BYTES: usize = 800;
+const MAX_POLL_QUESTION_CHARS: usize = 500;
+const MAX_POLL_OPTION_CHARS: usize = 200;
 const MIN_POLL_OPTIONS: usize = 2;
 const MAX_POLL_OPTIONS: usize = 10;
 
@@ -352,6 +354,24 @@ struct OpenReactionWire {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenPollOptionWire {
+    option_id: String,
+    text: String,
+    voters: Vec<OpenParticipantWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenPollWire {
+    question: String,
+    allow_multi: bool,
+    // Value keeps null distinct from an omitted required field without
+    // recreating the server's nullable-field machinery in this adapter.
+    closes_at: Value,
+    revision: i64,
+    options: Vec<OpenPollOptionWire>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenMessageWire {
     message_id: String,
     place: OpenPlaceWire,
@@ -369,6 +389,7 @@ struct OpenMessageWire {
     edited_at: Value,
     deleted: bool,
     attachments: Vec<MessagingAttachmentMetadata>,
+    poll: Option<OpenPollWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2942,12 +2963,15 @@ fn validate_open_message(
             || !message.mentions.is_empty()
             || !message.reactions.is_empty()
             || !message.attachments.is_empty()
+            || message.poll.is_some()
         {
             return Err(ToolError::Protocol(
                 "Messaging open tombstone still carries removed experience data".to_owned(),
             ));
         }
-    } else if (message.content.is_empty() && message.attachments.is_empty())
+    } else if (message.content.is_empty()
+        && message.attachments.is_empty()
+        && message.poll.is_none())
         || message.content.len() > MAX_CONTENT_BYTES
         || message.content.contains('\0')
     {
@@ -2955,7 +2979,67 @@ fn validate_open_message(
             "Messaging open live message has invalid content".to_owned(),
         ));
     }
+    if let Some(poll) = &message.poll {
+        validate_open_poll(poll)?;
+    }
     Ok(())
+}
+
+fn validate_open_poll(poll: &OpenPollWire) -> Result<(), ToolError> {
+    if !valid_open_poll_text(&poll.question, MAX_POLL_QUESTION_CHARS)
+        || !valid_nullable_string(&poll.closes_at, usize::MAX)
+        || poll.revision < 0
+        || !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&poll.options.len())
+    {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid poll".to_owned(),
+        ));
+    }
+
+    let mut option_ids = BTreeSet::new();
+    let mut option_texts = BTreeSet::new();
+    let mut single_choice_voters = BTreeSet::new();
+    for option in &poll.options {
+        if validate_canonical_uuid_v7(&option.option_id).is_err()
+            || !option_ids.insert(option.option_id.as_str())
+            || !valid_open_poll_text(&option.text, MAX_POLL_OPTION_CHARS)
+            || !option_texts.insert(option.text.as_str())
+        {
+            return Err(ToolError::Protocol(
+                "Messaging open message has an invalid poll option".to_owned(),
+            ));
+        }
+
+        let mut option_voters = BTreeSet::new();
+        for voter in &option.voters {
+            validate_open_participant(voter, "poll voter")?;
+            let Some(voter_id) = (match voter.kind.as_str() {
+                "human" => voter.human_id.as_deref(),
+                "personality_agent" => voter.personality_agent_id.as_deref(),
+                _ => None,
+            }) else {
+                return Err(ToolError::Protocol(
+                    "Messaging open message has an invalid poll voter".to_owned(),
+                ));
+            };
+            let voter_key = (voter.kind.as_str(), voter_id);
+            if !option_voters.insert(voter_key)
+                || (!poll.allow_multi && !single_choice_voters.insert(voter_key))
+            {
+                return Err(ToolError::Protocol(
+                    "Messaging open message has inconsistent poll voters".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_open_poll_text(value: &str, max_chars: usize) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.contains('\0')
+        && value.chars().count() <= max_chars
 }
 
 fn validate_attachment_metadata(
@@ -3178,6 +3262,27 @@ mod tests {
             "edited_at": null,
             "deleted": deleted,
             "attachments": []
+        })
+    }
+
+    fn test_open_poll() -> Value {
+        json!({
+            "question": "When should we ship?",
+            "allow_multi": false,
+            "closes_at": null,
+            "revision": 0,
+            "options": [
+                {
+                    "option_id": "0198f0f4-9b72-7000-8000-000000000401",
+                    "text": "Today",
+                    "voters": []
+                },
+                {
+                    "option_id": "0198f0f4-9b72-7000-8000-000000000402",
+                    "text": "Tomorrow",
+                    "voters": [test_participant()]
+                }
+            ]
         })
     }
 
@@ -6043,6 +6148,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_admits_a_poll_only_message_and_returns_its_poll() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let poll = test_open_poll();
+        let mut response = test_open_response("general", 1, 0, 1, 1, None);
+        response["messages"][0]["content"] = json!("");
+        response["messages"][0]["poll"] = poll.clone();
+        api.open_responses.lock().await.push_back(response);
+        let tool = MessagingTool::new(api);
+
+        let output = execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-poll",
+        )
+        .await
+        .expect("poll-only message opens successfully");
+
+        assert_eq!(output.details["messages"][0]["poll"], poll);
+        let state = default_state(&tool).await;
+        assert_eq!(state.focused_place_id.as_deref(), Some("general"));
+        assert_eq!(state.visible_messages[0].message_id, "m1");
+    }
+
+    #[tokio::test]
     async fn bound_write_keeps_place_a_after_the_view_focuses_place_b() {
         let (api, tool, registry) = binding_fixture().await;
         let proposal = json!({"action": "write", "content": "hello"});
@@ -6465,6 +6594,8 @@ mod tests {
         seq_zero["messages"][0]["seq"] = json!(0);
         let mut invalid_tombstone = valid();
         invalid_tombstone["messages"][0]["deleted"] = json!(true);
+        let mut genuinely_empty_live_message = valid();
+        genuinely_empty_live_message["messages"][0]["content"] = json!("");
         let mut gap = test_open_response("general", 3, 0, 1, 3, None);
         gap["messages"].as_array_mut().expect("messages").remove(1);
         let mut last_read_beyond_latest = valid();
@@ -6492,6 +6623,12 @@ mod tests {
             ("too-many-for-limit", valid(), None, Some(1)),
             ("gap", gap, None, None),
             ("invalid-tombstone", invalid_tombstone, None, None),
+            (
+                "genuinely-empty-live-message",
+                genuinely_empty_live_message,
+                None,
+                None,
+            ),
             (
                 "last-read-beyond-latest",
                 last_read_beyond_latest,
