@@ -63,11 +63,13 @@ type CallRegistry struct {
 	rooms        map[string]*CallState
 	sequence     uint64
 	roomSequence map[string]uint64
+	roomFinished map[string]uint64
 }
 
 func NewCallRegistry() *CallRegistry {
 	return &CallRegistry{
 		rooms: map[string]*CallState{}, roomSequence: map[string]uint64{},
+		roomFinished: map[string]uint64{},
 	}
 }
 
@@ -92,29 +94,37 @@ func (r *CallRegistry) active() []CallState {
 	return out
 }
 
-// replaceSnapshot applies a RoomService snapshot without losing participant
-// deltas from webhooks received while the snapshot was being read. RoomService
-// is authoritative for the room-level projection, while webhook participants
-// are newer than the snapshot. roomSequence retains tombstones too, so a
-// room_finished webhook cannot be resurrected by a stale snapshot.
-func (r *CallRegistry) replaceSnapshot(states []CallState, snapshotSequence uint64) {
+type callRoomSnapshot struct {
+	state    CallState
+	sequence uint64
+}
+
+// replaceSnapshot applies a RoomService snapshot. A room snapshot is accepted
+// only when no webhook changed that room while its participants were listed.
+// A room_finished event after the ListRooms read is a tombstone: it always
+// wins over the stale listing that included the room.
+func (r *CallRegistry) replaceSnapshot(states []callRoomSnapshot, snapshotSequence uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	next := make(map[string]*CallState, len(states))
-	for _, state := range states {
-		if r.roomSequence[state.PlaceID] > snapshotSequence {
-			if current, ok := r.rooms[state.PlaceID]; ok {
-				merged := mergeCallSnapshot(state, *current)
-				next[state.PlaceID] = &merged
+	for _, snapshot := range states {
+		placeID := snapshot.state.PlaceID
+		if r.roomFinished[placeID] > snapshotSequence {
+			continue
+		}
+		if r.roomSequence[placeID] > snapshot.sequence {
+			if current, ok := r.rooms[placeID]; ok {
+				copy := cloneCallState(current)
+				next[placeID] = &copy
 			}
 			continue
 		}
-		copy := cloneCallState(&state)
-		next[state.PlaceID] = &copy
+		copy := cloneCallState(&snapshot.state)
+		next[placeID] = &copy
 	}
 	for placeID, state := range r.rooms {
 		if r.roomSequence[placeID] > snapshotSequence {
-			if _, alreadyMerged := next[placeID]; !alreadyMerged {
+			if _, alreadyIncluded := next[placeID]; !alreadyIncluded {
 				copy := cloneCallState(state)
 				next[placeID] = &copy
 			}
@@ -123,32 +133,16 @@ func (r *CallRegistry) replaceSnapshot(states []CallState, snapshotSequence uint
 	r.rooms = next
 }
 
-func mergeCallSnapshot(snapshot, newer CallState) CallState {
-	merged := cloneCallState(&snapshot)
-	participants := make(map[ParticipantRef]CallParticipant, len(snapshot.Participants)+len(newer.Participants))
-	for _, participant := range snapshot.Participants {
-		participants[participant.Participant] = participant
-	}
-	for _, participant := range newer.Participants {
-		participants[participant.Participant] = participant
-	}
-	merged.Participants = make([]CallParticipant, 0, len(participants))
-	for _, participant := range participants {
-		merged.Participants = append(merged.Participants, participant)
-	}
-	sort.SliceStable(merged.Participants, func(i, j int) bool {
-		if merged.Participants[i].JoinedAt.Equal(merged.Participants[j].JoinedAt) {
-			return merged.Participants[i].Participant.Key() < merged.Participants[j].Participant.Key()
-		}
-		return merged.Participants[i].JoinedAt.Before(merged.Participants[j].JoinedAt)
-	})
-	return merged
-}
-
 func (r *CallRegistry) snapshotSequence() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sequence
+}
+
+func (r *CallRegistry) roomSnapshotSequence(placeID string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.roomSequence[placeID]
 }
 
 func (r *CallRegistry) changed(placeID string) {
@@ -174,6 +168,7 @@ func (r *CallRegistry) open(placeID string, at time.Time) CallState {
 	}
 	state.Active = true
 	r.changed(placeID)
+	delete(r.roomFinished, placeID)
 	return cloneCallState(state)
 }
 
@@ -182,6 +177,7 @@ func (r *CallRegistry) close(placeID string) CallState {
 	defer r.mu.Unlock()
 	delete(r.rooms, placeID)
 	r.changed(placeID)
+	r.roomFinished[placeID] = r.roomSequence[placeID]
 	return CallState{PlaceID: placeID}
 }
 
@@ -217,6 +213,10 @@ func (r *CallRegistry) leave(placeID string, participant ParticipantRef) (CallSt
 	defer r.mu.Unlock()
 	state, ok := r.rooms[placeID]
 	if !ok {
+		// A restart may receive participant_left before its first RoomService
+		// snapshot has populated this room. Record the delta so that snapshot
+		// is retried instead of reintroducing the departed participant.
+		r.changed(placeID)
 		return CallState{}, false
 	}
 	for i, existing := range state.Participants {
@@ -226,6 +226,7 @@ func (r *CallRegistry) leave(placeID string, participant ParticipantRef) (CallSt
 			return cloneCallState(state), true
 		}
 	}
+	r.changed(placeID)
 	return cloneCallState(state), false
 }
 
@@ -313,7 +314,7 @@ func (c *CallService) RegisterRoutes(mux *http.ServeMux) {
 }
 
 // withCallAdmission holds Workspace membership, exact installation epoch, and
-// place tenure through token construction and the server-side response write.
+// place tenure through token construction and transaction commit.
 func (s *ScopedStore) withCallAdmission(
 	ctx context.Context,
 	placeID string,
@@ -361,6 +362,12 @@ func (c *CallService) serveCallToken(w http.ResponseWriter, r *http.Request) {
 	}
 	store := scopedStoreForRequest(r)
 	tokenFailed := false
+	var response struct {
+		URL      string `json:"url"`
+		Token    string `json:"token"`
+		Room     string `json:"room"`
+		Identity string `json:"identity"`
+	}
 	done, err := c.Server.mutate(w, r, claims, func() error {
 		return store.withCallAdmission(r.Context(), r.PathValue("place_id"), func(place Place, displayName string) error {
 			if place.Kind == PlaceChannel && !place.Voice {
@@ -371,12 +378,12 @@ func (c *CallService) serveCallToken(w http.ResponseWriter, r *http.Request) {
 				tokenFailed = true
 				return err
 			}
-			writeJSON(w, http.StatusOK, struct {
+			response = struct {
 				URL      string `json:"url"`
 				Token    string `json:"token"`
 				Room     string `json:"room"`
 				Identity string `json:"identity"`
-			}{c.LiveKit.URL, token, place.PlaceID, store.Scope.Actor.Key()})
+			}{c.LiveKit.URL, token, place.PlaceID, store.Scope.Actor.Key()}
 			return nil
 		})
 	})
@@ -389,7 +396,9 @@ func (c *CallService) serveCallToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeStoreError(w, err)
+		return
 	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (c *CallService) serveCalls(w http.ResponseWriter, r *http.Request) {
@@ -711,29 +720,48 @@ func (c *CallService) rebuildRegistry(ctx context.Context) error {
 	if c.RoomService == nil {
 		return errors.New("LiveKit RoomService is unavailable")
 	}
-	// Snapshot sequence is captured before the first RoomService read. Webhook
-	// application takes the registry mutex and records a per-room sequence, so
-	// replaceSnapshot keeps any newer webhook projection instead of clobbering
-	// it with this necessarily non-atomic RoomService snapshot.
+	// Snapshot sequence is captured before the first RoomService read. A room's
+	// own sequence is then sampled around ListParticipants and retried so an
+	// event during that narrower read cannot be lost to the rebuild snapshot.
 	snapshotSequence := c.Registry.snapshotSequence()
 	rooms, err := c.RoomService.ListRooms(ctx)
 	if err != nil {
 		return err
 	}
-	states := make([]CallState, 0, len(rooms))
+	states := make([]callRoomSnapshot, 0, len(rooms))
 	for _, room := range rooms {
 		if room.Name == "" {
 			continue
 		}
-		participants, err := c.RoomService.ListParticipants(ctx, room.Name)
+		snapshot, err := c.snapshotRoom(ctx, room)
 		if err != nil {
 			return err
 		}
-		startedAt := time.Unix(room.CreatedAt, 0)
-		if room.CreatedAt == 0 {
-			startedAt = c.now()
+		states = append(states, snapshot)
+	}
+	c.Registry.replaceSnapshot(states, snapshotSequence)
+	c.rebuiltOnce = true
+	return nil
+}
+
+const callSnapshotAttempts = 3
+
+func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callRoomSnapshot, error) {
+	startedAt := time.Unix(room.CreatedAt, 0)
+	if room.CreatedAt == 0 {
+		startedAt = c.now()
+	}
+	var snapshot callRoomSnapshot
+	for attempt := 0; attempt < callSnapshotAttempts; attempt++ {
+		sequence := c.Registry.roomSnapshotSequence(room.Name)
+		participants, err := c.RoomService.ListParticipants(ctx, room.Name)
+		if err != nil {
+			return callRoomSnapshot{}, err
 		}
-		state := CallState{PlaceID: room.Name, Active: true, StartedAt: startedAt}
+		snapshot = callRoomSnapshot{
+			state:    CallState{PlaceID: room.Name, Active: true, StartedAt: startedAt},
+			sequence: sequence,
+		}
 		for _, participant := range participants {
 			ref, err := participantFromIdentity(participant.Identity)
 			if err != nil {
@@ -750,19 +778,27 @@ func (c *CallService) rebuildRegistry(ctx context.Context) error {
 					break
 				}
 			}
-			state.Participants = append(state.Participants, entry)
+			snapshot.state.Participants = append(snapshot.state.Participants, entry)
 		}
-		sort.SliceStable(state.Participants, func(i, j int) bool {
-			if state.Participants[i].JoinedAt.Equal(state.Participants[j].JoinedAt) {
-				return state.Participants[i].Participant.Key() < state.Participants[j].Participant.Key()
+		sort.SliceStable(snapshot.state.Participants, func(i, j int) bool {
+			if snapshot.state.Participants[i].JoinedAt.Equal(snapshot.state.Participants[j].JoinedAt) {
+				return snapshot.state.Participants[i].Participant.Key() < snapshot.state.Participants[j].Participant.Key()
 			}
-			return state.Participants[i].JoinedAt.Before(state.Participants[j].JoinedAt)
+			return snapshot.state.Participants[i].JoinedAt.Before(snapshot.state.Participants[j].JoinedAt)
 		})
-		states = append(states, state)
+		after := c.Registry.roomSnapshotSequence(room.Name)
+		if after == sequence {
+			return snapshot, nil
+		}
+		if attempt == callSnapshotAttempts-1 {
+			// Under sustained webhook traffic, retain the final RoomService
+			// response rather than spin forever. A later webhook still has a
+			// newer sequence and therefore applies after this snapshot.
+			snapshot.sequence = after
+			return snapshot, nil
+		}
 	}
-	c.Registry.replaceSnapshot(states, snapshotSequence)
-	c.rebuiltOnce = true
-	return nil
+	return snapshot, nil
 }
 
 // RemoveWorkspaceParticipant asks LiveKit to end active media sessions for a

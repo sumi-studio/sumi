@@ -266,12 +266,52 @@ func TestCallTokenAdmissionTracksCurrentMessagingAuthority(t *testing.T) {
 	}
 }
 
+func TestCallTokenCommitFailureDoesNotWriteToken(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	fixture := newScopedContractFixture(t, ctx, w, "call-token-commit", w.humanB)
+	owner := fixture.scope(t, w, w.humanA)
+	channel, err := owner.CreateChannel(ctx, "通話", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(w.store.core, stubSessions{})
+	server.AllowedOrigins = []string{testOrigin}
+	calls := NewCallService(server, testLiveKit())
+	requestContext, cancelRequest := context.WithCancel(ctx)
+	calls.Now = func() time.Time {
+		cancelRequest()
+		return time.Unix(1_780_000_000, 0)
+	}
+	mux := http.NewServeMux()
+	calls.RegisterRoutes(mux)
+	request := httptest.NewRequest(http.MethodPost,
+		scopedCallURL("http://sumi.test", "/messaging/places/"+channel.PlaceID+"/call/token", owner.Scope), nil,
+	).WithContext(requestContext)
+	request.Header.Set("Origin", testOrigin)
+	request.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: w.humanA.ID})
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("commit failure status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["token"]; present {
+		t.Fatalf("commit failure wrote a token: %s", response.Body.String())
+	}
+}
+
 type stubLiveKitRoomService struct {
-	rooms              []liveKitRoom
-	participants       map[string][]liveKitParticipant
-	err                error
-	onListParticipants func(string)
-	removed            *[][2]string
+	rooms                []liveKitRoom
+	participants         map[string][]liveKitParticipant
+	err                  error
+	onListParticipants   func(string)
+	listParticipantCalls *int
+	removed              *[][2]string
 }
 
 func (s stubLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom, error) {
@@ -279,10 +319,14 @@ func (s stubLiveKitRoomService) ListRooms(context.Context) ([]liveKitRoom, error
 }
 
 func (s stubLiveKitRoomService) ListParticipants(_ context.Context, room string) ([]liveKitParticipant, error) {
+	if s.listParticipantCalls != nil {
+		(*s.listParticipantCalls)++
+	}
+	participants := append([]liveKitParticipant(nil), s.participants[room]...)
 	if s.onListParticipants != nil {
 		s.onListParticipants(room)
 	}
-	return s.participants[room], s.err
+	return participants, s.err
 }
 
 func (s stubLiveKitRoomService) RemoveParticipant(_ context.Context, room, identity string) error {
@@ -290,6 +334,26 @@ func (s stubLiveKitRoomService) RemoveParticipant(_ context.Context, room, ident
 		*s.removed = append(*s.removed, [2]string{room, identity})
 	}
 	return s.err
+}
+
+func TestCallRegistryRebuildListsParticipantsOnceWithoutWebhook(t *testing.T) {
+	calls := 0
+	service := &CallService{
+		Registry: NewCallRegistry(),
+		RoomService: stubLiveKitRoomService{
+			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			participants: map[string][]liveKitParticipant{
+				"place-1": {{Identity: "human:01900000-0000-7000-8000-0000000000aa"}},
+			},
+			listParticipantCalls: &calls,
+		},
+	}
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("ListParticipants calls=%d, want 1 without a webhook race", calls)
+	}
 }
 
 func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
@@ -335,23 +399,32 @@ func TestCallRegistryRebuildsFromLiveKitRoomServiceAfterRestart(t *testing.T) {
 	}
 }
 
-func TestCallRegistryRebuildPreservesWebhookAppliedDuringSnapshot(t *testing.T) {
+func TestCallRegistryRebuildRetriesWebhookAppliedDuringSnapshot(t *testing.T) {
 	now := time.Unix(1_780_000_100, 0)
 	registry := NewCallRegistry()
 	snapshotParticipant := Human("01900000-0000-7000-8000-0000000000aa")
 	webhookParticipant := Human("01900000-0000-7000-8000-0000000000bb")
+	participants := map[string][]liveKitParticipant{
+		"place-1": {{Identity: snapshotParticipant.Key(), JoinedAt: 1_780_000_001}},
+	}
+	firstList := true
 	service := &CallService{
 		Registry: registry,
 		Now:      func() time.Time { return now },
 		RoomService: stubLiveKitRoomService{
-			rooms: []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
-			participants: map[string][]liveKitParticipant{
-				"place-1": {{Identity: "human:01900000-0000-7000-8000-0000000000aa", JoinedAt: 1_780_000_001}},
-			},
+			rooms:        []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			participants: participants,
 			onListParticipants: func(string) {
+				if !firstList {
+					return
+				}
+				firstList = false
 				// This is the previously unsafe interleaving: RoomService has
 				// already been read, then LiveKit delivers a newer webhook.
 				registry.join("place-1", webhookParticipant, now)
+				participants["place-1"] = append(participants["place-1"], liveKitParticipant{
+					Identity: webhookParticipant.Key(), JoinedAt: now.Unix(),
+				})
 			},
 		},
 	}
@@ -361,7 +434,40 @@ func TestCallRegistryRebuildPreservesWebhookAppliedDuringSnapshot(t *testing.T) 
 	state, ok := registry.snapshot("place-1")
 	if !ok || state.StartedAt.Unix() != 1_780_000_000 || len(state.Participants) != 2 ||
 		state.Participants[0].Participant != snapshotParticipant || state.Participants[1].Participant != webhookParticipant {
-		t.Fatalf("snapshot and newer webhook participants were not merged: %+v", state)
+		t.Fatalf("relisted participants = %+v", state)
+	}
+}
+
+func TestCallRegistryRebuildRetriesParticipantLeftDuringSnapshot(t *testing.T) {
+	now := time.Unix(1_780_000_100, 0)
+	registry := NewCallRegistry()
+	departed := Human("01900000-0000-7000-8000-0000000000aa")
+	participants := map[string][]liveKitParticipant{
+		"place-1": {{Identity: departed.Key(), JoinedAt: 1_780_000_001}},
+	}
+	firstList := true
+	service := &CallService{
+		Registry: registry,
+		Now:      func() time.Time { return now },
+		RoomService: stubLiveKitRoomService{
+			rooms:        []liveKitRoom{{Name: "place-1", CreatedAt: 1_780_000_000}},
+			participants: participants,
+			onListParticipants: func(string) {
+				if !firstList {
+					return
+				}
+				firstList = false
+				registry.leave("place-1", departed)
+				participants["place-1"] = nil
+			},
+		},
+	}
+	if err := service.rebuildRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, ok := registry.snapshot("place-1")
+	if !ok || len(state.Participants) != 0 {
+		t.Fatalf("departed participant remained after relist: %+v", state)
 	}
 }
 
