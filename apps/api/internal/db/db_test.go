@@ -1121,6 +1121,27 @@ func TestVoiceChannelMigrationRoundTrip(t *testing.T) {
 	assertUp("re-upgrade")
 }
 
+func TestMessageSearchConcurrentIndexMigration(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	applyMigrationsThrough(t, ctx, pool, 26)
+
+	var exists, valid bool
+	if err := pool.QueryRow(ctx, `
+		SELECT c.oid IS NOT NULL, COALESCE(i.indisvalid, false)
+		FROM (SELECT 1) AS singleton
+		LEFT JOIN pg_class c ON c.oid = to_regclass('public.messages_content_trgm')
+		LEFT JOIN pg_index i ON i.indexrelid = c.oid
+	`).Scan(&exists, &valid); err != nil {
+		t.Fatal(err)
+	}
+	if !exists || !valid {
+		t.Fatalf("messages_content_trgm exists=%v valid=%v, want a valid index", exists, valid)
+	}
+}
+
 func TestSplitSQLStatements(t *testing.T) {
 	tests := []struct {
 		name string
