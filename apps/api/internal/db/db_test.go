@@ -987,6 +987,143 @@ func TestHumanDirectChatDefaultMigrationBackfillsOnlyAbsentBindings(t *testing.T
 	}
 }
 
+func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 21)
+
+	const (
+		uninstalledHumanID = "0198f0f4-9b72-7000-8000-0000000003a1"
+		neverInstalledID   = "0198f0f4-9b72-7000-8000-0000000003a2"
+		liveHumanID        = "0198f0f4-9b72-7000-8000-0000000003a3"
+		incompleteHumanID  = "0198f0f4-9b72-7000-8000-0000000003a4"
+
+		uninstalledAppID = "0198f0f4-9b72-7000-8000-0000000003b1"
+		liveAppID        = "0198f0f4-9b72-7000-8000-0000000003b3"
+
+		uninstalledOperationID = "00000000-0000-4000-8000-0000000003a1"
+		liveOperationID        = "00000000-0000-4000-8000-0000000003a3"
+		incompleteOperationID  = "00000000-0000-4000-8000-0000000003a4"
+	)
+	past := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	createdAt := past.Add(-time.Minute)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO humans (human_id) VALUES ($1), ($2), ($3), ($4)`,
+		uninstalledHumanID, neverInstalledID, liveHumanID, incompleteHumanID,
+	); err != nil {
+		t.Fatalf("insert Humans: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_install_operation_receipts
+			(owner_kind, owner_id, operation_id, app_id, status, installation_id,
+			 enabled, authority_epoch, installed_at, updated_at, created_at, completed_at)
+		VALUES
+			('human', $1, $2, 'direct-chat', 'installed', $3, true, 1, $4, $4, $5, $4),
+			('human', $6, $7, 'direct-chat', 'installed', $8, true, 1, $4, $4, $5, $4)`,
+		uninstalledHumanID, uninstalledOperationID, uninstalledAppID,
+		past, createdAt,
+		liveHumanID, liveOperationID, liveAppID,
+	); err != nil {
+		t.Fatalf("insert completed install receipts: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_install_operation_receipts
+			(owner_kind, owner_id, operation_id, app_id, status, created_at)
+		VALUES ('human', $1, $2, 'direct-chat', 'pending', $3)`,
+		incompleteHumanID, incompleteOperationID, createdAt,
+	); err != nil {
+		t.Fatalf("insert incomplete install receipt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_installations
+			(installation_id, owner_kind, owner_id, app_id, enabled, authority_epoch,
+			 installed_at, updated_at)
+		VALUES ($1, 'human', $2, 'direct-chat', true, 1, $3, $3)`,
+		liveAppID, liveHumanID, past,
+	); err != nil {
+		t.Fatalf("insert live Direct Chat installation: %v", err)
+	}
+
+	readMigration := func(name string) string {
+		t.Helper()
+		content, err := migrationFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(content)
+	}
+	if _, err := pool.Exec(ctx, readMigration("0022_human_direct_chat_default.up.sql")); err != nil {
+		t.Fatalf("apply 0022: %v", err)
+	}
+
+	directChatInstallationID := func(humanID string) string {
+		t.Helper()
+		var installationID string
+		if err := pool.QueryRow(ctx, `
+			SELECT installation_id
+			FROM app_installations
+			WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = 'direct-chat'`, humanID,
+		).Scan(&installationID); err != nil {
+			t.Fatalf("load Direct Chat installation for %s: %v", humanID, err)
+		}
+		return installationID
+	}
+	for _, humanID := range []string{uninstalledHumanID, neverInstalledID, incompleteHumanID, liveHumanID} {
+		if directChatInstallationID(humanID) == "" {
+			t.Fatalf("0022 did not leave a Direct Chat installation for %s", humanID)
+		}
+	}
+	if got := directChatInstallationID(liveHumanID); got != liveAppID {
+		t.Fatalf("0022 changed the existing Direct Chat installation: got %q, want %q", got, liveAppID)
+	}
+
+	up := readMigration("0027_direct_chat_backfill_respects_uninstall.up.sql")
+	first, err := pool.Exec(ctx, up)
+	if err != nil {
+		t.Fatalf("apply 0027: %v", err)
+	}
+	if first.RowsAffected() != 1 {
+		t.Fatalf("0027 removed %d installations, want 1", first.RowsAffected())
+	}
+	installationExists := func(humanID string) bool {
+		t.Helper()
+		var exists bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM app_installations
+				WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = 'direct-chat'
+			)`, humanID,
+		).Scan(&exists); err != nil {
+			t.Fatalf("check Direct Chat installation for %s: %v", humanID, err)
+		}
+		return exists
+	}
+	if installationExists(uninstalledHumanID) {
+		t.Fatal("0027 retained the 0022 Direct Chat backfill after an explicit uninstall")
+	}
+	for _, humanID := range []string{neverInstalledID, incompleteHumanID, liveHumanID} {
+		if !installationExists(humanID) {
+			t.Fatalf("0027 unexpectedly removed Direct Chat for %s", humanID)
+		}
+	}
+	second, err := pool.Exec(ctx, up)
+	if err != nil {
+		t.Fatalf("reapply 0027: %v", err)
+	}
+	if second.RowsAffected() != 0 {
+		t.Fatalf("reapplying 0027 removed %d installations, want 0", second.RowsAffected())
+	}
+	if installationExists(uninstalledHumanID) {
+		t.Fatal("reapplying 0027 recreated a removed Direct Chat installation")
+	}
+	for _, humanID := range []string{neverInstalledID, incompleteHumanID, liveHumanID} {
+		if !installationExists(humanID) {
+			t.Fatalf("reapplying 0027 removed Direct Chat for %s", humanID)
+		}
+	}
+}
+
 func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
