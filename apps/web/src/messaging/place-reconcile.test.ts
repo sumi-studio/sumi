@@ -151,6 +151,7 @@ class FakeBackend implements MessagingBackend {
   fetchThread = vi.fn(async (_threadId: string): Promise<ThreadSummary> => {
     throw new Error("unused");
   });
+  fetchThreads = vi.fn(async (_parent: Place): Promise<ThreadSummary[]> => []);
   async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
     return { statuses: [], replyLaterMarkers: [] };
   }
@@ -282,11 +283,6 @@ describe("place lifecycleの再接続突き合わせ", () => {
       message: threadMessage(live.threadId, 2),
       notify: null,
     });
-    backend.emit({
-      type: "message_created",
-      message: threadMessage(live.threadId, 3),
-      notify: null,
-    });
     await settle();
 
     expect(backend.fetchThread).toHaveBeenCalledTimes(1);
@@ -312,6 +308,48 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(useMessaging.getState().threadsById[unopened.threadId]).toEqual(
       unopened,
     );
+  });
+
+  it("未知threadのhydrate中の新活動で古いGET summaryを戻さない", async () => {
+    const stale = thread("thread-hydration-race");
+    let resolveFetch!: (summary: ThreadSummary) => void;
+    backend.fetchThread.mockImplementation(
+      () =>
+        new Promise<ThreadSummary>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 2),
+      notify: null,
+    });
+    await settle();
+    expect(backend.fetchThread).toHaveBeenCalledWith(stale.threadId);
+
+    // The GET snapshot was already taken. A later event advances the
+    // projection before that stale response can be applied.
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 3),
+      notify: null,
+    });
+    const fresh = {
+      ...stale,
+      messageCount: 3,
+      latestSeq: 3,
+      lastMessageAt: 3,
+      lastMessage: "新しい返信です",
+    };
+    backend.fetchThreads.mockResolvedValue([fresh]);
+    await useMessaging.getState().loadThreads(CHANNEL_1);
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+
+    resolveFetch(stale);
+    await settle();
+
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
   });
 
   it("重複したthread message_createdで件数を二重加算しない", async () => {

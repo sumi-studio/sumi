@@ -82,6 +82,7 @@ pub(crate) struct CreateMessagingThreadRequest<'a> {
     pub name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_message_id: Option<&'a str>,
+    pub client_nonce: &'a str,
 }
 
 #[derive(Debug, Serialize)]

@@ -1665,6 +1665,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (get().threadsById[threadId]) return true;
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
+      const version = threadProjectionVersions.get(threadId) ?? 0;
       const fetchThread = currentBackend.fetchThread;
       if (!get().capabilities.threads || !fetchThread) {
         return false;
@@ -1687,7 +1688,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           const thread = await fetchThread.call(currentBackend, threadId);
           if (
             backend !== currentBackend ||
-            messagingSessionGeneration !== sessionGeneration
+            messagingSessionGeneration !== sessionGeneration ||
+            (threadProjectionVersions.get(threadId) ?? 0) !== version
           ) {
             return false;
           }

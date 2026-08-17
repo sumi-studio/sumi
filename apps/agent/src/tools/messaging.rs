@@ -1379,12 +1379,14 @@ impl MessagingTool {
                 result = self.api.threads(scope, ListMessagingThreadsRequest { parent_place_id: &parent_place_id }) => result,
             }.map_err(map_messaging_api_error)?,
             BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
                 let response = tokio::select! {
                     _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.create_thread(scope, CreateMessagingThreadRequest {
                         parent_place_id: &parent_place_id,
                         name: &name,
                         parent_message_id: parent_message_id.as_deref(),
+                        client_nonce: &nonce,
                     }) => result,
                 }.map_err(map_messaging_api_error)?;
                 let thread_id = response.get("thread_id").and_then(Value::as_str)
@@ -3065,7 +3067,7 @@ mod tests {
         promises: AsyncMutex<Vec<RecordedReplyLater>>,
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
-        threads: AsyncMutex<Vec<(String, String, Option<String>)>>,
+        threads: AsyncMutex<Vec<(String, String, Option<String>, String)>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
@@ -3446,6 +3448,7 @@ mod tests {
                 request.parent_place_id.to_owned(),
                 request.name.to_owned(),
                 request.parent_message_id.map(str::to_owned),
+                request.client_nonce.to_owned(),
             ));
             Ok(json!({
                 "thread_id": "th-1",
@@ -4659,7 +4662,8 @@ mod tests {
             &[(
                 "general".to_owned(),
                 "認証リダイレクト".to_owned(),
-                Some("m7".to_owned())
+                Some("m7".to_owned()),
+                client_nonce("flow", "create"),
             )]
         );
 
@@ -4671,6 +4675,44 @@ mod tests {
         .await
         .expect("write in newly focused thread");
         assert_eq!(api.writes.lock().await[0].0, "th-1");
+    }
+
+    #[tokio::test]
+    async fn thread_creation_retries_with_a_stable_nonce_and_returns_the_same_thread() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let create = json!({"action": "create_thread", "name": "認証リダイレクト"});
+
+        let first_tool = MessagingTool::new(api.clone());
+        execute(
+            &first_tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-first",
+        )
+        .await
+        .expect("open parent for first create");
+        let first = execute(&first_tool, create.clone(), "create-retry")
+            .await
+            .expect("create thread");
+
+        // A retry can be delivered after reconstructing the local view, so it
+        // must retain its operation identity independently of view state.
+        let retry_tool = MessagingTool::new(api.clone());
+        execute(
+            &retry_tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-retry",
+        )
+        .await
+        .expect("open parent for retry");
+        let replay = execute(&retry_tool, create, "create-retry")
+            .await
+            .expect("replay thread creation");
+
+        assert_eq!(first.details["thread_id"], replay.details["thread_id"]);
+        let threads = api.threads.lock().await;
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].3, client_nonce("flow", "create-retry"));
+        assert_eq!(threads[1].3, threads[0].3);
     }
 
     #[tokio::test]
