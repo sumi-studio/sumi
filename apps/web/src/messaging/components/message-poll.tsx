@@ -1,5 +1,5 @@
 import { BarChart3, Check } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Message } from "../model";
 import { isPollClosed, participantKey, pollVoteCount } from "../model";
 import { useMessaging } from "../store";
@@ -25,6 +25,10 @@ export function MessagePoll({ message }: { message: Message }) {
   const membersByKey = useMessaging((state) => state.membersByKey);
   const votePoll = useMessaging((state) => state.votePoll);
   const [now, setNow] = useState(() => Date.now());
+  const [optimisticSelection, setOptimisticSelection] = useState<string[] | null>(
+    null,
+  );
+  const pendingSelection = useRef<string[] | null>(null);
   const closesAt = poll?.closesAt ?? null;
 
   useEffect(() => {
@@ -41,7 +45,7 @@ export function MessagePoll({ message }: { message: Message }) {
   );
   const toggle = (optionId: string) => {
     if (closed || pending) return;
-    const mine = poll.options
+    const mine = pendingSelection.current ?? poll.options
       .filter((option) =>
         option.voters.some(
           (participant) => participantKey(participant) === selfKey,
@@ -49,16 +53,26 @@ export function MessagePoll({ message }: { message: Message }) {
       )
       .map((option) => option.optionId);
     const selected = mine.includes(optionId);
-    votePoll(
-      message,
-      poll.allowMulti
-        ? selected
-          ? mine.filter((id) => id !== optionId)
-          : [...mine, optionId]
-        : selected
-          ? []
-          : [optionId],
-    );
+    const next = poll.allowMulti
+      ? selected
+        ? mine.filter((id) => id !== optionId)
+        : [...mine, optionId]
+      : selected
+        ? []
+        : [optionId];
+    // `vote_poll` replaces the whole choice set. Remember the local intent
+    // between rapid clicks so the second request contains the first choice.
+    pendingSelection.current = next;
+    setOptimisticSelection(next);
+    void Promise.resolve(votePoll(message, next))
+      .finally(() => {
+        // Only the last queued replacement owns the displayed intent.
+        if (pendingSelection.current === next) {
+          pendingSelection.current = null;
+          setOptimisticSelection(null);
+        }
+      })
+      .catch(() => undefined);
   };
 
   return (
@@ -69,9 +83,11 @@ export function MessagePoll({ message }: { message: Message }) {
       </p>
       <div className="mt-2 space-y-1">
         {poll.options.map((option) => {
-          const mine = option.voters.some(
-            (participant) => participantKey(participant) === selfKey,
-          );
+          const mine =
+            optimisticSelection?.includes(option.optionId) ??
+            option.voters.some(
+              (participant) => participantKey(participant) === selfKey,
+            );
           const share = total === 0 ? 0 : (option.voters.length / total) * 100;
           const voters = option.voters
             .map(

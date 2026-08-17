@@ -235,7 +235,7 @@ interface MessagingState {
   ): Promise<NotificationWriteResult>;
   createReplyLater(message: Message, delayMs?: number): void;
   toggleReaction(message: Message, emoji: string): void;
-  votePoll(message: Message, optionIds: string[]): void;
+  votePoll(message: Message, optionIds: string[]): Promise<void>;
   loadOlder(key: PlaceKey): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
@@ -442,6 +442,26 @@ export const useMessaging = create<MessagingState>((set, get) => {
   // Their freshness therefore belongs to the message, not the place: a vote on
   // one poll must not invalidate a resync snapshot for another poll.
   const pollProjectionVersions = new Map<string, number>();
+  // Replacing a vote is not commutative. Keep requests for one poll in order
+  // so rapid multi-select clicks commit in the intended order.
+  const pollVoteQueues = new Map<string, Promise<void>>();
+
+  const mergeMessagePoll = (existing: Message | undefined, incoming: Message) => {
+    const existingPoll = existing?.poll;
+    const incomingPoll = incoming.poll;
+    if (
+      existingPoll !== null &&
+      existingPoll !== undefined &&
+      incomingPoll !== null &&
+      incomingPoll !== undefined &&
+      existingPoll.revision !== undefined &&
+      incomingPoll.revision !== undefined &&
+      incomingPoll.revision < existingPoll.revision
+    ) {
+      return { ...incoming, poll: existingPoll };
+    }
+    return incoming;
+  };
 
   const invalidateThreadSummary = (threadId: string): number => {
     const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
@@ -997,28 +1017,32 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
+        // An edit carries a full message snapshot, but its poll projection can
+        // have been read before a newer vote committed. Keep the newest poll
+        // while still applying every other field from the edit.
+        const incoming = mergeMessagePoll(existing, event.message);
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
-          event.message,
+          incoming,
         );
-        const nonce = event.message.clientNonce;
+        const nonce = incoming.clientNonce;
         const pending = nonce
           ? (state.pendingByPlace[key] ?? []).filter(
               (entry) => entry.clientNonce !== nonce,
             )
           : (state.pendingByPlace[key] ?? []);
-        const authorKey = participantKey(event.message.author);
+        const authorKey = participantKey(incoming.author);
         const typing = { ...(state.typingByPlace[key] ?? {}) };
         delete typing[authorKey];
         const lastRead =
           authorKey === state.selfKey
-            ? Math.max(state.lastReadByPlace[key] ?? 0, event.message.seq)
+            ? Math.max(state.lastReadByPlace[key] ?? 0, incoming.seq)
             : (state.lastReadByPlace[key] ?? 0);
         const previousContribution = existing
           ? unreadContribution(existing, lastRead, state.selfKey)
           : { unread: 0, mentions: 0 };
         const nextContribution = unreadContribution(
-          event.message,
+          incoming,
           lastRead,
           state.selfKey,
         );
@@ -2230,12 +2254,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
     votePoll(message, optionIds) {
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
-      if (!currentBackend.votePoll) return;
-      const projectionVersion =
-        pollProjectionVersions.get(message.messageId) ?? 0;
-      void currentBackend
-        .votePoll(message.place, message.messageId, optionIds)
-        .then((canonical) => {
+      if (!currentBackend.votePoll) return Promise.resolve();
+      // A failed/replaced transport must not let an unresolved old request
+      // block votes in the new session.
+      const queueKey = `${sessionGeneration}:${message.messageId}`;
+      const previous = pollVoteQueues.get(queueKey) ?? Promise.resolve();
+      const queued = previous
+        .catch(() => undefined)
+        .then(async () => {
+          const projectionVersion =
+            pollProjectionVersions.get(message.messageId) ?? 0;
+          const canonical = await currentBackend.votePoll!(
+            message.place,
+            message.messageId,
+            optionIds,
+          );
           if (
             backend !== currentBackend ||
             messagingSessionGeneration !== sessionGeneration ||
@@ -2273,8 +2306,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
               },
             };
           });
-        })
-        .catch(() => undefined);
+        });
+      pollVoteQueues.set(queueKey, queued);
+      void queued
+        .catch(() => undefined)
+        .finally(() => {
+          if (pollVoteQueues.get(queueKey) === queued)
+            pollVoteQueues.delete(queueKey);
+        });
+      return queued;
     },
 
     async loadOlder(key) {

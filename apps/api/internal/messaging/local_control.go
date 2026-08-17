@@ -423,6 +423,9 @@ func (s *Server) localCreatePoll(w http.ResponseWriter, r *http.Request, authori
 	if request.ClosesInMinutes > 0 {
 		moment := time.Now().Add(time.Duration(request.ClosesInMinutes) * time.Minute)
 		poll.ClosesAt = &moment
+		// The receipt's request identity is the relative promise the agent made,
+		// not this attempt's wall-clock conversion of it.
+		poll.RelativeClosesInMinutes = request.ClosesInMinutes
 	}
 	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
 	if !ok {

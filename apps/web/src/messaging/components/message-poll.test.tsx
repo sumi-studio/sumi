@@ -66,11 +66,21 @@ describe("MessagePoll", () => {
     const value = message();
     render(<MessagePoll message={value} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /明日/ }));
-    expect(votePoll).toHaveBeenLastCalledWith(value, ["tomorrow"]);
-
     fireEvent.click(screen.getByRole("button", { name: /今日/ }));
     expect(votePoll).toHaveBeenLastCalledWith(value, []);
+  });
+
+  it("複数選択の連続クリックは直前の選択を含めた全体置換にする", () => {
+    const value = message();
+    if (!value.poll) throw new Error("test fixture must include a poll");
+    value.poll.allowMulti = true;
+    render(<MessagePoll message={value} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /明日/ }));
+    fireEvent.click(screen.getByRole("button", { name: /今日/ }));
+
+    expect(votePoll).toHaveBeenNthCalledWith(1, value, ["today", "tomorrow"]);
+    expect(votePoll).toHaveBeenNthCalledWith(2, value, ["tomorrow"]);
   });
 
   it("投票者を表示用titleに持ち、締切後は結果だけになる", () => {

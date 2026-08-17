@@ -72,8 +72,6 @@ const MAX_CACHED_MESSAGING_VIEWS: usize = 16;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_THREAD_NAME_CHARS: usize = 100;
-const MAX_POLL_QUESTION_BYTES: usize = 2_000;
-const MAX_POLL_OPTION_BYTES: usize = 800;
 const MAX_POLL_QUESTION_CHARS: usize = 500;
 const MAX_POLL_OPTION_CHARS: usize = 200;
 const MIN_POLL_OPTIONS: usize = 2;
@@ -2292,15 +2290,23 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             closes_in_minutes,
             ..
         } => {
-            validate_bounded_nonempty(question, MAX_POLL_QUESTION_BYTES)?;
+            if question.trim().is_empty()
+                || question.contains('\0')
+                || question.chars().count() > MAX_POLL_QUESTION_CHARS
+            {
+                return Err(ToolError::InvalidArguments);
+            }
             if !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&options.len()) {
                 return Err(ToolError::InvalidArguments);
             }
+            let mut normalized_options = BTreeSet::new();
             for option in options {
-                validate_bounded_nonempty(option, MAX_POLL_OPTION_BYTES)?;
-            }
-            for (index, option) in options.iter().enumerate() {
-                if options[index + 1..].contains(option) {
+                let normalized = option.trim();
+                if normalized.is_empty()
+                    || option.contains('\0')
+                    || option.chars().count() > MAX_POLL_OPTION_CHARS
+                    || !normalized_options.insert(normalized)
+                {
                     return Err(ToolError::InvalidArguments);
                 }
             }
@@ -5265,6 +5271,33 @@ mod tests {
                 vec!["option-1".to_owned()],
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn create_poll_rejects_a_501_character_question_before_calling_the_server() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .expect("open place");
+
+        let error = execute(
+            &tool,
+            json!({
+                "action": "create_poll",
+                "question": "a".repeat(501),
+                "options": ["today", "tomorrow"]
+            }),
+            "question-too-long",
+        )
+        .await
+        .expect_err("501 character question must be rejected by the tool");
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert!(api.polls.lock().await.is_empty());
     }
 
     #[tokio::test]

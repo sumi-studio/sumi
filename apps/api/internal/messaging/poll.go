@@ -48,10 +48,11 @@ func (p Poll) Closed(now time.Time) bool {
 }
 
 type PollInput struct {
-	Question   string
-	AllowMulti bool
-	ClosesAt   *time.Time
-	Options    []string
+	Question                string
+	AllowMulti              bool
+	ClosesAt                *time.Time
+	RelativeClosesInMinutes uint32
+	Options                 []string
 }
 
 func pollMatchesInput(poll *Poll, input *PollInput) bool {
