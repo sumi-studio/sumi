@@ -959,9 +959,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
         };
       });
       if (event.type === "message_created") {
-        advanceThreadProjection(event.message);
-        noteThreadActivity(event.message);
-        presentNotification(event);
+        if (event.message.deleted) {
+          // Catch-up serializes deletions as message_created tombstones. They
+          // must take the same projection path as a live deletion, rather
+          // than becoming apparent new thread activity.
+          applyThreadDeletionSummary(event.message);
+        } else {
+          advanceThreadProjection(event.message);
+          noteThreadActivity(event.message);
+          presentNotification(event);
+        }
       } else {
         const version = advanceThreadProjection(event.message);
         if (version !== null) void refreshThreadSummary(event.message, version);
@@ -1128,6 +1135,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       workspaces: snapshot.workspaces,
       channels: snapshot.channels,
       dms: snapshot.dms,
+      // Threads are participation-scoped lifecycle data just like DMs. Keep
+      // what this client already learned while adding threads it was admitted
+      // to during the disconnect.
+      threadsById: {
+        ...state.threadsById,
+        ...Object.fromEntries(
+          (snapshot.threads ?? []).map((thread) => [thread.threadId, thread]),
+        ),
+      },
       membersByKey,
       lastReadByPlace,
       unreadCountByPlace,

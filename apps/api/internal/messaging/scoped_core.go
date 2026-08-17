@@ -238,14 +238,33 @@ func admitPlaceTenure(ctx context.Context, tx pgx.Tx, placeID string, membership
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("load active place tenure: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		INSERT INTO place_members
 			(place_member_id, workspace_id, place_id, workspace_member_id,
 			 member_kind, member_id, visible_from_seq)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (place_id, member_kind, member_id) WHERE left_at IS NULL
+		DO NOTHING`,
 		newUUIDv7(), membership.WorkspaceID, placeID, membership.WorkspaceMemberID,
-		membership.Participant.Kind, membership.Participant.ID, visibleFrom); err != nil {
+		membership.Participant.Kind, membership.Participant.ID, visibleFrom)
+	if err != nil {
 		return fmt.Errorf("admit place tenure: %w", err)
+	}
+	if result.RowsAffected() == 1 {
+		return nil
+	}
+	// A concurrent admission won the partial unique index. Read its exact
+	// Workspace tenure before treating this attempt as idempotent: a stale
+	// active tenure must remain an authority error, not a successful join.
+	err = tx.QueryRow(ctx, `
+		SELECT workspace_member_id FROM place_members
+		WHERE place_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
+		placeID, membership.Participant.Kind, membership.Participant.ID).Scan(&currentWorkspaceMemberID)
+	if err != nil {
+		return fmt.Errorf("reload active place tenure after conflict: %w", err)
+	}
+	if currentWorkspaceMemberID != membership.WorkspaceMemberID {
+		return errors.New("active place tenure is bound to a stale Workspace tenure")
 	}
 	return nil
 }

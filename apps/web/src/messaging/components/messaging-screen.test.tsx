@@ -176,4 +176,10 @@ describe("MessagingScreen route-owned current place", () => {
     expect(screen.getByText("親: #alpha")).toBeInTheDocument();
     expect(useMessaging.getState().activePlaceKey).toBe("thread:thread-a");
   });
+
+  it("hides thread controls when the backend does not support threads", () => {
+    render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    expect(screen.queryByTitle("スレッド")).not.toBeInTheDocument();
+  });
 });

@@ -42,6 +42,67 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	}
 }
 
+func TestConcurrentThreadParticipantAdmissionIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorldWithMaxConns(t, ctx, 10)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	thread, err := owner.CreateThread(ctx, channel.PlaceID, "同時参加", "")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+
+	lookup, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, err := w.workspaces.ActiveMembershipInTx(ctx, lookup, workspace.WorkspaceID, w.humanB)
+	if err != nil {
+		_ = lookup.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := lookup.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			tx, err := w.store.pool.Begin(ctx)
+			if err != nil {
+				results <- err
+				return
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			<-start
+			if err := admitPlaceTenure(ctx, tx, thread.Place.PlaceID, membership, 1); err != nil {
+				results <- err
+				return
+			}
+			results <- tx.Commit(ctx)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent thread admission: %v", err)
+		}
+	}
+
+	var count int
+	if err := w.store.pool.QueryRow(ctx, `
+		SELECT count(*) FROM place_members
+		WHERE place_id = $1 AND workspace_member_id = $2 AND left_at IS NULL`,
+		thread.Place.PlaceID, membership.WorkspaceMemberID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("active participant tenures = %d, want 1", count)
+	}
+}
+
 func TestThreadSearchUsesParticipationProjection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

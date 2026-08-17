@@ -425,6 +425,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
 export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const ready = useMessaging((state) => state.ready);
   const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
+  const canUseThreads = useMessaging((state) => state.capabilities.threads);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const selectPlace = useMessaging((state) => state.selectPlace);
   const clearPlaceSelection = useMessaging(
@@ -652,7 +653,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           ) : null}
           <span className="ml-auto flex items-center gap-1">
             <MessageSearch onJump={requestJump} />
-            {selectedPlaceKey?.startsWith("channel:") ? (
+            {canUseThreads && selectedPlaceKey?.startsWith("channel:") ? (
               <button
                 type="button"
                 title="スレッド"
@@ -720,7 +721,9 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             )}
           </main>
           {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
-          {threadsOpen && selectedPlaceKey?.startsWith("channel:") ? (
+          {canUseThreads &&
+          threadsOpen &&
+          selectedPlaceKey?.startsWith("channel:") ? (
             <ThreadPanel
               parentKey={selectedPlaceKey}
               onClose={() => setThreadsOpen(false)}

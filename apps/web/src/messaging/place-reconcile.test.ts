@@ -7,6 +7,7 @@ import type {
   Place,
   PlaceKey,
   ServerEvent,
+  ThreadSummary,
 } from "./model";
 import {
   bindMessagingSessionIdentity,
@@ -34,6 +35,21 @@ function dm(dmId: string): DmSummary {
   return { dmId, kind: "dm", participants: [SELF, OTHER] };
 }
 
+function thread(threadId: string): ThreadSummary {
+  return {
+    threadId,
+    workspaceId: "workspace-1",
+    parentPlace: { kind: "channel", channelId: "channel-1" },
+    parentMessageId: "message-1",
+    name: threadId,
+    messageCount: 1,
+    lastMessageAt: 1,
+    lastMessage: "参加してください",
+    participants: [SELF, OTHER],
+    latestSeq: 1,
+  };
+}
+
 function place(key: PlaceKey): Place {
   const [kind, id] = key.split(":");
   return kind === "channel"
@@ -46,6 +62,7 @@ function snapshot(options: {
   dms: DmSummary[];
   unread: Record<PlaceKey, { latest: number; unread: number; mention: number }>;
   lastRead?: Record<PlaceKey, number>;
+  threads?: ThreadSummary[];
 }): BootstrapSnapshot {
   const keys = Object.keys(options.unread) as PlaceKey[];
   return {
@@ -53,6 +70,7 @@ function snapshot(options: {
     workspaces: [{ workspaceId: "workspace-1", name: "Sumi" }],
     channels: options.channels,
     dms: options.dms,
+    threads: options.threads,
     members: [
       { participant: SELF, displayName: "Yohaku", tagline: "" },
       { participant: OTHER, displayName: "Aoi", tagline: "" },
@@ -261,6 +279,27 @@ describe("place lifecycleの再接続突き合わせ", () => {
       [DM_9]: 4,
     });
     expect(backend.listeners.size).toBe(1);
+  });
+
+  it("再接続snapshotで切断中に参加したthreadを既知threadを残して取り込む", async () => {
+    useMessaging.setState({
+      threadsById: { "thread-known": thread("thread-known") },
+    });
+    backend.next = snapshot({
+      channels: [channel("channel-1", "旧トピック")],
+      dms: [],
+      threads: [thread("thread-admitted-offline")],
+      unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
+    });
+
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    expect(useMessaging.getState().threadsById).toMatchObject({
+      "thread-known": { threadId: "thread-known" },
+      "thread-admitted-offline": { threadId: "thread-admitted-offline" },
+    });
   });
 
   it("進行中の未読・既読・ローカルstateを突き合わせで壊さない", async () => {

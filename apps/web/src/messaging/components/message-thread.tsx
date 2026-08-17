@@ -31,6 +31,7 @@ export function MessageThreadChip({ message }: { message: Message }) {
 }
 
 export function MessageThreadAction({ message }: { message: Message }) {
+  const canUseThreads = useMessaging((state) => state.capabilities.threads);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const threads = useMessaging((state) => state.threadsById);
   const createThread = useMessaging((state) => state.createThread);
@@ -38,6 +39,7 @@ export function MessageThreadAction({ message }: { message: Message }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   if (
+    !canUseThreads ||
     !activePlaceKey?.startsWith("channel:") ||
     message.deleted ||
     threadFor(message.messageId, threads)
