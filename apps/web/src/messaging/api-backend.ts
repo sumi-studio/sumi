@@ -5,6 +5,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   NotificationLevel,
   NotificationSetting,
@@ -167,6 +168,17 @@ export class ApiMessagingBackend implements MessagingBackend {
       ),
     );
     return asArray(body.messages).map(parseMessage);
+  }
+
+  async searchMessages(
+    query: string,
+    options: { place?: Place; limit?: number } = {},
+  ): Promise<MessageSearchResult[]> {
+    const params = new URLSearchParams({ q: query });
+    if (options.place) params.set("place_id", placeID(options.place));
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const body = asRecord(await this.request(`/messaging/search?${params}`));
+    return asArray(body.results).map(parseSearchResult);
   }
 
   async createChannel(
@@ -806,6 +818,18 @@ function parseAttachment(value: unknown): Attachment {
     sizeBytes,
     sha256: asString(wire.sha256),
     position,
+  };
+}
+
+function parseSearchResult(value: unknown): MessageSearchResult {
+  const wire = asRecord(value);
+  return {
+    messageId: asString(wire.message_id),
+    place: parsePlace(wire.place),
+    seq: asSeq(wire.seq),
+    author: parseParticipant(wire.author),
+    snippet: asString(wire.snippet),
+    createdAt: asTimestamp(wire.created_at),
   };
 }
 

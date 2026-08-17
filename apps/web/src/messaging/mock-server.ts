@@ -7,6 +7,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   NotificationSetting,
   NotificationSettingInput,
@@ -454,6 +455,47 @@ export class MockMessagingServer implements MessagingBackend {
     const limit = options?.limit ?? 50;
     const slice = messages.filter((message) => message.seq < beforeSeq);
     return slice.slice(Math.max(0, slice.length - limit));
+  }
+
+  async searchMessages(
+    query: string,
+    options: { place?: Place; limit?: number } = {},
+  ): Promise<MessageSearchResult[]> {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return [];
+    const keys = options.place
+      ? [placeKey(options.place)]
+      : [...this.history.keys()];
+    const results: { result: MessageSearchResult; content: string }[] = [];
+    for (const key of keys) {
+      const place = parsePlaceKey(key);
+      if (!place) continue;
+      for (const message of this.history.get(key) ?? []) {
+        if (message.deleted || !message.content.toLowerCase().includes(needle))
+          continue;
+        results.push({
+          content: message.content,
+          result: {
+            messageId: message.messageId,
+            place,
+            seq: message.seq,
+            author: message.author,
+            snippet: searchSnippet(message.content, needle),
+            createdAt: message.createdAt,
+          },
+        });
+      }
+    }
+    results.sort(
+      (a, b) =>
+        trigramSimilarity(b.content, needle) -
+          trigramSimilarity(a.content, needle) ||
+        b.result.createdAt - a.result.createdAt ||
+        (a.result.messageId < b.result.messageId ? 1 : -1),
+    );
+    return results
+      .slice(0, Math.min(options.limit ?? 20, 50))
+      .map((entry) => entry.result);
   }
 
   async createChannel(
@@ -918,4 +960,31 @@ export class MockMessagingServer implements MessagingBackend {
     const dm = DMS.find((entry) => entry.dmId === place.dmId);
     return dm?.participants.some((ref) => sameParticipant(ref, agent)) ?? false;
   }
+}
+
+function searchSnippet(content: string, query: string): string {
+  const characters = Array.from(content);
+  const matchAt = content.toLowerCase().indexOf(query.toLowerCase());
+  const startAt =
+    matchAt < 0 ? 0 : Array.from(content.slice(0, matchAt)).length;
+  const endAt = startAt + Array.from(query).length;
+  const start = Math.max(0, startAt - 40);
+  const end = Math.min(characters.length, endAt + 40);
+  return `${start > 0 ? "…" : ""}${characters.slice(start, end).join("")}${end < characters.length ? "…" : ""}`;
+}
+
+function trigramSimilarity(content: string, query: string): number {
+  const trigrams = (value: string) => {
+    const padded = `  ${value.toLowerCase()} `;
+    return new Set(
+      Array.from({ length: Math.max(0, padded.length - 2) }, (_, i) =>
+        padded.slice(i, i + 3),
+      ),
+    );
+  };
+  const left = trigrams(content);
+  const right = trigrams(query);
+  let shared = 0;
+  for (const trigram of left) if (right.has(trigram)) shared += 1;
+  return shared / (left.size + right.size - shared || 1);
 }

@@ -987,6 +987,48 @@ func TestHumanDirectChatDefaultMigrationBackfillsOnlyAbsentBindings(t *testing.T
 	}
 }
 
+func TestMessageSearchMigrationUpgradeDownAndReupgrade(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 22)
+
+	readMigration := func(name string) string {
+		t.Helper()
+		content, err := migrationFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(content)
+	}
+	up := readMigration("0024_message_search.up.sql")
+	down := readMigration("0024_message_search.down.sql")
+	assertIndex := func(want bool) {
+		t.Helper()
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			"SELECT to_regclass('public.messages_content_trgm') IS NOT NULL",
+		).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != want {
+			t.Fatalf("messages_content_trgm exists=%v, want %v", exists, want)
+		}
+	}
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	assertIndex(true)
+	if _, err := pool.Exec(ctx, down); err != nil {
+		t.Fatalf("downgrade: %v", err)
+	}
+	assertIndex(false)
+	if _, err := pool.Exec(ctx, up); err != nil {
+		t.Fatalf("re-upgrade: %v", err)
+	}
+	assertIndex(true)
+}
+
 func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maxVersion int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {

@@ -28,6 +28,7 @@ import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
+import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
 import { Sidebar } from "./sidebar";
@@ -509,8 +510,11 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     (jump: PendingJump) => {
       placeNavigate(jump.placeKey);
       setPendingJump(jump);
+      if (jump.seq !== undefined) {
+        void loadPlaceAround(jump.placeKey, jump.seq);
+      }
     },
-    [placeNavigate],
+    [placeNavigate, loadPlaceAround],
   );
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。
@@ -579,6 +583,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
+            <MessageSearch onJump={requestJump} />
             {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             {selectedPlaceIsLoaded ? (

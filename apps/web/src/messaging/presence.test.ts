@@ -136,6 +136,9 @@ class FakePresenceBackend implements MessagingBackend {
   async fetchMessages(): Promise<Message[]> {
     return [];
   }
+  async searchMessages(): Promise<import("./model").MessageSearchResult[]> {
+    return [];
+  }
   async createChannel(): ReturnType<MessagingBackend["createChannel"]> {
     throw new Error("unused");
   }
