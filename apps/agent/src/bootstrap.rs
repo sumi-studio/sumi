@@ -40,9 +40,10 @@ use crate::{
         route_policy::RoutePolicy,
         route_reviewer::{
             EscalationObjectionResponder, EscalationReviewer, ExecutionReviewer,
-            ProviderEscalationObjectionResponderTransport, ProviderEscalationReviewerTransport,
-            ProviderExecutionReviewerTransport, ReviewerBudgetV1,
-            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels, ReviewerToolRuntime,
+            PersonalityAgentPromptContextHandle, ProviderEscalationObjectionResponderTransport,
+            ProviderEscalationReviewerTransport, ProviderExecutionReviewerTransport,
+            ReviewerBudgetV1, ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels,
+            ReviewerToolRuntime,
         },
     },
     config::Config,
@@ -1135,6 +1136,19 @@ async fn run_after_not_ready(
             )
             .context("construct advisory Escalation AutoReview")?,
         );
+        let prompt = PromptContext {
+            system_prompt: config.system_prompt.clone(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: registry.definitions(),
+            replay_provenance: None,
+        };
+        // The objection responder uses the PA's model and strict schema, so
+        // reject a configured model that cannot ever perform its retry.
+        RouteReviewerModelSpec::require_structured_output(&model_spec)
+            .context("validate held-call Escalation objection responder model")?;
+        let personality_agent_context = PersonalityAgentPromptContextHandle::new(&prompt);
         let escalation_objection_model = RouteReviewerModelSpec::from_provider(&model_spec);
         let escalation_objection_responder = Arc::new(
             EscalationObjectionResponder::new(
@@ -1143,6 +1157,7 @@ async fn run_after_not_ready(
                     model_spec.clone(),
                 )),
                 ReviewerBudgetV1::escalation(),
+                personality_agent_context.clone(),
             )
             .context("construct held-call Escalation objection responder")?,
         );
@@ -1155,14 +1170,6 @@ async fn run_after_not_ready(
             )
             .with_escalation_objection_responder(escalation_objection_responder),
         );
-        let prompt = PromptContext {
-            system_prompt: config.system_prompt.clone(),
-            memory_blocks: Vec::new(),
-            messages: Vec::new(),
-            provider_context: Vec::new(),
-            tools: registry.definitions(),
-            replay_provenance: None,
-        };
         let driver = InjectedRunDriver::new(
             model_spec,
             RequestOptions::default(),
@@ -1172,6 +1179,7 @@ async fn run_after_not_ready(
             Some(context.authority.generation()),
         )
         .context("compose real provider RunDriver")?
+        .with_personality_agent_prompt_context(personality_agent_context)
         .with_hydrated_memory(
             store.clone(),
             context.authority.lease(),

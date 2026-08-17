@@ -121,6 +121,7 @@ pub(crate) struct PendingApprovalRequest {
     pub review_projection: Value,
     pub reviewer_objection: Option<String>,
     pub pa_reason: Option<String>,
+    pub pa_objection_failure: Option<String>,
 }
 
 impl PendingApprovalRequest {
@@ -131,6 +132,7 @@ impl PendingApprovalRequest {
         redactor: &Redactor,
         reviewer_objection: Option<String>,
         pa_reason: Option<String>,
+        pa_objection_failure: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             id,
@@ -150,6 +152,7 @@ impl PendingApprovalRequest {
                 .redact_value(&Value::Object(bound.review_projection.as_object().clone()))?,
             reviewer_objection,
             pa_reason,
+            pa_objection_failure,
         })
     }
 
@@ -167,14 +170,18 @@ impl PendingApprovalRequest {
                 match (
                     self.reviewer_objection.as_deref(),
                     self.pa_reason.as_deref(),
+                    self.pa_objection_failure.as_deref(),
                 ) {
-                    (Some(objection), Some(pa_reason)) => format!(
+                    (Some(objection), Some(pa_reason), _) => format!(
                         "The PA chose to proceed after AutoReview objected. Reviewer objection: {objection} PA reason: {pa_reason}"
                     ),
-                    (Some(objection), None) => format!(
+                    (Some(objection), None, Some(failure)) => format!(
+                        "AutoReview objected, but the PA objection response could not be obtained ({failure}). The unchanged held call is shown to the Human for the final decision. Reviewer objection: {objection}"
+                    ),
+                    (Some(objection), None, None) => format!(
                         "The PA chose to proceed after AutoReview objected. Reviewer objection: {objection}"
                     ),
-                    (None, _) => "This exact operation requires one-time approval.".to_owned(),
+                    (None, _, _) => "This exact operation requires one-time approval.".to_owned(),
                 },
             ),
             audit: None,
@@ -588,16 +595,10 @@ impl RouteApprovalBroker {
                     self.make_pending(sealed, route, scope, run_id, turn_id, snapshot, review)
                 } else {
                     let Some(responder) = self.escalation_objection_responder.as_ref() else {
-                        let reason = "The held call was withdrawn because the PA objection-response channel is unavailable".to_owned();
-                        return self.deny(
-                            bound,
-                            route,
-                            snapshot,
-                            PolicyDecisionRecord::ElevatedPreflight,
-                            None,
-                            Some(review),
-                            reason,
-                        );
+                        review.pa_objection_failure =
+                            Some("PA objection-response channel is unavailable".to_owned());
+                        return self
+                            .make_pending(sealed, route, scope, run_id, turn_id, snapshot, review);
                     };
                     let response = Box::pin(responder.answer(
                         EscalationObjectionRequest {
@@ -623,16 +624,21 @@ impl RouteApprovalBroker {
                             "The PA withdrew the held call after receiving the AutoReview objection"
                                 .to_owned(),
                         ),
-                        None => self.deny(
-                            bound,
-                            route,
-                            snapshot,
-                            PolicyDecisionRecord::ElevatedPreflight,
-                            None,
-                            Some(review),
-                            "The held call was withdrawn because the PA did not produce a valid objection answer"
-                                .to_owned(),
-                        ),
+                        None => {
+                            let terminal = review
+                                .pa_objection_response
+                                .as_ref()
+                                .expect("objection response was recorded")
+                                .budget
+                                .terminal
+                                .as_str();
+                            review.pa_objection_failure = Some(format!(
+                                "PA did not produce a valid objection answer (terminal: {terminal})"
+                            ));
+                            self.make_pending(
+                                sealed, route, scope, run_id, turn_id, snapshot, review,
+                            )
+                        }
                     }
                 }
             }
@@ -744,6 +750,10 @@ impl RouteApprovalBroker {
             .and_then(|response| response.answer.as_ref())
             .and_then(|answer| answer.reason.as_deref())
             .map(|reason| self.redactor.redact_text(reason));
+        let pa_objection_failure = escalation_review
+            .pa_objection_failure
+            .as_deref()
+            .map(|failure| self.redactor.redact_text(failure));
         let request = PendingApprovalRequest::from_bound(
             request_id.clone(),
             route,
@@ -751,6 +761,7 @@ impl RouteApprovalBroker {
             self.redactor.as_ref(),
             reviewer_objection,
             pa_reason,
+            pa_objection_failure,
         )?;
         let (sender, receiver) = oneshot::channel();
         self.pending
@@ -1509,13 +1520,14 @@ mod tests {
                 EscalationObjectionPrompt, EscalationObjectionResponder,
                 EscalationObjectionResponderTransport, EscalationReviewerPrompt,
                 EscalationReviewerTransport, ExecutionReviewerPrompt, ExecutionReviewerTransport,
-                ReviewerBudgetV1, ReviewerModelSpec, ReviewerTransportError, ReviewerTrustSet,
+                PersonalityAgentPromptContextHandle, ReviewerBudgetV1, ReviewerModelSpec,
+                ReviewerTransportError, ReviewerTrustSet,
             },
         },
         provider::types::{
-            ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
-            RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolDefinition,
-            ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
+            ApiProtocol, PromptContext, ProviderOrigin, PublicAssistantContent,
+            PublicAssistantMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall,
+            ToolDefinition, ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
         },
         tools::{
             AdapterIdentity, AppActionDescriptor, BoundExecutionArguments, BoundToolAdapter,
@@ -1763,6 +1775,13 @@ mod tests {
                 model(),
                 transport.clone(),
                 ReviewerBudgetV1::escalation(),
+                PersonalityAgentPromptContextHandle::new(&PromptContext::new(
+                    "test PA system prompt".to_owned(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )),
             )
             .expect("objection responder"),
         );
@@ -2337,6 +2356,98 @@ mod tests {
         assert_eq!(escalation.calls.load(Ordering::Relaxed), 1);
         assert_eq!(responder.calls.load(Ordering::Relaxed), 1);
         assert!(!broker.any_pending());
+    }
+
+    #[tokio::test]
+    async fn failed_pa_objection_answer_is_visible_to_human_and_does_not_withdraw_held_call() {
+        let (broker, _, _) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"block",
+                "risk":"high",
+                "misunderstanding":null,
+                "rationale":"reviewer objection sentinel"
+            }),
+        );
+        let (broker, responder) = with_objection_answer(broker, json!({"not":"a verdict"}));
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[user_message("still ask the Human")],
+                scope(),
+                "run-objection-failure",
+                "turn-objection-failure",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("objection failure must remain a Human decision");
+        let RouteApprovalOutcome::Pending { pending } = outcome else {
+            panic!("a missing PA objection answer must not withdraw the held call")
+        };
+        let public = pending.request().public_request();
+        assert!(
+            public
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("could not be obtained"))
+        );
+        let review = &pending.durable_evidence().escalation_review;
+        assert!(
+            review
+                .pa_objection_failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("malformed_exhausted"))
+        );
+        assert_eq!(
+            review
+                .pa_objection_response
+                .as_ref()
+                .map(|response| response.budget.terminal),
+            Some(ReviewerTerminalClass::MalformedExhausted)
+        );
+        assert_eq!(responder.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn objection_lane_keeps_redaction_and_visible_user_omission_markers() {
+        const SECRET: &str = "sk-objection-secret-must-not-reach-the-pa";
+        let (broker, _, _) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({
+                "outcome":"block",
+                "risk":"high",
+                "misunderstanding":null,
+                "rationale":"reviewer objection sentinel"
+            }),
+        );
+        let (broker, responder) =
+            with_objection_answer(broker, json!({"outcome":"proceed","reason":null}));
+        let mut transcript = (0..(MAX_CONTEXT_USER_MESSAGES + 1))
+            .map(|index| user_message(format!("historical human turn {index}")))
+            .collect::<Vec<_>>();
+        transcript.push(user_message(format!("latest human secret: {SECRET}")));
+
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &transcript,
+                scope(),
+                "run-objection-redaction",
+                "turn-objection-redaction",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("objection prompt is bounded and redacted");
+        assert!(matches!(outcome, RouteApprovalOutcome::Pending { .. }));
+
+        let prompts = responder.prompts.lock().expect("objection prompts");
+        assert_eq!(prompts.len(), 1);
+        let encoded = prompts[0].to_string();
+        assert!(encoded.contains(REVIEW_TRUNCATION_MARKER));
+        assert!(encoded.contains("[REDACTED:api_key]"));
+        assert!(!encoded.contains(SECRET));
     }
 
     #[tokio::test]

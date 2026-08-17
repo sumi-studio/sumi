@@ -1085,6 +1085,7 @@ mod executor_projection_tests {
                     rationale: format!("private-rationale-{hidden}"),
                 },
                 pa_objection_response: None,
+                pa_objection_failure: None,
             }),
             human_decision: Some(HumanDecisionEvidence {
                 request_id: format!("request-{hidden}"),
@@ -1208,6 +1209,7 @@ mod executor_projection_tests {
                 rationale: "ask".to_owned(),
             },
             pa_objection_response: None,
+            pa_objection_failure: None,
         };
         let mut encoded = serde_json::to_value(escalation).unwrap();
         assert_eq!(encoded.get("tool_trace"), Some(&serde_json::json!([])));

@@ -569,6 +569,7 @@ mod tests {
             &Redactor::v1(),
             None,
             None,
+            None,
         )
         .expect("Human cursor request")
         .public_request();

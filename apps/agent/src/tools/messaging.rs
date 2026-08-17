@@ -3528,6 +3528,7 @@ mod tests {
                 &Redactor::v1(),
                 None,
                 None,
+                None,
             )
             .expect("Human approval request")
             .public_request();

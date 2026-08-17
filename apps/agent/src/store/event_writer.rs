@@ -15401,6 +15401,7 @@ mod tests {
                 rationale: "fixture operation is understood and needs one-time consent".to_owned(),
             },
             pa_objection_response: None,
+            pa_objection_failure: None,
         }
     }
 

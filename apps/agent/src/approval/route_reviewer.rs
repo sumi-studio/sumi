@@ -6,7 +6,10 @@
 //! conversation, the agent's earlier tool-call and tool-result history, and the
 //! exact app-owned action projection.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -202,6 +205,55 @@ fn require_structured_output(
     }
 }
 
+/// The identity-bearing portion of the PromptContext that was actually sent
+/// for the PA turn which proposed the held call.  The objection is a new,
+/// bounded interaction rather than a replay continuation, so provider-native
+/// context is carried as evidence instead of being replayed out of its sealed
+/// send view.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonalityAgentPromptContext {
+    pub system_prompt: String,
+    pub memory_blocks: Vec<crate::provider::types::MemoryBlock>,
+    pub provider_context: Vec<crate::provider::types::ProviderContextItem>,
+}
+
+impl PersonalityAgentPromptContext {
+    pub fn from_prompt(prompt: &PromptContext) -> Self {
+        Self {
+            system_prompt: prompt.system_prompt.clone(),
+            memory_blocks: prompt.memory_blocks.clone(),
+            provider_context: prompt.provider_context.clone(),
+        }
+    }
+}
+
+/// A single PA runtime has one sequential active send view.  The driver
+/// publishes that view immediately before it starts a provider call; the
+/// objection lane snapshots it when the held call is evaluated.
+#[derive(Clone, Debug)]
+pub struct PersonalityAgentPromptContextHandle(Arc<Mutex<PersonalityAgentPromptContext>>);
+
+impl PersonalityAgentPromptContextHandle {
+    pub fn new(prompt: &PromptContext) -> Self {
+        Self(Arc::new(Mutex::new(
+            PersonalityAgentPromptContext::from_prompt(prompt),
+        )))
+    }
+
+    pub fn replace_from_prompt(&self, prompt: &PromptContext) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) =
+            PersonalityAgentPromptContext::from_prompt(prompt);
+    }
+
+    fn snapshot(&self) -> PersonalityAgentPromptContext {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
 /// Complete reviewer identity. A friendly trust-domain label alone is not a
 /// credential: provider endpoint, account scope, and processing policy are all
 /// bound by trusted runtime configuration.
@@ -243,6 +295,10 @@ impl ReviewerModelSpec {
             trust_domain_id: spec.provider_instance_id(),
             data_processing_policy: "configured-provider-binding".to_owned(),
         }
+    }
+
+    pub(crate) fn require_structured_output(spec: &ModelSpec) -> Result<(), ReviewerNotReady> {
+        require_structured_output("Escalation objection", spec)
     }
 
     fn is_complete(&self) -> bool {
@@ -953,12 +1009,13 @@ pub struct EscalationReviewerPrompt {
 #[serde(deny_unknown_fields)]
 pub struct EscalationObjectionPrompt {
     #[serde(skip)]
-    pub system: &'static str,
+    pub system: String,
     #[serde(skip)]
     pub output_schema: EscalationObjectionOutputSchema,
     pub prompt_version: &'static str,
     pub schema_version: &'static str,
     pub request: EscalationObjectionRequest,
+    pub personality_agent_context: PersonalityAgentPromptContext,
     pub retry_validation_code: Option<ReviewerValidationCode>,
 }
 
@@ -1151,7 +1208,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
             &self.spec,
             ReviewerKind::Escalation,
             None,
-            prompt.system,
+            &prompt.system,
             prompt.output_schema.provider_schema(),
             prompt,
             if prompt.retry_validation_code.is_some() {
@@ -1344,6 +1401,7 @@ fn classify_provider_review_error(
 }
 
 trait ProviderReviewPrompt {
+    fn system(&self) -> &str;
     fn prompt_version(&self) -> &'static str;
     fn schema_version(&self) -> &'static str;
     fn participants(&self) -> Option<&ReviewerParticipants>;
@@ -1355,9 +1413,17 @@ trait ProviderReviewPrompt {
     fn additional_evidence(&self) -> Option<Value> {
         None
     }
+
+    fn personality_agent_context(&self) -> Option<&PersonalityAgentPromptContext> {
+        None
+    }
 }
 
 impl ProviderReviewPrompt for ExecutionReviewerPrompt {
+    fn system(&self) -> &str {
+        self.system
+    }
+
     fn prompt_version(&self) -> &'static str {
         self.prompt_version
     }
@@ -1392,6 +1458,10 @@ impl ProviderReviewPrompt for ExecutionReviewerPrompt {
 }
 
 impl ProviderReviewPrompt for EscalationReviewerPrompt {
+    fn system(&self) -> &str {
+        self.system
+    }
+
     fn prompt_version(&self) -> &'static str {
         self.prompt_version
     }
@@ -1426,6 +1496,10 @@ impl ProviderReviewPrompt for EscalationReviewerPrompt {
 }
 
 impl ProviderReviewPrompt for EscalationObjectionPrompt {
+    fn system(&self) -> &str {
+        &self.system
+    }
+
     fn prompt_version(&self) -> &'static str {
         self.prompt_version
     }
@@ -1463,12 +1537,20 @@ impl ProviderReviewPrompt for EscalationObjectionPrompt {
             "kind": "escalation_reviewer_objection",
             "trust": UNTRUSTED_EVIDENCE_LABEL,
             "reviewer_objection": self.request.reviewer_objection,
+            // This is a fresh bounded request, not an authenticated replay of
+            // the original send view.  Preserve opaque provider context as
+            // model-visible evidence instead of attaching it as replay state.
+            "personality_agent_provider_context": self.personality_agent_context.provider_context,
             "choices": [
                 "proceed: present the unchanged held call to the Human",
                 "withdraw: end the held call"
             ],
             "proceed_reason_required": false
         }))
+    }
+
+    fn personality_agent_context(&self) -> Option<&PersonalityAgentPromptContext> {
+        Some(&self.personality_agent_context)
     }
 }
 
@@ -1550,15 +1632,20 @@ fn provider_evidence_digest(
     #[derive(Serialize)]
     #[serde(deny_unknown_fields)]
     struct DigestInput<'a> {
+        system: &'a str,
         conversation: &'a ReviewerTranscript,
         pending_action: PendingActionMessage<'a>,
         structured_evidence: StructuredReviewEvidenceWithoutDigest<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        personality_agent_context: Option<&'a PersonalityAgentPromptContext>,
     }
 
     let encoded = serde_json::to_vec(&DigestInput {
+        system: prompt.system(),
         conversation: prompt.transcript(),
         pending_action: pending_action_message(prompt),
         structured_evidence: structured_evidence_without_digest(prompt),
+        personality_agent_context: prompt.personality_agent_context(),
     })
     .map_err(|error| {
         ReviewerTransportError::Fatal(format!(
@@ -1837,7 +1924,10 @@ fn build_provider_review_request(
     messages.push(synthetic_user_message(structured_evidence));
     let context = PromptContext::new(
         system.to_owned(),
-        Vec::new(),
+        prompt
+            .personality_agent_context()
+            .map(|context| context.memory_blocks.clone())
+            .unwrap_or_default(),
         messages,
         Vec::new(),
         tools.to_vec(),
@@ -1976,6 +2066,10 @@ pub struct EscalationReviewEvidence {
     pub decision: EscalationReviewDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pa_objection_response: Option<Box<EscalationObjectionResponseEvidence>>,
+    /// Present only when the PA could not answer the objection.  A reviewer
+    /// failure is advisory and must not withdraw the held call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pa_objection_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2264,6 +2358,7 @@ pub struct EscalationObjectionResponder {
     model: ReviewerModelSpec,
     transport: Arc<dyn EscalationObjectionResponderTransport>,
     budget: CompiledReviewerBudget,
+    personality_agent_context: PersonalityAgentPromptContextHandle,
 }
 
 impl EscalationObjectionResponder {
@@ -2271,6 +2366,7 @@ impl EscalationObjectionResponder {
         model: ReviewerModelSpec,
         transport: Arc<dyn EscalationObjectionResponderTransport>,
         budget: ReviewerBudgetV1,
+        personality_agent_context: PersonalityAgentPromptContextHandle,
     ) -> Result<Self, ReviewerNotReady> {
         if transport.model_spec() != &model {
             return Err(ReviewerNotReady::UntrustedModel);
@@ -2279,6 +2375,7 @@ impl EscalationObjectionResponder {
             model,
             transport,
             budget: budget.compile()?,
+            personality_agent_context,
         })
     }
 
@@ -2287,6 +2384,10 @@ impl EscalationObjectionResponder {
         request: EscalationObjectionRequest,
         cancel: CancellationToken,
     ) -> EscalationObjectionResponseEvidence {
+        let personality_agent_context = self.personality_agent_context.snapshot();
+        if !objection_request_is_bounded(&request, &personality_agent_context) {
+            return self.evidence(0, ReviewerTerminalClass::InsufficientEvidence, None);
+        }
         let mut retry_validation_code = None;
         let mut structured_retry_used = false;
         let started = Instant::now();
@@ -2294,11 +2395,18 @@ impl EscalationObjectionResponder {
         loop {
             attempts += 1;
             let prompt = EscalationObjectionPrompt {
-                system: ESCALATION_OBJECTION_SYSTEM_PROMPT,
+                // Keep the PA's own system instructions first so its identity
+                // remains authoritative.  The objection-specific instruction
+                // follows as the bounded task for this one response.
+                system: format!(
+                    "{}\n\n{}",
+                    personality_agent_context.system_prompt, ESCALATION_OBJECTION_SYSTEM_PROMPT
+                ),
                 output_schema: EscalationObjectionOutputSchema::v1(),
                 prompt_version: ESCALATION_OBJECTION_PROMPT_VERSION_V1,
                 schema_version: ESCALATION_OBJECTION_SCHEMA_VERSION_V1,
                 request: request.clone(),
+                personality_agent_context: personality_agent_context.clone(),
                 retry_validation_code,
             };
             let attempt = run_attempt(
@@ -2371,6 +2479,15 @@ impl EscalationObjectionResponder {
             answer,
         }
     }
+}
+
+fn objection_request_is_bounded(
+    request: &EscalationObjectionRequest,
+    personality_agent_context: &PersonalityAgentPromptContext,
+) -> bool {
+    serde_json::to_vec(&(request, personality_agent_context))
+        .map(|encoded| encoded.len() <= MAX_REVIEW_REQUEST_BYTES)
+        .unwrap_or(false)
 }
 
 fn normalize_optional_reason(answer: &mut EscalationObjectionAnswer) {
@@ -2669,6 +2786,7 @@ fn escalation_result(
         tool_trace,
         decision,
         pa_objection_response: None,
+        pa_objection_failure: None,
     };
     if ask_human && evidence.decision.outcome == EscalationReviewOutcome::AskHuman {
         EscalationReviewResult::AskHuman(evidence)
@@ -2702,6 +2820,7 @@ fn escalation_synthetic_block(
             },
         },
         pa_objection_response: None,
+        pa_objection_failure: None,
     };
     EscalationReviewResult::AskHuman(evidence)
 }
@@ -2936,6 +3055,35 @@ mod tests {
         prompts: Mutex<Vec<EscalationReviewerPrompt>>,
     }
 
+    struct RecordingObjectionTransport {
+        responses: Mutex<VecDeque<Result<String, ReviewerTransportError>>>,
+        prompts: Mutex<Vec<EscalationObjectionPrompt>>,
+    }
+
+    #[async_trait]
+    impl EscalationObjectionResponderTransport for RecordingObjectionTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+
+        async fn complete(
+            &self,
+            prompt: &EscalationObjectionPrompt,
+            _cancel: CancellationToken,
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            self.prompts.lock().unwrap().push(prompt.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fixture response")
+                .map(|text| ReviewerTransportOutput {
+                    text,
+                    tool_trace: Vec::new(),
+                })
+        }
+    }
+
     #[async_trait]
     impl EscalationReviewerTransport for RecordingEscalationTransport {
         fn model_spec(&self) -> &ReviewerModelSpec {
@@ -3044,6 +3192,45 @@ mod tests {
                 PolicyDecisionRecord::ElevatedPreflight,
             ),
         }
+    }
+
+    fn pa_prompt_context() -> PromptContext {
+        use crate::provider::types::{
+            ApiProtocol, MemoryBlock, MemoryLayer, ProviderContextAnchor, ProviderContextItem,
+            ProviderContextPayload, ProviderOrigin,
+        };
+
+        PromptContext::new(
+            "PA system context sentinel".to_owned(),
+            vec![MemoryBlock {
+                layer: MemoryLayer::L2,
+                text: "PA memory context sentinel".to_owned(),
+                time_range: None,
+            }],
+            Vec::new(),
+            vec![ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "pa-context-message".to_owned(),
+                    message_seq: 7,
+                },
+                origin_message: None,
+                wire_item_index: None,
+                ordinal: 0,
+                provider_origin: ProviderOrigin {
+                    provider_instance_id: "pa-provider-sentinel".to_owned(),
+                    protocol: ApiProtocol::OpenAiResponses,
+                    model: "pa-model-sentinel".to_owned(),
+                },
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({"pa_provider_context":"sentinel"})],
+                    coverage: crate::provider::types::NativeCompactionCoverage {
+                        through_message_seq: 7,
+                        context_fingerprint: "pa-context-fingerprint".to_owned(),
+                    },
+                },
+            }],
+            Vec::new(),
+        )
     }
 
     static FIXTURE_REVIEWER_MODEL: LazyLock<ReviewerModelSpec> = LazyLock::new(|| {
@@ -3903,6 +4090,135 @@ mod tests {
                 reviewer: "Execution"
             })
         ));
+    }
+
+    #[test]
+    fn structured_output_incompatible_objection_responder_fails_startup() {
+        assert!(matches!(
+            ReviewerModelSpec::require_structured_output(
+                &ModelSpec::preset("umans").expect("unsupported fixture preset")
+            ),
+            Err(ReviewerNotReady::StructuredOutputUnsupported {
+                reviewer: "Escalation objection"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn objection_prompt_carries_pa_context_and_digest_binds_every_part() {
+        let pa_prompt = pa_prompt_context();
+        let context = PersonalityAgentPromptContextHandle::new(&pa_prompt);
+        let transport = Arc::new(RecordingObjectionTransport {
+            responses: Mutex::new(VecDeque::from([Ok(
+                r#"{"outcome":"proceed","reason":"PA context considered"}"#.to_owned(),
+            )])),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let responder = EscalationObjectionResponder::new(
+            reviewer_model(),
+            transport.clone(),
+            ReviewerBudgetV1::escalation(),
+            context,
+        )
+        .expect("objection responder");
+        let evidence = responder
+            .answer(
+                EscalationObjectionRequest {
+                    review: escalation_request(),
+                    reviewer_objection: "reviewer objection sentinel".to_owned(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            evidence.answer.unwrap().outcome,
+            EscalationObjectionOutcome::Proceed
+        );
+        let prompt = transport.prompts.lock().unwrap().pop().unwrap();
+        assert!(prompt.system.starts_with("PA system context sentinel"));
+        assert!(prompt.system.contains(ESCALATION_OBJECTION_SYSTEM_PROMPT));
+        assert_eq!(
+            prompt.personality_agent_context,
+            PersonalityAgentPromptContext::from_prompt(&pa_prompt)
+        );
+        let (provider_prompt, _) = build_provider_review_request(
+            &ModelSpec::preset("kimi-k3").unwrap(),
+            &prompt.system,
+            prompt.output_schema.provider_schema(),
+            &prompt,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(provider_prompt.memory_blocks, pa_prompt.memory_blocks);
+        let provider_messages = serde_json::to_string(&provider_prompt.messages).unwrap();
+        assert!(provider_messages.contains("pa_provider_context"));
+
+        let baseline = provider_evidence_digest(&prompt).unwrap();
+        let mut changed_composed_system = prompt.clone();
+        changed_composed_system.system.push('!');
+        assert_ne!(
+            baseline,
+            provider_evidence_digest(&changed_composed_system).unwrap()
+        );
+        let mut changed_system = prompt.clone();
+        changed_system
+            .personality_agent_context
+            .system_prompt
+            .push('!');
+        assert_ne!(baseline, provider_evidence_digest(&changed_system).unwrap());
+        let mut changed_memory = prompt.clone();
+        changed_memory.personality_agent_context.memory_blocks[0]
+            .text
+            .push('!');
+        assert_ne!(baseline, provider_evidence_digest(&changed_memory).unwrap());
+        let mut changed_provider_context = prompt;
+        changed_provider_context
+            .personality_agent_context
+            .provider_context[0]
+            .ordinal = 1;
+        assert_ne!(
+            baseline,
+            provider_evidence_digest(&changed_provider_context).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_pa_objection_context_is_visible_as_insufficient_evidence_without_a_call() {
+        let mut pa_prompt = pa_prompt_context();
+        pa_prompt.system_prompt = "x".repeat(MAX_REVIEW_REQUEST_BYTES);
+        let context = PersonalityAgentPromptContextHandle::new(&pa_prompt);
+        let transport = Arc::new(RecordingObjectionTransport {
+            responses: Mutex::new(VecDeque::from([Ok(
+                r#"{"outcome":"proceed","reason":"must remain unused"}"#.to_owned(),
+            )])),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let responder = EscalationObjectionResponder::new(
+            reviewer_model(),
+            transport.clone(),
+            ReviewerBudgetV1::escalation(),
+            context,
+        )
+        .expect("objection responder");
+
+        let evidence = responder
+            .answer(
+                EscalationObjectionRequest {
+                    review: escalation_request(),
+                    reviewer_objection: "reviewer objection sentinel".to_owned(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(evidence.budget.attempts, 0);
+        assert_eq!(
+            evidence.budget.terminal,
+            ReviewerTerminalClass::InsufficientEvidence
+        );
+        assert!(evidence.answer.is_none());
+        assert!(transport.prompts.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -540,6 +540,7 @@ fn escalation_review_denial() -> ToolExecutionDenialEvidence {
                 rationale: rationale.clone(),
             },
             pa_objection_response: None,
+            pa_objection_failure: None,
         }),
         reason: rationale,
     }
