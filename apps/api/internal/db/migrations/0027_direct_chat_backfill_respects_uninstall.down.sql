@@ -1,0 +1,1 @@
+-- Irreversible: the removed rows were themselves a backfill artifact.
