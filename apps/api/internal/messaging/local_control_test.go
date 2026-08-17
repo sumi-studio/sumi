@@ -291,7 +291,7 @@ func TestLocalExactCallStateReconcilesAfterRestart(t *testing.T) {
 	server := NewServer(w.store.core, nil)
 	calls := NewCallService(server, testLiveKit())
 	calls.RoomService = stubLiveKitRoomService{
-		rooms: []liveKitRoom{{Name: channel.PlaceID, CreatedAt: time.Now().Unix()}},
+		rooms: []liveKitRoom{{Name: channel.PlaceID, SID: testRoomSID, CreatedAt: time.Now().Unix()}},
 		participants: map[string][]liveKitParticipant{
 			channel.PlaceID: {{Identity: w.humanA.Key(), JoinedAt: time.Now().Unix()}},
 		},
