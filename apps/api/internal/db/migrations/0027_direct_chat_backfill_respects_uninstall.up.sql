@@ -3,9 +3,9 @@
 -- removes the binding while keeping the durable install receipt, that also
 -- recreated Direct Chat for Humans who had explicitly uninstalled it. Remove
 -- only those unchanged, deterministic 0022 bindings when a successful Direct
--- Chat install receipt predates the backfill.
+-- Chat install receipt exists and the latest such receipt predates the backfill.
 DELETE FROM app_installations ai
-USING humans h, app_install_operation_receipts r
+USING humans h
 WHERE ai.owner_kind = 'human'
   AND ai.owner_id = h.human_id
   AND ai.app_id = 'direct-chat'
@@ -18,9 +18,12 @@ WHERE ai.owner_kind = 'human'
       substr(md5('sumi:direct-chat-backfill:v1:' || h.human_id), 4, 3) ||
       '-' ||
       substr(md5('sumi:direct-chat-backfill:v1:' || h.human_id), 7, 12)
-  AND r.owner_kind = 'human'
-  AND r.owner_id = h.human_id
-  AND r.app_id = 'direct-chat'
-  AND r.status IN ('installed', 'already_installed')
-  AND r.completed_at IS NOT NULL
-  AND r.completed_at < ai.installed_at;
+  AND (
+      SELECT max(r.completed_at)
+      FROM app_install_operation_receipts r
+      WHERE r.owner_kind = 'human'
+        AND r.owner_id = h.human_id
+        AND r.app_id = 'direct-chat'
+        AND r.status IN ('installed', 'already_installed')
+        AND r.completed_at IS NOT NULL
+  ) < ai.installed_at;

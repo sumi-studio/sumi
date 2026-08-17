@@ -998,19 +998,24 @@ func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
 		neverInstalledID   = "0198f0f4-9b72-7000-8000-0000000003a2"
 		liveHumanID        = "0198f0f4-9b72-7000-8000-0000000003a3"
 		incompleteHumanID  = "0198f0f4-9b72-7000-8000-0000000003a4"
+		reinstalledHumanID = "0198f0f4-9b72-7000-8000-0000000003a5"
 
 		uninstalledAppID = "0198f0f4-9b72-7000-8000-0000000003b1"
 		liveAppID        = "0198f0f4-9b72-7000-8000-0000000003b3"
+		oldReinstallID   = "0198f0f4-9b72-7000-8000-0000000003b5"
 
 		uninstalledOperationID = "00000000-0000-4000-8000-0000000003a1"
 		liveOperationID        = "00000000-0000-4000-8000-0000000003a3"
 		incompleteOperationID  = "00000000-0000-4000-8000-0000000003a4"
+		oldReinstallOperation  = "00000000-0000-4000-8000-0000000003a5"
+		newReinstallOperation  = "00000000-0000-4000-8000-0000000003c5"
 	)
 	past := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	createdAt := past.Add(-time.Minute)
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO humans (human_id) VALUES ($1), ($2), ($3), ($4)`,
+		INSERT INTO humans (human_id) VALUES ($1), ($2), ($3), ($4), ($5)`,
 		uninstalledHumanID, neverInstalledID, liveHumanID, incompleteHumanID,
+		reinstalledHumanID,
 	); err != nil {
 		t.Fatalf("insert Humans: %v", err)
 	}
@@ -1020,10 +1025,12 @@ func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
 			 enabled, authority_epoch, installed_at, updated_at, created_at, completed_at)
 		VALUES
 			('human', $1, $2, 'direct-chat', 'installed', $3, true, 1, $4, $4, $5, $4),
-			('human', $6, $7, 'direct-chat', 'installed', $8, true, 1, $4, $4, $5, $4)`,
+			('human', $6, $7, 'direct-chat', 'installed', $8, true, 1, $4, $4, $5, $4),
+			('human', $9, $10, 'direct-chat', 'installed', $11, true, 1, $4, $4, $5, $4)`,
 		uninstalledHumanID, uninstalledOperationID, uninstalledAppID,
 		past, createdAt,
 		liveHumanID, liveOperationID, liveAppID,
+		reinstalledHumanID, oldReinstallOperation, oldReinstallID,
 	); err != nil {
 		t.Fatalf("insert completed install receipts: %v", err)
 	}
@@ -1069,13 +1076,34 @@ func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
 		}
 		return installationID
 	}
-	for _, humanID := range []string{uninstalledHumanID, neverInstalledID, incompleteHumanID, liveHumanID} {
+	for _, humanID := range []string{
+		uninstalledHumanID, neverInstalledID, incompleteHumanID, liveHumanID,
+		reinstalledHumanID,
+	} {
 		if directChatInstallationID(humanID) == "" {
 			t.Fatalf("0022 did not leave a Direct Chat installation for %s", humanID)
 		}
 	}
 	if got := directChatInstallationID(liveHumanID); got != liveAppID {
 		t.Fatalf("0022 changed the existing Direct Chat installation: got %q, want %q", got, liveAppID)
+	}
+	var backfilledAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT installed_at
+		FROM app_installations
+		WHERE owner_kind = 'human' AND owner_id = $1 AND app_id = 'direct-chat'`,
+		reinstalledHumanID,
+	).Scan(&backfilledAt); err != nil {
+		t.Fatalf("load backfilled Direct Chat timestamp: %v", err)
+	}
+	newInstallAt := backfilledAt.Add(time.Second)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_install_operation_receipts
+			(owner_kind, owner_id, operation_id, app_id, status, created_at, completed_at)
+		VALUES ('human', $1, $2, 'direct-chat', 'already_installed', $3, $3)`,
+		reinstalledHumanID, newReinstallOperation, newInstallAt,
+	); err != nil {
+		t.Fatalf("insert post-backfill Direct Chat install receipt: %v", err)
 	}
 
 	up := readMigration("0027_direct_chat_backfill_respects_uninstall.up.sql")
@@ -1102,7 +1130,9 @@ func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
 	if installationExists(uninstalledHumanID) {
 		t.Fatal("0027 retained the 0022 Direct Chat backfill after an explicit uninstall")
 	}
-	for _, humanID := range []string{neverInstalledID, incompleteHumanID, liveHumanID} {
+	for _, humanID := range []string{
+		neverInstalledID, incompleteHumanID, liveHumanID, reinstalledHumanID,
+	} {
 		if !installationExists(humanID) {
 			t.Fatalf("0027 unexpectedly removed Direct Chat for %s", humanID)
 		}
@@ -1117,7 +1147,9 @@ func TestDirectChatBackfillRespectsExplicitUninstallMigration(t *testing.T) {
 	if installationExists(uninstalledHumanID) {
 		t.Fatal("reapplying 0027 recreated a removed Direct Chat installation")
 	}
-	for _, humanID := range []string{neverInstalledID, incompleteHumanID, liveHumanID} {
+	for _, humanID := range []string{
+		neverInstalledID, incompleteHumanID, liveHumanID, reinstalledHumanID,
+	} {
 		if !installationExists(humanID) {
 			t.Fatalf("reapplying 0027 removed Direct Chat for %s", humanID)
 		}
