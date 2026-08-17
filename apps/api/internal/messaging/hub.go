@@ -71,6 +71,7 @@ const (
 	EventMessageEdited      = "message_edited"
 	EventMessageDeleted     = "message_deleted"
 	EventReactionUpdated    = "reaction_updated"
+	EventPollUpdated        = "poll_updated"
 	EventTyping             = "typing"
 	EventStatusUpdated      = "status_updated"
 	EventReplyLaterCreated  = "reply_later_created"

@@ -963,20 +963,34 @@ func enqueueAttachmentDeletionsInTx(ctx context.Context, tx pgx.Tx, workspaceID,
 // replay compares it so a changed request under the same nonce is a conflict.
 // Attachment identities are server-minted and one-to-one with immutable
 // manifests, so listing them in order fixes the manifests as well.
-func messageRequestDigest(content, urgency, replyTo string, attachmentIDs []string) []byte {
+func messageRequestDigest(content, urgency, replyTo string, attachmentIDs []string, poll *PollInput) []byte {
 	ids := attachmentIDs
 	if ids == nil {
 		ids = []string{}
 	}
+	if poll == nil {
+		canonical, err := json.Marshal(struct {
+			Content     string   `json:"content"`
+			Urgency     string   `json:"urgency"`
+			ReplyTo     string   `json:"reply_to"`
+			Attachments []string `json:"attachments"`
+		}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids})
+		if err != nil {
+			panic(fmt.Sprintf("marshal message request digest: %v", err))
+		}
+		sum := sha256.Sum256(append([]byte("sumi-messaging-request-v1\x00"), canonical...))
+		return sum[:]
+	}
 	canonical, err := json.Marshal(struct {
-		Content     string   `json:"content"`
-		Urgency     string   `json:"urgency"`
-		ReplyTo     string   `json:"reply_to"`
-		Attachments []string `json:"attachments"`
-	}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids})
+		Content     string    `json:"content"`
+		Urgency     string    `json:"urgency"`
+		ReplyTo     string    `json:"reply_to"`
+		Attachments []string  `json:"attachments"`
+		Poll        PollInput `json:"poll"`
+	}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids, Poll: *poll})
 	if err != nil {
 		panic(fmt.Sprintf("marshal message request digest: %v", err))
 	}
-	sum := sha256.Sum256(append([]byte("sumi-messaging-request-v1\x00"), canonical...))
+	sum := sha256.Sum256(append([]byte("sumi-messaging-request-v2\x00"), canonical...))
 	return sum[:]
 }

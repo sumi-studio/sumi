@@ -194,6 +194,23 @@
 - REST の `/messaging/*` は OpenAPI 契約（`contracts/openapi.yaml`）にはまだ 1 本も
   載っておらず、この文書が唯一の契約記述である。添付の 2 route も同じ扱いにしてある。
 
+### Poll — messageと同時に確定する質問（追補）
+
+- `Message.poll` は任意の1件で、pollはcarrier messageと1対1である。question、
+  `allow_multi`、任意の`closes_at`、2〜10件のoptionを持つ。option idはserverが割り当て、
+  voterは匿名化せず`ParticipantRef`で全員に見える。
+- pollは送信bodyの`poll`として渡し、message insert・seq・mention・attachment・通知と
+  同じtransactionで作る。pollだけ（空content、添付なし）のmessageも有効である。
+  nonce replayはpollを含むcanonical requestとして比較し、異なる再送は
+  `409 idempotency_conflict`になる。
+- `POST /messaging/places/{place_id}/messages/{message_id}/poll/vote` の
+  `option_ids`は本人の選択全体の置換で、空配列は取り下げである。single choiceへの複数票、
+  他pollのoption、締切後の投票をserverが拒否する。締切判定はserver clockを正本にする。
+- tombstoneはpoll・option・vote投影を削除する。editとreactionはpollを保持する。
+  `poll_updated`はcanonicalなmessage全体を運ぶが、reaction同様にplace replay cursorを
+  進めない。clientはpoll部分だけをpatchし、`caught_up`時にロード済み範囲を再取得して
+  切断中の更新へ収束する。
+
 ## API / event（人間UI側）
 
 - REST: place一覧、履歴取得（seqベースのpagination）、read marker更新、
@@ -224,6 +241,7 @@
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,
   `message_pinned`。
 - WS event（volatile）: `typing`, `status_updated`（下記）。
+- WS event（projection update、cursorを進めない）: `reaction_updated`, `poll_updated`。
 
 ### Status と ReplyLater — 自己申告のattention
 
@@ -309,6 +327,9 @@ agentにとってより適した方法があるときだけそちらで代替す
    Threadにはread-onlyの `threads` とmutatingな `create_thread` があり、後者は
    作成後にそのthreadを現在のviewとして開く。起点messageを指定する場合は現在の
    open画面に見えているmessageだけを対象にする。
+   Pollにはmutatingな `create_poll` と `vote_poll` がある。`create_poll`の締切は
+   agentからserver clock基準の相対分数で渡す。`vote_poll`はADR 0011 §3どおり、現在の
+   open画面に見えているpoll messageだけを対象にし、全選択の置換（空は取り下げ）を行う。
 3. **人生ログへの記録**: agent基盤がprovenanceとともに記録する。正本はWorkspace
    API側で、agent DBはlocal copy/projection（ADR 0008 §8）。
 

@@ -22,13 +22,13 @@ use uuid::{Uuid, Variant, Version};
 use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest, ExactMessagingScope,
-        GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
-        MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        CreateMessagingPollRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
+        ExactMessagingScope, GetMessagingCallStateRequest, ListMessagingThreadsRequest,
+        MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
         OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
         ReactMessagingReactionRequest, ReadMessagingThroughRequest,
         ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
-        UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
+        UploadMessagingAttachmentRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
     },
     approval::authority::MessagingSourceSigningContinuation,
     provider::types::{ToolDefinition, UserContent},
@@ -72,6 +72,10 @@ const MAX_CACHED_MESSAGING_VIEWS: usize = 16;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_THREAD_NAME_CHARS: usize = 100;
+const MAX_POLL_QUESTION_BYTES: usize = 2_000;
+const MAX_POLL_OPTION_BYTES: usize = 800;
+const MIN_POLL_OPTIONS: usize = 2;
+const MAX_POLL_OPTIONS: usize = 10;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MessagingProposal {
@@ -102,6 +106,26 @@ enum MessagingAction {
         message_id: Option<String>,
         #[serde(default)]
         seq: Option<u64>,
+    },
+    /// Ask the open place a question. The poll and its carrier message commit together.
+    CreatePoll {
+        question: String,
+        options: Vec<String>,
+        #[serde(default)]
+        allow_multi: bool,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        closes_in_minutes: Option<u32>,
+    },
+    /// Replace this person's entire answer to a poll on a visible message.
+    VotePoll {
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        #[serde(default)]
+        option_ids: Vec<String>,
     },
     /// Write in the place currently open in this view.
     Write {
@@ -175,6 +199,21 @@ enum BoundMessagingAction {
         name: String,
         #[serde(default)]
         parent_message_id: Option<String>,
+    },
+    CreatePoll {
+        place_id: String,
+        question: String,
+        options: Vec<String>,
+        allow_multi: bool,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        closes_in_minutes: Option<u32>,
+    },
+    VotePoll {
+        place_id: String,
+        message_id: String,
+        option_ids: Vec<String>,
     },
     Write {
         place_id: String,
@@ -600,7 +639,7 @@ fn messaging_parameters_schema() -> Value {
                 "enum": [
                     "overview", "open", "write", "open_attachment", "react",
                     "status", "reply_later", "resolve_reply_later", "get_call_state",
-                    "threads", "create_thread"
+                    "threads", "create_thread", "create_poll", "vote_poll"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -611,7 +650,9 @@ fn messaging_parameters_schema() -> Value {
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept; ",
                     "get_call_state reports who is currently in calls you can see; threads lists ",
-                    "side conversations under the open place; create_thread creates one and opens it."
+                    "side conversations under the open place; create_thread creates one and opens it; ",
+                    "create_poll asks the open place a question; vote_poll replaces your answer ",
+                    "to a poll carried by a visible message."
                 )
             },
             "place_id": {
@@ -622,6 +663,34 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "maxLength": 100,
                 "description": "Required for create_thread and omitted for other actions."
+            },
+            "question": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Required for create_poll and omitted for other actions. What the poll asks."
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": 200},
+                "minItems": 2,
+                "maxItems": 10,
+                "description": "Required for create_poll. Two to ten distinct answer labels."
+            },
+            "allow_multi": {
+                "type": "boolean",
+                "description": "Optional for create_poll. When true, each voter may select multiple options."
+            },
+            "closes_in_minutes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10080,
+                "description": "Optional for create_poll. Relative lifetime evaluated by the server clock."
+            },
+            "option_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+                "description": "Required for vote_poll. The visible poll option ids forming your entire replacement vote; empty withdraws."
             },
             "before_seq": {
                 "type": "integer",
@@ -660,9 +729,9 @@ fn messaging_parameters_schema() -> Value {
             "message_id": {
                 "type": "string",
                 "description": concat!(
-                    "For react, reply_later, and create_thread, omitted for other actions. The ",
-                    "target or optional thread-origin message by message_id. React and reply_later ",
-                    "require exactly one of message_id or seq; create_thread may omit both or use ",
+                    "For react, reply_later, vote_poll, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by message_id. React, reply_later, and ",
+                    "vote_poll require exactly one of message_id or seq; create_thread may omit both or use ",
                     "exactly one. The message must be visible in the currently open place."
                 )
             },
@@ -670,9 +739,9 @@ fn messaging_parameters_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "description": concat!(
-                    "For react, reply_later, and create_thread, omitted for other actions. The ",
-                    "target or optional thread-origin message by its seq in the currently open ",
-                    "place. React and reply_later require exactly one of message_id or seq; ",
+                    "For react, reply_later, vote_poll, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by its seq in the currently open place. ",
+                    "React, reply_later, and vote_poll require exactly one of message_id or seq; ",
                     "create_thread may omit both or use exactly one."
                 )
             },
@@ -874,6 +943,69 @@ impl BoundToolAdapter for MessagingTool {
                     "create_thread",
                     CapabilityClass::Mutate,
                     scopes,
+                    arguments.clone(),
+                    arguments,
+                )
+            }
+            MessagingAction::CreatePoll {
+                question,
+                options,
+                allow_multi,
+                content,
+                closes_in_minutes,
+            } => {
+                let state = view.lock().await;
+                let place_id = focused_place_for_binding(&state, "create_poll")?;
+                let mut arguments = object([
+                    ("action", Value::String("create_poll".to_owned())),
+                    ("place_id", Value::String(place_id.clone())),
+                    ("question", Value::String(question)),
+                    (
+                        "options",
+                        serde_json::to_value(options).expect("strings serialize"),
+                    ),
+                    ("allow_multi", Value::Bool(allow_multi)),
+                ]);
+                insert_optional_string(&mut arguments, "content", content);
+                insert_optional_u64(
+                    &mut arguments,
+                    "closes_in_minutes",
+                    closes_in_minutes.map(u64::from),
+                );
+                messaging_binding(
+                    &scope,
+                    "create_poll",
+                    CapabilityClass::Mutate,
+                    vec![ResourceScope::resource("messaging", "place", &place_id)],
+                    arguments.clone(),
+                    arguments,
+                )
+            }
+            MessagingAction::VotePoll {
+                message_id,
+                seq,
+                option_ids,
+            } => {
+                let state = view.lock().await;
+                let place_id = focused_place_for_binding(&state, "vote_poll")?;
+                let target = visible_target_for_binding(&state, &message_id, seq, "vote_poll")?;
+                let arguments = object([
+                    ("action", Value::String("vote_poll".to_owned())),
+                    ("place_id", Value::String(place_id.clone())),
+                    ("message_id", Value::String(target.message_id.clone())),
+                    (
+                        "option_ids",
+                        serde_json::to_value(option_ids).expect("strings serialize"),
+                    ),
+                ]);
+                messaging_binding(
+                    &scope,
+                    "vote_poll",
+                    CapabilityClass::Mutate,
+                    vec![
+                        ResourceScope::resource("messaging", "place", &place_id),
+                        ResourceScope::resource("messaging", "message", &target.message_id),
+                    ],
                     arguments.clone(),
                     arguments,
                 )
@@ -1396,6 +1528,56 @@ impl MessagingTool {
                 state.visible_messages.clear();
                 response
             }
+            BoundMessagingAction::CreatePoll {
+                place_id,
+                question,
+                options,
+                allow_multi,
+                content,
+                closes_in_minutes,
+            } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_poll(scope, CreateMessagingPollRequest {
+                        place_id: &place_id,
+                        question: &question,
+                        options: &options,
+                        allow_multi,
+                        content: content.as_deref(),
+                        client_nonce: &nonce,
+                        closes_in_minutes,
+                    }) => result,
+                }.map_err(map_messaging_api_error)?;
+                if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
+                    upsert_visible_message(state, visible_message_from_mutation(&response)?);
+                }
+                response
+            }
+            BoundMessagingAction::VotePoll {
+                place_id,
+                message_id,
+                option_ids,
+            } => {
+                let response = tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.vote_poll(scope, VoteMessagingPollRequest {
+                        place_id: &place_id,
+                        message_id: &message_id,
+                        option_ids: &option_ids,
+                    }) => result,
+                }.map_err(map_messaging_api_error)?;
+                if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
+                    let visible = visible_message_from_mutation(&response)?;
+                    if visible.message_id != message_id {
+                        return Err(ToolError::Protocol(
+                            "Messaging vote_poll returned a different message".to_owned(),
+                        ));
+                    }
+                    upsert_visible_message(state, visible);
+                }
+                response
+            }
             BoundMessagingAction::Write {
                 place_id,
                 content,
@@ -1835,6 +2017,33 @@ fn resolve_raw_action(
             } else { None };
             Ok(BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id })
         }
+        MessagingAction::CreatePoll {
+            question,
+            options,
+            allow_multi,
+            content,
+            closes_in_minutes,
+        } => Ok(BoundMessagingAction::CreatePoll {
+            place_id: state.focused_place_id.clone().ok_or_else(|| {
+                ToolError::Protocol("open a messaging place before creating a poll".to_owned())
+            })?,
+            question,
+            options,
+            allow_multi,
+            content,
+            closes_in_minutes,
+        }),
+        MessagingAction::VotePoll {
+            message_id,
+            seq,
+            option_ids,
+        } => Ok(BoundMessagingAction::VotePoll {
+            place_id: state.focused_place_id.clone().ok_or_else(|| {
+                ToolError::Protocol("open a messaging place before voting in a poll".to_owned())
+            })?,
+            message_id: visible_target(state, &message_id, seq, "vote_poll")?.message_id,
+            option_ids,
+        }),
         MessagingAction::Write {
             content,
             attachments,
@@ -2055,6 +2264,51 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::CreatePoll {
+            question,
+            options,
+            content,
+            closes_in_minutes,
+            ..
+        } => {
+            validate_bounded_nonempty(question, MAX_POLL_QUESTION_BYTES)?;
+            if !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&options.len()) {
+                return Err(ToolError::InvalidArguments);
+            }
+            for option in options {
+                validate_bounded_nonempty(option, MAX_POLL_OPTION_BYTES)?;
+            }
+            for (index, option) in options.iter().enumerate() {
+                if options[index + 1..].contains(option) {
+                    return Err(ToolError::InvalidArguments);
+                }
+            }
+            if content
+                .as_deref()
+                .is_some_and(|content| content.len() > MAX_CONTENT_BYTES || content.contains('\0'))
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_relative_minutes(closes_in_minutes)
+        }
+        MessagingAction::VotePoll {
+            message_id,
+            seq,
+            option_ids,
+        } => {
+            validate_visible_selector(message_id, seq)?;
+            if option_ids.len() > MAX_POLL_OPTIONS {
+                return Err(ToolError::InvalidArguments);
+            }
+            let mut seen = BTreeSet::new();
+            for option_id in option_ids {
+                validate_bounded_nonempty(option_id, MAX_MESSAGE_ID_BYTES)?;
+                if !seen.insert(option_id) {
+                    return Err(ToolError::InvalidArguments);
+                }
+            }
+            Ok(())
+        }
         MessagingAction::Write {
             content,
             attachments,
@@ -2190,6 +2444,35 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
                 name: name.clone(),
                 message_id: parent_message_id.clone(),
                 seq: None,
+            })
+        }
+        BoundMessagingAction::CreatePoll {
+            place_id,
+            question,
+            options,
+            allow_multi,
+            content,
+            closes_in_minutes,
+        } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            validate_action(&MessagingAction::CreatePoll {
+                question: question.clone(),
+                options: options.clone(),
+                allow_multi: *allow_multi,
+                content: content.clone(),
+                closes_in_minutes: *closes_in_minutes,
+            })
+        }
+        BoundMessagingAction::VotePoll {
+            place_id,
+            message_id,
+            option_ids,
+        } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            validate_action(&MessagingAction::VotePoll {
+                message_id: Some(message_id.clone()),
+                seq: None,
+                option_ids: option_ids.clone(),
             })
         }
         BoundMessagingAction::Write {
@@ -2444,6 +2727,40 @@ fn upsert_visible_message(state: &mut MessagingViewState, message: VisibleMessag
     state
         .visible_messages
         .sort_by_key(|known| known.seq.unwrap_or(u64::MAX));
+}
+
+fn visible_message_from_mutation(response: &Value) -> Result<VisibleMessage, ToolError> {
+    let message = response
+        .get("message")
+        .ok_or_else(|| ToolError::Protocol("Messaging mutation omitted message".to_owned()))?;
+    let message_id = message
+        .get("message_id")
+        .and_then(Value::as_str)
+        .filter(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_ok())
+        .ok_or_else(|| {
+            ToolError::Protocol("Messaging mutation returned invalid message_id".to_owned())
+        })?
+        .to_owned();
+    let seq = message
+        .get("seq")
+        .and_then(Value::as_u64)
+        .filter(|seq| *seq > 0)
+        .ok_or_else(|| ToolError::Protocol("Messaging mutation returned invalid seq".to_owned()))?;
+    let attachments: Vec<MessagingAttachmentMetadata> = serde_json::from_value(
+        message
+            .get("attachments")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    )
+    .map_err(|error| ToolError::Protocol(format!("invalid Messaging attachments: {error}")))?;
+    for (position, attachment) in attachments.iter().enumerate() {
+        validate_attachment_metadata(attachment, Some(position))?;
+    }
+    Ok(VisibleMessage {
+        message_id,
+        seq: Some(seq),
+        attachments,
+    })
 }
 
 /// Authenticate one complete Messaging screen before any of it becomes local
@@ -3068,6 +3385,17 @@ mod tests {
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         threads: AsyncMutex<Vec<(String, String, Option<String>, String)>>,
+        polls: AsyncMutex<
+            Vec<(
+                String,
+                String,
+                Vec<String>,
+                bool,
+                Option<String>,
+                Option<u32>,
+            )>,
+        >,
+        votes: AsyncMutex<Vec<(String, String, Vec<String>)>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
@@ -3202,6 +3530,49 @@ mod tests {
                 seq: 8,
                 created,
             })
+        }
+
+        async fn create_poll(
+            &self,
+            scope: &ExactMessagingScope,
+            request: CreateMessagingPollRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls
+                .lock()
+                .await
+                .push(format!("create_poll:{}", request.place_id));
+            self.polls.lock().await.push((
+                request.place_id.to_owned(),
+                request.question.to_owned(),
+                request.options.to_vec(),
+                request.allow_multi,
+                request.content.map(str::to_owned),
+                request.closes_in_minutes,
+            ));
+            Ok(json!({"message": {
+                "message_id": "poll-message", "seq": 9, "attachments": []
+            }, "created": true}))
+        }
+
+        async fn vote_poll(
+            &self,
+            scope: &ExactMessagingScope,
+            request: VoteMessagingPollRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls
+                .lock()
+                .await
+                .push(format!("vote_poll:{}", request.message_id));
+            self.votes.lock().await.push((
+                request.place_id.to_owned(),
+                request.message_id.to_owned(),
+                request.option_ids.to_vec(),
+            ));
+            Ok(json!({"message": {
+                "message_id": request.message_id, "seq": 7, "attachments": []
+            }}))
         }
 
         async fn upload_attachment(
@@ -3893,7 +4264,9 @@ mod tests {
                 "resolve_reply_later",
                 "get_call_state",
                 "threads",
-                "create_thread"
+                "create_thread",
+                "create_poll",
+                "vote_poll"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -3921,6 +4294,11 @@ mod tests {
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
+        assert_eq!(schema["properties"]["options"]["minItems"], 2);
+        assert_eq!(schema["properties"]["options"]["maxItems"], 10);
+        assert_eq!(schema["properties"]["question"]["maxLength"], 500);
+        assert_eq!(schema["properties"]["options"]["items"]["maxLength"], 200);
+        assert_eq!(schema["properties"]["option_ids"]["maxItems"], 10);
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
             assert_eq!(schema["properties"][field]["maximum"], 10080);
@@ -3934,9 +4312,11 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "action",
+                "allow_multi",
                 "attachment_id",
                 "attachments",
                 "before_seq",
+                "closes_in_minutes",
                 "content",
                 "emoji",
                 "expires_in_minutes",
@@ -3945,7 +4325,10 @@ mod tests {
                 "message_id",
                 "name",
                 "note",
+                "option_ids",
+                "options",
                 "place_id",
+                "question",
                 "remind_in_minutes",
                 "reply_to",
                 "seq",
@@ -4713,6 +5096,111 @@ mod tests {
         assert_eq!(threads.len(), 2);
         assert_eq!(threads[0].3, client_nonce("flow", "create-retry"));
         assert_eq!(threads[1].3, threads[0].3);
+    }
+
+    #[tokio::test]
+    async fn poll_actions_create_and_replace_a_vote_on_a_visible_message() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        let error = execute(
+            &tool,
+            json!({"action": "create_poll", "question": "いつ？", "options": ["今日", "明日"]}),
+            "without-place",
+        )
+        .await
+        .expect_err("poll creation needs the current place");
+        assert!(matches!(error, ToolError::Protocol(_)));
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .expect("open place");
+        execute(
+            &tool,
+            json!({
+                "action": "create_poll",
+                "question": "いつ？",
+                "options": ["今日", "明日"],
+                "allow_multi": false,
+                "content": "リリース日",
+                "closes_in_minutes": 30
+            }),
+            "create-poll",
+        )
+        .await
+        .expect("create poll");
+        execute(
+            &tool,
+            json!({"action": "vote_poll", "seq": 7, "option_ids": ["option-1"]}),
+            "vote-poll",
+        )
+        .await
+        .expect("replace vote");
+
+        assert_eq!(
+            api.polls.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "いつ？".to_owned(),
+                vec!["今日".to_owned(), "明日".to_owned()],
+                false,
+                Some("リリース日".to_owned()),
+                Some(30),
+            )]
+        );
+        assert_eq!(
+            api.votes.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "m7".to_owned(),
+                vec!["option-1".to_owned()],
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_binding_is_mutating_and_vote_requires_a_visible_message() {
+        let (_, _tool, registry) = binding_fixture().await;
+        let create = bind_action(
+            &registry,
+            "create-poll",
+            json!({"action": "create_poll", "question": "いつ？", "options": ["今日", "明日"]}),
+        )
+        .await
+        .expect("bind poll creation");
+        assert_eq!(create.descriptor.operation, "create_poll");
+        assert_eq!(create.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            create.execution_arguments.as_object()["place_id"],
+            "place-a"
+        );
+
+        let vote = bind_action(
+            &registry,
+            "vote-poll",
+            json!({"action": "vote_poll", "seq": 7, "option_ids": ["option-1"]}),
+        )
+        .await
+        .expect("bind visible vote");
+        assert_eq!(vote.descriptor.operation, "vote_poll");
+        assert_eq!(vote.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            vote.execution_arguments.as_object()["message_id"],
+            "message-7"
+        );
+
+        let error = bind_action(
+            &registry,
+            "vote-hidden",
+            json!({"action": "vote_poll", "seq": 999, "option_ids": []}),
+        )
+        .await
+        .expect_err("hidden message cannot become a vote target");
+        assert!(matches!(error, DescribeError::AppPrecondition { .. }));
     }
 
     #[tokio::test]

@@ -48,13 +48,13 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest, ExactMessagingScope,
-    GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure,
-    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
-    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    CreateMessagingPollRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
+    ExactMessagingScope, GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
+    MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
-    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
+    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse, VoteMessagingPollRequest,
     WriteMessagingMessageRequest, canonical_attachment_filename,
 };
 use crate::apiclient::workspace::{
@@ -779,6 +779,32 @@ impl MessagingApi for LocalControlHttpClient {
             }
         }
         unreachable!("the bounded Messaging retry loop always returns")
+    }
+
+    async fn create_poll(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingPollRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:create-poll",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn vote_poll(
+        &self,
+        scope: &ExactMessagingScope,
+        request: VoteMessagingPollRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:vote-poll",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
     }
 
     async fn write(

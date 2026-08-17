@@ -346,6 +346,7 @@ export class MockMessagingServer implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly history = buildSeedHistory();
@@ -637,6 +638,19 @@ export class MockMessagingServer implements MessagingBackend {
             .map((id) => this.uploads.get(id))
             .filter((entry): entry is Attachment => entry !== undefined)
             .map((entry, position) => ({ ...entry, position })),
+          poll:
+            input.poll == null
+              ? null
+              : {
+                  question: input.poll.question,
+                  allowMulti: input.poll.allowMulti,
+                  closesAt: input.poll.closesAt,
+                  options: input.poll.options.map((text) => ({
+                    optionId: secureRandomUUID(),
+                    text,
+                    voters: [],
+                  })),
+                },
         });
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
         this.emit({
@@ -706,6 +720,7 @@ export class MockMessagingServer implements MessagingBackend {
     // tombstone化: contentは残さず、消えた事実とseqだけが残る。
     message.deleted = true;
     message.content = "";
+    message.poll = null;
     this.emit({
       type: "message_deleted",
       message: { ...message },
@@ -789,6 +804,41 @@ export class MockMessagingServer implements MessagingBackend {
     return this.applyReaction(place, messageId, SELF, emoji);
   }
 
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<Message> {
+    const message = (this.history.get(placeKey(place)) ?? []).find(
+      (entry) => entry.messageId === messageId,
+    );
+    if (!message?.poll || message.deleted) throw new Error("Poll not found");
+    if (
+      (message.poll.closesAt !== null && Date.now() >= message.poll.closesAt) ||
+      (!message.poll.allowMulti && optionIds.length > 1)
+    ) {
+      throw new Error("Poll is closed or single-choice");
+    }
+    const valid = new Set(
+      message.poll.options.map((option) => option.optionId),
+    );
+    if (
+      new Set(optionIds).size !== optionIds.length ||
+      optionIds.some((id) => !valid.has(id))
+    ) {
+      throw new Error("Poll option not found");
+    }
+    for (const option of message.poll.options) {
+      option.voters = option.voters.filter(
+        (participant) => !sameParticipant(participant, SELF),
+      );
+      if (optionIds.includes(option.optionId)) option.voters.push(SELF);
+    }
+    const snapshot = structuredClone(message);
+    this.emit({ type: "poll_updated", message: snapshot });
+    return snapshot;
+  }
+
   /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
   private applyReaction(
     place: Place,
@@ -867,6 +917,7 @@ export class MockMessagingServer implements MessagingBackend {
     replyTo: string | null;
     clientNonce?: string;
     attachments?: Attachment[];
+    poll?: Message["poll"];
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -881,6 +932,7 @@ export class MockMessagingServer implements MessagingBackend {
       urgency: input.urgency,
       reactions: [],
       attachments: input.attachments ?? [],
+      poll: input.poll ?? null,
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,

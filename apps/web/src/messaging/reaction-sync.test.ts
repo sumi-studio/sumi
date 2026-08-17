@@ -652,6 +652,7 @@ class StubBackend implements MessagingBackend {
     status: false,
     replyLater: false,
     reactions: true,
+    polls: true,
     notifications: false,
   } as const;
   history: Message[] = [];
@@ -787,6 +788,10 @@ class StubBackend implements MessagingBackend {
     ): Promise<ReactionMutationResult> =>
       await (this.toggleResults.shift() ?? { messageId, reactions: [] }),
   );
+  votePoll = vi.fn(
+    async (_place: Place, _messageId: string, _optionIds: string[]) =>
+      message(1, "message"),
+  );
   async setNotificationSetting(): ReturnType<
     MessagingBackend["setNotificationSetting"]
   > {
@@ -809,3 +814,60 @@ class StubBackend implements MessagingBackend {
     this.listener = null;
   }
 }
+
+describe("poll convergence in the messaging store", () => {
+  let session = 0;
+
+  beforeEach(() => {
+    bindMessagingSessionIdentity(`poll-test-${++session}`);
+  });
+
+  afterEach(() => {
+    bindMessagingSessionIdentity(null);
+  });
+
+  it("patches only the poll and does not let an older resync overwrite a live update", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = {
+      ...message(1, "edited content", 99),
+      poll: {
+        question: "いつ？",
+        allowMulti: false,
+        closesAt: null,
+        options: [
+          { optionId: "today", text: "今日", voters: [] },
+          { optionId: "tomorrow", text: "明日", voters: [] },
+        ],
+      },
+    };
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
+    harness.history = [initial];
+    harness.holdFetches = true;
+
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    harness.emit({
+      type: "poll_updated",
+      message: {
+        ...message(1, "stale content"),
+        poll: {
+          ...initial.poll,
+          options: [
+            { optionId: "today", text: "今日", voters: [self] },
+            { optionId: "tomorrow", text: "明日", voters: [] },
+          ],
+        },
+      },
+    });
+    harness.releaseFetches();
+    await harness.settle();
+
+    const projected = useMessaging.getState().messagesByPlace[placeKey]?.[0];
+    expect(projected?.content).toBe("edited content");
+    expect(projected?.editedAt).toBe(99);
+    expect(projected?.poll?.options[0]?.voters).toEqual([self]);
+  });
+});

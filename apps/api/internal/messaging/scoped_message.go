@@ -22,9 +22,9 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 	default:
 		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
-	// Empty text is valid only when at least one attachment binds; the
+	// Empty text is valid only when at least one attachment or poll binds; the
 	// deferred database trigger enforces the same rule at commit.
-	if in.Content == "" && len(in.AttachmentIDs) == 0 {
+	if in.Content == "" && len(in.AttachmentIDs) == 0 && in.Poll == nil {
 		return Message{}, false, errors.New("content must not be empty")
 	}
 	if !messageContentFitsStorage(in.Content) {
@@ -32,6 +32,11 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 	}
 	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
 		return Message{}, false, ErrTooManyAttachments
+	}
+	if in.Poll != nil {
+		if err := in.Poll.Validate(time.Now()); err != nil {
+			return Message{}, false, err
+		}
 	}
 	if in.ClientNonce == "" || len(in.ClientNonce) > 128 {
 		return Message{}, false, errors.New("client nonce must be 1..128 bytes")
@@ -54,7 +59,7 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 // receipt of the message that already owns its nonce. A changed request under
 // the same nonce is a conflict, never a silent replay of the first message.
 func requestMatchesReplay(in AppendInput, storedDigest []byte) bool {
-	incoming := messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs)
+	incoming := messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs, in.Poll)
 	return bytes.Equal(incoming, storedDigest)
 }
 
@@ -167,7 +172,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		message.MessageID, s.Scope.WorkspaceID, message.PlaceID, message.Seq,
 		message.Author.Kind, message.Author.ID, message.Content, message.Urgency,
 		replyTo, message.ClientNonce,
-		messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs),
+		messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs, in.Poll),
 	).Scan(&message.CreatedAt); err != nil {
 		return Message{}, false, fmt.Errorf("insert scoped message: %w", err)
 	}
@@ -179,6 +184,12 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		return Message{}, false, err
 	}
 	message.Attachments = attachments
+	if in.Poll != nil {
+		message.Poll, err = insertPoll(ctx, tx, s.Scope.WorkspaceID, message.MessageID, *in.Poll)
+		if err != nil {
+			return Message{}, false, err
+		}
+	}
 	if err := insertMentions(ctx, tx, message.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
@@ -220,7 +231,7 @@ func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendIn
 	if len(messages) == 0 {
 		return Message{}, nil, false, nil
 	}
-	if err := attachMessagePartsWith(ctx, q, messages); err != nil {
+	if err := attachMessagePartsWith(ctx, q, s.Scope.WorkspaceID, messages); err != nil {
 		return Message{}, nil, false, err
 	}
 	var digest []byte
@@ -299,7 +310,7 @@ func (s *ScopedStore) historyAfterAuthorization(
 	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
 		messages[left], messages[right] = messages[right], messages[left]
 	}
-	if err := attachMessagePartsWith(ctx, q, messages); err != nil {
+	if err := attachMessagePartsWith(ctx, q, s.Scope.WorkspaceID, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -342,7 +353,7 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 	if err != nil {
 		return nil, err
 	}
-	if err := attachMessagePartsWith(ctx, tx, messages); err != nil {
+	if err := attachMessagePartsWith(ctx, tx, s.Scope.WorkspaceID, messages); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -416,7 +427,7 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	}
 	message.Content, message.Mentions, message.EditedAt = content, mentions, &editedAt
 	parts := []Message{message}
-	if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
+	if err := attachMessagePartsWith(ctx, tx, s.Scope.WorkspaceID, parts); err != nil {
 		return Message{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -485,10 +496,15 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 			return Message{}, fmt.Errorf("clear tombstone projection: %w", err)
 		}
 	}
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM message_polls WHERE workspace_id = $1 AND message_id = $2",
+		s.Scope.WorkspaceID, messageID); err != nil {
+		return Message{}, fmt.Errorf("clear scoped poll tombstone projection: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped delete: %w", err)
 	}
-	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Deleted = "", nil, nil, nil, true
+	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Poll, message.Deleted = "", nil, nil, nil, nil, true
 	return message, nil
 }
 
@@ -668,14 +684,17 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 	return summaries, nil
 }
 
-func attachMessagePartsWith(ctx context.Context, q querier, messages []Message) error {
+func attachMessagePartsWith(ctx context.Context, q querier, workspaceID string, messages []Message) error {
 	if err := attachMentionsWith(ctx, q, messages); err != nil {
 		return err
 	}
 	if err := attachReactionsWith(ctx, q, messages); err != nil {
 		return err
 	}
-	return attachAttachmentsWith(ctx, q, messages)
+	if err := attachAttachmentsWith(ctx, q, messages); err != nil {
+		return err
+	}
+	return attachPollsWith(ctx, q, workspaceID, messages)
 }
 
 func attachMentionsWith(ctx context.Context, q querier, messages []Message) error {

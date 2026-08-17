@@ -61,6 +61,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -281,6 +282,18 @@ export class ApiMessagingBackend implements MessagingBackend {
             reply_to: input.replyTo ?? "",
             client_nonce: input.clientNonce,
             attachments: input.attachments,
+            poll:
+              input.poll == null
+                ? null
+                : {
+                    question: input.poll.question,
+                    allow_multi: input.poll.allowMulti,
+                    closes_at:
+                      input.poll.closesAt === null
+                        ? null
+                        : new Date(input.poll.closesAt).toISOString(),
+                    options: input.poll.options,
+                  },
           },
         },
       ),
@@ -291,6 +304,20 @@ export class ApiMessagingBackend implements MessagingBackend {
       seq: asSeq(body.seq),
       created: asBoolean(body.created),
     };
+  }
+
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/poll/vote`,
+        { method: "POST", body: { option_ids: optionIds } },
+      ),
+    );
+    return parseMessage(body.message);
   }
 
   async uploadAttachment(
@@ -576,6 +603,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       this.registerPlace(message.place);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
+    } else if (eventType === "poll_updated") {
+      // Like reactions, voting on an older message never advances replay.
+      parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "reaction_updated") {
       // A reaction can target a message older than the replay cursor, so it
       // must never move the cursor (backwards or at all). It is also a partial
@@ -882,12 +912,30 @@ function parseMessage(value: unknown): Message {
     urgency: asUrgency(wire.urgency),
     reactions: asArray(wire.reactions).map(parseReaction),
     attachments: asArray(wire.attachments ?? []).map(parseAttachment),
+    poll: wire.poll == null ? null : parsePoll(wire.poll),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
     deleted: asBoolean(wire.deleted),
+  };
+}
+
+function parsePoll(value: unknown): Message["poll"] {
+  const wire = asRecord(value);
+  return {
+    question: asString(wire.question),
+    allowMulti: asBoolean(wire.allow_multi),
+    closesAt: wire.closes_at == null ? null : asTimestamp(wire.closes_at),
+    options: asArray(wire.options).map((entry) => {
+      const option = asRecord(entry);
+      return {
+        optionId: asString(option.option_id),
+        text: asString(option.text),
+        voters: asArray(option.voters).map(parseParticipant),
+      };
+    }),
   };
 }
 
