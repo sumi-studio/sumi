@@ -142,8 +142,49 @@ CREATE INDEX message_attachment_uploads_settled
 -- replay so a changed request under the same nonce is a conflict, never a
 -- silent replay of the first message.
 ALTER TABLE messages
-    ADD COLUMN request_digest bytea
-        CHECK (request_digest IS NULL OR octet_length(request_digest) = 32);
+    ADD COLUMN request_digest bytea;
+
+-- Messages that predate attachments necessarily have an empty attachment
+-- list. Reproduce encoding/json's HTML-safe string escaping so this backfill
+-- is byte-for-byte identical to messageRequestDigest. A pre-existing
+-- tombstone has already discarded its content; hashing the empty sentinel is
+-- deliberately fail-closed because an empty attachment-free append is invalid.
+WITH canonical_requests AS (
+    SELECT message_id,
+           '{"content":' ||
+               replace(
+                   replace(
+                       replace(
+                           replace(
+                               replace(
+                                   to_json(COALESCE(content, ''))::text,
+                                   '&', chr(92) || 'u0026'
+                               ),
+                               '<', chr(92) || 'u003c'
+                           ),
+                           '>', chr(92) || 'u003e'
+                       ),
+                       U&'\2028', chr(92) || 'u2028'
+                   ),
+                   U&'\2029', chr(92) || 'u2029'
+               ) ||
+           ',"urgency":' || to_json(urgency)::text ||
+           ',"reply_to":' || to_json(COALESCE(reply_to::text, ''))::text ||
+           ',"attachments":[]}' AS canonical
+    FROM messages
+)
+UPDATE messages AS m
+SET request_digest = sha256(
+    convert_to('sumi-messaging-request-v1', 'UTF8') ||
+    decode('00', 'hex') ||
+    convert_to(c.canonical, 'UTF8')
+)
+FROM canonical_requests AS c
+WHERE c.message_id = m.message_id;
+
+ALTER TABLE messages
+    ALTER COLUMN request_digest SET NOT NULL,
+    ADD CHECK (octet_length(request_digest) = 32);
 
 -- Empty text is valid only when at least one attachment binds in the same
 -- transaction. The trigger is deferred so the message insert can precede its

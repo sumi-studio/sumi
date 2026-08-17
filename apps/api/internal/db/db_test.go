@@ -1,7 +1,10 @@
 package db
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -143,8 +146,16 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 			len(exactContent), len(overContent), len(exactNonce), len(overNonce))
 	}
 
+	requestDigestRequired := false
 	insertMessage := func(messageID string, seq int, content, nonce string) error {
 		t.Helper()
+		if requestDigestRequired {
+			_, err := pool.Exec(ctx, `INSERT INTO messages
+				(message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+				VALUES ($1, $2, $3, $4, 'human', $5, $6, $7, decode(repeat('ab', 32), 'hex'))`,
+				messageID, workspaceID, placeID, seq, authorID, content, nonce)
+			return err
+		}
 		_, err := pool.Exec(ctx, `INSERT INTO messages
 			(message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
 			VALUES ($1, $2, $3, $4, 'human', $5, $6, $7)`,
@@ -186,6 +197,7 @@ func TestMessagingByteConstraintsReplaceCharacterLimitsAndRollback(t *testing.T)
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("apply byte-constraint migration: %v", err)
 	}
+	requestDigestRequired = true
 
 	if err := insertMessage(
 		"0198f0f4-9b72-7000-8000-000000000105", 2, exactContent, "content-exact",
@@ -1480,10 +1492,80 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	}
 	up := readMigration("0023_message_attachments.up.sql")
 	down := readMigration("0023_message_attachments.down.sql")
+	const (
+		backfillHuman   = "0198f0f4-9b72-7000-8000-000000000411"
+		backfillWS      = "0198f0f4-9b72-7000-8000-000000000412"
+		backfillMember  = "0198f0f4-9b72-7000-8000-000000000413"
+		backfillPlace   = "0198f0f4-9b72-7000-8000-000000000414"
+		backfillMessage = "0198f0f4-9b72-7000-8000-000000000415"
+		backfillContent = "escape <tag>&\u2028\u2029"
+	)
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", backfillHuman); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspaces (workspace_id, name, owner_workspace_member_id)
+		VALUES ($1, 'backfill', $2)`, backfillWS, backfillMember); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO workspace_members
+			(workspace_member_id, workspace_id, member_kind, member_id)
+		VALUES ($1, $2, 'human', $3)`, backfillMember, backfillWS, backfillHuman); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO places (place_id, kind, workspace_id, name, last_seq)
+		VALUES ($1, 'channel', $2, 'backfill', 1)`, backfillPlace, backfillWS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO messages
+			(message_id, workspace_id, place_id, seq, author_kind, author_id, content, urgency, client_nonce)
+		VALUES ($1, $2, $3, 1, 'human', $4, $5, 'urgent', 'backfill')`,
+		backfillMessage, backfillWS, backfillPlace, backfillHuman, backfillContent); err != nil {
+		t.Fatal(err)
+	}
 	for _, step := range []struct{ name, sql string }{{"up", up}, {"down", down}, {"re-up", up}} {
 		if _, err := pool.Exec(ctx, step.sql); err != nil {
 			t.Fatalf("%s: %v", step.name, err)
 		}
+	}
+	canonical, err := json.Marshal(struct {
+		Content     string   `json:"content"`
+		Urgency     string   `json:"urgency"`
+		ReplyTo     string   `json:"reply_to"`
+		Attachments []string `json:"attachments"`
+	}{backfillContent, "urgent", "", []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := sha256.Sum256(append([]byte("sumi-messaging-request-v1\x00"), canonical...))
+	var gotDigest []byte
+	if err := pool.QueryRow(ctx,
+		"SELECT request_digest FROM messages WHERE message_id=$1",
+		backfillMessage,
+	).Scan(&gotDigest); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotDigest, wantDigest[:]) {
+		t.Fatalf("backfilled request digest = %x, want %x", gotDigest, wantDigest)
+	}
+	var nullable string
+	if err := pool.QueryRow(ctx, `
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_name='messages' AND column_name='request_digest'`).Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != "NO" {
+		t.Fatalf("request_digest nullable = %q, want NO", nullable)
 	}
 	// After down the attachment tables and the messages column are gone; after
 	// re-up they exist again with the same shape.
@@ -1548,8 +1630,8 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	}
 	for _, m := range [][3]string{{messageA, wsA, placeA}, {messageB, wsB, placeB}} {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
-			VALUES ($1, $2, $3, 1, 'human', $4, 'hello', 'n')`, m[0], m[1], m[2], humanID); err != nil {
+			INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+			VALUES ($1, $2, $3, 1, 'human', $4, 'hello', 'n', decode(repeat('ab', 32), 'hex'))`, m[0], m[1], m[2], humanID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1596,17 +1678,17 @@ func TestMessageAttachmentsMigrationUpDownReupAndConstraints(t *testing.T) {
 	// Empty content requires a bound attachment at commit; a message that
 	// binds one in the same transaction is fine.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
-		VALUES ('0198f0f4-9b72-7000-8000-00000000040d', $1, $2, 2, 'human', $3, '', 'empty')`, wsA, placeA, humanID); err == nil {
+		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+		VALUES ('0198f0f4-9b72-7000-8000-00000000040d', $1, $2, 2, 'human', $3, '', 'empty', decode(repeat('ab', 32), 'hex'))`, wsA, placeA, humanID); err == nil {
 		t.Fatal("empty message without attachments accepted")
 	}
-	tx, err := pool.Begin(ctx)
+	tx, err = pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce)
-		VALUES ('0198f0f4-9b72-7000-8000-00000000040e', $1, $2, 3, 'human', $3, '', 'empty-ok')`, wsA, placeA, humanID); err != nil {
+		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
+		VALUES ('0198f0f4-9b72-7000-8000-00000000040e', $1, $2, 3, 'human', $3, '', 'empty-ok', decode(repeat('ab', 32), 'hex'))`, wsA, placeA, humanID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `
