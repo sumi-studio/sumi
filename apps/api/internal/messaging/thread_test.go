@@ -42,6 +42,48 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	}
 }
 
+func TestNonparticipantThreadReadMarkerSurvivesBootstrap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "閲覧だけ", "")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "既読を残します")
+	viewer := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
+	if threads, err := viewer.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("viewer started as a nonparticipant: threads=%+v err=%v", threads, err)
+	}
+
+	resp, body := call(t, ts, http.MethodPut,
+		"/messaging/places/"+thread.Place.PlaceID+"/read-through", w.humanB.ID,
+		map[string]any{"seq": message.Seq})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("read-through: status %d body %v", resp.StatusCode, body)
+	}
+	if threads, err := viewer.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("read marker made viewer a participant: threads=%+v err=%v", threads, err)
+	}
+
+	resp, body = call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanB.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bootstrap after read-through: status %d body %v", resp.StatusCode, body)
+	}
+	for _, raw := range body["unread_summaries"].([]any) {
+		summary := raw.(map[string]any)
+		if summary["place"].(map[string]any)["thread_id"] == thread.Place.PlaceID {
+			if summary["unread_count"] != float64(0) || summary["latest_seq"] != float64(message.Seq) {
+				t.Fatalf("thread unread summary after bootstrap = %v", summary)
+			}
+			return
+		}
+	}
+	t.Fatalf("bootstrap unread summaries omitted visible thread: %v", body["unread_summaries"])
+}
+
 func TestConcurrentThreadParticipantAdmissionIsIdempotent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

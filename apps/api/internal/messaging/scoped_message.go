@@ -528,26 +528,17 @@ func (s *ScopedStore) ReadThrough(ctx context.Context, placeID string, seq int64
 	if seq > place.LastSeq {
 		return ErrSeqBeyondLatest
 	}
-	if access.PlaceMemberID == "" {
-		// Merely reading a thread does not make someone a participant. Thread
-		// participation is reserved for writing or being mentioned.
-		if place.Kind == PlaceThread {
-			return tx.Commit(ctx)
-		}
+	if access.PlaceMemberID == "" && place.Kind != PlaceThread {
 		if err := admitPlaceTenure(ctx, tx, placeID, membership, 1); err != nil {
-			return err
-		}
-		access, err = s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
-		if err != nil {
 			return err
 		}
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO read_markers (place_id, place_member_id, last_read_seq)
+		INSERT INTO read_markers (place_id, workspace_member_id, last_read_seq)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (place_id, place_member_id)
+		ON CONFLICT (place_id, workspace_member_id)
 		DO UPDATE SET last_read_seq = GREATEST(read_markers.last_read_seq, EXCLUDED.last_read_seq),
-		              updated_at = now()`, placeID, access.PlaceMemberID, seq); err != nil {
+		              updated_at = now()`, placeID, membership.WorkspaceMemberID, seq); err != nil {
 		return fmt.Errorf("advance scoped read marker: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -559,18 +550,18 @@ func (s *ScopedStore) ReadMarker(ctx context.Context, placeID string) (int64, er
 		return 0, fmt.Errorf("begin scoped read-marker read: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	membership, err := s.authorizeInTx(ctx, tx)
+	if err != nil {
 		return 0, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
 	if err != nil {
 		return 0, err
 	}
-	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
-	if err != nil {
+	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
 		return 0, err
 	}
-	seq, err := s.readMarkerAfterAuthorization(ctx, tx, place, access)
+	seq, err := s.readMarkerAfterAuthorization(ctx, tx, place, membership.WorkspaceMemberID)
 	if err != nil {
 		return 0, err
 	}
@@ -580,22 +571,19 @@ func (s *ScopedStore) ReadMarker(ctx context.Context, placeID string) (int64, er
 	return seq, nil
 }
 
-// readMarkerAfterAuthorization reads the cursor for the exact active place
-// tenure selected by access. It deliberately accepts the caller's querier so
-// an OpenSnapshot cannot escape to the pool between history and cursor reads.
+// readMarkerAfterAuthorization reads the cursor for the exact active Workspace
+// membership tenure. It deliberately accepts the caller's querier so an
+// OpenSnapshot cannot escape to the pool between history and cursor reads.
 func (s *ScopedStore) readMarkerAfterAuthorization(
 	ctx context.Context,
 	q querier,
 	place Place,
-	access PlaceAccess,
+	workspaceMemberID string,
 ) (int64, error) {
-	if access.PlaceMemberID == "" {
-		return 0, nil
-	}
 	var seq int64
 	err := q.QueryRow(ctx, `
 		SELECT last_read_seq FROM read_markers
-		WHERE place_id = $1 AND place_member_id = $2`, place.PlaceID, access.PlaceMemberID).Scan(&seq)
+		WHERE place_id = $1 AND workspace_member_id = $2`, place.PlaceID, workspaceMemberID).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
 		seq = 0
 	} else if err != nil {
@@ -640,7 +628,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 		          AND NOT (m.author_kind = $3 AND m.author_id = $4))
 		FROM visible_places vp
 		LEFT JOIN read_markers rm
-		  ON rm.place_id = vp.place_id AND rm.place_member_id = vp.place_member_id
+		  ON rm.place_id = vp.place_id AND rm.workspace_member_id = $2
 		ORDER BY vp.created_at, vp.place_id`,
 		s.Scope.WorkspaceID, membership.WorkspaceMemberID, s.Scope.Actor.Kind, s.Scope.Actor.ID)
 	if err != nil {

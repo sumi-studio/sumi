@@ -912,10 +912,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "message_created" || event.type === "message_edited") {
       const key = placeKey(event.message.place);
+      let created = false;
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
+        created = !existing;
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           event.message,
@@ -974,7 +976,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           applyThreadDeletionSummary(event.message);
         } else {
           advanceThreadProjection(event.message);
-          noteThreadActivity(event.message);
+          // A WebSocket event can race the cursored catch-up that carries the
+          // same commit. The timeline is an upsert, so only project a new
+          // thread message into its summary when that upsert inserted it.
+          if (created) noteThreadActivity(event.message);
           if (
             event.message.place.kind === "thread" &&
             !get().threadsById[event.message.place.threadId]
@@ -1674,7 +1679,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       };
       const request = (async () => {
         try {
-          const thread = await fetchThread(threadId);
+          const thread = await fetchThread.call(currentBackend, threadId);
           if (
             backend !== currentBackend ||
             messagingSessionGeneration !== sessionGeneration

@@ -85,7 +85,7 @@ func (s *ScopedStore) openSnapshotFromPlace(
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
-	lastRead, err := s.readMarkerAfterAuthorization(ctx, q, place, access)
+	lastRead, err := s.readMarkerAfterAuthorization(ctx, q, place, access.WorkspaceMemberID)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}

@@ -297,6 +297,38 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(useMessaging.getState().activePlaceKey).toBe(THREAD_LIVE);
   });
 
+  it("URLで開いたbootstrap未取得threadでもbackendのthisを保つ", async () => {
+    const unopened = thread("thread-direct-link");
+    backend.fetchThread.mockImplementation(async function (this: FakeBackend) {
+      // ApiMessagingBackend.fetchThread also calls this.request(...).
+      expect(this).toBe(backend);
+      return unopened;
+    });
+
+    await expect(
+      useMessaging.getState().loadThread(unopened.threadId),
+    ).resolves.toBe(true);
+    expect(backend.fetchThread).toHaveBeenCalledWith(unopened.threadId);
+    expect(useMessaging.getState().threadsById[unopened.threadId]).toEqual(
+      unopened,
+    );
+  });
+
+  it("重複したthread message_createdで件数を二重加算しない", async () => {
+    const known = thread("thread-known");
+    useMessaging.setState({ threadsById: { [known.threadId]: known } });
+    const incoming = threadMessage(known.threadId, 2);
+
+    backend.emit({ type: "message_created", message: incoming, notify: null });
+    backend.emit({ type: "message_created", message: incoming, notify: null });
+    await settle();
+
+    expect(useMessaging.getState().threadsById[known.threadId]).toMatchObject({
+      messageCount: known.messageCount + 1,
+      latestSeq: incoming.seq,
+    });
+  });
+
   it("切断中に作られたplaceとtopic編集を再接続で取り込む", async () => {
     useMessaging.getState().selectPlace(CHANNEL_1);
     useMessaging.getState().setDraft(CHANNEL_1, "書きかけ");
