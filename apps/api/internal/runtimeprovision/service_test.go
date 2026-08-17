@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -449,6 +450,119 @@ func TestDurableReapStateRejectsMissingGeneration(t *testing.T) {
 	if _, err := NewService(newFakeBackend(), ServiceConfig{StateDirectory: stateDirectory}); err == nil || !strings.Contains(err.Error(), "reaped_through_generation is required") {
 		t.Fatalf("missing durable reap generation was accepted: %v", err)
 	}
+}
+
+func TestDurableReapStateAtMaximumSizeRoundTrips(t *testing.T) {
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	state, err := newDurableReapState(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillReapStateToMaximumSize(t, state)
+	if err := state.persist(); err != nil {
+		t.Fatalf("persist reap state at maximum size: %v", err)
+	}
+	info, err := os.Stat(state.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != maxReapStateBytes {
+		t.Fatalf("persisted reap state has size %d, want exact limit %d", info.Size(), maxReapStateBytes)
+	}
+
+	restarted, err := newDurableReapState(stateDirectory)
+	if err != nil {
+		t.Fatalf("load reap state at maximum size: %v", err)
+	}
+	if !reflect.DeepEqual(restarted.entries, state.entries) {
+		t.Fatal("maximum-size reap state did not round-trip")
+	}
+}
+
+func TestDurableReapStateRejectsOversizeBeforePublishing(t *testing.T) {
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	state, err := newDurableReapState(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextPersonalityAgentID := fillReapStateToMaximumSize(t, state)
+	if err := state.persist(); err != nil {
+		t.Fatalf("persist reap state at maximum size: %v", err)
+	}
+	if err := state.record(nextPersonalityAgentID, 0); err == nil || !strings.Contains(err.Error(), "would exceed the maximum allowed size") {
+		t.Fatalf("oversize reap state write was accepted or unclear: %v", err)
+	}
+	if _, ok := state.entries[nextPersonalityAgentID]; ok {
+		t.Fatal("oversize reap state write remained in memory")
+	}
+	info, err := os.Stat(state.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != maxReapStateBytes {
+		t.Fatalf("oversize reap state write published %d bytes, want %d", info.Size(), maxReapStateBytes)
+	}
+	if _, err := newDurableReapState(stateDirectory); err != nil {
+		t.Fatalf("state after rejected oversize write no longer loads: %v", err)
+	}
+}
+
+func fillReapStateToMaximumSize(t *testing.T, state *durableReapState) string {
+	t.Helper()
+	next := 0
+	for {
+		personalityAgentID := reapStateTestPersonalityAgentID(next)
+		state.entries[personalityAgentID] = 0
+		encoded, err := encodeReapStateDocument(reapStateDocumentForEntries(state.entries))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) > maxReapStateBytes {
+			delete(state.entries, personalityAgentID)
+			break
+		}
+		next++
+	}
+	encoded, err := encodeReapStateDocument(reapStateDocumentForEntries(state.entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := maxReapStateBytes - len(encoded)
+	for index := 0; remaining > 0; index++ {
+		extraDigits := min(remaining, 18)
+		generation := uint64(1)
+		for range extraDigits {
+			generation *= 10
+		}
+		state.entries[reapStateTestPersonalityAgentID(index)] = generation
+		remaining -= extraDigits
+	}
+	encoded, err = encodeReapStateDocument(reapStateDocumentForEntries(state.entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != maxReapStateBytes {
+		t.Fatalf("maximum reap state fixture has size %d, want %d", len(encoded), maxReapStateBytes)
+	}
+	return reapStateTestPersonalityAgentID(next)
+}
+
+func reapStateDocumentForEntries(entries map[string]uint64) reapStateDocument {
+	document := reapStateDocument{
+		Version:           reapStateVersion,
+		PersonalityAgents: make(map[string]reapStateAgentRecord, len(entries)),
+	}
+	for personalityAgentID, generation := range entries {
+		reapedThroughGeneration := generation
+		document.PersonalityAgents[personalityAgentID] = reapStateAgentRecord{
+			ReapedThroughGeneration: &reapedThroughGeneration,
+		}
+	}
+	return document
+}
+
+func reapStateTestPersonalityAgentID(index int) string {
+	return fmt.Sprintf("00000000-0000-7000-8000-%012x", index)
 }
 
 func TestReconcileObservedEmptyReapIsPersistedAcrossRestart(t *testing.T) {

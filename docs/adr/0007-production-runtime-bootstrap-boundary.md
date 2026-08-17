@@ -30,9 +30,9 @@ T17はT16へ依存し、T16はT15へ依存するため、T15でproduction bootst
   productionではT26が取得・発行した`ProcessGenerationLease`と現世代exclusive ownershipを証明するtyped `GenerationRecoveryFence`を注入して
   Store scopeへ束縛し、persisted transcript anchors、provider context、Store上のmemory/command/phase stateを
   復号・検証する。typed `HydratedRunState`とphysical recovery intentsを返し、intentsが空なら同じfence内で
-  全phaseの論理的な不足suffixを完了してstableな`HydrationReceiptIdentity`を持つhydration receiptを返す。非空ならT27が`receipt_id`、digest、
-  `ProcessGeneration` lease、canonical exact intent setへ束縛して永続化した`PhysicalRecoveryReceipt`を再注入した後だけ影響suffixを完了する。
-  T17はT27のphysical proof storeとは別のapplication ledgerへ、既存`tool_executions.tool_call_id` PKを
+  全phaseの論理的な不足suffixを完了してstableな`HydrationReceiptIdentity`を持つhydration receiptを返す。非空ならT27が発行した
+  generation-bound `PhysicalReapAttestation`をagent bootがintent setと照合し、agent内で組み立てた`PhysicalRecoveryReceipt`を適用した後だけ影響suffixを完了する。
+  T17はattestationとは別のapplication ledgerへ、既存`tool_executions.tool_call_id` PKを
   canonical keyとするsorted unique exact intent set、logical suffix、
   該当する`indeterminate` terminalを同一transactionで記録する。同一receipt ID+digest+lease+canonical exact intent setの
   再送はledgerの全行完全一致時だけcrash後も`already-applied`としてidempotently受理し、stale、lease/generation・
@@ -89,7 +89,7 @@ T17はT16へ依存し、T16はT15へ依存するため、T15でproduction bootst
 - `ProcessGeneration`のdomainは`0..=i64::MAX`で、0も有効である。T26 allocatorはincrement前に最大値を
   検査し、`i64::MAX`後はwrap/reuseせず新bootstrapをfail-closedに拒否する。全componentへのdistributionと
   mismatchをテストする。
-- T27のcontrol planeは旧epochのlocal-control authorityをfenceした後、host supervisorでkill/reapとdescendant cleanupを実行し、Compose projectが空であることを観測して初めて、そのPAIDについて`reaped_through_generation`までprocessが残存しない事実を次epochのPAID・`ProcessGeneration`・`RpcBootNonce`へ束縛したauthenticated activation materialとして発行する。T17はこのattestationを生成・推測せず、非空physical recovery intentsの`executor_generation`がattested bound以下の場合だけ、attestation（およびそのdigest）を含む`PhysicalRecoveryReceipt`とapplication ledgerをlogical suffixと同一transactionで適用して`running → indeterminate`を完了する。これはexternal effectのcommit有無を証明しないためsuccess/failureへ確定せず、attestationなし・別PAID/epoch・bound不足、stale lease/generation・intent set不一致、conflicting receipt、同一IDの異なるdigestはすべてfail-closedに拒否し、同一receiptの完全一致再送だけを`already-applied`として受理する。allocator/issuanceは重複実装せず、空intentsのT26 bootstrapを妨げない。
+- T27のcontrol planeは旧epochのlocal-control authorityをfenceした後、host supervisorでkill/reapとdescendant cleanupを実行し、Compose projectが空であることを観測して初めて、そのPAIDについて`reaped_through_generation`までprocessが残存しない事実を次epochのPAID・`ProcessGeneration`・`RpcBootNonce`へ束縛した`PhysicalReapAttestation`としてactivation materialへ発行する。T17はこれを生成・推測せず、agent bootが非空physical recovery intentsの`executor_generation`と照合して`PhysicalRecoveryReceipt`を組み立て、T17 application ledgerとlogical suffixを同一transactionで適用して`running → indeterminate`を完了する。これはexternal effectのcommit有無を証明しないためsuccess/failureへ確定せず、attestationなし・別PAID/epoch・bound不足、stale lease/generation・intent set不一致、conflicting receipt、同一IDの異なるdigestはすべてfail-closedに拒否し、同一receiptの完全一致再送だけを`already-applied`として受理する。allocator/issuanceは重複実装せず、空intentsのT26 bootstrapを妨げない。
 - `HydrationReady`はedge signalではなく`ProcessGeneration`ごとのlatched stateである。current generationは必ず
   `NotReady`から始まり、T17のstable `HydrationReceiptIdentity`へ束縛されたimmutableな
   `Ready { generation, hydration_receipt_identity }`へ一度だけ遷移する。T26はgeneration rollover時に旧Readyを
@@ -129,11 +129,11 @@ T26はT13B/T17/T21/T23/T24を直接入力として唯一のproduction compositio
 - 認証identity/`ProcessGeneration`とGateway credential、Store scope、Session、runtime/executor/broker RPCの
   generationが一致しない、または`RpcBootNonce`が同generationと対にならないまま開始する。
 - 既存conversationのhistory/provider context読出し失敗を空としてproviderへ送る。
-- lease/exclusive fenceが欠落・破損している、または非空intentsに必要な`PhysicalRecoveryReceipt`/T17 application ledgerが欠落・破損・
+- lease/exclusive fenceが欠落・破損している、または非空intentsに必要な`PhysicalReapAttestation`、agent内で組み立てる`PhysicalRecoveryReceipt`、T17 application ledgerが欠落・破損・
   stale・別intent set/generation・conflicting receiptなのに論理復旧またはphysical cleanup済みとして進む。同一receipt
   IDの異なるdigest再利用も拒否し、負またはdomain外generation、負・逆転・danglingなlogical suffix境界、
-  exact suffix membership不一致も拒否する。`after_t27_receipt_persist`、`before_t17_logical_suffix_transaction`、
-  `after_t17_logical_suffix_transaction` failpoint後にapplication ledger親・全子、logical suffix、`indeterminate` terminalを全件なし/全件ありにし、二重生成しない。orphan `receipt_id`、null terminal seq、通常eventまたは別tool/receipt terminalへのwrong-event参照、terminalなしghost child reservationもschema/EventWriter fixtureで拒否する。前者はT27 integration/Cloud global acceptance、後二者は明示注入receiptを使うT17単体acceptanceのownerとし、T17完了をT27へ循環依存させない。
+  exact suffix membership不一致も拒否する。supervisorのempty-project観測からattestation発行まで、`before_t17_logical_suffix_transaction`、
+  `after_t17_logical_suffix_transaction`の各crash境界でapplication ledger親・全子、logical suffix、`indeterminate` terminalを全件なし/全件ありにし、二重生成しない。orphan `receipt_id`、null terminal seq、通常eventまたは別tool/receipt terminalへのwrong-event参照、terminalなしghost child reservationもschema/EventWriter fixtureで拒否する。前者はT27 integration/Cloud global acceptance、後二者は明示注入receiptを使うT17単体acceptanceのownerとし、T17完了をT27へ循環依存させない。
 - current generationがNotReady、stale generationのReady、またはreceipt identity不一致なのにcommandをSessionへ
   公開し、ACK/provider/executorを開始する。helloより先のReadyをedgeとして失うことも違反である。
 - M0 echo、注入mock、fresh conversationだけの成功をproduction bootstrapの証拠にする。
@@ -158,10 +158,10 @@ T26はT13B/T17/T21/T23/T24を直接入力として唯一のproduction compositio
 ## 影響と下流境界
 
 T15/T16のコードPRはproduction `main`を触らず、注入harnessでcore gateを閉じられる。T17は単なるStore
-拡張ではなくtyped boot hydration API、physical recovery intents、T27 proofとは別のdurable application ledgerを受入対象にする。
+拡張ではなくtyped boot hydration API、physical recovery intents、T27 attestationを使ってagent内で組み立てたreceiptを適用するdurable application ledgerを受入対象にする。
 T24はGateway/connection supervisorとexactly-once `ConnectionEpoch`/`DeliveryEpoch` mapping/invalidation、および旧epochのlate
 frame/error拒否のownerのまま、T26が`ProcessGeneration`を発行して
 空intentsのclean existing conversationを含むproduction runtimeを構成する。T27は非空intentsに対し、そのleaseを
-使うquota/reaper/fault-injectionと永続化済みidempotent `PhysicalRecoveryReceipt`を追加する。T28のWS
+使うquota/reaper/fault-injectionとgeneration-bound `PhysicalReapAttestation`を追加し、agent bootがidempotent `PhysicalRecoveryReceipt`を組み立てて適用する。T28のWS
 production E2EはT26 bootstrapとhello→`HydrationReady` gateを前提にする。pre-launchのため旧bootstrapとの
 compat経路は作らない。

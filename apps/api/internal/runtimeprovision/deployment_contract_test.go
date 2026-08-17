@@ -163,7 +163,80 @@ exec /usr/bin/stat "$@"
 	}
 }
 
-func TestSupervisorReconcileCleanupReceiptContractIsFailClosed(t *testing.T) {
+func TestSupervisorReconcileReattestsAlreadyEmptyProjectAfterProvisionerCrash(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=recovered-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" reconcile`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reconcile after provisioner crash failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"phase":"unknown","reaped_through_generation":7`) {
+		t.Fatalf("reconcile after provisioner crash did not re-attest observed-empty project: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "compose.lifecycle.yaml down") {
+		t.Fatalf("already-empty project unexpectedly ran teardown:\n%s", calls)
+	}
+	emptyObservation := strings.Index(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
+	if emptyObservation < 0 || durableGeneration <= emptyObservation {
+		t.Fatalf("reconcile did not verify emptiness before re-attesting the durable generation:\n%s", calls)
+	}
+}
+
+func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpoch(t *testing.T) {
 	supervisor := readDeploymentFile(t, "supervisor")
 	reconcileStart := strings.Index(supervisor, "  reconcile)")
 	if reconcileStart < 0 {
@@ -172,14 +245,15 @@ func TestSupervisorReconcileCleanupReceiptContractIsFailClosed(t *testing.T) {
 	reconcile := supervisor[reconcileStart:]
 	for _, required := range []string{
 		"cleanup_project_is_empty || fail",
-		"epoch_identity || fail",
+		"if epoch_identity; then",
 		`print_reaped_json "${reaped_generation}"`,
+		"print_unknown_json",
 	} {
 		if !strings.Contains(reconcile, required) {
 			t.Fatalf("reconcile cleanup omits %q:\n%s", required, reconcile)
 		}
 	}
-	if strings.Index(reconcile, "cleanup_project_is_empty") > strings.Index(reconcile, "epoch_identity") ||
+	if strings.Index(reconcile, "cleanup_project_is_empty") > strings.Index(reconcile, "if epoch_identity; then") ||
 		strings.Index(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
 		t.Fatalf("reconcile can attest before observed-empty verification and durable generation recovery:\n%s", reconcile)
 	}

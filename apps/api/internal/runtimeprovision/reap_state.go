@@ -155,6 +155,13 @@ func (state *durableReapState) persist() (result error) {
 			ReapedThroughGeneration: &reapedThroughGeneration,
 		}
 	}
+	encoded, err := encodeReapStateDocument(document)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > maxReapStateBytes {
+		return errors.New("durable reap state would exceed the maximum allowed size")
+	}
 	temporary, err := os.CreateTemp(state.directory, ".reap-attestations-*")
 	if err != nil {
 		return fmt.Errorf("create temporary reap state: %w", err)
@@ -167,9 +174,8 @@ func (state *durableReapState) persist() (result error) {
 	if err := temporary.Chmod(0o600); err != nil {
 		return fmt.Errorf("protect temporary reap state: %w", err)
 	}
-	encoder := json.NewEncoder(temporary)
-	if err := encoder.Encode(document); err != nil {
-		return fmt.Errorf("encode temporary reap state: %w", err)
+	if _, err := temporary.Write(encoded); err != nil {
+		return fmt.Errorf("write temporary reap state: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
 		return fmt.Errorf("sync temporary reap state: %w", err)
@@ -189,4 +195,12 @@ func (state *durableReapState) persist() (result error) {
 		return fmt.Errorf("sync reap state directory: %w", err)
 	}
 	return nil
+}
+
+func encodeReapStateDocument(document reapStateDocument) ([]byte, error) {
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode reap state: %w", err)
+	}
+	return append(encoded, '\n'), nil
 }

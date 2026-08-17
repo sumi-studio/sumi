@@ -961,17 +961,28 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     running="$(running_role_count)" || fail "cannot inspect Compose role state"
-    if [[ "${running}" != 0 && "${running}" != 3 ]] ||
-      { [[ "${running}" == 0 ]] && long_lived_containers_exist; }; then
-      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-        >/dev/null 2>&1 || true
-      cleanup_project_is_empty || fail "reconcile did not leave an observed-empty Compose project"
-      epoch_identity || fail "observed-empty project has no coherent last allocated epoch"
-      reaped_generation="${EPOCH_GENERATION}"
-      remove_runtime_secret_tree
-      print_reaped_json "${reaped_generation}"
-    else
+    if [[ "${running}" == 3 ]] ||
+      { [[ "${running}" == 0 ]] && ! long_lived_containers_exist && prepared_containers_exist; }; then
       inspect_epoch
+    else
+      # This branch also covers a provisioner crash after a verified stop or
+      # abort: Compose is already empty, but the daemon had no chance to
+      # publish its local receipt. Re-read the allocator's durable last epoch
+      # only after observing that this PAID's project is empty.
+      if [[ "${running}" != 0 ]] || long_lived_containers_exist; then
+        lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+          >/dev/null 2>&1 || true
+      fi
+      cleanup_project_is_empty || fail "reconcile did not leave an observed-empty Compose project"
+      if epoch_identity; then
+        reaped_generation="${EPOCH_GENERATION}"
+        remove_runtime_secret_tree
+        print_reaped_json "${reaped_generation}"
+      else
+        # A never-provisioned PAID has no durable epoch to attest. Preserve
+        # unknown rather than manufacturing a recovery proof.
+        print_unknown_json
+      fi
     fi
     ;;
   *)
