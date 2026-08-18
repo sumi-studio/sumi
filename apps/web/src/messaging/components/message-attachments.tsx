@@ -98,19 +98,19 @@ function ImageAttachment({
         }
         className="block overflow-hidden rounded-lg border border-border bg-muted/40"
       >
-        <img
-          src={href}
-          alt={label}
-          loading="lazy"
-          decoding="async"
-          onError={() => setBroken(true)}
-          className={`block max-h-72 max-w-full object-contain sm:max-w-md ${
-            covered ? "blur-xl" : ""
-          }`}
-        />
+        {covered ? null : (
+          <img
+            src={href}
+            alt={label}
+            loading="lazy"
+            decoding="async"
+            onError={() => setBroken(true)}
+            className="block max-h-72 max-w-full object-contain sm:max-w-md"
+          />
+        )}
       </button>
       {covered ? (
-        <span className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1 text-center">
+        <span className="flex min-h-28 min-w-48 flex-col items-center justify-center gap-1 px-3 text-center">
           <span className="flex items-center gap-1 rounded-full bg-background/85 px-2 py-0.5 font-medium text-[12px]">
             <EyeOff className="size-3.5" />
             ネタバレ

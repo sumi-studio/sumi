@@ -2,6 +2,7 @@ import { EyeOff, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { isImeComposing } from "../../lib/ime";
+import { clampCodePoints } from "../../lib/text-length";
 import type { AttachmentDraftPatch } from "../model";
 import { MAX_ATTACHMENT_ALT_LENGTH } from "../model";
 
@@ -49,8 +50,9 @@ export function AttachmentEditDialog({
   const apply = () => {
     const patch: AttachmentDraftPatch = {};
     const trimmed = nextFilename.trim();
+    const clampedAlt = clampCodePoints(nextAlt, MAX_ATTACHMENT_ALT_LENGTH);
     if (trimmed && trimmed !== filename) patch.filename = trimmed;
-    if (nextAlt !== alt) patch.alt = nextAlt;
+    if (clampedAlt !== alt) patch.alt = clampedAlt;
     if (nextSpoiler !== spoiler) patch.spoiler = nextSpoiler;
     onApply(patch);
   };
@@ -105,8 +107,14 @@ export function AttachmentEditDialog({
             <span className="mb-1 block font-medium text-[12px]">説明</span>
             <textarea
               value={nextAlt}
-              onChange={(event) => setNextAlt(event.target.value)}
-              maxLength={MAX_ATTACHMENT_ALT_LENGTH}
+              onChange={(event) =>
+                setNextAlt(
+                  clampCodePoints(
+                    event.target.value,
+                    MAX_ATTACHMENT_ALT_LENGTH,
+                  ),
+                )
+              }
               rows={2}
               placeholder="中身を見なくても何か分かる説明"
               className="w-full resize-none rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/70 focus:border-ring/60"

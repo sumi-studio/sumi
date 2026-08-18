@@ -10,6 +10,7 @@ import {
   installMessagingBackend,
   useMessaging,
 } from "../store";
+import { AttachmentEditDialog } from "./attachment-edit-dialog";
 import { Composer } from "./composer";
 import { ComposerAttachments } from "./composer-attachments";
 import { MessageAttachments } from "./message-attachments";
@@ -125,20 +126,19 @@ describe("Attachment spoiler and viewer", () => {
     bindMessagingSessionIdentity(null);
   });
 
-  it("keeps a spoilered image covered until the reader opens it, and names it by its alt", () => {
+  it("does not render a spoilered image until the reader opens it", () => {
     bindMessagingSessionIdentity("human-self");
     installMessagingBackend(new MockMessagingServer());
     render(<MessageAttachments attachments={[SPOILER]} />);
-    // 覆いの下でも「何の画像か」は分かる: altがそのまま読み上げ名になる。
-    const image = screen.getByRole("img", { name: "結末の一枚" });
-    expect(image.className).toContain("blur");
+    expect(screen.queryByRole("img", { name: "結末の一枚" })).toBeNull();
     const cover = screen.getByRole("button", {
       name: "結末の一枚のネタバレを開く",
     });
     fireEvent.click(cover);
-    expect(
-      screen.getByRole("img", { name: "結末の一枚" }).className,
-    ).not.toContain("blur");
+    expect(screen.getByRole("img", { name: "結末の一枚" })).toHaveAttribute(
+      "src",
+      `/mock/attachments/${SPOILER.attachmentId}`,
+    );
     // 開いても本体を開くのは次のクリック。1クリックでビューアーまで飛ばない。
     expect(screen.queryByTestId("image-viewer")).toBeNull();
   });
@@ -158,6 +158,29 @@ describe("Attachment spoiler and viewer", () => {
     ).toBe(`/mock/attachments/${IMAGE.attachmentId}`);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByTestId("image-viewer")).toBeNull();
+  });
+});
+
+describe("AttachmentEditDialog", () => {
+  afterEach(cleanup);
+
+  it("accepts a 1,000-code-point description even when its UTF-16 length is larger", () => {
+    const onApply = vi.fn();
+    const description = "😀".repeat(1000);
+    render(
+      <AttachmentEditDialog
+        filename="shot.png"
+        alt=""
+        spoiler={false}
+        onCancel={vi.fn()}
+        onApply={onApply}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "説明" }), {
+      target: { value: description },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(onApply).toHaveBeenCalledWith({ alt: description });
   });
 });
 
