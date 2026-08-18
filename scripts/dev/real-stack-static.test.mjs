@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const repositoryRoot = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -290,7 +294,10 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
     launcher,
     /SUMI_MODEL_API_KEY_ENV \\\n+\s+SUMI_EXECUTION_REVIEWER_MODEL_PRESET/,
   );
-  assert.match(launcher, /\[\[ -z "\$\{reviewer_api_key_env\}" \]\] && continue/);
+  assert.match(
+    launcher,
+    /\[\[ -z "\$\{reviewer_api_key_env\}" \]\] && continue/,
+  );
 });
 
 test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async () => {
@@ -329,4 +336,67 @@ test("the allocator exception is bounded to one locked disposable generation", a
   assert.match(launcher, /rm -rf -- "\$\{RUNTIME_ROOT\}"/);
   assert.match(launcher, /fail "a required Sumi process exited"/);
   assert.doesNotMatch(launcher, /--supervisor-allocate/);
+});
+
+/**
+ * Expands the launcher's own attachment root definitions under a controlled
+ * environment, so the test measures where the bytes actually land rather than
+ * how the assignment happens to be spelled.
+ */
+async function attachmentRootFor(launcher, environment) {
+  const definitions = launcher
+    .split("\n")
+    .filter((line) =>
+      /^readonly (?:PERSISTENT_STATE_ROOT|MESSAGING_ATTACHMENT_DIR)=/.test(
+        line,
+      ),
+    );
+  assert.equal(definitions.length, 2);
+  const script = [
+    "set -euo pipefail",
+    'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
+    ...definitions,
+    'printf %s "$MESSAGING_ATTACHMENT_DIR"',
+  ].join("\n");
+  const { stdout } = await execFileAsync("bash", ["-c", script], {
+    env: {
+      PATH: process.env.PATH,
+      DISPOSABLE_RUNTIME_ROOT: "/tmp/sumi-real-stack.disposable",
+      HOME: "/home/example",
+      ...environment,
+    },
+  });
+  return stdout;
+}
+
+test("uploaded attachment bytes outlive the disposable runtime root", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+
+  // Postgres survives a restart in a named Compose volume, so attachment bytes
+  // must not sit in the tree that shutdown deletes; otherwise the rows outlive
+  // the objects they name and every stored image comes back missing.
+  assert.match(launcher, /rm -rf -- "\$\{RUNTIME_ROOT\}"/);
+  const disposableDirectories = launcher.match(
+    /mkdir -m 0700 \\\n(?:\s+"\$\{[A-Z_]+\}" \\\n)*\s+"\$\{[A-Z_]+\}"\n/,
+  );
+  assert.ok(disposableDirectories);
+  assert.doesNotMatch(disposableDirectories[0], /MESSAGING_ATTACHMENT_DIR/);
+
+  assert.equal(
+    await attachmentRootFor(launcher, {}),
+    "/home/example/.local/state/sumi/real-stack/messaging-attachments",
+  );
+  assert.equal(
+    await attachmentRootFor(launcher, {
+      XDG_STATE_HOME: "/home/example/state",
+    }),
+    "/home/example/state/sumi/real-stack/messaging-attachments",
+  );
+  assert.equal(
+    await attachmentRootFor(launcher, {
+      SUMI_REAL_STACK_STATE_ROOT: "/srv/sumi-dev",
+      XDG_STATE_HOME: "/home/example/state",
+    }),
+    "/srv/sumi-dev/messaging-attachments",
+  );
 });
