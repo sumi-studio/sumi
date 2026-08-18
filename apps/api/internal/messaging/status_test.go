@@ -264,6 +264,80 @@ func TestTimedStatusLapsesBackToTheDeclarationUnderneath(t *testing.T) {
 	}
 }
 
+// The same guarantee has to hold for a participant who has never declared
+// anything. Ordering used to come from locking the existing row, so a
+// participant with no row had nothing to serialize on: two first declarations
+// each concluded「下には何も無い」, and the temporary one committed last would
+// erase the lasting one instead of promising to return to it — an hour later
+// the participant would be saying nothing at all.
+//
+// This is the same footing as the sweeper: the row is what orders the
+// statements. Deriving the base inside the writing statement makes the second
+// writer wait on the key and read what the first actually committed, whether
+// or not the row existed when it started.
+func TestATimedStatusTakesItsBaseFromTheDeclarationThatCommittedFirst(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	// A lasting declaration in flight on another connection, written exactly
+	// as SetStatus writes one. Nothing is committed yet, so there is no row
+	// for the timed declaration below to find or lock.
+	lasting, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the lasting declaration: %v", err)
+	}
+	defer func() { _ = lasting.Rollback(context.Background()) }()
+	if _, err := lasting.Exec(ctx, `
+		INSERT INTO participant_statuses
+			(member_kind, member_id, status, note, expires_at, base_status, base_note)
+		VALUES ($1, $2, $3, $4, NULL, NULL, '')`,
+		w.humanA.Kind, w.humanA.ID, StatusAway, "在宅です"); err != nil {
+		t.Fatalf("write the lasting declaration: %v", err)
+	}
+
+	type declaration struct {
+		status ParticipantStatus
+		err    error
+	}
+	soon := time.Now().Add(time.Hour)
+	done := make(chan declaration, 1)
+	go func() {
+		status, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &soon)
+		done <- declaration{status: status, err: err}
+	}()
+	waitForWaitingBackend(t, ctx, w.store.pool)
+	if err := lasting.Commit(ctx); err != nil {
+		t.Fatalf("commit the lasting declaration: %v", err)
+	}
+
+	timed := <-done
+	if timed.err != nil {
+		t.Fatalf("set timed status: %v", timed.err)
+	}
+	if timed.status.BaseStatus != StatusAway || timed.status.BaseNote != "在宅です" {
+		t.Fatalf("timed status = %+v, want the lasting declaration as its base", timed.status)
+	}
+
+	// And it really returns there rather than ending. The hour is moved into
+	// the past directly; what is under test is the base, not the clock.
+	if _, err := w.store.pool.Exec(ctx, `
+		UPDATE participant_statuses SET expires_at = now() - interval '1 minute'
+		WHERE member_kind = $1 AND member_id = $2`,
+		w.humanA.Kind, w.humanA.ID); err != nil {
+		t.Fatalf("move the expiry into the past: %v", err)
+	}
+	expiries, err := collectExpiries(ctx, w.store.core)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(expiries) != 1 || expiries[0].Status.Status != StatusAway ||
+		expiries[0].Status.Note != "在宅です" {
+		t.Fatalf("expiries = %+v, want a lapse back to the lasting declaration", expiries)
+	}
+}
+
 // The sweep only makes the read-time answer durable and announces it. It must
 // not invent a state nobody declared, and it must have somewhere to announce to.
 func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {

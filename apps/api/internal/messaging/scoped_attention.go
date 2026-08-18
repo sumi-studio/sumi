@@ -140,6 +140,15 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 // A temporary status (expiresAt != nil) remembers the state it replaces, so it
 // lapses back to what the participant had already said. Setting a lasting
 // status clears that memory: the new declaration is the whole truth.
+//
+// The base is derived by the same statement that writes the row, so a
+// participant's declarations are ordered against each other whether or not
+// they already had a row. A read-then-write could not do that: an unwritten
+// participant has no row to lock, so two first declarations would each decide
+// "there was nothing underneath" and the later one would erase the lasting
+// status the earlier one had just made. ON CONFLICT makes the second writer
+// wait on the same key and read what the first actually committed — the same
+// footing as the sweeper, where the row lock is what guarantees the order.
 func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expiresAt *time.Time) (ParticipantStatus, error) {
 	if !ValidStatus(status) {
 		return ParticipantStatus{}, fmt.Errorf("unknown status %q", status)
@@ -155,63 +164,50 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return ParticipantStatus{}, err
 	}
-	next := ParticipantStatus{Participant: s.Scope.Actor, Status: status, Note: note, ExpiresAt: expiresAt}
-	if expiresAt != nil {
-		// The row is read and rewritten in the same transaction, so two
-		// temporary statuses racing cannot both take the lasting one as base
-		// and then lose it.
-		base, err := s.lastingStatusInTx(ctx, tx)
-		if err != nil {
-			return ParticipantStatus{}, err
-		}
-		next.BaseStatus = base.Status
-		next.BaseNote = base.Note
-	}
-	var baseStatus *string
-	baseNote := next.BaseNote
-	if next.BaseStatus != "" {
-		baseStatus = &next.BaseStatus
-	} else {
-		baseNote = ""
-	}
-	if _, err := tx.Exec(ctx, `
+	// The CASE arms say what a new temporary declaration lapses back to: a
+	// declaration that holds until replaced is itself the thing underneath,
+	// and anything with an expiry — still holding or already lapsed — hands
+	// on the base it was already carrying, so temporary states in a row
+	// cannot bury the lasting one the participant chose. The rule is written
+	// once, here, where the row is written; a second copy in Go would be a
+	// second answer to the same question.
+	var stored storedStatus
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO participant_statuses
 			(member_kind, member_id, status, note, expires_at, base_status, base_note)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		VALUES ($1, $2, $3, $4, $5, NULL, '')
 		ON CONFLICT (member_kind, member_id)
 		DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note,
 		              expires_at = EXCLUDED.expires_at,
-		              base_status = EXCLUDED.base_status,
-		              base_note = EXCLUDED.base_note, updated_at = now()`,
+		              base_status = CASE
+		                  WHEN EXCLUDED.expires_at IS NULL THEN NULL
+		                  WHEN participant_statuses.expires_at IS NULL THEN participant_statuses.status
+		                  ELSE participant_statuses.base_status
+		              END,
+		              base_note = CASE
+		                  WHEN EXCLUDED.expires_at IS NULL THEN ''
+		                  WHEN participant_statuses.expires_at IS NULL THEN participant_statuses.note
+		                  WHEN participant_statuses.base_status IS NULL THEN ''
+		                  ELSE participant_statuses.base_note
+		              END,
+		              updated_at = now()
+		RETURNING status, note, expires_at, base_status, base_note`,
 		s.Scope.Actor.Kind, s.Scope.Actor.ID, status, note, expiresAt,
-		baseStatus, baseNote); err != nil {
+	).Scan(&stored.status, &stored.note, &stored.expiresAt,
+		&stored.baseStatus, &stored.baseNote); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("set scoped status: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("commit scoped status: %w", err)
 	}
-	next.BaseNote = baseNote
+	next := ParticipantStatus{
+		Participant: s.Scope.Actor, Status: stored.status, Note: stored.note,
+		ExpiresAt: stored.expiresAt, BaseNote: stored.baseNote,
+	}
+	if stored.baseStatus != nil {
+		next.BaseStatus = *stored.baseStatus
+	}
 	return next, nil
-}
-
-// lastingStatusInTx returns what the actor would be back to once every
-// temporary status they have set has lapsed.
-func (s *ScopedStore) lastingStatusInTx(ctx context.Context, tx pgx.Tx) (ParticipantStatus, error) {
-	var stored storedStatus
-	err := tx.QueryRow(ctx, `
-		SELECT status, note, expires_at, base_status, base_note
-		FROM participant_statuses
-		WHERE member_kind = $1 AND member_id = $2
-		FOR UPDATE`,
-		s.Scope.Actor.Kind, s.Scope.Actor.ID).Scan(&stored.status, &stored.note,
-		&stored.expiresAt, &stored.baseStatus, &stored.baseNote)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ParticipantStatus{Participant: s.Scope.Actor}, nil
-	}
-	if err != nil {
-		return ParticipantStatus{}, fmt.Errorf("read scoped status: %w", err)
-	}
-	return stored.lasting(s.Scope.Actor, time.Now()), nil
 }
 
 func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatus, error) {

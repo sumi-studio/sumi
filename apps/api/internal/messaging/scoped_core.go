@@ -81,18 +81,34 @@ func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string, voi
 	if _, err := s.authorizeManageChannelsInTx(ctx, tx); err != nil {
 		return Place{}, err
 	}
-	place := Place{
-		PlaceID: newUUIDv7(), Kind: PlaceChannel, WorkspaceID: s.Scope.WorkspaceID,
-		Name: name, Topic: topic, Visibility: "public", Voice: voice,
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
-		VALUES ($1, 'channel', $2, $3, $4, $5)`,
-		place.PlaceID, place.WorkspaceID, place.Name, place.Topic, place.Voice); err != nil {
+	place, err := s.insertChannelInTx(ctx, tx, name, topic, voice)
+	if err != nil {
 		return Place{}, fmt.Errorf("insert channel: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Place{}, fmt.Errorf("commit create channel: %w", err)
+	}
+	return place, nil
+}
+
+// insertChannelInTx writes the new channel and reads back the row the database
+// actually stored, so the columns this code does not name — visibility, the
+// sequence a place starts at — are reported as the schema decides them rather
+// than as a second copy of that decision kept in Go.
+func (s *ScopedStore) insertChannelInTx(ctx context.Context, tx pgx.Tx, name, topic string, voice bool) (Place, error) {
+	var place Place
+	var storedName *string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
+		VALUES ($1, 'channel', $2, $3, $4, $5)
+		RETURNING place_id, kind, workspace_id, name, topic, visibility, last_seq, voice`,
+		newUUIDv7(), s.Scope.WorkspaceID, name, topic, voice,
+	).Scan(&place.PlaceID, &place.Kind, &place.WorkspaceID, &storedName,
+		&place.Topic, &place.Visibility, &place.LastSeq, &place.Voice); err != nil {
+		return Place{}, err
+	}
+	if storedName != nil {
+		place.Name = *storedName
 	}
 	return place, nil
 }
@@ -133,23 +149,33 @@ func (s *ScopedStore) UpdateChannel(ctx context.Context, placeID string, name, t
 		return Place{}, ErrNotAChannel
 	}
 	// COALESCE keeps the omitted column exactly as it was, in the database
-	// rather than in the caller's memory of it.
-	if _, err := tx.Exec(ctx, `
+	// rather than in the caller's memory of it — and RETURNING reports the row
+	// the statement left behind, not the one this transaction read on its way
+	// in. Two people editing different fields of the same channel would
+	// otherwise each answer with the other's field as they last saw it, and
+	// the place_updated built from that answer would put the stale value on
+	// everyone's screen.
+	var updated Place
+	var updatedName *string
+	if err := tx.QueryRow(ctx, `
 		UPDATE places SET name = COALESCE($1, name), topic = COALESCE($2, topic)
-		WHERE workspace_id = $3 AND place_id = $4`,
-		name, topic, s.Scope.WorkspaceID, placeID); err != nil {
+		WHERE workspace_id = $3 AND place_id = $4
+		RETURNING place_id, kind, workspace_id, name, topic, visibility, last_seq, voice`,
+		name, topic, s.Scope.WorkspaceID, placeID,
+	).Scan(&updated.PlaceID, &updated.Kind, &updated.WorkspaceID, &updatedName,
+		&updated.Topic, &updated.Visibility, &updated.LastSeq, &updated.Voice); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Place{}, ErrPlaceNotFound
+		}
 		return Place{}, fmt.Errorf("update channel: %w", err)
 	}
-	if name != nil {
-		place.Name = *name
-	}
-	if topic != nil {
-		place.Topic = *topic
+	if updatedName != nil {
+		updated.Name = *updatedName
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Place{}, fmt.Errorf("commit update channel: %w", err)
 	}
-	return place, nil
+	return updated, nil
 }
 
 // DuplicateChannel opens a new, empty channel shaped like an existing one. It
@@ -182,14 +208,8 @@ func (s *ScopedStore) DuplicateChannel(ctx context.Context, placeID, name string
 	if name == "" {
 		name = copyChannelName(source.Name)
 	}
-	place := Place{
-		PlaceID: newUUIDv7(), Kind: PlaceChannel, WorkspaceID: s.Scope.WorkspaceID,
-		Name: name, Topic: source.Topic, Visibility: "public", Voice: source.Voice,
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
-		VALUES ($1, 'channel', $2, $3, $4, $5)`,
-		place.PlaceID, place.WorkspaceID, place.Name, place.Topic, place.Voice); err != nil {
+	place, err := s.insertChannelInTx(ctx, tx, name, source.Topic, source.Voice)
+	if err != nil {
 		return Place{}, fmt.Errorf("insert duplicated channel: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
