@@ -486,10 +486,15 @@ test("the launcher never re-modes a state root it did not create", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
   try {
     // A root the launcher creates itself is private from the first byte.
-    const created = join(scratch, "nested", "real-stack");
+    const created = join(scratch, "new-parent", "nested", "real-stack");
     const fresh = await provisionStateRoot(launcher, created);
     assert.equal(fresh.code, 0);
     assert.equal((await stat(created)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(scratch, "new-parent"))).mode & 0o777, 0o700);
+    assert.equal(
+      (await stat(join(scratch, "new-parent", "nested"))).mode & 0o777,
+      0o700,
+    );
 
     // A root that already exists may be $HOME, $TMPDIR, or any other directory
     // with duties of its own. Forcing it to 0700 would strip access the rest of
@@ -516,6 +521,15 @@ test("the launcher never re-modes a state root it did not create", async () => {
     const rejected = await provisionStateRoot(launcher, linked);
     assert.equal(rejected.code, 3);
     assert.match(rejected.stderr, /must be a real directory/);
+
+    // Normalizing at the provisioner's entrance keeps a trailing slash from
+    // making bash inspect the symlink target instead of the link itself.
+    const trailingSlashRejected = await provisionStateRoot(
+      launcher,
+      `${linked}/`,
+    );
+    assert.equal(trailingSlashRejected.code, 3);
+    assert.match(trailingSlashRejected.stderr, /must be a real directory/);
   } finally {
     await rm(scratch, { force: true, recursive: true });
   }

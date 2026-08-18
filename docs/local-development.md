@@ -310,15 +310,15 @@ registry rows and the attachment bytes they name have to be discarded together
 or not at all:
 
 - the control-plane Postgres, in the Compose volume `sumi-postgres`;
-- messaging attachment bytes, including profile images, under
+- messaging attachment bytes under
   `${XDG_STATE_HOME:-~/.local/state}/sumi/real-stack/messaging-attachments`
   (override with `SUMI_REAL_STACK_STATE_ROOT`; the path must be absolute, and
   an existing directory must already be mode 0700 and owned by you — the
   launcher will not relax or tighten a directory it did not create).
 
 Keeping the bytes inside the temporary directory left the database naming
-objects that shutdown had already deleted, so every uploaded image came back
-missing after a restart. Delete both stores together to start clean; the API's
+objects that shutdown had already deleted, so attachments referred to missing
+objects after a restart. Delete both stores together to start clean; the API's
 attachment reconciler sweeps bytes the database no longer names.
 
 Do not use this exception for persistent, concurrent, or restartable

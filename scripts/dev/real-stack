@@ -108,13 +108,20 @@ require_value() {
 # the store whenever the stack is started from somewhere else.
 provision_persistent_state_root() {
   local root="$1" metadata mode owner
+  # Normalize trailing separators once before every subsequent path check.
+  # In particular, -L follows a symlink when its operand has a trailing slash.
+  while [[ "${root}" != "/" && "${root}" == */ ]]; do
+    root="${root%/}"
+  done
   [[ "${root}" == /* ]] ||
     fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${root}"
-  mkdir -p -- "$(dirname -- "${root}")" ||
+  (umask 077; mkdir -p -- "$(dirname -- "${root}")") ||
     fail "cannot create the parent of the persistent local state root: ${root}"
   # mkdir without -p reports the difference between "created for us" and
   # "already there", which is exactly the line the launcher must not cross.
-  if mkdir -m 0700 -- "${root}" 2>/dev/null; then
+  if [[ ! -e "${root}" && ! -L "${root}" ]]; then
+    mkdir -m 0700 -- "${root}" ||
+      fail "cannot create the persistent local state root: ${root}"
     return 0
   fi
   [[ -d "${root}" && ! -L "${root}" ]] ||
@@ -557,8 +564,8 @@ readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
 # Attachment bytes have to outlive one run. Postgres keeps the rows that name
 # them in a named Compose volume, so holding the bytes under the disposable
 # runtime root left the database pointing at files that shutdown had already
-# deleted: profile images and uploads came back as missing objects after every
-# restart. The persistent root sits under the user state directory instead.
+# deleted: attachments then referred to missing objects after every restart.
+# The persistent root sits under the user state directory instead.
 readonly PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
 readonly MESSAGING_ATTACHMENT_DIR="${PERSISTENT_STATE_ROOT}/messaging-attachments"
 # Local runs use explicit bounded attachment caps; the API refuses to serve
