@@ -404,6 +404,71 @@ describe("place lifecycleの再接続突き合わせ", () => {
     );
   });
 
+  it("遅れて届いたthread作成eventで新しいserver aggregateを巻き戻さない", async () => {
+    const stale = thread("thread-late-create");
+    const fresh = {
+      ...stale,
+      messageCount: 2,
+      latestSeq: 2,
+      lastMessageAt: 2,
+      lastMessage: "作成後の返信です",
+      participants: [
+        ...stale.participants,
+        { kind: "human", humanId: "human-c" } as const,
+      ],
+    };
+    useMessaging.setState({ threadsById: { [stale.threadId]: stale } });
+    backend.fetchThread.mockResolvedValue(fresh);
+
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 2),
+      notify: null,
+    });
+    await settle();
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+
+    backend.emit({ type: "place_created", thread: stale });
+    // place_created is synchronous; a stale write here would be visible even
+    // if the follow-up authoritative GET happened to complete immediately.
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+    await settle();
+
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+  });
+
+  it("thread summary再取得が一度失敗しても親一覧を開き直せば回復する", async () => {
+    const stale = thread("thread-refresh-retry");
+    const fresh = {
+      ...stale,
+      messageCount: 2,
+      latestSeq: 2,
+      lastMessageAt: 2,
+      lastMessage: "再取得後の返信です",
+    };
+    useMessaging.setState({
+      threadsById: { [stale.threadId]: stale },
+      threadsLoadedForPlace: { [CHANNEL_1]: true },
+    });
+    backend.fetchThread.mockRejectedValueOnce(new Error("timeout"));
+
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 2),
+      notify: null,
+    });
+    await settle();
+
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(
+      false,
+    );
+    backend.fetchThreads.mockResolvedValueOnce([fresh]);
+    await useMessaging.getState().loadThreads(CHANNEL_1);
+
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+  });
+
   it("bootstrapが先に取り込んだthread messageをcatch-upで再加算しない", async () => {
     const known = thread("thread-known");
     const incoming = threadMessage(known.threadId, 2);

@@ -45,6 +45,34 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	}
 }
 
+func TestEditingThreadMessageAdmitsNewMention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	a := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	b := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	thread, _, err := a.CreateThread(ctx, channel.PlaceID, "編集で参加", "", "thread-edit-mention-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "あとで追記します")
+	if threads, err := b.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("mentioned member started as nonparticipant: threads=%+v err=%v", threads, err)
+	}
+
+	if _, err := a.EditMessage(ctx, thread.Place.PlaceID, message.MessageID, "@Haru この件もお願いします"); err != nil {
+		t.Fatalf("edit thread message: %v", err)
+	}
+	threads, err := b.ThreadsFor(ctx)
+	if err != nil || len(threads) != 1 {
+		t.Fatalf("edited mention did not admit participant: threads=%+v err=%v", threads, err)
+	}
+	if got := threads[0].Participants; len(got) != 2 || got[0] != w.humanA || got[1] != w.humanB {
+		t.Fatalf("thread participants = %+v, want author and edited mention", got)
+	}
+}
+
 func TestThreadRejectsDeletedOriginMessage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

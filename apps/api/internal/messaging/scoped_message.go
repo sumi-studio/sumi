@@ -363,7 +363,8 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, fmt.Errorf("begin scoped edit: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
+	if err != nil {
 		return Message{}, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
@@ -404,6 +405,14 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	}
 	if err := insertMentions(ctx, tx, messageID, mentions); err != nil {
 		return Message{}, err
+	}
+	// Editing may introduce a new mention. Keep the same transaction-level
+	// admission contract as append: every mentioned member is a thread
+	// participant before this edit becomes observable.
+	if place.Kind == PlaceThread {
+		if err := s.joinThreadParticipants(ctx, tx, place.PlaceID, actorMembership, mentions); err != nil {
+			return Message{}, err
+		}
 	}
 	message.Content, message.Mentions, message.EditedAt = content, mentions, &editedAt
 	parts := []Message{message}

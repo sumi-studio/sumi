@@ -486,8 +486,26 @@ export const useMessaging = create<MessagingState>((set, get) => {
             threadsById: { ...state.threadsById, [thread.threadId]: thread },
           }));
         } catch {
-          // The next event or explicit load retries; no local approximation is
-          // allowed to stand in for the server aggregate.
+          // Do not strand a stale aggregate behind a successful parent-list
+          // cache entry. A later panel open must fetch the authoritative list
+          // even when the event that invalidated this summary was the last
+          // event we receive.
+          if (
+            backend === currentBackend &&
+            messagingSessionGeneration === sessionGeneration
+          ) {
+            set((state) => {
+              const thread = state.threadsById[threadId];
+              if (!thread) return {};
+              const parentKey = placeKey(thread.parentPlace);
+              return {
+                threadsLoadedForPlace: {
+                  ...state.threadsLoadedForPlace,
+                  [parentKey]: false,
+                },
+              };
+            });
+          }
         } finally {
           queuedRefresh.request = null;
           if (
@@ -1050,11 +1068,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "place_created") {
       const { channel, dm, thread } = event;
+      let knownThread = false;
       set((state) => {
-        if (thread)
+        if (thread) {
+          knownThread = Boolean(state.threadsById[thread.threadId]);
+          if (knownThread) return {};
           return {
             threadsById: { ...state.threadsById, [thread.threadId]: thread },
           };
+        }
         if (channel) {
           return state.channels.some(
             (entry) => entry.channelId === channel.channelId,
@@ -1069,6 +1091,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }
         return {};
       });
+      // place lifecycle and message delivery have no shared ordering. A late
+      // creation payload is only useful for an unknown thread; for a known
+      // one it must not roll an already refreshed server aggregate backward.
+      if (thread && knownThread) scheduleThreadSummaryRefresh(thread.threadId);
       return;
     }
     if (event.type === "place_updated") {
