@@ -83,11 +83,11 @@ require_tracked_compose_support() {
   command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
 }
 
-require_cleanup_verification_support() {
+require_cleanup_timeout_support() {
   command -v timeout >/dev/null 2>&1 ||
-    fail "GNU timeout is required for bounded cleanup verification"
+    fail "GNU timeout is required for bounded cleanup Docker calls"
   timeout --foreground --kill-after=1s 1s true >/dev/null 2>&1 ||
-    fail "timeout must support --foreground and --kill-after for bounded cleanup verification"
+    fail "timeout must support --foreground and --kill-after for bounded cleanup Docker calls"
 }
 
 configure_apparmor_profile() {
@@ -473,8 +473,13 @@ declare ACTIVE_COMPOSE_PID=
 readonly MILLISECONDS_PER_SECOND=1000
 readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
+# Every cleanup-path Docker CLI call has a wall-clock cap.  `down --timeout`
+# is Docker's container-stop grace, not a cap on the CLI or daemon response;
+# therefore the outer timeout is the cleanup stage's actual bound.
+readonly CLEANUP_DOWN_TIMEOUT_SECONDS="${SUMI_COMPOSE_TIMEOUT}"
+readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
 # `cleanup_project_is_empty` runs once after each cleanup `down`. Bound both
-# the query and the time allowed for timeout(1) to join a TERM-resistant
+# its query and the time allowed for timeout(1) to join a TERM-resistant
 # Docker CLI before its KILL fallback.
 readonly CLEANUP_VERIFICATION_TIMEOUT_SECONDS=5
 readonly CLEANUP_VERIFICATION_KILL_GRACE_SECONDS=1
@@ -490,16 +495,19 @@ readonly COMPOSE_CHILD_TERM_DELAY_MILLISECONDS=100
 readonly LONG_LIVED_ROLES=(runtime executor broker)
 readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
 # The cancellation cleanup can first wait for the tracked Compose child to
-# honour TERM, then run each `down --timeout`, verify each attempt, and wait
+# honour TERM, then run each bounded `down`, verify each attempt, and wait
 # between unsuccessful attempts. `flock -n` has no wait to add: cleanup is
 # armed only after that lock has already been acquired. Keep this in the same
-# constants that drive those waits, rather than a hand-maintained total.
+# constants that drive those waits, rather than a hand-maintained total.  The
+# inner `down --timeout` is intentionally the same value as its outer CLI cap.
 #
-# timeout(1)'s verification KILL grace and the final scheduling margin cover
-# joining its process plus local secret removal after the bounded Docker calls.
+# Each timeout(1) KILL grace and the final scheduling margin cover joining its
+# process plus local secret removal after the bounded Docker calls.
 readonly SUPERVISOR_CLEANUP_BOUND_MILLISECONDS=$((
   COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS +
-  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT * MILLISECONDS_PER_SECOND +
+  CLEANUP_MAX_ATTEMPTS * (
+    CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS
+  ) * MILLISECONDS_PER_SECOND +
   CLEANUP_MAX_ATTEMPTS * (
     CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS
   ) * MILLISECONDS_PER_SECOND +
@@ -531,7 +539,17 @@ lifecycle_compose() {
     "$@"
 }
 
-cleanup_lifecycle_compose() {
+cleanup_down_lifecycle_compose() {
+  timeout --foreground \
+    --kill-after="${CLEANUP_DOWN_KILL_GRACE_SECONDS}s" \
+    "${CLEANUP_DOWN_TIMEOUT_SECONDS}s" \
+    docker compose \
+      --project-name "${SUMI_COMPOSE_PROJECT}" \
+      --file "${LIFECYCLE_COMPOSE_FILE}" \
+      "$@"
+}
+
+cleanup_verification_lifecycle_compose() {
   timeout --foreground \
     --kill-after="${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}s" \
     "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}s" \
@@ -929,7 +947,7 @@ cleanup_partial_generation() {
     # A nonzero `down` can still leave an empty project, while a zero status is
     # not the cleanup contract by itself. Bound retries on observed emptiness.
     for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
-      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+      cleanup_down_lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1
       if project_is_empty; then
         cleanup_complete=1
@@ -977,7 +995,7 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
-    require_cleanup_verification_support
+    require_cleanup_timeout_support
     configure_apparmor_profile
     validate_prepare_compose_redacted
     # The API installs exact-generation authorization and creates the PAID
@@ -1013,7 +1031,7 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
-    require_cleanup_verification_support
+    require_cleanup_timeout_support
     require_expected_epoch
     set_runtime_secret_host_dir "${EPOCH_GENERATION}"
     require_launch_environment
