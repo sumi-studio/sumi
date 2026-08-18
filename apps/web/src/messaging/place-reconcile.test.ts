@@ -274,6 +274,15 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(backend.listeners.size).toBe(1);
   });
 
+  it("再接続snapshotから消えたchannelを保持しない", async () => {
+    backend.next = snapshot({ channels: [], dms: [], unread: {} });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    expect(useMessaging.getState().channels).toEqual([]);
+  });
+
   it("進行中の未読・既読・ローカルstateを突き合わせで壊さない", async () => {
     useMessaging.getState().selectPlace(CHANNEL_1);
     useMessaging.getState().setDraft(CHANNEL_1, "書きかけ");

@@ -171,6 +171,8 @@ enum MessagingAction {
         name: String,
         #[serde(default)]
         topic: Option<String>,
+        #[serde(default)]
+        voice: bool,
     },
     /// Rename a channel, retopic it, or both.  An omitted field is left alone.
     UpdateChannel {
@@ -250,6 +252,8 @@ enum BoundMessagingAction {
         name: String,
         #[serde(default)]
         topic: Option<String>,
+        #[serde(default)]
+        voice: bool,
     },
     UpdateChannel {
         place_id: String,
@@ -628,7 +632,7 @@ fn messaging_parameters_schema() -> Value {
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
             "marker_id; get_call_state may include place_id; start_dm requires participants; ",
-            "create_channel requires name and may include topic; update_channel requires ",
+            "create_channel requires name and may include topic and voice; update_channel requires ",
             "place_id plus name, topic or both; duplicate_channel requires place_id and may ",
             "include name. Write, react and reply_later act ",
             "on the place most recently opened in this tool view; status, get_call_state and ",
@@ -685,6 +689,10 @@ fn messaging_parameters_schema() -> Value {
                     "Optional for create_channel and update_channel, omitted for other actions. ",
                     "The one line describing what the channel is for."
                 )
+            },
+            "voice": {
+                "type": "boolean",
+                "description": "Optional for create_channel. Set true to create a voice channel; omitted creates a text channel."
             },
             "participants": {
                 "type": "array",
@@ -1227,12 +1235,13 @@ impl BoundToolAdapter for MessagingTool {
                     arguments,
                 )
             }
-            MessagingAction::CreateChannel { name, topic } => {
+            MessagingAction::CreateChannel { name, topic, voice } => {
                 let mut arguments = object([
                     ("action", Value::String("create_channel".to_owned())),
                     ("name", Value::String(name.clone())),
                 ]);
                 insert_optional_string(&mut arguments, "topic", topic);
+                arguments.insert("voice".to_owned(), Value::Bool(voice));
                 let review_projection = arguments.clone();
                 messaging_binding(
                     &scope,
@@ -1630,12 +1639,13 @@ impl MessagingTool {
                 focus_opened_place(&mut *state, &response, "dm", "dm_id");
                 response
             }
-            BoundMessagingAction::CreateChannel { name, topic } => {
+            BoundMessagingAction::CreateChannel { name, topic, voice } => {
                 let response = tokio::select! {
                     _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.create_channel(scope, CreateMessagingChannelRequest {
                         name: &name,
                         topic: topic.as_deref(),
+                        voice,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
@@ -2110,8 +2120,8 @@ fn resolve_raw_action(
         MessagingAction::StartDm { participants } => {
             Ok(BoundMessagingAction::StartDm { participants })
         }
-        MessagingAction::CreateChannel { name, topic } => {
-            Ok(BoundMessagingAction::CreateChannel { name, topic })
+        MessagingAction::CreateChannel { name, topic, voice } => {
+            Ok(BoundMessagingAction::CreateChannel { name, topic, voice })
         }
         MessagingAction::UpdateChannel {
             place_id,
@@ -2298,7 +2308,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             Ok(())
         }
         MessagingAction::StartDm { participants } => validate_dm_participants(participants),
-        MessagingAction::CreateChannel { name, topic } => {
+        MessagingAction::CreateChannel { name, topic, .. } => {
             validate_channel_name(name)?;
             validate_optional_bounded(topic, MAX_TOPIC_BYTES)
         }
@@ -2502,10 +2512,11 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
             })
         }
         BoundMessagingAction::StartDm { participants } => validate_dm_participants(participants),
-        BoundMessagingAction::CreateChannel { name, topic } => {
+        BoundMessagingAction::CreateChannel { name, topic, voice } => {
             validate_action(&MessagingAction::CreateChannel {
                 name: name.clone(),
                 topic: topic.clone(),
+                voice: *voice,
             })
         }
         BoundMessagingAction::UpdateChannel {
@@ -3320,7 +3331,7 @@ mod tests {
         reply_later_markers: AsyncMutex<Vec<Value>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
-        created_channels: AsyncMutex<Vec<(String, Option<String>)>>,
+        created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
         updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
         duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
@@ -3611,10 +3622,11 @@ mod tests {
         ) -> Result<Value> {
             self.record_scope(scope).await;
             self.calls.lock().await.push("create_channel".to_owned());
-            self.created_channels
-                .lock()
-                .await
-                .push((request.name.to_owned(), request.topic.map(str::to_owned)));
+            self.created_channels.lock().await.push((
+                request.name.to_owned(),
+                request.topic.map(str::to_owned),
+                request.voice,
+            ));
             Ok(json!({
                 "channel": {
                     "channel_id": "channel-new",
@@ -6815,6 +6827,13 @@ mod tests {
             .await
             .unwrap();
         }
+        execute(
+            &tool,
+            json!({"action": "create_channel", "name": "voice", "voice": true}),
+            "voice-channel",
+        )
+        .await
+        .unwrap();
         for action in [
             json!({"action": "create_channel", "name": "あ".repeat(201)}),
             json!({"action": "update_channel", "place_id": "place-a", "name": "あ".repeat(201)}),
@@ -6825,7 +6844,14 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, ToolError::InvalidArguments));
         }
-        assert_eq!(api.created_channels.lock().await.len(), 2);
+        assert_eq!(
+            *api.created_channels.lock().await,
+            vec![
+                ("a".repeat(200), None, false),
+                ("あ".repeat(200), None, false),
+                ("voice".to_owned(), None, true),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -7122,7 +7148,7 @@ mod tests {
         let create = bind_action(
             &registry,
             "create-channel",
-            json!({"action": "create_channel", "name": "design", "topic": "意匠の話"}),
+            json!({"action": "create_channel", "name": "design", "topic": "意匠の話", "voice": true}),
         )
         .await
         .expect("bind create_channel");
@@ -7133,7 +7159,8 @@ mod tests {
             scoped_execution(json!({
                 "action": "create_channel",
                 "name": "design",
-                "topic": "意匠の話"
+                "topic": "意匠の話",
+                "voice": true
             }))
         );
 

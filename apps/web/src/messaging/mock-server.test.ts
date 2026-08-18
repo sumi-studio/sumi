@@ -142,4 +142,35 @@ describe("MockMessagingServer place edits", () => {
     const renamed = await server.updateChannel("ch-general", { name: "設計" });
     expect(renamed.name).toBe("設計");
   });
+
+  it("renameを新しいeventとACKで即時に配る", async () => {
+    const server = new MockMessagingServer();
+    const initial = await server.bootstrap();
+    const before = initial.channels.find(
+      (channel) => channel.channelId === "ch-general",
+    );
+    const events: import("./model").ServerEvent[] = [];
+    server.subscribe((event) => events.push(event));
+
+    const renamed = await server.updateChannel("ch-general", {
+      name: "即時反映",
+    });
+    const event = events.at(-1);
+
+    expect(before?.name).not.toBe("即時反映");
+    expect(renamed).toMatchObject({
+      name: "即時反映",
+      revision: (before?.revision ?? 0) + 1,
+    });
+    expect(event).toMatchObject({
+      type: "place_updated",
+      channel: {
+        name: "即時反映",
+        revision: (before?.revision ?? 0) + 1,
+      },
+    });
+    if (event?.type !== "place_updated")
+      throw new Error("missing rename event");
+    expect(event.channel).not.toBe(renamed);
+  });
 });
