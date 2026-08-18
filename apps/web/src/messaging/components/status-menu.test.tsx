@@ -53,6 +53,7 @@ describe("StatusMenu", () => {
   it("期限を選ぶ前に、その期限が切れたときどこへ戻るかを見せる", () => {
     setSelfStatus({
       participant: SELF,
+      revision: 1,
       status: "away",
       note: "在宅です",
       expiresAt: null,
@@ -99,6 +100,7 @@ describe("StatusMenu", () => {
     const until = Date.parse("2026-08-18T10:30:00Z");
     setSelfStatus({
       participant: SELF,
+      revision: 1,
       status: "busy",
       note: "会議中",
       expiresAt: until,

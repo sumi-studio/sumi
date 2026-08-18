@@ -38,9 +38,13 @@ func ValidStatus(status string) bool {
 // answer from「対応可能」.
 type ParticipantStatus struct {
 	Participant ParticipantRef
-	Status      string
-	Note        string
-	ExpiresAt   *time.Time
+	// Revision is allocated only by participant_statuses' database trigger.
+	// Every projection, including an empty one after expiry, carries it so a
+	// recipient can reject a delayed older state.
+	Revision  int64
+	Status    string
+	Note      string
+	ExpiresAt *time.Time
 	// BaseStatus is what this status lapses back to at ExpiresAt. Empty means
 	// there was nothing to return to, and the lapse simply ends the
 	// declaration. It is meaningless without ExpiresAt.
@@ -51,20 +55,24 @@ type ParticipantStatus struct {
 // storedStatus is the row as written. Readers never see it: everything goes
 // through resolve, so no caller can accidentally report a lapsed declaration.
 type storedStatus struct {
-	status     string
+	status     *string
 	note       string
 	expiresAt  *time.Time
 	baseStatus *string
 	baseNote   string
+	revision   int64
 }
 
 // resolve turns the stored row into what may be reported at `now`: the
 // declared state while it holds, the base it lapses to once it has expired, or
 // nothing at all when there was no base.
 func (r storedStatus) resolve(participant ParticipantRef, now time.Time) ParticipantStatus {
+	if r.status == nil {
+		return ParticipantStatus{Participant: participant, Revision: r.revision}
+	}
 	if r.expiresAt == nil || r.expiresAt.After(now) {
 		out := ParticipantStatus{
-			Participant: participant, Status: r.status, Note: r.note, ExpiresAt: r.expiresAt,
+			Participant: participant, Revision: r.revision, Status: *r.status, Note: r.note, ExpiresAt: r.expiresAt,
 			BaseNote: r.baseNote,
 		}
 		if r.baseStatus != nil {
@@ -73,9 +81,9 @@ func (r storedStatus) resolve(participant ParticipantRef, now time.Time) Partici
 		return out
 	}
 	if r.baseStatus == nil {
-		return ParticipantStatus{Participant: participant}
+		return ParticipantStatus{Participant: participant, Revision: r.revision}
 	}
-	return ParticipantStatus{Participant: participant, Status: *r.baseStatus, Note: r.baseNote}
+	return ParticipantStatus{Participant: participant, Revision: r.revision, Status: *r.baseStatus, Note: r.baseNote}
 }
 
 // StatusExpiry is one lapsed temporary status made durable, together with the
@@ -127,14 +135,14 @@ func (s *Store) ExpireStatuses(
 		    expires_at = NULL, base_status = NULL, base_note = '', updated_at = now()
 		WHERE expires_at IS NOT NULL AND expires_at <= now()
 		  AND base_status IS NOT NULL
-		RETURNING member_kind, member_id, status, note`)
+		RETURNING member_kind, member_id, status, note, revision`)
 	if err != nil {
 		return fmt.Errorf("restore lapsed statuses: %w", err)
 	}
 	for restored.Next() {
 		var status ParticipantStatus
 		if err := restored.Scan(
-			&status.Participant.Kind, &status.Participant.ID, &status.Status, &status.Note,
+			&status.Participant.Kind, &status.Participant.ID, &status.Status, &status.Note, &status.Revision,
 		); err != nil {
 			restored.Close()
 			return fmt.Errorf("scan restored status: %w", err)
@@ -148,17 +156,19 @@ func (s *Store) ExpireStatuses(
 	restored.Close()
 
 	cleared, err := tx.Query(ctx, `
-		DELETE FROM participant_statuses
+		UPDATE participant_statuses
+		SET status = NULL, note = '', expires_at = NULL,
+		    base_status = NULL, base_note = '', updated_at = now()
 		WHERE expires_at IS NOT NULL AND expires_at <= now()
 		  AND base_status IS NULL
-		RETURNING member_kind, member_id`)
+		RETURNING member_kind, member_id, revision`)
 	if err != nil {
 		return fmt.Errorf("clear lapsed statuses: %w", err)
 	}
 	for cleared.Next() {
 		// An empty status is how a clear says「もう何も言っていない」.
 		var status ParticipantStatus
-		if err := cleared.Scan(&status.Participant.Kind, &status.Participant.ID); err != nil {
+		if err := cleared.Scan(&status.Participant.Kind, &status.Participant.ID, &status.Revision); err != nil {
 			cleared.Close()
 			return fmt.Errorf("scan cleared status: %w", err)
 		}

@@ -24,6 +24,7 @@ import type {
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusCleared,
   StatusKind,
   UnreadSummary,
   UploadAttachmentInput,
@@ -145,6 +146,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       dms,
       members,
       statuses: presence.statuses,
+      clearedStatuses: presence.clearedStatuses,
       readMarkers,
       unreadSummaries,
       replyLaterMarkers: presence.replyLaterMarkers,
@@ -605,6 +607,7 @@ export class ApiMessagingBackend implements MessagingBackend {
           ? {
               type: "status_cleared",
               participant: parseParticipant(status.participant),
+              revision: asRevision(status.revision),
             }
           : { type: eventType, status: parseStatus(status) };
     } else if (eventType === "reply_later_created") {
@@ -820,10 +823,25 @@ function parseReaction(value: unknown): ReactionSummary {
 
 function parsePresence(body: Record<string, unknown>): {
   statuses: ParticipantStatus[];
+  clearedStatuses: StatusCleared[];
   replyLaterMarkers: ReplyLaterMarker[];
 } {
+  const statuses: ParticipantStatus[] = [];
+  const clearedStatuses: StatusCleared[] = [];
+  for (const value of asArray(body.statuses)) {
+    const status = asRecord(value);
+    if (status.status === "") {
+      clearedStatuses.push({
+        participant: parseParticipant(status.participant),
+        revision: asRevision(status.revision),
+      });
+    } else {
+      statuses.push(parseStatus(status));
+    }
+  }
   return {
-    statuses: asArray(body.statuses).map(parseStatus),
+    statuses,
+    clearedStatuses,
     replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
   };
 }
@@ -832,6 +850,7 @@ function parseStatus(value: unknown): ParticipantStatus {
   const wire = asRecord(value);
   return {
     participant: parseParticipant(wire.participant),
+    revision: asRevision(wire.revision),
     status: asStatusKind(wire.status),
     note: asString(wire.note),
     expiresAt: wire.expires_at == null ? null : asTimestamp(wire.expires_at),
@@ -844,6 +863,12 @@ function parseStatus(value: unknown): ParticipantStatus {
         : asStatusKind(wire.base_status),
     baseNote: typeof wire.base_note === "string" ? wire.base_note : "",
   };
+}
+
+function asRevision(value: unknown): number {
+  const revision = asSeq(value);
+  if (revision < 1) throw new Error("invalid status revision");
+  return revision;
 }
 
 function parseReplyLater(value: unknown): ReplyLaterMarker {

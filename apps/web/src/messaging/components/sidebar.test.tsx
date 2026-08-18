@@ -302,6 +302,7 @@ describe("Sidebar overlay and IME behavior", () => {
       statusByKey: {
         "human:human-a": {
           participant: SELF,
+          revision: 1,
           status: "available",
           note: "",
           expiresAt: null,

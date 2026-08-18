@@ -298,6 +298,7 @@ type readMarkerWire struct {
 // which is a different answer from saying they are available.
 type statusWire struct {
 	Participant participantWire `json:"participant"`
+	Revision    int64           `json:"revision"`
 	Status      string          `json:"status"`
 	Note        string          `json:"note"`
 	ExpiresAt   *time.Time      `json:"expires_at"`
@@ -310,6 +311,7 @@ type statusWire struct {
 func statusToWire(status ParticipantStatus) statusWire {
 	return statusWire{
 		Participant: participantToWire(status.Participant),
+		Revision:    status.Revision,
 		Status:      status.Status,
 		Note:        status.Note,
 		ExpiresAt:   status.ExpiresAt,
