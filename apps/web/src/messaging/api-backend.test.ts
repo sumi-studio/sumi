@@ -192,6 +192,114 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
+  it("routes a reaction for an unjoined thread immediately after its first message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({
+          ...bootstrap,
+          // threads is intentionally empty: bootstrap projects joined threads
+          // only, and this thread has no pre-existing unread summary either.
+          threads: [],
+        }),
+      ),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    socket?.message({
+      type: "event",
+      event: {
+        type: "message_created",
+        message: messageWire(
+          1,
+          "最初の返信",
+          [],
+          threadPlaceWire("thread-unjoined"),
+        ),
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "reaction_updated",
+        place_id: "thread-unjoined",
+        reaction: {
+          message_id: "message-1",
+          reactions: [
+            {
+              emoji: "👍",
+              participants: [{ kind: "human", human_id: "human-1" }],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(events).toMatchObject([
+      {
+        type: "message_created",
+        message: { place: { kind: "thread", threadId: "thread-unjoined" } },
+      },
+      {
+        type: "reaction_updated",
+        place: { kind: "thread", threadId: "thread-unjoined" },
+        messageId: "message-1",
+      },
+    ]);
+  });
+
+  it("routes a reaction for an unjoined thread named only by an unread summary", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({
+          ...bootstrap,
+          threads: [],
+          unread_summaries: [
+            ...bootstrap.unread_summaries,
+            {
+              place: threadPlaceWire("thread-summary-only"),
+              latest_seq: 1,
+              unread_count: 1,
+              mention_count: 0,
+            },
+          ],
+        }),
+      ),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    socket?.message({
+      type: "event",
+      event: {
+        type: "reaction_updated",
+        place_id: "thread-summary-only",
+        reaction: { message_id: "message-1", reactions: [] },
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        type: "reaction_updated",
+        place: { kind: "thread", threadId: "thread-summary-only" },
+        messageId: "message-1",
+        reactions: [],
+      },
+    ]);
+  });
+
   it("returns the canonical REST reaction result and projects WS updates", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -801,6 +909,10 @@ function channelWire() {
   return { kind: "channel", channel_id: "channel-1" };
 }
 
+function threadPlaceWire(threadId: string) {
+  return { kind: "thread", thread_id: threadId };
+}
+
 function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
@@ -828,10 +940,11 @@ function messageWire(
   seq: number,
   content: string,
   reactions: { emoji: string; participants: unknown[] }[] = [],
+  place: Record<string, string> = channelWire(),
 ) {
   return {
     message_id: `message-${seq}`,
-    place: channelWire(),
+    place,
     seq,
     author: { kind: "human", human_id: "human-1" },
     content,

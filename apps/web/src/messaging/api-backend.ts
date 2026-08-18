@@ -124,8 +124,13 @@ export class ApiMessagingBackend implements MessagingBackend {
     const unreadSummaries: UnreadSummary[] = asArray(body.unread_summaries).map(
       (entry) => {
         const value = asRecord(entry);
+        const place = parsePlace(value.place);
+        // bootstrapのthreadsは参加中のものだけだが、未読summaryは
+        // workspaceから見える未参加threadも運ぶ。後続のreaction eventを
+        // ルーティングできるよう、summaryだけのplaceも覚えておく。
+        this.registerPlace(place);
         return {
-          place: parsePlace(value.place),
+          place,
           latestSeq: asSeq(value.latest_seq),
           unreadCount: asSeq(value.unread_count),
           mentionCount: asSeq(value.mention_count),
@@ -556,6 +561,10 @@ export class ApiMessagingBackend implements MessagingBackend {
     let parsed: ServerEvent;
     if (eventType === "message_created") {
       const message = parseMessage(wire.message);
+      // A visible thread can have no bootstrap thread projection. Its first
+      // message still establishes the routing authority for later partial
+      // events, which may arrive before the store finishes hydrating it.
+      this.registerPlace(message.place);
       this.cursors.set(placeID(message.place), message.seq);
       // notifyが無いことは欠損ではなく「呼んでいない」という答え。
       parsed = { type: eventType, message, notify: parseNotify(wire.notify) };
@@ -564,6 +573,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       eventType === "message_deleted"
     ) {
       const message = parseMessage(wire.message);
+      this.registerPlace(message.place);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
     } else if (eventType === "reaction_updated") {
@@ -634,13 +644,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       visibility: asVisibility(wire.visibility),
       voice: asBoolean(wire.voice),
     };
-    if (!this.cursors.has(channel.channelId)) {
-      this.cursors.set(channel.channelId, 0);
-    }
-    this.places.set(channel.channelId, {
-      kind: "channel",
-      channelId: channel.channelId,
-    });
+    this.registerPlace({ kind: "channel", channelId: channel.channelId });
     return channel;
   }
 
@@ -652,8 +656,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
-    if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
-    this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
+    this.registerPlace({ kind: dm.kind, dmId: dm.dmId });
     return dm;
   }
 
@@ -677,13 +680,15 @@ export class ApiMessagingBackend implements MessagingBackend {
       participants: asArray(wire.participants).map(parseParticipant),
       latestSeq: asSeq(wire.latest_seq),
     };
-    this.places.set(thread.threadId, {
-      kind: "thread",
-      threadId: thread.threadId,
-    });
-    if (!this.cursors.has(thread.threadId))
-      this.cursors.set(thread.threadId, 0);
+    this.registerPlace({ kind: "thread", threadId: thread.threadId });
     return thread;
+  }
+
+  /** Remembers any place shape that can be named by a live event. */
+  private registerPlace(place: Place): void {
+    const id = placeID(place);
+    this.places.set(id, place);
+    if (!this.cursors.has(id)) this.cursors.set(id, 0);
   }
 
   private stopSocket(): void {

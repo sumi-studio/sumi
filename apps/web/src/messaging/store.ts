@@ -1540,10 +1540,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           });
           scheduleStatusExpiry();
           currentBackend.subscribe(applyEvent, { sinceByPlace });
-          // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
-          // 再接続なので、replayされないplace lifecycleを読み直す。presenceは
-          // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
-          let connectedOnce = false;
+          // bootstrapはsubscribeより前に読まれるため、最初の接続にもその間に
+          // 作られたplaceや親thread一覧が欠け得る。connectedをsnapshotのfence
+          // として毎回再検証し、live eventはその再取得を促す合図として扱う。
           currentBackend.subscribeConnection((connection) => {
             if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
               return;
@@ -1554,11 +1553,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             }));
             if (connection !== "connected") return;
             void useCall.getState().hydrate();
-            if (connectedOnce) {
-              void reconcilePlaces().catch(() => undefined);
-            } else {
-              connectedOnce = true;
-            }
+            void reconcilePlaces().catch(() => undefined);
             void resyncPresence().catch(() => undefined);
           });
         })

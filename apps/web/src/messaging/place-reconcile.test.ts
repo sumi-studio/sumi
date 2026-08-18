@@ -263,15 +263,37 @@ describe("place lifecycleの再接続突き合わせ", () => {
     installMessagingBackend(backend);
     useMessaging.getState().init();
     await settle();
-    backend.emitConnection("connected");
-    await settle();
   });
 
   afterEach(() => bindMessagingSessionIdentity(null));
 
-  it("最初のconnectedではbootstrapを読み直さない", () => {
-    expect(backend.bootstrapCalls).toBe(1);
+  it("最初のconnectedでもbootstrap-to-subscribe gapを再検証する", async () => {
+    backend.emitConnection("connected");
+    await settle();
+    expect(backend.bootstrapCalls).toBe(2);
     expect(useMessaging.getState().ready).toBe(true);
+  });
+
+  it("初回接続の継ぎ目で作られた非参加threadを親一覧へ取り込む", async () => {
+    const beforeConnect = thread("thread-before-connect");
+    const createdInGap = thread("thread-created-in-gap");
+    backend.fetchThreads.mockResolvedValueOnce([beforeConnect]);
+    await useMessaging.getState().loadThreads(CHANNEL_1);
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+
+    // The bootstrap projection remains participation-scoped, so only the
+    // parent list fetched after the first hello ACK can reveal this thread.
+    backend.fetchThreads.mockResolvedValueOnce([beforeConnect, createdInGap]);
+    backend.emitConnection("connected");
+    await settle();
+
+    expect(backend.bootstrapCalls).toBe(2);
+    expect(backend.fetchThreads).toHaveBeenCalledTimes(2);
+    expect(useMessaging.getState().threadsById).toMatchObject({
+      [beforeConnect.threadId]: beforeConnect,
+      [createdInGap.threadId]: createdInGap,
+    });
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
   });
 
   it("liveイベントで初めて知ったthreadを一度だけhydrateして選べる", async () => {
