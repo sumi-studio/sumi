@@ -57,8 +57,8 @@ import {
   setActiveMessagingScope,
   validateMessagingScope,
 } from "./scope";
-import type { PendingMessage } from "./timeline";
-import { mergeMessages, upsertMessage } from "./timeline";
+import type { MessageContentRevision, PendingMessage } from "./timeline";
+import { applyMessageRevision, mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
@@ -157,6 +157,8 @@ interface EditSession {
   token: number;
 }
 
+type EditConflict = Required<MessageContentRevision>;
+
 interface MessagingState {
   capabilities: MessagingCapabilities;
   ready: boolean;
@@ -212,7 +214,7 @@ interface MessagingState {
   /** 非同期保存の完了を発行元だけに閉じ込める編集セッション。 */
   editSession: EditSession | null;
   /** 書きかけを保持したまま保存を止めるための、受信済みの新しい本文。 */
-  editConflict: { content: string; revision: number } | null;
+  editConflict: EditConflict | null;
   replyTargetId: string | null;
   connection: ConnectionState;
   /**
@@ -312,6 +314,29 @@ function clearedEditSession(): Pick<
     editSession: null,
     editConflict: null,
   };
+}
+
+/**
+ * 画面上の本文、競合本文、今回の応答を一つのrevision規則で畳み込む。
+ * 呼び出し元は「どの場所に書き戻すか」だけを決め、版の優劣を別実装しない。
+ */
+function latestMessageContent(
+  ...versions: Array<MessageContentRevision | undefined | null>
+): MessageContentRevision | undefined {
+  let latest: MessageContentRevision | undefined;
+  for (const version of versions) {
+    if (version) latest = applyMessageRevision(latest, version);
+  }
+  return latest;
+}
+
+function latestEditConflict(
+  ...versions: Array<MessageContentRevision | undefined | null>
+): EditConflict | undefined {
+  const latest = latestMessageContent(...versions);
+  return latest
+    ? { content: latest.content, revision: latest.revision ?? 1 }
+    : undefined;
 }
 
 /**
@@ -889,11 +914,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
-        const incomingRevision = event.message.revision ?? 1;
-        if (
-          existing !== undefined &&
-          incomingRevision < (existing.revision ?? 1)
-        ) {
+        if (applyMessageRevision(existing, event.message) !== event.message) {
           return {};
         }
         const messages = upsertMessage(
@@ -925,8 +946,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           event.type === "message_edited" &&
           state.editingMessageId === event.message.messageId &&
           state.editBaseRevision !== null &&
-          incomingRevision !== state.editBaseRevision
-            ? { content: event.message.content, revision: incomingRevision }
+          (event.message.revision ?? 1) !== state.editBaseRevision
+            ? (latestEditConflict(
+                existing,
+                state.editConflict,
+                event.message,
+              ) ?? state.editConflict)
             : state.editConflict;
         return {
           messagesByPlace: { ...state.messagesByPlace, [key]: messages },
@@ -1912,12 +1937,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const state = get();
       const session = state.editSession;
       if (!state.editConflict || !session) return;
+      const current = (state.messagesByPlace[session.placeKey] ?? []).find(
+        (message) => message.messageId === session.messageId,
+      );
+      const base = latestMessageContent(current, state.editConflict);
+      if (!base) return;
       set({
-        editDraft: state.editConflict.content,
-        editBaseRevision: state.editConflict.revision,
+        editDraft: base.content,
+        editBaseRevision: base.revision ?? 1,
         editSession: {
           ...session,
-          revision: state.editConflict.revision,
+          revision: base.revision ?? 1,
           token: ++nextEditSessionToken,
         },
         editConflict: null,
@@ -1965,6 +1995,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 placeKey(latest.place) !== key
               )
                 return {};
+              const currentMessage = (current.messagesByPlace[key] ?? []).find(
+                (message) => message.messageId === latest.messageId,
+              );
+              const conflict = latestEditConflict(
+                currentMessage,
+                current.editConflict,
+                latest,
+              );
+              if (!conflict) return {};
               return {
                 messagesByPlace: {
                   ...current.messagesByPlace,
@@ -1973,10 +2012,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                     latest,
                   ),
                 },
-                editConflict: {
-                  content: latest.content,
-                  revision: latest.revision ?? 1,
-                },
+                editConflict: conflict,
               };
             });
           },

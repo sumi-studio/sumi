@@ -449,6 +449,81 @@ describe("編集セッションのタイムライン整合性", () => {
     );
   });
 
+  it("revision 3のWS後に遅れて届くrevision 2の409で競合本文と編集基準を戻さない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+    const revision2 = {
+      ...target,
+      content: "revision 2 の競合本文",
+      revision: 2,
+    };
+    const revision3 = {
+      ...target,
+      content: "revision 3 のWS本文",
+      revision: 3,
+    };
+    let rejectFirstSave: ((error: unknown) => void) | undefined;
+    const firstSave = new Promise<void>((_resolve, reject) => {
+      rejectFirstSave = reject;
+    });
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockImplementationOnce(() => firstSave)
+      .mockResolvedValueOnce();
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("自分の書きかけ"));
+    act(() => useMessaging.getState().submitEdit());
+    act(() => emit({ type: "message_edited", message: revision3 }));
+    await act(async () => {
+      rejectFirstSave?.(
+        new MessagingAPIError("edit_conflict", 409, {
+          message: conflictWire(revision2),
+        }),
+      );
+      await firstSave.catch(() => undefined);
+    });
+
+    await waitFor(() => {
+      expect(useMessaging.getState().editConflict).toEqual({
+        content: "revision 3 のWS本文",
+        revision: 3,
+      });
+    });
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        ),
+    ).toMatchObject({ content: "revision 3 のWS本文", revision: 3 });
+
+    act(() => useMessaging.getState().reloadEditConflict());
+    act(() => useMessaging.getState().setEditDraft("revision 3から保存"));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() =>
+      expect(edit).toHaveBeenLastCalledWith(
+        target.place,
+        target.messageId,
+        "revision 3から保存",
+        3,
+      ),
+    );
+  });
+
   it("revision 3の取り込み後にrevision 2のmessage_editedが届いても本文を戻さない", async () => {
     const backend = await bootStore();
     const target = useMessaging
