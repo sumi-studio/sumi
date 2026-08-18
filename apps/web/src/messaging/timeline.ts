@@ -41,12 +41,20 @@ export interface MessageContentRevision {
 }
 
 /**
+ * revision付きのmessage event/ACKは本文側だけの部分更新、履歴取得はmessage全体の
+ * snapshotである。reactionsには独自の `reaction_updated` 同期経路があるため、
+ * この区別を呼び出し元で明示する。
+ */
+export type MessagePayloadKind = "revision" | "snapshot";
+
+/**
  * 後着の古い本文で、すでに表示・競合表示・編集基準にした版を戻さない。
  * 同一revisionは server の正規化済み本文を受け入れる。
  */
 export function applyMessageRevision<T extends MessageContentRevision>(
   current: T | undefined,
   incoming: T,
+  _payload: MessagePayloadKind,
 ): T {
   const currentRevision = current?.revision ?? 1;
   const incomingRevision = incoming.revision ?? 1;
@@ -65,19 +73,43 @@ export function applyMessageRevision<T extends MessageContentRevision>(
 }
 
 /**
+ * revisionが受理されたmessageを投影する。部分更新はmessage revisionが支配する
+ * 項目だけを置き換え、reaction_updatedが最後に確定したreactionsを保つ。履歴の
+ * snapshotはreactionsも置き換える。snapshotの本文側が古いrevisionなら本文側は
+ * 単調に保ちつつ、独立同期のreactionsだけはsnapshotで更新する。tombstoneも
+ * revision側の状態なので、部分更新は既知のreactionsを保持する。
+ */
+function applyMessagePayload(
+  current: Message | undefined,
+  incoming: Message,
+  payload: MessagePayloadKind,
+): Message {
+  const revisionApplied = applyMessageRevision(current, incoming, payload);
+  if (revisionApplied !== incoming) {
+    if (current && payload === "snapshot" && !current.deleted) {
+      return { ...current, reactions: incoming.reactions };
+    }
+    return revisionApplied;
+  }
+  if (!current || payload === "snapshot") return incoming;
+  return { ...incoming, reactions: current.reactions };
+}
+
+/**
  * seq昇順を保ってメッセージを挿入・置換する。
  * 同じmessageIdではrevisionを単調に保ち、同じseqの別IDは後着を採用しない。
  */
 export function upsertMessage(
   messages: readonly Message[],
   incoming: Message,
+  payload: MessagePayloadKind,
 ): Message[] {
   const byId = messages.findIndex(
     (entry) => entry.messageId === incoming.messageId,
   );
   if (byId >= 0) {
     const current = messages[byId];
-    const nextMessage = applyMessageRevision(current, incoming);
+    const nextMessage = applyMessagePayload(current, incoming, payload);
     if (nextMessage === current) return [...messages];
     const next = [...messages];
     next[byId] = nextMessage;
@@ -102,9 +134,12 @@ export function removeMessage(
 export function mergeMessages(
   current: readonly Message[],
   incoming: readonly Message[],
+  payload: MessagePayloadKind,
 ): Message[] {
   let merged = [...current];
-  for (const message of incoming) merged = upsertMessage(merged, message);
+  for (const message of incoming) {
+    merged = upsertMessage(merged, message, payload);
+  }
   return merged;
 }
 

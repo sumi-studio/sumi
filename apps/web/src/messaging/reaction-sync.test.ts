@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "./api-backend";
 import type {
   ConnectionState,
   Message,
@@ -507,6 +508,88 @@ describe("reaction convergence in the messaging store", () => {
     expect(
       useMessaging.getState().messagesByPlace[placeKey]?.[0],
     ).toMatchObject({ content: "", deleted: true, revision: 3 });
+  });
+
+  it("keeps a reaction published before a successful edit response", async () => {
+    const harness = new StubBackend();
+    const committed = deferred<Message>();
+    harness.editMessage = vi.fn(async () => await committed.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = { ...message(1, "編集前"), revision: 1 };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+    });
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("PATCHで確定した本文");
+    useMessaging.getState().submitEdit();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [other] }],
+    });
+    committed.resolve({
+      ...target,
+      content: "PATCHで確定した本文",
+      revision: 2,
+      reactions: [],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "PATCHで確定した本文",
+      revision: 2,
+      reactions: [{ emoji: "👍", participants: [other] }],
+    });
+  });
+
+  it("keeps a reaction published before a 409 edit-conflict response", async () => {
+    const harness = new StubBackend();
+    const target = { ...message(1, "編集前"), revision: 1 };
+    const conflict = new MessagingAPIError("edit_conflict", 409);
+    Object.defineProperty(conflict, "currentMessage", {
+      value: {
+        ...target,
+        content: "別クライアントの編集",
+        revision: 2,
+        reactions: [],
+      },
+    });
+    harness.editMessage = vi.fn(async () => {
+      throw conflict;
+    });
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+    });
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("競合する編集");
+    useMessaging.getState().submitEdit();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "🎉", participants: [other] }],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "別クライアントの編集",
+      revision: 2,
+      reactions: [{ emoji: "🎉", participants: [other] }],
+    });
   });
 
   it("discards toggle ACKs and queued mutations from an earlier session", async () => {
