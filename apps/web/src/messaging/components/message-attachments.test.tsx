@@ -2,15 +2,16 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "../mock-server";
-import type { Attachment } from "../model";
+import type { Attachment, AttachmentDraftPatch } from "../model";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
   useMessaging,
 } from "../store";
 import { Composer } from "./composer";
+import { ComposerAttachments } from "./composer-attachments";
 import { MessageAttachments } from "./message-attachments";
 
 const IMAGE: Attachment = {
@@ -223,5 +224,51 @@ describe("Composer attachment cards", () => {
       URL.createObjectURL = createObjectURL;
       URL.revokeObjectURL = revokeObjectURL;
     }
+  });
+
+  it("shows a rejected edit's reason and its retained declaration with retry and discard", () => {
+    const retry = vi.fn();
+    const remove = vi.fn();
+    const patch: AttachmentDraftPatch = {
+      filename: "after.txt",
+      alt: "保存される説明",
+      spoiler: true,
+    };
+    render(
+      <ComposerAttachments
+        drafts={[
+          {
+            clientNonce: "edit-failure",
+            filename: "before.txt",
+            sizeBytes: 3,
+            contentType: "text/plain",
+            status: "edit_failed",
+            errorCode: "invalid_request",
+            editPatch: patch,
+            attachment: {
+              ...IMAGE,
+              attachmentId: "att-edit",
+              filename: "before.txt",
+            },
+          },
+        ]}
+        onEdit={vi.fn()}
+        onRemove={remove}
+        onRetry={retry}
+      />,
+    );
+    expect(screen.getByTestId("composer-attachments")).toHaveTextContent(
+      "この内容では保存できません",
+    );
+    expect(screen.getByTestId("composer-attachments")).toHaveTextContent(
+      "after.txt",
+    );
+    expect(screen.getByTestId("composer-attachments")).toHaveTextContent(
+      "保存される説明",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "after.txtを再送" }));
+    expect(retry).toHaveBeenCalledWith("edit-failure");
+    fireEvent.click(screen.getByRole("button", { name: "after.txtを外す" }));
+    expect(remove).toHaveBeenCalledWith("edit-failure");
   });
 });

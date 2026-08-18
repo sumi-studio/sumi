@@ -1177,13 +1177,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
           attachment: updated,
           filename: updated.filename,
           errorCode: undefined,
+          editPatch: undefined,
         });
       })
       .catch((error: unknown) => {
         if (!stillLive()) return;
-        // bytesは預けたままなので、送れる状態には戻す。落ちたのは宣言だけ。
+        // bytesは預けたままだが、古い宣言で送れてしまうと保存済みと誤認する。
+        // 直前のPATCHと理由を残し、再試行か破棄が済むまで送信を閉じる。
         apply({
-          status: "ready",
+          status: "edit_failed",
           errorCode: attachmentUploadFailureCode(error),
         });
       });
@@ -1687,7 +1689,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const draft = (get().draftAttachmentsByPlace[key] ?? []).find(
         (entry) => entry.clientNonce === clientNonce,
       );
-      if (draft?.status !== "failed" || !draftFiles.has(clientNonce)) {
+      if (!draft) return;
+      if (
+        draft.status === "edit_failed" &&
+        draft.attachment &&
+        draft.editPatch
+      ) {
+        const retried: DraftAttachment = {
+          ...draft,
+          status: "editing",
+          errorCode: undefined,
+        };
+        set((current) => ({
+          draftAttachmentsByPlace: {
+            ...current.draftAttachmentsByPlace,
+            [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+              entry.clientNonce === clientNonce ? retried : entry,
+            ),
+          },
+        }));
+        dispatchDraftEdit(key, retried, draft.attachment, draft.editPatch);
+        return;
+      }
+      if (draft.status !== "failed" || !draftFiles.has(clientNonce)) {
         return;
       }
       const retried: DraftAttachment = {
@@ -1722,7 +1746,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ...current.draftAttachmentsByPlace,
           [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
             entry.clientNonce === clientNonce
-              ? { ...entry, status: "editing" as const, errorCode: undefined }
+              ? {
+                  ...entry,
+                  status: "editing" as const,
+                  errorCode: undefined,
+                  editPatch: patch,
+                }
               : entry,
           ),
         },

@@ -5,6 +5,7 @@ import { ApiMessagingBackend, MessagingAPIError } from "./api-backend";
 import { MockMessagingServer } from "./mock-server";
 import type {
   Attachment,
+  AttachmentDraftPatch,
   UploadAttachmentInput,
   UploadAttachmentReceipt,
 } from "./model";
@@ -38,6 +39,11 @@ class UploadControlledServer extends MockMessagingServer {
     deferred: Deferred<UploadAttachmentReceipt>;
   }[] = [];
   readonly sent: { content: string; attachments: string[] }[] = [];
+  readonly pendingEdits: {
+    attachmentId: string;
+    patch: AttachmentDraftPatch;
+    deferred: Deferred<Attachment>;
+  }[] = [];
 
   override uploadAttachment(
     input: UploadAttachmentInput,
@@ -52,6 +58,15 @@ class UploadControlledServer extends MockMessagingServer {
   ) {
     this.sent.push({ content: input.content, attachments: input.attachments });
     return super.sendMessage(input);
+  }
+
+  override updateDraftAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment> {
+    const deferred = new Deferred<Attachment>();
+    this.pendingEdits.push({ attachmentId, patch, deferred });
+    return deferred.promise;
   }
 }
 
@@ -206,6 +221,74 @@ describe("composer draft attachments", () => {
     ).toEqual([]);
     useMessaging.getState().send("text", "normal");
     expect(server.sent).toEqual([{ content: "text", attachments: [] }]);
+  });
+
+  it("keeps a rejected attachment edit visible and unsendable until its PATCH succeeds", async () => {
+    const server = new UploadControlledServer();
+    bootstrapStore(server);
+    useMessaging
+      .getState()
+      .addDraftAttachments([
+        new File(["x"], "before.txt", { type: "text/plain" }),
+      ]);
+    server.pendingUploads[0]?.deferred.resolve(
+      receipt("att-edit", "before.txt"),
+    );
+    await settle();
+    const nonce =
+      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0]
+        ?.clientNonce ?? "";
+    const patch = {
+      filename: "after.txt",
+      alt: "保存される説明",
+      spoiler: true,
+    };
+
+    useMessaging.getState().editDraftAttachment(nonce, patch);
+    expect(server.pendingEdits).toHaveLength(1);
+    server.pendingEdits[0]?.deferred.reject(
+      new MessagingAPIError("invalid_request", 400),
+    );
+    await settle();
+    expect(
+      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+    ).toMatchObject({
+      status: "edit_failed",
+      errorCode: "invalid_request",
+      editPatch: patch,
+    });
+    useMessaging.getState().send("must stay in the composer", "normal");
+    expect(server.sent).toHaveLength(0);
+
+    useMessaging.getState().retryDraftAttachment(nonce);
+    expect(server.pendingEdits).toHaveLength(2);
+    expect(server.pendingEdits[1]).toMatchObject({
+      attachmentId: "att-edit",
+      patch,
+    });
+    server.pendingEdits[1]?.deferred.resolve({
+      ...receipt("att-edit", "after.txt").attachment,
+      alt: "保存される説明",
+      spoiler: true,
+    });
+    await settle();
+    expect(
+      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+    ).toMatchObject({
+      status: "ready",
+      filename: "after.txt",
+      errorCode: undefined,
+      editPatch: undefined,
+      attachment: {
+        attachmentId: "att-edit",
+        alt: "保存される説明",
+        spoiler: true,
+      },
+    });
+    useMessaging.getState().send("saved", "normal");
+    expect(server.sent).toEqual([
+      { content: "saved", attachments: ["att-edit"] },
+    ]);
   });
 
   it("rejects oversized and empty files locally and caps the draft count", () => {

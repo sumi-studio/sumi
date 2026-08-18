@@ -24,6 +24,7 @@ import {
 import { useState } from "react";
 import type { DraftAttachment } from "../draft-attachments";
 import {
+  attachmentEditFailureLabel,
   attachmentFailureLabel,
   formatAttachmentSize,
 } from "../draft-attachments";
@@ -80,12 +81,16 @@ function FormatIcon({ mime, filename }: { mime: string; filename: string }) {
 
 function statusLine(draft: DraftAttachment): string {
   if (draft.status === "failed") return attachmentFailureLabel(draft.errorCode);
+  if (draft.status === "edit_failed") {
+    return attachmentEditFailureLabel(draft.errorCode);
+  }
   if (draft.status === "editing") return "保存中";
   return formatAttachmentSize(draft.sizeBytes);
 }
 
 /** 再送しても同じ結果にしかならない失敗には再送を出さない。 */
 function retryable(draft: DraftAttachment): boolean {
+  if (draft.status === "edit_failed") return true;
   return (
     draft.status === "failed" &&
     draft.errorCode !== "attachment_too_large" &&
@@ -110,27 +115,29 @@ export function ComposerAttachments({
   return (
     <AttachmentGroup className="px-3 pt-2.5" data-testid="composer-attachments">
       {drafts.map((draft) => {
-        const spoiler = draft.attachment?.spoiler ?? false;
+        const filename = draft.editPatch?.filename ?? draft.filename;
+        const spoiler =
+          draft.editPatch?.spoiler ?? draft.attachment?.spoiler ?? false;
+        const alt = draft.editPatch?.alt ?? draft.attachment?.alt;
         // 宣言は預かりが済んでから付ける。まだ受領が無いあいだは操作を出さない。
-        const declarable = draft.attachment !== undefined;
+        const declarable =
+          draft.attachment !== undefined && draft.status === "ready";
         const busy = draft.status === "uploading" || draft.status === "editing";
+        const failed =
+          draft.status === "failed" || draft.status === "edit_failed";
         return (
           <AttachmentCard
             key={draft.clientNonce}
             orientation="vertical"
-            state={draft.status === "failed" ? "error" : "done"}
+            state={failed ? "error" : "done"}
             data-status={draft.status}
-            className={
-              draft.status === "failed"
-                ? "border-rose-500/40 bg-rose-500/8"
-                : undefined
-            }
+            className={failed ? "border-rose-500/40 bg-rose-500/8" : undefined}
           >
             <AttachmentMedia className="aspect-4/3">
               {draft.previewUrl ? (
                 <img
                   src={draft.previewUrl}
-                  alt={`${draft.filename} のプレビュー`}
+                  alt={`${filename} のプレビュー`}
                   className={spoiler ? "blur-md" : undefined}
                 />
               ) : (
@@ -149,7 +156,7 @@ export function ComposerAttachments({
                   <Loader2 className="size-4 animate-spin text-muted-foreground" />
                 </span>
               ) : null}
-              {draft.status === "failed" ? (
+              {failed ? (
                 <span className="absolute inset-0 flex items-center justify-center bg-background/60 text-rose-600 dark:text-rose-400">
                   <TriangleAlert className="size-4" />
                 </span>
@@ -159,7 +166,7 @@ export function ComposerAttachments({
               <div className="absolute top-1 right-1 flex items-center gap-1">
                 {declarable ? (
                   <AttachmentAction
-                    aria-label={`${draft.filename}の${
+                    aria-label={`${filename}の${
                       spoiler ? "ネタバレを解除" : "ネタバレをマーク"
                     }`}
                     aria-pressed={spoiler}
@@ -177,7 +184,7 @@ export function ComposerAttachments({
                 ) : null}
                 {declarable ? (
                   <AttachmentAction
-                    aria-label={`${draft.filename}を編集`}
+                    aria-label={`${filename}を編集`}
                     title="名前と説明を編集"
                     disabled={busy}
                     onClick={() => setEditingNonce(draft.clientNonce)}
@@ -188,7 +195,7 @@ export function ComposerAttachments({
                 ) : null}
                 {retryable(draft) ? (
                   <AttachmentAction
-                    aria-label={`${draft.filename}を再送`}
+                    aria-label={`${filename}を再送`}
                     title="もう一度送る"
                     onClick={() => onRetry(draft.clientNonce)}
                     className="bg-background/80 opacity-60 focus-visible:opacity-100 group-hover/attachment:opacity-100"
@@ -197,7 +204,7 @@ export function ComposerAttachments({
                   </AttachmentAction>
                 ) : null}
                 <AttachmentAction
-                  aria-label={`${draft.filename}を外す`}
+                  aria-label={`${filename}を外す`}
                   title="添付を取り消す"
                   onClick={() => onRemove(draft.clientNonce)}
                   className="bg-background/80 opacity-60 hover:text-rose-600 focus-visible:opacity-100 group-hover/attachment:opacity-100 dark:hover:text-rose-400"
@@ -207,24 +214,22 @@ export function ComposerAttachments({
               </div>
             </AttachmentMedia>
             <AttachmentContent>
-              <AttachmentTitle title={draft.filename}>
-                {draft.filename}
-              </AttachmentTitle>
+              <AttachmentTitle title={filename}>{filename}</AttachmentTitle>
               <span
                 className={`block truncate tabular-nums ${
-                  draft.status === "failed"
+                  failed
                     ? "text-rose-600 dark:text-rose-400"
                     : "text-muted-foreground"
                 }`}
               >
                 {statusLine(draft)}
               </span>
-              {draft.attachment?.alt ? (
+              {alt ? (
                 <span
                   className="block truncate text-muted-foreground"
-                  title={draft.attachment.alt}
+                  title={alt}
                 >
-                  {draft.attachment.alt}
+                  {alt}
                 </span>
               ) : null}
             </AttachmentContent>
