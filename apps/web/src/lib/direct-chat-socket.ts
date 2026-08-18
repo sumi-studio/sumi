@@ -29,7 +29,13 @@ export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE = 4001;
 export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON = "runtime_not_ready";
 
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
-export type DirectChatReadyState = "unknown" | "ready" | "not_ready";
+// An in-band unavailable frame is transient lifecycle state (replacement or
+// re-hydration). A 4001 close is the distinct, attributed failure to start.
+export type DirectChatReadyState =
+  | "unknown"
+  | "ready"
+  | "unavailable"
+  | "not_ready";
 
 export type DirectChatEventFrame = {
   type: "event";
@@ -992,7 +998,7 @@ export class DirectChatSocket {
       }
       if (frame.type === "direct_chat_status") {
         this.admissionReady = frame.status === "ready";
-        this.setReadyState(frame.status === "ready" ? "ready" : "not_ready");
+        this.setReadyState(frame.status === "ready" ? "ready" : "unavailable");
         if (this.admissionReady) {
           // An accepted upgrade can still immediately report a failed lazy
           // runtime spawn. Only an explicit ready frame proves this connection

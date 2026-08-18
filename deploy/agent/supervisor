@@ -465,7 +465,11 @@ declare CLEANUP_ARMED=0
 declare ACTIVE_COMPOSE_PID=
 readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
-readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
+# Keep the post-TERM grace on the same 15s ceiling as initial session/group
+# isolation below: both bounds protect the same tracked Compose child, and a
+# slower host must not classify it as untrackable before its group can be
+# recovered.
+readonly COMPOSE_CHILD_TERM_ATTEMPTS=150
 readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
 # One explicit bound covers termination of the active detached Compose session,
 # every cleanup retry at the configured Compose timeout, verification calls,
@@ -550,10 +554,11 @@ tracked_compose_child_isolated() {
   [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
 }
 
-# `setsid` makes the child its own session and group within microseconds on an
-# idle host, but this suite starts thirteen Docker fixtures while Cargo builds.
-# A 500ms ceiling lost that race and turned load into a launch failure, so the
-# bound is generous while still bounded.
+# `setsid` normally makes the child its own session and group within
+# microseconds. Under the recorded test load (thirteen Docker fixtures plus
+# Cargo builds), the old 500ms ceiling lost that scheduling race; 20/20 runs
+# with six busy loops completed at the 15s ceiling. Match the TERM grace above
+# so initial tracking and later group recovery use one bounded host-load budget.
 readonly TRACKED_COMPOSE_ISOLATION_ATTEMPTS=1500
 
 wait_for_tracked_compose_child_isolation() {

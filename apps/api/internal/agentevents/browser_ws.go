@@ -583,14 +583,17 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.removeConnection(conn)
 	defer conn.Close()
 	if runtimeUnavailable {
-		_ = conn.WriteControl(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(
-				DirectChatRuntimeUnavailableCloseCode,
-				DirectChatRuntimeUnavailableCloseReason,
-			),
-			s.sessionDeadline(claims, s.writeTimeout()),
-		)
+		deadline := s.sessionDeadline(claims, s.writeTimeout())
+		if deadline.After(time.Now()) {
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(
+					DirectChatRuntimeUnavailableCloseCode,
+					DirectChatRuntimeUnavailableCloseReason,
+				),
+				deadline,
+			)
+		}
 		return
 	}
 	if err := s.run(r.Context(), conn, claims, scope); err != nil && !errors.Is(err, context.Canceled) {

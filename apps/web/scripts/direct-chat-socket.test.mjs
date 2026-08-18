@@ -471,7 +471,7 @@ test("tracks browser connection separately from authoritative agent readiness", 
   wire.receive({ type: "direct_chat_status", status: "unavailable" });
   wire.receive({ type: "direct_chat_status", status: "ready" });
   assert.deepEqual(connections, ["connecting", "connected"]);
-  assert.deepEqual(readiness, ["unknown", "not_ready", "ready"]);
+  assert.deepEqual(readiness, ["unknown", "unavailable", "ready"]);
   socket.close();
 });
 
