@@ -145,23 +145,61 @@ describe("Composer 送信ボタン", () => {
     expect(composer()).toHaveFocus();
   });
 
-  it("IME変換中はボタンでも送らない（Enter経路と同じ規律）", () => {
+  it("変換中に押されたら、いま見えている文字を確定して送る", () => {
+    // ボタンには「変換を確定する」という仕事が無い。ここで止めると、画面が何も
+    // 変わらず理由も出ないまま enabled で居続ける死んだボタンになる。
+    const blur = vi.spyOn(HTMLTextAreaElement.prototype, "blur");
     render(<Composer />);
     const input = composer();
 
-    // 変換中もChromeはinputを発火するので、未変換の読みがdraftに載る。
+    // 変換中もブラウザはinputを発火するので、いま見えている読みがdraftに載る。
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "かんじ" } });
+    expect(screen.getByRole("button", { name: "送信" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
+
+    expect(mocks.send).toHaveBeenCalledWith("かんじ", "normal");
+    // 変換は終わらせる。残したままだと確定分が空になった入力欄へ戻ってくる。
+    expect(blur).toHaveBeenCalled();
+    blur.mockRestore();
+  });
+
+  it("blurが変換を確定させる環境では、確定後の値が送られる", () => {
+    // Chromeデスクトップの順序（blur → 変換確定 → compositionend）をblurの中で
+    // 再現する。このときReactの値はまだ確定前の読みなので、入力欄の中身を正と
+    // しないと未変換の読みが送られてしまう。
+    render(<Composer />);
+    const input = composer();
+    const blur = vi
+      .spyOn(HTMLTextAreaElement.prototype, "blur")
+      .mockImplementation(function commit(this: HTMLTextAreaElement) {
+        fireEvent.compositionEnd(this, { target: { value: "漢字" } });
+      });
+
     fireEvent.compositionStart(input);
     fireEvent.change(input, { target: { value: "かんじ" } });
     fireEvent.click(screen.getByRole("button", { name: "送信" }));
-    expect(mocks.send).not.toHaveBeenCalled();
 
-    // 確定すれば同じボタンで送れる。送るのは確定後の値。
+    expect(mocks.send).toHaveBeenCalledWith("漢字", "normal");
+    expect(mocks.send).not.toHaveBeenCalledWith("かんじ", "normal");
+    blur.mockRestore();
+  });
+
+  it("変換が確定した後は確定後の値を送る", () => {
+    render(<Composer />);
+    const input = composer();
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "かんじ" } });
     fireEvent.compositionEnd(input, { target: { value: "漢字" } });
+
     fireEvent.click(screen.getByRole("button", { name: "送信" }));
+
     expect(mocks.send).toHaveBeenCalledWith("漢字", "normal");
   });
 
-  it("IME変換中はEnterでも送らない", () => {
+  it("変換中のEnterはIMEのものなので送らない", () => {
+    // Enterはブラウザ側で変換確定に使われる。そこに送信を重ねない。
     render(<Composer />);
     const input = composer();
     fireEvent.compositionStart(input);
@@ -170,6 +208,50 @@ describe("Composer 送信ボタン", () => {
     fireEvent.keyDown(input, { key: "Enter", isComposing: true, keyCode: 229 });
 
     expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it("変換中でないEnterは既定を止めて送る", () => {
+    render(<Composer />);
+    const input = composer();
+    fireEvent.change(input, { target: { value: "こんばんは" } });
+
+    // preventDefaultされていれば改行は入らない。fireEventはfalseを返す。
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(false);
+    expect(mocks.send).toHaveBeenCalledWith("こんばんは", "normal");
+  });
+
+  it("Shift+Enterは改行なので送らない", () => {
+    render(<Composer />);
+    const input = composer();
+    fireEvent.change(input, { target: { value: "つづき" } });
+
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(
+      true,
+    );
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it("未閉鎖のコードブロックの中ではEnterを改行に譲る", () => {
+    render(<Composer />);
+    const input = composer();
+    fireEvent.change(input, { target: { value: "```ts\nconst a = 1" } });
+    input.setSelectionRange(input.value.length, input.value.length);
+
+    // 既定を止めないので改行が入る。送信もしない。
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(true);
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it("Enterでも編集を保存する（ボタンと同じsubmitを通る）", () => {
+    useMessaging.setState({
+      editingMessageId: "m1",
+      messagesByPlace: { [placeKey]: [ownMessage("もとの本文")] },
+    });
+    render(<Composer />);
+    fireEvent.change(composer(), { target: { value: "直した本文" } });
+
+    expect(fireEvent.keyDown(composer(), { key: "Enter" })).toBe(false);
+    expect(mocks.submitEdit).toHaveBeenCalledWith("直した本文");
   });
 
   it("添付の準備が終わるまで押せない（Enter送信と同じ判定）", () => {

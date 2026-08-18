@@ -108,8 +108,9 @@ export function Composer() {
   const [mentionIndex, setMentionIndex] = useState(0);
   const lastTypingAt = useRef(0);
   // IME変換中か。keydownはeventからisComposingを見られる（lib/ime.ts）が、
-  // クリックのイベントには変換の状態が乗らない。入口によらず同じ判断ができるよう、
-  // compositionの生死をここで持つ（message-searchと同じ流儀）。
+  // クリックのイベントには変換の状態が乗らない。ボタンで送るときに変換を
+  // 終わらせるべきか判断するために、compositionの生死をここで持つ
+  // （message-searchと同じ流儀）。送るか止めるかの判断には使わない。
   const composing = useRef(false);
   const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
 
@@ -232,40 +233,55 @@ export function Composer() {
   const readyAttachmentCount = draftAttachments.filter(
     (entry) => entry.status === "ready",
   ).length;
-  const canSend =
-    !editing &&
-    attachmentsSettled &&
-    (value.trim().length > 0 || readyAttachmentCount > 0);
   const attachmentsFull =
     draftAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
-  // 送れるか（＝編集なら保存できるか）。ボタンの活殺とsubmitの関門が同じ式を見るので、
-  // 押せる見た目と実際に起きることがずれない。編集中の空本文はsubmitEditが黙って
-  // 捨てるだけなので「保存できない」に倒し、取り消しはEsc・×の明示の口に一本化する。
-  const canSubmit = editing ? value.trim().length > 0 : canSend;
+  // 送れるか（＝編集なら保存できるか）を、対象の文字列から決める。ボタンの活殺は
+  // 描画時のReactの値で、submitの関門は送る直前の入力欄の中身で、同じ規則を見る。
+  // 編集中の空本文はsubmitEditが黙って捨てるだけなので「保存できない」に倒し、
+  // 取り消しはEsc・×の明示の口に一本化する。
+  const canSubmitText = useCallback(
+    (text: string) =>
+      editing
+        ? text.trim().length > 0
+        : attachmentsSettled &&
+          (text.trim().length > 0 || readyAttachmentCount > 0),
+    [editing, attachmentsSettled, readyAttachmentCount],
+  );
+  const canSubmit = canSubmitText(value);
 
   /**
    * 送信・保存の唯一の関門。Enterもボタンもここを通る。
    *
-   * 入口ごとに規律を書き分けると必ずずれるので、IME変換中の遮断・送れるかの判定・
-   * 送ったあとのフォーカスの行き先をすべてここに集める。呼ぶ側は「押された」ことだけを
-   * 伝える。
+   * 押されたら「いま入力欄の箱に入っているもの」を確定して送る。変換中かどうかで
+   * 仕事を変えない。変換中のEnterを止めるのは、そのEnterがIMEの確定という見える
+   * 仕事をするからで、それはEnter経路（onKeyDown）だけの事情。ボタンには対応する
+   * 仕事が無いので、ここで同じように止めると、画面が何も変わらず理由も出ないまま
+   * enabledで居続ける死んだボタンになる。狭い幅ではこれが唯一の送信口なので、
+   * 押されたら必ず「送る」か「送れない理由を出す」のどちらかにする。
    */
   const submit = useCallback(() => {
-    // 変換中のEnterは「確定」の意味しか持たない（lib/ime.ts）。クリックも同じ扱いにする。
-    // ここで止めても、確定後にもう一度押せば送れる。
-    if (composing.current) return;
-    if (!canSubmit) return;
+    // 変換の途中で押されたら、まず終わらせる。blurでcompositionendが来る環境
+    // （Chromeデスクトップ）ではそこで確定し、来ない環境（Safari・ソフトキーボード）
+    // でも、いま見えている文字を下でそのまま採る。どちらでも押した瞬間に見えている
+    // ものが送られ、送ったあとに変換の残りが空の入力欄へ戻ることも無い。
+    if (composing.current) {
+      composing.current = false;
+      textareaRef.current?.blur();
+    }
+    // 送る値は入力欄の実際の中身。上のblurで確定した直後は、こちらがReactの値より新しい。
+    const text = textareaRef.current?.value ?? value;
+    if (!canSubmitText(text)) return;
     if (editing) {
-      submitEdit(value);
+      submitEdit(text);
     } else {
-      send(value, urgency);
+      send(text, urgency);
       setUrgency("normal");
       setMention(null);
     }
     // どの入口から送っても、次の一文字は入力欄に入る。ボタンを押して送った直後に
     // ボタンがdisabledになってフォーカスが行き場を失うのを防ぐ意味もある。
     textareaRef.current?.focus();
-  }, [canSubmit, editing, submitEdit, value, send, urgency]);
+  }, [canSubmitText, editing, submitEdit, value, send, urgency]);
 
   const acceptFiles = useCallback(
     (list: FileList | File[] | null | undefined) => {
@@ -592,7 +608,7 @@ export function Composer() {
               </span>
             )}
             {/* キーボードを使わずに送れる口。Enter送信と同じsubmitを呼ぶだけで、
-                規律（変換中は送らない・送ったら入力欄へ戻す）はsubmitが持つ。
+                規律（押されたら確定して送る・送ったら入力欄へ戻す）はsubmitが持つ。
                 mousedownの既定は止めない。止めるとblurによる変換確定を潰してしまう。 */}
             <button
               type="button"
