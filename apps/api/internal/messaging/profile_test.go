@@ -26,6 +26,26 @@ func profileOf(t *testing.T, profiles []MemberProfile, who ParticipantRef) Membe
 	return MemberProfile{}
 }
 
+func readPublishedProfile(t *testing.T, sub *subscriber) memberWire {
+	t.Helper()
+	select {
+	case raw := <-sub.send:
+		var frame struct {
+			Event Event `json:"event"`
+		}
+		if err := json.Unmarshal(raw.payload, &frame); err != nil {
+			t.Fatalf("decode profile event: %v", err)
+		}
+		if frame.Event.Type != EventProfileUpdated || frame.Event.Profile == nil {
+			t.Fatalf("profile event = %+v", frame.Event)
+		}
+		return *frame.Event.Profile
+	case <-time.After(5 * time.Second):
+		t.Fatal("profile event was not published")
+		return memberWire{}
+	}
+}
+
 // The tagline belongs to the Participant, so it rides with every member list
 // the participant appears in rather than being re-declared per place.
 func TestTaglineIsCarriedByEveryMemberListOfTheParticipant(t *testing.T) {
@@ -150,9 +170,10 @@ func TestSetProfileRefusesUnusableNamesAndOverlongTaglines(t *testing.T) {
 			t.Fatalf("display name %q: got %v, want ErrInvalidDisplayName", name, err)
 		}
 	}
-	if _, err := w.store.SetProfile(ctx, w.humanA, nil,
-		ptr(strings.Repeat("あ", MaxTaglineChars+1))); !errors.Is(err, ErrInvalidTagline) {
-		t.Fatalf("overlong tagline: got %v, want ErrInvalidTagline", err)
+	for _, tagline := range []string{strings.Repeat("あ", MaxTaglineChars+1), "a\nb", "a\n"} {
+		if _, err := w.store.SetProfile(ctx, w.humanA, nil, ptr(tagline)); !errors.Is(err, ErrInvalidTagline) {
+			t.Fatalf("invalid tagline %q: got %v, want ErrInvalidTagline", tagline, err)
+		}
 	}
 	// A refused write leaves the canonical name untouched.
 	profile, err := w.store.Profile(ctx, w.humanA)
@@ -166,6 +187,10 @@ func TestSetProfileRefusesUnusableNamesAndOverlongTaglines(t *testing.T) {
 	if _, err := w.store.SetProfile(ctx, w.humanA, nil,
 		ptr(strings.Repeat("あ", MaxTaglineChars))); err != nil {
 		t.Fatalf("tagline of exactly %d runes: %v", MaxTaglineChars, err)
+	}
+	profile, err = w.store.SetProfile(ctx, w.humanA, nil, ptr("  開発  "))
+	if err != nil || profile.Tagline != "開発" {
+		t.Fatalf("trimmed tagline = %+v, err %v", profile, err)
 	}
 }
 
@@ -266,6 +291,11 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 		t.Fatalf("overlong tagline: status %d body %v", resp.StatusCode, body)
 	}
 	resp, body = call(t, ts, http.MethodPut, "/messaging/profile", w.humanA.ID,
+		map[string]any{"tagline": "a\nb"})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_tagline" {
+		t.Fatalf("multiline tagline: status %d body %v", resp.StatusCode, body)
+	}
+	resp, body = call(t, ts, http.MethodPut, "/messaging/profile", w.humanA.ID,
 		map[string]any{"display_name": "  "})
 	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_display_name" {
 		t.Fatalf("blank display name: status %d body %v", resp.StatusCode, body)
@@ -355,6 +385,11 @@ func TestLocalProfileGivesTheAgentTheSameSelfDeclarationAsAHuman(t *testing.T) {
 		t.Fatalf("agent overlong tagline: status %d body %v", status, body)
 	}
 	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath,
+		map[string]any{"tagline": "a\nb"}, authorization)
+	if status != http.StatusBadRequest || body["error"] != "invalid_tagline" {
+		t.Fatalf("agent multiline tagline: status %d body %v", status, body)
+	}
+	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath,
 		map[string]any{"display_name": "  "}, authorization)
 	if status != http.StatusBadRequest || body["error"] != "invalid_display_name" {
 		t.Fatalf("agent blank display name: status %d body %v", status, body)
@@ -381,5 +416,104 @@ func TestLocalProfileGivesTheAgentTheSameSelfDeclarationAsAHuman(t *testing.T) {
 	}
 	if got := profileOf(t, members, w.humanB); got.Tagline != "" {
 		t.Fatalf("the agent's request altered another participant: %+v", got)
+	}
+}
+
+func TestProfileUpdateFansOutToEveryWorkspaceAudience(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspaceA, _ := w.workspaceWithChannel(t, ctx)
+	workspaceB, err := w.store.CreateWorkspace(ctx, "sumi-ops", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.AddWorkspaceMember(ctx, workspaceB.WorkspaceID, w.humanB, RoleMember); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(w.store.core, nil)
+	server.Hub = NewHub(w.store.core)
+	watchA := server.Hub.subscribe(w.store.mustScope(t, ctx, workspaceA.WorkspaceID, w.humanB))
+	watchB := server.Hub.subscribe(w.store.mustScope(t, ctx, workspaceB.WorkspaceID, w.humanB))
+	t.Cleanup(func() {
+		server.Hub.unsubscribe(watchA)
+		server.Hub.unsubscribe(watchB)
+	})
+
+	actor := w.store.mustScope(t, ctx, workspaceA.WorkspaceID, w.humanA)
+	if _, err := server.setProfile(ctx, actor, nil, ptr("両方に届く")); err != nil {
+		t.Fatalf("set profile: %v", err)
+	}
+	for label, watcher := range map[string]*subscriber{"workspace A": watchA, "workspace B": watchB} {
+		profile := readPublishedProfile(t, watcher)
+		if profile.Participant.HumanID != w.humanA.ID || profile.Tagline != "両方に届く" {
+			t.Fatalf("%s profile = %+v", label, profile)
+		}
+	}
+}
+
+func TestConcurrentProfileUpdatesPublishInDatabaseOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	server.Hub = NewHub(w.store.core)
+	watcher := server.Hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB))
+	t.Cleanup(func() { server.Hub.unsubscribe(watcher) })
+	actor := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	firstEntered := make(chan struct{})
+	allowFirst := make(chan struct{})
+	published := make(chan string, 2)
+	publisher := func(ctx context.Context, scopes []Scope, profile MemberProfile) {
+		if profile.Tagline == "古い" {
+			close(firstEntered)
+			<-allowFirst
+		}
+		published <- profile.Tagline
+		server.publishProfile(ctx, scopes, profile)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := actor.SetProfile(ctx, nil, ptr("古い"), publisher)
+		firstDone <- err
+	}()
+	<-firstEntered
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := actor.SetProfile(ctx, nil, ptr("新しい"), publisher)
+		secondDone <- err
+	}()
+	select {
+	case tagline := <-published:
+		t.Fatalf("later write published %q before the earlier write released its row lock", tagline)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(allowFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+
+	if got := <-published; got != "古い" {
+		t.Fatalf("first published profile = %q", got)
+	}
+	if got := <-published; got != "新しい" {
+		t.Fatalf("second published profile = %q", got)
+	}
+	if got := readPublishedProfile(t, watcher).Tagline; got != "古い" {
+		t.Fatalf("first live profile = %q", got)
+	}
+	if got := readPublishedProfile(t, watcher).Tagline; got != "新しい" {
+		t.Fatalf("second live profile = %q", got)
+	}
+	profile, err := actor.Profile(ctx)
+	if err != nil || profile.Tagline != "新しい" {
+		t.Fatalf("durable profile = %+v, err %v", profile, err)
 	}
 }

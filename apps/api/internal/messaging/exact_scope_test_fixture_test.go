@@ -703,7 +703,7 @@ func (s *testMessagingStore) SetProfile(ctx context.Context, actor ParticipantRe
 	if err != nil {
 		return MemberProfile{}, err
 	}
-	return scoped.SetProfile(ctx, displayName, tagline)
+	return scoped.SetProfile(ctx, displayName, tagline, nil)
 }
 
 func (s *testMessagingStore) ParticipantVisible(ctx context.Context, actor, target ParticipantRef) (bool, error) {

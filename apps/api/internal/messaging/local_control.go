@@ -592,12 +592,11 @@ func (s *Server) localProfile(w http.ResponseWriter, r *http.Request, authorizat
 		}{memberToWire(profile)})
 		return
 	}
-	profile, err := store.SetProfile(r.Context(), request.DisplayName, request.Tagline)
+	profile, err := s.setProfile(r.Context(), store, request.DisplayName, request.Tagline)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	s.publishProfile(r.Context(), store, profile)
 	writeJSON(w, http.StatusOK, struct {
 		Profile memberWire `json:"profile"`
 	}{memberToWire(profile)})

@@ -478,17 +478,26 @@ func (s *Server) publishStatus(ctx context.Context, store *ScopedStore, status P
 	_ = s.Hub.PublishScoped(ctx, store, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
 }
 
-// publishProfile fans a replaced profile out to everyone who may see the
-// participant, on the same participant-scoped boundary as status. Unlike
-// status it is durable: bootstrap already carries the current value, so a
-// missed frame is repaired by reconnecting rather than by a replay.
-func (s *Server) publishProfile(ctx context.Context, store *ScopedStore, profile MemberProfile) {
+// publishProfile fans a replaced profile out to every Workspace where its
+// participant is presently visible. Unlike status it is durable: bootstrap
+// already carries the current value, so a missed frame is repaired by
+// reconnecting rather than by a replay.
+func (s *Server) publishProfile(ctx context.Context, scopes []Scope, profile MemberProfile) {
 	if s.Hub == nil {
 		return
 	}
 	subject := profile.Participant
 	wire := memberToWire(profile)
-	_ = s.Hub.PublishScoped(ctx, store, Event{Type: EventProfileUpdated, Subject: &subject, Profile: &wire})
+	for _, scope := range scopes {
+		_ = s.Hub.PublishSystemScoped(ctx, scope, Event{Type: EventProfileUpdated, Subject: &subject, Profile: &wire})
+	}
+}
+
+// setProfile is the one transport-independent profile write path. Both the
+// Human REST route and PA local-control publish before SetProfile releases its
+// participant lock, preserving the database order at every live subscriber.
+func (s *Server) setProfile(ctx context.Context, store *ScopedStore, displayName, tagline *string) (MemberProfile, error) {
+	return store.SetProfile(ctx, displayName, tagline, s.publishProfile)
 }
 
 type unreadSummaryWire struct {
@@ -1226,7 +1235,7 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 	var profile MemberProfile
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		profile, opErr = scopedStoreForRequest(r).SetProfile(r.Context(), req.DisplayName, req.Tagline)
+		profile, opErr = s.setProfile(r.Context(), scopedStoreForRequest(r), req.DisplayName, req.Tagline)
 		return opErr
 	})
 	if !done {
@@ -1236,7 +1245,6 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	s.publishProfile(r.Context(), scopedStoreForRequest(r), profile)
 	writeJSON(w, http.StatusOK, memberToWire(profile))
 }
 
