@@ -15,6 +15,7 @@
 2. HumanとPersonalityAgentはメッセージング上で同じ「参加者」。
 3. direct chatはチャットではなく人生ログの正面窓（Employer専用私信、ADR 0009 §5）。
    本契約のスコープ外で、既存の `contracts/agent-events.yaml` の世界に残る。
+   `/direct-chat/ws` の `4001` / `runtime_not_ready` close pair はサーバー発のみとする。
 4. SecretaryとのDMはメッセージング側の通常のDMとして別途作る（ログ全部見えのDMはノイズ）。
 5. channel配送は人間と同型: 全発言が参加agentの未読として積もり、
    本人の通知設定が覚醒トリガ（呼びかけ）を決める。コスト上限はEmployer予算の別軸。

@@ -299,8 +299,24 @@ func validateLocalControlRegistryRoot(rootDir string, socketGID int) error {
 		return errors.New("local control listener root path must not contain symlinks")
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int(stat.Uid) != os.Geteuid() || int(stat.Gid) != socketGID {
-		return errors.New("local control listener root owner or group is not trusted")
+	if !ok {
+		return errors.New("local control listener root filesystem metadata is unavailable")
+	}
+	if stat.Nlink == 0 {
+		return fmt.Errorf(
+			"local control listener root %q is an unlinked directory (nlink 0); the container holds a deleted directory and must be recreated",
+			rootDir,
+		)
+	}
+	if int(stat.Uid) != os.Geteuid() || int(stat.Gid) != socketGID {
+		return fmt.Errorf(
+			"local control listener root %q owner or group is not trusted: expected uid=%d gid=%d, got uid=%d gid=%d",
+			rootDir,
+			os.Geteuid(),
+			socketGID,
+			stat.Uid,
+			stat.Gid,
+		)
 	}
 	if info.Mode().Perm() != localControlRegistryDirectoryMode {
 		return fmt.Errorf(

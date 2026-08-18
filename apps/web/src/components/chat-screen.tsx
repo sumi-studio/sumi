@@ -71,6 +71,8 @@ function ChatScreenContent({
     lastError,
     recoverableDrafts,
     acquireConnection,
+    disconnect,
+    resumeMountedConnection,
     sendMessage,
     restoreDraft,
     abort,
@@ -141,6 +143,10 @@ function ChatScreenContent({
     (item) => item.kind === "prose" && item.agentMessageFinal,
   );
   const status = describeAvailability(connection, ready);
+  const retryAgent = () => {
+    disconnect();
+    resumeMountedConnection();
+  };
 
   return (
     <div className="flex h-full bg-background text-foreground">
@@ -317,6 +323,24 @@ function ChatScreenContent({
               {lastError}
             </p>
           )}
+          {ready === "not_ready" && (
+            <section
+              role="alert"
+              className="mb-2 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900 text-sm"
+            >
+              <span>
+                エージェントを起動できませんでした。しばらくしてから再試行してください。
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={retryAgent}
+              >
+                再試行
+              </Button>
+            </section>
+          )}
           <ChatPromptInput
             value={draft}
             onValueChange={setDraft}
@@ -408,10 +432,18 @@ function describeAvailability(
   connection: "connecting" | "connected" | "closed",
   ready: "unknown" | "ready" | "not_ready",
 ) {
+  // "not_ready" only ever comes from the server saying so: an in-band status
+  // frame, or the close code the API uses to name a runtime it could not
+  // start. It is a stated fact about the agent, not something inferred from a
+  // close the browser cannot attribute, so it outranks the transport blip
+  // "再接続中" describes. It must not hide that a retry is already in flight.
+  if (ready === "not_ready")
+    return connection === "connected"
+      ? "エージェント利用不可"
+      : "エージェント利用不可（再接続中）";
   if (connection === "connecting") return "接続中";
   if (connection === "closed") return "再接続中";
   if (ready === "ready") return "エージェント利用可能";
-  if (ready === "not_ready") return "エージェント利用不可";
   return "エージェント確認中";
 }
 

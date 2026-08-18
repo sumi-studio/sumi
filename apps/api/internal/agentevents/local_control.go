@@ -319,6 +319,9 @@ func newLocalControlServer(
 	if err := gateway.installLocalControlIntegrityKeyring(integrityKey, previousIntegrityKeys, owners); err != nil {
 		return nil, err
 	}
+	if err := gateway.ValidateLocalControlDurableStateKeyring(); err != nil {
+		return nil, err
+	}
 	checkedState := make(map[string]struct{}, len(normalized))
 	for _, authorization := range normalized {
 		if _, checked := checkedState[authorization.PersonalityAgentID]; checked {
@@ -1653,6 +1656,18 @@ func (g *DurableGateway) localControlIntegrityKeyringSnapshot() (localControlInt
 		}
 	}
 	return ring, true
+}
+
+// localControlOwnerSnapshot lists the personality agents this process is
+// authorized to control, so callers can tell state it owns from debris.
+func (g *DurableGateway) localControlOwnerSnapshot() []string {
+	g.localControlIntegrityMu.RLock()
+	defer g.localControlIntegrityMu.RUnlock()
+	owners := make([]string, 0, len(g.localControlOwners))
+	for personalityAgentID := range g.localControlOwners {
+		owners = append(owners, personalityAgentID)
+	}
+	return owners
 }
 
 func (g *DurableGateway) localControlOwns(personalityAgentID string) bool {
