@@ -131,6 +131,9 @@ func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovisio
 	if !exists || current != request.PreparedEpoch {
 		return runtimeprovision.Inspection{}, runtimeprovision.ErrConflict
 	}
+	if p.recovery[request.PersonalityAgentID] {
+		return runtimeprovision.Inspection{}, runtimeprovision.ErrConflict
+	}
 	p.stops[request.PersonalityAgentID]++
 	delete(p.epochs, request.PersonalityAgentID)
 	return p.reapInspection(request.PreparedEpoch), nil
@@ -494,6 +497,45 @@ func TestProvisionedProcessStaleStopCannotCloseReplacementListener(t *testing.T)
 	}
 	if current := authorizations.current[paid]; current.Generation != replacement.Generation || current.RPCBootNonce != replacement.RPCBootNonce {
 		t.Fatalf("stale stop fenced replacement authorization: %#v", current)
+	}
+}
+
+func TestProvisionedProcessStopReconcilesRecoveryInsteadOfLeavingPartialRuntime(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+
+	if err := process.Stop(); err != nil {
+		t.Fatalf("recovery Stop = %v, want fenced reconciliation", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("recovery Stop left the partial runtime behind")
+	}
+	if reaped, ok := provisioner.reapedThrough[paid]; !ok || reaped != 0 {
+		t.Fatalf("recovery Stop did not return an exact observed-empty receipt: reaped=%d present=%t", reaped, ok)
+	}
+	if authorizations.fences[paid] != 2 || listeners.active[paid] {
+		t.Fatalf("recovery Stop retained local authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"fence:" + paid,
+		"stop:" + paid,
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("recovery Stop did not fence and reconcile before returning: %v", recorder.calls)
 	}
 }
 
@@ -936,6 +978,48 @@ func TestProvisionedRuntimeSpawnerRejectsReadyThenExit(t *testing.T) {
 	}
 	if authorizations.fences[paid] != 1 || listeners.active[paid] {
 		t.Fatal("Ready-then-exit runtime retained authority")
+	}
+}
+
+func TestProvisionedRuntimeSpawnerPreReadyRecoveryReconcilesExactEpochBeforeFailing(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	readiness := &fakeRuntimeReadiness{terminal: true}
+	readiness.onObserve = func() {
+		provisioner.mu.Lock()
+		defer provisioner.mu.Unlock()
+		provisioner.recovery[paid] = true
+		provisioner.reconcileReaps[paid] = true
+	}
+	spawner.config.Readiness = readiness
+
+	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
+		GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "terminal NotReady") {
+		t.Fatalf("pre-Ready recovery spawn error = %v, want terminal readiness failure", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("pre-Ready recovery left the partial runtime behind")
+	}
+	if reaped, ok := provisioner.reapedThrough[paid]; !ok || reaped != 0 {
+		t.Fatalf("pre-Ready recovery did not produce the exact observed-empty receipt: reaped=%d present=%t", reaped, ok)
+	}
+	if authorizations.fences[paid] != 2 || listeners.active[paid] {
+		t.Fatalf("pre-Ready recovery retained local authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"fence:" + paid,
+		"stop:" + paid,
+		"unlisten:" + paid,
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("pre-Ready recovery did not fence and reconcile before returning: %v", recorder.calls)
 	}
 }
 

@@ -152,6 +152,29 @@ func (s *provisionedRuntimeSpawner) Spawn(
 			PreparedEpoch: epoch,
 		})
 		listenerErr := s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID)
+		if stopErr != nil {
+			inspection, inspectErr := s.config.Provisioner.Inspect(cleanupCtx, runtimeprovision.InspectRequest{
+				Version:            runtimeprovision.ProtocolVersion,
+				PersonalityAgentID: epoch.PersonalityAgentID,
+			})
+			if inspectErr == nil &&
+				inspection.Phase == runtimeprovision.PhaseRecovery &&
+				inspection.Epoch != nil && *inspection.Epoch == epoch {
+				reconcileErr := fenceAndReconcileRecovery(
+					cleanupCtx,
+					s.config.Provisioner,
+					s.config.Authorizations,
+					s.config.Listeners,
+					epoch,
+				)
+				// Stop deliberately rejects a recovery-shaped project. Once the
+				// exact fenced reconcile has observed it empty, that rejection is
+				// no longer a teardown failure; Spawn still returns its original
+				// pre-Ready failure.
+				return errors.Join(cause, fenceErr, listenerErr, reconcileErr)
+			}
+			return errors.Join(cause, fenceErr, listenerErr, stopErr, inspectErr)
+		}
 		return errors.Join(cause, fenceErr, listenerErr, stopErr)
 	}
 
@@ -374,6 +397,44 @@ func (s *provisionedRuntimeSpawner) fenceLocalRuntimeBeforeReap(epoch runtimepro
 	return nil
 }
 
+// fenceAndReconcileRecovery removes a partial project only after revoking the
+// exact epoch's local authority. Reconcile's observed-empty receipt is the
+// proof that no runtime containers were stranded by a failed lifecycle call.
+func fenceAndReconcileRecovery(
+	ctx context.Context,
+	provisioner runtimeProvisioner,
+	authorizations localRuntimeAuthorizationController,
+	listeners localRuntimeListenerController,
+	epoch runtimeprovision.PreparedEpoch,
+) error {
+	if err := authorizations.FenceLocalRuntimeAuthorization(
+		ctx,
+		epoch.PersonalityAgentID,
+		epoch.Generation,
+		epoch.RPCBootNonce,
+	); err != nil {
+		return fmt.Errorf("fence recovering runtime before reconcile: %w", err)
+	}
+	if err := listeners.CloseLocalRuntime(ctx, epoch.PersonalityAgentID); err != nil {
+		return fmt.Errorf("close recovering runtime before reconcile: %w", err)
+	}
+	inspection, err := provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+		Version:            runtimeprovision.ProtocolVersion,
+		PersonalityAgentID: epoch.PersonalityAgentID,
+		FencedEpoch:        &epoch,
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile recovering runtime: %w", err)
+	}
+	if inspection.Phase != runtimeprovision.PhaseUnknown ||
+		inspection.PersonalityAgentID != epoch.PersonalityAgentID ||
+		inspection.ReapedThroughGeneration == nil ||
+		*inspection.ReapedThroughGeneration != epoch.Generation {
+		return errors.New("recovering runtime reconcile did not return an exact observed-empty reap receipt")
+	}
+	return nil
+}
+
 type provisionedProcess struct {
 	provisioner     runtimeProvisioner
 	authorizations  localRuntimeAuthorizationController
@@ -507,10 +568,23 @@ func (p *provisionedProcess) Stop() error {
 			Version:       runtimeprovision.ProtocolVersion,
 			PreparedEpoch: p.epoch,
 		})
-		var listenerErr error
-		if stopErr == nil {
-			listenerErr = p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID)
+		if stopErr != nil {
+			inspection, inspectErr := p.provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
+				Version:            runtimeprovision.ProtocolVersion,
+				PersonalityAgentID: p.epoch.PersonalityAgentID,
+			})
+			if inspectErr == nil &&
+				inspection.Phase == runtimeprovision.PhaseRecovery &&
+				inspection.Epoch != nil && *inspection.Epoch == p.epoch {
+				reconcileErr := fenceAndReconcileRecovery(ctx, p.provisioner, p.authorizations, p.listeners, p.epoch)
+				p.stopErr = errors.Join(fenceErr, reconcileErr)
+				return
+			}
+			p.stopErr = errors.Join(fenceErr, stopErr, inspectErr)
+			return
 		}
+		var listenerErr error
+		listenerErr = p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID)
 		p.stopErr = errors.Join(fenceErr, stopErr, listenerErr)
 	})
 	return p.stopErr
