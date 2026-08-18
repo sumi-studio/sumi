@@ -339,34 +339,40 @@ test("the allocator exception is bounded to one locked disposable generation", a
 });
 
 /**
- * Expands the launcher's own attachment root definitions under a controlled
- * environment, so the test measures where the bytes actually land rather than
- * how the assignment happens to be spelled.
+ * Runs the launcher's own attachment root block under a controlled environment,
+ * so the test measures where the bytes actually land and which values the block
+ * refuses, rather than how either happens to be spelled.
  */
 async function attachmentRootFor(launcher, environment) {
-  const definitions = launcher
-    .split("\n")
-    .filter((line) =>
-      /^readonly (?:PERSISTENT_STATE_ROOT|MESSAGING_ATTACHMENT_DIR)=/.test(
-        line,
-      ),
-    );
-  assert.equal(definitions.length, 2);
+  const start = launcher.indexOf('readonly PERSISTENT_STATE_ROOT="');
+  const end = launcher.indexOf(
+    "\n",
+    launcher.indexOf('readonly MESSAGING_ATTACHMENT_DIR="'),
+  );
+  assert.ok(start > 0 && end > start);
   const script = [
     "set -euo pipefail",
+    'fail() { printf "fail: %s\\n" "$*" >&2; exit 3; }',
     'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
-    ...definitions,
+    launcher.slice(start, end),
     'printf %s "$MESSAGING_ATTACHMENT_DIR"',
   ].join("\n");
-  const { stdout } = await execFileAsync("bash", ["-c", script], {
+  const options = {
     env: {
       PATH: process.env.PATH,
       DISPOSABLE_RUNTIME_ROOT: "/tmp/sumi-real-stack.disposable",
       HOME: "/home/example",
       ...environment,
     },
-  });
-  return stdout;
+  };
+  try {
+    return {
+      ...(await execFileAsync("bash", ["-c", script], options)),
+      code: 0,
+    };
+  } catch (error) {
+    return { stdout: error.stdout, stderr: error.stderr, code: error.code };
+  }
 }
 
 test("uploaded attachment bytes outlive the disposable runtime root", async () => {
@@ -382,21 +388,52 @@ test("uploaded attachment bytes outlive the disposable runtime root", async () =
   assert.ok(disposableDirectories);
   assert.doesNotMatch(disposableDirectories[0], /MESSAGING_ATTACHMENT_DIR/);
 
-  assert.equal(
-    await attachmentRootFor(launcher, {}),
-    "/home/example/.local/state/sumi/real-stack/messaging-attachments",
+  for (const [environment, expected] of [
+    [{}, "/home/example/.local/state/sumi/real-stack/messaging-attachments"],
+    [
+      { XDG_STATE_HOME: "/home/example/state" },
+      "/home/example/state/sumi/real-stack/messaging-attachments",
+    ],
+    [
+      {
+        SUMI_REAL_STACK_STATE_ROOT: "/srv/sumi-dev",
+        XDG_STATE_HOME: "/home/example/state",
+      },
+      "/srv/sumi-dev/messaging-attachments",
+    ],
+  ]) {
+    const resolved = await attachmentRootFor(launcher, environment);
+    assert.equal(resolved.code, 0);
+    assert.equal(resolved.stdout, expected);
+  }
+});
+
+test("a relative state root is refused instead of splitting the store", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+
+  // The API runs from apps/api and resolves SUMI_MESSAGING_ATTACHMENT_ROOT from
+  // there, while the launcher creates directories from the invocation
+  // directory. A relative root would therefore point the two at different
+  // places, and would move the store every time the stack is started from
+  // somewhere else.
+  assert.match(
+    launcher.slice(launcher.indexOf('log "starting API"')),
+    /cd "\$\{REPOSITORY_ROOT\}\/apps\/api"/,
   );
-  assert.equal(
-    await attachmentRootFor(launcher, {
-      XDG_STATE_HOME: "/home/example/state",
-    }),
-    "/home/example/state/sumi/real-stack/messaging-attachments",
-  );
-  assert.equal(
-    await attachmentRootFor(launcher, {
-      SUMI_REAL_STACK_STATE_ROOT: "/srv/sumi-dev",
-      XDG_STATE_HOME: "/home/example/state",
-    }),
-    "/srv/sumi-dev/messaging-attachments",
-  );
+
+  for (const environment of [
+    { SUMI_REAL_STACK_STATE_ROOT: "sumi-dev-state" },
+    { SUMI_REAL_STACK_STATE_ROOT: "./sumi-dev-state" },
+    { SUMI_REAL_STACK_STATE_ROOT: "../sumi-dev-state" },
+    { XDG_STATE_HOME: "state" },
+  ]) {
+    const refused = await attachmentRootFor(launcher, environment);
+    assert.equal(refused.code, 3);
+    assert.equal(refused.stdout, "");
+    assert.match(refused.stderr, /must be an absolute path/);
+    assert.match(
+      refused.stderr,
+      /SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME/,
+    );
+  }
 });

@@ -530,6 +530,14 @@ readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
 # deleted: profile images and uploads came back as missing objects after every
 # restart. The persistent root sits under the user state directory instead.
 readonly PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
+# The API resolves SUMI_MESSAGING_ATTACHMENT_ROOT against its own working
+# directory (apps/api), not the one make dev was invoked from, so a relative
+# root would have the launcher provision one parent while the API demands
+# another and refuses to start. It would also move the store whenever the stack
+# is started from a different directory, which is the very disappearance this
+# persistent root exists to stop.
+[[ "${PERSISTENT_STATE_ROOT}" == /* ]] ||
+  fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${PERSISTENT_STATE_ROOT}"
 readonly MESSAGING_ATTACHMENT_DIR="${PERSISTENT_STATE_ROOT}/messaging-attachments"
 # Local runs use explicit bounded attachment caps; the API refuses to serve
 # attachments unless every Workspace and store-wide byte/object cap is set.
