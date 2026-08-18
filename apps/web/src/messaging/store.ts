@@ -2076,10 +2076,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     async updateChannel(channelId, input) {
       const request = beginMessagingBackendRequest();
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
       const channel = await request.wait((backend) =>
         backend.updateChannel(channelId, input),
       );
-      if (!channel || !request.isCurrent()) return;
+      if (
+        !channel ||
+        !request.isCurrent() ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during channel edit");
+      }
       set((state) => ({
         channels: state.channels.map((entry) =>
           entry.channelId === channel.channelId ? channel : entry,
@@ -2088,7 +2097,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async duplicateChannel(channelId) {
-      const channel = await backend.duplicateChannel(channelId);
+      const request = beginMessagingBackendRequest();
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
+      const channel = await request.wait((backend) =>
+        backend.duplicateChannel(channelId),
+      );
+      if (
+        !channel ||
+        !request.isCurrent() ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during channel duplication");
+      }
       set((state) =>
         state.channels.some((entry) => entry.channelId === channel.channelId)
           ? {}
