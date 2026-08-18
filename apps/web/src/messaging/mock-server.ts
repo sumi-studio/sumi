@@ -340,6 +340,20 @@ const TYPING_DELAY_MS = 650;
 const TYPING_INTERVAL_MS = 3_000;
 const REPLY_LATER_REMIND_MS = 9_000;
 
+/**
+ * 複製の既定名。本番の `copyChannelName`（apps/api/internal/messaging/scoped_core.go）
+ * と同じ規則で、末尾の「 のコピー」を剥がしてから付け直す——コピーのコピーで
+ * サフィックスが積み上がると、元の名前を探すのに単語を数えることになる。
+ * mock がここで違う名前を出すと、手で確かめた挙動が本物と食い違う。
+ */
+function copyChannelName(source: string): string {
+  const suffix = " のコピー";
+  const base = source.endsWith(suffix)
+    ? source.slice(0, -suffix.length)
+    : source;
+  return `${base === "" ? source : base}${suffix}`;
+}
+
 export class MockMessagingServer implements MessagingBackend {
   readonly capabilities = {
     status: true,
@@ -577,7 +591,7 @@ export class MockMessagingServer implements MessagingBackend {
     const copy: ChannelSummary = {
       channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
       workspaceId: source.workspaceId,
-      name: name && name !== "" ? name : `${source.name} のコピー`,
+      name: name && name !== "" ? name : copyChannelName(source.name),
       topic: source.topic,
       visibility: "public",
       voice: source.voice,
