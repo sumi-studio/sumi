@@ -319,6 +319,9 @@ func newLocalControlServer(
 	if err := gateway.installLocalControlIntegrityKeyring(integrityKey, previousIntegrityKeys, owners); err != nil {
 		return nil, err
 	}
+	if err := gateway.ValidateLocalControlDurableStateKeyring(); err != nil {
+		return nil, err
+	}
 	checkedState := make(map[string]struct{}, len(normalized))
 	for _, authorization := range normalized {
 		if _, checked := checkedState[authorization.PersonalityAgentID]; checked {

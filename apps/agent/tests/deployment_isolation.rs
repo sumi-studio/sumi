@@ -25,11 +25,26 @@ use uuid::Uuid;
 const PAID_A: &str = "0198f0f4-9b72-7000-8000-000000000001";
 const PAID_B: &str = "0198f0f4-9b72-7000-8000-000000000002";
 const LOCAL_CONTROL_GID: u32 = 10022;
-const HOST_RUN_ROOT: &str = "/run/sumi";
+// This is deliberately not /run/sumi.  The deployment supervisor has fixed
+// production trust anchors there, so integration tests run a private copy of
+// the deployment artifact with the same anchors rooted below a fixture-owned
+// directory.  Do not make the production roots configurable by environment.
 const TEST_WRAPPING_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_APPROVAL_DIGEST_KEY: &str =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+fn host_run_snapshot() -> Option<(u64, u64, u32, u32, u64)> {
+    std::fs::symlink_metadata("/run/sumi").ok().map(|metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.nlink(),
+        )
+    })
+}
 
 fn deploy_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -209,6 +224,9 @@ struct HostTrustFixture {
     lock_path: PathBuf,
     control_socket: PathBuf,
     runtime_secret_root: PathBuf,
+    fixture_root: PathBuf,
+    supervisor: PathBuf,
+    host_run_before: Option<(u64, u64, u32, u32, u64)>,
     control_gid: u32,
     listener: Option<UnixListener>,
     _guard: MutexGuard<'static, ()>,
@@ -219,6 +237,7 @@ impl HostTrustFixture {
         let guard = HOST_FIXTURE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let host_run_before = host_run_snapshot();
         if !docker_fixture_host_available() {
             eprintln!(
                 "HOST_UNAVAILABLE: Docker and cached debian:bookworm-slim are required to \
@@ -248,9 +267,41 @@ impl HostTrustFixture {
         let paid = Uuid::now_v7().to_string();
         let compact = paid.replace('-', "");
         let project = format!("sumi-{compact}");
-        let lock_path =
-            PathBuf::from(HOST_RUN_ROOT).join(format!("supervisor-locks/{project}.lock"));
-        let control_dir = PathBuf::from(HOST_RUN_ROOT).join(format!("local-control/{compact}"));
+        let fixture_root = std::env::temp_dir().join(format!("sumi-deployment-run-{}", Uuid::now_v7()));
+        let private_run_root = fixture_root.join("run/sumi");
+        std::fs::create_dir_all(&private_run_root).unwrap();
+        let private_deploy_dir = fixture_root.join("deploy");
+        std::fs::create_dir_all(&private_deploy_dir).unwrap();
+        for entry in std::fs::read_dir(deploy_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let target = private_deploy_dir.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                for child in std::fs::read_dir(entry.path()).unwrap() {
+                    let child = child.unwrap();
+                    std::fs::copy(child.path(), target.join(child.file_name())).unwrap();
+                }
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+        let supervisor = private_deploy_dir.join("supervisor");
+        let private_run_root_text = private_run_root.display().to_string();
+        let supervisor_source = std::fs::read_to_string(&supervisor)
+            .unwrap()
+            .replace(
+                "readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks",
+                &format!("readonly SUPERVISOR_LOCK_ROOT={private_run_root_text}/supervisor-locks"),
+            )
+            .replace(
+                "readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control",
+                &format!("readonly LOCAL_CONTROL_HOST_ROOT={private_run_root_text}/local-control"),
+            )
+            .replace("/run/sumi", &private_run_root_text);
+        std::fs::write(&supervisor, supervisor_source).unwrap();
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lock_path = private_run_root.join(format!("supervisor-locks/{project}.lock"));
+        let control_dir = private_run_root.join(format!("local-control/{compact}"));
         let control_socket = control_dir.join("control.sock");
         let runtime_secret_root =
             std::env::temp_dir().join(format!("sumi-runtime-secrets-{compact}"));
@@ -279,7 +330,7 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
                 "--network".into(),
                 "none".into(),
                 "-v".into(),
-                "/run:/host-run".into(),
+                format!("{}:/host-run", fixture_root.join("run").display()),
                 "debian:bookworm-slim".into(),
                 "bash".into(),
                 "-c".into(),
@@ -298,6 +349,11 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
             );
             return None;
         }
+        assert_eq!(
+            host_run_snapshot(),
+            host_run_before,
+            "deployment fixture changed the host /run/sumi trust anchor"
+        );
 
         let listener = UnixListener::bind(&control_socket).unwrap();
         std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o660)).unwrap();
@@ -308,6 +364,9 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
             lock_path,
             control_socket,
             runtime_secret_root,
+            fixture_root,
+            supervisor,
+            host_run_before,
             control_gid,
             listener: Some(listener),
             _guard: guard,
@@ -325,6 +384,10 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
                 "SUMI_LOCAL_CONTROL_SOCKET_GID",
                 self.control_gid.to_string(),
             );
+    }
+
+    fn supervisor_command(&self) -> Command {
+        Command::new(&self.supervisor)
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
@@ -349,7 +412,7 @@ rmdir /host-run/sumi 2>/dev/null || true
                 "--network".into(),
                 "none".into(),
                 "-v".into(),
-                "/run:/host-run".into(),
+                format!("{}:/host-run", self.fixture_root.join("run").display()),
                 "debian:bookworm-slim".into(),
                 "bash".into(),
                 "-c".into(),
@@ -393,6 +456,18 @@ rmdir /host-run/sumi 2>/dev/null || true
                 "cannot remove exact runtime secret fixture {}: {error}",
                 self.runtime_secret_root.display()
             ));
+        }
+        make_tree_removable(&self.fixture_root);
+        if let Err(error) = std::fs::remove_dir_all(&self.fixture_root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!(
+                "cannot remove private deployment fixture {}: {error}",
+                self.fixture_root.display()
+            ));
+        }
+        if host_run_snapshot() != self.host_run_before {
+            errors.push("private deployment fixture changed host /run/sumi".to_owned());
         }
         if errors.is_empty() {
             Ok(())
@@ -2619,7 +2694,7 @@ fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let log = root.join("docker.log");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -2675,7 +2750,7 @@ fn competing_supervisor_invocation_fails_before_lifecycle_mutation() {
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -2721,7 +2796,7 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
     let log = root.join("docker.log");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut up = Command::new(deploy_dir().join("supervisor"));
+    let mut up = fixture.supervisor_command();
     up.arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
         .env("SUMI_FAKE_DOCKER_LOG", &log);
@@ -2740,7 +2815,7 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
         ("down", "down --remove-orphans"),
     ] {
         std::fs::write(&log, b"").unwrap();
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .env_clear()
             .arg(action)
@@ -2865,7 +2940,7 @@ esac
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut logs = Command::new(deploy_dir().join("supervisor"));
+    let mut logs = fixture.supervisor_command();
     logs.arg("logs")
         .arg("-f")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -2881,7 +2956,7 @@ esac
     }
     let logs_started = markers.join("logs-started").exists();
 
-    let mut stop = Command::new(deploy_dir().join("supervisor"));
+    let mut stop = fixture.supervisor_command();
     stop.arg("stop")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
         .env("SUMI_FAKE_MARKERS", &markers)
@@ -3020,7 +3095,7 @@ esac
     let log = root.join("docker.log");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3141,7 +3216,7 @@ esac
         std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log = root.join("docker.log");
 
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .arg("prepare")
             .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3287,7 +3362,7 @@ esac
 
         let bash_env = root.join("bash_env");
         std::fs::write(&bash_env, "set -m\n").unwrap();
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .arg("prepare")
             .process_group(0)
@@ -3391,7 +3466,7 @@ esac
     std::fs::write(&fake_docker, script).unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3431,7 +3506,7 @@ fn validate_error_redacts_combined_compose_output() {
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
         "provider-sentinel-not-for-output",
     ];
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3535,7 +3610,7 @@ fn supervisor_rejects_reserved_or_role_colliding_local_control_gids() {
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
     for gid in ["0", "999", "65534", "10001", "10020"] {
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .arg("validate")
             .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3551,7 +3626,7 @@ fn supervisor_rejects_reserved_or_role_colliding_local_control_gids() {
         );
     }
 
-    let mut wrong_uid = Command::new(deploy_dir().join("supervisor"));
+    let mut wrong_uid = fixture.supervisor_command();
     wrong_uid
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()));
@@ -3586,7 +3661,7 @@ fn supervisor_requires_explicit_local_control_socket_gid_before_lifecycle_mutati
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3627,7 +3702,7 @@ fn local_control_path_swap_is_detected_before_validation_succeeds() {
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3995,7 +4070,7 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
 
         let expected_project = format!("sumi-{}", fixture.paid.replace('-', ""));
         assert_eq!(fixture.project, expected_project);
-        let supervisor = deploy_dir().join("supervisor");
+        let supervisor = fixture.supervisor.clone();
         let mut project_name = Command::new("timeout");
         project_name
             .args(["--preserve-status", "30s"])

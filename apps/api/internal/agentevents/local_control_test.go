@@ -1257,6 +1257,47 @@ func TestLocalControlIntegrityRotationConstructorMigratesPreviousKeyState(t *tes
 	}
 }
 
+func TestLocalControlStartupNamesStaleDurableStateKeyAndRecovery(t *testing.T) {
+	runtimeDir := privateRuntimeDir(t)
+	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
+	oldSecret := []byte("old-local-control-startup-reporting-secret-1")
+	currentSecret := []byte("new-local-control-startup-reporting-secret-2")
+	oldControl, err := NewLocalControlServer(oldGateway, oldSecret, []LocalRuntimeAuthorization{authorization})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldControl.publishRuntimeState(context.Background(), startupPublication("stale-key", localControlTestPAID, 7, "boot-a")); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewLocalControlServer(restarted, currentSecret, []LocalRuntimeAuthorization{authorization})
+	if err == nil {
+		t.Fatal("startup accepted durable state signed by an unavailable key")
+	}
+	oldID := deriveLocalControlIntegrityKeyID(deriveLocalControlIntegrityKey(oldSecret))
+	currentID := deriveLocalControlIntegrityKeyID(deriveLocalControlIntegrityKey(currentSecret))
+	for _, want := range []string{runtimeDir, oldID, currentID, "SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS", "discard"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("startup diagnostic missing %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), string(oldSecret)) || strings.Contains(err.Error(), string(currentSecret)) {
+		t.Fatalf("startup diagnostic exposed signing secret: %v", err)
+	}
+	withPrevious, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(withPrevious, currentSecret, [][]byte{oldSecret}, []LocalRuntimeAuthorization{authorization}); err != nil {
+		t.Fatalf("previous signing secret did not restore startup: %v", err)
+	}
+}
+
 func TestLocalControlIntegrityRotationRepairsPartialStateBeforePreviousKeyRetirement(t *testing.T) {
 	runtimeDir := privateRuntimeDir(t)
 	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)

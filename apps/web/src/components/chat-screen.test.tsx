@@ -23,6 +23,9 @@ const state = vi.hoisted(() => ({
   restoreDraft: vi.fn<(key: string) => string | undefined>(),
   releaseConnection: vi.fn(),
   acquireConnection: vi.fn(),
+  disconnect: vi.fn(),
+  resumeMountedConnection: vi.fn(),
+  ready: "ready" as "ready" | "not_ready",
 }));
 
 state.acquireConnection.mockImplementation(() => state.releaseConnection);
@@ -55,10 +58,12 @@ vi.mock("../agent/store", () => ({
     },
     running: false,
     connection: "connected",
-    ready: "ready",
+    ready: state.ready,
     lastError: null,
     recoverableDrafts: state.recoverableDrafts,
     acquireConnection: state.acquireConnection,
+    disconnect: state.disconnect,
+    resumeMountedConnection: state.resumeMountedConnection,
     sendMessage: state.sendMessage,
     restoreDraft: state.restoreDraft,
     discardDraft: vi.fn(),
@@ -133,6 +138,9 @@ afterEach(() => {
   state.restoreDraft.mockReset();
   state.acquireConnection.mockClear();
   state.releaseConnection.mockClear();
+  state.disconnect.mockClear();
+  state.resumeMountedConnection.mockClear();
+  state.ready = "ready";
 });
 
 describe("SDUI action boundary", () => {
@@ -248,5 +256,17 @@ describe("SDUI action boundary", () => {
     expect(screen.getByRole("textbox", { name: "テスト入力欄" })).toHaveValue(
       "いま書いている入力",
     );
+  });
+
+  it("names an unavailable agent and keeps an explicit retry path", () => {
+    state.ready = "not_ready";
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "エージェントを起動できませんでした",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+    expect(state.disconnect).toHaveBeenCalledTimes(1);
+    expect(state.resumeMountedConnection).toHaveBeenCalledTimes(1);
   });
 });

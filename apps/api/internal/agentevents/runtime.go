@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -2332,6 +2333,48 @@ func stringPointerEqual(left, right *string) bool {
 
 func (g *DurableGateway) statePath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "runtime-"+safeFileID(personalityAgentID)+".json")
+}
+
+// ValidateLocalControlDurableStateKeyring reports a stale checkout/runtime
+// pairing before the API starts serving spawn requests.  It intentionally
+// reports only key identifiers, never signing material or durable contents.
+func (g *DurableGateway) ValidateLocalControlDurableStateKeyring() error {
+	keyring, ok := g.localControlIntegrityKeyringSnapshot()
+	if !ok {
+		return errors.New("local control integrity keyring is not installed")
+	}
+	entries, err := os.ReadDir(g.dir)
+	if err != nil {
+		return fmt.Errorf("list durable runtime state directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "runtime-") || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(g.dir, entry.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read durable runtime state %q: %w", path, err)
+		}
+		var state runtimeState
+		if err := unmarshalStrict(raw, &state); err != nil || state.LocalControl == nil || state.LocalControl.Integrity == nil {
+			continue
+		}
+		savedID := state.LocalControl.Integrity.KeyID
+		if savedID == keyring.Current.ID {
+			continue
+		}
+		if _, previous := keyring.Previous[savedID]; previous {
+			continue
+		}
+		return fmt.Errorf(
+			"durable local-control state uses an unknown integrity key: file=%q saved_key_id=%s current_key_id=%s; configure SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS to re-sign it, or discard this runtime state",
+			path,
+			savedID,
+			keyring.Current.ID,
+		)
+	}
+	return nil
 }
 
 func (g *DurableGateway) connectionLeasePath(personalityAgentID string) string {
