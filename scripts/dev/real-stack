@@ -132,7 +132,7 @@ validate_persistent_state_root_ancestors() {
 }
 
 provision_persistent_state_root() {
-  local root="$1" metadata mode owner
+  local root="$1" canonical_root metadata mode owner
   # Normalize trailing separators once before every subsequent path check.
   # In particular, -L follows a symlink when its operand has a trailing slash.
   while [[ "${root}" != "/" && "${root}" == */ ]]; do
@@ -142,13 +142,11 @@ provision_persistent_state_root() {
     fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${root}"
   (umask 077; mkdir -p -- "$(dirname -- "${root}")") ||
     fail "cannot create the parent of the persistent local state root: ${root}"
-  validate_persistent_state_root_ancestors "${root}"
   # mkdir without -p reports the difference between "created for us" and
   # "already there", which is exactly the line the launcher must not cross.
   if [[ ! -e "${root}" && ! -L "${root}" ]]; then
     mkdir -m 0700 -- "${root}" ||
       fail "cannot create the persistent local state root: ${root}"
-    return 0
   fi
   [[ -d "${root}" && ! -L "${root}" ]] ||
     fail "the persistent local state root must be a real directory: ${root}"
@@ -158,6 +156,13 @@ provision_persistent_state_root() {
   owner="${metadata##* }"
   [[ "${mode: -3}" == 700 && "${owner}" == "${UID}" ]] ||
     fail "the persistent local state root already exists as mode ${mode} owned by uid ${owner}; it must be a private directory of this user (mode 0700, uid ${UID}) before it can hold attachments: ${root}"
+  # Resolve every ancestor once after the root exists and its own symlink
+  # check has passed. From here on, use this stable real path only: a later
+  # replacement of an ancestor link cannot redirect the API to unchecked data.
+  canonical_root="$(realpath -e -- "${root}")" ||
+    fail "cannot resolve the persistent local state root: ${root}"
+  validate_persistent_state_root_ancestors "${canonical_root}"
+  printf '%s\n' "${canonical_root}"
 }
 
 valid_paid() {
@@ -591,8 +596,14 @@ readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
 # them in a named Compose volume, so holding the bytes under the disposable
 # runtime root left the database pointing at files that shutdown had already
 # deleted: attachments then referred to missing objects after every restart.
-# The persistent root sits under the user state directory instead.
-readonly PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
+# The persistent root sits under the user state directory instead. Resolve it
+# once after provisioning so both validation and the API use one real path.
+readonly CONFIGURED_PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
+PERSISTENT_STATE_ROOT="$(provision_persistent_state_root "${CONFIGURED_PERSISTENT_STATE_ROOT}")"
+readonly PERSISTENT_STATE_ROOT
+if [[ "${PERSISTENT_STATE_ROOT}" != "${CONFIGURED_PERSISTENT_STATE_ROOT}" ]]; then
+  log "persistent local state root normalized: configured ${CONFIGURED_PERSISTENT_STATE_ROOT}; using ${PERSISTENT_STATE_ROOT}"
+fi
 readonly MESSAGING_ATTACHMENT_DIR="${PERSISTENT_STATE_ROOT}/messaging-attachments"
 # Local runs use explicit bounded attachment caps; the API refuses to serve
 # attachments unless every Workspace and store-wide byte/object cap is set.
@@ -613,10 +624,6 @@ mkdir -m 0700 \
   "${IPC_DIR}" \
   "${LOG_DIR}" \
   "${BIN_DIR}"
-# This one is not created with the disposable directories above: it is the only
-# state that has to be there again on the next run.
-provision_persistent_state_root "${PERSISTENT_STATE_ROOT}"
-
 readonly API_BINARY="${BIN_DIR}/sumi-api"
 readonly AGENT_BINARY="${REPOSITORY_ROOT}/apps/agent/target/debug/sumi-agent"
 readonly EXECUTOR_SOCKET="${IPC_DIR}/executor.sock"

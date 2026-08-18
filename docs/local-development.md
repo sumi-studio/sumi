@@ -314,7 +314,8 @@ or not at all:
   `${XDG_STATE_HOME:-~/.local/state}/sumi/real-stack/messaging-attachments`
   (override with `SUMI_REAL_STACK_STATE_ROOT`; the path must be absolute, and
   an existing directory must already be mode 0700 and owned by you — the
-  launcher will not relax or tighten a directory it did not create). Its
+  launcher will not relax or tighten a directory it did not create). The
+  configured path is normalized once and its real path is used. Its
   ancestors must be owned by you or root, and may only be group/other-writable
   when sticky; the default path beneath your home directory needs no extra
   setup.

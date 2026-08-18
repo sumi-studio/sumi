@@ -384,20 +384,20 @@ async function runBash(script, environment) {
 }
 
 /**
- * Expands the launcher's own attachment root definitions, so the test measures
- * where the bytes actually land rather than how the assignment is spelled.
+ * Expands the configured attachment root definition, so this test covers the
+ * default and override selection without provisioning a real user-state path.
  */
 function attachmentRootFor(launcher, environment) {
-  const start = launcher.indexOf('readonly PERSISTENT_STATE_ROOT="');
+  const start = launcher.indexOf('readonly CONFIGURED_PERSISTENT_STATE_ROOT="');
   const end = launcher.indexOf(
     "\n",
-    launcher.indexOf('readonly MESSAGING_ATTACHMENT_DIR="'),
+    launcher.indexOf('\nPERSISTENT_STATE_ROOT="$(provision_persistent_state_root'),
   );
   assert.ok(start > 0 && end > start);
   const script = [
     'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
     launcher.slice(start, end),
-    'printf %s "$MESSAGING_ATTACHMENT_DIR"',
+    'printf %s "${CONFIGURED_PERSISTENT_STATE_ROOT}/messaging-attachments"',
   ].join("\n");
   return runBash(script, environment);
 }
@@ -481,7 +481,7 @@ test("the launcher never re-modes a state root it did not create", async () => {
   const launcher = await source("scripts/dev/real-stack");
   assert.match(
     launcher,
-    /^provision_persistent_state_root "\$\{PERSISTENT_STATE_ROOT\}"$/m,
+    /^PERSISTENT_STATE_ROOT="\$\(provision_persistent_state_root "\$\{CONFIGURED_PERSISTENT_STATE_ROOT\}"\)"$/m,
   );
 
   const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
@@ -608,6 +608,45 @@ test("a state root under a writable sticky ancestor is accepted", async () => {
 
     const accepted = await provisionStateRoot(launcher, root);
     assert.equal(accepted.code, 0);
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
+});
+
+test("a state root with a symlink ancestor passes its canonical path to the API", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    const realParent = join(scratch, "real-parent");
+    const linkedParent = join(scratch, "linked-parent");
+    const configuredRoot = join(linkedParent, "real-stack");
+    const canonicalRoot = join(realParent, "real-stack");
+    await mkdir(realParent, { mode: 0o700 });
+    await chmod(realParent, 0o700);
+    await symlink(realParent, linkedParent);
+
+    const provisioned = await provisionStateRoot(launcher, configuredRoot);
+    assert.equal(provisioned.code, 0);
+    assert.equal(provisioned.stdout, `${canonicalRoot}\n`);
+
+    // The launcher constructs the API root from the provisioner's returned
+    // real path, rather than from the configured spelling with its link.
+    assert.match(
+      launcher,
+      /PERSISTENT_STATE_ROOT="\$\(provision_persistent_state_root "\$\{CONFIGURED_PERSISTENT_STATE_ROOT\}"\)"/,
+    );
+    assert.match(
+      launcher,
+      /readonly MESSAGING_ATTACHMENT_DIR="\$\{PERSISTENT_STATE_ROOT\}\/messaging-attachments"/,
+    );
+    assert.match(
+      launcher,
+      /"SUMI_MESSAGING_ATTACHMENT_ROOT=\$\{MESSAGING_ATTACHMENT_DIR\}"/,
+    );
+    assert.equal(
+      `${provisioned.stdout.trim()}/messaging-attachments`,
+      `${canonicalRoot}/messaging-attachments`,
+    );
   } finally {
     await rm(scratch, { force: true, recursive: true });
   }
