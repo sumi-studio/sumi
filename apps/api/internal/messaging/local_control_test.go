@@ -277,6 +277,56 @@ func TestLocalControlRequiresAuthenticatedExactScope(t *testing.T) {
 	}
 }
 
+func TestLocalCreateThreadAcceptsAgentNonceAndReplaysIt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	request := map[string]any{
+		"parent_place_id": channel.PlaceID,
+		"name":            "agent 作成の枝",
+		"client_nonce":    "agent-create-thread-1",
+	}
+
+	status, body := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, request, authorization)
+	if status != http.StatusCreated {
+		t.Fatalf("agent local create = %d %v", status, body)
+	}
+	threadID, ok := body["thread_id"].(string)
+	if !ok || threadID == "" {
+		t.Fatalf("agent local create omitted thread_id: %v", body)
+	}
+
+	status, replay := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, request, authorization)
+	if status != http.StatusOK || replay["thread_id"] != threadID {
+		t.Fatalf("agent local create replay = %d %v, want %q", status, replay, threadID)
+	}
+	if _, err := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent).ThreadFor(ctx, threadID); err != nil {
+		t.Fatalf("agent-created thread is not visible to its creator: %v", err)
+	}
+}
+
+func TestLocalCreateThreadRejectsNULName(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+
+	status, body := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, map[string]any{
+		"workspace_id":    workspace.WorkspaceID,
+		"parent_place_id": channel.PlaceID,
+		"name":            "bad\x00thread",
+		"client_nonce":    "thread-nul-local",
+	}, authorization)
+	if status != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("local NUL thread name = %d %v, want 400 invalid_request", status, body)
+	}
+}
+
 func TestLocalExactCallStateReconcilesAfterRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

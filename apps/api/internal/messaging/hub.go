@@ -22,6 +22,7 @@ type Event struct {
 	Actor    *participantWire    `json:"actor,omitempty"`
 	Channel  *channelWire        `json:"channel,omitempty"`
 	DM       *dmWire             `json:"dm,omitempty"`
+	Thread   *threadWire         `json:"thread,omitempty"`
 	Status   *statusWire         `json:"status,omitempty"`
 	Marker   *replyLaterWire     `json:"marker,omitempty"`
 	Call     *callStateWire      `json:"call,omitempty"`
@@ -94,6 +95,15 @@ type subscriber struct {
 	done    chan struct{}
 	mu      sync.Mutex
 	visible map[string]bool
+	// openPlaceID is the one place this connection currently has open. It is a
+	// delivery filter, never an authorization: it can only widen delivery to a
+	// participant the event's fenced audience already listed as a watcher.
+	openPlaceID string
+	// deferred holds the handshake cursors for places this connection may read
+	// but does not hold. They are not replayed at hello — that would make a
+	// thread the viewer merely visited ambient again — and are flushed only if
+	// this connection declares that place open.
+	deferred map[string]int64
 }
 
 // markVisible records a known visibility verdict.
@@ -108,6 +118,60 @@ func (s *subscriber) visibility(placeID string) (bool, bool) {
 	defer s.mu.Unlock()
 	ok, known := s.visible[placeID]
 	return ok, known
+}
+
+// openPlace declares the one place this connection is looking at. A screen
+// shows one place, so a later declaration replaces the earlier one and no
+// client can accumulate watched places.
+func (s *subscriber) openPlace(placeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.openPlaceID = placeID
+}
+
+// closePlace clears the declaration only when it still names the same place,
+// so a close for the screen the viewer already left cannot cancel the one
+// they moved to.
+func (s *subscriber) closePlace(placeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.openPlaceID == placeID {
+		s.openPlaceID = ""
+	}
+}
+
+// deferCursor remembers a handshake cursor that was not replayed. The map is
+// bounded by maxHelloCursors because it can only ever hold cursors the
+// handshake already carried.
+func (s *subscriber) deferCursor(placeID string, since int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deferred == nil {
+		s.deferred = map[string]int64{}
+	}
+	s.deferred[placeID] = since
+}
+
+// takeDeferredCursor consumes the cursor for one place. It is one-shot: a
+// later close drops the client's own cursor for a place it does not hold, so
+// re-opening in the same connection must not replay the same stretch again.
+func (s *subscriber) takeDeferredCursor(placeID string) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	since, ok := s.deferred[placeID]
+	if ok {
+		delete(s.deferred, placeID)
+	}
+	return since, ok
+}
+
+func (s *subscriber) watching(placeID string) bool {
+	if placeID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openPlaceID == placeID
 }
 
 // Hub fans messaging events out to live subscribers. REST mutations and WS
@@ -132,7 +196,7 @@ type hubAuthorizer interface {
 		Scope,
 		liveBoundary,
 		bool,
-		func(map[ParticipantRef]struct{}) error,
+		func(liveAudience) error,
 	) error
 }
 
@@ -285,7 +349,7 @@ func (h *Hub) publishVariants(
 		}
 	}
 
-	fanout := func(authorized map[ParticipantRef]struct{}) error {
+	fanout := func(authorized liveAudience) error {
 		h.mu.Lock()
 		subs := make([]*subscriber, 0, len(h.subscribers))
 		for sub := range h.subscribers {
@@ -310,7 +374,7 @@ func (h *Hub) publishVariants(
 			if h.authorizer == nil {
 				visible, _ = sub.visibility(boundary.key())
 			} else {
-				_, visible = authorized[sub.viewer]
+				visible = authorized.admits(sub.viewer, sub.watching(boundary.placeID))
 			}
 			sub.markVisible(boundary.key(), visible)
 			if !visible {
@@ -344,7 +408,7 @@ func (h *Hub) publishVariants(
 	if h.authorizer != nil {
 		return h.authorizer.withLiveAudience(ctx, scope, boundary, requireActor, fanout)
 	}
-	return fanout(nil)
+	return fanout(liveAudience{})
 }
 
 func eventScope(event Event) (liveBoundary, bool) {

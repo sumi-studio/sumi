@@ -15,6 +15,7 @@ import { Route as WWorkspaceIdRouteImport } from './routes/w.$workspaceId'
 import { Route as WWorkspaceIdIndexRouteImport } from './routes/w.$workspaceId.index'
 import { Route as WWorkspaceIdMessagingRouteImport } from './routes/w.$workspaceId.messaging'
 import { Route as WWorkspaceIdMessagingIndexRouteImport } from './routes/w.$workspaceId.messaging.index'
+import { Route as WWorkspaceIdMessagingTThreadIdRouteImport } from './routes/w.$workspaceId.messaging.t.$threadId'
 import { Route as WWorkspaceIdMessagingGroupDmIdRouteImport } from './routes/w.$workspaceId.messaging.group.$dmId'
 import { Route as WWorkspaceIdMessagingDmDmIdRouteImport } from './routes/w.$workspaceId.messaging.dm.$dmId'
 import { Route as WWorkspaceIdMessagingCChannelIdRouteImport } from './routes/w.$workspaceId.messaging.c.$channelId'
@@ -50,6 +51,12 @@ const WWorkspaceIdMessagingIndexRoute =
     path: '/',
     getParentRoute: () => WWorkspaceIdMessagingRoute,
   } as any)
+const WWorkspaceIdMessagingTThreadIdRoute =
+  WWorkspaceIdMessagingTThreadIdRouteImport.update({
+    id: '/t/$threadId',
+    path: '/t/$threadId',
+    getParentRoute: () => WWorkspaceIdMessagingRoute,
+  } as any)
 const WWorkspaceIdMessagingGroupDmIdRoute =
   WWorkspaceIdMessagingGroupDmIdRouteImport.update({
     id: '/group/$dmId',
@@ -79,6 +86,7 @@ export interface FileRoutesByFullPath {
   '/w/$workspaceId/messaging/c/$channelId': typeof WWorkspaceIdMessagingCChannelIdRoute
   '/w/$workspaceId/messaging/dm/$dmId': typeof WWorkspaceIdMessagingDmDmIdRoute
   '/w/$workspaceId/messaging/group/$dmId': typeof WWorkspaceIdMessagingGroupDmIdRoute
+  '/w/$workspaceId/messaging/t/$threadId': typeof WWorkspaceIdMessagingTThreadIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -88,6 +96,7 @@ export interface FileRoutesByTo {
   '/w/$workspaceId/messaging/c/$channelId': typeof WWorkspaceIdMessagingCChannelIdRoute
   '/w/$workspaceId/messaging/dm/$dmId': typeof WWorkspaceIdMessagingDmDmIdRoute
   '/w/$workspaceId/messaging/group/$dmId': typeof WWorkspaceIdMessagingGroupDmIdRoute
+  '/w/$workspaceId/messaging/t/$threadId': typeof WWorkspaceIdMessagingTThreadIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -100,6 +109,7 @@ export interface FileRoutesById {
   '/w/$workspaceId/messaging/c/$channelId': typeof WWorkspaceIdMessagingCChannelIdRoute
   '/w/$workspaceId/messaging/dm/$dmId': typeof WWorkspaceIdMessagingDmDmIdRoute
   '/w/$workspaceId/messaging/group/$dmId': typeof WWorkspaceIdMessagingGroupDmIdRoute
+  '/w/$workspaceId/messaging/t/$threadId': typeof WWorkspaceIdMessagingTThreadIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -113,6 +123,7 @@ export interface FileRouteTypes {
     | '/w/$workspaceId/messaging/c/$channelId'
     | '/w/$workspaceId/messaging/dm/$dmId'
     | '/w/$workspaceId/messaging/group/$dmId'
+    | '/w/$workspaceId/messaging/t/$threadId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -122,6 +133,7 @@ export interface FileRouteTypes {
     | '/w/$workspaceId/messaging/c/$channelId'
     | '/w/$workspaceId/messaging/dm/$dmId'
     | '/w/$workspaceId/messaging/group/$dmId'
+    | '/w/$workspaceId/messaging/t/$threadId'
   id:
     | '__root__'
     | '/'
@@ -133,6 +145,7 @@ export interface FileRouteTypes {
     | '/w/$workspaceId/messaging/c/$channelId'
     | '/w/$workspaceId/messaging/dm/$dmId'
     | '/w/$workspaceId/messaging/group/$dmId'
+    | '/w/$workspaceId/messaging/t/$threadId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -185,6 +198,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WWorkspaceIdMessagingIndexRouteImport
       parentRoute: typeof WWorkspaceIdMessagingRoute
     }
+    '/w/$workspaceId/messaging/t/$threadId': {
+      id: '/w/$workspaceId/messaging/t/$threadId'
+      path: '/t/$threadId'
+      fullPath: '/w/$workspaceId/messaging/t/$threadId'
+      preLoaderRoute: typeof WWorkspaceIdMessagingTThreadIdRouteImport
+      parentRoute: typeof WWorkspaceIdMessagingRoute
+    }
     '/w/$workspaceId/messaging/group/$dmId': {
       id: '/w/$workspaceId/messaging/group/$dmId'
       path: '/group/$dmId'
@@ -214,6 +234,7 @@ interface WWorkspaceIdMessagingRouteChildren {
   WWorkspaceIdMessagingCChannelIdRoute: typeof WWorkspaceIdMessagingCChannelIdRoute
   WWorkspaceIdMessagingDmDmIdRoute: typeof WWorkspaceIdMessagingDmDmIdRoute
   WWorkspaceIdMessagingGroupDmIdRoute: typeof WWorkspaceIdMessagingGroupDmIdRoute
+  WWorkspaceIdMessagingTThreadIdRoute: typeof WWorkspaceIdMessagingTThreadIdRoute
 }
 
 const WWorkspaceIdMessagingRouteChildren: WWorkspaceIdMessagingRouteChildren = {
@@ -221,6 +242,7 @@ const WWorkspaceIdMessagingRouteChildren: WWorkspaceIdMessagingRouteChildren = {
   WWorkspaceIdMessagingCChannelIdRoute: WWorkspaceIdMessagingCChannelIdRoute,
   WWorkspaceIdMessagingDmDmIdRoute: WWorkspaceIdMessagingDmDmIdRoute,
   WWorkspaceIdMessagingGroupDmIdRoute: WWorkspaceIdMessagingGroupDmIdRoute,
+  WWorkspaceIdMessagingTThreadIdRoute: WWorkspaceIdMessagingTThreadIdRoute,
 }
 
 const WWorkspaceIdMessagingRouteWithChildren =

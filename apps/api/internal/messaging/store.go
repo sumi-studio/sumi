@@ -20,6 +20,7 @@ const (
 	PlaceChannel = "channel"
 	PlaceDM      = "dm"
 	PlaceGroupDM = "group_dm"
+	PlaceThread  = "thread"
 )
 
 // Sentinel errors. The transport layer maps these to status codes; the store

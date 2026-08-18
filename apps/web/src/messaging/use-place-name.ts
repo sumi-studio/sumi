@@ -3,7 +3,7 @@ import { participantKey } from "./model";
 import { useMessaging } from "./store";
 
 export interface PlaceDisplay {
-  kind: "channel" | "dm" | "group_dm";
+  kind: "channel" | "dm" | "group_dm" | "thread";
   name: string;
   topic: string;
 }
@@ -12,6 +12,7 @@ export interface PlaceDisplay {
 export function usePlaceDisplay(key: PlaceKey | null): PlaceDisplay | null {
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
+  const threadsById = useMessaging((state) => state.threadsById);
   const membersByKey = useMessaging((state) => state.membersByKey);
   const selfKey = useMessaging((state) => state.selfKey);
   if (!key) return null;
@@ -20,6 +21,10 @@ export function usePlaceDisplay(key: PlaceKey | null): PlaceDisplay | null {
   );
   if (channel) {
     return { kind: "channel", name: channel.name, topic: channel.topic };
+  }
+  if (key.startsWith("thread:")) {
+    const thread = threadsById[key.slice("thread:".length)];
+    if (thread) return { kind: "thread", name: thread.name, topic: "" };
   }
   const dm = dms.find((entry) => `${entry.kind}:${entry.dmId}` === key);
   if (dm) {

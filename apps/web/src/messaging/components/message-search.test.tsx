@@ -9,7 +9,7 @@ import {
   screen,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MessageSearchResult } from "../model";
+import type { MessageSearchResult, ThreadSummary } from "../model";
 import { MessageSearch } from "./message-search";
 
 const mocks = vi.hoisted(() => ({ searchMessages: vi.fn() }));
@@ -25,6 +25,7 @@ const state = {
     },
   ],
   dms: [],
+  threadsById: {} as Record<string, ThreadSummary>,
   membersByKey: {
     "human:author-1": {
       participant: { kind: "human" as const, humanId: "author-1" },
@@ -61,6 +62,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.resetAllMocks();
+  state.threadsById = {};
 });
 
 describe("MessageSearch", () => {
@@ -96,6 +98,38 @@ describe("MessageSearch", () => {
     fireEvent.compositionEnd(input, { currentTarget: { value: "予定" } });
     await advance(300);
     expect(mocks.searchMessages).toHaveBeenCalledWith("予定");
+  });
+
+  it("labels a thread result with its thread name", async () => {
+    mocks.searchMessages.mockResolvedValueOnce([
+      {
+        ...result(),
+        place: { kind: "thread", threadId: "thread-1" },
+      },
+    ]);
+    state.threadsById = {
+      "thread-1": {
+        threadId: "thread-1",
+        parentPlace: { kind: "channel", channelId: "channel-1" },
+        parentMessageId: null,
+        workspaceId: "workspace-1",
+        name: "認証リダイレクト",
+        messageCount: 1,
+        lastMessageAt: null,
+        lastMessage: "",
+        participants: [],
+        latestSeq: 1,
+      },
+    };
+    render(<MessageSearch onJump={vi.fn()} />);
+
+    fireEvent.change(screen.getByPlaceholderText("検索"), {
+      target: { value: "予定" },
+    });
+    await advance(300);
+
+    expect(screen.getByRole("button", { name: /認証リダイレクト/ })).toBeInTheDocument();
+    expect(screen.queryByText("DM")).not.toBeInTheDocument();
   });
 
   it("closes on Escape and an outside pointer", async () => {

@@ -238,38 +238,71 @@ func admitPlaceTenure(ctx context.Context, tx pgx.Tx, placeID string, membership
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("load active place tenure: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		INSERT INTO place_members
 			(place_member_id, workspace_id, place_id, workspace_member_id,
 			 member_kind, member_id, visible_from_seq)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (place_id, member_kind, member_id) WHERE left_at IS NULL
+		DO NOTHING`,
 		newUUIDv7(), membership.WorkspaceID, placeID, membership.WorkspaceMemberID,
-		membership.Participant.Kind, membership.Participant.ID, visibleFrom); err != nil {
+		membership.Participant.Kind, membership.Participant.ID, visibleFrom)
+	if err != nil {
 		return fmt.Errorf("admit place tenure: %w", err)
+	}
+	if result.RowsAffected() == 1 {
+		return nil
+	}
+	// A concurrent admission won the partial unique index. Read its exact
+	// Workspace tenure before treating this attempt as idempotent: a stale
+	// active tenure must remain an authority error, not a successful join.
+	err = tx.QueryRow(ctx, `
+		SELECT workspace_member_id FROM place_members
+		WHERE place_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
+		placeID, membership.Participant.Kind, membership.Participant.ID).Scan(&currentWorkspaceMemberID)
+	if err != nil {
+		return fmt.Errorf("reload active place tenure after conflict: %w", err)
+	}
+	if currentWorkspaceMemberID != membership.WorkspaceMemberID {
+		return errors.New("active place tenure is bound to a stale Workspace tenure")
 	}
 	return nil
 }
 
 func (s *ScopedStore) PlaceFor(ctx context.Context, placeID string) (Place, error) {
+	place, _, err := s.PlaceParticipationFor(ctx, placeID)
+	return place, err
+}
+
+// PlaceParticipationFor answers two different questions in one read: may this
+// viewer see the place at all, and do they hold it. For a channel or a thread
+// those answers differ — a Workspace member may open a thread they never
+// joined — and everything that decides whether a place belongs in this
+// viewer's own ledger (rather than merely being readable) needs the second
+// answer, not the first.
+func (s *ScopedStore) PlaceParticipationFor(ctx context.Context, placeID string) (Place, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Place{}, fmt.Errorf("begin scoped place read: %w", err)
+		return Place{}, false, fmt.Errorf("begin scoped place read: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := s.authorizeInTx(ctx, tx); err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
 	if err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
-	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
-		return Place{}, err
+	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
+	if err != nil {
+		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Place{}, fmt.Errorf("commit scoped place read: %w", err)
+		return Place{}, false, fmt.Errorf("commit scoped place read: %w", err)
 	}
-	return place, nil
+	// A private place is unreadable without a tenure, so reaching here already
+	// proves participation; a channel or thread reports it explicitly.
+	return place, access.PlaceMemberID != "", nil
 }
 
 func (s *ScopedStore) loadScopedPlace(ctx context.Context, q querier, placeID string) (Place, error) {
@@ -314,7 +347,7 @@ func (s *ScopedStore) loadScopedPlaceWithClause(
 
 func (s *ScopedStore) placeAccessAfterAuthorization(ctx context.Context, q querier, place Place, actor ParticipantRef) (PlaceAccess, error) {
 	var access PlaceAccess
-	if place.Kind == PlaceChannel {
+	if place.Kind == PlaceChannel || place.Kind == PlaceThread {
 		err := q.QueryRow(ctx, `
 			SELECT wm.workspace_member_id,
 			       COALESCE(pm.place_member_id::text, ''), COALESCE(pm.visible_from_seq, 1)
@@ -386,9 +419,10 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 	condition := `pm.workspace_id = $1 AND pm.place_id = $2
 		AND pm.left_at IS NULL AND wm.left_at IS NULL`
 	args := []any{s.Scope.WorkspaceID, place.PlaceID}
-	if place.Kind == PlaceChannel {
-		// A channel admits every Workspace member; the place-scoped join above
-		// still needs its place argument, so both branches pass the same args.
+	if place.Kind == PlaceChannel || place.Kind == PlaceThread {
+		// A channel and a thread under one both admit every Workspace member;
+		// the place-scoped join above still needs its place argument, so both
+		// branches pass the same args.
 		condition = `wm.workspace_id = $1 AND wm.left_at IS NULL`
 	}
 	rows, err := q.Query(ctx, `

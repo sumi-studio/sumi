@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
-import type { ChannelSummary, DmSummary } from "./model";
+import type { ChannelSummary, DmSummary, ThreadSummary } from "./model";
 import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
@@ -227,6 +227,57 @@ describe("messaging session boundary", () => {
       "Messaging session changed during channel creation",
     );
     expect(useMessaging.getState().workspaces).toEqual([]);
+    expect(useMessaging.getState().channels).toEqual([]);
+  });
+
+  it("rejects a deferred thread result after the messaging identity changes", async () => {
+    bindMessagingSessionIdentity("human-a");
+    const server = new MockMessagingServer();
+    let resolveThread!: (thread: ThreadSummary) => void;
+    const deferredThread = new Promise<ThreadSummary>((resolve) => {
+      resolveThread = resolve;
+    });
+    vi.spyOn(server, "createThread").mockReturnValue(deferredThread);
+    installMessagingBackend(server);
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "human-a" },
+      selfKey: "human:human-a",
+      channels: [
+        {
+          channelId: "channel-a",
+          workspaceId: "workspace-a",
+          name: "private-a",
+          topic: "",
+          visibility: "private",
+          voice: false,
+        },
+      ],
+      threadsById: {},
+    });
+
+    const operation = useMessaging
+      .getState()
+      .createThread("channel:channel-a", "stale thread", null, "nonce-a");
+    bindMessagingSessionIdentity(null);
+    bindMessagingSessionIdentity("human-b");
+    resolveThread({
+      threadId: "stale-thread",
+      workspaceId: "workspace-a",
+      parentPlace: { kind: "channel", channelId: "channel-a" },
+      parentMessageId: null,
+      name: "stale thread",
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [{ kind: "human", humanId: "human-a" }],
+      latestSeq: 0,
+    });
+
+    await expect(operation).rejects.toThrow(
+      "Messaging session changed during thread creation",
+    );
+    expect(useMessaging.getState().threadsById).toEqual({});
     expect(useMessaging.getState().channels).toEqual([]);
   });
 });

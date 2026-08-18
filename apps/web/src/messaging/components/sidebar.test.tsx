@@ -185,6 +185,33 @@ describe("Sidebar route authority", () => {
     ).toBeVisible();
   });
 
+  it("resolves a thread route to its parent Workspace", () => {
+    setTwoWorkspaceState(vi.fn(async (): Promise<PlaceKey> => "channel:new"));
+    useMessaging.setState({
+      threadsById: {
+        "thread-a": {
+          threadId: "thread-a",
+          workspaceId: "workspace-a",
+          parentPlace: { kind: "channel", channelId: "channel-a" },
+          parentMessageId: "message-a",
+          name: "認証リダイレクト",
+          messageCount: 1,
+          lastMessageAt: 1,
+          lastMessage: "確認してください",
+          participants: [SELF],
+          latestSeq: 1,
+        },
+      },
+    });
+
+    render(
+      <Sidebar selectedPlaceKey="thread:thread-a" workspaceId="workspace-a" />,
+    );
+
+    expect(screen.getByText("Workspace A")).toBeVisible();
+    expect(screen.getByTitle("チャンネルを作成")).toBeVisible();
+  });
+
   it("creates the first channel from the exact bound Workspace", async () => {
     const createChannel = vi.fn(
       async (): Promise<PlaceKey> => "channel:first-b",

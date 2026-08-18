@@ -10,19 +10,40 @@ import type {
   Place,
   PlaceKey,
   ServerEvent,
+  ThreadSummary,
 } from "./model";
 import { resetNotificationAudio } from "./notifications";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
+  notifiableUnreadCount,
   notificationLevelFor,
   useMessaging,
 } from "./store";
 
 const SELF = { kind: "human", humanId: "human-1" } as const;
 const OTHER = { kind: "human", humanId: "human-2" } as const;
-const CHANNEL: Place = { kind: "channel", channelId: "channel-1" };
+const PARENT_CHANNEL = { kind: "channel", channelId: "channel-1" } as const;
+const CHANNEL: Place = PARENT_CHANNEL;
 const CHANNEL_KEY: PlaceKey = "channel:channel-1";
+
+function threadIn(
+  threadId: string,
+  participants: ThreadSummary["participants"],
+): ThreadSummary {
+  return {
+    threadId,
+    workspaceId: "ws",
+    parentPlace: PARENT_CHANNEL,
+    parentMessageId: "message-0",
+    name: threadId,
+    messageCount: 1,
+    lastMessageAt: 1,
+    lastMessage: "",
+    participants,
+    latestSeq: 1,
+  };
+}
 
 /** MessagingBackendの最小実装。設定の送信と、event配送だけを見る。 */
 class StubBackend implements MessagingBackend {
@@ -439,6 +460,55 @@ describe("presenting an incoming message", () => {
     expect(FakeNotification.constructed[0]?.options.body).toBe(
       "デプロイの件です",
     );
+  });
+
+  it("names the thread in a called thread notification", () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const thread: ThreadSummary = {
+      threadId: "thread-1",
+      workspaceId: "ws",
+      parentPlace: CHANNEL,
+      parentMessageId: "message-0",
+      name: "設計レビュー",
+      messageCount: 1,
+      lastMessageAt: 1,
+      lastMessage: "",
+      participants: [SELF, OTHER],
+      latestSeq: 1,
+    };
+    useMessaging.setState({ threadsById: { [thread.threadId]: thread } });
+
+    backend.emit({
+      type: "message_created",
+      message: incoming({
+        place: { kind: "thread", threadId: thread.threadId },
+      }),
+      notify: { reason: "mention" },
+    });
+
+    expect(FakeNotification.constructed[0]?.title).toBe("設計レビュー — Kuro");
+  });
+
+  it("タブの件数は自分の台帳にあるplaceだけを数える", () => {
+    // URLで開いただけのthreadはsidebarにもbootstrapのthreadsにも出ない。
+    // その未読をタイトルへ足すと、どのバッジにも無い数字だけが増える。
+    useMessaging.setState({
+      threadsById: {
+        "thread-joined": threadIn("thread-joined", [SELF, OTHER]),
+        "thread-visiting": threadIn("thread-visiting", [OTHER]),
+      },
+      unreadCountByPlace: {
+        [CHANNEL_KEY]: 2,
+        "thread:thread-joined": 3,
+        "thread:thread-visiting": 40,
+        "thread:thread-not-hydrated": 7,
+      },
+      mentionCountByPlace: {},
+      notificationDefaultLevel: "all",
+      notificationLevelByPlace: {},
+    });
+
+    expect(notifiableUnreadCount(useMessaging.getState())).toBe(5);
   });
 
   it("stays quiet when the server did not call this person", () => {

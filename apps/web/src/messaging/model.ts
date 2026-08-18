@@ -30,12 +30,14 @@ export function sameParticipant(a: ParticipantRef, b: ParticipantRef): boolean {
 export type Place =
   | { kind: "channel"; channelId: string }
   | { kind: "dm"; dmId: string }
-  | { kind: "group_dm"; dmId: string };
+  | { kind: "group_dm"; dmId: string }
+  | { kind: "thread"; threadId: string };
 
 /** Stable map key for a place: `channel:<id>` / `dm:<id>` / `group_dm:<id>`. */
 export type PlaceKey = string;
 
 export function placeKey(place: Place): PlaceKey {
+  if (place.kind === "thread") return `thread:${place.threadId}`;
   return place.kind === "channel"
     ? `channel:${place.channelId}`
     : `${place.kind}:${place.dmId}`;
@@ -49,6 +51,7 @@ export function parsePlaceKey(key: PlaceKey): Place | null {
   if (!id) return null;
   if (kind === "channel") return { kind, channelId: id };
   if (kind === "dm" || kind === "group_dm") return { kind, dmId: id };
+  if (kind === "thread") return { kind, threadId: id };
   return null;
 }
 
@@ -151,6 +154,19 @@ export interface DmSummary {
   dmId: string;
   kind: "dm" | "group_dm";
   participants: ParticipantRef[];
+}
+
+export interface ThreadSummary {
+  threadId: string;
+  parentPlace: Extract<Place, { kind: "channel" }>;
+  parentMessageId: string | null;
+  workspaceId: string;
+  name: string;
+  messageCount: number;
+  lastMessageAt: number | null;
+  lastMessage: string;
+  participants: ParticipantRef[];
+  latestSeq: number;
 }
 
 /**
@@ -266,7 +282,12 @@ export type ServerEvent =
    */
   | { type: "caught_up"; place: Place }
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
-  | { type: "place_created"; channel?: ChannelSummary; dm?: DmSummary }
+  | {
+      type: "place_created";
+      channel?: ChannelSummary;
+      dm?: DmSummary;
+      thread?: ThreadSummary;
+    }
   /** channelのmutable属性（v0: topic）の変更。 */
   | { type: "place_updated"; channel: ChannelSummary }
   /** Volatile presence: reconnect repairs it through GET /messaging/calls. */
@@ -314,6 +335,7 @@ export interface MessagingCapabilities {
   replyLater: boolean;
   reactions: boolean;
   notifications: boolean;
+  threads?: boolean;
 }
 
 /**
@@ -329,6 +351,7 @@ export interface MessagingBackend {
     workspaces: WorkspaceSummary[];
     channels: ChannelSummary[];
     dms: DmSummary[];
+    threads?: ThreadSummary[];
     members: MemberProfile[];
     statuses: ParticipantStatus[];
     readMarkers: ReadMarker[];
@@ -357,6 +380,14 @@ export interface MessagingBackend {
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
   createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
   updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
+  fetchThread?(threadId: string): Promise<ThreadSummary>;
+  fetchThreads?(parent: Place): Promise<ThreadSummary[]>;
+  createThread?(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+    clientNonce: string,
+  ): Promise<ThreadSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /** メッセージより先にbytesを預ける。受領したIDをsendMessageのattachmentsへ。 */
   uploadAttachment(
@@ -406,6 +437,14 @@ export interface MessagingBackend {
   ): Promise<NotificationSetting>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
+  /**
+   * いま画面に開いているplaceをserverへ宣言する。参加していないthreadをURLで
+   * 開いた閲覧者は、開いている間だけそのplaceのlive eventを受け取る。参加して
+   * いるplaceの配送はこの宣言に依存しない（開いていなくても届く）。
+   * sinceSeqはその画面をどこまで見ているか——切断を跨いで開いたままのときに、
+   * その先だけをreplayさせるためのcursorである。閉じれば一緒に捨てられる。
+   */
+  openPlace?(place: Place | null, sinceSeq?: number): void;
   /**
    * durable eventの購読。再接続時はplaceごとの消費済みseqをcursorとして渡し、
    * その次からcatch-upする（volatile eventはreplayしない）。

@@ -24,6 +24,7 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
   UploadAttachmentInput,
   UploadAttachmentReceipt,
@@ -59,6 +60,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -66,6 +68,9 @@ export class ApiMessagingBackend implements MessagingBackend {
   >();
   private readonly cursors = new Map<string, number>();
   private readonly places = new Map<string, Place>();
+  /** cursorをdurableに持つplace——自分の台帳にあるもの。 */
+  private readonly followed = new Set<string>();
+  private openPlaceID: string | null = null;
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private reconnectDelay = 250;
@@ -99,6 +104,9 @@ export class ApiMessagingBackend implements MessagingBackend {
     const dms: DmSummary[] = asArray(body.dms).map((entry) =>
       this.registerDm(entry),
     );
+    const threads: ThreadSummary[] = asArray(body.threads ?? []).map((entry) =>
+      this.registerThread(entry),
+    );
     const members: MemberProfile[] = asArray(body.members).map((entry) => {
       const value = asRecord(entry);
       return {
@@ -119,14 +127,19 @@ export class ApiMessagingBackend implements MessagingBackend {
     const unreadSummaries: UnreadSummary[] = asArray(body.unread_summaries).map(
       (entry) => {
         const value = asRecord(entry);
+        const place = parsePlace(value.place);
+        // 未読summaryは自分の台帳にあるplaceだけを運ぶ。cursorはsubscribeが
+        // sinceByPlaceで登録するので、ここではeventのrouting先として覚える。
+        this.registerPlace(place);
         return {
-          place: parsePlace(value.place),
+          place,
           latestSeq: asSeq(value.latest_seq),
           unreadCount: asSeq(value.unread_count),
           mentionCount: asSeq(value.mention_count),
         };
       },
     );
+    this.adoptThreadLedger(unreadSummaries);
     // status_updated は replay されないvolatile eventなので、現在値はここでしか
     // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
     const presence = parsePresence(body);
@@ -135,6 +148,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       workspaces,
       channels,
       dms,
+      threads,
       members,
       statuses: presence.statuses,
       readMarkers,
@@ -220,6 +234,42 @@ export class ApiMessagingBackend implements MessagingBackend {
       { method: "PATCH", body: { topic } },
     );
     return this.registerChannel(body);
+  }
+
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      ),
+    );
+    return asArray(body.threads).map((entry) => this.registerThread(entry));
+  }
+
+  async fetchThread(threadId: string): Promise<ThreadSummary> {
+    const body = asRecord(
+      await this.request(`/messaging/places/${encodeURIComponent(threadId)}`),
+    );
+    return this.registerThread(body.thread);
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+    clientNonce: string,
+  ): Promise<ThreadSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      {
+        method: "POST",
+        body: {
+          name,
+          parent_message_id: originMessageId ?? "",
+          client_nonce: clientNonce,
+        },
+      },
+    );
+    return this.registerThread(body);
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -411,6 +461,29 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  /**
+   * 開いている画面をserverへ宣言する。参加していないthreadに届くliveはこの
+   * 宣言の間だけで、閉じれば止まる。参加しているplaceの配送は宣言に依存しない。
+   *
+   * cursorも同じ線で持つ: 開いている間だけの購読なので、閉じたらそのthreadの
+   * cursorは畳む。残したままにすると、次のhelloがそれを運び、開いてもいない
+   * 背景threadのeventが（未読と通知の効果ごと）replayされてしまう。sinceSeqは
+   * その画面をどこまで見ているかで、台帳の持ち主（store）から渡される。
+   */
+  openPlace(place: Place | null, sinceSeq = 0): void {
+    const previous = this.openPlaceID;
+    const next = place ? placeID(place) : null;
+    if (place && next) {
+      this.registerPlace(place);
+      if (!this.cursors.has(next)) this.cursors.set(next, sinceSeq);
+    }
+    this.openPlaceID = next;
+    if (previous !== null && previous !== next && this.watchOnly(previous)) {
+      this.cursors.delete(previous);
+    }
+    this.declareOpenPlace(previous);
+  }
+
   subscribe(
     listener: (event: ServerEvent) => void,
     options: { sinceByPlace?: Record<PlaceKey, number> } = {},
@@ -418,7 +491,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     this.listeners.add(listener);
     for (const [key, seq] of Object.entries(options.sinceByPlace ?? {})) {
       const place = parsePlaceKey(key);
-      if (place) this.cursors.set(placeID(place), seq);
+      if (!place) continue;
+      // storeが渡すcursorは自分の台帳そのものなので、followとして扱う。
+      this.followed.add(placeID(place));
+      this.places.set(placeID(place), place);
+      this.cursors.set(placeID(place), seq);
     }
     this.stopped = false;
     this.connect();
@@ -468,6 +545,9 @@ export class ApiMessagingBackend implements MessagingBackend {
           cursors: Object.fromEntries(this.cursors),
         }),
       );
+      // 新しいsocketは何も開いていない状態から始まる。画面はそのままなので、
+      // 開いているplaceは接続のたびに宣言し直す。
+      this.declareOpenPlace(null);
     });
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
@@ -491,6 +571,20 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
   }
 
+  /** 現在の宣言をsocketへ流す。閉じたことも同じ経路で伝える。 */
+  private declareOpenPlace(previous: string | null): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    if (this.openPlaceID !== null) {
+      this.socket.send(
+        JSON.stringify({ type: "open", place_id: this.openPlaceID }),
+      );
+      return;
+    }
+    if (previous !== null) {
+      this.socket.send(JSON.stringify({ type: "close", place_id: previous }));
+    }
+  }
+
   private handleFrame(frame: Record<string, unknown>): void {
     const type = asString(frame.type);
     if (type === "hello_ack") {
@@ -498,6 +592,8 @@ export class ApiMessagingBackend implements MessagingBackend {
       this.emitConnection("connected");
       return;
     }
+    // 開いた宣言が届いた確認。状態はこちらが正本なので受け取るだけでよい。
+    if (type === "open_ack") return;
     if (type === "caught_up") {
       // Catch-up replays only messages after the cursor, so reactions that
       // landed on already-read messages while the socket was down are not in
@@ -514,7 +610,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     let parsed: ServerEvent;
     if (eventType === "message_created") {
       const message = parseMessage(wire.message);
-      this.cursors.set(placeID(message.place), message.seq);
+      // A visible thread can have no bootstrap thread projection. Its first
+      // message still establishes the routing authority for later partial
+      // events, which may arrive before the store finishes hydrating it.
+      this.registerPlace(message.place);
+      this.advanceCursor(message.place, message.seq);
       // notifyが無いことは欠損ではなく「呼んでいない」という答え。
       parsed = { type: eventType, message, notify: parseNotify(wire.notify) };
     } else if (
@@ -522,7 +622,8 @@ export class ApiMessagingBackend implements MessagingBackend {
       eventType === "message_deleted"
     ) {
       const message = parseMessage(wire.message);
-      this.cursors.set(placeID(message.place), message.seq);
+      this.registerPlace(message.place);
+      this.advanceCursor(message.place, message.seq);
       parsed = { type: eventType, message };
     } else if (eventType === "reaction_updated") {
       // A reaction can target a message older than the replay cursor, so it
@@ -558,12 +659,14 @@ export class ApiMessagingBackend implements MessagingBackend {
       parsed = { type: "call_state", call: parseCallState(wire.call) };
     } else if (eventType === "place_created") {
       parsed =
-        wire.channel === undefined || wire.channel === null
-          ? { type: "place_created", dm: this.registerDm(wire.dm) }
-          : {
-              type: "place_created",
-              channel: this.registerChannel(wire.channel),
-            };
+        wire.thread != null
+          ? { type: "place_created", thread: this.registerThread(wire.thread) }
+          : wire.channel == null
+            ? { type: "place_created", dm: this.registerDm(wire.dm) }
+            : {
+                type: "place_created",
+                channel: this.registerChannel(wire.channel),
+              };
     } else if (eventType === "place_updated") {
       parsed = {
         type: "place_updated",
@@ -590,13 +693,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       visibility: asVisibility(wire.visibility),
       voice: asBoolean(wire.voice),
     };
-    if (!this.cursors.has(channel.channelId)) {
-      this.cursors.set(channel.channelId, 0);
-    }
-    this.places.set(channel.channelId, {
-      kind: "channel",
-      channelId: channel.channelId,
-    });
+    this.followPlace({ kind: "channel", channelId: channel.channelId });
     return channel;
   }
 
@@ -608,9 +705,99 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
-    if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
-    this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
+    this.followPlace({ kind: dm.kind, dmId: dm.dmId });
     return dm;
+  }
+
+  private registerThread(value: unknown): ThreadSummary {
+    const wire = asRecord(value);
+    const parent = parsePlace(wire.parent_place);
+    if (parent.kind !== "channel") throw new Error("invalid thread parent");
+    const thread: ThreadSummary = {
+      threadId: asString(wire.thread_id),
+      parentPlace: parent,
+      parentMessageId:
+        wire.parent_message_id == null
+          ? null
+          : asString(wire.parent_message_id),
+      workspaceId: asString(wire.workspace_id),
+      name: asString(wire.name),
+      messageCount: asSeq(wire.message_count),
+      lastMessageAt:
+        wire.last_message_at == null ? null : asTimestamp(wire.last_message_at),
+      lastMessage: asString(wire.last_message),
+      participants: asArray(wire.participants).map(parseParticipant),
+      latestSeq: asSeq(wire.latest_seq),
+    };
+    // A thread is remembered for routing but not followed: a Workspace can
+    // hold more threads than one handshake may carry, and the ones this viewer
+    // participates in arrive as bootstrap cursors instead.
+    this.registerPlace({ kind: "thread", threadId: thread.threadId });
+    return thread;
+  }
+
+  /** Remembers any place shape that can be named by a live event. */
+  private registerPlace(place: Place): void {
+    this.places.set(placeID(place), place);
+  }
+
+  /**
+   * Follows a place: its durable events replay from this cursor after a
+   * reconnect. Only the places this viewer's own ledger carries belong here.
+   * A Workspace's threads are unbounded and mostly other people's, so merely
+   * learning that one exists must not add a cursor: the handshake is refused
+   * outright past its cursor bound, and a bootstrap that rebuilds the same
+   * oversized ledger would keep it refused across reloads.
+   */
+  private followPlace(place: Place): void {
+    const id = placeID(place);
+    this.places.set(id, place);
+    this.followed.add(id);
+    if (!this.cursors.has(id)) this.cursors.set(id, 0);
+  }
+
+  /**
+   * 見えるだけで自分のものではないplaceか。threadだけがこの状態を持つ:
+   * channelとDMは在籍そのものが台帳で、開いていなくても自分の場所である。
+   */
+  private watchOnly(id: string): boolean {
+    return this.places.get(id)?.kind === "thread" && !this.followed.has(id);
+  }
+
+  /**
+   * bootstrapの未読summaryは「この閲覧者が持っている場所」の正本で、threadに
+   * ついては参加しているものだけを運ぶ。cursorを持つthreadをここで台帳へ
+   * 揃え直す——参加しているthreadと、いま開いているthreadだけが残る。
+   * 参加が終わったthreadのcursorが残り続けない、唯一の合流点でもある。
+   */
+  private adoptThreadLedger(summaries: UnreadSummary[]): void {
+    const participating = new Map<string, number>();
+    for (const summary of summaries) {
+      if (summary.place.kind !== "thread") continue;
+      participating.set(placeID(summary.place), summary.latestSeq);
+    }
+    for (const [id, latestSeq] of participating) {
+      this.followed.add(id);
+      // 新しく参加したthreadは、bootstrapが見た時点から先だけを追えばよい。
+      if (!this.cursors.has(id)) this.cursors.set(id, latestSeq);
+    }
+    for (const id of [...this.cursors.keys()]) {
+      if (this.places.get(id)?.kind !== "thread") continue;
+      if (participating.has(id)) continue;
+      this.followed.delete(id);
+      if (id !== this.openPlaceID) this.cursors.delete(id);
+    }
+  }
+
+  /**
+   * live eventが進めるのは、この接続が既に持っているcursorだけ。参加しても
+   * 開いてもいないthreadのeventでcursorを作ると、閉じたあとの再接続でまた
+   * それを運んでしまう。channelとDMは在籍が台帳なので今までどおり作る。
+   */
+  private advanceCursor(place: Place, seq: number): void {
+    const id = placeID(place);
+    if (place.kind === "thread" && !this.cursors.has(id)) return;
+    this.cursors.set(id, seq);
   }
 
   private stopSocket(): void {
@@ -663,6 +850,7 @@ export class ApiMessagingBackend implements MessagingBackend {
 }
 
 function placeID(place: Place): string {
+  if (place.kind === "thread") return place.threadId;
   return place.kind === "channel" ? place.channelId : place.dmId;
 }
 
@@ -676,6 +864,8 @@ function participantToWire(ref: ParticipantRef): Record<string, string> {
 }
 
 function placeToWire(place: Place): Record<string, string> {
+  if (place.kind === "thread")
+    return { kind: place.kind, thread_id: place.threadId };
   return place.kind === "channel"
     ? { kind: place.kind, channel_id: place.channelId }
     : { kind: place.kind, dm_id: place.dmId };
@@ -785,6 +975,7 @@ function parsePlace(value: unknown): Place {
   if (kind === "dm" || kind === "group_dm") {
     return { kind, dmId: asString(wire.dm_id) };
   }
+  if (kind === "thread") return { kind, threadId: asString(wire.thread_id) };
   throw new Error("invalid place");
 }
 

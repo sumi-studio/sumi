@@ -192,6 +192,114 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
+  it("routes a reaction for an unjoined thread immediately after its first message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({
+          ...bootstrap,
+          // threads is intentionally empty: bootstrap projects joined threads
+          // only, and this thread has no pre-existing unread summary either.
+          threads: [],
+        }),
+      ),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    socket?.message({
+      type: "event",
+      event: {
+        type: "message_created",
+        message: messageWire(
+          1,
+          "最初の返信",
+          [],
+          threadPlaceWire("thread-unjoined"),
+        ),
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "reaction_updated",
+        place_id: "thread-unjoined",
+        reaction: {
+          message_id: "message-1",
+          reactions: [
+            {
+              emoji: "👍",
+              participants: [{ kind: "human", human_id: "human-1" }],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(events).toMatchObject([
+      {
+        type: "message_created",
+        message: { place: { kind: "thread", threadId: "thread-unjoined" } },
+      },
+      {
+        type: "reaction_updated",
+        place: { kind: "thread", threadId: "thread-unjoined" },
+        messageId: "message-1",
+      },
+    ]);
+  });
+
+  it("routes a reaction for an unjoined thread named only by an unread summary", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({
+          ...bootstrap,
+          threads: [],
+          unread_summaries: [
+            ...bootstrap.unread_summaries,
+            {
+              place: threadPlaceWire("thread-summary-only"),
+              latest_seq: 1,
+              unread_count: 1,
+              mention_count: 0,
+            },
+          ],
+        }),
+      ),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    socket?.message({
+      type: "event",
+      event: {
+        type: "reaction_updated",
+        place_id: "thread-summary-only",
+        reaction: { message_id: "message-1", reactions: [] },
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        type: "reaction_updated",
+        place: { kind: "thread", threadId: "thread-summary-only" },
+        messageId: "message-1",
+        reactions: [],
+      },
+    ]);
+  });
+
   it("returns the canonical REST reaction result and projects WS updates", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -759,6 +867,163 @@ describe("ApiMessagingBackend", () => {
       { type: "message_created", notify: null },
     ]);
   });
+
+  it("keeps announced and listed threads out of the handshake", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/places/channel-1/threads") {
+          return json({
+            threads: [
+              threadSummaryWire("thread-listed-1"),
+              threadSummaryWire("thread-listed-2"),
+            ],
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    // 一覧で見えたthreadも、親channelへ告知されただけのthreadも、自分の
+    // 台帳ではない。cursorにすると次のhandshakeが上限で撥ねられる。
+    expect(await backend.fetchThreads(channel)).toHaveLength(2);
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "thread-announced",
+        thread: threadSummaryWire("thread-announced"),
+      },
+    });
+
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4 },
+    });
+  });
+
+  it("drops a visited thread's cursor when it is closed, and keeps a joined one", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrapWithJoinedThread())),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    // 参加していないthreadをURLで開く。開いている間は購読しているのでcursorも
+    // 持つが、それはこの画面の間だけのものである。
+    backend.openPlace({ kind: "thread", threadId: "thread-visiting" }, 3);
+    backend.openPlace(null);
+
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    // 閉じたthreadは載らない。参加しているthreadはbootstrapが運ぶ台帳なので載る。
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "thread-joined": 7 },
+    });
+  });
+
+  it("re-derives which threads hold a cursor from every bootstrap", async () => {
+    vi.useFakeTimers();
+    let bootstraps = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        bootstraps += 1;
+        // 2度目のbootstrapにはこのthreadが無い——参加が終わった、が唯一の
+        // 伝わり方である。cursorもそこで畳む。
+        return json(bootstraps === 1 ? bootstrapWithJoinedThread() : bootstrap);
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    expect(JSON.parse(socket?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "thread-joined": 7 },
+    });
+
+    await backend.bootstrap();
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4 },
+    });
+  });
+
+  it("declares the open place, re-declares it after reconnecting, and closes it", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    backend.openPlace({ kind: "thread", threadId: "thread-open" });
+    expect(JSON.parse(socket?.sent[1] ?? "{}")).toEqual({
+      type: "open",
+      place_id: "thread-open",
+    });
+    // 宣言の受領確認は状態を持たない。捨てられるだけで、eventにはならない。
+    socket?.message({ type: "open_ack", place_id: "thread-open" });
+    expect(events).toEqual([]);
+
+    // 新しいsocketは何も開いていない状態から始まる。画面はそのままなので、
+    // helloの直後に宣言し直す。開いている場所はreplay対象でもある。
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "thread-open": 0 },
+    });
+    expect(JSON.parse(reconnected?.sent[1] ?? "{}")).toEqual({
+      type: "open",
+      place_id: "thread-open",
+    });
+
+    backend.openPlace(null);
+    expect(JSON.parse(reconnected?.sent[2] ?? "{}")).toEqual({
+      type: "close",
+      place_id: "thread-open",
+    });
+  });
 });
 
 class FakeWebSocket extends EventTarget {
@@ -801,6 +1066,41 @@ function channelWire() {
   return { kind: "channel", channel_id: "channel-1" };
 }
 
+function threadPlaceWire(threadId: string) {
+  return { kind: "thread", thread_id: threadId };
+}
+
+function bootstrapWithJoinedThread() {
+  return {
+    ...bootstrap,
+    threads: [threadSummaryWire("thread-joined")],
+    unread_summaries: [
+      ...bootstrap.unread_summaries,
+      {
+        place: threadPlaceWire("thread-joined"),
+        latest_seq: 7,
+        unread_count: 2,
+        mention_count: 0,
+      },
+    ],
+  };
+}
+
+function threadSummaryWire(threadId: string) {
+  return {
+    thread_id: threadId,
+    parent_place: channelWire(),
+    parent_message_id: "message-1",
+    workspace_id: "workspace-1",
+    name: threadId,
+    message_count: 1,
+    last_message_at: "2026-08-01T11:00:00Z",
+    last_message: "返信",
+    participants: [{ kind: "human", human_id: "human-2" }],
+    latest_seq: 1,
+  };
+}
+
 function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
@@ -828,10 +1128,11 @@ function messageWire(
   seq: number,
   content: string,
   reactions: { emoji: string; participants: unknown[] }[] = [],
+  place: Record<string, string> = channelWire(),
 ) {
   return {
     message_id: `message-${seq}`,
-    place: channelWire(),
+    place,
     seq,
     author: { kind: "human", human_id: "human-1" },
     content,

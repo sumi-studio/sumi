@@ -97,7 +97,8 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		return Message{}, false, fmt.Errorf("begin scoped append: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
+	if err != nil {
 		return Message{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, in.PlaceID)
@@ -180,6 +181,15 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	message.Attachments = attachments
 	if err := insertMentions(ctx, tx, message.MessageID, mentions); err != nil {
 		return Message{}, false, err
+	}
+	if place.Kind == PlaceThread {
+		if err := s.joinThreadParticipants(ctx, tx, place.PlaceID, actorMembership, mentions); err != nil {
+			return Message{}, false, err
+		}
+		members, err = s.threadNotificationMembers(ctx, tx, place.PlaceID, members)
+		if err != nil {
+			return Message{}, false, err
+		}
 	}
 	// Notification intent issuance is part of the same commit. Delivery remains
 	// post-commit/best-effort, but authoritative recipient intent never is.
@@ -353,7 +363,8 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, fmt.Errorf("begin scoped edit: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
+	if err != nil {
 		return Message{}, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
@@ -394,6 +405,14 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	}
 	if err := insertMentions(ctx, tx, messageID, mentions); err != nil {
 		return Message{}, err
+	}
+	// Editing may introduce a new mention. Keep the same transaction-level
+	// admission contract as append: every mentioned member is a thread
+	// participant before this edit becomes observable.
+	if place.Kind == PlaceThread {
+		if err := s.joinThreadParticipants(ctx, tx, place.PlaceID, actorMembership, mentions); err != nil {
+			return Message{}, err
+		}
 	}
 	message.Content, message.Mentions, message.EditedAt = content, mentions, &editedAt
 	parts := []Message{message}
@@ -445,7 +464,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if message.Deleted {
 		return message, tx.Commit(ctx)
 	}
-	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel {
+	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel && place.Kind != PlaceThread {
 		return Message{}, ErrForbidden
 	}
 	if _, err := tx.Exec(ctx, `
@@ -518,21 +537,17 @@ func (s *ScopedStore) ReadThrough(ctx context.Context, placeID string, seq int64
 	if seq > place.LastSeq {
 		return ErrSeqBeyondLatest
 	}
-	if access.PlaceMemberID == "" {
+	if access.PlaceMemberID == "" && place.Kind != PlaceThread {
 		if err := admitPlaceTenure(ctx, tx, placeID, membership, 1); err != nil {
-			return err
-		}
-		access, err = s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
-		if err != nil {
 			return err
 		}
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO read_markers (place_id, place_member_id, last_read_seq)
+		INSERT INTO read_markers (place_id, workspace_member_id, last_read_seq)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (place_id, place_member_id)
+		ON CONFLICT (place_id, workspace_member_id)
 		DO UPDATE SET last_read_seq = GREATEST(read_markers.last_read_seq, EXCLUDED.last_read_seq),
-		              updated_at = now()`, placeID, access.PlaceMemberID, seq); err != nil {
+		              updated_at = now()`, placeID, membership.WorkspaceMemberID, seq); err != nil {
 		return fmt.Errorf("advance scoped read marker: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -544,18 +559,18 @@ func (s *ScopedStore) ReadMarker(ctx context.Context, placeID string) (int64, er
 		return 0, fmt.Errorf("begin scoped read-marker read: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeInTx(ctx, tx); err != nil {
+	membership, err := s.authorizeInTx(ctx, tx)
+	if err != nil {
 		return 0, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
 	if err != nil {
 		return 0, err
 	}
-	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
-	if err != nil {
+	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
 		return 0, err
 	}
-	seq, err := s.readMarkerAfterAuthorization(ctx, tx, place, access)
+	seq, err := s.readMarkerAfterAuthorization(ctx, tx, place, membership.WorkspaceMemberID)
 	if err != nil {
 		return 0, err
 	}
@@ -565,22 +580,19 @@ func (s *ScopedStore) ReadMarker(ctx context.Context, placeID string) (int64, er
 	return seq, nil
 }
 
-// readMarkerAfterAuthorization reads the cursor for the exact active place
-// tenure selected by access. It deliberately accepts the caller's querier so
-// an OpenSnapshot cannot escape to the pool between history and cursor reads.
+// readMarkerAfterAuthorization reads the cursor for the exact active Workspace
+// membership tenure. It deliberately accepts the caller's querier so an
+// OpenSnapshot cannot escape to the pool between history and cursor reads.
 func (s *ScopedStore) readMarkerAfterAuthorization(
 	ctx context.Context,
 	q querier,
 	place Place,
-	access PlaceAccess,
+	workspaceMemberID string,
 ) (int64, error) {
-	if access.PlaceMemberID == "" {
-		return 0, nil
-	}
 	var seq int64
 	err := q.QueryRow(ctx, `
 		SELECT last_read_seq FROM read_markers
-		WHERE place_id = $1 AND place_member_id = $2`, place.PlaceID, access.PlaceMemberID).Scan(&seq)
+		WHERE place_id = $1 AND workspace_member_id = $2`, place.PlaceID, workspaceMemberID).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
 		seq = 0
 	} else if err != nil {
@@ -599,6 +611,11 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 	if err != nil {
 		return nil, err
 	}
+	// A thread is summarized like a DM, not like a channel: a Workspace member
+	// may open one they never joined, but an unjoined thread is not part of
+	// their ledger. Projecting every thread here would put unread counts on
+	// places that appear in no list, and would make the reconnect handshake
+	// carry one cursor per Workspace thread.
 	rows, err := tx.Query(ctx, `
 		WITH visible_places AS (
 			SELECT p.*, pm.place_member_id, COALESCE(pm.visible_from_seq, 1) AS visible_from_seq
@@ -607,7 +624,8 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 			  ON pm.workspace_id = p.workspace_id AND pm.place_id = p.place_id
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			  AND (p.kind = 'channel' OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
+			  AND (p.kind = 'channel'
+			       OR (p.kind IN ('thread', 'dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.name, vp.topic,
 		       vp.visibility, vp.last_seq, vp.voice, COALESCE(rm.last_read_seq, 0),
@@ -625,7 +643,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 		          AND NOT (m.author_kind = $3 AND m.author_id = $4))
 		FROM visible_places vp
 		LEFT JOIN read_markers rm
-		  ON rm.place_id = vp.place_id AND rm.place_member_id = vp.place_member_id
+		  ON rm.place_id = vp.place_id AND rm.workspace_member_id = $2
 		ORDER BY vp.created_at, vp.place_id`,
 		s.Scope.WorkspaceID, membership.WorkspaceMemberID, s.Scope.Actor.Kind, s.Scope.Actor.ID)
 	if err != nil {

@@ -27,8 +27,10 @@ const maxHelloCursors = 1024
 // every place the participant can see (契約ドラフト: WS 1本で全Workspace/place
 // をmultiplex)。Authentication is identical to the REST surface. Frames:
 //
-//	client → server: hello{cursors}, send{...}, typing{place_id}
-//	server → client: hello_ack, event{...}, caught_up{place_id, latest_seq},
+//	client → server: hello{cursors}, send{...}, typing{place_id},
+//	                 open{place_id}, close{place_id}
+//	server → client: hello_ack, open_ack{place_id}, event{...},
+//	                 caught_up{place_id, latest_seq},
 //	                 receipt{client_nonce, message_id, seq, created},
 //	                 error{code, client_nonce?}
 //
@@ -204,9 +206,16 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // catchUp replays durable messages after each cursor and closes each place
 // with caught_up{latest_seq} so the client can detect a replay gap.
+//
+// A cursor is a claim, not an entitlement. Replay follows the same line as
+// live delivery: a place this viewer holds, or a thread this connection has
+// declared open. A thread the viewer once visited stays visible Workspace-wide,
+// so replaying it on the strength of its cursor alone would push a background
+// conversation — with its unread and notification effects — back into someone
+// who only ever read it. Those cursors wait for an open declaration instead.
 func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[string]int64) bool {
 	for placeID, since := range cursors {
-		place, err := sub.store.PlaceFor(ctx, placeID)
+		place, participating, err := sub.store.PlaceParticipationFor(ctx, placeID)
 		if err != nil {
 			if errors.Is(err, ErrPlaceNotFound) {
 				// Not visible (or gone): the cursor is silently dropped. The
@@ -219,31 +228,44 @@ func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[str
 			// disable -> re-enable binding survive catch-up.
 			return false
 		}
+		if place.Kind == PlaceThread && !participating && !sub.watching(placeID) {
+			// Nothing is open yet at hello, so this is where a thread the
+			// viewer merely visited stops. Its cursor is kept for the open
+			// frame that may still arrive on this connection.
+			sub.deferCursor(placeID, since)
+			continue
+		}
 		sub.markVisible(placeID, true)
-		messages, err := sub.store.MessagesSince(ctx, placeID, since, catchUpLimit)
-		if err != nil {
-			return false
-		}
-		for _, m := range messages {
-			event := Event{Type: EventMessageCreated, PlaceID: placeID}
-			wire := messageToWire(place, m)
-			event.Message = &wire
-			if !s.enqueueJSONAt(sub, liveBoundary{placeID: placeID}, struct {
-				Type  string `json:"type"`
-				Event Event  `json:"event"`
-			}{Type: "event", Event: event}) {
-				return false
-			}
-		}
-		if !s.enqueueJSONAt(sub, liveBoundary{placeID: placeID}, struct {
-			Type      string `json:"type"`
-			PlaceID   string `json:"place_id"`
-			LatestSeq int64  `json:"latest_seq"`
-		}{Type: "caught_up", PlaceID: placeID, LatestSeq: place.LastSeq}) {
+		if !s.replayPlace(ctx, sub, place, since) {
 			return false
 		}
 	}
 	return true
+}
+
+// replayPlace sends one place's durable messages after since and closes it
+// with caught_up{latest_seq}.
+func (s *WSServer) replayPlace(ctx context.Context, sub *subscriber, place Place, since int64) bool {
+	messages, err := sub.store.MessagesSince(ctx, place.PlaceID, since, catchUpLimit)
+	if err != nil {
+		return false
+	}
+	for _, m := range messages {
+		event := Event{Type: EventMessageCreated, PlaceID: place.PlaceID}
+		wire := messageToWire(place, m)
+		event.Message = &wire
+		if !s.enqueueJSONAt(sub, liveBoundary{placeID: place.PlaceID}, struct {
+			Type  string `json:"type"`
+			Event Event  `json:"event"`
+		}{Type: "event", Event: event}) {
+			return false
+		}
+	}
+	return s.enqueueJSONAt(sub, liveBoundary{placeID: place.PlaceID}, struct {
+		Type      string `json:"type"`
+		PlaceID   string `json:"place_id"`
+		LatestSeq int64  `json:"latest_seq"`
+	}{Type: "caught_up", PlaceID: place.PlaceID, LatestSeq: place.LastSeq})
 }
 
 func (s *WSServer) readPump(ctx context.Context, conn *websocket.Conn, sub *subscriber, claims agentevents.UserSessionClaims) {
@@ -265,6 +287,10 @@ func (s *WSServer) readPump(ctx context.Context, conn *websocket.Conn, sub *subs
 			s.handleSend(ctx, sub, claims, frame)
 		case "typing":
 			s.handleTyping(ctx, sub, claims, frame)
+		case "open":
+			s.handleOpen(ctx, sub, frame)
+		case "close":
+			sub.closePlace(frame.PlaceID)
 		default:
 			s.enqueueError(sub, "unknown_frame", "")
 			return
@@ -325,6 +351,42 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 	}{Type: "receipt", ClientNonce: frame.ClientNonce, MessageID: msg.MessageID, Seq: msg.Seq, Created: created})
 	if created {
 		publishMessageCreated(ctx, sub.store, s.Hub, place, msg)
+	}
+}
+
+// handleOpen records which place this connection is looking at. A place the
+// viewer holds (a channel, a DM, a thread they joined) is delivered from its
+// own audience whether or not it is open; this declaration only lets someone
+// reading a thread they never joined see it arrive while it is on screen.
+// Visibility is checked so the frame cannot probe places, and every delivery
+// remains fenced by the event's own audience snapshot and authorizeWrite.
+//
+// Opening is also where a deferred handshake cursor is honoured. The contract
+// is ordered: a reconnect replays the places this viewer holds, and a thread
+// they only have open replays after its open frame — never before, because
+// until the frame arrives this connection has not said it is looking at it.
+func (s *WSServer) handleOpen(ctx context.Context, sub *subscriber, frame wsClientFrame) {
+	if sub == nil || sub.store == nil || frame.PlaceID == "" {
+		s.enqueueError(sub, "not_found", "")
+		return
+	}
+	place, _, err := sub.store.PlaceParticipationFor(ctx, frame.PlaceID)
+	if err != nil {
+		s.enqueueError(sub, storeErrorCode(err), "")
+		return
+	}
+	sub.openPlace(frame.PlaceID)
+	if !s.enqueueJSONAt(sub, liveBoundary{placeID: frame.PlaceID}, struct {
+		Type    string `json:"type"`
+		PlaceID string `json:"place_id"`
+	}{Type: "open_ack", PlaceID: frame.PlaceID}) {
+		return
+	}
+	// The visibility verdict is deliberately not cached here: watching is
+	// temporary by construction, and a cached "visible" would outlive the
+	// close that ends it.
+	if since, deferred := sub.takeDeferredCursor(frame.PlaceID); deferred {
+		s.replayPlace(ctx, sub, place, since)
 	}
 }
 

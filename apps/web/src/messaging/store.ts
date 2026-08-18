@@ -1,9 +1,9 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
-import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
   ChannelSummary,
@@ -25,6 +25,7 @@ import type {
   ReplyLaterMarker,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   Urgency,
   WorkspaceSummary,
 } from "./model";
@@ -39,6 +40,7 @@ import {
   isNotificationSoundEnabled,
   isTabActive,
   notificationBody,
+  notificationCountForPlace,
   notificationPermission,
   notificationTitle,
   setNotificationSoundEnabled as persistNotificationSound,
@@ -76,12 +78,16 @@ const UNBOUND_CAPABILITIES: MessagingCapabilities = {
   replyLater: false,
   reactions: false,
   notifications: false,
+  threads: false,
 };
 
 function unboundMessagingBackend(): MessagingBackend {
   const target = {
     capabilities: UNBOUND_CAPABILITIES,
     dispose() {},
+    // 開いている画面の宣言はvolatileなbest-effort。scopeが束ねられていない
+    // 間は伝える相手が居ないだけで、失敗ではない。
+    openPlace() {},
   } as Partial<MessagingBackend>;
   return new Proxy(target as MessagingBackend, {
     get(value, property, receiver) {
@@ -137,6 +143,8 @@ interface MessagingState {
   workspaces: WorkspaceSummary[];
   channels: ChannelSummary[];
   dms: DmSummary[];
+  threadsById: Record<string, ThreadSummary>;
+  threadsLoadedForPlace: Record<PlaceKey, boolean>;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -190,6 +198,14 @@ interface MessagingState {
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannelTopic(channelId: string, topic: string): Promise<void>;
+  loadThreads(parentKey: PlaceKey): Promise<void>;
+  loadThread(threadId: string): Promise<boolean>;
+  createThread(
+    parentKey: PlaceKey,
+    name: string,
+    originMessageId: string | null,
+    clientNonce: string,
+  ): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
@@ -266,6 +282,16 @@ function unreadContribution(
 
 let initialized = false;
 let messagingSessionGeneration = 0;
+
+function isCurrentMessagingSession(
+  expectedBackend: MessagingBackend,
+  expectedGeneration: number,
+): boolean {
+  return (
+    backend === expectedBackend &&
+    messagingSessionGeneration === expectedGeneration
+  );
+}
 
 type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
 
@@ -357,6 +383,41 @@ export function notificationLevelFor(
   return state.notificationLevelByPlace[key] ?? state.notificationDefaultLevel;
 }
 
+/** 自分が参加しているthreadか。参加はplace_membersの投影が正本。 */
+export function participatesInThread(
+  state: Pick<MessagingState, "threadsById" | "selfKey">,
+  threadId: string,
+): boolean {
+  const thread = state.threadsById[threadId];
+  if (!thread) return false;
+  return thread.participants.some(
+    (ref) => participantKey(ref) === state.selfKey,
+  );
+}
+
+/**
+ * タブタイトルが出す件数。数えるのは自分の台帳にある場所——channel・DM・
+ * 参加しているthread——だけにする。開いただけのthreadはsidebarにもbootstrapの
+ * threadsにも出ないので、その未読を足すとどのバッジにも無い数字がタイトルに
+ * 出てしまう。
+ */
+export function notifiableUnreadCount(state: MessagingState): number {
+  let unread = 0;
+  for (const [key, count] of Object.entries(state.unreadCountByPlace)) {
+    const place = parsePlaceKey(key);
+    if (!place) continue;
+    if (place.kind === "thread" && !participatesInThread(state, place.threadId))
+      continue;
+    unread += notificationCountForPlace(
+      key,
+      notificationLevelFor(state, key),
+      count,
+      state.mentionCountByPlace[key] ?? 0,
+    );
+  }
+  return unread;
+}
+
 /**
  * 通知の見出しに使う場所の名前。DMは相手の名前が発言者の名前と同じなので
  * 場所を名乗らせない（「Haru — Haru」は情報が無い）。
@@ -369,6 +430,9 @@ function notificationPlaceLabel(state: MessagingState, key: PlaceKey): string {
       (entry) => entry.channelId === place.channelId,
     );
     return channel ? `#${channel.name}` : "";
+  }
+  if (place.kind === "thread") {
+    return state.threadsById[place.threadId]?.name ?? "";
   }
   if (place.kind === "dm") return "";
   const dm = state.dms.find(
@@ -388,6 +452,141 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+  // A thread message is only an invalidation signal for its summary.  Counts,
+  // latest sequence, previews, and participants come from the server's
+  // aggregate: event delivery order is not a projection contract.
+  const threadProjectionVersions = new Map<string, number>();
+  const threadSummaryRefreshes = new Map<
+    string,
+    {
+      backend: MessagingBackend;
+      sessionGeneration: number;
+      dirty: boolean;
+      scheduled: boolean;
+      request: Promise<void> | null;
+    }
+  >();
+  const threadHydrations = new Map<
+    string,
+    {
+      backend: MessagingBackend;
+      sessionGeneration: number;
+      request: Promise<boolean>;
+    }
+  >();
+
+  const invalidateThreadSummary = (threadId: string): number => {
+    const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
+    threadProjectionVersions.set(threadId, version);
+    return version;
+  };
+
+  // This is the only path that installs a server thread aggregate. Every
+  // asynchronous source captures its projection version before issuing the
+  // request, so a response that raced a live invalidation cannot overwrite a
+  // newer authoritative projection.
+  const applyThreadSummary = (
+    threadId: string,
+    summary: ThreadSummary,
+    version: number,
+  ): boolean => {
+    if (
+      summary.threadId !== threadId ||
+      (threadProjectionVersions.get(threadId) ?? 0) !== version
+    ) {
+      return false;
+    }
+    set((state) => ({
+      threadsById: { ...state.threadsById, [threadId]: summary },
+    }));
+    return true;
+  };
+
+  const scheduleThreadSummaryRefresh = (threadId: string) => {
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    let refresh = threadSummaryRefreshes.get(threadId);
+    if (
+      !refresh ||
+      refresh.backend !== currentBackend ||
+      refresh.sessionGeneration !== sessionGeneration
+    ) {
+      refresh = {
+        backend: currentBackend,
+        sessionGeneration,
+        dirty: false,
+        scheduled: false,
+        request: null,
+      };
+      threadSummaryRefreshes.set(threadId, refresh);
+    }
+    refresh.dirty = true;
+    invalidateThreadSummary(threadId);
+    if (refresh.scheduled || refresh.request) return;
+    refresh.scheduled = true;
+    const queuedRefresh = refresh;
+    queueMicrotask(() => {
+      queuedRefresh.scheduled = false;
+      if (queuedRefresh.request || !queuedRefresh.dirty) return;
+      const version = threadProjectionVersions.get(threadId) ?? 0;
+      queuedRefresh.dirty = false;
+      queuedRefresh.request = (async () => {
+        try {
+          const fetchThread = currentBackend.fetchThread;
+          if (!fetchThread) return;
+          const thread = await fetchThread.call(currentBackend, threadId);
+          if (
+            backend !== currentBackend ||
+            messagingSessionGeneration !== sessionGeneration
+          ) {
+            return;
+          }
+          applyThreadSummary(threadId, thread, version);
+        } catch {
+          // Do not strand a stale aggregate behind a successful parent-list
+          // cache entry. A later panel open must fetch the authoritative list
+          // even when the event that invalidated this summary was the last
+          // event we receive.
+          if (
+            backend === currentBackend &&
+            messagingSessionGeneration === sessionGeneration
+          ) {
+            set((state) => {
+              const thread = state.threadsById[threadId];
+              if (!thread) return {};
+              const parentKey = placeKey(thread.parentPlace);
+              return {
+                threadsLoadedForPlace: {
+                  ...state.threadsLoadedForPlace,
+                  [parentKey]: false,
+                },
+              };
+            });
+          }
+        } finally {
+          queuedRefresh.request = null;
+          if (
+            threadSummaryRefreshes.get(threadId) === queuedRefresh &&
+            queuedRefresh.dirty
+          ) {
+            scheduleThreadSummaryRefresh(threadId);
+          } else if (threadSummaryRefreshes.get(threadId) === queuedRefresh) {
+            threadSummaryRefreshes.delete(threadId);
+          }
+        }
+      })();
+    });
+  };
+  /**
+   * A thread's parent-list entry changes for more reasons than a live event:
+   * an ACK-confirmed send whose echo was lost, a tombstone, a mention that
+   * admitted a participant. Every one of them goes through this single refresh
+   * so no route can quietly leave the list describing an older thread.
+   */
+  const noteThreadProjectionChange = (place: Place) => {
+    if (place.kind === "thread") scheduleThreadSummaryRefresh(place.threadId);
+  };
+
   const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
     const key = placeKey(event.place);
     // reactionだけを差し替える。message全体を置き換えると、同時に届いた
@@ -842,7 +1041,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
-      if (event.type === "message_created") presentNotification(event);
+      // Do not calculate a summary from event payloads. The durable aggregate
+      // includes admissions made by mentions and stays right even when commits
+      // reach the Hub out of sequence.
+      noteThreadProjectionChange(event.message.place);
+      if (event.type === "message_created" && !event.message.deleted) {
+        presentNotification(event);
+      }
       return;
     }
     if (event.type === "message_deleted") {
@@ -881,6 +1086,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      noteThreadProjectionChange(event.message.place);
       return;
     }
     if (event.type === "typing") {
@@ -914,7 +1120,27 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "place_created") {
-      const { channel, dm } = event;
+      const { channel, dm, thread } = event;
+      const knownThread = thread
+        ? Boolean(get().threadsById[thread.threadId])
+        : false;
+      // A new thread is news for the whole parent channel, but only its
+      // participants and the panel that is currently listing that channel
+      // have a place to put it. Holding every announced thread would grow
+      // this map with other people's conversations for the whole session.
+      const wantedThread =
+        thread !== undefined &&
+        (thread.participants.some(
+          (ref) => participantKey(ref) === get().selfKey,
+        ) ||
+          Boolean(get().threadsLoadedForPlace[placeKey(thread.parentPlace)]));
+      if (thread && !knownThread && wantedThread) {
+        applyThreadSummary(
+          thread.threadId,
+          thread,
+          threadProjectionVersions.get(thread.threadId) ?? 0,
+        );
+      }
       set((state) => {
         if (channel) {
           return state.channels.some(
@@ -930,6 +1156,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }
         return {};
       });
+      // place lifecycle and message delivery have no shared ordering. A late
+      // creation payload is only useful for an unknown thread; for a known
+      // one it must not roll an already refreshed server aggregate backward.
+      if (thread && knownThread) scheduleThreadSummaryRefresh(thread.threadId);
       return;
     }
     if (event.type === "place_updated") {
@@ -956,8 +1186,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
    */
   const reconcilePlaces = async () => {
     const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = get().selfKey;
+    const threadVersions = new Map(threadProjectionVersions);
     const snapshot = await currentBackend.bootstrap();
     if (
       backend !== currentBackend ||
@@ -969,12 +1201,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     const state = get();
+    const loadedThreadParents = Object.entries(state.threadsLoadedForPlace)
+      .filter(([, loaded]) => loaded)
+      .map(([parentKey]) => parentKey);
     const known = new Set<PlaceKey>([
       ...state.channels.map((entry) =>
         placeKey({ kind: "channel", channelId: entry.channelId }),
       ),
       ...state.dms.map((entry) =>
         placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+      ...Object.values(state.threadsById).map((thread) =>
+        placeKey({ kind: "thread", threadId: thread.threadId }),
       ),
     ]);
     const membersByKey: Record<ParticipantKey, MemberProfile> = {};
@@ -1000,11 +1238,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
       workspaces: snapshot.workspaces,
       channels: snapshot.channels,
       dms: snapshot.dms,
+      // snapshot.threads only contains participating threads. The parent list
+      // includes all workspace-visible threads, and its lifecycle events are
+      // not replayed, so every list fetched before a disconnect is stale.
+      threadsLoadedForPlace: {},
       membersByKey,
       lastReadByPlace,
       unreadCountByPlace,
       mentionCountByPlace,
     });
+    // Threads are participation-scoped lifecycle data just like DMs. Keep
+    // what this client already learned while adding threads it was admitted
+    // to during the disconnect, but only if no live invalidation overtook the
+    // bootstrap response.
+    for (const thread of snapshot.threads ?? []) {
+      applyThreadSummary(
+        thread.threadId,
+        thread,
+        threadVersions.get(thread.threadId) ?? 0,
+      );
+    }
+    // The currently mounted parent panel does not re-run its effect merely
+    // because a reconnect completed. Refresh the lists that had been loaded
+    // before the disconnect after invalidating their cache entries above.
+    await Promise.all(
+      loadedThreadParents.map((parentKey) => get().loadThreads(parentKey)),
+    );
+    if (
+      !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+      getMessagingSessionIdentity() !== currentIdentity ||
+      get().selfKey !== expectedSelfKey
+    ) {
+      return;
+    }
     if (Object.keys(sinceByPlace).length > 0) {
       // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
       // durable eventがreplayされるようにする。applyEventは同一参照なので
@@ -1018,7 +1284,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
     if (get().messagesByPlace[key]) return;
-    const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const messages = await currentBackend.fetchMessages(place, {
+      limit: PAGE_SIZE,
+    });
+    if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
@@ -1036,7 +1307,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const dispatchSend = (key: PlaceKey, pending: PendingMessage) => {
     const place = parsePlaceKey(key);
     if (!place) return;
-    backend
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const isCurrent = () =>
+      isCurrentMessagingSession(currentBackend, sessionGeneration) &&
+      (get().pendingByPlace[key] ?? []).some(
+        (entry) => entry.clientNonce === pending.clientNonce,
+      );
+    currentBackend
       .sendMessage({
         place,
         content: pending.content,
@@ -1046,6 +1324,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         attachments: pending.attachments.map((entry) => entry.attachmentId),
       })
       .then(async (receipt) => {
+        if (!isCurrent()) return;
         let confirmed = (get().messagesByPlace[key] ?? []).some(
           (message) =>
             message.messageId === receipt.messageId ||
@@ -1053,10 +1332,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         if (!confirmed) {
           // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
-          const messages = await backend.fetchMessages(place, {
+          const messages = await currentBackend.fetchMessages(place, {
             beforeSeq: receipt.seq + 1,
             limit: 1,
           });
+          if (!isCurrent()) return;
           const committed = messages.find(
             (message) => message.messageId === receipt.messageId,
           );
@@ -1070,10 +1350,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 ),
               },
             }));
+            // The receipt is what confirmed this message, so the parent list
+            // has to be refreshed from here too: the live echo that normally
+            // does it is exactly what went missing.
+            noteThreadProjectionChange(place);
             confirmed = true;
           }
         }
         if (!confirmed) throw new Error("Committed message was not found");
+        if (!isCurrent()) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -1084,6 +1369,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }));
       })
       .catch(() => {
+        if (!isCurrent()) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -1231,6 +1517,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -1261,9 +1549,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
-      void backend
+      threadProjectionVersions.clear();
+      threadSummaryRefreshes.clear();
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const threadVersions = new Map(threadProjectionVersions);
+      void currentBackend
         .bootstrap()
         .then((snapshot) => {
+          if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+            return;
+          }
           const membersByKey: Record<ParticipantKey, MemberProfile> = {};
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
@@ -1293,12 +1589,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
           );
           set({
             ready: true,
-            capabilities: backend.capabilities,
+            capabilities: currentBackend.capabilities,
             self: snapshot.self,
             selfKey: participantKey(snapshot.self),
             workspaces: snapshot.workspaces,
             channels: snapshot.channels,
             dms: snapshot.dms,
+            threadsLoadedForPlace: {},
             membersByKey,
             statusByKey,
             lastReadByPlace,
@@ -1308,28 +1605,36 @@ export const useMessaging = create<MessagingState>((set, get) => {
             ...confirmedNotificationSetting,
             employedAgents: snapshot.employedAgents,
           });
+          for (const thread of snapshot.threads ?? []) {
+            applyThreadSummary(
+              thread.threadId,
+              thread,
+              threadVersions.get(thread.threadId) ?? 0,
+            );
+          }
           scheduleStatusExpiry();
-          backend.subscribe(applyEvent, { sinceByPlace });
-          // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
-          // 再接続なので、replayされないplace lifecycleを読み直す。presenceは
-          // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
-          let connectedOnce = false;
-          backend.subscribeConnection((connection) => {
+          currentBackend.subscribe(applyEvent, { sinceByPlace });
+          // bootstrapはsubscribeより前に読まれるため、最初の接続にもその間に
+          // 作られたplaceや親thread一覧が欠け得る。connectedをsnapshotのfence
+          // として毎回再検証し、live eventはその再取得を促す合図として扱う。
+          currentBackend.subscribeConnection((connection) => {
+            if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+              return;
+            }
             set((state) => ({
               connection,
               everConnected: state.everConnected || connection === "connected",
             }));
             if (connection !== "connected") return;
             void useCall.getState().hydrate();
-            if (connectedOnce) {
-              void reconcilePlaces().catch(() => undefined);
-            } else {
-              connectedOnce = true;
-            }
+            void reconcilePlaces().catch(() => undefined);
             void resyncPresence().catch(() => undefined);
           });
         })
         .catch(() => {
+          if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+            return;
+          }
           initialized = false;
           set({ connection: "disconnected" });
         });
@@ -1344,9 +1649,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ? state.channels.some(
               (channel) => channel.channelId === place.channelId,
             )
-          : state.dms.some(
-              (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
-            );
+          : place.kind === "thread"
+            ? state.threadsById[place.threadId] !== undefined
+            : state.dms.some(
+                (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
+              );
       if (!known) return;
       set((state) => ({
         activePlaceKey: key,
@@ -1357,6 +1664,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
           [key]: state.lastReadByPlace[key] ?? 0,
         },
       }));
+      // Tell the server which screen is open. A thread the viewer never joined
+      // is delivered live only while it is the open one, so the cursor for it
+      // comes from here too: the summary's latest seq is what this client has
+      // already been shown, and a disconnect while the screen stays open must
+      // resume from there rather than replaying the thread from its start.
+      backend.openPlace?.(
+        place,
+        place.kind === "thread"
+          ? (get().threadsById[place.threadId]?.latestSeq ?? 0)
+          : 0,
+      );
       void loadPlace(place);
     },
 
@@ -1374,6 +1692,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         editingMessageId: null,
         replyTargetId: null,
       });
+      backend.openPlace?.(null);
     },
 
     async createChannel(workspaceId, name, topic, voice) {
@@ -1427,7 +1746,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async updateChannelTopic(channelId, topic) {
-      const channel = await backend.updateChannelTopic(channelId, topic);
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const channel = await currentBackend.updateChannelTopic(channelId, topic);
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        throw new Error(
+          "Messaging session changed during channel topic update",
+        );
+      }
       set((state) => ({
         channels: state.channels.map((entry) =>
           entry.channelId === channel.channelId ? channel : entry,
@@ -1435,8 +1761,131 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }));
     },
 
+    async loadThreads(parentKey) {
+      if (!get().capabilities.threads) return;
+      if (get().threadsLoadedForPlace[parentKey]) return;
+      const parent = parsePlaceKey(parentKey);
+      if (parent?.kind !== "channel") return;
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const versions = new Map(threadProjectionVersions);
+      const threads = (await currentBackend.fetchThreads?.(parent)) ?? [];
+      if (
+        backend !== currentBackend ||
+        messagingSessionGeneration !== sessionGeneration
+      ) {
+        return;
+      }
+      // Every thread in the list is applied. A short-circuiting `some` used to
+      // stop at the first one a live invalidation had overtaken, so a single
+      // raced entry kept the rest of the channel's threads out of the store.
+      for (const thread of threads) {
+        applyThreadSummary(
+          thread.threadId,
+          thread,
+          versions.get(thread.threadId) ?? 0,
+        );
+      }
+      // A rejected apply means a newer authoritative projection is already
+      // installed or in flight for that thread, so the list itself is loaded.
+      // Its own failure path is what marks the parent for a re-fetch.
+      set((state) => ({
+        threadsLoadedForPlace: {
+          ...state.threadsLoadedForPlace,
+          [parentKey]: true,
+        },
+      }));
+    },
+
+    async loadThread(threadId) {
+      if (get().threadsById[threadId]) return true;
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const version = threadProjectionVersions.get(threadId) ?? 0;
+      const fetchThread = currentBackend.fetchThread;
+      if (!get().capabilities.threads || !fetchThread) {
+        return false;
+      }
+      const existing = threadHydrations.get(threadId);
+      if (
+        existing &&
+        existing.backend === currentBackend &&
+        existing.sessionGeneration === sessionGeneration
+      ) {
+        return existing.request;
+      }
+      const hydration = {
+        backend: currentBackend,
+        sessionGeneration,
+        request: Promise.resolve(false),
+      };
+      const request = (async () => {
+        try {
+          const thread = await fetchThread.call(currentBackend, threadId);
+          if (
+            backend !== currentBackend ||
+            messagingSessionGeneration !== sessionGeneration
+          ) {
+            return false;
+          }
+          if (!applyThreadSummary(threadId, thread, version)) {
+            scheduleThreadSummaryRefresh(threadId);
+            return false;
+          }
+          return true;
+        } catch {
+          return false;
+        } finally {
+          if (threadHydrations.get(threadId) === hydration) {
+            threadHydrations.delete(threadId);
+          }
+        }
+      })();
+      hydration.request = request;
+      threadHydrations.set(threadId, hydration);
+      return request;
+    },
+
+    async createThread(parentKey, name, originMessageId, clientNonce) {
+      const parent = parsePlaceKey(parentKey);
+      if (parent?.kind !== "channel")
+        throw new Error("Threads require a channel parent");
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
+      const createThread = currentBackend.createThread;
+      if (!createThread) throw new Error("Threads are unavailable");
+      const thread = await createThread.call(
+        currentBackend,
+        parent,
+        name,
+        originMessageId,
+        clientNonce,
+      );
+      if (
+        !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during thread creation");
+      }
+      // A live message can arrive before the create response. The response is
+      // only usable at the zero version of this as-yet unknown thread.
+      if (!applyThreadSummary(thread.threadId, thread, 0)) {
+        scheduleThreadSummaryRefresh(thread.threadId);
+      }
+      return `thread:${thread.threadId}`;
+    },
+
     async searchMessages(query) {
-      return backend.searchMessages(query);
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const results = await currentBackend.searchMessages(query);
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        throw new Error("Messaging session changed during message search");
+      }
+      return results;
     },
 
     async loadPlaceAround(key, seq) {
@@ -1449,10 +1898,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return true;
       }
-      const messages = await backend.fetchMessages(place, {
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const messages = await currentBackend.fetchMessages(place, {
         beforeSeq: seq + 1,
         limit: 50,
       });
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        return false;
+      }
       set((state) => ({
         messagesByPlace: {
           ...state.messagesByPlace,
@@ -1790,10 +2244,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((entry) => ({
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
-      const older = await backend.fetchMessages(place, {
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const older = await currentBackend.fetchMessages(place, {
         beforeSeq: current[0].seq,
         limit: PAGE_SIZE,
       });
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
       set((entry) => {
         const existing = entry.messagesByPlace[key] ?? [];
         const known = new Set(existing.map((m) => m.messageId));
@@ -1924,6 +2381,8 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},

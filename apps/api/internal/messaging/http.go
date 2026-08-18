@@ -61,6 +61,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/group-dms", s.serveCreateGroupDM)
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
+	mux.HandleFunc("GET /messaging/places/{place_id}/threads", s.serveThreads)
+	mux.HandleFunc("POST /messaging/places/{place_id}/threads", s.serveCreateThread)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
@@ -130,13 +132,61 @@ type placeWire struct {
 	Kind      string `json:"kind"`
 	ChannelID string `json:"channel_id,omitempty"`
 	DMID      string `json:"dm_id,omitempty"`
+	ThreadID  string `json:"thread_id,omitempty"`
 }
 
 func placeToWire(p Place) placeWire {
-	if p.Kind == PlaceChannel {
+	switch p.Kind {
+	case PlaceChannel:
 		return placeWire{Kind: p.Kind, ChannelID: p.PlaceID}
+	case PlaceThread:
+		return placeWire{Kind: p.Kind, ThreadID: p.PlaceID}
+	default:
+		return placeWire{Kind: p.Kind, DMID: p.PlaceID}
 	}
-	return placeWire{Kind: p.Kind, DMID: p.PlaceID}
+}
+
+func (p placeWire) placeID() string {
+	if p.ChannelID != "" {
+		return p.ChannelID
+	}
+	if p.DMID != "" {
+		return p.DMID
+	}
+	return p.ThreadID
+}
+
+type threadWire struct {
+	ThreadID        string            `json:"thread_id"`
+	ParentPlace     placeWire         `json:"parent_place"`
+	ParentMessageID *string           `json:"parent_message_id"`
+	WorkspaceID     string            `json:"workspace_id"`
+	Name            string            `json:"name"`
+	MessageCount    int64             `json:"message_count"`
+	LastMessageAt   *time.Time        `json:"last_message_at"`
+	LastMessage     string            `json:"last_message"`
+	Participants    []participantWire `json:"participants"`
+	LatestSeq       int64             `json:"latest_seq"`
+}
+
+func threadToWire(t Thread) threadWire {
+	w := threadWire{ThreadID: t.Place.PlaceID, ParentPlace: placeToWire(Place{PlaceID: t.ParentPlaceID, Kind: PlaceChannel}),
+		WorkspaceID: t.Place.WorkspaceID, Name: t.Place.Name, MessageCount: t.MessageCount,
+		LastMessageAt: t.LastMessageAt, LastMessage: t.LastMessagePreview,
+		Participants: participantsToWire(t.Participants), LatestSeq: t.Place.LastSeq}
+	if t.ParentMessageID != "" {
+		id := t.ParentMessageID
+		w.ParentMessageID = &id
+	}
+	return w
+}
+
+func threadsToWire(threads []Thread) []threadWire {
+	out := make([]threadWire, len(threads))
+	for i, thread := range threads {
+		out[i] = threadToWire(thread)
+	}
+	return out
 }
 
 type messageWire struct {
@@ -615,6 +665,9 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			channels = append(channels, channelToWire(sum.Place))
 			continue
 		}
+		if sum.Place.Kind == PlaceThread {
+			continue
+		}
 		profiles, err := store.ActiveMembers(ctx, sum.Place.PlaceID)
 		if err != nil {
 			writeStoreError(w, err)
@@ -663,12 +716,18 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	threads, err := store.ThreadsFor(ctx)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, struct {
 		Self                participantWire         `json:"self"`
 		Workspaces          []workspaceWire         `json:"workspaces"`
 		Channels            []channelWire           `json:"channels"`
 		DMs                 []dmWire                `json:"dms"`
+		Threads             []threadWire            `json:"threads"`
 		Members             []memberWire            `json:"members"`
 		Statuses            []statusWire            `json:"statuses"`
 		ReadMarkers         []readMarkerWire        `json:"read_markers"`
@@ -680,6 +739,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		Workspaces:          workspaceWires,
 		Channels:            channels,
 		DMs:                 dms,
+		Threads:             threadsToWire(threads),
 		Members:             members,
 		Statuses:            statusWires,
 		ReadMarkers:         readMarkers,
@@ -849,6 +909,69 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, wire)
 }
 
+func (s *Server) serveThreads(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := s.viewer(w, r); !ok {
+		return
+	}
+	threads, err := scopedStoreForRequest(r).ThreadsIn(r.Context(), r.PathValue("place_id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Threads []threadWire `json:"threads"`
+	}{threadsToWire(threads)})
+}
+
+func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
+	_, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name            string `json:"name"`
+		ParentMessageID string `json:"parent_message_id"`
+		ClientNonce     string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !threadNameValid(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
+	store := scopedStoreForRequest(r)
+	var thread Thread
+	var created bool
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		thread, created, opErr = store.CreateThread(r.Context(), r.PathValue("place_id"), req.Name, req.ParentMessageID, req.ClientNonce)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := threadToWire(thread)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
+}
+
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	_, _, ok := s.viewer(w, r)
 	if !ok {
@@ -869,11 +992,22 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	for i, p := range profiles {
 		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
 	}
+	var thread *threadWire
+	if place.Kind == PlaceThread {
+		summary, err := store.ThreadFor(r.Context(), place.PlaceID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		wire := threadToWire(summary)
+		thread = &wire
+	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`
 		LatestSeq int64        `json:"latest_seq"`
 		Members   []memberWire `json:"members"`
-	}{Place: placeToWire(place), LatestSeq: place.LastSeq, Members: members})
+		Thread    *threadWire  `json:"thread,omitempty"`
+	}{Place: placeToWire(place), LatestSeq: place.LastSeq, Members: members, Thread: thread})
 }
 
 func (s *Server) serveHistory(w http.ResponseWriter, r *http.Request) {
@@ -1257,10 +1391,7 @@ func (s *Server) serveSetNotificationSetting(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "invalid_level")
 			return
 		}
-		placeID := entry.Place.ChannelID
-		if placeID == "" {
-			placeID = entry.Place.DMID
-		}
+		placeID := entry.Place.placeID()
 		if placeID == "" {
 			writeError(w, http.StatusBadRequest, "invalid_place")
 			return
@@ -1469,6 +1600,10 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	case errors.Is(err, ErrNotAChannel):
 		writeError(w, http.StatusBadRequest, "not_a_channel")
+	case errors.Is(err, ErrNotThreadable):
+		writeError(w, http.StatusBadRequest, "not_threadable")
+	case errors.Is(err, ErrThreadExists):
+		writeError(w, http.StatusConflict, "thread_exists")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
 	case errors.Is(err, ErrInvalidScope):

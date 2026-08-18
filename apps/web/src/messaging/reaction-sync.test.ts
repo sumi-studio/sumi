@@ -6,6 +6,7 @@ import type {
   Place,
   ReactionMutationResult,
   ServerEvent,
+  ThreadSummary,
 } from "./model";
 import {
   bindMessagingSessionIdentity,
@@ -461,6 +462,43 @@ describe("reaction convergence in the messaging store", () => {
     ).toMatchObject({ deleted: true, reactions: [] });
   });
 
+  it("projects a replayed thread tombstone as a deletion", async () => {
+    const harness = new StubBackend();
+    const thread = threadSummary();
+    harness.threadSummaries = [
+      {
+        ...thread,
+        messageCount: 1,
+        lastMessageAt: 2,
+        lastMessage: "survives",
+      },
+    ];
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.setState({ threadsById: { [thread.threadId]: thread } });
+
+    // WebSocket replay represents the offline deletion as message_created
+    // containing a tombstone, not as a message_deleted event.
+    harness.emit({
+      type: "message_created",
+      message: {
+        ...message(2, ""),
+        place: { kind: "thread", threadId: thread.threadId },
+        deleted: true,
+      },
+      notify: null,
+    });
+    await harness.settle();
+
+    expect(harness.fetchThread).toHaveBeenCalledWith(thread.threadId);
+    expect(useMessaging.getState().threadsById[thread.threadId]).toMatchObject({
+      messageCount: 1,
+      lastMessageAt: 2,
+      lastMessage: "survives",
+    });
+  });
+
   it("discards toggle ACKs and queued mutations from an earlier session", async () => {
     const oldHarness = new StubBackend();
     const acknowledgement = deferred<ReactionMutationResult>();
@@ -594,6 +632,21 @@ function message(
   };
 }
 
+function threadSummary(): ThreadSummary {
+  return {
+    threadId: "thread-1",
+    workspaceId: "workspace-1",
+    parentPlace: { kind: "channel", channelId: "channel-1" },
+    parentMessageId: "message-1",
+    name: "Thread",
+    messageCount: 2,
+    lastMessageAt: 1,
+    lastMessage: "deleted message",
+    participants: [self],
+    latestSeq: 2,
+  };
+}
+
 class StubBackend implements MessagingBackend {
   readonly capabilities = {
     status: false,
@@ -602,6 +655,7 @@ class StubBackend implements MessagingBackend {
     notifications: false,
   } as const;
   history: Message[] = [];
+  threadSummaries: ThreadSummary[] = [];
   readonly fetches: { beforeSeq?: number; limit?: number }[] = [];
   readonly toggleResults: (
     | ReactionMutationResult
@@ -682,6 +736,16 @@ class StubBackend implements MessagingBackend {
       this.heldFetches.push({ response, resolve });
     });
   }
+
+  fetchThreads = vi.fn(async (_parent: Place) => this.threadSummaries);
+
+  fetchThread = vi.fn(async (threadId: string) => {
+    const thread = this.threadSummaries.find(
+      (summary) => summary.threadId === threadId,
+    );
+    if (!thread) throw new Error("thread not found");
+    return thread;
+  });
 
   async searchMessages(): Promise<import("./model").MessageSearchResult[]> {
     return [];

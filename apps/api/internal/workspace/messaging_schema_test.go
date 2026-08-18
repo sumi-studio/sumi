@@ -86,8 +86,8 @@ func TestMessagingPlaceTenureBindsExactWorkspaceMembership(t *testing.T) {
 	}
 
 	if _, err := w.pool.Exec(ctx, `
-		INSERT INTO read_markers (place_id, place_member_id, last_read_seq)
-		VALUES ($1, $2, 0)`, placeID, humanBPlaceTenure); err != nil {
+		INSERT INTO read_markers (place_id, workspace_member_id, last_read_seq)
+		VALUES ($1, $2, 0)`, placeID, humanBMembership.WorkspaceMemberID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.pool.Exec(ctx, `
@@ -182,8 +182,8 @@ func TestMessagingPlaceTenureBindsExactWorkspaceMembership(t *testing.T) {
 	if err := w.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM read_markers
-			WHERE place_id = $1 AND place_member_id = $2
-		)`, placeID, newPlaceTenure).Scan(&markerOnNewTenure); err != nil {
+			WHERE place_id = $1 AND workspace_member_id = $2
+		)`, placeID, rejoined.WorkspaceMemberID).Scan(&markerOnNewTenure); err != nil {
 		t.Fatal(err)
 	}
 	if markerOnNewTenure {

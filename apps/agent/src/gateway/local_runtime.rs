@@ -48,8 +48,8 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-    MessagingApi, MessagingApiFailure,
+    CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest, ExactMessagingScope,
+    GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure,
     MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
     OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
@@ -713,6 +713,74 @@ impl MessagingApi for LocalControlHttpClient {
         .await
     }
 
+    async fn threads(
+        &self,
+        scope: &ExactMessagingScope,
+        request: ListMessagingThreadsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:threads",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_thread(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingThreadRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        let mut first_indeterminate = None;
+        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
+            // Thread creation has a durable nonce receipt. Re-send this exact
+            // request only when the first response may have been committed but
+            // lost; a definite rejection must remain a one-shot failure.
+            let result = async {
+                let (status, body) = self
+                    .post_json_bounded_raw(
+                        "/local-control/v1/messaging:create-thread",
+                        &ScopedMessagingRequest::new(
+                            scope,
+                            CreateMessagingThreadRequest {
+                                parent_place_id: request.parent_place_id,
+                                name: request.name,
+                                parent_message_id: request.parent_message_id,
+                                client_nonce: request.client_nonce,
+                            },
+                        ),
+                        MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging thread creation",
+                            format!("transport or response framing failed: {error}"),
+                        )
+                    })?;
+                validate_messaging_thread_creation_response(status, body.as_slice())
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
+                        && is_indeterminate_messaging_failure(&error) =>
+                {
+                    first_indeterminate = Some(error);
+                    continue;
+                }
+                Err(_replay_error) if first_indeterminate.is_some() => {
+                    return Err(first_indeterminate
+                        .take()
+                        .expect("only a replay has an initial indeterminate result"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded Messaging retry loop always returns")
+    }
+
     async fn write(
         &self,
         scope: &ExactMessagingScope,
@@ -1129,6 +1197,34 @@ fn validate_messaging_write_response(
         .into());
     }
     Ok(receipt)
+}
+
+fn validate_messaging_thread_creation_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> Result<serde_json::Value> {
+    const OPERATION: &str = "Messaging thread creation";
+    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
+        return Err(messaging_mutation_rejection(status, body, OPERATION));
+    }
+    let response: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
+        MessagingApiFailure::indeterminate(
+            OPERATION,
+            format!("committed success receipt was malformed: {error}"),
+        )
+    })?;
+    if response
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(MessagingApiFailure::indeterminate(
+            OPERATION,
+            "committed success receipt omitted thread_id",
+        )
+        .into());
+    }
+    Ok(response)
 }
 
 fn is_indeterminate_messaging_failure(error: &anyhow::Error) -> bool {
@@ -3903,6 +3999,32 @@ mod tests {
             .into_response()
     }
 
+    async fn thread_response_loss_then_replay_fixture(
+        State(state): State<MessagingReplayFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).expect("strict JSON thread creation");
+        let nonce = request["client_nonce"]
+            .as_str()
+            .expect("thread nonce")
+            .to_owned();
+        let mut requests = state.requests.lock().unwrap();
+        requests.push((nonce, "create_thread".to_owned(), body.to_vec()));
+        if requests.len() == 1 {
+            return committed_response_loss();
+        }
+        drop(requests);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "thread_id": "0198f0f4-9b72-7000-8000-000000000799",
+                "name": "retry thread"
+            })),
+        )
+            .into_response()
+    }
+
     #[derive(Clone)]
     struct CountedMutationFixture {
         status: StatusCode,
@@ -4303,6 +4425,58 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1], "replay must be wire-identical");
         assert_eq!(requests[0].0, "message-nonce-2");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_thread_creation_retries_committed_response_loss_with_same_nonce_and_wire_body()
+     {
+        let state = MessagingReplayFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-thread",
+                post(thread_response_loss_then_replay_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+
+        let response = client
+            .create_thread(
+                &messaging_scope(),
+                CreateMessagingThreadRequest {
+                    parent_place_id: "01900000-0000-7000-8000-000000000002",
+                    name: "retry thread",
+                    parent_message_id: None,
+                    client_nonce: "thread-nonce-2",
+                },
+            )
+            .await
+            .expect("same-nonce replay resolves the committed thread");
+        assert_eq!(
+            response["thread_id"],
+            "0198f0f4-9b72-7000-8000-000000000799"
+        );
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1], "replay must be wire-identical");
+        assert_eq!(requests[0].0, "thread-nonce-2");
         server.abort();
     }
 
