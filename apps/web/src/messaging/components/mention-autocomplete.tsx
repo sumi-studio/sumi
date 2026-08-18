@@ -70,6 +70,7 @@ export function useMentionAutocomplete({
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const valueRef = useRef(value);
+  const mentionQueryRef = useRef<string | null>(null);
   valueRef.current = value;
 
   const candidates = useMemo(() => {
@@ -92,11 +93,22 @@ export function useMentionAutocomplete({
     },
     [onValueChange],
   );
-  const updateMention = useCallback((next: string, caret: number) => {
-    setMention(findMentionQuery(next, caret));
-    setMentionIndex(0);
+  const replaceMention = useCallback((next: MentionQuery | null) => {
+    // キャレット追跡は候補の query を変えない限り選択位置を動かさない。
+    // これにより ArrowDown の keyup / selectionchange 後も index は残る。
+    if (mentionQueryRef.current !== (next?.query ?? null)) {
+      setMentionIndex(0);
+    }
+    mentionQueryRef.current = next?.query ?? null;
+    setMention(next);
   }, []);
-  const dismiss = useCallback(() => setMention(null), []);
+  const updateMention = useCallback(
+    (next: string, caret: number) => {
+      replaceMention(findMentionQuery(next, caret));
+    },
+    [replaceMention],
+  );
+  const dismiss = useCallback(() => replaceMention(null), [replaceMention]);
   const insertTrigger = useCallback(() => {
     const textarea = inputRef.current;
     const current = valueRef.current;
@@ -106,15 +118,14 @@ export function useMentionAutocomplete({
     const next = before + inserted + current.slice(caret);
     const nextCaret = caret + inserted.length;
     updateValue(next);
-    setMention(findMentionQuery(next, nextCaret));
-    setMentionIndex(0);
+    replaceMention(findMentionQuery(next, nextCaret));
     window.requestAnimationFrame(() => {
       const input = inputRef.current;
       if (!input) return;
       input.focus();
       input.setSelectionRange(nextCaret, nextCaret);
     });
-  }, [inputRef, updateValue]);
+  }, [inputRef, replaceMention, updateValue]);
 
   const select = useCallback(
     (member: MemberProfile, query = mention) => {
@@ -124,7 +135,7 @@ export function useMentionAutocomplete({
       const next =
         current.slice(0, query.start) + inserted + current.slice(query.end);
       updateValue(next);
-      setMention(null);
+      replaceMention(null);
       window.requestAnimationFrame(() => {
         const textarea = inputRef.current;
         if (!textarea) return;
@@ -133,7 +144,7 @@ export function useMentionAutocomplete({
         textarea.focus();
       });
     },
-    [inputRef, mention, updateValue],
+    [inputRef, mention, replaceMention, updateValue],
   );
 
   return {

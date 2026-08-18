@@ -25,6 +25,14 @@ const agent: ParticipantRef = {
   kind: "personality_agent",
   personalityAgentId: "a1",
 };
+const secondAgent: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a2",
+};
+const thirdAgent: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a3",
+};
 const humanKey = participantKey(human);
 
 const members: MemberProfile[] = [
@@ -106,6 +114,30 @@ afterEach(() => {
 });
 
 describe("Composer 送信ボタン", () => {
+  it("ArrowDownを2回押してkeyupを通っても3番目の候補をEnterで選ぶ", () => {
+    useMessaging.setState({
+      membersByKey: Object.fromEntries(
+        [
+          ...members,
+          { participant: secondAgent, displayName: "綾", tagline: "編集" },
+          { participant: thirdAgent, displayName: "凛", tagline: "分析" },
+        ].map((member) => [participantKey(member.participant), member]),
+      ),
+    });
+    render(<Composer />);
+    const input = composer();
+
+    fireEvent.change(input, { target: { value: "@" } });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyUp(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyUp(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyUp(input, { key: "Enter" });
+
+    expect(input).toHaveValue("@凛 ");
+  });
+
   it("空入力では無効で、文字を入れるとクリックだけで送れる", () => {
     render(<Composer />);
     const button = screen.getByRole("button", { name: "送信" });

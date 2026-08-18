@@ -34,6 +34,26 @@ export type TimelineRow =
       failed: boolean;
     };
 
+/** 本文を持つ版の比較に必要な最小の形。 */
+export interface MessageContentRevision {
+  content: string;
+  revision?: number;
+}
+
+/**
+ * 後着の古い本文で、すでに表示・競合表示・編集基準にした版を戻さない。
+ * 同一revisionは server の正規化済み本文を受け入れる。
+ */
+export function applyMessageRevision<T extends MessageContentRevision>(
+  current: T | undefined,
+  incoming: T,
+): T {
+  if (!current || (incoming.revision ?? 1) >= (current.revision ?? 1)) {
+    return incoming;
+  }
+  return current;
+}
+
 /**
  * seq昇順を保ってメッセージを挿入・置換する。
  * 同じmessageIdではrevisionを単調に保ち、同じseqの別IDは後着を採用しない。
@@ -47,11 +67,10 @@ export function upsertMessage(
   );
   if (byId >= 0) {
     const current = messages[byId];
-    if ((incoming.revision ?? 1) < (current.revision ?? 1)) {
-      return [...messages];
-    }
+    const nextMessage = applyMessageRevision(current, incoming);
+    if (nextMessage === current) return [...messages];
     const next = [...messages];
-    next[byId] = incoming;
+    next[byId] = nextMessage;
     return next;
   }
   const next = [...messages];
