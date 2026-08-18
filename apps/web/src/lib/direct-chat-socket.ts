@@ -19,13 +19,14 @@ export type DirectChatCommand =
     };
 
 /**
- * The API accepts the upgrade and closes with this code when an authorized
- * session could not get an agent runtime started. It is the only channel a page
- * can read a cause on, and it mirrors
+ * The API accepts the upgrade and closes with this code/reason pair when an
+ * authorized session could not get an agent runtime started. It is the only
+ * channel a page can read a cause on, and it mirrors
  * `DirectChatRuntimeUnavailableCloseCode` in
  * `apps/api/internal/agentevents/browser_ws.go`.
  */
 export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE = 4001;
+export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON = "runtime_not_ready";
 
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
 export type DirectChatReadyState = "unknown" | "ready" | "not_ready";
@@ -1016,7 +1017,8 @@ export class DirectChatSocket {
       // origin, an offline network, and a DNS or TLS failure are all the same
       // unattributable close here and stay "unknown".
       this.setReadyState(
-        event?.code === DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE
+        event?.code === DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE &&
+          event.reason === DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON
           ? "not_ready"
           : "unknown",
       );

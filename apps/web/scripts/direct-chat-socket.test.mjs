@@ -3,6 +3,7 @@ import test from "node:test";
 import { createConversationStore } from "../src/agent/store.ts";
 import {
   DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+  DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON,
   DirectChatSocket,
   isDirectChatCommand,
   parseDirectChatServerFrame,
@@ -1297,7 +1298,10 @@ test("only a cause the server states marks the agent unavailable", () => {
   // close frame, which is the only channel a page can read a cause on.
   const wire = FakeWebSocket.instances.at(-1);
   wire.open();
-  wire.close(DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE, "runtime_not_ready");
+  wire.close(
+    DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+    DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON,
+  );
 
   assert.deepEqual(connections, ["connecting", "connected", "closed"]);
   assert.deepEqual(readiness, ["unknown", "not_ready"]);
@@ -1324,6 +1328,18 @@ test("closes the browser cannot attribute never blame the agent runtime", () => 
       (wire) => {
         wire.open();
         wire.close(1001, "going away");
+      },
+    ],
+    // CloseEvent exposes client-originated codes too. Code 4001 without the
+    // server-reserved reason must not become an attributed runtime failure.
+    [
+      "client pending retry",
+      (wire) => {
+        wire.open();
+        wire.close(
+          DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+          "deterministic pending retry",
+        );
       },
     ],
   ]) {

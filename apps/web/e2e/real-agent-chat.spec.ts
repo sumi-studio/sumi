@@ -85,7 +85,7 @@ test("two real Chrome pages own Direct Chat through the production Participant l
             if (state.armed) {
               state.armed = false;
               state.suppressed += 1;
-              this.close(4001, "deterministic pending retry");
+              this.close(4000, "client_pending_retry");
               return;
             }
           }
