@@ -38,6 +38,26 @@ type recordingPushClient struct {
 	err            error
 }
 
+// blockingPushClient makes the boundary between the lease and HTTPS observable:
+// started closes only after webpush has built the outbound request, and Do then
+// remains blocked until the test releases the remote endpoint.
+type blockingPushClient struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingPushClient) Do(request *http.Request) (*http.Response, error) {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return &http.Response{
+		StatusCode: http.StatusCreated,
+		Body:       io.NopCloser(bytes.NewReader(nil)),
+		Header:     http.Header{},
+		Request:    request,
+	}, nil
+}
+
 func (c *recordingPushClient) Do(request *http.Request) (*http.Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -422,6 +442,75 @@ func TestPushDoesNotSendToAMemberRemovedAfterMessageCommit(t *testing.T) {
 		ch, msg, decisions, "Yohaku")
 	if sent := client.endpoints(); len(sent) != 0 {
 		t.Fatalf("push sent to member removed after commit: %v", sent)
+	}
+}
+
+func TestPushDoesNotSendDeletedMessageContent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/deleted")
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "消した本文は通知しない")
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+	if _, err := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).
+		DeleteMessage(ctx, ch.PlaceID, msg.MessageID); err != nil {
+		t.Fatalf("delete committed before push planning: %v", err)
+	}
+
+	client := &recordingPushClient{}
+	dispatcher := w.dispatcher(t, ctx, client)
+	dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope,
+		ch, msg, decisions, "Yohaku")
+	if sent := client.endpoints(); len(sent) != 0 {
+		t.Fatalf("deleted message sent push endpoints: %v", sent)
+	}
+}
+
+func TestSlowPushEndpointDoesNotHoldWorkspaceLease(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/slow")
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "遅い push endpoint")
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+	client := &blockingPushClient{started: make(chan struct{}), release: make(chan struct{})}
+	dispatcher := w.dispatcher(t, ctx, client)
+	delivered := make(chan struct{})
+	go func() {
+		defer close(delivered)
+		dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope,
+			ch, msg, decisions, "Yohaku")
+	}()
+	select {
+	case <-client.started:
+	case <-ctx.Done():
+		t.Fatal("push never reached the blocked endpoint")
+	}
+
+	// This is an exclusive Workspace mutation. It must complete while the
+	// endpoint is stalled: the delivery plan's lease was committed before Do.
+	mutationCtx, mutationCancel := context.WithTimeout(ctx, 2*time.Second)
+	err = w.workspaces.RemoveMember(mutationCtx, workspace.WorkspaceID,
+		activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.humanB), w.humanA)
+	mutationCancel()
+	if err != nil {
+		close(client.release)
+		<-delivered
+		t.Fatalf("workspace mutation waited for slow push: %v", err)
+	}
+	close(client.release)
+	select {
+	case <-delivered:
+	case <-ctx.Done():
+		t.Fatal("push delivery did not finish after release")
 	}
 }
 

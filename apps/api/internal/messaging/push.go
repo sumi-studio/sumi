@@ -231,13 +231,12 @@ func (s *ScopedStore) DeletePushSubscription(ctx context.Context, endpoint strin
 	return nil
 }
 
-// pushSubscriptionsFor loads every endpoint belonging to the given humans in
-// one round trip, keyed by ParticipantRef.Key(). これは配送側の内部読み出しで、
-// 呼び出し元が current audience の shared lease を保持している間にだけ使う。
-// intent は message と同じ transaction で確定するが、それ自体は後続配送の
-// 認可にはならない。
-func (s *Store) pushSubscriptionsFor(
-	ctx context.Context, recipients []ParticipantRef,
+// pushSubscriptionsForWith loads every endpoint belonging to the given humans
+// in one round trip, keyed by ParticipantRef.Key(). Callers that form a
+// delivery plan use the audience lease transaction as q, so authorization,
+// message state, and endpoint selection share one snapshot.
+func (s *Store) pushSubscriptionsForWith(
+	ctx context.Context, q querier, recipients []ParticipantRef,
 ) (map[string][]PushSubscription, error) {
 	humanIDs := make([]string, 0, len(recipients))
 	for _, recipient := range recipients {
@@ -249,7 +248,7 @@ func (s *Store) pushSubscriptionsFor(
 	if len(humanIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.pool.Query(ctx,
+	rows, err := q.Query(ctx,
 		`SELECT subscription_id, human_id, endpoint, p256dh, auth, created_at
 		 FROM push_subscriptions WHERE human_id = ANY($1)
 		 ORDER BY created_at`, humanIDs)
@@ -274,6 +273,12 @@ func (s *Store) pushSubscriptionsFor(
 		return nil, fmt.Errorf("iterate push subscriptions: %w", err)
 	}
 	return out, nil
+}
+
+func (s *Store) pushSubscriptionsFor(
+	ctx context.Context, recipients []ParticipantRef,
+) (map[string][]PushSubscription, error) {
+	return s.pushSubscriptionsForWith(ctx, s.pool, recipients)
 }
 
 // forgetPushEndpoint removes an endpoint the push service declared dead (404 /
@@ -445,24 +450,39 @@ func (d *PushDispatcher) deliver(
 		return
 	}
 	// A notification intent is the immutable decision that a recipient should
-	// be called. It is not permission to disclose the message forever. Take the
-	// exact same shared audience lease as live fanout before this process sends
-	// a payload outside; a membership removal that committed first therefore
-	// removes the browser from the only sendable audience.
-	err := d.store.withLiveAudience(ctx, scope, liveBoundary{placeID: place.PlaceID}, false,
-		func(audience map[ParticipantRef]struct{}) error {
-			d.deliverToAudience(ctx, audience, place, msg, decisions, authorName)
-			return nil
+	// be called. It is not permission to disclose the message forever. Recheck
+	// the current audience, message, and subscriptions in the same audience
+	// lease, then release it before HTTPS delivery. Unlike live WS fanout,
+	// push is external I/O and a slow endpoint must never hold these locks.
+	var deliveries []pushDelivery
+	err := d.store.withLiveAudienceInTx(ctx, scope, liveBoundary{placeID: place.PlaceID}, false,
+		func(tx pgx.Tx, audience map[ParticipantRef]struct{}) error {
+			var err error
+			deliveries, err = d.deliveryPlanInTx(ctx, tx, scope, audience, place, msg, decisions, authorName)
+			return err
 		})
 	if err != nil {
 		log.Printf("messaging push: reauthorize audience: %v", err)
+		return
+	}
+	for _, delivery := range deliveries {
+		d.send(ctx, delivery.subscription, delivery.payload, delivery.topic)
 	}
 }
 
-func (d *PushDispatcher) deliverToAudience(
-	ctx context.Context, audience map[ParticipantRef]struct{}, place Place, msg Message,
+type pushDelivery struct {
+	subscription PushSubscription
+	payload      []byte
+	topic        string
+}
+
+// deliveryPlanInTx only reads durable state and builds bytes. In particular,
+// it deliberately contains no HTTP call; deliver sends the completed plan
+// after withLiveAudienceInTx has committed and released its fences.
+func (d *PushDispatcher) deliveryPlanInTx(
+	ctx context.Context, tx pgx.Tx, scope Scope, audience map[ParticipantRef]struct{}, place Place, msg Message,
 	decisions []NotificationDecision, authorName string,
-) {
+) ([]pushDelivery, error) {
 	humans := make([]ParticipantRef, 0, len(decisions))
 	for _, decision := range decisions {
 		if decision.Participant.Kind == KindHuman {
@@ -472,19 +492,42 @@ func (d *PushDispatcher) deliverToAudience(
 		}
 	}
 	if len(humans) == 0 {
-		return
+		return nil, nil
 	}
-	subscriptions, err := d.store.pushSubscriptionsFor(ctx, humans)
+	subscriptions, err := d.store.pushSubscriptionsForWith(ctx, tx, humans)
 	if err != nil {
-		log.Printf("messaging push: load subscriptions: %v", err)
-		return
+		return nil, err
 	}
 	if len(subscriptions) == 0 {
-		return
+		return nil, nil
+	}
+	// Read the message as late as possible before the plan is frozen. A deletion
+	// that committed before this lease reaches this query wins and produces no
+	// push at all: a generic late notification would still be misleading, while
+	// place/cursor replay remains the durable truth.
+	current, err := lockMessageScoped(ctx, tx, scope.WorkspaceID, place.PlaceID, msg.MessageID)
+	if err != nil {
+		return nil, err
+	}
+	if current.Deleted {
+		return nil, nil
+	}
+	currentParts := []Message{current}
+	if err := attachAttachmentsWith(ctx, tx, currentParts); err != nil {
+		return nil, err
+	}
+	current = currentParts[0]
+	// The place is already FOR SHARE through the live-audience lease. Reload it
+	// here so the payload's title/address comes from the same snapshot as the
+	// message and endpoints rather than from post-commit append state.
+	currentPlace, err := (&ScopedStore{Store: d.store, Scope: scope}).loadScopedPlace(ctx, tx, place.PlaceID)
+	if err != nil {
+		return nil, err
 	}
 	if authorName == "" {
 		authorName = defaultPushTitle
 	}
+	var out []pushDelivery
 	for _, decision := range decisions {
 		if decision.Participant.Kind != KindHuman {
 			continue
@@ -497,22 +540,26 @@ func (d *PushDispatcher) deliverToAudience(
 			continue
 		}
 		payload, err := json.Marshal(PushPayload{
-			WorkspaceID: place.WorkspaceID,
-			PlaceID:     place.PlaceID,
-			PlaceKind:   place.Kind,
-			Title:       PushTitle(place, authorName),
-			Body:        PushBody(msg),
+			WorkspaceID: currentPlace.WorkspaceID,
+			PlaceID:     currentPlace.PlaceID,
+			PlaceKind:   currentPlace.Kind,
+			Title:       PushTitle(currentPlace, authorName),
+			Body:        PushBody(current),
 			Reason:      decision.Reason,
-			Seq:         msg.Seq,
+			Seq:         current.Seq,
 		})
 		if err != nil {
-			log.Printf("messaging push: encode payload: %v", err)
-			return
+			return nil, fmt.Errorf("encode push payload: %w", err)
 		}
 		for _, subscription := range endpoints {
-			d.send(ctx, subscription, payload, pushTopic(place.PlaceID))
+			out = append(out, pushDelivery{
+				subscription: subscription,
+				payload:      payload,
+				topic:        pushTopic(currentPlace.PlaceID),
+			})
 		}
 	}
+	return out, nil
 }
 
 func (d *PushDispatcher) send(ctx context.Context, subscription PushSubscription, payload []byte, topic string) {

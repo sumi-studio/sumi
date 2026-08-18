@@ -526,37 +526,31 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	current, err := store.NotificationSettingFor(r.Context())
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	if request.DefaultsLevel == nil && request.PerPlace == nil && request.Keywords == nil {
+		current, err := store.NotificationSettingFor(r.Context())
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, struct {
 			Setting notificationSettingWire `json:"setting"`
 		}{notificationSettingToWire(current)})
 		return
 	}
-	defaultLevel := current.Default()
-	if request.DefaultsLevel != nil {
-		defaultLevel = *request.DefaultsLevel
-	}
-	perPlace := current.PerPlace
+	var perPlace *[]PlaceNotifyLevel
 	if request.PerPlace != nil {
-		perPlace = make([]PlaceNotifyLevel, 0, len(*request.PerPlace))
+		converted := make([]PlaceNotifyLevel, 0, len(*request.PerPlace))
 		for _, entry := range *request.PerPlace {
 			if entry.PlaceID == "" {
 				writeError(w, http.StatusBadRequest, "invalid_request")
 				return
 			}
-			perPlace = append(perPlace, PlaceNotifyLevel{PlaceID: entry.PlaceID, Level: entry.Level})
+			converted = append(converted, PlaceNotifyLevel{PlaceID: entry.PlaceID, Level: entry.Level})
 		}
+		perPlace = &converted
 	}
-	keywords := current.Keywords
-	if request.Keywords != nil {
-		keywords = *request.Keywords
-	}
-	stored, err := store.SetNotificationSetting(r.Context(), defaultLevel, perPlace, keywords)
+	stored, err := store.UpdateNotificationSetting(
+		r.Context(), request.DefaultsLevel, perPlace, request.Keywords)
 	if err != nil {
 		writeStoreError(w, err)
 		return
