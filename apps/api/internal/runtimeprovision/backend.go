@@ -11,5 +11,5 @@ type Backend interface {
 	Abort(context.Context, PreparedEpoch) (Inspection, error)
 	Inspect(context.Context, string) (Inspection, error)
 	Stop(context.Context, PreparedEpoch) (Inspection, error)
-	Reconcile(context.Context, string) (Inspection, error)
+	Reconcile(context.Context, ReconcileRequest) (Inspection, error)
 }

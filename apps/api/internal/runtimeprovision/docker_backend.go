@@ -461,12 +461,22 @@ func (backend *DockerBackend) Stop(ctx context.Context, epoch PreparedEpoch) (In
 	return parseExactSupervisorReap(output, epoch)
 }
 
-func (backend *DockerBackend) Reconcile(ctx context.Context, personalityAgentID string) (Inspection, error) {
-	output, err := backend.run(ctx, "reconcile", personalityAgentID, nil, nil)
+func (backend *DockerBackend) Reconcile(ctx context.Context, request ReconcileRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	var expected map[string]string
+	if request.FencedEpoch != nil {
+		expected = map[string]string{
+			"SUMI_EXPECTED_RPC_GENERATION": fmt.Sprint(request.FencedEpoch.Generation),
+			"SUMI_EXPECTED_RPC_NONCE":      request.FencedEpoch.RPCBootNonce,
+		}
+	}
+	output, err := backend.run(ctx, "reconcile", request.PersonalityAgentID, nil, expected)
 	if err != nil {
 		return Inspection{}, err
 	}
-	return parseSupervisorInspection(output, personalityAgentID)
+	return parseSupervisorInspection(output, request.PersonalityAgentID)
 }
 
 func (backend *DockerBackend) run(ctx context.Context, action, personalityAgentID string, supplied, forced map[string]string) ([]byte, error) {

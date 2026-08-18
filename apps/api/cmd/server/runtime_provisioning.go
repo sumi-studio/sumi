@@ -22,6 +22,7 @@ type runtimeProvisioner interface {
 	Prepare(context.Context, runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error)
 	Activate(context.Context, runtimeprovision.ActivateRequest) (runtimeprovision.Inspection, error)
 	Abort(context.Context, runtimeprovision.AbortRequest) (runtimeprovision.Inspection, error)
+	Inspect(context.Context, runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error)
 	Stop(context.Context, runtimeprovision.StopRequest) (runtimeprovision.Inspection, error)
 	Reconcile(context.Context, runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error)
 }
@@ -264,7 +265,7 @@ func (s *provisionedRuntimeSpawner) requireExactActiveEpoch(
 	ctx context.Context,
 	epoch runtimeprovision.PreparedEpoch,
 ) error {
-	inspection, err := s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+	inspection, err := s.config.Provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 		Version:            runtimeprovision.ProtocolVersion,
 		PersonalityAgentID: epoch.PersonalityAgentID,
 	})
@@ -279,9 +280,25 @@ func (s *provisionedRuntimeSpawner) requireExactActiveEpoch(
 }
 
 func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) (*uint64, error) {
-	inspection, err := s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+	inspection, err := s.config.Provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 		Version:            runtimeprovision.ProtocolVersion,
 		PersonalityAgentID: personalityAgentID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("inspect previous runtime before reconcile: %w", err)
+	}
+	var fencedEpoch *runtimeprovision.PreparedEpoch
+	if inspection.Epoch != nil {
+		epoch := *inspection.Epoch
+		if err := s.fenceLocalRuntimeBeforeReap(epoch); err != nil {
+			return nil, err
+		}
+		fencedEpoch = &epoch
+	}
+	inspection, err = s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+		Version:            runtimeprovision.ProtocolVersion,
+		PersonalityAgentID: personalityAgentID,
+		FencedEpoch:        fencedEpoch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reconcile previous runtime: %w", err)
@@ -291,20 +308,22 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 			return nil, nil
 		}
 		reaped := *inspection.ReapedThroughGeneration
+		if fencedEpoch != nil && reaped < fencedEpoch.Generation {
+			return nil, errors.New("reconcile reaped a generation older than the fenced runtime")
+		}
 		return &reaped, nil
 	}
 	if inspection.Epoch == nil {
 		return nil, errors.New("reconcile returned a live phase without an epoch")
 	}
 	epoch := *inspection.Epoch
+	if fencedEpoch == nil || *fencedEpoch != epoch {
+		if err := s.fenceLocalRuntimeBeforeReap(epoch); err != nil {
+			return nil, err
+		}
+	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), s.config.TeardownTimeout)
 	defer cancel()
-	fenceErr := s.config.Authorizations.FenceLocalRuntimeAuthorization(
-		cleanupCtx,
-		epoch.PersonalityAgentID,
-		epoch.Generation,
-		epoch.RPCBootNonce,
-	)
 	var teardown runtimeprovision.Inspection
 	var lifecycleErr error
 	switch inspection.Phase {
@@ -321,12 +340,8 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 	default:
 		lifecycleErr = fmt.Errorf("reconcile returned unsupported phase %q", inspection.Phase)
 	}
-	var listenerErr error
-	if lifecycleErr == nil {
-		listenerErr = s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID)
-	}
-	if err := errors.Join(fenceErr, lifecycleErr, listenerErr); err != nil {
-		return nil, fmt.Errorf("retire reconciled runtime: %w", err)
+	if lifecycleErr != nil {
+		return nil, fmt.Errorf("retire reconciled runtime: %w", lifecycleErr)
 	}
 	if teardown.Phase != runtimeprovision.PhaseUnknown ||
 		teardown.PersonalityAgentID != epoch.PersonalityAgentID ||
@@ -336,6 +351,26 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 	}
 	reaped := *teardown.ReapedThroughGeneration
 	return &reaped, nil
+}
+
+// fenceLocalRuntimeBeforeReap revokes both the bearer/Ready authority and its
+// listener before any call that can destroy this epoch's Compose project.
+func (s *provisionedRuntimeSpawner) fenceLocalRuntimeBeforeReap(epoch runtimeprovision.PreparedEpoch) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), s.config.TeardownTimeout)
+	defer cancel()
+	fenceErr := s.config.Authorizations.FenceLocalRuntimeAuthorization(
+		cleanupCtx,
+		epoch.PersonalityAgentID,
+		epoch.Generation,
+		epoch.RPCBootNonce,
+	)
+	if fenceErr != nil {
+		return fmt.Errorf("fence local runtime before reap: %w", fenceErr)
+	}
+	if err := s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID); err != nil {
+		return fmt.Errorf("close local runtime before reap: %w", err)
+	}
+	return nil
 }
 
 type provisionedProcess struct {
@@ -359,7 +394,7 @@ func (p *provisionedProcess) Wait() error {
 			return p.stopErr
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-			inspection, err := p.provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+			inspection, err := p.provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 				Version:            runtimeprovision.ProtocolVersion,
 				PersonalityAgentID: p.epoch.PersonalityAgentID,
 			})

@@ -82,6 +82,9 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	if err := service.attachDurableReap(&inspection); err != nil {
 		return PreparedEpoch{}, err
 	}
+	if inspection.Phase == PhaseRecovery {
+		return PreparedEpoch{}, fmt.Errorf("%w: runtime requires fenced reconciliation before prepare", ErrConflict)
+	}
 	if inspection.Phase == PhasePrepared || inspection.Phase == PhaseActive {
 		entry.known = true
 		entry.phase = inspection.Phase
@@ -119,7 +122,7 @@ func (service *Service) Activate(ctx context.Context, request ActivateRequest) (
 	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
 		return Inspection{}, err
 	}
-	if !entry.known || entry.phase == PhaseUnknown || entry.epoch != request.PreparedEpoch {
+	if !entry.known || (entry.phase != PhasePrepared && entry.phase != PhaseActive) || entry.epoch != request.PreparedEpoch {
 		return Inspection{}, fmt.Errorf("%w: activate does not match the prepared epoch", ErrConflict)
 	}
 	if entry.phase == PhaseActive {
@@ -148,6 +151,9 @@ func (service *Service) Abort(ctx context.Context, request AbortRequest) (Inspec
 	}
 	if entry.known && entry.phase == PhaseUnknown {
 		return entry.unknownInspection(request.PersonalityAgentID), nil
+	}
+	if entry.known && entry.phase == PhaseRecovery {
+		return Inspection{}, fmt.Errorf("%w: runtime requires fenced reconciliation before abort", ErrConflict)
 	}
 	if !entry.known || entry.phase == PhaseUnknown || entry.epoch != request.PreparedEpoch {
 		return Inspection{}, fmt.Errorf("%w: abort does not match the prepared epoch", ErrConflict)
@@ -231,7 +237,11 @@ func (service *Service) Reconcile(ctx context.Context, request ReconcileRequest)
 	entry := service.entry(request.PersonalityAgentID)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
-	inspection, err := service.backend.Reconcile(ctx, request.PersonalityAgentID)
+	if entry.known && entry.phase == PhaseRecovery &&
+		(request.FencedEpoch == nil || *request.FencedEpoch != entry.epoch) {
+		return Inspection{}, fmt.Errorf("%w: recovery reconcile requires its exact fenced epoch", ErrConflict)
+	}
+	inspection, err := service.backend.Reconcile(ctx, request)
 	if err != nil {
 		return Inspection{}, err
 	}

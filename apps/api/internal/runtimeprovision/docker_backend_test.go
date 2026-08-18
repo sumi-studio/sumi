@@ -123,12 +123,28 @@ func TestDockerBackendReconcileReturnsObservedEmptyReceipt(t *testing.T) {
 		"reconcile": `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":7}`,
 	}}
 	backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}
-	inspection, err := backend.Reconcile(context.Background(), testPAID)
+	fenced := PreparedEpoch{
+		PersonalityAgentID:   testPAID,
+		Generation:           7,
+		RPCBootNonce:         "boot-7",
+		OpaquePreparedHandle: dockerPreparedHandle(testPAID, 7, "boot-7"),
+	}
+	inspection, err := backend.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, FencedEpoch: &fenced,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != 7 {
 		t.Fatalf("reconcile lost the supervisor's observed-empty receipt: %#v", inspection)
+	}
+	for _, expected := range []string{
+		"SUMI_EXPECTED_RPC_GENERATION=7",
+		"SUMI_EXPECTED_RPC_NONCE=boot-7",
+	} {
+		if !strings.Contains(strings.Join(runner.envs[0], "\n"), expected) {
+			t.Fatalf("fenced reconcile did not pin %q: %#v", expected, runner.envs[0])
+		}
 	}
 }
 

@@ -55,6 +55,8 @@ type fakeRuntimeProvisioner struct {
 	activationErr   error
 	mismatchActive  bool
 	dropBeforeReady bool
+	recovery        map[string]bool
+	reconcileReaps  map[string]bool
 	omitReapReceipt bool
 }
 
@@ -67,6 +69,8 @@ func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvi
 		stops:          make(map[string]int),
 		activations:    make(map[string]runtimeprovision.ActivationConfig),
 		reapedThrough:  make(map[string]uint64),
+		recovery:       make(map[string]bool),
+		reconcileReaps: make(map[string]bool),
 	}
 }
 
@@ -158,6 +162,13 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 		}
 		return inspection, nil
 	}
+	if p.reconcileReaps[request.PersonalityAgentID] {
+		p.recorder.add("reap:" + request.PersonalityAgentID)
+		delete(p.epochs, request.PersonalityAgentID)
+		delete(p.recovery, request.PersonalityAgentID)
+		delete(p.reconcileReaps, request.PersonalityAgentID)
+		return p.reapInspection(epoch), nil
+	}
 	if p.dropBeforeReady {
 		delete(p.epochs, request.PersonalityAgentID)
 		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
@@ -167,6 +178,25 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 		Phase:              runtimeprovision.PhaseActive,
 		Epoch:              &epoch,
 	}, nil
+}
+
+func (p *fakeRuntimeProvisioner) Inspect(_ context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
+	p.recorder.add("inspect:" + request.PersonalityAgentID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	epoch, exists := p.epochs[request.PersonalityAgentID]
+	if !exists {
+		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	}
+	if p.dropBeforeReady {
+		delete(p.epochs, request.PersonalityAgentID)
+		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	}
+	phase := runtimeprovision.PhaseActive
+	if p.recovery[request.PersonalityAgentID] {
+		phase = runtimeprovision.PhaseRecovery
+	}
+	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: phase, Epoch: &epoch}, nil
 }
 
 type fakeAuthorizationController struct {
@@ -506,10 +536,11 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 		t.Fatalf("replacement activation omitted or misbound verified reap attestation: %#v", activation.ReapAttestation)
 	}
 	want := []string{
-		"reconcile:" + paid,
+		"inspect:" + paid,
 		"fence:" + paid,
-		"stop:" + paid,
 		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"stop:" + paid,
 		"prepare:" + paid,
 	}
 	// Match the second lifecycle suffix rather than the initial reconciliation.
@@ -522,6 +553,63 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	}
 	if !containsOrdered(recorder.calls[secondStart:], want) {
 		t.Fatalf("reconcile ordering mismatch: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerFencesBeforeReconcileReapsActiveProjectWithOrphan(t *testing.T) {
+	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+		"prepare:" + paid,
+	}) {
+		t.Fatalf("active orphan reconcile reaped before local authority was fenced: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerFencesBeforeReconcileReapsPartialProject(t *testing.T) {
+	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+		"prepare:" + paid,
+	}) {
+		t.Fatalf("partial reconcile reaped before local authority was fenced: %v", recorder.calls)
 	}
 }
 

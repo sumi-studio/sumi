@@ -789,20 +789,24 @@ inspect_epoch() {
   local running
   running="$(running_role_count)" || fail "cannot inspect Compose role state"
   if [[ "${running}" == 3 ]]; then
-    project_containers_match_expected_roles runtime executor broker ||
-      fail "active project contains containers outside the expected role set; reconcile before reuse"
-    epoch_identity || fail "active project has no coherent prepared epoch"
-    print_epoch_json active
-    return
+    if project_containers_match_expected_roles runtime executor broker; then
+      epoch_identity || fail "active project has no coherent prepared epoch"
+      print_epoch_json active
+      return
+    fi
   fi
-  [[ "${running}" == 0 ]] || fail "project contains a partial active generation"
-  ! long_lived_containers_exist ||
-    fail "project contains a failed active generation; reconcile before reuse"
-  if prepared_containers_exist; then
+  if [[ "${running}" == 0 ]] && ! long_lived_containers_exist && prepared_containers_exist; then
     project_containers_match_expected_roles allocator prepare ||
       fail "prepared project contains containers outside the expected role set; reconcile before reuse"
     epoch_identity || fail "prepared project has no coherent epoch"
     print_epoch_json prepared
+    return
+  fi
+  # A partial, failed, or orphaned project is not reusable, but allocator
+  # identity remains the authority needed by the API to fence local control
+  # before its subsequent destructive reconcile.
+  if epoch_identity; then
+    print_epoch_json recovery
   else
     print_unknown_json
   fi
@@ -1010,6 +1014,15 @@ case "${action}" in
       # publish its local receipt. `down` is a no-op in that case; always run
       # it so every other leftover container shape is removed before the
       # observed-empty check and any durable re-attestation.
+      # If a durable epoch remains, the API must bind this destructive action
+      # to the exact epoch whose local-control authority it already fenced.
+      # Without an epoch there is no issued local-control authority; a
+      # long-lived role in that state is ambiguous and must not be reaped.
+      if epoch_identity; then
+        require_expected_epoch
+      elif long_lived_containers_exist; then
+        fail "reconcile found long-lived roles without a fenceable epoch"
+      fi
       lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1 || true
       cleanup_project_is_empty || fail "reconcile did not leave an observed-empty Compose project"

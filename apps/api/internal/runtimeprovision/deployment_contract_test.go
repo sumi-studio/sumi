@@ -143,6 +143,8 @@ exec /usr/bin/stat "$@"
 		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
 		"SUMI_FAKE_DOCKER_STATE=" + dockerState,
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_EXPECTED_RPC_GENERATION=7",
+		"SUMI_EXPECTED_RPC_NONCE=reconciled-nonce",
 	}
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -157,7 +159,7 @@ exec /usr/bin/stat "$@"
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
 	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
-	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
+	durableGeneration := strings.LastIndex(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("reconcile did not observe empty before deriving its durable generation:\n%s", calls)
 	}
@@ -214,6 +216,8 @@ exec /usr/bin/stat "$@"
 		"SUMI_CONFIG_FILE=/dev/null",
 		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_EXPECTED_RPC_GENERATION=7",
+		"SUMI_EXPECTED_RPC_NONCE=recovered-nonce",
 	}
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -228,7 +232,7 @@ exec /usr/bin/stat "$@"
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
 	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
-	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
+	durableGeneration := strings.LastIndex(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("reconcile did not verify emptiness before re-attesting the durable generation:\n%s", calls)
 	}
@@ -299,6 +303,8 @@ exec /usr/bin/stat "$@"
 		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
 		"SUMI_FAKE_DOCKER_STATE=" + dockerState,
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_EXPECTED_RPC_GENERATION=7",
+		"SUMI_EXPECTED_RPC_NONCE=allocator-only-nonce",
 	}
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -313,7 +319,7 @@ exec /usr/bin/stat "$@"
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
 	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
-	durableGeneration := strings.Index(string(calls), "compose.prepare.yaml run")
+	durableGeneration := strings.LastIndex(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("allocator-only reconcile did not tear down and observe empty before re-attesting:\n%s", calls)
 	}
@@ -420,8 +426,9 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 			t.Fatalf("reconcile cleanup omits %q:\n%s", required, reconcile)
 		}
 	}
-	if strings.Index(reconcile, "cleanup_project_is_empty") > strings.Index(reconcile, "if epoch_identity; then") ||
-		strings.Index(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
+	if strings.Index(reconcile, "require_expected_epoch") > strings.Index(reconcile, "lifecycle_compose down") ||
+		strings.Index(reconcile, "cleanup_project_is_empty") > strings.LastIndex(reconcile, "if epoch_identity; then") ||
+		strings.LastIndex(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
 		t.Fatalf("reconcile can attest before observed-empty verification and durable generation recovery:\n%s", reconcile)
 	}
 }

@@ -173,7 +173,8 @@ func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) (Inspec
 	return inspection, nil
 }
 
-func (backend *fakeBackend) Reconcile(ctx context.Context, personalityAgentID string) (Inspection, error) {
+func (backend *fakeBackend) Reconcile(ctx context.Context, request ReconcileRequest) (Inspection, error) {
+	personalityAgentID := request.PersonalityAgentID
 	backend.mu.Lock()
 	if generation, ok := backend.reconcileReaps[personalityAgentID]; ok {
 		backend.mu.Unlock()

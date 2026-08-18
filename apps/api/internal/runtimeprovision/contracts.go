@@ -29,6 +29,10 @@ const (
 	PhaseUnknown  Phase = "unknown"
 	PhasePrepared Phase = "prepared"
 	PhaseActive   Phase = "active"
+	// PhaseRecovery identifies a durable epoch whose Compose project is not in
+	// a reusable shape. It carries enough authority to fence local control
+	// before Reconcile removes the project.
+	PhaseRecovery Phase = "recovery"
 )
 
 // PrepareRequest asks the privileged backend to allocate exactly one new
@@ -114,6 +118,9 @@ type StopRequest struct {
 type ReconcileRequest struct {
 	Version            int    `json:"version"`
 	PersonalityAgentID string `json:"personality_agent_id"`
+	// FencedEpoch is the exact local-control epoch the API fenced before it
+	// asked the host to run a destructive reconciliation.
+	FencedEpoch *PreparedEpoch `json:"fenced_epoch,omitempty"`
 }
 
 type Inspection struct {
@@ -338,7 +345,18 @@ func (request ReconcileRequest) Validate() error {
 	if err := validateVersion(request.Version); err != nil {
 		return err
 	}
-	return ValidatePersonalityAgentID(request.PersonalityAgentID)
+	if err := ValidatePersonalityAgentID(request.PersonalityAgentID); err != nil {
+		return err
+	}
+	if request.FencedEpoch != nil {
+		if err := request.FencedEpoch.Validate(); err != nil {
+			return fmt.Errorf("fenced_epoch: %w", err)
+		}
+		if request.FencedEpoch.PersonalityAgentID != request.PersonalityAgentID {
+			return errors.New("fenced_epoch personality_agent_id mismatch")
+		}
+	}
+	return nil
 }
 
 func (inspection Inspection) Validate() error {
@@ -350,9 +368,9 @@ func (inspection Inspection) Validate() error {
 		if inspection.Epoch != nil {
 			return errors.New("unknown inspection must not carry an epoch")
 		}
-	case PhasePrepared, PhaseActive:
+	case PhasePrepared, PhaseActive, PhaseRecovery:
 		if inspection.Epoch == nil {
-			return errors.New("prepared or active inspection must carry an epoch")
+			return errors.New("prepared, active, or recovery inspection must carry an epoch")
 		}
 		if err := inspection.Epoch.Validate(); err != nil {
 			return err
