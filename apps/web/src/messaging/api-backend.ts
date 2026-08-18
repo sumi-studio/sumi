@@ -579,12 +579,22 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
   }
 
-  /** 現在の宣言をsocketへ流す。閉じたことも同じ経路で伝える。 */
+  /**
+   * 現在の宣言をsocketへ流す。閉じたことも同じ経路で伝える。
+   *
+   * 宣言にはこの画面をどこまで持っているか（cursor）を載せる。画面はRESTで
+   * 履歴を取ってから開くので、その取得とこの宣言の間にcommitされた投稿は、
+   * 手元のページにもliveにも無い——serverがここから replay して埋める。
+   */
   private declareOpenPlace(previous: string | null): void {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
     if (this.openPlaceID !== null) {
       this.socket.send(
-        JSON.stringify({ type: "open", place_id: this.openPlaceID }),
+        JSON.stringify({
+          type: "open",
+          place_id: this.openPlaceID,
+          since: this.cursors.get(this.openPlaceID) ?? 0,
+        }),
       );
       return;
     }

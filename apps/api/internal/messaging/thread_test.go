@@ -241,23 +241,34 @@ func TestThreadLiveDeliveryIsParticipationScopedUntilTheThreadIsOpen(t *testing.
 		}
 	}
 	// Frames reach one subscriber in the order they were queued, and each post
-	// has already fanned out by the time it responds. So an acknowledgement
-	// arriving first is proof that nothing was delivered before it — a read
-	// timeout would prove the same thing but permanently break the socket.
-	declareOpen := func(conn *websocket.Conn, placeID string) {
+	// has already fanned out by the time it responds. So the first frame that
+	// answers the declaration is proof that nothing was delivered before it — a
+	// read timeout would prove the same thing but permanently break the socket.
+	// The declaration says the client already holds everything committed so far,
+	// which leaves the replay empty and caught_up first.
+	declareOpenHoldingAll := func(conn *websocket.Conn, placeID string) {
 		t.Helper()
+		place, err := owner.PlaceFor(ctx, placeID)
+		if err != nil {
+			t.Fatalf("read place %s: %v", placeID, err)
+		}
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if err := conn.WriteJSON(map[string]any{"type": "open", "place_id": placeID}); err != nil {
+		if err := conn.WriteJSON(map[string]any{
+			"type": "open", "place_id": placeID, "since": place.LastSeq,
+		}); err != nil {
 			t.Fatalf("declare open place: %v", err)
 		}
+		if frame := readFrame(t, conn); frame["type"] != "caught_up" || frame["place_id"] != placeID {
+			t.Fatalf("first frame after open = %v, want caught_up for %s", frame, placeID)
+		}
 		if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != placeID {
-			t.Fatalf("first frame after open = %v, want open_ack for %s", frame, placeID)
+			t.Fatalf("frame after replay = %v, want open_ack for %s", frame, placeID)
 		}
 	}
 
 	post("参加者だけに届く", "thread-live-nonce-1")
 	expectMessage(participant, "参加者だけに届く")
-	declareOpen(viewer, thread.Place.PlaceID)
+	declareOpenHoldingAll(viewer, thread.Place.PlaceID)
 
 	post("開いている間は届く", "thread-live-nonce-2")
 	expectMessage(participant, "開いている間は届く")
@@ -269,7 +280,7 @@ func TestThreadLiveDeliveryIsParticipationScopedUntilTheThreadIsOpen(t *testing.
 	}
 	post("閉じたら届かない", "thread-live-nonce-3")
 	expectMessage(participant, "閉じたら届かない")
-	declareOpen(viewer, DefaultGeneralChannelID)
+	declareOpenHoldingAll(viewer, DefaultGeneralChannelID)
 
 	// Reading never admitted the viewer as a participant.
 	viewerStore := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
@@ -531,16 +542,19 @@ func TestThreadCatchUpFollowsParticipationNotTheClientsCursor(t *testing.T) {
 			t.Fatalf("expected caught_up for %s, got %v", placeID, frame)
 		}
 	}
-	declareOpen := func(conn *websocket.Conn, placeID string) {
+	declareOpen := func(conn *websocket.Conn, placeID string, since int64) {
 		t.Helper()
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if err := conn.WriteJSON(map[string]any{"type": "open", "place_id": placeID}); err != nil {
+		if err := conn.WriteJSON(map[string]any{
+			"type": "open", "place_id": placeID, "since": since,
+		}); err != nil {
 			t.Fatalf("declare open place: %v", err)
 		}
-		// Frames reach one subscriber in the order they were queued, so an
-		// acknowledgement arriving first proves nothing preceded it.
+	}
+	expectOpenAck := func(conn *websocket.Conn, placeID string) {
+		t.Helper()
 		if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != placeID {
-			t.Fatalf("first frame after open = %v, want open_ack for %s", frame, placeID)
+			t.Fatalf("expected open_ack for %s, got %v", placeID, frame)
 		}
 	}
 
@@ -554,17 +568,95 @@ func TestThreadCatchUpFollowsParticipationNotTheClientsCursor(t *testing.T) {
 	// different place proves the handshake replayed nothing for the thread:
 	// its acknowledgement is the first frame after hello_ack.
 	viewer := dialWS(t, ts, w.humanB.ID, map[string]int64{thread.Place.PlaceID: 0})
-	declareOpen(viewer, DefaultGeneralChannelID)
+	channel, err := owner.PlaceFor(ctx, DefaultGeneralChannelID)
+	if err != nil {
+		t.Fatalf("read channel place: %v", err)
+	}
+	declareOpen(viewer, DefaultGeneralChannelID, channel.LastSeq)
+	expectCaughtUp(viewer, DefaultGeneralChannelID)
+	expectOpenAck(viewer, DefaultGeneralChannelID)
 
-	// Declaring the thread open is what finally admits the deferred replay.
-	declareOpen(viewer, thread.Place.PlaceID)
+	// Declaring the thread open is what finally admits the deferred replay, and
+	// it lands before the acknowledgement like any other cursor's.
+	declareOpen(viewer, thread.Place.PlaceID, 0)
 	expectMessage(viewer, "先に置いておく")
 	expectMessage(viewer, "二通目")
 	expectCaughtUp(viewer, thread.Place.PlaceID)
+	expectOpenAck(viewer, thread.Place.PlaceID)
 
 	// Replay is delivery, not admission: the viewer is still not a participant.
 	viewerStore := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
 	if threads, err := viewerStore.ThreadsFor(ctx); err != nil || len(threads) != 0 {
 		t.Fatalf("catch-up admitted a participant: threads=%+v err=%v", threads, err)
 	}
+}
+
+// A screen is opened after its history has been fetched, so the declaration and
+// the fetch cannot be made simultaneous: whatever commits between them is in
+// neither. It is not in the page the client already holds, and it is not live,
+// because until the frame arrives the connection has not said it is looking at
+// the thread. The open frame therefore carries how far the client holds, and
+// the server replays from there before acknowledging.
+func TestThreadOpenReplaysWhatCommittedWhileTheDeclarationWasInFlight(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "行き違う枝", "", "thread-open-gap-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	post := func(content, nonce string) {
+		t.Helper()
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": nonce})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+	expectMessage := func(conn *websocket.Conn, content string) {
+		t.Helper()
+		frame := readFrame(t, conn)
+		event, _ := frame["event"].(map[string]any)
+		message, _ := event["message"].(map[string]any)
+		if frame["type"] != "event" || message["content"] != content {
+			t.Fatalf("expected %q, got %v", content, frame)
+		}
+	}
+
+	post("画面が読み込んだ分", "thread-open-gap-post-1")
+	// The screen fetched its history here: this is everything the client holds.
+	held, err := owner.PlaceFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("read thread place: %v", err)
+	}
+
+	// The socket is already up and carries no cursor for a thread this viewer
+	// never joined, so the handshake deferred nothing to flush.
+	viewer := dialWS(t, ts, w.humanB.ID, nil)
+	post("取得と宣言の隙間", "thread-open-gap-post-2")
+
+	_ = viewer.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := viewer.WriteJSON(map[string]any{
+		"type": "open", "place_id": thread.Place.PlaceID, "since": held.LastSeq,
+	}); err != nil {
+		t.Fatalf("declare open place: %v", err)
+	}
+
+	// The gap arrives by replay, before the acknowledgement. Frames reach one
+	// subscriber in the order they were queued, so this is also proof that the
+	// page the client already holds was not replayed on top of it.
+	expectMessage(viewer, "取得と宣言の隙間")
+	if frame := readFrame(t, viewer); frame["type"] != "caught_up" || frame["place_id"] != thread.Place.PlaceID {
+		t.Fatalf("expected caught_up for the thread, got %v", frame)
+	}
+	if frame := readFrame(t, viewer); frame["type"] != "open_ack" || frame["place_id"] != thread.Place.PlaceID {
+		t.Fatalf("expected open_ack after the replay, got %v", frame)
+	}
+
+	// Live delivery starts at the declaration, so replay and live overlap
+	// rather than leaving a second gap behind the first.
+	post("開いてからのlive", "thread-open-gap-post-3")
+	expectMessage(viewer, "開いてからのlive")
 }

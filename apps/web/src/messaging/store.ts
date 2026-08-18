@@ -466,6 +466,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
    */
   const heldPlaces = new Map<PlaceKey, true>();
   /**
+   * 「この場所はここまで在ると知っている」。開く宣言が運ぶcursorはここから作る。
+   * 履歴を持っていない場所で0を名乗ると、serverは先頭からreplayしてしまう——
+   * 欲しいのは最後のpageと宣言の隙間だけなので、知っている最新seqから頼む。
+   * 情報源はbootstrapのunread summary、thread summary、liveで見たseq、そして
+   * 読み込んだpageの先頭。どれも実在するseqなので、真の最新を追い越さない。
+   */
+  const knownLatestSeq = new Map<PlaceKey, number>();
+  const noteLatestSeq = (key: PlaceKey, seq: number) => {
+    if (seq > (knownLatestSeq.get(key) ?? 0)) knownLatestSeq.set(key, seq);
+  };
+  /**
    * 一度に履歴を抱える場所の上限。serverのmaxHelloCursorsより十分小さく取り、
    * 「開き続けたら握手が拒否される」状態に構造的に到達しないようにする。
    */
@@ -1003,14 +1014,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "message_created" || event.type === "message_edited") {
       const key = placeKey(event.message.place);
+      noteLatestSeq(key, event.message.seq);
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
-        const messages = upsertMessage(
-          state.messagesByPlace[key] ?? [],
-          event.message,
-        );
+        // 持っていない場所の履歴はここで作らない。手放した直後にHubがすでに
+        // enqueueしていたframeが届いて1件だけの履歴を生やすと、次に開いた
+        // ときそれが「読み込み済みの履歴」に見えて穴が残る。
+        const messages = heldPlaces.has(key)
+          ? upsertMessage(state.messagesByPlace[key] ?? [], event.message)
+          : null;
         const nonce = event.message.clientNonce;
         const pending = nonce
           ? (state.pendingByPlace[key] ?? []).filter(
@@ -1033,7 +1047,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           state.selfKey,
         );
         return {
-          messagesByPlace: { ...state.messagesByPlace, [key]: messages },
+          messagesByPlace: messages
+            ? { ...state.messagesByPlace, [key]: messages }
+            : state.messagesByPlace,
           pendingByPlace: { ...state.pendingByPlace, [key]: pending },
           typingByPlace: { ...state.typingByPlace, [key]: typing },
           lastReadByPlace: { ...state.lastReadByPlace, [key]: lastRead },
@@ -1068,6 +1084,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "message_deleted") {
       const key = placeKey(event.message.place);
+      noteLatestSeq(key, event.message.seq);
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
@@ -1078,14 +1095,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
           state.lastReadByPlace[key] ?? 0,
           state.selfKey,
         );
+        // 墓標も履歴なので、持っていない場所には置かない。
+        const messages = heldPlaces.has(key)
+          ? upsertMessage(state.messagesByPlace[key] ?? [], event.message)
+          : null;
         return {
-          messagesByPlace: {
-            ...state.messagesByPlace,
-            [key]: upsertMessage(
-              state.messagesByPlace[key] ?? [],
-              event.message,
-            ),
-          },
+          messagesByPlace: messages
+            ? { ...state.messagesByPlace, [key]: messages }
+            : state.messagesByPlace,
           unreadCountByPlace: {
             ...state.unreadCountByPlace,
             [key]: Math.max(
@@ -1243,6 +1260,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const mentionCountByPlace = { ...state.mentionCountByPlace };
     for (const summary of snapshot.unreadSummaries) {
       const key = placeKey(summary.place);
+      noteLatestSeq(key, summary.latestSeq);
       if (heldPlaces.has(key)) continue;
       // 手元の既読が最新に追いついているなら、serverの未読はまだ古い数字。
       const caughtUp = (lastReadByPlace[key] ?? 0) >= summary.latestSeq;
@@ -1338,12 +1356,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
-    if (get().messagesByPlace[key]) return;
+    // heldに入るときは必ず履歴を取る。cacheの有無で決めると、手放したあとに
+    // 遅れて届いた1件がcacheに見えて「読み込み済み」と誤判定し、穴の空いた
+    // タイムラインのまま開いてしまう。読み込み済みかどうかはheldが答える。
+    if (heldPlaces.has(key)) return;
     const currentBackend = backend;
     const sessionGeneration = messagingSessionGeneration;
-    const messages = await currentBackend.fetchMessages(place, {
-      limit: PAGE_SIZE,
-    });
+    // 取得を待つ前にheldへ入る。この往復の間に届いたliveを持っていない扱いで
+    // 捨てると、RESTのpageにも載らないままcursorだけが進み、二度と埋まらない
+    // 穴になる。cursorはここでは動かさない（0はfollowPlaceのmaxで無視される）。
+    holdPlace(place, 0);
+    let messages: Message[];
+    try {
+      messages = await currentBackend.fetchMessages(place, {
+        limit: PAGE_SIZE,
+      });
+    } catch (error) {
+      // 取れなかったのにheldのままにすると、開き直しても取りに行かない。
+      if (isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        releasePlace(key);
+      }
+      throw error;
+    }
     if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
     set((state) => ({
       messagesByPlace: {
@@ -1355,12 +1389,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
         [key]: messages.length >= PAGE_SIZE,
       },
     }));
-    // 履歴を持った場所だけがreplayを頼む。先頭はいま読み込んだ最新seqで、
-    // それより先に届いていたliveがあればbackendのcursorが既に進んでいる。
-    holdPlace(
-      place,
-      messages.reduce((head, message) => Math.max(head, message.seq), 0),
+    // 持っている先頭をcursorへ。取得中に届いたliveで既に先へ進んでいれば
+    // backendのmaxがそれを残す。
+    const head = messages.reduce(
+      (seq, message) => Math.max(seq, message.seq),
+      0,
     );
+    noteLatestSeq(key, head);
+    holdPlace(place, head);
   };
 
   // 送信・再送の共通経路。ACK(receipt)はecho eventで照合されるため、
@@ -1613,6 +1649,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       threadProjectionVersions.clear();
       threadSummaryRefreshes.clear();
       heldPlaces.clear();
+      knownLatestSeq.clear();
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
       const threadVersions = new Map(threadProjectionVersions);
@@ -1641,6 +1678,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             const key = placeKey(summary.place);
             unreadCountByPlace[key] = summary.unreadCount;
             mentionCountByPlace[key] = summary.mentionCount;
+            noteLatestSeq(key, summary.latestSeq);
           }
           // bootstrapが運ぶ設定はサーバーの確定値。書き込みが失敗したときの
           // 戻り先はここから始まる。
@@ -1731,14 +1769,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }));
       // Tell the server which screen is open. A thread the viewer never joined
       // is delivered live only while it is the open one, so the cursor for it
-      // comes from here too: the summary's latest seq is what this client has
-      // already been shown, and a disconnect while the screen stays open must
-      // resume from there rather than replaying the thread from its start.
+      // comes from here too. The cursor is what this client already knows the
+      // place holds: the screen's own REST page is fetched right after this,
+      // so replaying from the start would push ancient history at every first
+      // open, while replaying from here is exactly the gap between that page
+      // and this declaration. A disconnect while the screen stays open resumes
+      // from the same point.
       backend.openPlace?.(
         place,
-        place.kind === "thread"
-          ? (get().threadsById[place.threadId]?.latestSeq ?? 0)
-          : 0,
+        Math.max(
+          knownLatestSeq.get(key) ?? 0,
+          place.kind === "thread"
+            ? (get().threadsById[place.threadId]?.latestSeq ?? 0)
+            : 0,
+        ),
       );
       void loadPlace(place);
     },

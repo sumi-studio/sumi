@@ -217,6 +217,7 @@ class FakeBackend implements MessagingBackend {
     throw new Error("unused");
   }
   sendTyping() {}
+  openPlace = vi.fn((_place: Place | null, _sinceSeq?: number): void => {});
   releasePlace = vi.fn((_place: Place): void => {});
 
   subscribe(
@@ -910,6 +911,75 @@ describe("place lifecycleの再接続突き合わせ", () => {
       kind: "thread",
       threadId: visiting.threadId,
     });
+  });
+
+  it("初めて開く場所の宣言は知っている最新seqを名乗る", async () => {
+    // 宣言のcursorはserverのreplay開始点。持っていないからと0を名乗ると、
+    // 画面を開くたびにその場所の先頭から流れてくる。欲しいのは、いま取りに
+    // 行くpageとこの宣言の隙間だけ。
+    useMessaging.getState().selectPlace(CHANNEL_1);
+    await settle();
+    expect(backend.openPlace).toHaveBeenCalledWith(
+      { kind: "channel", channelId: "channel-1" },
+      5,
+    );
+
+    // liveで先へ進んだあとに開き直しても、宣言は進んだ分から頼む。
+    useMessaging.getState().clearPlaceSelection();
+    backend.emit({
+      type: "message_created",
+      message: {
+        ...threadMessage("unused", 7),
+        place: { kind: "channel", channelId: "channel-1" },
+      },
+      notify: null,
+    });
+    useMessaging.getState().selectPlace(CHANNEL_1);
+    await settle();
+    expect(backend.openPlace).toHaveBeenLastCalledWith(
+      { kind: "channel", channelId: "channel-1" },
+      7,
+    );
+  });
+
+  it("手放した後に届いた遅延frameは履歴を作らず、開き直せば全部揃う", async () => {
+    const visiting: ThreadSummary = {
+      ...thread("thread-late-frame"),
+      participants: [OTHER],
+    };
+    const key = `thread:${visiting.threadId}` as PlaceKey;
+    useMessaging.setState({ threadsById: { [visiting.threadId]: visiting } });
+    backend.fetchMessages.mockResolvedValueOnce([
+      threadMessage(visiting.threadId, 2),
+    ]);
+
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    useMessaging.getState().clearPlaceSelection();
+    expect(useMessaging.getState().messagesByPlace[key]).toBeUndefined();
+
+    // 手放した時点でHubが既にenqueueしていた分。持っていない場所の履歴を
+    // ここで作ると、次に開いたときそれが「読み込み済み」に見えて穴が残る。
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(visiting.threadId, 3),
+      notify: null,
+    });
+    expect(useMessaging.getState().messagesByPlace[key]).toBeUndefined();
+    // 数え上げは別の台帳。開いていない場所のバッジは進み続ける。
+    expect(useMessaging.getState().unreadCountByPlace[key]).toBe(1);
+
+    backend.fetchMessages.mockResolvedValueOnce([
+      threadMessage(visiting.threadId, 2),
+      threadMessage(visiting.threadId, 3),
+    ]);
+    useMessaging.getState().selectPlace(key);
+    await settle();
+
+    expect(backend.fetchMessages).toHaveBeenCalledTimes(2);
+    expect(
+      useMessaging.getState().messagesByPlace[key]?.map((m) => m.seq),
+    ).toEqual([2, 3]);
   });
 
   it("既知threadの既読・未読を再接続snapshotで巻き戻さない", async () => {

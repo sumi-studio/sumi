@@ -217,11 +217,20 @@
   `thread` summaryに親channelを含める。未読summaryとlive配信も同じ線で切る:
   ambientに載るのは参加しているthreadだけで、開けるだけのthreadは読んでも
   参加者にならない。参加していないthreadをURLで開いた閲覧者には、WSの
-  `open{place_id}` / `close{place_id}`（ackは `open_ack{place_id}`）で宣言した
-  「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可ではない。
-  cursorを持つ台帳も同じ線で切る。serverのcatch-upはcursorを購読の根拠にしない:
-  helloでreplayするのは参加しているplaceだけで、開いているだけのthreadはその
-  `open` frame のあとにreplayされる。
+  `open{place_id, since}` / `close{place_id}`（ackは `open_ack{place_id}`）で
+  宣言した「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可では
+  ない。cursorを持つ台帳も同じ線で切る。serverのcatch-upはcursorを購読の根拠に
+  しない: helloでreplayするのは参加しているplaceだけで、開いているだけのthread
+  はその `open` frame のあとにreplayされる。
+  画面はRESTで履歴を取ってから開くので、その取得と宣言の隙間にcommitされた分は
+  手元のpageにもliveにも無い。`open` は「ここまで持っている」（`since`）を運び、
+  serverはそこからreplayして最後に `open_ack` を返す——replayが先、ackが後。
+  helloが預かったcursorも同じ経路に合流し（両者のうち手前から replay する）、
+  replayの経路は1本だけである。live配信は宣言の時点から始まるので、replayと
+  liveは重なる（重複はclientが畳めるが、隙間は畳めない）。まだ履歴を持って
+  いない場所でも、clientは0ではなく**知っている最新seq**（unread summaryや
+  thread summary、liveで見たseq）を名乗る。0は「先頭からreplayせよ」であり、
+  開くたびに古い履歴が流れてしまう。
 - 再接続の握手はWorkspaceの場所数に比例しない。clientがcursorを持つのは**いま
   履歴を持っている場所**（開いて読み込んだ場所）と、いま開いている場所だけで、
   手放すときはcursorと履歴を一緒に捨てる（片方だけ残すと穴の空いた履歴になる）。

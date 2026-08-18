@@ -1025,9 +1025,12 @@ describe("ApiMessagingBackend", () => {
     socket?.open();
 
     backend.openPlace({ kind: "thread", threadId: "thread-open" });
+    // 宣言は「ここまで持っている」を運ぶ。開く画面はRESTで履歴を取ってから
+    // 開くので、その取得とこの宣言の隙間はserverがここから replay して埋める。
     expect(JSON.parse(socket?.sent[1] ?? "{}")).toEqual({
       type: "open",
       place_id: "thread-open",
+      since: 0,
     });
     // 宣言の受領確認は状態を持たない。捨てられるだけで、eventにはならない。
     socket?.message({ type: "open_ack", place_id: "thread-open" });
@@ -1046,6 +1049,7 @@ describe("ApiMessagingBackend", () => {
     expect(JSON.parse(reconnected?.sent[1] ?? "{}")).toEqual({
       type: "open",
       place_id: "thread-open",
+      since: 0,
     });
 
     backend.openPlace(null);

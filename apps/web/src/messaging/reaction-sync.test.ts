@@ -18,6 +18,21 @@ const place: Place = { kind: "channel", channelId: "channel-1" };
 const placeKey = "channel:channel-1" as const;
 
 /**
+ * 履歴を持っている状態を作る。storeが履歴を受け付けるのはheldなplaceだけなので、
+ * stateへ直接置くのではなく画面を開く経路（selectPlace → loadPlace）で作る。
+ * 読み込みのfetchは記録から外し、後続のresyncだけを見えるようにする。
+ */
+async function holdLoaded(
+  harness: StubBackend,
+  messages: Message[],
+): Promise<void> {
+  harness.history = messages;
+  useMessaging.getState().selectPlace(placeKey);
+  await harness.settle();
+  harness.fetches.splice(0);
+}
+
+/**
  * reaction eventはmessage全体を運ばない、という契約のstore側の裏。編集を
  * 巻き戻さないこと、切断中に落ちたreactionが再接続で戻ることを見る。
  */
@@ -37,9 +52,7 @@ describe("reaction convergence in the messaging store", () => {
     installMessagingBackend(harness);
     useMessaging.getState().init();
     await harness.bootstrapped;
-    useMessaging.setState({
-      messagesByPlace: { [placeKey]: [message(1, "編集前"), message(2, "隣")] },
-    });
+    await holdLoaded(harness, [message(1, "編集前"), message(2, "隣")]);
 
     // 編集がcommit/publishしたあとに、編集前のcontentを見ていたreaction eventが
     // 遅れて届く。reactionだけが乗るので編集は生き残る。
@@ -437,7 +450,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = message(1, "message");
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().toggleReaction(target, "👍");
     await harness.settle();

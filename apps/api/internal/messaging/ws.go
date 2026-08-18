@@ -28,7 +28,7 @@ const maxHelloCursors = 1024
 // をmultiplex)。Authentication is identical to the REST surface. Frames:
 //
 //	client → server: hello{cursors}, send{...}, typing{place_id},
-//	                 open{place_id}, close{place_id}
+//	                 open{place_id, since}, close{place_id}
 //	server → client: hello_ack, open_ack{place_id}, event{...},
 //	                 caught_up{place_id, latest_seq},
 //	                 receipt{client_nonce, message_id, seq, created},
@@ -87,8 +87,13 @@ type wsHello struct {
 }
 
 type wsClientFrame struct {
-	Type        string `json:"type"`
-	PlaceID     string `json:"place_id"`
+	Type    string `json:"type"`
+	PlaceID string `json:"place_id"`
+	// Since is how far the client already holds the place it is opening. A
+	// screen is opened after its history has been fetched, so this frame is
+	// the only thing that can name the boundary between the page the client
+	// already has and what committed while the declaration was in flight.
+	Since       int64  `json:"since"`
 	Content     string `json:"content"`
 	Urgency     string `json:"urgency"`
 	ReplyTo     string `json:"reply_to"`
@@ -361,10 +366,14 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 // Visibility is checked so the frame cannot probe places, and every delivery
 // remains fenced by the event's own audience snapshot and authorizeWrite.
 //
-// Opening is also where a deferred handshake cursor is honoured. The contract
-// is ordered: a reconnect replays the places this viewer holds, and a thread
-// they only have open replays after its open frame — never before, because
-// until the frame arrives this connection has not said it is looking at it.
+// Opening is also where the client's own cursor is honoured, through the one
+// replay path every cursor uses. A screen is opened after its history has been
+// fetched, so whatever commits between that fetch and this frame is in
+// neither: not in the page the client already holds, and not live, because
+// until this frame arrives the connection has not said it is looking at the
+// place. The frame therefore carries how far the client holds, and the reply
+// is ordered — replay first, then open_ack. Live delivery starts before the
+// replay so the two overlap: a duplicate the client repairs, a gap it cannot.
 func (s *WSServer) handleOpen(ctx context.Context, sub *subscriber, frame wsClientFrame) {
 	if sub == nil || sub.store == nil || frame.PlaceID == "" {
 		s.enqueueError(sub, "not_found", "")
@@ -376,18 +385,25 @@ func (s *WSServer) handleOpen(ctx context.Context, sub *subscriber, frame wsClie
 		return
 	}
 	sub.openPlace(frame.PlaceID)
-	if !s.enqueueJSONAt(sub, liveBoundary{placeID: frame.PlaceID}, struct {
-		Type    string `json:"type"`
-		PlaceID string `json:"place_id"`
-	}{Type: "open_ack", PlaceID: frame.PlaceID}) {
-		return
+	since := frame.Since
+	if since < 0 {
+		since = 0
+	}
+	// A cursor the handshake had to defer describes the same client. Replay
+	// from whichever of the two is further back, so neither can skip a commit.
+	if deferred, ok := sub.takeDeferredCursor(frame.PlaceID); ok && deferred < since {
+		since = deferred
 	}
 	// The visibility verdict is deliberately not cached here: watching is
 	// temporary by construction, and a cached "visible" would outlive the
 	// close that ends it.
-	if since, deferred := sub.takeDeferredCursor(frame.PlaceID); deferred {
-		s.replayPlace(ctx, sub, place, since)
+	if !s.replayPlace(ctx, sub, place, since) {
+		return
 	}
+	s.enqueueJSONAt(sub, liveBoundary{placeID: frame.PlaceID}, struct {
+		Type    string `json:"type"`
+		PlaceID string `json:"place_id"`
+	}{Type: "open_ack", PlaceID: frame.PlaceID})
 }
 
 func (s *WSServer) handleTyping(
