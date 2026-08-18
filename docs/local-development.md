@@ -300,10 +300,26 @@ bind host, which the other device reaches over the Tailnet.
 
 `make dev` creates state directories and non-production secrets in one
 mode-0700 temporary directory. It acquires one host lock, starts exactly one
-generation (`0`), never restarts or replaces that generation, and deletes all
-state on shutdown. Because there is no surviving ledger or replacement
+generation (`0`), never restarts or replaces that generation, and deletes that
+directory on shutdown. Because there is no surviving ledger or replacement
 generation to allocate, the persistent supervisor allocator is not part of
 this deliberately disposable single-agent direct path.
+
+Two stores are deliberately outside that boundary, because the identity
+registry rows and the attachment bytes they name have to be discarded together
+or not at all:
+
+- the control-plane Postgres, in the Compose volume `sumi-postgres`;
+- messaging attachment bytes, including profile images, under
+  `${XDG_STATE_HOME:-~/.local/state}/sumi/real-stack/messaging-attachments`
+  (override with `SUMI_REAL_STACK_STATE_ROOT`; the path must be absolute, and
+  an existing directory must already be mode 0700 and owned by you — the
+  launcher will not relax or tighten a directory it did not create).
+
+Keeping the bytes inside the temporary directory left the database naming
+objects that shutdown had already deleted, so every uploaded image came back
+missing after a restart. Delete both stores together to start clean; the API's
+attachment reconciler sweeps bytes the database no longer names.
 
 Do not use this exception for persistent, concurrent, or restartable
 deployment. `deploy/agent/supervisor` and its allocator own monotonic

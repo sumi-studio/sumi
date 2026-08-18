@@ -97,6 +97,36 @@ require_value() {
   [[ -n "${!name:-}" ]] || fail "${name} is required"
 }
 
+# Prepares the one directory whose contents outlive a run. The launcher owns
+# only the directory it creates itself: a root that already exists may have
+# other duties (${HOME}, ${TMPDIR}), so its mode is verified and never forced,
+# because fitting it to 0700 would strip access the rest of the system relies
+# on. The root must also be absolute, since the API resolves
+# SUMI_MESSAGING_ATTACHMENT_ROOT against its own working directory (apps/api)
+# rather than the one make dev was invoked from: a relative root would have the
+# launcher provision one parent while the API demands another, and would move
+# the store whenever the stack is started from somewhere else.
+provision_persistent_state_root() {
+  local root="$1" metadata mode owner
+  [[ "${root}" == /* ]] ||
+    fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${root}"
+  mkdir -p -- "$(dirname -- "${root}")" ||
+    fail "cannot create the parent of the persistent local state root: ${root}"
+  # mkdir without -p reports the difference between "created for us" and
+  # "already there", which is exactly the line the launcher must not cross.
+  if mkdir -m 0700 -- "${root}" 2>/dev/null; then
+    return 0
+  fi
+  [[ -d "${root}" && ! -L "${root}" ]] ||
+    fail "the persistent local state root must be a real directory: ${root}"
+  metadata="$(stat -c '%a %u' -- "${root}")" ||
+    fail "cannot inspect the persistent local state root: ${root}"
+  mode="${metadata%% *}"
+  owner="${metadata##* }"
+  [[ "${mode: -3}" == 700 && "${owner}" == "${UID}" ]] ||
+    fail "the persistent local state root already exists as mode ${mode} owned by uid ${owner}; it must be a private directory of this user (mode 0700, uid ${UID}) before it can hold attachments: ${root}"
+}
+
 valid_paid() {
   [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
 }
@@ -530,14 +560,6 @@ readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
 # deleted: profile images and uploads came back as missing objects after every
 # restart. The persistent root sits under the user state directory instead.
 readonly PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
-# The API resolves SUMI_MESSAGING_ATTACHMENT_ROOT against its own working
-# directory (apps/api), not the one make dev was invoked from, so a relative
-# root would have the launcher provision one parent while the API demands
-# another and refuses to start. It would also move the store whenever the stack
-# is started from a different directory, which is the very disappearance this
-# persistent root exists to stop.
-[[ "${PERSISTENT_STATE_ROOT}" == /* ]] ||
-  fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${PERSISTENT_STATE_ROOT}"
 readonly MESSAGING_ATTACHMENT_DIR="${PERSISTENT_STATE_ROOT}/messaging-attachments"
 # Local runs use explicit bounded attachment caps; the API refuses to serve
 # attachments unless every Workspace and store-wide byte/object cap is set.
@@ -558,15 +580,9 @@ mkdir -m 0700 \
   "${IPC_DIR}" \
   "${LOG_DIR}" \
   "${BIN_DIR}"
-# The attachment backend creates at most its own root and demands that the root
-# be a private (0700) directory, so the launcher provisions only the hierarchy
-# above it and leaves the root itself to the API's own checks.
-mkdir -p -m 0700 -- "${PERSISTENT_STATE_ROOT}" ||
-  fail "cannot create the persistent local state root: ${PERSISTENT_STATE_ROOT}"
-[[ -d "${PERSISTENT_STATE_ROOT}" && ! -L "${PERSISTENT_STATE_ROOT}" ]] ||
-  fail "persistent local state root must be a real directory: ${PERSISTENT_STATE_ROOT}"
-chmod 0700 -- "${PERSISTENT_STATE_ROOT}" ||
-  fail "cannot restrict the persistent local state root: ${PERSISTENT_STATE_ROOT}"
+# This one is not created with the disposable directories above: it is the only
+# state that has to be there again on the next run.
+provision_persistent_state_root "${PERSISTENT_STATE_ROOT}"
 
 readonly API_BINARY="${BIN_DIR}/sumi-api"
 readonly AGENT_BINARY="${REPOSITORY_ROOT}/apps/agent/target/debug/sumi-agent"

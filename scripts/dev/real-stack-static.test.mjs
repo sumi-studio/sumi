@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -338,25 +347,16 @@ test("the allocator exception is bounded to one locked disposable generation", a
   assert.doesNotMatch(launcher, /--supervisor-allocate/);
 });
 
-/**
- * Runs the launcher's own attachment root block under a controlled environment,
- * so the test measures where the bytes actually land and which values the block
- * refuses, rather than how either happens to be spelled.
- */
-async function attachmentRootFor(launcher, environment) {
-  const start = launcher.indexOf('readonly PERSISTENT_STATE_ROOT="');
-  const end = launcher.indexOf(
-    "\n",
-    launcher.indexOf('readonly MESSAGING_ATTACHMENT_DIR="'),
-  );
-  assert.ok(start > 0 && end > start);
-  const script = [
-    "set -euo pipefail",
-    'fail() { printf "fail: %s\\n" "$*" >&2; exit 3; }',
-    'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
-    launcher.slice(start, end),
-    'printf %s "$MESSAGING_ATTACHMENT_DIR"',
-  ].join("\n");
+/** Lifts one top-level function out of the launcher so a test can drive it. */
+function launcherFunction(launcher, name) {
+  const start = launcher.indexOf(`\n${name}() {\n`);
+  assert.ok(start > 0);
+  const end = launcher.indexOf("\n}\n", start);
+  assert.ok(end > start);
+  return launcher.slice(start + 1, end + 3);
+}
+
+async function runBash(script, environment) {
   const options = {
     env: {
       PATH: process.env.PATH,
@@ -365,14 +365,50 @@ async function attachmentRootFor(launcher, environment) {
       ...environment,
     },
   };
+  const preamble = [
+    "set -Eeuo pipefail",
+    'fail() { printf "fail: %s\\n" "$*" >&2; exit 3; }',
+  ].join("\n");
   try {
     return {
-      ...(await execFileAsync("bash", ["-c", script], options)),
+      ...(await execFileAsync(
+        "bash",
+        ["-c", `${preamble}\n${script}`],
+        options,
+      )),
       code: 0,
     };
   } catch (error) {
     return { stdout: error.stdout, stderr: error.stderr, code: error.code };
   }
+}
+
+/**
+ * Expands the launcher's own attachment root definitions, so the test measures
+ * where the bytes actually land rather than how the assignment is spelled.
+ */
+function attachmentRootFor(launcher, environment) {
+  const start = launcher.indexOf('readonly PERSISTENT_STATE_ROOT="');
+  const end = launcher.indexOf(
+    "\n",
+    launcher.indexOf('readonly MESSAGING_ATTACHMENT_DIR="'),
+  );
+  assert.ok(start > 0 && end > start);
+  const script = [
+    'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
+    launcher.slice(start, end),
+    'printf %s "$MESSAGING_ATTACHMENT_DIR"',
+  ].join("\n");
+  return runBash(script, environment);
+}
+
+/** Runs the launcher's own provisioner against a real path on disk. */
+function provisionStateRoot(launcher, root) {
+  const script = [
+    launcherFunction(launcher, "provision_persistent_state_root"),
+    `provision_persistent_state_root ${JSON.stringify(root)}`,
+  ].join("\n");
+  return runBash(script, {});
 }
 
 test("uploaded attachment bytes outlive the disposable runtime root", async () => {
@@ -387,6 +423,14 @@ test("uploaded attachment bytes outlive the disposable runtime root", async () =
   );
   assert.ok(disposableDirectories);
   assert.doesNotMatch(disposableDirectories[0], /MESSAGING_ATTACHMENT_DIR/);
+
+  // The disposable-boundary documentation already drifted from the launcher
+  // once, telling developers that shutdown removes all state. Keep the
+  // exception named where they read about shutdown.
+  const guide = await source("docs/local-development.md");
+  assert.doesNotMatch(guide, /deletes all\s+state on shutdown/);
+  assert.match(guide, /SUMI_REAL_STACK_STATE_ROOT/);
+  assert.match(guide, /sumi\/real-stack\/messaging-attachments/);
 
   for (const [environment, expected] of [
     [{}, "/home/example/.local/state/sumi/real-stack/messaging-attachments"],
@@ -421,19 +465,58 @@ test("a relative state root is refused instead of splitting the store", async ()
     /cd "\$\{REPOSITORY_ROOT\}\/apps\/api"/,
   );
 
-  for (const environment of [
-    { SUMI_REAL_STACK_STATE_ROOT: "sumi-dev-state" },
-    { SUMI_REAL_STACK_STATE_ROOT: "./sumi-dev-state" },
-    { SUMI_REAL_STACK_STATE_ROOT: "../sumi-dev-state" },
-    { XDG_STATE_HOME: "state" },
-  ]) {
-    const refused = await attachmentRootFor(launcher, environment);
+  for (const root of ["sumi-dev-state", "./sumi-dev-state", "../sumi-dev"]) {
+    const refused = await provisionStateRoot(launcher, root);
     assert.equal(refused.code, 3);
-    assert.equal(refused.stdout, "");
     assert.match(refused.stderr, /must be an absolute path/);
     assert.match(
       refused.stderr,
       /SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME/,
     );
+  }
+});
+
+test("the launcher never re-modes a state root it did not create", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  assert.match(
+    launcher,
+    /^provision_persistent_state_root "\$\{PERSISTENT_STATE_ROOT\}"$/m,
+  );
+
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    // A root the launcher creates itself is private from the first byte.
+    const created = join(scratch, "nested", "real-stack");
+    const fresh = await provisionStateRoot(launcher, created);
+    assert.equal(fresh.code, 0);
+    assert.equal((await stat(created)).mode & 0o777, 0o700);
+
+    // A root that already exists may be $HOME, $TMPDIR, or any other directory
+    // with duties of its own. Forcing it to 0700 would strip access the rest of
+    // the system depends on, so the launcher refuses and leaves it untouched.
+    const shared = join(scratch, "shared");
+    await mkdir(shared, { mode: 0o755 });
+    await chmod(shared, 0o755);
+    const refused = await provisionStateRoot(launcher, shared);
+    assert.equal(refused.code, 3);
+    assert.match(refused.stderr, /mode 0700/);
+    assert.equal((await stat(shared)).mode & 0o777, 0o755);
+
+    // An existing root that already satisfies the contract is accepted as is.
+    const private_ = join(scratch, "private");
+    await mkdir(private_, { mode: 0o700 });
+    await chmod(private_, 0o700);
+    const reused = await provisionStateRoot(launcher, private_);
+    assert.equal(reused.code, 0);
+    assert.equal((await stat(private_)).mode & 0o777, 0o700);
+
+    // A symlink is refused too: its target is someone else's directory.
+    const linked = join(scratch, "linked");
+    await symlink(private_, linked);
+    const rejected = await provisionStateRoot(launcher, linked);
+    assert.equal(rejected.code, 3);
+    assert.match(rejected.stderr, /must be a real directory/);
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
   }
 });
