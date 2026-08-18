@@ -66,6 +66,21 @@ function lastingBeneath(
 }
 
 /**
+ * 期限付きの申告を今から送るとき、サーバーが保存する戻り先をそのまま予告する。
+ * kind が次の申告と同じかは関係ない。同じ kind でも一言を戻すための base があれば、
+ * 期限後に申告は残る。
+ */
+function expiryOutcome(
+  base: { status: StatusKind; note: string } | null,
+): string {
+  if (!base) return "期限が来たら申告そのものが解除されます";
+  const restored = base.note
+    ? `${STATUS_LABEL[base.status]} — ${base.note}`
+    : STATUS_LABEL[base.status];
+  return `期限が来たら「${restored}」に戻ります`;
+}
+
+/**
  * 自分のステータス。三値の申告に「いつまで」と一言を足す。
  *
  * 期間を選ぶところまで一つのメニューに収め、選ぶ前に「期限が来たらどこへ戻るか」
@@ -141,8 +156,6 @@ export function StatusMenu() {
           {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => {
             const chosen = selfStatus?.status === kind;
             const submenuOpen = expanded === kind;
-            const returnsTo =
-              base && base.status !== kind ? STATUS_LABEL[base.status] : null;
             return (
               <div
                 key={kind}
@@ -200,15 +213,9 @@ export function StatusMenu() {
                         {duration.label}
                       </button>
                     ))}
-                    {returnsTo ? (
-                      <p className="px-2 pt-1 pb-0.5 text-[10.5px] text-muted-foreground/80">
-                        期限が来たら「{returnsTo}」に戻ります
-                      </p>
-                    ) : (
-                      <p className="px-2 pt-1 pb-0.5 text-[10.5px] text-muted-foreground/80">
-                        期限が来たら申告そのものが解除されます
-                      </p>
-                    )}
+                    <p className="px-2 pt-1 pb-0.5 text-[10.5px] text-muted-foreground/80">
+                      {expiryOutcome(base)}
+                    </p>
                   </div>
                 ) : null}
               </div>
