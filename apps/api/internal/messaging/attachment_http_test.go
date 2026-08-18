@@ -623,7 +623,9 @@ func TestAttachmentDraftSpoilerAltAndEditWindow(t *testing.T) {
 	}
 
 	// Naming nothing at all is not an edit, and an oversized description is
-	// refused rather than silently truncated.
+	// refused rather than silently truncated. A field outside the JSON shape is
+	// a decode failure, like every other JSON messaging request, rather than a
+	// PATCH-specific invalid_request.
 	resp, body = patch(f.humanA.ID, nil)
 	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
 		t.Fatalf("empty patch: %d %v", resp.StatusCode, body)
@@ -631,6 +633,10 @@ func TestAttachmentDraftSpoilerAltAndEditWindow(t *testing.T) {
 	resp, body = patch(f.humanA.ID, map[string]any{"alt": strings.Repeat("あ", MaxAttachmentAltRunes+1)})
 	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
 		t.Fatalf("oversized alt: %d %v", resp.StatusCode, body)
+	}
+	resp, body = patch(f.humanA.ID, map[string]any{"unknown": true})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_json" {
+		t.Fatalf("unknown patch field: %d %v", resp.StatusCode, body)
 	}
 
 	// Sent: the declarations ride along with the message.
