@@ -480,6 +480,12 @@ func newApplicationFromEnv() (*application, error) {
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
+	if messagingServer != nil {
+		// Temporary statuses lapse back to what the participant had said
+		// before. Readers resolve that themselves, so this loop only makes the
+		// change visible on screens that are already open.
+		go messagingServer.RunStatusExpiry(backgroundCtx, messaging.DefaultStatusExpiryInterval)
+	}
 	return &application{
 		publicMux:      mux,
 		localMux:       localMux,

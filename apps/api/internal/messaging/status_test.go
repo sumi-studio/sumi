@@ -54,8 +54,9 @@ func TestStatusIsReplacedInPlaceAndExpiresAtReadTime(t *testing.T) {
 		t.Fatalf("statuses = %d, want exactly one row per participant", n)
 	}
 
-	// An already-expired status is simply not reported: expiry is a read-time
-	// filter, so no sweeper can disagree with what readers see.
+	// An expired temporary status is resolved at read time, so no sweeper can
+	// disagree with what readers see. With a lasting declaration underneath,
+	// what is reported is that declaration — not「対応可能」and not nothing.
 	past := time.Now().Add(-time.Minute)
 	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
 		t.Fatalf("set expiring status: %v", err)
@@ -64,16 +65,21 @@ func TestStatusIsReplacedInPlaceAndExpiresAtReadTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list statuses after expiry: %v", err)
 	}
-	if _, ok := statusOf(t, statuses, w.humanA); ok {
-		t.Fatalf("expired status must not be reported, got %+v", statuses)
+	got, ok = statusOf(t, statuses, w.humanA)
+	if !ok || got.Status != StatusAway || got.Note != "" || got.ExpiresAt != nil {
+		t.Fatalf("lapsed status = %+v (found %v), want the lasting away", got, ok)
 	}
-	// The owner does not get to see their own expired status either.
+
+	// With nothing behind it, the lapse ends the declaration outright.
+	if _, err := w.store.SetStatus(ctx, w.humanB, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set expiring status without a base: %v", err)
+	}
 	statuses, err = w.store.StatusesVisibleTo(ctx, w.humanA)
 	if err != nil {
 		t.Fatalf("list own statuses: %v", err)
 	}
-	if _, ok := statusOf(t, statuses, w.humanA); ok {
-		t.Fatalf("expired own status must not be reported, got %+v", statuses)
+	if _, ok := statusOf(t, statuses, w.humanB); ok {
+		t.Fatalf("a lapsed status with no base must not be reported, got %+v", statuses)
 	}
 
 	// Only the three declared values exist; anything else fails closed.
@@ -213,5 +219,116 @@ func TestLocalStatusSetsTheAgentsOwnAttentionState(t *testing.T) {
 	}, authorization)
 	if status != http.StatusBadRequest {
 		t.Fatalf("unknown agent status: %d, want 400", status)
+	}
+}
+
+// A timed status is a promise about a return, not just about an end: it has to
+// say what it returns to, decide that at declaration time, and hold that answer
+// even if another timed status is stacked on top of it.
+func TestTimedStatusLapsesBackToTheDeclarationUnderneath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "在宅です", nil); err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	soon := time.Now().Add(time.Hour)
+	declared, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &soon)
+	if err != nil {
+		t.Fatalf("set timed status: %v", err)
+	}
+	// The declaration itself already names the return, so a screen can say
+	// 「期限が来たら『離席中』に戻ります」before the hour is up.
+	if declared.BaseStatus != StatusAway || declared.BaseNote != "在宅です" {
+		t.Fatalf("timed status = %+v, want the lasting away recorded as its base", declared)
+	}
+
+	// Stacking a second timed status keeps the lasting declaration underneath.
+	stacked, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "電話中", &soon)
+	if err != nil {
+		t.Fatalf("stack timed status: %v", err)
+	}
+	if stacked.BaseStatus != StatusAway || stacked.BaseNote != "在宅です" {
+		t.Fatalf("stacked status = %+v, want the base to survive", stacked)
+	}
+
+	// A lasting declaration has nothing to return to.
+	lasting, err := w.store.SetStatus(ctx, w.humanA, StatusAvailable, "", nil)
+	if err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	if lasting.BaseStatus != "" || lasting.ExpiresAt != nil {
+		t.Fatalf("lasting status = %+v, want no base", lasting)
+	}
+}
+
+// The sweep only makes the read-time answer durable and announces it. It must
+// not invent a state nobody declared, and it must have somewhere to announce to.
+func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+
+	past := time.Now().Add(-time.Minute)
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "在宅です", nil); err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set lapsed status with a base: %v", err)
+	}
+	if _, err := w.store.SetStatus(ctx, w.humanB, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set lapsed status without a base: %v", err)
+	}
+
+	expiries, err := w.store.core.ExpireStatuses(ctx)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(expiries) != 2 {
+		t.Fatalf("expiries = %d, want both lapsed rows", len(expiries))
+	}
+	for _, expiry := range expiries {
+		switch expiry.Status.Participant {
+		case w.humanA:
+			if expiry.Status.Status != StatusAway || expiry.Status.Note != "在宅です" {
+				t.Fatalf("restored status = %+v", expiry.Status)
+			}
+		case w.humanB:
+			// An empty status is how the sweep says「もう何も言っていない」.
+			if expiry.Status.Status != "" {
+				t.Fatalf("cleared status = %+v", expiry.Status)
+			}
+		default:
+			t.Fatalf("unexpected expiry subject %+v", expiry.Status.Participant)
+		}
+		// The announcement has an address to go to, and it is the Messaging
+		// installation of a Workspace they are actually in.
+		if len(expiry.Scopes) != 1 || expiry.Scopes[0].WorkspaceID != workspace.WorkspaceID {
+			t.Fatalf("expiry scopes = %+v", expiry.Scopes)
+		}
+	}
+
+	// Sweeping is idempotent: the second pass finds nothing left to lapse.
+	again, err := w.store.core.ExpireStatuses(ctx)
+	if err != nil {
+		t.Fatalf("second expire: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("second sweep = %+v, want nothing", again)
+	}
+
+	// And the durable rows now agree with what readers were already told.
+	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := statusOf(t, statuses, w.humanA); !ok || got.Status != StatusAway || got.ExpiresAt != nil {
+		t.Fatalf("status after sweep = %+v (found %v)", got, ok)
+	}
+	if _, ok := statusOf(t, statuses, w.humanB); ok {
+		t.Fatalf("cleared status must be gone, got %+v", statuses)
 	}
 }

@@ -133,10 +133,15 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 	return stored, nil
 }
 
+// SetStatus replaces the actor's own status. Only the actor can set it — the
+// participant is the receiver's scope, never a request field (自己申告: the
+// platform does not speak about anyone's attention on their behalf).
+//
+// A temporary status (expiresAt != nil) remembers the state it replaces, so it
+// lapses back to what the participant had already said. Setting a lasting
+// status clears that memory: the new declaration is the whole truth.
 func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expiresAt *time.Time) (ParticipantStatus, error) {
-	switch status {
-	case StatusAvailable, StatusBusy, StatusAway:
-	default:
+	if !ValidStatus(status) {
 		return ParticipantStatus{}, fmt.Errorf("unknown status %q", status)
 	}
 	if utf8.RuneCountInString(note) > MaxStatusNoteChars {
@@ -150,19 +155,63 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return ParticipantStatus{}, err
 	}
+	next := ParticipantStatus{Participant: s.Scope.Actor, Status: status, Note: note, ExpiresAt: expiresAt}
+	if expiresAt != nil {
+		// The row is read and rewritten in the same transaction, so two
+		// temporary statuses racing cannot both take the lasting one as base
+		// and then lose it.
+		base, err := s.lastingStatusInTx(ctx, tx)
+		if err != nil {
+			return ParticipantStatus{}, err
+		}
+		next.BaseStatus = base.Status
+		next.BaseNote = base.Note
+	}
+	var baseStatus *string
+	baseNote := next.BaseNote
+	if next.BaseStatus != "" {
+		baseStatus = &next.BaseStatus
+	} else {
+		baseNote = ""
+	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO participant_statuses (member_kind, member_id, status, note, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO participant_statuses
+			(member_kind, member_id, status, note, expires_at, base_status, base_note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (member_kind, member_id)
 		DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note,
-		              expires_at = EXCLUDED.expires_at, updated_at = now()`,
-		s.Scope.Actor.Kind, s.Scope.Actor.ID, status, note, expiresAt); err != nil {
+		              expires_at = EXCLUDED.expires_at,
+		              base_status = EXCLUDED.base_status,
+		              base_note = EXCLUDED.base_note, updated_at = now()`,
+		s.Scope.Actor.Kind, s.Scope.Actor.ID, status, note, expiresAt,
+		baseStatus, baseNote); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("set scoped status: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("commit scoped status: %w", err)
 	}
-	return ParticipantStatus{Participant: s.Scope.Actor, Status: status, Note: note, ExpiresAt: expiresAt}, nil
+	next.BaseNote = baseNote
+	return next, nil
+}
+
+// lastingStatusInTx returns what the actor would be back to once every
+// temporary status they have set has lapsed.
+func (s *ScopedStore) lastingStatusInTx(ctx context.Context, tx pgx.Tx) (ParticipantStatus, error) {
+	var stored storedStatus
+	err := tx.QueryRow(ctx, `
+		SELECT status, note, expires_at, base_status, base_note
+		FROM participant_statuses
+		WHERE member_kind = $1 AND member_id = $2
+		FOR UPDATE`,
+		s.Scope.Actor.Kind, s.Scope.Actor.ID).Scan(&stored.status, &stored.note,
+		&stored.expiresAt, &stored.baseStatus, &stored.baseNote)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ParticipantStatus{Participant: s.Scope.Actor}, nil
+	}
+	if err != nil {
+		return ParticipantStatus{}, fmt.Errorf("read scoped status: %w", err)
+	}
+	return stored.lasting(s.Scope.Actor, time.Now()), nil
 }
 
 func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatus, error) {
@@ -174,25 +223,40 @@ func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatu
 	if _, err := s.authorizeInTx(ctx, tx); err != nil {
 		return nil, err
 	}
+	// Expiry is resolved here, at read time: a lapsed temporary status reports
+	// the state it lapses back to, or nothing when there is none. The sweeper
+	// only makes that same answer durable and announces it, so it can never
+	// disagree with what a reader would have computed anyway.
 	rows, err := tx.Query(ctx, `
-		SELECT ps.member_kind, ps.member_id, ps.status, ps.note, ps.expires_at
+		SELECT ps.member_kind, ps.member_id, ps.status, ps.note, ps.expires_at,
+		       ps.base_status, ps.base_note
 		FROM participant_statuses ps
 		JOIN workspace_members wm
 		  ON wm.member_kind = ps.member_kind AND wm.member_id = ps.member_id
 		WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
-		  AND (ps.expires_at IS NULL OR ps.expires_at > now())
 		ORDER BY ps.member_kind, ps.member_id`, s.Scope.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query scoped statuses: %w", err)
 	}
 	defer rows.Close()
+	now := time.Now()
 	var statuses []ParticipantStatus
 	for rows.Next() {
-		var status ParticipantStatus
-		if err := rows.Scan(&status.Participant.Kind, &status.Participant.ID, &status.Status, &status.Note, &status.ExpiresAt); err != nil {
+		var (
+			participant ParticipantRef
+			stored      storedStatus
+		)
+		if err := rows.Scan(&participant.Kind, &participant.ID, &stored.status,
+			&stored.note, &stored.expiresAt, &stored.baseStatus, &stored.baseNote); err != nil {
 			return nil, fmt.Errorf("scan scoped status: %w", err)
 		}
-		statuses = append(statuses, status)
+		resolved := stored.resolve(participant, now)
+		// A lapsed status with nothing behind it says nothing about the
+		// participant, so it is not reported at all.
+		if resolved.Status == "" {
+			continue
+		}
+		statuses = append(statuses, resolved)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
