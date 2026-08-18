@@ -2967,7 +2967,7 @@ esac
     let reaped = root.join("reaped");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("reconcile")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
