@@ -20,6 +20,7 @@ import {
   MentionSuggestions,
   useMentionAutocomplete,
 } from "./mention-autocomplete";
+import { useImeCommittedTextarea } from "./use-ime-committed-textarea";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
@@ -87,7 +88,7 @@ export function Composer() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [urgency, setUrgency] = useState<Urgency>("normal");
   const lastTypingAt = useRef(0);
-  const composing = useRef(false);
+  const ime = useImeCommittedTextarea(textareaRef);
 
   const replyTarget = replyTargetId
     ? messages.find((entry) => entry.messageId === replyTargetId)
@@ -155,17 +156,13 @@ export function Composer() {
   const canSend = canSubmitText(value);
 
   const submit = useCallback(() => {
-    if (composing.current) {
-      composing.current = false;
-      textareaRef.current?.blur();
-    }
-    const text = textareaRef.current?.value ?? value;
+    const text = ime.committedValue(value);
     if (!canSubmitText(text)) return;
     send(text, urgency);
     setUrgency("normal");
     mentionAutocomplete.dismiss();
     textareaRef.current?.focus();
-  }, [value, send, urgency, canSubmitText, mentionAutocomplete]);
+  }, [value, send, urgency, canSubmitText, mentionAutocomplete, ime]);
 
   const acceptFiles = useCallback(
     (list: FileList | File[] | null | undefined) => {
@@ -326,11 +323,9 @@ export function Composer() {
           onChange={mentionAutocomplete.onInputChange}
           onKeyDown={onKeyDown}
           onKeyUp={mentionAutocomplete.onKeyUp}
-          onCompositionStart={() => {
-            composing.current = true;
-          }}
+          onCompositionStart={ime.onCompositionStart}
           onCompositionEnd={(event) => {
-            composing.current = false;
+            ime.onCompositionEnd();
             mentionAutocomplete.onCompositionEnd(event);
           }}
           onPaste={onPaste}

@@ -141,7 +141,9 @@ class FakeBackend implements MessagingBackend {
       created: true,
     };
   }
-  async editMessage() {}
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
+    throw new Error("unused");
+  }
   async deleteMessage() {}
   async markRead() {}
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {

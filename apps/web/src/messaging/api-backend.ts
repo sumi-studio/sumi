@@ -329,11 +329,14 @@ export class ApiMessagingBackend implements MessagingBackend {
     messageId: string,
     content: string,
     expectedRevision: number,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "PATCH", body: { content, revision: expectedRevision } },
+  ): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
+        { method: "PATCH", body: { content, revision: expectedRevision } },
+      ),
     );
+    return parseMessage(body.message);
   }
 
   async deleteMessage(place: Place, messageId: string): Promise<void> {

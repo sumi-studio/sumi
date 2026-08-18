@@ -1972,12 +1972,26 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend
         .editMessage(place, session.messageId, trimmed, session.revision)
         .then(
-          () => {
-            set((current) =>
-              isCurrentEditSession(current, session)
-                ? clearedEditSession()
-                : {},
-            );
+          (committed) => {
+            set((current) => {
+              if (
+                committed.messageId !== session.messageId ||
+                placeKey(committed.place) !== key
+              )
+                return {};
+              return {
+                messagesByPlace: {
+                  ...current.messagesByPlace,
+                  [key]: upsertMessage(
+                    current.messagesByPlace[key] ?? [],
+                    committed,
+                  ),
+                },
+                ...(isCurrentEditSession(current, session)
+                  ? clearedEditSession()
+                  : {}),
+              };
+            });
           },
           (error: unknown) => {
             if (
@@ -1989,12 +2003,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
               return;
             const latest = error.currentMessage;
             set((current) => {
-              if (!isCurrentEditSession(current, session)) return {};
               if (
                 latest.messageId !== session.messageId ||
                 placeKey(latest.place) !== key
               )
                 return {};
+              const messagesByPlace = {
+                ...current.messagesByPlace,
+                [key]: upsertMessage(
+                  current.messagesByPlace[key] ?? [],
+                  latest,
+                ),
+              };
+              if (!isCurrentEditSession(current, session)) {
+                return { messagesByPlace };
+              }
               const currentMessage = (current.messagesByPlace[key] ?? []).find(
                 (message) => message.messageId === latest.messageId,
               );
@@ -2003,15 +2026,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 current.editConflict,
                 latest,
               );
-              if (!conflict) return {};
+              if (!conflict) return { messagesByPlace };
               return {
-                messagesByPlace: {
-                  ...current.messagesByPlace,
-                  [key]: upsertMessage(
-                    current.messagesByPlace[key] ?? [],
-                    latest,
-                  ),
-                },
+                messagesByPlace,
                 editConflict: conflict,
               };
             });

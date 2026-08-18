@@ -412,7 +412,11 @@ describe("編集セッションのタイムライン整合性", () => {
           message: conflictWire(current),
         }),
       )
-      .mockResolvedValueOnce();
+      .mockResolvedValueOnce({
+        ...current,
+        content: "再読込後の保存",
+        revision: (current.revision ?? 1) + 1,
+      });
 
     act(() => useMessaging.getState().startEdit(target.messageId));
     act(() => useMessaging.getState().setEditDraft("自分の書きかけ"));
@@ -475,13 +479,17 @@ describe("編集セッションのタイムライン整合性", () => {
       revision: 3,
     };
     let rejectFirstSave: ((error: unknown) => void) | undefined;
-    const firstSave = new Promise<void>((_resolve, reject) => {
+    const firstSave = new Promise<Message>((_resolve, reject) => {
       rejectFirstSave = reject;
     });
     const edit = vi
       .spyOn(backend, "editMessage")
       .mockImplementationOnce(() => firstSave)
-      .mockResolvedValueOnce();
+      .mockResolvedValueOnce({
+        ...revision3,
+        content: "revision 3から保存",
+        revision: 4,
+      });
 
     act(() => useMessaging.getState().startEdit(target.messageId));
     act(() => useMessaging.getState().setEditDraft("自分の書きかけ"));
@@ -562,6 +570,65 @@ describe("編集セッションのタイムライン整合性", () => {
     ).toMatchObject({ content: "revision 3", revision: 3 });
   });
 
+  it("WS切断中の成功応答で本文とrevisionを反映し、次の編集もそのrevisionを送る", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const committed = {
+      ...target,
+      content: "WSなしで確定した本文",
+      editedAt: Date.UTC(2026, 7, 19, 12, 0, 0),
+      revision: (target.revision ?? 1) + 1,
+    };
+    const afterRetry = {
+      ...committed,
+      content: "次の編集も成功",
+      revision: (committed.revision ?? 1) + 1,
+    };
+    // mockはlive eventをemitしない。PATCH成功応答だけでtimelineが収束することを見る。
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockResolvedValueOnce(committed)
+      .mockResolvedValueOnce(afterRetry);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft(committed.content));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() => {
+      expect(
+        useMessaging
+          .getState()
+          .messagesByPlace["channel:ch-general"]?.find(
+            (message) => message.messageId === target.messageId,
+          ),
+      ).toMatchObject({
+        content: committed.content,
+        revision: committed.revision,
+      });
+      expect(useMessaging.getState().editingMessageId).toBeNull();
+    });
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft(afterRetry.content));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() =>
+      expect(edit).toHaveBeenLastCalledWith(
+        target.place,
+        target.messageId,
+        afterRetry.content,
+        committed.revision,
+      ),
+    );
+  });
+
   it("保存中に取消して別の編集を始めても、先の成功は新しいセッションを閉じない", async () => {
     const backend = await bootStore();
     const [first, second] = (
@@ -573,8 +640,8 @@ describe("編集セッションのタイムライン整合性", () => {
     );
     if (!first || !second) throw new Error("test messages were not loaded");
 
-    let resolveFirstSave: (() => void) | undefined;
-    const firstSave = new Promise<void>((resolve) => {
+    let resolveFirstSave: ((message: Message) => void) | undefined;
+    const firstSave = new Promise<Message>((resolve) => {
       resolveFirstSave = resolve;
     });
     const edit = vi
@@ -596,7 +663,11 @@ describe("編集セッションのタイムライン整合性", () => {
     act(() => useMessaging.getState().setEditDraft("新しい書きかけ"));
 
     await act(async () => {
-      resolveFirstSave?.();
+      resolveFirstSave?.({
+        ...first,
+        content: "先の保存",
+        revision: (first.revision ?? 1) + 1,
+      });
       await firstSave;
     });
 

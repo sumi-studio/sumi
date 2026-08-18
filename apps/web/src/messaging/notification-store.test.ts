@@ -136,7 +136,9 @@ class StubBackend implements MessagingBackend {
       created: true,
     };
   }
-  async editMessage(): Promise<void> {}
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
+    throw new Error("unused");
+  }
   async deleteMessage(): Promise<void> {}
   async markRead(): Promise<void> {}
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {

@@ -707,7 +707,9 @@ class StubBackend implements MessagingBackend {
     return `/test/attachments/${attachmentId}`;
   }
   sendMessage = vi.fn();
-  editMessage = vi.fn(async () => undefined);
+  editMessage = async (): ReturnType<MessagingBackend["editMessage"]> => {
+    throw new Error("editMessage is not part of this test");
+  };
   deleteMessage = vi.fn(async () => undefined);
   markRead = vi.fn(async () => undefined);
   setStatus = vi.fn(async () => {
