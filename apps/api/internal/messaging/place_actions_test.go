@@ -56,6 +56,65 @@ func TestUpdateChannelChangesOnlyWhatWasNamed(t *testing.T) {
 	}
 }
 
+// Two people editing the same channel at once are each editing a different
+// field of one answer to「このチャンネルは何か」. The reply — and the
+// place_updated built from it (http.go serveUpdatePlace) — has to be what the
+// channel now is. An answer assembled from what this request happened to read
+// on its way in would carry the other person's field as it was before their
+// edit, and every open screen would take that as the current name.
+func TestAConcurrentEditIsAnsweredWithWhatTheChannelNowIs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	// Someone else's topic change, written but not yet committed. The rename
+	// below reads the place before this lands and writes after it.
+	other, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the other edit: %v", err)
+	}
+	defer func() { _ = other.Rollback(context.Background()) }()
+	if _, err := other.Exec(ctx, `
+		UPDATE places SET topic = $1 WHERE workspace_id = $2 AND place_id = $3`,
+		"設計の話", workspace.WorkspaceID, channel.PlaceID); err != nil {
+		t.Fatalf("other edit: %v", err)
+	}
+
+	type renameResult struct {
+		place Place
+		err   error
+	}
+	renamed := "設計"
+	done := make(chan renameResult, 1)
+	go func() {
+		place, err := scoped.UpdateChannel(ctx, channel.PlaceID, &renamed, nil)
+		done <- renameResult{place: place, err: err}
+	}()
+	waitForWaitingBackend(t, ctx, w.store.pool)
+	if err := other.Commit(ctx); err != nil {
+		t.Fatalf("commit the other edit: %v", err)
+	}
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("rename: %v", got.err)
+	}
+	if got.place.Name != "設計" || got.place.Topic != "設計の話" {
+		t.Fatalf("renamed place = %+v, want both edits", got.place)
+	}
+	var name, topic string
+	if err := w.store.pool.QueryRow(ctx, `
+		SELECT name, topic FROM places WHERE place_id = $1`,
+		channel.PlaceID).Scan(&name, &topic); err != nil {
+		t.Fatalf("read back the place: %v", err)
+	}
+	if name != got.place.Name || topic != got.place.Topic {
+		t.Fatalf("stored place = %q/%q, answer said %+v", name, topic, got.place)
+	}
+}
+
 // Duplicating carries the shape and nothing else. Messages, read state, and
 // notification settings belong to the channel they were made in; a copy that
 // dragged them along would be claiming things about the new place that nobody

@@ -78,23 +78,6 @@ func (r storedStatus) resolve(participant ParticipantRef, now time.Time) Partici
 	return ParticipantStatus{Participant: participant, Status: *r.baseStatus, Note: r.baseNote}
 }
 
-// lasting is what the participant would be back to once every temporary status
-// they have set has lapsed. Replacing one temporary status with another keeps
-// that answer, so two short states in a row cannot bury the lasting one the
-// participant actually chose to hold.
-func (r storedStatus) lasting(participant ParticipantRef, now time.Time) ParticipantStatus {
-	if r.expiresAt != nil && r.expiresAt.After(now) {
-		// Still holding: what lies underneath is its own base, not itself.
-		out := ParticipantStatus{Participant: participant}
-		if r.baseStatus != nil {
-			out.Status = *r.baseStatus
-			out.Note = r.baseNote
-		}
-		return out
-	}
-	return r.resolve(participant, now)
-}
-
 // StatusExpiry is one lapsed temporary status made durable, together with the
 // exact Messaging app addresses that may be told about it. A sweep has no
 // actor, so it carries the addresses rather than an actor-scoped store: the
