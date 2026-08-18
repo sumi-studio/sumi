@@ -98,10 +98,25 @@ const DMS: DmSummary[] = [
 // 名乗りの初期値。書き換えは各MockMessagingServerが自分の複製に対して行うので、
 // 一方のモックでの保存が他方の初期状態を汚さない。
 const SEED_MEMBERS: readonly MemberProfile[] = [
-  { participant: SELF, displayName: "yohaku", tagline: "Founder / デザイン" },
-  { participant: HARU, displayName: "Haru", tagline: "エンジニア" },
-  { participant: SUMI, displayName: "Sumi", tagline: "yohakuの秘書" },
-  { participant: KURO, displayName: "Kuro", tagline: "開発" },
+  {
+    participant: SELF,
+    displayName: "yohaku",
+    tagline: "Founder / デザイン",
+    revision: 0,
+  },
+  {
+    participant: HARU,
+    displayName: "Haru",
+    tagline: "エンジニア",
+    revision: 0,
+  },
+  {
+    participant: SUMI,
+    displayName: "Sumi",
+    tagline: "yohakuの秘書",
+    revision: 0,
+  },
+  { participant: KURO, displayName: "Kuro", tagline: "開発", revision: 0 },
 ];
 
 interface AgentPersona {
@@ -748,6 +763,7 @@ export class MockMessagingServer implements MessagingBackend {
         ? {}
         : { displayName: input.displayName }),
       ...(input.tagline === undefined ? {} : { tagline: input.tagline }),
+      revision: (current.revision ?? 0) + 1,
     };
     this.members[index] = next;
     this.emit({ type: "profile_updated", profile: next });

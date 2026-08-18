@@ -55,8 +55,8 @@ function snapshot(options: {
     channels: options.channels,
     dms: options.dms,
     members: options.members ?? [
-      { participant: SELF, displayName: "Yohaku", tagline: "" },
-      { participant: OTHER, displayName: "Aoi", tagline: "" },
+      { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
+      { participant: OTHER, displayName: "Aoi", tagline: "", revision: 1 },
     ],
     statuses: [],
     readMarkers: keys.map((key) => ({
@@ -248,8 +248,13 @@ describe("place lifecycleの再接続突き合わせ", () => {
       dms: [],
       unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
       members: [
-        { participant: SELF, displayName: "Yohaku", tagline: "" },
-        { participant: OTHER, displayName: "葵", tagline: "デザイン" },
+        { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
+        {
+          participant: OTHER,
+          displayName: "葵",
+          tagline: "デザイン",
+          revision: 2,
+        },
       ],
     });
     gap.emitConnection("connected");

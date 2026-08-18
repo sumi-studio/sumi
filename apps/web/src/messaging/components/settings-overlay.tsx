@@ -1,6 +1,7 @@
 import { Check, Copy, Settings, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { create } from "zustand";
+import { useAuth } from "../../auth/auth-context";
 import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import type { ParticipantRef } from "../model";
 import { useMessaging } from "../store";
@@ -101,6 +102,7 @@ function Field({
 
 /** 名乗り: 表示名とひとこと。 */
 function ProfileSection() {
+  const { syncDisplayName, user } = useAuth();
   const selfKey = useMessaging((state) => state.selfKey);
   const member = useMessaging((state) => state.membersByKey[selfKey]);
   const updateProfile = useMessaging((state) => state.updateProfile);
@@ -134,13 +136,19 @@ function ProfileSection() {
     setFailed("");
     setSaved(false);
     try {
-      await updateProfile({
+      const canonical = await updateProfile({
         displayName: clampCodePoints(
           displayName.trim(),
           MAX_DISPLAY_NAME_CHARS,
         ),
         tagline: clampCodePoints(tagline.trim(), MAX_TAGLINE_CHARS),
       });
+      if (
+        canonical.participant.kind === "human" &&
+        canonical.participant.humanId === user?.id
+      ) {
+        syncDisplayName(user.id, canonical.displayName);
+      }
       setSaved(true);
     } catch {
       setFailed("保存できませんでした。表示名は1文字以上必要です");

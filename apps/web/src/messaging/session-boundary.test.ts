@@ -76,6 +76,7 @@ describe("messaging session boundary", () => {
           participant: { kind: "human", humanId: "human-a" },
           displayName: "After",
           tagline: "",
+          revision: 2,
         },
         {
           participant: {
@@ -84,6 +85,7 @@ describe("messaging session boundary", () => {
           },
           displayName: "Sumi（After）",
           tagline: "",
+          revision: 2,
         },
       ],
     });
@@ -116,6 +118,7 @@ describe("messaging session boundary", () => {
           participant: { kind: "human", humanId: "human-a" },
           displayName: "Before",
           tagline: "",
+          revision: 1,
         },
         "personality_agent:agent-a": {
           participant: {
@@ -124,6 +127,7 @@ describe("messaging session boundary", () => {
           },
           displayName: "Sumi（Before）",
           tagline: "",
+          revision: 1,
         },
       },
       messagesByPlace,
@@ -136,6 +140,48 @@ describe("messaging session boundary", () => {
       "personality_agent:agent-a": { displayName: "Sumi（After）" },
     });
     expect(useMessaging.getState().messagesByPlace).toBe(messagesByPlace);
+  });
+
+  it("refreshの古いprofile snapshotで新しいrevisionを巻き戻さない", async () => {
+    bindMessagingSessionIdentity("human-a");
+    const server = new MockMessagingServer();
+    const snapshot = await server.bootstrap();
+    vi.spyOn(server, "bootstrap").mockResolvedValue({
+      ...snapshot,
+      self: { kind: "human", humanId: "human-a" },
+      members: [
+        {
+          participant: { kind: "human", humanId: "human-a" },
+          displayName: "Stale",
+          tagline: "",
+          revision: 2,
+        },
+      ],
+    });
+    installMessagingBackend(server);
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "human-a" },
+      selfKey: "human:human-a",
+      membersByKey: {
+        "human:human-a": {
+          participant: { kind: "human", humanId: "human-a" },
+          displayName: "Current",
+          tagline: "最新",
+          revision: 3,
+        },
+      },
+    });
+
+    await refreshMessagingMemberProfiles();
+
+    expect(useMessaging.getState().membersByKey["human:human-a"]).toMatchObject(
+      {
+        displayName: "Current",
+        tagline: "最新",
+        revision: 3,
+      },
+    );
   });
 
   it("rejects a deferred DM result after the messaging identity changes", async () => {

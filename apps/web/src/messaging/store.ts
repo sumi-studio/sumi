@@ -83,6 +83,41 @@ const UNBOUND_CAPABILITIES: MessagingCapabilities = {
   notifications: false,
 };
 
+const profileRevision = (profile: MemberProfile): number =>
+  profile.revision ?? 0;
+
+/** profileを更新する唯一の書き込み口。revisionが同じか古ければ残す。 */
+function applyProfile(
+  membersByKey: Record<ParticipantKey, MemberProfile>,
+  profile: MemberProfile,
+  allowUnknown = true,
+): Record<ParticipantKey, MemberProfile> {
+  const key = participantKey(profile.participant);
+  const current = membersByKey[key];
+  if (!current && !allowUnknown) return membersByKey;
+  if (current && profileRevision(profile) <= profileRevision(current)) {
+    return membersByKey;
+  }
+  return { ...membersByKey, [key]: profile };
+}
+
+function mergeProfilesByRevision(
+  current: Record<ParticipantKey, MemberProfile>,
+  snapshot: MemberProfile[],
+): Record<ParticipantKey, MemberProfile> {
+  let merged: Record<ParticipantKey, MemberProfile> = {};
+  for (const profile of snapshot) {
+    const currentProfile = current[participantKey(profile.participant)];
+    const winner =
+      currentProfile &&
+      profileRevision(currentProfile) >= profileRevision(profile)
+        ? currentProfile
+        : profile;
+    merged = applyProfile(merged, winner);
+  }
+  return merged;
+}
+
 function unboundMessagingBackend(): MessagingBackend {
   const target = {
     capabilities: UNBOUND_CAPABILITIES,
@@ -244,7 +279,7 @@ interface MessagingState {
    * 自分の名乗りを置き換える。サーバーが正規化した確定値をそのまま取り込むので、
    * 失敗した保存が手元にだけ残ることはない。
    */
-  updateProfile(input: ProfileInput): Promise<void>;
+  updateProfile(input: ProfileInput): Promise<MemberProfile>;
   setPlaceNotificationLevel(
     key: PlaceKey,
     level: NotificationLevel,
@@ -553,34 +588,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * まだ知らない参加者は無視する:
    * membershipはbootstrapが決めるもので、eventで増えたりはしない。
    */
-  const profileRevision = (profile: MemberProfile): number =>
-    profile.revision ?? 0;
-
-  const applyProfile = (profile: MemberProfile) => {
-    const key = participantKey(profile.participant);
-    set((state) =>
-      state.membersByKey[key] &&
-      profileRevision(profile) > profileRevision(state.membersByKey[key])
-        ? { membersByKey: { ...state.membersByKey, [key]: profile } }
-        : {},
-    );
-  };
-
-  const mergeProfilesByRevision = (
-    current: Record<ParticipantKey, MemberProfile>,
-    snapshot: MemberProfile[],
-  ): Record<ParticipantKey, MemberProfile> => {
-    const merged: Record<ParticipantKey, MemberProfile> = {};
-    for (const profile of snapshot) {
-      const key = participantKey(profile.participant);
-      const currentProfile = current[key];
-      merged[key] =
-        currentProfile &&
-        profileRevision(currentProfile) > profileRevision(profile)
-          ? currentProfile
-          : profile;
-    }
-    return merged;
+  const applyProfileEvent = (profile: MemberProfile) => {
+    set((state) => {
+      const membersByKey = applyProfile(state.membersByKey, profile, false);
+      return membersByKey === state.membersByKey ? {} : { membersByKey };
+    });
   };
 
   const applyPresenceProjection = (
@@ -985,7 +997,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "profile_updated") {
-      applyProfile(event.profile);
+      applyProfileEvent(event.profile);
       return;
     }
     if (event.type === "reply_later_created") {
@@ -1902,9 +1914,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
         messagingSessionGeneration !== sessionGeneration
       ) {
         // 別のsessionのbackendが答えた値を今の一覧へ混ぜない。
-        return;
+        throw new Error("Messaging session changed during profile update");
       }
-      applyProfile(canonical);
+      applyProfileEvent(canonical);
+      return (
+        get().membersByKey[participantKey(canonical.participant)] ?? canonical
+      );
     },
     setStatus(status, note) {
       const currentBackend = backend;
@@ -2094,11 +2109,12 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
     throw new Error("Messaging session changed during profile refresh");
   }
 
-  const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-  for (const member of snapshot.members) {
-    membersByKey[participantKey(member.participant)] = member;
-  }
-  useMessaging.setState({ membersByKey });
+  useMessaging.setState((current) => ({
+    membersByKey: mergeProfilesByRevision(
+      current.membersByKey,
+      snapshot.members,
+    ),
+  }));
 }
 
 export function bindMessagingSessionIdentity(identity: string | null): void {

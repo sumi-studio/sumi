@@ -4,12 +4,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagingAPIError } from "./api-backend";
 import { MockMessagingServer } from "./mock-server";
 import type { Message } from "./model";
+import {
+  bindMessagingSessionIdentity,
+  installMessagingBackend,
+  useMessaging,
+} from "./store";
 
 const GENERAL = { kind: "channel", channelId: "ch-general" } as const;
 const DEV = { kind: "channel", channelId: "ch-dev" } as const;
 
 afterEach(() => {
   vi.useRealTimers();
+  bindMessagingSessionIdentity(null);
 });
 
 describe("MockMessagingServer admission", () => {
@@ -121,6 +127,22 @@ describe("MockMessagingServer admission", () => {
     expect(fresh.members[0]).toMatchObject({
       displayName: "yohaku",
       tagline: "Founder / デザイン",
+    });
+  });
+
+  it("保存した名乗りをrevision付きで画面のstoreへ反映する", async () => {
+    bindMessagingSessionIdentity("h-yohaku");
+    installMessagingBackend(new MockMessagingServer());
+    useMessaging.getState().init();
+    await vi.waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+
+    await useMessaging.getState().updateProfile({ displayName: "余白" });
+
+    expect(
+      useMessaging.getState().membersByKey["human:h-yohaku"],
+    ).toMatchObject({
+      displayName: "余白",
+      revision: 1,
     });
   });
 });

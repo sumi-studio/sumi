@@ -197,6 +197,12 @@ function AuthStateProbe() {
       >
         update display name
       </button>
+      <button
+        type="button"
+        onClick={() => auth.syncDisplayName("user-a", "After")}
+      >
+        sync display name
+      </button>
     </>
   );
 }
@@ -230,6 +236,29 @@ describe("canonical Human profile", () => {
       expect(screen.getByTestId("display-name")).toHaveTextContent("After");
     });
     expect(authMocks.updateSumiProfile).toHaveBeenCalledWith("After");
+  });
+
+  it("accepts the Messaging profile write's confirmed Human name", async () => {
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sync display name" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("After");
+    });
   });
 
   it("reconciles a committed profile update whose response was lost", async () => {

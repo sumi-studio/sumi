@@ -147,6 +147,8 @@ export interface AuthContextValue {
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
   updateDisplayName: (displayName: string) => Promise<void>;
+  /** Messaging profile writeが確定したHuman名を、同じsessionへ反映する。 */
+  syncDisplayName: (userId: string, displayName: string) => void;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -825,6 +827,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [isCurrentGeneration, nextGeneration, serializeSessionMutation],
   );
 
+  const syncDisplayName = useCallback((userId: string, displayName: string) => {
+    const current = serverSession.current;
+    if (!current.authenticated || current.user.id !== userId) return;
+    const nextSession: SumiSessionStatus = {
+      ...current,
+      user: { ...current.user, displayName },
+    };
+    serverSession.current = nextSession;
+    setSession(nextSession);
+  }, []);
+
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
     // the already-upgraded socket before the cookie is cleared server-side.
@@ -913,6 +926,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       cancelIntentTransition,
       dismissOutcomeNotice,
       updateDisplayName,
+      syncDisplayName,
       logout,
       refreshSession,
     }),
@@ -935,6 +949,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       outcomeNotice,
       user,
       updateDisplayName,
+      syncDisplayName,
     ],
   );
 
