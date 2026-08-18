@@ -682,6 +682,9 @@ describe("カードの束縛と転送先", () => {
         onDelete={vi.fn()}
         onJumpTo={vi.fn()}
         onRetry={vi.fn()}
+        revealedAttachmentIds={new Set()}
+        onRevealAttachment={vi.fn()}
+        onOpenImage={vi.fn()}
       />,
     );
 
