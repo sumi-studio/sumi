@@ -17,6 +17,11 @@
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
+  /* shadcn由来のコンポーネントとメッセージングUIは hover/選択の面を accent で
+     書く。@theme に無いとTailwindが bg-accent 系のクラスを生成せず、
+     ハイライトが丸ごと消える。 */
+  --color-accent: var(--interactive-hover);
+  --color-accent-foreground: var(--foreground);
   --color-interactive-active: var(--interactive-active);
   --color-interactive-hover: var(--interactive-hover);
   --color-destructive: var(--destructive);
