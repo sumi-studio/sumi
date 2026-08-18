@@ -157,6 +157,10 @@ enum MessagingAction {
     /// dm), exactly like the human sidebar's「ダイレクトメッセージを開始」.
     /// The new place becomes the one in view, as it does for a human who is
     /// taken into the conversation they just opened.
+    ///
+    /// Participants are named, not selected from this view: overview, an open
+    /// place's members, and message authors are where their shape comes from,
+    /// and Workspace membership is what decides who may be reached.
     StartDm {
         participants: Vec<MessagingParticipant>,
     },
@@ -686,9 +690,11 @@ fn messaging_parameters_schema() -> Value {
                 "maxItems": 32,
                 "description": concat!(
                     "Required for start_dm and omitted for other actions. The people to open the ",
-                    "conversation with, each copied from the participant object overview showed ",
-                    "for that member. Do not list yourself. One entry opens the single direct ",
-                    "conversation with that person; several open a group conversation."
+                    "conversation with, in the participant shape used everywhere else: take one ",
+                    "from overview's member list, an open place's members, or a message author. ",
+                    "Do not list yourself. One entry opens the single direct conversation with ",
+                    "that person; several open a group conversation. Who may be reached is ",
+                    "decided by Workspace membership, not by what this view has shown."
                 ),
                 "items": {
                     "type": "object",
@@ -2325,9 +2331,16 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
     }
 }
 
-/// The people a conversation is opened with. Each is named in the shape
-/// overview already showed, and each names exactly one identity: a kind
-/// without its matching id (or with the other kind's id) is not a person.
+/// The people a conversation is opened with. Each is named in the shape the
+/// rest of this tool uses, and each names exactly one identity: a kind without
+/// its matching id (or with the other kind's id) is not a person.
+///
+/// This does not check the names against what the view has shown. Whether a
+/// conversation may be opened with someone is a question about Workspace
+/// membership, which the Store answers; refusing a fellow member here because
+/// this view had not listed them would be the tool inventing an authorization
+/// rule out of an affordance. A human picks from a list because that is how a
+/// list is useful, not because the list is the boundary.
 fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(), ToolError> {
     if participants.is_empty() || participants.len() > MAX_DM_PARTICIPANTS {
         return Err(ToolError::InvalidArguments);

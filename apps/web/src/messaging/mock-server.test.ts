@@ -88,3 +88,29 @@ describe("MockMessagingServer admission", () => {
     expect(dev).toMatchObject({ unreadCount: 6, mentionCount: 1 });
   });
 });
+
+describe("MockMessagingServer place edits", () => {
+  it("複製の既定名は本番と同じ規則で、コピーのコピーでも重ならない", async () => {
+    const server = new MockMessagingServer();
+
+    const copy = await server.duplicateChannel("ch-general");
+    expect(copy.name).toBe("general のコピー");
+    expect(copy.channelId).not.toBe("ch-general");
+
+    const second = await server.duplicateChannel(copy.channelId);
+    expect(second.name).toBe("general のコピー");
+
+    // 名前を指名したときはそれが勝つ。
+    const named = await server.duplicateChannel("ch-general", "general-2");
+    expect(named.name).toBe("general-2");
+  });
+
+  it("何も指名しない編集は成功として返さない", async () => {
+    const server = new MockMessagingServer();
+
+    await expect(server.updateChannel("ch-general", {})).rejects.toThrow();
+
+    const renamed = await server.updateChannel("ch-general", { name: "設計" });
+    expect(renamed.name).toBe("設計");
+  });
+});
