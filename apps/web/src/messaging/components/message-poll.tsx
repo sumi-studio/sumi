@@ -25,9 +25,9 @@ export function MessagePoll({ message }: { message: Message }) {
   const membersByKey = useMessaging((state) => state.membersByKey);
   const votePoll = useMessaging((state) => state.votePoll);
   const [now, setNow] = useState(() => Date.now());
-  const [optimisticSelection, setOptimisticSelection] = useState<string[] | null>(
-    null,
-  );
+  const [optimisticSelection, setOptimisticSelection] = useState<
+    string[] | null
+  >(null);
   const pendingSelection = useRef<string[] | null>(null);
   const closesAt = poll?.closesAt ?? null;
 
@@ -45,13 +45,15 @@ export function MessagePoll({ message }: { message: Message }) {
   );
   const toggle = (optionId: string) => {
     if (closed || pending) return;
-    const mine = pendingSelection.current ?? poll.options
-      .filter((option) =>
-        option.voters.some(
-          (participant) => participantKey(participant) === selfKey,
-        ),
-      )
-      .map((option) => option.optionId);
+    const mine =
+      pendingSelection.current ??
+      poll.options
+        .filter((option) =>
+          option.voters.some(
+            (participant) => participantKey(participant) === selfKey,
+          ),
+        )
+        .map((option) => option.optionId);
     const selected = mine.includes(optionId);
     const next = poll.allowMulti
       ? selected

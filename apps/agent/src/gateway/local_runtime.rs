@@ -4559,8 +4559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messaging_thread_creation_retries_committed_response_loss_with_same_nonce_and_wire_body()
-    {
+    async fn messaging_thread_creation_retries_lost_response_with_same_wire_body() {
         let state = MessagingReplayFixtureState::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4611,8 +4610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messaging_poll_creation_retries_committed_response_loss_with_same_nonce_and_wire_body()
-    {
+    async fn messaging_poll_creation_retries_lost_response_with_same_wire_body() {
         let state = MessagingReplayFixtureState::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

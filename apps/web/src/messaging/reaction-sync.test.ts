@@ -1040,7 +1040,11 @@ describe("poll convergence in the messaging store", () => {
       type: "poll_updated",
       message: {
         ...initial,
-        poll: { ...initial.poll, revision: 2, options: [{ optionId: "option", text: "A", voters: [other] }] },
+        poll: {
+          ...initial.poll,
+          revision: 2,
+          options: [{ optionId: "option", text: "A", voters: [other] }],
+        },
       },
     });
     harness.emit({
@@ -1049,7 +1053,11 @@ describe("poll convergence in the messaging store", () => {
         ...initial,
         content: "after edit",
         editedAt: 99,
-        poll: { ...initial.poll, revision: 1, options: [{ optionId: "option", text: "A", voters: [self] }] },
+        poll: {
+          ...initial.poll,
+          revision: 1,
+          options: [{ optionId: "option", text: "A", voters: [self] }],
+        },
       },
     });
 
@@ -1086,28 +1094,45 @@ describe("poll convergence in the messaging store", () => {
     useMessaging.getState().votePoll(initial, ["a", "b"]);
     await harness.settle();
     expect(harness.votePoll).toHaveBeenCalledTimes(1);
-    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", ["a"]);
+    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", [
+      "a",
+    ]);
 
     first.resolve({
       ...initial,
-      poll: { ...initial.poll, revision: 1, options: [
-        { optionId: "a", text: "A", voters: [self] },
-        { optionId: "b", text: "B", voters: [] },
-      ] },
+      poll: {
+        ...initial.poll,
+        revision: 1,
+        options: [
+          { optionId: "a", text: "A", voters: [self] },
+          { optionId: "b", text: "B", voters: [] },
+        ],
+      },
     });
     await harness.settle();
     expect(harness.votePoll).toHaveBeenCalledTimes(2);
-    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", ["a", "b"]);
+    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", [
+      "a",
+      "b",
+    ]);
 
     second.resolve({
       ...initial,
-      poll: { ...initial.poll, revision: 2, options: [
-        { optionId: "a", text: "A", voters: [self] },
-        { optionId: "b", text: "B", voters: [self] },
-      ] },
+      poll: {
+        ...initial.poll,
+        revision: 2,
+        options: [
+          { optionId: "a", text: "A", voters: [self] },
+          { optionId: "b", text: "B", voters: [self] },
+        ],
+      },
     });
     await harness.settle();
-    const projected = useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll;
-    expect(projected?.options.map((option) => option.voters)).toEqual([[self], [self]]);
+    const projected =
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll;
+    expect(projected?.options.map((option) => option.voters)).toEqual([
+      [self],
+      [self],
+    ]);
   });
 });

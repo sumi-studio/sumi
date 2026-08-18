@@ -446,7 +446,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
   // so rapid multi-select clicks commit in the intended order.
   const pollVoteQueues = new Map<string, Promise<void>>();
 
-  const mergeMessagePoll = (existing: Message | undefined, incoming: Message) => {
+  const mergeMessagePoll = (
+    existing: Message | undefined,
+    incoming: Message,
+  ) => {
     const existingPoll = existing?.poll;
     const incomingPoll = incoming.poll;
     if (
@@ -2257,7 +2260,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     votePoll(message, optionIds) {
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
-      if (!currentBackend.votePoll) return Promise.resolve();
+      const votePoll = currentBackend.votePoll;
+      if (!votePoll) return Promise.resolve();
       // A failed/replaced transport must not let an unresolved old request
       // block votes in the new session.
       const queueKey = `${sessionGeneration}:${message.messageId}`;
@@ -2267,7 +2271,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         .then(async () => {
           const projectionVersion =
             pollProjectionVersions.get(message.messageId) ?? 0;
-          const canonical = await currentBackend.votePoll!(
+          const canonical = await votePoll(
             message.place,
             message.messageId,
             optionIds,

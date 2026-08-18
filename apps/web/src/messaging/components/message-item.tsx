@@ -27,8 +27,8 @@ import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
-import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { MessagePoll } from "./message-poll";
+import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 

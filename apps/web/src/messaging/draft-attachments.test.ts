@@ -169,7 +169,9 @@ describe("composer draft attachments", () => {
     useMessaging
       .getState()
       .addDraftAttachments([new File(["x"], "agenda.txt")]);
-    server.pendingUploads[0]?.deferred.resolve(receipt("att-poll", "agenda.txt"));
+    server.pendingUploads[0]?.deferred.resolve(
+      receipt("att-poll", "agenda.txt"),
+    );
     await settle();
 
     useMessaging.getState().send("release notes", "normal", {

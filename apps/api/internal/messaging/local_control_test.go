@@ -324,7 +324,7 @@ func TestLocalCreateThreadRejectsNULName(t *testing.T) {
 	}, authorization)
 	if status != http.StatusBadRequest || body["error"] != "invalid_request" {
 		t.Fatalf("local NUL thread name = %d %v, want 400 invalid_request", status, body)
- 	}
+	}
 }
 
 func TestLocalCreatePollReplayWithRelativeDeadlineReturnsOriginalReceipt(t *testing.T) {

@@ -70,7 +70,9 @@ describe("PollCreateDialog", () => {
 
     expect(screen.getByRole("button", { name: "投票を送信" })).toBeDisabled();
     expect(
-      screen.getByText("添付付きの投票は作成できません。添付を外してから送信してください。"),
+      screen.getByText(
+        "添付付きの投票は作成できません。添付を外してから送信してください。",
+      ),
     ).toBeInTheDocument();
     expect(send).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();

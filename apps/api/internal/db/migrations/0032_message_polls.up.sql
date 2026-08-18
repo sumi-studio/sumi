@@ -1,4 +1,4 @@
--- 0029_message_polls: a poll is the one-to-one attachment of a message.
+-- 0032_message_polls: a poll is the one-to-one attachment of a message.
 CREATE TABLE message_polls (
     workspace_id uuidv7      NOT NULL,
     message_id   uuidv7      NOT NULL,
