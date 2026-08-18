@@ -78,8 +78,8 @@ func TestStatusIsReplacedInPlaceAndExpiresAtReadTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list own statuses: %v", err)
 	}
-	if _, ok := statusOf(t, statuses, w.humanB); ok {
-		t.Fatalf("a lapsed status with no base must not be reported, got %+v", statuses)
+	if got, ok := statusOf(t, statuses, w.humanB); !ok || got.Status != "" || got.Revision != 1 {
+		t.Fatalf("a lapsed status with no base must report its empty revisioned projection, got %+v (found %v)", got, ok)
 	}
 
 	// Only the three declared values exist; anything else fails closed.
@@ -135,6 +135,9 @@ func TestStatusOverHTTPPublishesToParticipantScopedSubscribers(t *testing.T) {
 	if body["status"] != "busy" || body["note"] != "取り込み中" || body["expires_at"] != nil {
 		t.Fatalf("status body = %v", body)
 	}
+	if body["revision"] != float64(1) {
+		t.Fatalf("status revision = %v, want 1", body["revision"])
+	}
 
 	// status_updated carries no place: it is scoped to the participant, and the
 	// subscriber receives it because they share a workspace.
@@ -151,6 +154,9 @@ func TestStatusOverHTTPPublishesToParticipantScopedSubscribers(t *testing.T) {
 		status["participant"].(map[string]any)["human_id"] != w.humanA.ID {
 		t.Fatalf("status event payload = %v", status)
 	}
+	if status["revision"] != float64(1) {
+		t.Fatalf("status event revision = %v, want 1", status["revision"])
+	}
 
 	// Bootstrap reports the current value, since the event never replays.
 	resp, body = call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanB.ID, nil)
@@ -160,6 +166,9 @@ func TestStatusOverHTTPPublishesToParticipantScopedSubscribers(t *testing.T) {
 	statuses := body["statuses"].([]any)
 	if len(statuses) != 1 || statuses[0].(map[string]any)["status"] != "busy" {
 		t.Fatalf("bootstrap statuses = %v", statuses)
+	}
+	if statuses[0].(map[string]any)["revision"] != float64(1) {
+		t.Fatalf("bootstrap status revision = %v, want 1", statuses[0])
 	}
 
 	// Nobody sets anybody else's: the value comes from the session only, and a
@@ -261,6 +270,40 @@ func TestTimedStatusLapsesBackToTheDeclarationUnderneath(t *testing.T) {
 	}
 	if lasting.BaseStatus != "" || lasting.ExpiresAt != nil {
 		t.Fatalf("lasting status = %+v, want no base", lasting)
+	}
+}
+
+func TestStatusRevisionAdvancesForEveryDurableProjection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	lasting, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "在宅です", nil)
+	if err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	if lasting.Revision != 1 {
+		t.Fatalf("first status revision = %d, want 1", lasting.Revision)
+	}
+	past := time.Now().Add(-time.Minute)
+	temporary, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past)
+	if err != nil {
+		t.Fatalf("set temporary status: %v", err)
+	}
+	if temporary.Revision != 2 {
+		t.Fatalf("replacement status revision = %d, want 2", temporary.Revision)
+	}
+
+	expiries, err := collectExpiries(ctx, w.store.core)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(expiries) != 1 || expiries[0].Status.Revision != 3 {
+		t.Fatalf("expiry revisions = %+v, want one revision 3", expiries)
+	}
+	if expiries[0].Status.Status != StatusAway {
+		t.Fatalf("expiry status = %+v, want restored away", expiries[0].Status)
 	}
 }
 
@@ -402,8 +445,8 @@ func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {
 	if got, ok := statusOf(t, statuses, w.humanA); !ok || got.Status != StatusAway || got.ExpiresAt != nil {
 		t.Fatalf("status after sweep = %+v (found %v)", got, ok)
 	}
-	if _, ok := statusOf(t, statuses, w.humanB); ok {
-		t.Fatalf("cleared status must be gone, got %+v", statuses)
+	if got, ok := statusOf(t, statuses, w.humanB); !ok || got.Status != "" || got.Revision != 2 {
+		t.Fatalf("cleared status = %+v (found %v), want empty revision 2", got, ok)
 	}
 }
 

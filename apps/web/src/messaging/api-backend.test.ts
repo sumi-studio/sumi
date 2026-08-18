@@ -553,6 +553,7 @@ describe("ApiMessagingBackend", () => {
       statuses: [
         {
           participant: { kind: "human", human_id: "human-2" },
+          revision: 5,
           status: "busy",
           note: "取り込み中",
           expires_at: null,
@@ -570,6 +571,7 @@ describe("ApiMessagingBackend", () => {
         if (path === "/messaging/status" && init?.method === "PUT") {
           return json({
             participant: { kind: "human", human_id: "human-1" },
+            revision: 6,
             status: "busy",
             note: "取り込み中",
             expires_at: "2026-08-01T11:00:00Z",
@@ -609,6 +611,7 @@ describe("ApiMessagingBackend", () => {
     expect(snapshot.statuses).toEqual([
       {
         participant: { kind: "human", humanId: "human-2" },
+        revision: 5,
         status: "busy",
         note: "取り込み中",
         expiresAt: null,
@@ -623,6 +626,7 @@ describe("ApiMessagingBackend", () => {
     // 再接続後の再同期は、bootstrapと同じ現在値をもう一度読み直す。
     await expect(backend.fetchPresence()).resolves.toEqual({
       statuses: snapshot.statuses,
+      clearedStatuses: [],
       replyLaterMarkers: snapshot.replyLaterMarkers,
     });
 
@@ -633,6 +637,7 @@ describe("ApiMessagingBackend", () => {
       backend.setStatus("busy", "取り込み中", until),
     ).resolves.toEqual({
       participant: { kind: "human", humanId: "human-1" },
+      revision: 6,
       status: "busy",
       note: "取り込み中",
       expiresAt: until,
@@ -687,6 +692,7 @@ describe("ApiMessagingBackend", () => {
         type: "status_updated",
         status: {
           participant: { kind: "human", human_id: "human-2" },
+          revision: 7,
           status: "away",
           note: "",
           expires_at: "2026-08-01T12:00:00Z",

@@ -191,17 +191,17 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 		                  ELSE participant_statuses.base_note
 		              END,
 		              updated_at = now()
-		RETURNING status, note, expires_at, base_status, base_note`,
+		RETURNING status, note, expires_at, base_status, base_note, revision`,
 		s.Scope.Actor.Kind, s.Scope.Actor.ID, status, note, expiresAt,
 	).Scan(&stored.status, &stored.note, &stored.expiresAt,
-		&stored.baseStatus, &stored.baseNote); err != nil {
+		&stored.baseStatus, &stored.baseNote, &stored.revision); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("set scoped status: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("commit scoped status: %w", err)
 	}
 	next := ParticipantStatus{
-		Participant: s.Scope.Actor, Status: stored.status, Note: stored.note,
+		Participant: s.Scope.Actor, Revision: stored.revision, Status: status, Note: stored.note,
 		ExpiresAt: stored.expiresAt, BaseNote: stored.baseNote,
 	}
 	if stored.baseStatus != nil {
@@ -225,7 +225,7 @@ func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatu
 	// disagree with what a reader would have computed anyway.
 	rows, err := tx.Query(ctx, `
 		SELECT ps.member_kind, ps.member_id, ps.status, ps.note, ps.expires_at,
-		       ps.base_status, ps.base_note
+		       ps.base_status, ps.base_note, ps.revision
 		FROM participant_statuses ps
 		JOIN workspace_members wm
 		  ON wm.member_kind = ps.member_kind AND wm.member_id = ps.member_id
@@ -243,15 +243,10 @@ func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatu
 			stored      storedStatus
 		)
 		if err := rows.Scan(&participant.Kind, &participant.ID, &stored.status,
-			&stored.note, &stored.expiresAt, &stored.baseStatus, &stored.baseNote); err != nil {
+			&stored.note, &stored.expiresAt, &stored.baseStatus, &stored.baseNote, &stored.revision); err != nil {
 			return nil, fmt.Errorf("scan scoped status: %w", err)
 		}
 		resolved := stored.resolve(participant, now)
-		// A lapsed status with nothing behind it says nothing about the
-		// participant, so it is not reported at all.
-		if resolved.Status == "" {
-			continue
-		}
 		statuses = append(statuses, resolved)
 	}
 	if err := rows.Err(); err != nil {

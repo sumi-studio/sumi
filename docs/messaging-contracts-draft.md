@@ -227,6 +227,7 @@
 // Status: 本人が設定する。期限付き
 {
   "participant": ParticipantRef,
+  "revision": 12,
   "status": "available | busy | away",
   "note": "取り込み中",
   "expires_at": "...",
@@ -249,6 +250,10 @@
   リマインドして返信忘れを防ぐ**（通知タブ + 覚醒トリガ「予定された出来事」に合流）。
 - 既読の自動晒し（read receipt）は作らない。見えるのは本人が宣言したものだけ。
 - Statusの現在値はREST、変化はvolatile event `status_updated`。ReplyLaterはdurable。
+- Status wire（HTTP ACK、`status_updated`、bootstrap/presence再同期、期限切れの
+  復元・clearを含む）はparticipantごとの単調増加 `revision` を運ぶ。clientは既知の
+  revisionより新しいprojectionだけを適用するので、HTTP ACKより遅く届いた古いexpiry
+  frameや過去のpresence snapshotは新しい自己申告を巻き戻さない。
 - 期限付きStatusは**置き換える前の宣言を覚える**。`base_status` / `base_note` が
   それで、`expires_at` に達したら宣言はそこへ戻る。期限付きを期限付きで置き換えても
   `base_*` は引き継ぐので、短い宣言を重ねても本人が選んだ「期限の無い宣言」は

@@ -13,7 +13,17 @@ ALTER TABLE participant_statuses
     ADD COLUMN base_status text
         CHECK (base_status IS NULL OR base_status IN ('available', 'busy', 'away')),
     ADD COLUMN base_note text NOT NULL DEFAULT ''
-        CHECK (length(base_note) <= 200);
+        CHECK (length(base_note) <= 200),
+    -- A participant whose temporary declaration lapsed without a base keeps
+    -- this row as a tombstone.  That lets the next declaration, and every
+    -- reader of the clear, share one monotonic projection revision.
+    ADD COLUMN revision bigint NOT NULL DEFAULT 1
+        CHECK (revision BETWEEN 1 AND 9007199254740991);
+
+-- A clear is a state too.  NULL is its durable representation; the old
+-- CHECK already accepts NULL, so only the NOT NULL constraint must move.
+ALTER TABLE participant_statuses
+    ALTER COLUMN status DROP NOT NULL;
 
 -- A base only means something for a status that will lapse.
 ALTER TABLE participant_statuses
@@ -25,3 +35,17 @@ ALTER TABLE participant_statuses
 CREATE INDEX participant_statuses_expiring
     ON participant_statuses (expires_at)
     WHERE expires_at IS NOT NULL;
+
+CREATE FUNCTION messaging_increment_participant_status_revision()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.revision := OLD.revision + 1;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER participant_statuses_increment_revision
+BEFORE UPDATE ON participant_statuses
+FOR EACH ROW EXECUTE FUNCTION messaging_increment_participant_status_revision();

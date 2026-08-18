@@ -174,6 +174,8 @@ export type StatusKind = "available" | "busy" | "away";
  */
 export interface ParticipantStatus {
   participant: ParticipantRef;
+  /** Monotonic database revision of this participant's status projection. */
+  revision: number;
   status: StatusKind;
   note: string;
   expiresAt: number | null;
@@ -183,6 +185,12 @@ export interface ParticipantStatus {
    */
   baseStatus: StatusKind | null;
   baseNote: string;
+}
+
+/** A durable empty status projection. It still advances the participant's revision. */
+export interface StatusCleared {
+  participant: ParticipantRef;
+  revision: number;
 }
 
 /** 一時ステータスの期間プリセット。nullは「解除するまで」。 */
@@ -280,7 +288,7 @@ export type ServerEvent =
    * ではなく「何も言っていない状態に戻った」——サーバーが代わりに何かを
    * 名乗ることはしない。
    */
-  | { type: "status_cleared"; participant: ParticipantRef }
+  | ({ type: "status_cleared" } & StatusCleared)
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   /**
@@ -364,6 +372,8 @@ export interface MessagingBackend {
     dms: DmSummary[];
     members: MemberProfile[];
     statuses: ParticipantStatus[];
+    /** Empty status wires, split from statuses so UI state remains status-only. */
+    clearedStatuses?: StatusCleared[];
     readMarkers: ReadMarker[];
     unreadSummaries: UnreadSummary[];
     replyLaterMarkers: ReplyLaterMarker[];
@@ -423,6 +433,8 @@ export interface MessagingBackend {
    */
   fetchPresence(): Promise<{
     statuses: ParticipantStatus[];
+    /** Empty status wires, split from statuses so UI state remains status-only. */
+    clearedStatuses?: StatusCleared[];
     replyLaterMarkers: ReplyLaterMarker[];
   }>;
   /**

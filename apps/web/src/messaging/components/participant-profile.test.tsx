@@ -85,6 +85,7 @@ function setMembers() {
     statusByKey: {
       [agentKey]: {
         participant: agent,
+        revision: 1,
         status: "busy",
         note: "設計中",
         expiresAt: null,

@@ -12,6 +12,23 @@ afterEach(() => {
 });
 
 describe("MockMessagingServer admission", () => {
+  it("status projection revisions advance once per participant mutation", async () => {
+    const server = new MockMessagingServer();
+    const first = await server.setStatus("busy", "会議中", null);
+    const second = await server.setStatus("away", "外出中", null);
+
+    expect(first.revision).toBe(1);
+    expect(second.revision).toBe(2);
+    const presence = await server.fetchPresence();
+    expect(
+      presence.statuses.find(
+        (entry) =>
+          entry.participant.kind === "human" &&
+          entry.participant.humanId === "h-yohaku",
+      ),
+    ).toMatchObject({ revision: 2, status: "away" });
+  });
+
   it("client文字列の部分一致ではmentionを解決しない", async () => {
     vi.useFakeTimers();
     const server = new MockMessagingServer();

@@ -23,6 +23,7 @@ import type {
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusCleared,
   StatusKind,
   UnreadSummary,
   UploadAttachmentInput,
@@ -376,6 +377,9 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
+  /** Mirrors the database trigger: every participant projection advances alone. */
+  private readonly statusRevisions = new Map<string, number>();
+  private readonly clearedStatuses = new Map<string, StatusCleared>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
@@ -389,14 +393,17 @@ export class MockMessagingServer implements MessagingBackend {
 
   constructor() {
     this.readMarkers = initialReadMarkers(this.history);
-    this.statuses.set(participantKey(KURO), {
+    const key = participantKey(KURO);
+    this.statuses.set(key, {
       participant: KURO,
+      revision: 1,
       status: "busy",
       note: "デプロイ対応中",
       expiresAt: null,
       baseStatus: null,
       baseNote: "",
     });
+    this.statusRevisions.set(key, 1);
   }
 
   dispose(): void {
@@ -436,6 +443,7 @@ export class MockMessagingServer implements MessagingBackend {
       dms: DMS,
       members: MEMBERS,
       statuses: [...this.statuses.values()],
+      clearedStatuses: [...this.clearedStatuses.values()],
       readMarkers,
       unreadSummaries,
       replyLaterMarkers: [...this.replyLaterMarkers.values()],
@@ -726,10 +734,12 @@ export class MockMessagingServer implements MessagingBackend {
 
   async fetchPresence(): Promise<{
     statuses: ParticipantStatus[];
+    clearedStatuses: StatusCleared[];
     replyLaterMarkers: ReplyLaterMarker[];
   }> {
     return {
       statuses: [...this.statuses.values()],
+      clearedStatuses: [...this.clearedStatuses.values()],
       replyLaterMarkers: [...this.replyLaterMarkers.values()].filter(
         (marker) => !marker.resolved,
       ),
@@ -757,6 +767,7 @@ export class MockMessagingServer implements MessagingBackend {
             : { status: current.status, note: current.note };
     const next: ParticipantStatus = {
       participant: SELF,
+      revision: this.nextStatusRevision(key),
       status,
       note,
       expiresAt,
@@ -764,6 +775,7 @@ export class MockMessagingServer implements MessagingBackend {
       baseNote: base?.note ?? "",
     };
     this.statuses.set(key, next);
+    this.clearedStatuses.delete(key);
     this.emit({ type: "status_updated", status: next });
     if (expiresAt === null) return next;
     window.setTimeout(
@@ -772,11 +784,17 @@ export class MockMessagingServer implements MessagingBackend {
         if (this.statuses.get(key) !== next) return;
         if (next.baseStatus === null) {
           this.statuses.delete(key);
-          this.emit({ type: "status_cleared", participant: SELF });
+          const cleared = {
+            participant: SELF,
+            revision: this.nextStatusRevision(key),
+          };
+          this.clearedStatuses.set(key, cleared);
+          this.emit({ type: "status_cleared", ...cleared });
           return;
         }
         const restored: ParticipantStatus = {
           participant: SELF,
+          revision: this.nextStatusRevision(key),
           status: next.baseStatus,
           note: next.baseNote,
           expiresAt: null,
@@ -784,6 +802,7 @@ export class MockMessagingServer implements MessagingBackend {
           baseNote: "",
         };
         this.statuses.set(key, restored);
+        this.clearedStatuses.delete(key);
         this.emit({ type: "status_updated", status: restored });
       },
       Math.max(0, expiresAt - Date.now()),
@@ -1011,13 +1030,16 @@ export class MockMessagingServer implements MessagingBackend {
         this.emit({ type: "reply_later_resolved", markerId: marker.markerId });
         const status: ParticipantStatus = {
           participant: persona.ref,
+          revision: this.nextStatusRevision(participantKey(persona.ref)),
           status: "available",
           note: "",
           expiresAt: null,
           baseStatus: null,
           baseNote: "",
         };
-        this.statuses.set(participantKey(persona.ref), status);
+        const key = participantKey(persona.ref);
+        this.statuses.set(key, status);
+        this.clearedStatuses.delete(key);
         this.emit({ type: "status_updated", status });
       }, 1_700);
     }, REPLY_LATER_REMIND_MS);
@@ -1039,6 +1061,12 @@ export class MockMessagingServer implements MessagingBackend {
       message: { ...message },
       notify: this.notifyFor(message),
     });
+  }
+
+  private nextStatusRevision(key: string): number {
+    const revision = (this.statusRevisions.get(key) ?? 0) + 1;
+    this.statusRevisions.set(key, revision);
+    return revision;
   }
 
   private scheduleTypingUntil(
