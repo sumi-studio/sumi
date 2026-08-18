@@ -33,6 +33,7 @@ function ParticipantProfileCard({
   const status = useMessaging((state) => state.statusByKey[key]);
   const selfKey = useMessaging((state) => state.selfKey);
   const startDM = useMessaging((state) => state.startDM);
+  const dmPending = useMessaging((state) => state.startingDM !== null);
   const placeNavigate = usePlaceNavigate();
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -47,11 +48,14 @@ function ParticipantProfileCard({
 
   const own = key === selfKey;
 
+  // DM開始の保留はstoreに一つだけある。メンバーリストの行から始まった
+  // 保留も同じ一つなので、このカードから2本目が走ることはない。
+  //
   // DM遷移はstoreの完了だけでは足りない。待っている間にidentityが
   // 入れ替われば、それは別人のauthorityで開くDMになる（sidebar・member
   // listのDM導線と同じfence）。
   const openDM = async () => {
-    if (busy) return;
+    if (busy || dmPending) return;
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = selfKey;
     setBusy(true);
@@ -123,7 +127,7 @@ function ParticipantProfileCard({
           <button
             type="button"
             onClick={() => void openDM()}
-            disabled={busy}
+            disabled={busy || dmPending}
             aria-busy={busy}
             className="w-full rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
           >

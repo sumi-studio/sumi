@@ -14,9 +14,15 @@ export function MemberList() {
   const statusByKey = useMessaging((state) => state.statusByKey);
   const selfKey = useMessaging((state) => state.selfKey);
   const startDM = useMessaging((state) => state.startDM);
+  const startingDM = useMessaging((state) => state.startingDM);
   const placeNavigate = usePlaceNavigate();
-  const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [failedKey, setFailedKey] = useState<string | null>(null);
+
+  // 保留はstoreに一つだけある。行もカードも同じ一つを見るので、
+  // 保留中に別の入口から2本目のstartDMが走ることはない。
+  const pendingKey =
+    startingDM?.length === 1 ? participantKey(startingDM[0]) : null;
+  const dmPending = startingDM !== null;
 
   const members = useMemo(
     () =>
@@ -92,11 +98,10 @@ export function MemberList() {
                   title={`${member.displayName}にDMを送る`}
                   aria-label={`${member.displayName}にDMを送る`}
                   aria-busy={pendingKey === key}
-                  disabled={pendingKey !== null}
+                  disabled={dmPending}
                   onClick={async () => {
                     const currentIdentity = getMessagingSessionIdentity();
                     const expectedSelfKey = selfKey;
-                    setPendingKey(key);
                     setFailedKey(null);
                     try {
                       const place = await startDM([member.participant]);
@@ -116,8 +121,6 @@ export function MemberList() {
                       ) {
                         setFailedKey(key);
                       }
-                    } finally {
-                      setPendingKey(null);
                     }
                   }}
                   className="flex min-w-0 flex-1 items-center gap-2.5 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:opacity-60"

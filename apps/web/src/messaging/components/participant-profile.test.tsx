@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -9,11 +10,18 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MemberProfile, ParticipantRef, PlaceKey } from "../model";
+import { MockMessagingServer } from "../mock-server";
+import type {
+  DmSummary,
+  MemberProfile,
+  ParticipantRef,
+  PlaceKey,
+} from "../model";
 import { participantKey } from "../model";
 import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
+  installMessagingBackend,
   useMessaging,
 } from "../store";
 import { MemberList } from "./member-list";
@@ -45,6 +53,15 @@ const members: MemberProfile[] = [
 ];
 
 const startDM = vi.fn<(participants: ParticipantRef[]) => Promise<PlaceKey>>();
+const realStartDM = useMessaging.getState().startDM;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 function setMembers() {
   useMessaging.setState({
@@ -254,6 +271,37 @@ describe("MemberList のプロフィール導線", () => {
 
     expect(container.querySelectorAll("button button")).toHaveLength(0);
   });
+
+  it("行のDMが保留の間は別の参加者のカードから2本目を始められない", async () => {
+    const pending = deferred<DmSummary>();
+    const server = new MockMessagingServer();
+    vi.spyOn(server, "ensureDM").mockReturnValue(pending.promise);
+    installMessagingBackend(server);
+    setMembers();
+    useMessaging.setState({ startDM: realStartDM });
+    render(<MemberList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "墨にDMを送る" }));
+    expect(server.ensureDM).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "墨にDMを送る" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "筆のプロフィール" }));
+    const send = await screen.findByRole("button", { name: "DMを送る" });
+
+    expect(send).toBeDisabled();
+    fireEvent.click(send);
+    expect(server.ensureDM).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pending.resolve({
+        dmId: "dm-a",
+        kind: "dm",
+        participants: [human, agent],
+      });
+      await pending.promise;
+    });
+    await waitFor(() => expect(useMessaging.getState().startingDM).toBeNull());
+  });
 });
 
 describe("Sidebar のプロフィール導線", () => {
@@ -347,5 +395,25 @@ describe("Sidebar のプロフィール導線", () => {
     const { container } = renderSidebar();
 
     expect(container.querySelectorAll("button button")).toHaveLength(0);
+  });
+
+  it("DM行のアバターを右クリックしても行の通知メニューが開く", () => {
+    useMessaging.setState({
+      capabilities: {
+        status: true,
+        replyLater: false,
+        reactions: false,
+        notifications: true,
+      },
+    });
+    renderSidebar();
+
+    fireEvent.contextMenu(
+      screen.getByRole("button", { name: "墨のプロフィール" }),
+    );
+
+    expect(
+      screen.getByRole("dialog", { name: "この場所の通知設定" }),
+    ).toBeInTheDocument();
   });
 });

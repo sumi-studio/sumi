@@ -199,7 +199,16 @@ function PlaceRow({
   const active = selectedPlaceKey === key;
   const muted = level === "mute";
   return (
+    // 右クリックは行そのものが受ける。leadingへ切り出したアバターの上でも
+    // 同じ導線が出る（行の右クリック契約はアバター領域を含む）。行内の
+    // buttonへフォーカスしたままのShift+F10もここへ上がってくる。
+    // biome-ignore lint/a11y/noStaticElementInteractions: 右クリックは補助導線で、正規の入口は同じ行の「…」button。
     <div
+      onContextMenu={(event) => {
+        if (!canConfigure) return;
+        event.preventDefault();
+        setMenuOpen(true);
+      }}
       className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors ${
         active
           ? "bg-accent text-foreground"
@@ -213,11 +222,6 @@ function PlaceRow({
         type="button"
         aria-current={active ? "page" : undefined}
         onClick={() => placeNavigate(key)}
-        onContextMenu={(event) => {
-          if (!canConfigure) return;
-          event.preventDefault();
-          setMenuOpen(true);
-        }}
         className="flex min-w-0 flex-1 items-center gap-2 text-left"
       >
         {leading ? null : icon}
@@ -427,6 +431,7 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   const statusByKey = useMessaging((state) => state.statusByKey);
   const selfKey = useMessaging((state) => state.selfKey);
   const startDM = useMessaging((state) => state.startDM);
+  const dmPending = useMessaging((state) => state.startingDM !== null);
   const placeNavigate = usePlaceNavigate();
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
@@ -444,7 +449,7 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   );
 
   const submit = async () => {
-    if (busy || chosen.length === 0) return;
+    if (busy || dmPending || chosen.length === 0) return;
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = selfKey;
     setBusy(true);
@@ -540,7 +545,7 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
         <button
           type="button"
           onClick={() => void submit()}
-          disabled={busy || chosen.length === 0}
+          disabled={busy || dmPending || chosen.length === 0}
           className="rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >
           {chosen.length > 1 ? "グループDMを作成" : "DMを開始"}
