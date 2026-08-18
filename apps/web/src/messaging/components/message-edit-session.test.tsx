@@ -8,6 +8,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "../mock-server";
@@ -39,10 +40,19 @@ const MESSAGE_COUNT = 200;
 const OFFSCREEN_INDEX = 3;
 
 const SELF: ParticipantRef = { kind: "human", humanId: "human-a" };
+const SUMI: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "sumi-a",
+};
 const PLACE: PlaceKey = "channel:channel-a";
 
 const membersByKey: Record<string, MemberProfile> = {
   "human:human-a": { participant: SELF, displayName: "余白", tagline: "" },
+  "personality_agent:sumi-a": {
+    participant: SUMI,
+    displayName: "墨",
+    tagline: "秘書",
+  },
 };
 
 function makeMessages(count: number): Message[] {
@@ -198,6 +208,26 @@ describe("編集セッションは仮想リストの行より長生きする", (
     fireEvent.scroll(viewport);
     const again = await screen.findByLabelText("メッセージを編集");
     expect(again).toHaveValue("書きかけの続き");
+  });
+
+  it("インライン編集中の @ 補完は候補を選ぶと表示名を挿入する", async () => {
+    const messages = makeMessages(MESSAGE_COUNT);
+    seedStore(messages);
+    render(<MessageList />);
+
+    act(() =>
+      useMessaging.getState().startEdit(messages[OFFSCREEN_INDEX].messageId),
+    );
+    const textarea = await screen.findByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: "@" } });
+
+    const suggestions = screen.getByTestId("mention-suggestions");
+    expect(suggestions).toHaveTextContent("墨");
+    fireEvent.mouseDown(
+      within(suggestions).getByRole("button", { name: /墨/ }),
+    );
+
+    await waitFor(() => expect(textarea).toHaveValue("@墨 "));
   });
 });
 

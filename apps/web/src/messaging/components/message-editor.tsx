@@ -1,6 +1,11 @@
 import { useEffect, useRef } from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
+import type { MemberProfile, ParticipantKey } from "../model";
+import {
+  MentionSuggestions,
+  useMentionAutocomplete,
+} from "./mention-autocomplete";
 
 const MAX_HEIGHT_PX = 220;
 
@@ -20,13 +25,24 @@ export function MessageEditor({
   onChange,
   onSubmit,
   onCancel,
+  membersByKey,
+  selfKey,
 }: {
   value: string;
   onChange: (content: string) => void;
   onSubmit: () => void;
   onCancel: () => void;
+  membersByKey: Record<ParticipantKey, MemberProfile>;
+  selfKey: ParticipantKey;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const mentionAutocomplete = useMentionAutocomplete({
+    value,
+    onValueChange: onChange,
+    inputRef: textareaRef,
+    membersByKey,
+    selfKey,
+  });
 
   // 開いた瞬間に本文末尾へキャレットを置く（続きを書き足す方が多い）。
   useEffect(() => {
@@ -59,16 +75,22 @@ export function MessageEditor({
   };
 
   return (
-    <div className="my-0.5">
+    <div className="relative my-0.5">
+      <MentionSuggestions
+        autocomplete={mentionAutocomplete}
+        className="absolute bottom-full left-0 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md"
+      />
       <textarea
         ref={textareaRef}
         value={value}
         aria-label="メッセージを編集"
         rows={1}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={mentionAutocomplete.onInputChange}
+        onClick={mentionAutocomplete.onInputClick}
         onKeyDown={(event) => {
           // IME変換中のEnter/Escは変換の操作。編集の操作として横取りしない。
           if (isImeComposing(event)) return;
+          if (mentionAutocomplete.onKeyDown(event)) return;
           if (event.key === "Escape") {
             event.preventDefault();
             onCancel();
