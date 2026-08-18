@@ -2035,6 +2035,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 });
 
+/**
+ * 編集セッションは、現在開いているタイムラインに対象が表示可能な間だけ有効。
+ *
+ * メッセージの取り込み経路は live event、ページング、再同期、scope reset など複数ある。
+ * それぞれで編集状態を片付けるのではなく、編集セッションが依存する三つの値が変わる
+ * たびにここで不変条件を検査する。tombstone は配列に残るがタイムラインには出ないため、
+ * deleted も対象不在として扱う。
+ */
+function hasEditingTarget(state: MessagingState): boolean {
+  const key = state.activePlaceKey;
+  const messageId = state.editingMessageId;
+  return Boolean(
+    key &&
+      messageId &&
+      state.messagesByPlace[key]?.some(
+        (message) => message.messageId === messageId && !message.deleted,
+      ),
+  );
+}
+
+useMessaging.subscribe((state, previous) => {
+  if (
+    state.editingMessageId === previous.editingMessageId &&
+    state.activePlaceKey === previous.activePlaceKey &&
+    state.messagesByPlace === previous.messagesByPlace
+  ) {
+    return;
+  }
+  if (state.editingMessageId !== null && !hasEditingTarget(state)) {
+    useMessaging.setState({ editingMessageId: null, editDraft: "" });
+  }
+});
+
 let messagingSessionIdentity: string | null = null;
 
 export function getMessagingSessionIdentity(): string | null {

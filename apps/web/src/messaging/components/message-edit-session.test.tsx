@@ -10,13 +10,18 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MockMessagingServer } from "../mock-server";
 import type {
   MemberProfile,
   Message,
   ParticipantRef,
   PlaceKey,
 } from "../model";
-import { useMessaging } from "../store";
+import {
+  bindMessagingSessionIdentity,
+  installMessagingBackend,
+  useMessaging,
+} from "../store";
 import { MessageList } from "./message-list";
 
 /**
@@ -193,5 +198,74 @@ describe("編集セッションは仮想リストの行より長生きする", (
     fireEvent.scroll(viewport);
     const again = await screen.findByLabelText("メッセージを編集");
     expect(again).toHaveValue("書きかけの続き");
+  });
+});
+
+describe("編集セッションのタイムライン整合性", () => {
+  afterEach(() => {
+    bindMessagingSessionIdentity(null);
+  });
+
+  async function bootStore() {
+    bindMessagingSessionIdentity("message-edit-session");
+    const backend = new MockMessagingServer();
+    installMessagingBackend(backend);
+    useMessaging.getState().init();
+    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+    useMessaging.getState().selectPlace("channel:ch-general");
+    await waitFor(() =>
+      expect(
+        useMessaging.getState().messagesByPlace["channel:ch-general"],
+      ).not.toHaveLength(0),
+    );
+    return backend;
+  }
+
+  it("編集中の対象が message_deleted で消えると composer を通常状態へ戻す", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: target.content,
+    });
+
+    await backend.deleteMessage(target.place, target.messageId);
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: null,
+      editDraft: "",
+    });
+  });
+
+  it("別メッセージの message_deleted では編集セッションを維持する", async () => {
+    const backend = await bootStore();
+    const messages = (
+      useMessaging.getState().messagesByPlace["channel:ch-general"] ?? []
+    ).filter(
+      (message) =>
+        message.author.kind === "human" &&
+        message.author.humanId === "h-yohaku",
+    );
+    const target = messages[0];
+    const other = messages[1];
+    if (!target || !other) throw new Error("test messages were not loaded");
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("保存前の書きかけ"));
+    await backend.deleteMessage(other.place, other.messageId);
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: "保存前の書きかけ",
+    });
   });
 });
