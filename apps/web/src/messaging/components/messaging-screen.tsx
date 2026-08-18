@@ -1,4 +1,4 @@
-import { Bell, Clock, Hash, Pencil, Users, X } from "lucide-react";
+import { Bell, Clock, Hash, Users, X } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -7,7 +7,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { isImeComposing } from "../../lib/ime";
 import { CallBanner } from "../call/call-banner";
 import { CallFailureNotice } from "../call/call-failure-notice";
 import { CallStage } from "../call/call-stage";
@@ -60,95 +59,6 @@ function relativeTime(target: number, now: number): string {
   if (minutes < 1) return "まもなく";
   if (minutes < 60) return `${minutes}分後`;
   return `${Math.round(minutes / 60)}時間後`;
-}
-
-/**
- * ヘッダーのchannelトピック。クリックでその場のinputになり、Enterで保存、
- * Escapeで破棄する。権限はサーバーのmembershipモデルに従う（v0: workspaceの
- * activeメンバーなら誰でも編集できる）。
- */
-export function ChannelTopic({
-  channelId,
-  topic,
-}: {
-  channelId: string;
-  topic: string;
-}) {
-  const updateChannelTopic = useMessaging((state) => state.updateChannelTopic);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(topic);
-  const [busy, setBusy] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (editing) inputRef.current?.focus();
-  }, [editing]);
-
-  if (!editing) {
-    return (
-      <button
-        type="button"
-        title="トピックを編集"
-        onClick={() => {
-          setDraft(topic);
-          setEditing(true);
-        }}
-        className="group flex min-w-0 items-center gap-2 text-left"
-      >
-        <span className="h-4 w-px shrink-0 bg-border" />
-        {topic ? (
-          <span className="truncate text-[12px] text-muted-foreground group-hover:text-foreground">
-            {topic}
-          </span>
-        ) : (
-          <span className="shrink-0 text-[12px] text-muted-foreground/60 group-hover:text-foreground">
-            トピックを追加
-          </span>
-        )}
-        <Pencil className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-      </button>
-    );
-  }
-
-  const submit = async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await updateChannelTopic(channelId, draft.trim());
-      setEditing(false);
-    } catch {
-      // 保存できなかったときは入力を失わず編集中のまま残す。
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <span className="flex min-w-0 items-center gap-2">
-      <span className="h-4 w-px shrink-0 bg-border" />
-      <input
-        ref={inputRef}
-        value={draft}
-        disabled={busy}
-        maxLength={200}
-        onChange={(event) => setDraft(event.target.value)}
-        onKeyDown={(event) => {
-          if (isImeComposing(event)) return;
-          if (event.key === "Enter") {
-            event.preventDefault();
-            void submit();
-          } else if (event.key === "Escape") {
-            setEditing(false);
-          }
-        }}
-        onBlur={() => {
-          if (!busy) setEditing(false);
-        }}
-        placeholder="トピックを設定"
-        className="w-72 max-w-full rounded-md border border-border bg-background px-2 py-0.5 text-[12px] outline-none focus-visible:border-ring/60 disabled:opacity-50"
-      />
-    </span>
-  );
 }
 
 function TypingIndicator() {
@@ -638,12 +548,9 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           <span className="truncate font-semibold text-[14.5px]">
             {display?.name ?? "メッセージ"}
           </span>
-          {display?.kind === "channel" && selectedPlaceKey ? (
-            <ChannelTopic
-              channelId={selectedPlaceKey.slice("channel:".length)}
-              topic={display.topic}
-            />
-          ) : display?.topic ? (
+          {/* トピックの編集はサイドバーの place メニューへ移した。ヘッダーは
+              いま居る場所を示すだけで、押せるものを置かない。 */}
+          {display?.topic ? (
             <>
               <span className="h-4 w-px shrink-0 bg-border" />
               <span className="truncate text-[12px] text-muted-foreground">

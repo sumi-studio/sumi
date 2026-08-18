@@ -283,7 +283,12 @@ interface MessagingState {
   ): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
-  updateChannelTopic(channelId: string, topic: string): Promise<void>;
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<void>;
+  /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
+  duplicateChannel(channelId: string): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
@@ -309,7 +314,7 @@ interface MessagingState {
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
-  setStatus(status: StatusKind, note: string): void;
+  setStatus(status: StatusKind, note: string, expiresAt?: number | null): void;
   setPlaceNotificationLevel(
     key: PlaceKey,
     level: NotificationLevel,
@@ -683,6 +688,7 @@ const reactionProjectionByPlace = new Map<
 let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 type PresenceProjection =
   | { type: "status"; status: ParticipantStatus }
+  | { type: "status_cleared"; participant: ParticipantRef }
   | { type: "reply_later"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string };
 let presenceResyncGeneration = 0;
@@ -814,20 +820,35 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 正しい。serverは読み出し時に落とすだけで失効eventを送らないので、
    * 期限に達した分はこちらで落とす。
    */
+  /**
+   * 期限切れの一時ステータスを、サーバーが読み出し時にするのと同じ形へ畳む。
+   * 戻る先があればその宣言へ戻し、無ければ宣言そのものを消す——「対応可能」に
+   * 書き換えることはしない。ここが黙って違う答えを出すと、開いている画面だけが
+   * サーバーと食い違う。
+   */
   const withoutExpired = (
     statuses: Record<ParticipantKey, ParticipantStatus>,
     now: number,
   ): Record<ParticipantKey, ParticipantStatus> => {
     const live: Record<ParticipantKey, ParticipantStatus> = {};
-    let dropped = false;
+    let changed = false;
     for (const [key, status] of Object.entries(statuses)) {
-      if (status.expiresAt !== null && status.expiresAt <= now) {
-        dropped = true;
+      if (status.expiresAt === null || status.expiresAt > now) {
+        live[key] = status;
         continue;
       }
-      live[key] = status;
+      changed = true;
+      if (status.baseStatus === null) continue;
+      live[key] = {
+        participant: status.participant,
+        status: status.baseStatus,
+        note: status.baseNote,
+        expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
+      };
     }
-    return dropped ? live : statuses;
+    return changed ? live : statuses;
   };
 
   const scheduleStatusExpiry = () => {
@@ -873,6 +894,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
     scheduleStatusExpiry();
   };
 
+  /** その人が何も言っていない状態へ戻す。既定値で埋めることはしない。 */
+  const clearStatus = (participant: ParticipantRef) => {
+    set((state) => {
+      const key = participantKey(participant);
+      if (!(key in state.statusByKey)) return {};
+      const statusByKey = { ...state.statusByKey };
+      delete statusByKey[key];
+      return { statusByKey };
+    });
+    scheduleStatusExpiry();
+  };
+
   /**
    * markerの現在値を書き込む。RESTのACKとWS echoは同じmarkerを二度運ぶので、
    * 順序に関わらず収束するよう「解けた約束は解けたまま」「一度知った自分の
@@ -903,6 +936,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (projection.type === "status") {
       applyStatus(projection.status);
+      return;
+    }
+    if (projection.type === "status_cleared") {
+      clearStatus(projection.participant);
       return;
     }
     if (projection.type === "reply_later") {
@@ -1403,6 +1440,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "status_updated") {
       applyPresenceProjection({ type: "status", status: event.status });
+      return;
+    }
+    if (event.type === "status_cleared") {
+      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
+      applyPresenceProjection({
+        type: "status_cleared",
+        participant: event.participant,
+      });
       return;
     }
     if (event.type === "reply_later_created") {
@@ -2029,10 +2074,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
     },
 
-    async updateChannelTopic(channelId, topic) {
+    async updateChannel(channelId, input) {
       const request = beginMessagingBackendRequest();
       const channel = await request.wait((backend) =>
-        backend.updateChannelTopic(channelId, topic),
+        backend.updateChannel(channelId, input),
       );
       if (!channel || !request.isCurrent()) return;
       set((state) => ({
@@ -2040,6 +2085,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
           entry.channelId === channel.channelId ? channel : entry,
         ),
       }));
+    },
+
+    async duplicateChannel(channelId) {
+      const channel = await backend.duplicateChannel(channelId);
+      set((state) =>
+        state.channels.some((entry) => entry.channelId === channel.channelId)
+          ? {}
+          : { channels: [...state.channels, channel] },
+      );
+      return placeKey({ kind: "channel", channelId: channel.channelId });
     },
 
     async searchMessages(query) {
@@ -2569,10 +2624,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
-    setStatus(status, note) {
+    setStatus(status, note, expiresAt = null) {
       const request = beginMessagingBackendRequest();
       void request
-        .wait((backend) => backend.setStatus(status, note))
+        .wait((backend) => backend.setStatus(status, note, expiresAt))
         .then(
           (canonical) => {
             if (!canonical || !request.isCurrent()) return;

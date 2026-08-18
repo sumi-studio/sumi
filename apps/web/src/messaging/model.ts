@@ -184,13 +184,38 @@ export interface MemberProfile {
 
 export type StatusKind = "available" | "busy" | "away";
 
-/** 自己申告のステータス。監視による自動表示はしない。 */
+/**
+ * 自己申告のステータス。監視による自動表示はしない。
+ * 「オフライン」「非表示」が無いのは隠す手段が足りないからではなく、
+ * Sumiが在席を観測しないから——隠すべき自動の表示がそもそも無い。
+ */
 export interface ParticipantStatus {
   participant: ParticipantRef;
   status: StatusKind;
   note: string;
   expiresAt: number | null;
+  /**
+   * expiresAtが来たときに戻る先。nullなら戻る先が無く、期限で宣言そのものが
+   * 終わる。期限なしのステータスでは常にnull。
+   */
+  baseStatus: StatusKind | null;
+  baseNote: string;
 }
+
+/** 一時ステータスの期間プリセット。nullは「解除するまで」。 */
+export interface StatusDuration {
+  label: string;
+  minutes: number | null;
+}
+
+export const STATUS_DURATIONS: StatusDuration[] = [
+  { label: "15分", minutes: 15 },
+  { label: "1時間", minutes: 60 },
+  { label: "8時間", minutes: 8 * 60 },
+  { label: "24時間", minutes: 24 * 60 },
+  { label: "3日間", minutes: 3 * 24 * 60 },
+  { label: "解除するまで", minutes: null },
+];
 
 /**
  * 「後で返信します」の応答予約。相手には返信予定が見え、
@@ -267,6 +292,12 @@ export type ServerEvent =
   | { type: "message_deleted"; message: Message }
   | { type: "typing"; place: Place; participant: ParticipantRef }
   | { type: "status_updated"; status: ParticipantStatus }
+  /**
+   * 一時ステータスが戻る先を持たずに期限切れになった。「対応可能になった」
+   * ではなく「何も言っていない状態に戻った」——サーバーが代わりに何かを
+   * 名乗ることはしない。
+   */
+  | { type: "status_cleared"; participant: ParticipantRef }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   /**
@@ -375,7 +406,20 @@ export interface MessagingBackend {
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
   createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
-  updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
+  /**
+   * channelのmutableな身元（名前・トピック）を書き換える。省いた項目は
+   * そのまま残る——名前を変えただけでトピックが消えては困る。
+   */
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<ChannelSummary>;
+  /**
+   * 同じ形（名前・トピック）の空のchannelを新しく作る。中身は複製しない:
+   * メッセージ・既読・通知設定は元のchannelのもの。nameを省くとサーバーが
+   * 既定の名前（「〜 のコピー」）を決める。
+   */
+  duplicateChannel(channelId: string, name?: string): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /** メッセージより先にbytesを預ける。受領したIDをsendMessageのattachmentsへ。 */
   uploadAttachment(
@@ -415,7 +459,15 @@ export interface MessagingBackend {
    * mutationはserverが確定した値を返す。socketが再接続中でも成功ACKだけで
    * 収束できるよう、呼び出し側はこの戻り値を状態に反映する。
    */
-  setStatus(status: StatusKind, note: string): Promise<ParticipantStatus>;
+  /**
+   * 自分のステータスだけを置き換える。expiresAtを渡すと一時ステータスになり、
+   * 期限で「その前に言っていたこと」へ戻る（サーバーが解決する）。
+   */
+  setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null,
+  ): Promise<ParticipantStatus>;
   createReplyLater(
     place: Place,
     messageId: string,

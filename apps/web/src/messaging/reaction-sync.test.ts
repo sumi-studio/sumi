@@ -881,7 +881,8 @@ class StubBackend implements MessagingBackend {
   createChannel = vi.fn();
   ensureDM = vi.fn();
   createGroupDM = vi.fn();
-  updateChannelTopic = vi.fn();
+  updateChannel = vi.fn();
+  duplicateChannel = vi.fn();
   fetchPresence = vi.fn(async () => ({
     statuses: [],
     replyLaterMarkers: [],
