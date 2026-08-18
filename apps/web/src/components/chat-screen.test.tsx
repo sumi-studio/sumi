@@ -25,7 +25,7 @@ const state = vi.hoisted(() => ({
   acquireConnection: vi.fn(),
   disconnect: vi.fn(),
   resumeMountedConnection: vi.fn(),
-  ready: "ready" as "ready" | "not_ready",
+  ready: "ready" as "ready" | "unavailable" | "not_ready",
   connection: "connected" as "connecting" | "connected" | "closed",
 }));
 
@@ -273,6 +273,21 @@ describe("SDUI action boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "再試行" }));
     expect(state.disconnect).toHaveBeenCalledTimes(1);
     expect(state.resumeMountedConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("describes an in-band unavailable status as a transition, not a failed start", () => {
+    state.ready = "unavailable";
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
+
+    expect(screen.getAllByRole("status")[0]).toHaveTextContent(
+      "エージェント切り替え中",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "エージェントを切り替え中です。接続を回復しています。",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent(
+      "エージェントを起動できませんでした",
+    );
   });
 
   it("keeps an automatic reconnect visible while the agent stays unavailable", () => {

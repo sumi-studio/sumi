@@ -323,13 +323,15 @@ function ChatScreenContent({
               {lastError}
             </p>
           )}
-          {ready === "not_ready" && (
+          {(ready === "not_ready" || ready === "unavailable") && (
             <section
               role="alert"
               className="mb-2 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900 text-sm"
             >
               <span>
-                エージェントを起動できませんでした。しばらくしてから再試行してください。
+                {ready === "not_ready"
+                  ? "エージェントを起動できませんでした。しばらくしてから再試行してください。"
+                  : "エージェントを切り替え中です。接続を回復しています。"}
               </span>
               <Button
                 type="button"
@@ -430,13 +432,15 @@ function EmptyState({ available }: { available: boolean }) {
 
 function describeAvailability(
   connection: "connecting" | "connected" | "closed",
-  ready: "unknown" | "ready" | "not_ready",
+  ready: "unknown" | "ready" | "unavailable" | "not_ready",
 ) {
-  // "not_ready" only ever comes from the server saying so: an in-band status
-  // frame, or the close code the API uses to name a runtime it could not
-  // start. It is a stated fact about the agent, not something inferred from a
-  // close the browser cannot attribute, so it outranks the transport blip
-  // "再接続中" describes. It must not hide that a retry is already in flight.
+  // The in-band unavailable frame reports a replacement/re-hydration in
+  // progress. Only the API's 4001 close names an attempt that could not start;
+  // other closes remain unattributed transport failures.
+  if (ready === "unavailable")
+    return connection === "connected"
+      ? "エージェント切り替え中"
+      : "エージェント切り替え中（再接続中）";
   if (ready === "not_ready")
     return connection === "connected"
       ? "エージェント利用不可"
@@ -449,10 +453,11 @@ function describeAvailability(
 
 function composerPlaceholder(
   connection: "connecting" | "connected" | "closed",
-  ready: "unknown" | "ready" | "not_ready",
+  ready: "unknown" | "ready" | "unavailable" | "not_ready",
 ) {
   if (connection !== "connected") return "接続を待っています…";
   if (ready === "not_ready") return "現在エージェントを利用できません";
+  if (ready === "unavailable") return "エージェントを切り替えています…";
   if (ready === "unknown") return "エージェントを確認しています…";
   return "メッセージを入力…";
 }
