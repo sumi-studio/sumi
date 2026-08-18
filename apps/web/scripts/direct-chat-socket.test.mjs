@@ -1430,6 +1430,46 @@ test("a reconnect the browser cannot attribute withdraws the stated cause", () =
   socket.close();
 });
 
+test("runtime-not-ready reconnects back off until a ready connection resets them", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(binding);
+
+  withCapturedRetryTimer((fireReconnect) => {
+    socket.connect();
+    const first = FakeWebSocket.instances.at(-1);
+    first.open();
+    first.close(
+      DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+      "runtime_not_ready",
+    );
+    const firstDelay = fireReconnect();
+
+    const second = FakeWebSocket.instances.at(-1);
+    second.open();
+    second.close(
+      DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+      "runtime_not_ready",
+    );
+    const secondDelay = fireReconnect();
+    assert.ok(
+      secondDelay > firstDelay,
+      "a WebSocket upgrade alone must not reset a failed runtime's backoff",
+    );
+
+    const ready = FakeWebSocket.instances.at(-1);
+    ready.open();
+    ready.receive({ type: "direct_chat_status", status: "ready" });
+    ready.drop();
+    const resetDelay = fireReconnect();
+    assert.ok(
+      resetDelay < secondDelay,
+      "a ready connection must restart the reconnect backoff from attempt zero",
+    );
+  });
+  socket.close();
+});
+
 test("the mounted store surfaces a stated runtime failure and clears it on retry", async () => {
   FakeWebSocket.instances = [];
   const transport = new DirectChatSocket();

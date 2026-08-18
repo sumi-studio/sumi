@@ -959,7 +959,6 @@ export class DirectChatSocket {
     this.socket = socket;
     socket.onopen = () => {
       if (this.socket !== socket) return;
-      this.reconnectAttempt = 0;
       this.setConnectionState("connected");
       this.admissionReady = false;
       this.setReadyState("unknown");
@@ -993,7 +992,13 @@ export class DirectChatSocket {
       if (frame.type === "direct_chat_status") {
         this.admissionReady = frame.status === "ready";
         this.setReadyState(frame.status === "ready" ? "ready" : "not_ready");
-        if (this.admissionReady) this.flushPending();
+        if (this.admissionReady) {
+          // An accepted upgrade can still immediately report a failed lazy
+          // runtime spawn. Only an explicit ready frame proves this connection
+          // is usable enough to restart the reconnect backoff.
+          this.reconnectAttempt = 0;
+          this.flushPending();
+        }
       }
       if (frame.type === "command_accepted")
         this.pending.delete(frame.idempotency_key);
