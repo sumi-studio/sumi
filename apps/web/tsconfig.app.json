@@ -6,6 +6,10 @@
     "module": "esnext",
     "types": ["vite/client"],
     "allowArbitraryExtensions": true,
+    // public/ の素の JS（Service Worker と、app と共有する住所の規則）を
+    // そのまま型付けして読む。手書きの .d.ts を置くと、実装とは別の二つ目の
+    // 定義になり、しかも dist へ配られてしまう。
+    "allowJs": true,
     "skipLibCheck": true,
 
     /* Bundler mode */

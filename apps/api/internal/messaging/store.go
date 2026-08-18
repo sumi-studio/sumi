@@ -57,6 +57,10 @@ type Store struct {
 	// push is set by UsePush. A nil dispatcher means this deployment simply has
 	// no Web Push; 既存のタブ内通知はそれとは独立に動き続ける。
 	push *PushDispatcher
+	// egress is the Web Push destination policy (push_egress.go). A nil value
+	// means real DNS. テストが差し替えるのは名前解決だけで、どの IP なら
+	// 出てよいかの判断は差し替えられない。
+	egress *pushEgress
 }
 
 type attachmentMissingBlobScan struct {

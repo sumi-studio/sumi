@@ -131,6 +131,11 @@ func (s *ScopedStore) SavePushSubscription(
 	if err := validatePushSubscriptionFields(endpoint, p256dh, auth); err != nil {
 		return PushSubscription{}, err
 	}
+	// 出口の判断は push_egress.go にひとつだけある。ここで断らないと、押し込ま
+	// れた URL がそのまま将来の送信（サーバー発の POST）になる。
+	if err := s.Store.pushEgressPolicy().allowEndpoint(ctx, endpoint); err != nil {
+		return PushSubscription{}, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return PushSubscription{}, fmt.Errorf("begin push subscription save: %w", err)
@@ -260,8 +265,9 @@ func validatePushSubscriptionFields(endpoint, p256dh, auth string) error {
 	case endpoint == "" || len(endpoint) > maxPushEndpointBytes:
 		return fmt.Errorf("%w: endpoint", ErrInvalidPushSubscription)
 	case !strings.HasPrefix(endpoint, "https://"):
-		// push service の endpoint は必ず https。ここを緩めると、任意の URL へ
-		// サーバーから POST させる踏み台になる。
+		// https は形の条件にすぎない。「どこへ出てよいか」は https では決まらず
+		// （内部の TLS 終端も https で始まる）、push_egress.go の allowEndpoint が
+		// 解決先の IP で決める。
 		return fmt.Errorf("%w: endpoint must be https", ErrInvalidPushSubscription)
 	case p256dh == "" || len(p256dh) > maxPushP256dhBytes:
 		return fmt.Errorf("%w: p256dh", ErrInvalidPushSubscription)
@@ -275,15 +281,20 @@ func validatePushSubscriptionFields(endpoint, p256dh, auth string) error {
 
 // PushPayload is what the Service Worker receives. 本文そのものではなく
 // 「どこで、誰が、だいたい何を」に留め、続きは place を開いて読む。
-// place の URL 形は web 側（place-route.ts と sw.js）が持つので、ここは
-// place_id と place_kind までを運ぶ。
+//
+// place の URL 形はここに書かない。住所の作り方は web 側の一つの関数
+// （public/place-path.js）にあり、アプリのルーターと Service Worker が同じ
+// ものを通る。ここが運ぶのは、その関数が必要とする材料——**どの Workspace の**
+// どの place か——までである。workspace_id が要るのは、place が必ず Workspace
+// の内側にあるからで、これが無いと通知はどの authority で開くか決められない。
 type PushPayload struct {
-	PlaceID   string `json:"place_id"`
-	PlaceKind string `json:"place_kind"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
-	Reason    string `json:"reason"`
-	Seq       int64  `json:"seq"`
+	WorkspaceID string `json:"workspace_id"`
+	PlaceID     string `json:"place_id"`
+	PlaceKind   string `json:"place_kind"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	Reason      string `json:"reason"`
+	Seq         int64  `json:"seq"`
 }
 
 // pushHTTPClient is the seam tests replace. 本番では *http.Client。
@@ -317,7 +328,10 @@ func NewPushDispatcher(ctx context.Context, store *Store, subject string) (*Push
 	if err != nil {
 		return nil, err
 	}
-	return &PushDispatcher{store: store, keys: keys, subject: subject, client: http.DefaultClient}, nil
+	// http.DefaultClient は使わない。push の送信は「外から与えられた URL へ
+	// サーバーが出ていく」経路なので、出口ポリシーを織り込んだ client でしか
+	// 送らない（push_egress.go）。
+	return &PushDispatcher{store: store, keys: keys, subject: subject, client: newPushHTTPClient()}, nil
 }
 
 // PublicKey is the application server key a browser must present to
@@ -405,12 +419,13 @@ func (d *PushDispatcher) deliver(
 			continue
 		}
 		payload, err := json.Marshal(PushPayload{
-			PlaceID:   place.PlaceID,
-			PlaceKind: place.Kind,
-			Title:     PushTitle(place, authorName),
-			Body:      PushBody(msg),
-			Reason:    decision.Reason,
-			Seq:       msg.Seq,
+			WorkspaceID: place.WorkspaceID,
+			PlaceID:     place.PlaceID,
+			PlaceKind:   place.Kind,
+			Title:       PushTitle(place, authorName),
+			Body:        PushBody(msg),
+			Reason:      decision.Reason,
+			Seq:         msg.Seq,
 		})
 		if err != nil {
 			log.Printf("messaging push: encode payload: %v", err)
@@ -437,6 +452,12 @@ func (d *PushDispatcher) send(ctx context.Context, subscription PushSubscription
 		Topic: topic,
 	})
 	if err != nil {
+		if pushDialWasRefused(err) {
+			// 出てはいけない先だった、と「相手が落ちている」を混ぜない。
+			// endpoint は bearer secret なので、ここでも中身は出さない。
+			log.Print("messaging push: destination refused by egress policy")
+			return
+		}
 		log.Printf("messaging push: send: %v", err)
 		return
 	}

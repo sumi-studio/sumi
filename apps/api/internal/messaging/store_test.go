@@ -61,6 +61,9 @@ func newWorldWithMaxConns(t *testing.T, ctx context.Context, maxConns int32) wor
 	workspaces := workspacecontrol.New(pool)
 	apps := applicationapps.New(pool, workspaces)
 	core := New(pool, workspaces, apps)
+	// テストの中の「インターネット」。どの IP なら出てよいかの判断は本物のまま
+	// で、差し替えるのは名前が何に解決されるかだけ（push_test.go）。
+	core.egress = testPushEgress()
 	store := &testMessagingStore{Store: core, core: core, workspaces: workspaces, apps: apps}
 	registerTestStore(store, Human(humanA), Human(humanB), PersonalityAgent(agent))
 	return world{

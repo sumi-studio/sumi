@@ -16,6 +16,12 @@
 
 /// <reference lib="webworker" />
 
+// place の住所の作り方はここに持たない。アプリのルーターと同じ一つの関数を
+// 読む（public/place-path.js）。書き写すと、route が変わったときに通知の
+// クリックだけが存在しない URL へ進む。そのために SW は module worker として
+// 登録される（src/messaging/push.ts）。
+import { isMessagingPath, messagingPlacePath } from "./place-path.js";
+
 // 新しい SW は待たずに引き継ぐ。通知の配線は前の版と競合しない。
 self.addEventListener("install", () => {
   self.skipWaiting();
@@ -25,24 +31,36 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-/** place の URL 形。src/messaging/place-route.ts と同じ規則。 */
-function placePath(placeId, placeKind) {
-  if (!placeId) return "/";
-  if (placeKind === "channel") return `/c/${placeId}`;
-  if (placeKind === "group_dm") return `/group/${placeId}`;
-  return `/dm/${placeId}`;
+/** client.url から pathname だけを取り出す。壊れた URL は「別の場所」。 */
+function pathnameOf(url) {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "";
+  }
 }
 
 /**
- * 今この瞬間、画面を見ている窓があるか。あるならタブ内の通知層が同じ出来事を
- * 既に扱っている——OS の通知を重ねると、同じ呼びかけが二回鳴る。
+ * 今この瞬間、**その Workspace の Messaging** を見ている窓があるか。
+ *
+ * 抑止してよいのは「同じ知らせが既に画面に見えている」ときだけである。別の
+ * Workspace の画面や Messaging 以外の画面は、その Workspace の scoped な
+ * WebSocket event を受け取らないので、そこで黙ると呼びかけはどこにも出ない。
+ * 購読は人単位（ブラウザは人の身体）で、通知は Workspace ごとに来る——だから
+ * 「窓があるか」ではなく「その Workspace を映しているか」で決める。
  */
-async function focusedClient() {
+async function focusedMessagingClient(workspaceId) {
+  if (!workspaceId) return null;
   const windows = await self.clients.matchAll({
     type: "window",
     includeUncontrolled: true,
   });
-  return windows.find((client) => client.focused) ?? null;
+  return (
+    windows.find(
+      (client) =>
+        client.focused && isMessagingPath(pathnameOf(client.url), workspaceId),
+    ) ?? null
+  );
 }
 
 self.addEventListener("push", (event) => {
@@ -57,10 +75,12 @@ self.addEventListener("push", (event) => {
       }
       if (!payload || !payload.title) return;
 
-      // 見ている窓があるなら、同じ出来事は WebSocket 経由で既にその窓へ
-      // 届いており、タブ内の通知層が「どう提示するか」を決めている。ここで
-      // OS 通知を重ねると同じ呼びかけが二回鳴る。だから黙る。
-      if (await focusedClient()) return;
+      // その Workspace の Messaging を見ている窓があるなら、同じ出来事は
+      // WebSocket 経由で既にその窓へ届いており、タブ内の通知層が「どう提示
+      // するか」を決めている。ここで OS 通知を重ねると同じ呼びかけが二回鳴る。
+      // 逆に、別 Workspace や Messaging 以外を見ている窓は同じ出来事を受け
+      // 取らないので、そこで黙るとどこにも出なくなる。
+      if (await focusedMessagingClient(payload.workspace_id)) return;
 
       await self.registration.showNotification(payload.title, {
         body: payload.body || "",
@@ -70,7 +90,11 @@ self.addEventListener("push", (event) => {
         icon: "/favicon.svg",
         badge: "/favicon.svg",
         data: {
-          url: placePath(payload.place_id, payload.place_kind),
+          url: messagingPlacePath(
+            payload.workspace_id,
+            payload.place_kind,
+            payload.place_id,
+          ),
           reason: payload.reason || "",
         },
       });

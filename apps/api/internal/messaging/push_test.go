@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -54,6 +56,28 @@ func (c *recordingPushClient) endpoints() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.sent...)
+}
+
+// testPushEgress is the test network's DNS. 「どの IP なら出てよいか」は本物の
+// 述語のままで、差し替えるのは名前が何に解決されるかだけ——出口の判断そのものを
+// テスト用に緩めると、テストは policy ではなく自分の作り話を見ることになる。
+//
+//	internal.*     → 10.0.0.7（内部アドレスを指す名前）
+//	unresolvable.* → 名前が引けない
+//	その他          → 203.0.113.10（公開ユニキャスト）
+func testPushEgress() *pushEgress {
+	return &pushEgress{
+		resolve: func(_ context.Context, host string) ([]net.IP, error) {
+			switch {
+			case strings.HasPrefix(host, "internal."):
+				return []net.IP{net.ParseIP("10.0.0.7")}, nil
+			case strings.HasPrefix(host, "unresolvable."):
+				return nil, errors.New("no such host")
+			default:
+				return []net.IP{net.ParseIP("203.0.113.10")}, nil
+			}
+		},
+	}
 }
 
 // dispatcher returns a dispatcher on a real VAPID pair: webpush-go signs the
@@ -196,6 +220,84 @@ func TestPushSubscriptionRequiresALiveMessagingInstallation(t *testing.T) {
 	}
 	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != 0 {
 		t.Fatalf("stale-epoch subscription landed: %d rows", got)
+	}
+}
+
+func TestPushEndpointsThatPointInsideTheDeploymentAreRefused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScopeForActor(t, ctx, w.humanA)
+
+	// 登録が「サーバーが後で自分から出ていく先」を決めてしまうので、断るのは
+	// 送信時ではなく登録時。https は形の条件でしかない。
+	for _, endpoint := range []string{
+		"https://internal.example.test/hook", // 名前が内部アドレスを指す
+		"https://127.0.0.1/hook",             // loopback を直に書く
+		"https://[::1]/hook",
+		"https://10.0.0.7/hook",              // RFC1918
+		"https://169.254.169.254/latest",     // link-local（クラウドの metadata）
+		"https://[fd00::1]/hook",             // unique local
+		"https://unresolvable.example.test/", // 名前が引けない＝通さない
+		"https://user:pass@push.example.test/a",
+	} {
+		if _, err := scoped.SavePushSubscription(ctx, endpoint, testPushP256dh, testPushAuth); !errors.Is(err, ErrInvalidPushSubscription) {
+			t.Fatalf("endpoint %s err = %v, want ErrInvalidPushSubscription", endpoint, err)
+		}
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != 0 {
+		t.Fatalf("a refused endpoint still landed: %d rows", got)
+	}
+
+	// 公開ユニキャストへ解決する名前は通る。自前の push service を閉じない。
+	if _, err := scoped.SavePushSubscription(ctx,
+		"https://push.example.test/ok", testPushP256dh, testPushAuth); err != nil {
+		t.Fatalf("public endpoint rejected: %v", err)
+	}
+}
+
+func TestPushSendingCannotReachAnAddressTheRegistrationWouldHaveRefused(t *testing.T) {
+	// 登録時に解決した答えと、送信時に繋ぐ相手は同じとは限らない（rebinding）。
+	// だから同じ述語を dialer にも埋め込んである。ここでは本物の client で
+	// loopback の TLS server へ出ようとして、繋ぐ前に断られることを見る。
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := newPushHTTPClient()
+	request, err := http.NewRequest(http.MethodPost, server.URL, strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	response, err := client.Do(request)
+	if err == nil {
+		_ = response.Body.Close()
+		t.Fatal("the push client connected to a loopback address")
+	}
+	if !pushDialWasRefused(err) {
+		t.Fatalf("dial error = %v, want the egress policy's refusal", err)
+	}
+
+	// 述語そのもの：公開ユニキャストだけが通る。
+	for address, want := range map[string]bool{
+		"203.0.113.10:443":      true,
+		"[2606:4700::1]:443":    true,
+		"127.0.0.1:443":         false,
+		"10.0.0.7:443":          false,
+		"192.168.1.5:443":       false,
+		"169.254.169.254:80":    false,
+		"100.64.0.1:443":        false,
+		"[::1]:443":             false,
+		"[fd00::1]:443":         false,
+		"[::ffff:10.0.0.7]:443": false,
+		"224.0.0.1:443":         false,
+	} {
+		err := guardDialAddress(address)
+		if (err == nil) != want {
+			t.Fatalf("guardDialAddress(%s) err = %v, want allowed=%v", address, err, want)
+		}
 	}
 }
 

@@ -125,7 +125,7 @@ describe("enablePushSubscription", () => {
 
   it("subscribes with the server's key and registers the endpoint", async () => {
     const created = fakeSubscription("https://push.test/created");
-    const { subscribe } = stubBrowser({ subscribed: created });
+    const { register, subscribe } = stubBrowser({ subscribed: created });
     const posted: unknown[] = [];
     stubFetch((path, init) => {
       if (path === "/messaging/push-key") {
@@ -141,6 +141,12 @@ describe("enablePushSubscription", () => {
     expect(await enablePushSubscription()).toBe(true);
     expect(subscribe).toHaveBeenCalledWith(
       expect.objectContaining({ userVisibleOnly: true }),
+    );
+    // module worker として登録する。SW が place の住所の作り方を書き写さず、
+    // アプリのルーターと同じ一つの関数を import できるのはこの形のときだけ。
+    expect(register).toHaveBeenCalledWith(
+      "/sw.js",
+      expect.objectContaining({ scope: "/", type: "module" }),
     );
     expect(posted).toEqual([
       {

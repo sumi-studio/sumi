@@ -44,11 +44,21 @@ type AttentionCandidate struct {
 }
 
 // AttentionInbox is one poll's answer: what is still waiting, how much this
-// call acknowledged, and how far the numbering has come.
+// call acknowledged, and how far it is safe to acknowledge.
 type AttentionInbox struct {
 	Candidates []AttentionCandidate
 	Consumed   int64
-	LatestSeq  int64
+	// LatestSeq は **配られたところまで** の目盛りである。ack はこの軸の
+	// cursor を進める操作で、cursor は「まだ見ていないもの」を飛び越えては
+	// いけない。だから一回の poll が limit で切って返したときの LatestSeq は
+	// 「返した最後の候補」までであり、採番だけ済んでまだ渡していない候補は
+	// 含めない。含めると、caller が素直に latest_seq を consume_through へ
+	// 渡した瞬間に、見ていない呼びかけが consumed になって永久に落ちる。
+	//
+	// 何も返さなかった poll（未消化が無い）では、既に ack 済みの最大値を返す。
+	// 未消化が一つも無いとき、その値は採番済み全体の最大値と一致し、かつ
+	// 再度 ack しても冪等なので、cursor は後戻りしない。
+	LatestSeq int64
 }
 
 // MaxAttentionCandidates bounds one poll. 溜まった候補を一息に全部渡すのは
@@ -154,14 +164,22 @@ func (s *ScopedStore) PollAttentionCandidates(
 	}
 	rows.Close()
 
-	// LatestSeq は「どこまで配られたか」の目盛りで、consume_through に渡せる
-	// 上限でもある。consumed も含める：ack した番号より後ろだけが残っている、
-	// ということを本人が確かめられる。
+	// LatestSeq は consume_through に渡してよい上限であり、その資格は
+	// 「本人に配られたこと」から来る。採番済みでも返していない候補は
+	// 数えない（limit で切った残りは、次の poll で配ってから ack させる）。
+	var acked int64
 	if err := tx.QueryRow(ctx, `
 		SELECT COALESCE(MAX(candidate_seq), 0) FROM attention_candidates
-		WHERE workspace_id = $1 AND agent_id = $2`,
-		s.Scope.WorkspaceID, agentID).Scan(&inbox.LatestSeq); err != nil {
+		WHERE workspace_id = $1 AND agent_id = $2 AND consumed_at IS NOT NULL`,
+		s.Scope.WorkspaceID, agentID).Scan(&acked); err != nil {
 		return AttentionInbox{}, fmt.Errorf("latest attention seq: %w", err)
+	}
+	inbox.LatestSeq = acked
+	if n := len(inbox.Candidates); n > 0 {
+		// ORDER BY candidate_seq なので末尾が返した中の最大。
+		if last := inbox.Candidates[n-1].CandidateSeq; last > inbox.LatestSeq {
+			inbox.LatestSeq = last
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return AttentionInbox{}, fmt.Errorf("commit attention poll: %w", err)

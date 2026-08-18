@@ -68,7 +68,15 @@ export function isPushSupported(): boolean {
 export async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
   if (!isPushSupported()) return null;
   try {
-    return await navigator.serviceWorker.register(SW_URL, { scope: "/" });
+    // module worker として登録する。SW が place の住所の作り方を書き写さず、
+    // アプリのルーターと同じ public/place-path.js を import できるようにする
+    // ため——規則が二か所にあると、route が変わったときに通知のクリックだけが
+    // 静かに壊れる。module SW を持たないブラウザではここが投げ、その端末は
+    // 「タブを閉じている間は呼ばれない」だけになる（会話は何も壊れない）。
+    return await navigator.serviceWorker.register(SW_URL, {
+      scope: "/",
+      type: "module",
+    });
   } catch {
     return null;
   }
