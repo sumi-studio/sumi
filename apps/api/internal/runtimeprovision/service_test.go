@@ -92,6 +92,26 @@ type fakeBackend struct {
 	stopCalls      map[string]int
 	privateVolumes map[string]bool
 	reconcileReaps map[string]uint64
+	// identitySurvivesReap reproduces the host shape that made every spawn after
+	// the first fail. A verified teardown runs `compose down` without removing
+	// the allocator's named volume, so the epoch identity written there outlives
+	// the containers and the supervisor's next inspection classifies the empty
+	// project as PhaseRecovery instead of PhaseUnknown.
+	identitySurvivesReap bool
+}
+
+// reapedInspection is what the backend reports for a personality agent whose
+// containers this backend has just removed.
+func (backend *fakeBackend) reapedInspection(epoch PreparedEpoch) Inspection {
+	if !backend.identitySurvivesReap {
+		return unknownInspection(epoch.PersonalityAgentID)
+	}
+	retired := epoch
+	return Inspection{
+		PersonalityAgentID: epoch.PersonalityAgentID,
+		Phase:              PhaseRecovery,
+		Epoch:              &retired,
+	}
 }
 
 func newFakeBackend() *fakeBackend {
@@ -148,7 +168,7 @@ func (backend *fakeBackend) Abort(_ context.Context, epoch PreparedEpoch) (Inspe
 	reaped := epoch.Generation
 	inspection := unknownInspection(epoch.PersonalityAgentID)
 	inspection.ReapedThroughGeneration = &reaped
-	backend.state[epoch.PersonalityAgentID] = unknownInspection(epoch.PersonalityAgentID)
+	backend.state[epoch.PersonalityAgentID] = backend.reapedInspection(epoch)
 	return inspection, nil
 }
 
@@ -169,7 +189,7 @@ func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) (Inspec
 	reaped := epoch.Generation
 	inspection := unknownInspection(epoch.PersonalityAgentID)
 	inspection.ReapedThroughGeneration = &reaped
-	backend.state[epoch.PersonalityAgentID] = unknownInspection(epoch.PersonalityAgentID)
+	backend.state[epoch.PersonalityAgentID] = backend.reapedInspection(epoch)
 	return inspection, nil
 }
 
@@ -579,25 +599,40 @@ func TestDurableReapStateKeepsPublishedEntryAfterDirectorySyncFailure(t *testing
 
 func fillReapStateToMaximumSize(t *testing.T, state *durableReapState) string {
 	t.Helper()
-	next := 0
-	for {
-		personalityAgentID := reapStateTestPersonalityAgentID(next)
-		state.entries[personalityAgentID] = 0
+	encodedSize := func() int {
 		encoded, err := encodeReapStateDocument(reapStateDocumentForEntries(state.entries))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(encoded) > maxReapStateBytes {
+		return len(encoded)
+	}
+	// Re-encoding the whole document once per candidate entry made this fixture
+	// quadratic in the ~12k entries a 1 MiB document holds. Every entry has the
+	// same canonical PAID width, so measure one entry's cost, jump to a
+	// deliberately low estimate, and converge from there.
+	empty := encodedSize()
+	state.entries[reapStateTestPersonalityAgentID(0)] = 0
+	single := encodedSize()
+	state.entries[reapStateTestPersonalityAgentID(1)] = 0
+	perEntry := encodedSize() - single
+	if perEntry <= 0 {
+		t.Fatalf("reap state entry cost is not positive: %d", perEntry)
+	}
+	next := 2
+	for index := next; index < (maxReapStateBytes-empty)/perEntry-2; index++ {
+		state.entries[reapStateTestPersonalityAgentID(index)] = 0
+		next = index + 1
+	}
+	for {
+		personalityAgentID := reapStateTestPersonalityAgentID(next)
+		state.entries[personalityAgentID] = 0
+		if encodedSize() > maxReapStateBytes {
 			delete(state.entries, personalityAgentID)
 			break
 		}
 		next++
 	}
-	encoded, err := encodeReapStateDocument(reapStateDocumentForEntries(state.entries))
-	if err != nil {
-		t.Fatal(err)
-	}
-	remaining := maxReapStateBytes - len(encoded)
+	remaining := maxReapStateBytes - encodedSize()
 	for index := 0; remaining > 0; index++ {
 		extraDigits := min(remaining, 18)
 		generation := uint64(1)
@@ -607,12 +642,8 @@ func fillReapStateToMaximumSize(t *testing.T, state *durableReapState) string {
 		state.entries[reapStateTestPersonalityAgentID(index)] = generation
 		remaining -= extraDigits
 	}
-	encoded, err = encodeReapStateDocument(reapStateDocumentForEntries(state.entries))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) != maxReapStateBytes {
-		t.Fatalf("maximum reap state fixture has size %d, want %d", len(encoded), maxReapStateBytes)
+	if size := encodedSize(); size != maxReapStateBytes {
+		t.Fatalf("maximum reap state fixture has size %d, want %d", size, maxReapStateBytes)
 	}
 	return reapStateTestPersonalityAgentID(next)
 }
@@ -710,4 +741,155 @@ func TestUnknownRuntimeWithoutDurableReapAttestationStaysUnattested(t *testing.T
 	if inspection.ReapedThroughGeneration != nil {
 		t.Fatalf("unknown runtime fabricated a reap attestation: %#v", inspection)
 	}
+}
+
+// A verified stop leaves the allocator's named volume in place, so the host
+// keeps answering with the retired epoch identity and the supervisor reports
+// the empty project as PhaseRecovery. Before the durable receipt became the
+// authority on "already cleaned up", that inspection made Prepare refuse every
+// spawn after the first for the same personality agent.
+func TestSecondSpawnSucceedsAfterAVerifiedStopLeavesTheAllocatorIdentityBehind(t *testing.T) {
+	backend := newFakeBackend()
+	backend.identitySurvivesReap = true
+	service := newTestService(t, backend)
+
+	first, err := service.Prepare(context.Background(), PrepareRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "spawn-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Activate(context.Background(), ActivateRequest{
+		Version: ProtocolVersion, PreparedEpoch: first, Activation: testActivationConfig(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := service.Stop(context.Background(), StopRequest{
+		Version: ProtocolVersion, PreparedEpoch: first,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.ReapedThroughGeneration == nil || *stopped.ReapedThroughGeneration != first.Generation {
+		t.Fatalf("stop did not return the exact reap receipt: %#v", stopped)
+	}
+	if inspection, err := service.Inspect(context.Background(), InspectRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	}); err != nil || inspection.Phase != PhaseRecovery {
+		t.Fatalf("fixture does not reproduce the surviving identity: %#v %v", inspection, err)
+	}
+
+	second, err := service.Prepare(context.Background(), PrepareRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "spawn-2",
+	})
+	if err != nil {
+		t.Fatalf("second spawn was refused after a verified stop: %v", err)
+	}
+	if second.Generation != first.Generation+1 || backend.prepareCalls[testPAID] != 2 {
+		t.Fatalf("second spawn did not allocate exactly the next epoch: %#v calls=%d",
+			second, backend.prepareCalls[testPAID])
+	}
+
+	activation := testActivationConfig()
+	activation.ReapAttestation = &ReapAttestation{
+		PersonalityAgentID:      testPAID,
+		EpochGeneration:         second.Generation,
+		RPCBootNonce:            second.RPCBootNonce,
+		ReapedThroughGeneration: first.Generation,
+	}
+	inspection, err := service.Activate(context.Background(), ActivateRequest{
+		Version: ProtocolVersion, PreparedEpoch: second, Activation: activation,
+	})
+	if err != nil || inspection.Phase != PhaseActive {
+		t.Fatalf("observed reap receipt was refused on activation: %#v %v", inspection, err)
+	}
+}
+
+// The runtime consumes ReapedThroughGeneration as a host observation. The
+// provisioner holds the physical record, so it must recompute the caller's
+// claim against that record instead of forwarding whatever the API declares.
+func TestActivateRejectsAReapAttestationNoDurableReceiptCovers(t *testing.T) {
+	prepareAt := func(t *testing.T, generation uint64) (*Service, *fakeBackend, PreparedEpoch) {
+		t.Helper()
+		backend := newFakeBackend()
+		backend.identitySurvivesReap = true
+		service := newTestService(t, backend)
+		backend.nextGeneration[testPAID] = generation
+		epoch, err := service.Prepare(context.Background(), PrepareRequest{
+			Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "forged",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return service, backend, epoch
+	}
+
+	t.Run("no durable receipt at all", func(t *testing.T) {
+		service, backend, epoch := prepareAt(t, 6)
+		activation := testActivationConfig()
+		activation.ReapAttestation = &ReapAttestation{
+			PersonalityAgentID:      testPAID,
+			EpochGeneration:         epoch.Generation,
+			RPCBootNonce:            epoch.RPCBootNonce,
+			ReapedThroughGeneration: 5,
+		}
+		_, err := service.Activate(context.Background(), ActivateRequest{
+			Version: ProtocolVersion, PreparedEpoch: epoch, Activation: activation,
+		})
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("unbacked reap attestation was accepted: %v", err)
+		}
+		if backend.activateCalls[testPAID] != 0 {
+			t.Fatal("unbacked reap attestation reached the backend")
+		}
+	})
+
+	t.Run("durable receipt behind the claim", func(t *testing.T) {
+		backend := newFakeBackend()
+		backend.identitySurvivesReap = true
+		service := newTestService(t, backend)
+		backend.nextGeneration[testPAID] = 3
+		retired, err := service.Prepare(context.Background(), PrepareRequest{
+			Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "spawn-3",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.Abort(context.Background(), AbortRequest{
+			Version: ProtocolVersion, PreparedEpoch: retired,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Generations 4 and 5 were allocated on the host without this daemon
+		// observing their teardown, so its durable receipt stops at 3.
+		backend.nextGeneration[testPAID] = 6
+		epoch, err := service.Prepare(context.Background(), PrepareRequest{
+			Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "spawn-6",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		activation := testActivationConfig()
+		activation.ReapAttestation = &ReapAttestation{
+			PersonalityAgentID:      testPAID,
+			EpochGeneration:         epoch.Generation,
+			RPCBootNonce:            epoch.RPCBootNonce,
+			ReapedThroughGeneration: 5,
+		}
+		activate := ActivateRequest{
+			Version: ProtocolVersion, PreparedEpoch: epoch, Activation: activation,
+		}
+		if _, err := service.Activate(context.Background(), activate); !errors.Is(err, ErrConflict) {
+			t.Fatalf("over-claimed reap attestation was accepted: %v", err)
+		}
+		if backend.activateCalls[testPAID] != 0 {
+			t.Fatal("over-claimed reap attestation reached the backend")
+		}
+
+		activate.Activation.ReapAttestation.ReapedThroughGeneration = retired.Generation
+		inspection, err := service.Activate(context.Background(), activate)
+		if err != nil || inspection.Phase != PhaseActive {
+			t.Fatalf("observed reap receipt was refused on activation: %#v %v", inspection, err)
+		}
+	})
 }

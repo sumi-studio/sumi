@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -421,6 +422,138 @@ exec /usr/bin/stat "$@"
 	}
 }
 
+// A project can carry a complete set of running roles and still be unusable
+// when an interrupted Compose operation left an extra labelled container beside
+// them. Reconcile must treat that shape as destructive: fence on the exact
+// epoch, remove everything, and only then attest.
+//
+// The Rust fixture for this path binds the host's real /run, so it cannot run
+// on a machine with a live control plane. This drives the same supervisor
+// branch inside a private mount namespace over a tmpfs /run instead.
+func TestSupervisorReconcileReapsAnOrphanBesideCompleteActiveRoles(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version")
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    [ -e "$SUMI_FAKE_REAPED" ] && exit 0
+    printf 'aaaaaaaaaaaa\truntime\n'
+    printf 'bbbbbbbbbbbb\texecutor\n'
+    printf 'cccccccccccc\tbroker\n'
+    printf 'dddddddddddd\torphan-one-off\n'
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet runtime"*)
+    [ -e "$SUMI_FAKE_REAPED" ] || printf 'aaaaaaaaaaaa\n'
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet executor"*)
+    [ -e "$SUMI_FAKE_REAPED" ] || printf 'bbbbbbbbbbbb\n'
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet broker"*)
+    [ -e "$SUMI_FAKE_REAPED" ] || printf 'cccccccccccc\n'
+    ;;
+  *"compose.lifecycle.yaml down --remove-orphans"*)
+    : > "$SUMI_FAKE_REAPED"
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet"*)
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=orphan-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+`
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	reconcile := func(t *testing.T, fenced bool) ([]byte, string, error) {
+		t.Helper()
+		testRoot := t.TempDir()
+		dockerLog := filepath.Join(testRoot, "docker.log")
+		if err := os.WriteFile(filepath.Join(testRoot, "docker"), []byte(fakeDockerScript), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(testRoot, "stat"), []byte(fakeStatScript), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(
+			"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+			`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" reconcile`,
+			"--", supervisor,
+		)
+		command.Env = []string{
+			"PATH=" + testRoot + ":/usr/bin:/bin",
+			"SUMI_CONFIG_FILE=/dev/null",
+			"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+			"SUMI_FAKE_REAPED=" + filepath.Join(testRoot, "reaped"),
+			"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		}
+		if fenced {
+			command.Env = append(command.Env,
+				"SUMI_EXPECTED_RPC_GENERATION=7",
+				"SUMI_EXPECTED_RPC_NONCE=orphan-nonce",
+			)
+		}
+		output, err := command.CombinedOutput()
+		calls, readErr := os.ReadFile(dockerLog)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			t.Fatal(readErr)
+		}
+		return output, string(calls), err
+	}
+
+	t.Run("fenced reconcile removes the orphan and attests", func(t *testing.T) {
+		output, calls, err := reconcile(t, true)
+		if err != nil {
+			t.Fatalf("real supervisor reconcile failed: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), `"phase":"unknown","reaped_through_generation":7`) {
+			t.Fatalf("reconcile did not attest the exact reaped generation: %s", output)
+		}
+		if !strings.Contains(calls, "compose.lifecycle.yaml down --remove-orphans") {
+			t.Fatalf("reconcile reported the project active instead of removing the orphan:\n%s", calls)
+		}
+		down := strings.Index(calls, "compose.lifecycle.yaml down --remove-orphans")
+		fence := strings.Index(calls, "compose.prepare.yaml run")
+		emptyObservation := strings.LastIndex(calls, "compose.lifecycle.yaml ps --all --quiet")
+		if fence < 0 || fence >= down || emptyObservation <= down {
+			t.Fatalf("reconcile did not fence before, and observe empty after, its destructive down:\n%s", calls)
+		}
+	})
+
+	// Without the fenced epoch the API never revoked this generation's
+	// local-control authority, so the supervisor must refuse rather than reap.
+	t.Run("unfenced reconcile refuses to reap", func(t *testing.T) {
+		output, calls, err := reconcile(t, false)
+		if err == nil {
+			t.Fatalf("unfenced reconcile of a durable epoch was accepted: %s", output)
+		}
+		if strings.Contains(calls, "compose.lifecycle.yaml down --remove-orphans") {
+			t.Fatalf("unfenced reconcile still destroyed the project:\n%s", calls)
+		}
+	})
+}
+
 func TestSupervisorReconcileKeepsFullyRunningProjectActive(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
@@ -527,6 +660,150 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 		strings.LastIndex(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
 		t.Fatalf("reconcile can attest before observed-empty verification and durable generation recovery:\n%s", reconcile)
 	}
+}
+
+// reapAttestationVariables is the exact wire the runtime consumes as its boot
+// reap receipt. Every hop from the provisioner to `sumi-agent` has to carry all
+// four or the runtime silently loses the receipt and refuses to reuse durable
+// state, which is the symptom this branch exists to remove.
+var reapAttestationVariables = []string{
+	"SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID",
+	"SUMI_REAP_ATTESTATION_EPOCH_GENERATION",
+	"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE",
+	"SUMI_REAPED_THROUGH_GENERATION",
+}
+
+func TestReapAttestationCrossesEveryHopFromProvisionerToRuntime(t *testing.T) {
+	attestation := ReapAttestation{
+		PersonalityAgentID:      testPAID,
+		EpochGeneration:         9,
+		RPCBootNonce:            "boot-9",
+		ReapedThroughGeneration: 8,
+	}
+	expected := map[string]string{
+		"SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID": testPAID,
+		"SUMI_REAP_ATTESTATION_EPOCH_GENERATION":     "9",
+		"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE":       "boot-9",
+		"SUMI_REAPED_THROUGH_GENERATION":             "8",
+	}
+
+	t.Run("provisioner to supervisor", func(t *testing.T) {
+		config := testActivationConfig()
+		config.ReapAttestation = &attestation
+		values := activationEnvironment(config)
+		environment, err := mergeEnvironment(nil, values, nil, testPAID)
+		if err != nil {
+			t.Fatalf("attestation environment was rejected by the supervisor allowlist: %v", err)
+		}
+		joined := strings.Join(environment, "\n")
+		for _, name := range reapAttestationVariables {
+			if values[name] != expected[name] {
+				t.Fatalf("activation environment set %s=%q, want %q", name, values[name], expected[name])
+			}
+			if !strings.Contains(joined, name+"="+expected[name]) {
+				t.Fatalf("supervisor environment omitted %s:\n%s", name, joined)
+			}
+		}
+	})
+
+	t.Run("supervisor to compose", func(t *testing.T) {
+		runtimeEnvironment := composeServiceEnvironmentBlock(t, readDeploymentFile(t, "compose.yaml"), "runtime")
+		for _, name := range reapAttestationVariables {
+			// Optional pass-through. A required (`:?`) mapping would refuse to
+			// start the very first generation, which legitimately has no receipt.
+			mapping := "      " + name + ": ${" + name + ":-}"
+			if !strings.Contains(runtimeEnvironment, mapping+"\n") {
+				t.Fatalf("runtime service does not pass %s through Compose:\n%s", name, runtimeEnvironment)
+			}
+		}
+	})
+
+	t.Run("compose to entrypoint", func(t *testing.T) {
+		harness := filepath.Join(t.TempDir(), "forwarding-harness")
+		if err := os.WriteFile(harness, []byte(entrypointReapForwardingHarness(t)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		run := func(t *testing.T, environment []string) []string {
+			t.Helper()
+			command := exec.Command("/bin/bash", harness)
+			command.Env = append([]string{"PATH=/usr/bin:/bin"}, environment...)
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("entrypoint forwarding harness failed: %v\n%s", err, output)
+			}
+			return strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+		}
+
+		supplied := make([]string, 0, len(reapAttestationVariables))
+		for _, name := range reapAttestationVariables {
+			supplied = append(supplied, name+"="+expected[name])
+		}
+		forwarded := run(t, supplied)
+		for _, name := range reapAttestationVariables {
+			if !slices.Contains(forwarded, name+"="+expected[name]) {
+				t.Fatalf("entrypoint dropped %s before exec: %#v", name, forwarded)
+			}
+		}
+
+		// Compose maps every one of them to the empty string on a first-ever
+		// generation. The entrypoint must omit them rather than hand the runtime
+		// an empty attestation field.
+		empty := make([]string, 0, len(reapAttestationVariables))
+		for _, name := range reapAttestationVariables {
+			empty = append(empty, name+"=")
+		}
+		for _, environment := range [][]string{empty, nil} {
+			for _, forwarded := range run(t, environment) {
+				if forwarded != "" {
+					t.Fatalf("entrypoint forwarded an unattested value %q", forwarded)
+				}
+			}
+		}
+	})
+}
+
+// composeServiceEnvironmentBlock returns the exact `environment:` block of one
+// Compose service without depending on a YAML parser in this module.
+func composeServiceEnvironmentBlock(t *testing.T, compose, service string) string {
+	t.Helper()
+	serviceStart := strings.Index(compose, "\n  "+service+":\n")
+	if serviceStart < 0 {
+		t.Fatalf("compose file has no %s service", service)
+	}
+	block := compose[serviceStart+1:]
+	environmentStart := strings.Index(block, "\n    environment:\n")
+	if environmentStart < 0 {
+		t.Fatalf("%s service has no environment block", service)
+	}
+	block = block[environmentStart+len("\n    environment:\n"):]
+	var environment strings.Builder
+	for _, line := range strings.Split(block, "\n") {
+		if line != "" && !strings.HasPrefix(line, "      ") {
+			break
+		}
+		environment.WriteString(line)
+		environment.WriteString("\n")
+	}
+	return environment.String()
+}
+
+// entrypointReapForwardingHarness lifts the real forwarding loop out of
+// container-entrypoint so the test executes the shipped text rather than a
+// paraphrase of it.
+func entrypointReapForwardingHarness(t *testing.T) string {
+	t.Helper()
+	entrypoint := readDeploymentFile(t, "container-entrypoint")
+	start := strings.Index(entrypoint, "    for name in \\\n      "+reapAttestationVariables[0])
+	if start < 0 {
+		t.Fatal("container-entrypoint has no reap attestation forwarding loop")
+	}
+	end := strings.Index(entrypoint[start:], "\n    done\n")
+	if end < 0 {
+		t.Fatal("reap attestation forwarding loop has no terminator")
+	}
+	return "#!/usr/bin/env bash\nset -euo pipefail\ndeclare -a runtime_environment=()\n" +
+		entrypoint[start:start+end+len("\n    done\n")] +
+		"printf '%s\\n' \"${runtime_environment[@]+\"${runtime_environment[@]}\"}\"\n"
 }
 
 func TestSupervisorRedactsReapAttestationNonceDiagnostics(t *testing.T) {

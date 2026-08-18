@@ -82,7 +82,22 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	if err := service.attachDurableReap(&inspection); err != nil {
 		return PreparedEpoch{}, err
 	}
-	if inspection.Phase == PhaseRecovery {
+	// A verified teardown removes containers but deliberately keeps the
+	// allocator's named volume, so the epoch identity written there outlives
+	// every stop, abort, and reconcile. The supervisor reports any project that
+	// still answers with an identity but is not in a reusable container shape as
+	// PhaseRecovery, which would otherwise make a fully reaped personality agent
+	// look like it needs recovery on its next spawn and fail every spawn after
+	// the first. The durable reap receipt is this daemon's own physical record of
+	// an observed-empty project and is the single authority on "already cleaned
+	// up"; the surviving identity is not evidence of live processes.
+	//
+	// Falling through is safe for the covered epoch: the receipt exists only
+	// because a fenced teardown of that exact generation already completed, and
+	// the backend prepare joins a synchronous `down` before the allocator issues
+	// a replacement generation.
+	if inspection.Phase == PhaseRecovery &&
+		!service.reapReceiptCovers(request.PersonalityAgentID, inspection.Epoch.Generation) {
 		return PreparedEpoch{}, fmt.Errorf("%w: runtime requires fenced reconciliation before prepare", ErrConflict)
 	}
 	if inspection.Phase == PhasePrepared || inspection.Phase == PhaseActive {
@@ -114,6 +129,9 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 
 func (service *Service) Activate(ctx context.Context, request ActivateRequest) (Inspection, error) {
 	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	if err := service.verifyReapAttestation(request); err != nil {
 		return Inspection{}, err
 	}
 	entry := service.entry(request.PersonalityAgentID)
@@ -270,6 +288,39 @@ func (service *Service) hydrateEntry(ctx context.Context, personalityAgentID str
 		return err
 	}
 	entry.setInspection(inspection)
+	return nil
+}
+
+// reapReceiptCovers reports whether this daemon's own durable state already
+// holds an observed-empty teardown receipt for every generation through
+// generation. It is the single answer to "is this personality agent already
+// cleaned up", shared by Prepare's phase classification and by the Activate
+// attestation check, so neither one re-derives that judgement from weaker
+// evidence such as a surviving allocator identity or a caller's claim.
+func (service *Service) reapReceiptCovers(personalityAgentID string, generation uint64) bool {
+	reaped, ok := service.reaps.lookup(personalityAgentID)
+	return ok && reaped >= generation
+}
+
+// verifyReapAttestation recomputes a caller's claimed reap receipt against the
+// durable record this daemon wrote when it observed the empty project. ADR 0007
+// assigns kill/reap and its physical proof to the control plane, so the control
+// plane may forward a receipt the provisioner already holds, but it may not
+// issue one: the runtime consumes this value as a host observation, not as an
+// API assertion. ActivateRequest.Validate only checks that the attestation is
+// self-consistent and bound to the prepared epoch; this is the check against
+// physical evidence.
+func (service *Service) verifyReapAttestation(request ActivateRequest) error {
+	attestation := request.Activation.ReapAttestation
+	if attestation == nil {
+		return nil
+	}
+	if !service.reapReceiptCovers(request.PersonalityAgentID, attestation.ReapedThroughGeneration) {
+		return fmt.Errorf(
+			"%w: reap attestation claims a generation no durable teardown receipt covers",
+			ErrConflict,
+		)
+	}
 	return nil
 }
 

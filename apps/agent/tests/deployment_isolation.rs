@@ -2972,7 +2972,12 @@ esac
         .arg("reconcile")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
         .env("SUMI_FAKE_DOCKER_LOG", &log)
-        .env("SUMI_FAKE_REAPED", &reaped);
+        .env("SUMI_FAKE_REAPED", &reaped)
+        // A project in this shape still has a durable epoch, so reconcile is
+        // destructive and demands the exact epoch the API already fenced.
+        // The allocator identity this fake docker returns is generation 7.
+        .env("SUMI_EXPECTED_RPC_GENERATION", "7")
+        .env("SUMI_EXPECTED_RPC_NONCE", "fixture-nonce");
     launch_runtime_env(&mut command, &fixture);
     let output = command.output().unwrap();
 
@@ -2987,8 +2992,9 @@ esac
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("\"phase\":\"unknown\""),
-        "reconcile did not return an observed-empty reap attestation: {}",
+        String::from_utf8_lossy(&output.stdout)
+            .contains(r#""phase":"unknown","reaped_through_generation":7"#),
+        "reconcile did not attest the exact reaped generation: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let calls = std::fs::read_to_string(&log).unwrap();

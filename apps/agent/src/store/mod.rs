@@ -429,6 +429,10 @@ pub(crate) struct Store {
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
     event_writer_finalizers: event_writer::CommitFinalizerRegistry,
     post_commit_feed: post_commit::PostCommitFeed,
+    /// Hydration policy for a running tool execution with no owning assistant
+    /// `ToolCall`. Every constructor sets `Reject`; only a fixture that creates
+    /// such a row by direct mutation may relax it, and only for itself.
+    ownerless_running_tools: event_writer::OwnerlessRunningTool,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
@@ -495,6 +499,15 @@ impl Store {
         let mut store = Self::finish_open(pool, scope, key_provider).await?;
         store._in_memory_anchor = Some(Arc::new(Mutex::new(anchor)));
         Ok(store)
+    }
+
+    /// Opt one fixture out of owning-`ToolCall` attribution. Only for fixtures
+    /// that create `running` rows by direct mutation instead of by replaying an
+    /// assistant transcript. There is no production equivalent: `Store::open`
+    /// always rejects an ownerless running row.
+    #[cfg(test)]
+    pub(crate) fn synthesize_owners_for_ownerless_running_tools(&mut self) {
+        self.ownerless_running_tools = event_writer::OwnerlessRunningTool::SynthesizeOwner;
     }
 
     #[cfg(test)]
@@ -597,6 +610,7 @@ impl Store {
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
             event_writer_finalizers: event_writer::CommitFinalizerRegistry::default(),
             post_commit_feed: post_commit::PostCommitFeed::new(0),
+            ownerless_running_tools: event_writer::OwnerlessRunningTool::Reject,
             #[cfg(test)]
             _in_memory_anchor: None,
         });
@@ -1491,6 +1505,7 @@ impl Store {
                     &command_id,
                     &run_id,
                     generation,
+                    self.ownerless_running_tools,
                 )
                 .await?;
                 intents.push(PhysicalRecoveryIntentRequest {

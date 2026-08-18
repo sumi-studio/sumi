@@ -11565,6 +11565,24 @@ pub(super) struct RunningToolRecoveryEvidence {
     pub(super) assistant_message_id: String,
 }
 
+/// How to treat a running tool execution whose owning assistant `ToolCall` is
+/// absent from the authenticated transcript.
+///
+/// This used to be a `#[cfg(test)]` early return, which made the fail-closed
+/// branch unreachable in every test build. It is now an explicit argument, so
+/// the caller states which behaviour it wants and the production choice is the
+/// one that runs in tests unless a fixture deliberately says otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OwnerlessRunningTool {
+    /// An unattributable running row is not recoverable evidence. Production
+    /// hydration always uses this.
+    Reject,
+    /// Accept the row under a synthesized owner. Only low-level EventWriter
+    /// fixtures that create running rows by direct mutation may ask for this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    SynthesizeOwner,
+}
+
 pub(super) async fn authenticate_running_tool_intent(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
@@ -11572,6 +11590,7 @@ pub(super) async fn authenticate_running_tool_intent(
     command_id: &str,
     run_id: &str,
     executor_generation: ProcessGeneration,
+    ownerless: OwnerlessRunningTool,
 ) -> Result<RunningToolRecoveryEvidence> {
     let sequences: Vec<i64> = sqlx::query_scalar(
         "SELECT seq FROM agent_events
@@ -11628,14 +11647,10 @@ pub(super) async fn authenticate_running_tool_intent(
             "running tool execution {tool_call_id} requires exactly one owning assistant ToolCall"
         );
     }
-    #[cfg(test)]
-    if assistant_sequences.is_empty() {
-        // A few low-level EventWriter fixtures predate assistant transcript
-        // ownership and create running rows through direct test-only mutation.
-        // Production hydration has no such bypass and remains fail-closed.
+    if assistant_sequences.is_empty() && ownerless == OwnerlessRunningTool::SynthesizeOwner {
         return Ok(RunningToolRecoveryEvidence {
             tool_name,
-            assistant_message_id: format!("legacy-test-owner-{tool_call_id}"),
+            assistant_message_id: format!("synthesized-owner-{tool_call_id}"),
         });
     }
     let Some(assistant_sequence) = assistant_sequences.first().copied() else {
@@ -15306,6 +15321,54 @@ mod tests {
             .await
             .expect("open test store")
             .into()
+    }
+
+    /// A store for fixtures that create `running` tool rows by direct mutation
+    /// rather than by replaying an assistant transcript that claims them.
+    /// `Store::open` has no equivalent: production always rejects an
+    /// unattributable running row.
+    async fn ownerless_running_tool_test_store() -> Arc<Store> {
+        let mut store = Store::in_memory(scope(), test_provider())
+            .await
+            .expect("open test store");
+        store.synthesize_owners_for_ownerless_running_tools();
+        store.into()
+    }
+
+    /// Drives one tool call from pending approval through `ToolExecutionStart`,
+    /// leaving exactly one `running` row that no assistant `ToolCall` claims.
+    async fn seed_running_tool_execution(
+        store: &Arc<Store>,
+        writer: &EventWriter,
+        request_id: &str,
+        tool_call_id: &str,
+        run_id: &str,
+        decision_id: &str,
+    ) {
+        seed_pending_approval(store, writer, request_id, tool_call_id, run_id).await;
+        writer
+            .persist_inbound(&approval_command(2, decision_id, request_id))
+            .await
+            .expect("persist approval decision");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    request_id,
+                    "approved_once",
+                    "test",
+                    Some((decision_id, 2, run_id)),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approve tool");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write(tool_call_id, run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start tool");
     }
 
     async fn file_test_store(path: &Path) -> Arc<Store> {
@@ -31321,37 +31384,47 @@ mod tests {
         assert!(error.unwrap_err().to_string().contains("lease"));
     }
 
+    /// The transcript this fixture writes never claims `tool-1`, so on a default
+    /// store the running row is unattributable and boot must fail closed. Before
+    /// the ownerless policy became an explicit argument, a `#[cfg(test)]` early
+    /// return made this branch unreachable in every test build.
+    #[tokio::test]
+    async fn hydration_rejects_a_running_tool_no_assistant_tool_call_owns() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_running_tool_execution(
+            &store,
+            &writer,
+            "request-1",
+            "tool-1",
+            "run-1",
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .await;
+
+        let lease = test_lease(2);
+        let fence = test_fence(&lease);
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("running tool with no owning assistant ToolCall must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one owning assistant ToolCall"),
+            "unexpected hydration failure: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn hydrate_returns_recovery_required_for_running_tool() {
-        let store = test_store().await;
+        let store = ownerless_running_tool_test_store().await;
         let writer = EventWriter::new(store.clone());
         let run_id = "run-1";
         let tool_call_id = "tool-1";
         let decision_id = "00000000-0000-4000-8000-000000000002";
-        seed_pending_approval(&store, &writer, "request-1", tool_call_id, run_id).await;
-        writer
-            .persist_inbound(&approval_command(2, decision_id, "request-1"))
-            .await
-            .expect("persist approval decision");
-        writer
-            .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-1",
-                    "approved_once",
-                    "test",
-                    Some((decision_id, 2, run_id)),
-                )],
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("approve tool");
-        writer
-            .apply(EventBatch {
-                writes: vec![tool_start_write(tool_call_id, run_id)],
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("start tool");
+        seed_running_tool_execution(&store, &writer, "request-1", tool_call_id, run_id, decision_id)
+            .await;
 
         let lease = test_lease(2);
         let fence = test_fence(&lease);

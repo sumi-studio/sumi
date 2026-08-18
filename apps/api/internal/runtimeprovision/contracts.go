@@ -239,6 +239,11 @@ func (request ActivateRequest) Validate() error {
 	if err := request.Activation.Validate(); err != nil {
 		return err
 	}
+	// Self-consistency and epoch binding only. Every field here comes from the
+	// caller, so these checks cannot tell whether the claimed teardown happened.
+	// Service.verifyReapAttestation is the check against the provisioner's own
+	// durable observed-empty receipt; it runs before any activation reaches a
+	// backend.
 	if attestation := request.Activation.ReapAttestation; attestation != nil {
 		if attestation.PersonalityAgentID != request.PersonalityAgentID ||
 			attestation.EpochGeneration != request.Generation ||
