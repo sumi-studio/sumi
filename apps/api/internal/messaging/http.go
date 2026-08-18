@@ -1131,7 +1131,9 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	wire := messageToWire(place, msg)
 	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: wire})
 }
 
 // serveToggleReaction toggles the viewer's emoji on a message. The same store

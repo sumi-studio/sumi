@@ -461,6 +461,54 @@ describe("reaction convergence in the messaging store", () => {
     ).toMatchObject({ deleted: true, reactions: [] });
   });
 
+  it("keeps a tombstone when message_deleted precedes the PATCH response and replay", async () => {
+    const harness = new StubBackend();
+    const committed = deferred<Message>();
+    harness.editMessage = vi.fn(async () => await committed.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = { ...message(1, "編集前"), revision: 1 };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+    });
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("PATCHで確定した本文");
+    useMessaging.getState().submitEdit();
+    expect(harness.editMessage).toHaveBeenCalledOnce();
+
+    const tombstone = {
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: 3,
+    };
+    harness.emit({ type: "message_deleted", message: tombstone });
+    committed.resolve({
+      ...target,
+      content: "PATCHで確定した本文",
+      revision: 2,
+    });
+    await harness.settle();
+
+    // reconnectのcatch-upはmessage_createdで運ばれるが、旧編集eventも同じ
+    // 単調適用を通るためtombstoneを覆えない。
+    harness.emit({
+      type: "message_created",
+      message: { ...target, content: "replayされた古い編集", revision: 2 },
+      notify: null,
+    });
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ content: "", deleted: true, revision: 3 });
+  });
+
   it("discards toggle ACKs and queued mutations from an earlier session", async () => {
     const oldHarness = new StubBackend();
     const acknowledgement = deferred<ReactionMutationResult>();
@@ -710,7 +758,9 @@ class StubBackend implements MessagingBackend {
   editMessage = async (): ReturnType<MessagingBackend["editMessage"]> => {
     throw new Error("editMessage is not part of this test");
   };
-  deleteMessage = vi.fn(async () => undefined);
+  deleteMessage = vi.fn(async (): Promise<Message> => {
+    throw new Error("deleteMessage is not part of this test");
+  });
   markRead = vi.fn(async () => undefined);
   setStatus = vi.fn(async () => {
     throw new Error("unused");

@@ -209,6 +209,32 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
+  it("returns the revisioned tombstone from DELETE", async () => {
+    const deleted = {
+      ...messageWire(1, ""),
+      deleted: true,
+      revision: 2,
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path.endsWith("/messages/message-1") && init?.method === "DELETE") {
+          return json({ message: deleted });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.deleteMessage(channel, "message-1"),
+    ).resolves.toMatchObject({
+      deleted: true,
+      revision: 2,
+    });
+  });
+
   it("requests the scoped bounded search projection", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = expectScopedMessagingPath(input);

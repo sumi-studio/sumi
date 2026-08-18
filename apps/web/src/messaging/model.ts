@@ -400,7 +400,7 @@ export interface MessagingBackend {
     content: string,
     expectedRevision: number,
   ): Promise<Message>;
-  deleteMessage(place: Place, messageId: string): Promise<void>;
+  deleteMessage(place: Place, messageId: string): Promise<Message>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
   /**
    * 自己申告のattentionの現在値。status_updatedはvolatileでreplayされず、

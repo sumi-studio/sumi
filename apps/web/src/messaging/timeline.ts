@@ -48,7 +48,17 @@ export function applyMessageRevision<T extends MessageContentRevision>(
   current: T | undefined,
   incoming: T,
 ): T {
-  if (!current || (incoming.revision ?? 1) >= (current.revision ?? 1)) {
+  const currentRevision = current?.revision ?? 1;
+  const incomingRevision = incoming.revision ?? 1;
+  const currentDeleted = (current as (T & { deleted?: boolean }) | undefined)
+    ?.deleted;
+  const incomingDeleted = (incoming as T & { deleted?: boolean }).deleted;
+  // 削除は終端状態。旧経路の再送などでrevisionが欠けたり同値だったとしても、
+  // tombstoneを通常メッセージへ戻さない。サーバーも削除時にrevisionを進める。
+  if (current && currentDeleted && !incomingDeleted) {
+    return current;
+  }
+  if (!current || incomingRevision >= currentRevision) {
     return incoming;
   }
   return current;
