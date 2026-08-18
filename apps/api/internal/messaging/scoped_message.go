@@ -466,9 +466,10 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel {
 		return Message{}, ErrForbidden
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE messages SET content = NULL, deleted_at = now()
-		WHERE workspace_id = $1 AND message_id = $2`, s.Scope.WorkspaceID, messageID); err != nil {
+	if err := tx.QueryRow(ctx, `
+		UPDATE messages SET content = NULL, deleted_at = now(), revision = revision + 1
+		WHERE workspace_id = $1 AND message_id = $2
+		RETURNING revision`, s.Scope.WorkspaceID, messageID).Scan(&message.Revision); err != nil {
 		return Message{}, fmt.Errorf("tombstone scoped message: %w", err)
 	}
 	// Bytes leave through the durable deletion outbox after commit; the

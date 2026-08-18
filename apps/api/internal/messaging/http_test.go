@@ -416,9 +416,13 @@ func TestEditAndDeleteMapAuthorizationOverHTTP(t *testing.T) {
 	}
 
 	// Owner (humanA) deletes another's message in a channel.
-	resp, _ = call(t, ts, http.MethodDelete, base, w.humanA.ID, nil)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("owner delete: status %d", resp.StatusCode)
+	resp, body = call(t, ts, http.MethodDelete, base, w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("owner delete: status %d body %v", resp.StatusCode, body)
+	}
+	deleted, ok := body["message"].(map[string]any)
+	if !ok || deleted["revision"] != float64(3) || deleted["deleted"] != true {
+		t.Fatalf("deleted message = %v, want revision 3 tombstone", body)
 	}
 	// Editing the tombstone conflicts.
 	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "復活", "revision": 2})

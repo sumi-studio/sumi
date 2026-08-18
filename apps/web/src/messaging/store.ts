@@ -893,6 +893,46 @@ export const useMessaging = create<MessagingState>((set, get) => {
     });
   };
 
+  // REST DELETE応答とlive/replayのmessage_deletedは、同じtombstone投影を通す。
+  // これでsocketが不在でも集計を即時に収束させ、後着イベントも単調に扱える。
+  const applyMessageDeleted = (message: Message) => {
+    const key = placeKey(message.place);
+    set((state) => {
+      const existing = (state.messagesByPlace[key] ?? []).find(
+        (entry) => entry.messageId === message.messageId,
+      );
+      if (applyMessageRevision(existing, message) !== message) return {};
+      const previous = existing ?? { ...message, deleted: false };
+      const contribution = unreadContribution(
+        previous,
+        state.lastReadByPlace[key] ?? 0,
+        state.selfKey,
+      );
+      const editingDeleted = state.editingMessageId === message.messageId;
+      return {
+        messagesByPlace: {
+          ...state.messagesByPlace,
+          [key]: upsertMessage(state.messagesByPlace[key] ?? [], message),
+        },
+        unreadCountByPlace: {
+          ...state.unreadCountByPlace,
+          [key]: Math.max(
+            0,
+            (state.unreadCountByPlace[key] ?? 0) - contribution.unread,
+          ),
+        },
+        mentionCountByPlace: {
+          ...state.mentionCountByPlace,
+          [key]: Math.max(
+            0,
+            (state.mentionCountByPlace[key] ?? 0) - contribution.mentions,
+          ),
+        },
+        ...(editingDeleted ? clearedEditSession() : {}),
+      };
+    });
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
@@ -983,48 +1023,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "message_deleted") {
-      const key = placeKey(event.message.place);
-      set((state) => {
-        const existing = (state.messagesByPlace[key] ?? []).find(
-          (message) => message.messageId === event.message.messageId,
-        );
-        const previous = existing ?? { ...event.message, deleted: false };
-        const contribution = unreadContribution(
-          previous,
-          state.lastReadByPlace[key] ?? 0,
-          state.selfKey,
-        );
-        const editingDeleted =
-          state.editingMessageId === event.message.messageId;
-        return {
-          messagesByPlace: {
-            ...state.messagesByPlace,
-            [key]: upsertMessage(
-              state.messagesByPlace[key] ?? [],
-              event.message,
-            ),
-          },
-          unreadCountByPlace: {
-            ...state.unreadCountByPlace,
-            [key]: Math.max(
-              0,
-              (state.unreadCountByPlace[key] ?? 0) - contribution.unread,
-            ),
-          },
-          mentionCountByPlace: {
-            ...state.mentionCountByPlace,
-            [key]: Math.max(
-              0,
-              (state.mentionCountByPlace[key] ?? 0) - contribution.mentions,
-            ),
-          },
-          ...(editingDeleted
-            ? {
-                ...clearedEditSession(),
-              }
-            : {}),
-        };
-      });
+      applyMessageDeleted(event.message);
       return;
     }
     if (event.type === "typing") {
@@ -2038,11 +2037,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     deleteMessage(messageId) {
       const state = get();
-      const place = state.activePlaceKey
-        ? parsePlaceKey(state.activePlaceKey)
-        : null;
-      if (!place) return;
-      void backend.deleteMessage(place, messageId);
+      const key = state.activePlaceKey;
+      const place = key ? parsePlaceKey(key) : null;
+      if (!key || !place) return;
+      void backend.deleteMessage(place, messageId).then((committed) => {
+        if (
+          committed.messageId !== messageId ||
+          placeKey(committed.place) !== key
+        )
+          return;
+        applyMessageDeleted(committed);
+      });
     },
 
     setReplyTarget(messageId) {

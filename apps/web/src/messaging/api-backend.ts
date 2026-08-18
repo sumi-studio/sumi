@@ -339,11 +339,14 @@ export class ApiMessagingBackend implements MessagingBackend {
     return parseMessage(body.message);
   }
 
-  async deleteMessage(place: Place, messageId: string): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "DELETE" },
+  async deleteMessage(place: Place, messageId: string): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
+        { method: "DELETE" },
+      ),
     );
+    return parseMessage(body.message);
   }
 
   async markRead(place: Place, lastReadSeq: number): Promise<void> {

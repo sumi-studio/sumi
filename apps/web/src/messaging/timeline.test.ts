@@ -64,6 +64,22 @@ describe("upsertMessage", () => {
     expect(next).toEqual([current]);
   });
 
+  it("tombstoneを同じrevision以下の通常メッセージで復活させない", () => {
+    const tombstone = message({
+      seq: 1,
+      content: "",
+      deleted: true,
+      revision: 3,
+    });
+
+    const next = upsertMessage(
+      [tombstone],
+      message({ seq: 1, content: "遅着した本文", revision: 3 }),
+    );
+
+    expect(next).toEqual([tombstone]);
+  });
+
   it("同じseqの別IDは受け入れない", () => {
     const list = [message({ seq: 1 })];
     const next = upsertMessage(list, {
