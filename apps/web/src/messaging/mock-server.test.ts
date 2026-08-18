@@ -100,4 +100,27 @@ describe("MockMessagingServer admission", () => {
 
     expect(dev).toMatchObject({ unreadCount: 6, mentionCount: 1 });
   });
+
+  it("名乗りの書き換えは他のモックへ漏れない", async () => {
+    const server = new MockMessagingServer();
+    const saved = await server.updateProfile({
+      displayName: "余白",
+      tagline: "開発",
+    });
+    expect(saved).toMatchObject({ displayName: "余白", tagline: "開発" });
+
+    const own = await server.bootstrap();
+    expect(own.members[0]).toMatchObject({
+      displayName: "余白",
+      tagline: "開発",
+    });
+
+    // 後から作った別のモックは初期状態のまま。開発用の別sessionや別テストが
+    // 一方の保存に汚されない。
+    const fresh = await new MockMessagingServer().bootstrap();
+    expect(fresh.members[0]).toMatchObject({
+      displayName: "yohaku",
+      tagline: "Founder / デザイン",
+    });
+  });
 });

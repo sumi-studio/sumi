@@ -95,8 +95,9 @@ const DMS: DmSummary[] = [
   { dmId: "dm-haru", kind: "dm", participants: [SELF, HARU] },
 ];
 
-// 名乗りは書き換わるので、モックでも定数ではなく可変の一覧として持つ。
-const MEMBERS: MemberProfile[] = [
+// 名乗りの初期値。書き換えは各MockMessagingServerが自分の複製に対して行うので、
+// 一方のモックでの保存が他方の初期状態を汚さない。
+const SEED_MEMBERS: readonly MemberProfile[] = [
   { participant: SELF, displayName: "yohaku", tagline: "Founder / デザイン" },
   { participant: HARU, displayName: "Haru", tagline: "エンジニア" },
   { participant: SUMI, displayName: "Sumi", tagline: "yohakuの秘書" },
@@ -331,10 +332,13 @@ function initialReadMarkers(
   return markers;
 }
 
-function resolveMentionsAtAdmission(content: string): ParticipantRef[] {
-  return MEMBERS.filter((member) =>
-    hasDisplayMention(content, member.displayName),
-  ).map((member) => member.participant);
+function resolveMentionsAtAdmission(
+  content: string,
+  members: readonly MemberProfile[],
+): ParticipantRef[] {
+  return members
+    .filter((member) => hasDisplayMention(content, member.displayName))
+    .map((member) => member.participant);
 }
 
 const SEND_LATENCY_MS = 160;
@@ -353,6 +357,10 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
+  /** 名乗りはこのモックの中でだけ書き換わる。 */
+  private readonly members: MemberProfile[] = SEED_MEMBERS.map((member) => ({
+    ...member,
+  }));
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
@@ -409,7 +417,7 @@ export class MockMessagingServer implements MessagingBackend {
       workspaces: WORKSPACES,
       channels: CHANNELS,
       dms: DMS,
-      members: MEMBERS,
+      members: [...this.members],
       statuses: [...this.statuses.values()],
       readMarkers,
       unreadSummaries,
@@ -583,7 +591,7 @@ export class MockMessagingServer implements MessagingBackend {
           author: SELF,
           content: input.content,
           // mentionはclientから信用せず、現在のmembershipからadmission時に解決する。
-          mentions: resolveMentionsAtAdmission(input.content),
+          mentions: resolveMentionsAtAdmission(input.content, this.members),
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
@@ -674,7 +682,7 @@ export class MockMessagingServer implements MessagingBackend {
       return;
     }
     message.content = content;
-    message.mentions = resolveMentionsAtAdmission(content);
+    message.mentions = resolveMentionsAtAdmission(content, this.members);
     message.editedAt = Date.now();
     this.emit({ type: "message_edited", message: { ...message } });
   }
@@ -729,10 +737,10 @@ export class MockMessagingServer implements MessagingBackend {
 
   /** 自分の名乗りだけを置き換える。実APIと同じく対象は常にSELF。 */
   async updateProfile(input: ProfileInput): Promise<MemberProfile> {
-    const index = MEMBERS.findIndex((member) =>
+    const index = this.members.findIndex((member) =>
       sameParticipant(member.participant, SELF),
     );
-    const current = MEMBERS[index];
+    const current = this.members[index];
     if (!current) throw new Error("mock server lost its own profile");
     const next: MemberProfile = {
       ...current,
@@ -741,7 +749,7 @@ export class MockMessagingServer implements MessagingBackend {
         : { displayName: input.displayName }),
       ...(input.tagline === undefined ? {} : { tagline: input.tagline }),
     };
-    MEMBERS[index] = next;
+    this.members[index] = next;
     this.emit({ type: "profile_updated", profile: next });
     return next;
   }
