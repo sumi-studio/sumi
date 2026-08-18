@@ -172,13 +172,17 @@ func joinThread(ctx context.Context, tx pgx.Tx, placeID string, membership works
 	return admitPlaceTenure(ctx, tx, placeID, membership, 1)
 }
 
+// ThreadsIn lists the threads under one channel. Like every other thread
+// projection it reads at REPEATABLE READ: counts, the latest message, and the
+// participant list are three statements, and at READ COMMITTED a commit
+// between them would produce a summary that existed at no single moment.
 func (s *ScopedStore) ThreadsIn(ctx context.Context, parentPlaceID string) ([]Thread, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.Store.beginOpenSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	membership, err := s.authorizeInTx(ctx, tx)
+	membership, err := s.authorizeSnapshotInTx(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -202,13 +206,14 @@ func (s *ScopedStore) ThreadsIn(ctx context.Context, parentPlaceID string) ([]Th
 	return threads, nil
 }
 
+// ThreadsFor lists the threads this viewer participates in, from one snapshot.
 func (s *ScopedStore) ThreadsFor(ctx context.Context) ([]Thread, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.Store.beginOpenSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	membership, err := s.authorizeInTx(ctx, tx)
+	membership, err := s.authorizeSnapshotInTx(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -224,18 +229,25 @@ func (s *ScopedStore) ThreadsFor(ctx context.Context) ([]Thread, error) {
 	return threads, nil
 }
 
+// ThreadFor projects one thread from one snapshot.
 func (s *ScopedStore) ThreadFor(ctx context.Context, threadID string) (Thread, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.Store.beginOpenSnapshot(ctx)
 	if err != nil {
 		return Thread{}, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	membership, err := s.authorizeInTx(ctx, tx)
+	membership, err := s.authorizeSnapshotInTx(ctx, tx)
 	if err != nil {
 		return Thread{}, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, threadID)
-	if err != nil || place.Kind != PlaceThread {
+	// A store failure is not an answer about existence. Reporting it as
+	// not-found would tell the caller that a thread it can see is gone, and a
+	// client that believes that stops asking for it.
+	if err != nil {
+		return Thread{}, err
+	}
+	if place.Kind != PlaceThread {
 		return Thread{}, ErrPlaceNotFound
 	}
 	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
@@ -269,6 +281,12 @@ func (s *ScopedStore) threadForAuthorizedPlace(ctx context.Context, q querier, w
 	return threads[0], nil
 }
 
+// threadsWhere projects thread summaries from one statement, so the counts,
+// the latest message, and the participant list of a thread are always the same
+// moment. Reading the participants separately produced summaries that never
+// existed: a message committed between the two reads showed up in the count
+// with its author still missing from the participants.
+//
 // conditions use $1=workspace and $2=viewer Workspace tenure; extra args start at $3.
 func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemberID, condition string, args ...any) ([]Thread, error) {
 	queryArgs := []any{s.Scope.WorkspaceID, workspaceMemberID}
@@ -278,7 +296,17 @@ func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemb
 		       t.parent_place_id, t.parent_message_id,
 		       (SELECT count(*) FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL),
 		       (SELECT m.created_at FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL ORDER BY m.seq DESC LIMIT 1),
-		       (SELECT m.content FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL ORDER BY m.seq DESC LIMIT 1)
+		       (SELECT m.content FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL ORDER BY m.seq DESC LIMIT 1),
+		       ARRAY(SELECT pm.member_kind FROM place_members pm
+		             JOIN workspace_members wm ON wm.workspace_id=pm.workspace_id
+		               AND wm.workspace_member_id=pm.workspace_member_id AND wm.left_at IS NULL
+		             WHERE pm.workspace_id=$1 AND pm.place_id=t.place_id AND pm.left_at IS NULL
+		             ORDER BY pm.joined_at, pm.place_member_id),
+		       ARRAY(SELECT pm.member_id FROM place_members pm
+		             JOIN workspace_members wm ON wm.workspace_id=pm.workspace_id
+		               AND wm.workspace_member_id=pm.workspace_member_id AND wm.left_at IS NULL
+		             WHERE pm.workspace_id=$1 AND pm.place_id=t.place_id AND pm.left_at IS NULL
+		             ORDER BY pm.joined_at, pm.place_member_id)
 		FROM places t WHERE t.workspace_id=$1 AND $2::text IS NOT NULL AND t.kind='thread' AND (%s)
 		ORDER BY COALESCE((SELECT max(m.created_at) FROM messages m WHERE m.place_id=t.place_id), t.created_at) DESC, t.place_id DESC`, condition), queryArgs...)
 	if err != nil {
@@ -286,15 +314,18 @@ func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemb
 	}
 	defer rows.Close()
 	var out []Thread
-	var ids []string
 	for rows.Next() {
 		var t Thread
 		var name string
 		var origin, preview *string
+		var kinds, ids []string
 		if err := rows.Scan(&t.Place.PlaceID, &t.Place.WorkspaceID, &name, &t.Place.Topic,
 			&t.Place.Visibility, &t.Place.LastSeq, &t.ParentPlaceID, &origin,
-			&t.MessageCount, &t.LastMessageAt, &preview); err != nil {
+			&t.MessageCount, &t.LastMessageAt, &preview, &kinds, &ids); err != nil {
 			return nil, fmt.Errorf("scan thread: %w", err)
+		}
+		if len(kinds) != len(ids) {
+			return nil, fmt.Errorf("thread %q participant projection is inconsistent", t.Place.PlaceID)
 		}
 		t.Place.Kind, t.Place.Name = PlaceThread, name
 		if origin != nil {
@@ -303,18 +334,15 @@ func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemb
 		if preview != nil {
 			t.LastMessagePreview = truncateRunes(*preview, ThreadPreviewChars)
 		}
-		out, ids = append(out, t), append(ids, t.Place.PlaceID)
+		for i := range kinds {
+			t.Participants = append(t.Participants, ParticipantRef{
+				Kind: ParticipantKind(kinds[i]), ID: ids[i],
+			})
+		}
+		out = append(out, t)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
-	}
-	rows.Close()
-	participants, err := s.threadParticipants(ctx, q, ids)
-	if err != nil {
-		return nil, err
-	}
-	for i := range out {
-		out[i].Participants = participants[out[i].Place.PlaceID]
 	}
 	return out, nil
 }

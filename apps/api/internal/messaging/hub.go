@@ -95,6 +95,10 @@ type subscriber struct {
 	done    chan struct{}
 	mu      sync.Mutex
 	visible map[string]bool
+	// openPlaceID is the one place this connection currently has open. It is a
+	// delivery filter, never an authorization: it can only widen delivery to a
+	// participant the event's fenced audience already listed as a watcher.
+	openPlaceID string
 }
 
 // markVisible records a known visibility verdict.
@@ -109,6 +113,35 @@ func (s *subscriber) visibility(placeID string) (bool, bool) {
 	defer s.mu.Unlock()
 	ok, known := s.visible[placeID]
 	return ok, known
+}
+
+// openPlace declares the one place this connection is looking at. A screen
+// shows one place, so a later declaration replaces the earlier one and no
+// client can accumulate watched places.
+func (s *subscriber) openPlace(placeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.openPlaceID = placeID
+}
+
+// closePlace clears the declaration only when it still names the same place,
+// so a close for the screen the viewer already left cannot cancel the one
+// they moved to.
+func (s *subscriber) closePlace(placeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.openPlaceID == placeID {
+		s.openPlaceID = ""
+	}
+}
+
+func (s *subscriber) watching(placeID string) bool {
+	if placeID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openPlaceID == placeID
 }
 
 // Hub fans messaging events out to live subscribers. REST mutations and WS
@@ -133,7 +166,7 @@ type hubAuthorizer interface {
 		Scope,
 		liveBoundary,
 		bool,
-		func(map[ParticipantRef]struct{}) error,
+		func(liveAudience) error,
 	) error
 }
 
@@ -286,7 +319,7 @@ func (h *Hub) publishVariants(
 		}
 	}
 
-	fanout := func(authorized map[ParticipantRef]struct{}) error {
+	fanout := func(authorized liveAudience) error {
 		h.mu.Lock()
 		subs := make([]*subscriber, 0, len(h.subscribers))
 		for sub := range h.subscribers {
@@ -311,7 +344,7 @@ func (h *Hub) publishVariants(
 			if h.authorizer == nil {
 				visible, _ = sub.visibility(boundary.key())
 			} else {
-				_, visible = authorized[sub.viewer]
+				visible = authorized.admits(sub.viewer, sub.watching(boundary.placeID))
 			}
 			sub.markVisible(boundary.key(), visible)
 			if !visible {
@@ -345,7 +378,7 @@ func (h *Hub) publishVariants(
 	if h.authorizer != nil {
 		return h.authorizer.withLiveAudience(ctx, scope, boundary, requireActor, fanout)
 	}
-	return fanout(nil)
+	return fanout(liveAudience{})
 }
 
 func eventScope(event Event) (liveBoundary, bool) {

@@ -867,6 +867,100 @@ describe("ApiMessagingBackend", () => {
       { type: "message_created", notify: null },
     ]);
   });
+
+  it("keeps announced and listed threads out of the handshake", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/places/channel-1/threads") {
+          return json({
+            threads: [
+              threadSummaryWire("thread-listed-1"),
+              threadSummaryWire("thread-listed-2"),
+            ],
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    // 一覧で見えたthreadも、親channelへ告知されただけのthreadも、自分の
+    // 台帳ではない。cursorにすると次のhandshakeが上限で撥ねられる。
+    expect(await backend.fetchThreads(channel)).toHaveLength(2);
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "thread-announced",
+        thread: threadSummaryWire("thread-announced"),
+      },
+    });
+
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4 },
+    });
+  });
+
+  it("declares the open place, re-declares it after reconnecting, and closes it", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    backend.openPlace({ kind: "thread", threadId: "thread-open" });
+    expect(JSON.parse(socket?.sent[1] ?? "{}")).toEqual({
+      type: "open",
+      place_id: "thread-open",
+    });
+    // 宣言の受領確認は状態を持たない。捨てられるだけで、eventにはならない。
+    socket?.message({ type: "open_ack", place_id: "thread-open" });
+    expect(events).toEqual([]);
+
+    // 新しいsocketは何も開いていない状態から始まる。画面はそのままなので、
+    // helloの直後に宣言し直す。開いている場所はreplay対象でもある。
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4, "thread-open": 0 },
+    });
+    expect(JSON.parse(reconnected?.sent[1] ?? "{}")).toEqual({
+      type: "open",
+      place_id: "thread-open",
+    });
+
+    backend.openPlace(null);
+    expect(JSON.parse(reconnected?.sent[2] ?? "{}")).toEqual({
+      type: "close",
+      place_id: "thread-open",
+    });
+  });
 });
 
 class FakeWebSocket extends EventTarget {
@@ -911,6 +1005,21 @@ function channelWire() {
 
 function threadPlaceWire(threadId: string) {
   return { kind: "thread", thread_id: threadId };
+}
+
+function threadSummaryWire(threadId: string) {
+  return {
+    thread_id: threadId,
+    parent_place: channelWire(),
+    parent_message_id: "message-1",
+    workspace_id: "workspace-1",
+    name: threadId,
+    message_count: 1,
+    last_message_at: "2026-08-01T11:00:00Z",
+    last_message: "返信",
+    participants: [{ kind: "human", human_id: "human-2" }],
+    latest_seq: 1,
+  };
 }
 
 function channelSummaryWire(topic: string, voice = false) {

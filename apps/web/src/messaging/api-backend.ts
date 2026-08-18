@@ -68,6 +68,7 @@ export class ApiMessagingBackend implements MessagingBackend {
   >();
   private readonly cursors = new Map<string, number>();
   private readonly places = new Map<string, Place>();
+  private openPlaceID: string | null = null;
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private reconnectDelay = 250;
@@ -125,9 +126,8 @@ export class ApiMessagingBackend implements MessagingBackend {
       (entry) => {
         const value = asRecord(entry);
         const place = parsePlace(value.place);
-        // bootstrapのthreadsは参加中のものだけだが、未読summaryは
-        // workspaceから見える未参加threadも運ぶ。後続のreaction eventを
-        // ルーティングできるよう、summaryだけのplaceも覚えておく。
+        // 未読summaryは自分の台帳にあるplaceだけを運ぶ。cursorはsubscribeが
+        // sinceByPlaceで登録するので、ここではeventのrouting先として覚える。
         this.registerPlace(place);
         return {
           place,
@@ -458,6 +458,19 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  /**
+   * 開いている画面をserverへ宣言する。参加していないthreadに届くliveはこの
+   * 宣言の間だけで、閉じれば止まる。参加しているplaceの配送は宣言に依存しない。
+   */
+  openPlace(place: Place | null): void {
+    const previous = this.openPlaceID;
+    this.openPlaceID = place ? placeID(place) : null;
+    // 開いている間は自分のcursorでもある。切断してもその場のdurable eventが
+    // replayされるよう、開いたplaceだけはfollowする。
+    if (place) this.followPlace(place);
+    this.declareOpenPlace(previous);
+  }
+
   subscribe(
     listener: (event: ServerEvent) => void,
     options: { sinceByPlace?: Record<PlaceKey, number> } = {},
@@ -515,6 +528,9 @@ export class ApiMessagingBackend implements MessagingBackend {
           cursors: Object.fromEntries(this.cursors),
         }),
       );
+      // 新しいsocketは何も開いていない状態から始まる。画面はそのままなので、
+      // 開いているplaceは接続のたびに宣言し直す。
+      this.declareOpenPlace(null);
     });
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
@@ -538,6 +554,20 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
   }
 
+  /** 現在の宣言をsocketへ流す。閉じたことも同じ経路で伝える。 */
+  private declareOpenPlace(previous: string | null): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    if (this.openPlaceID !== null) {
+      this.socket.send(
+        JSON.stringify({ type: "open", place_id: this.openPlaceID }),
+      );
+      return;
+    }
+    if (previous !== null) {
+      this.socket.send(JSON.stringify({ type: "close", place_id: previous }));
+    }
+  }
+
   private handleFrame(frame: Record<string, unknown>): void {
     const type = asString(frame.type);
     if (type === "hello_ack") {
@@ -545,6 +575,8 @@ export class ApiMessagingBackend implements MessagingBackend {
       this.emitConnection("connected");
       return;
     }
+    // 開いた宣言が届いた確認。状態はこちらが正本なので受け取るだけでよい。
+    if (type === "open_ack") return;
     if (type === "caught_up") {
       // Catch-up replays only messages after the cursor, so reactions that
       // landed on already-read messages while the socket was down are not in
@@ -644,7 +676,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       visibility: asVisibility(wire.visibility),
       voice: asBoolean(wire.voice),
     };
-    this.registerPlace({ kind: "channel", channelId: channel.channelId });
+    this.followPlace({ kind: "channel", channelId: channel.channelId });
     return channel;
   }
 
@@ -656,7 +688,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
-    this.registerPlace({ kind: dm.kind, dmId: dm.dmId });
+    this.followPlace({ kind: dm.kind, dmId: dm.dmId });
     return dm;
   }
 
@@ -680,12 +712,27 @@ export class ApiMessagingBackend implements MessagingBackend {
       participants: asArray(wire.participants).map(parseParticipant),
       latestSeq: asSeq(wire.latest_seq),
     };
+    // A thread is remembered for routing but not followed: a Workspace can
+    // hold more threads than one handshake may carry, and the ones this viewer
+    // participates in arrive as bootstrap cursors instead.
     this.registerPlace({ kind: "thread", threadId: thread.threadId });
     return thread;
   }
 
   /** Remembers any place shape that can be named by a live event. */
   private registerPlace(place: Place): void {
+    this.places.set(placeID(place), place);
+  }
+
+  /**
+   * Follows a place: its durable events replay from this cursor after a
+   * reconnect. Only the places this viewer's own ledger carries belong here.
+   * A Workspace's threads are unbounded and mostly other people's, so merely
+   * learning that one exists must not add a cursor: the handshake is refused
+   * outright past its cursor bound, and a bootstrap that rebuilds the same
+   * oversized ledger would keep it refused across reloads.
+   */
+  private followPlace(place: Place): void {
     const id = placeID(place);
     this.places.set(id, place);
     if (!this.cursors.has(id)) this.cursors.set(id, 0);

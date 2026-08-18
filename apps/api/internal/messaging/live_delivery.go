@@ -9,6 +9,31 @@ import (
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
 
+// liveAudience is one immutable current audience for one event boundary.
+// Members hold the place itself and always receive the event. Watchers may
+// only read it — a Workspace member who opens a thread they never joined —
+// and receive it exclusively while that exact place is the one their
+// connection has open. Reading therefore never turns a place's traffic into
+// the reader's ambient ledger, which is what participation is for.
+type liveAudience struct {
+	members  map[ParticipantRef]struct{}
+	watchers map[ParticipantRef]struct{}
+}
+
+// admits answers whether this connection may receive the event now. watching
+// is the connection's own open-place declaration; it can widen delivery only
+// to a participant the fenced audience already listed as a watcher.
+func (a liveAudience) admits(participant ParticipantRef, watching bool) bool {
+	if _, member := a.members[participant]; member {
+		return true
+	}
+	if !watching {
+		return false
+	}
+	_, watcher := a.watchers[participant]
+	return watcher
+}
+
 // withLiveAudience projects one already-committed event to one immutable
 // current audience. It deliberately does not require the originating actor to
 // remain a member: this is delivery of durable application truth, not a new
@@ -23,7 +48,7 @@ func (s *Store) withLiveAudience(
 	scope Scope,
 	boundary liveBoundary,
 	requireActor bool,
-	deliver func(map[ParticipantRef]struct{}) error,
+	deliver func(liveAudience) error,
 ) error {
 	if s == nil || s.workspaces == nil || s.apps == nil || deliver == nil {
 		return ErrInvalidScope
@@ -67,7 +92,10 @@ func (s *Store) withLiveAudience(
 		}
 	}
 
-	audience := map[ParticipantRef]struct{}{}
+	audience := liveAudience{
+		members:  map[ParticipantRef]struct{}{},
+		watchers: map[ParticipantRef]struct{}{},
+	}
 	if boundary.placeID != "" {
 		place, err := scoped.lockScopedPlace(ctx, tx, boundary.placeID)
 		if err != nil {
@@ -84,8 +112,26 @@ func (s *Store) withLiveAudience(
 		if err != nil {
 			return err
 		}
-		for _, member := range members {
-			audience[member.Participant] = struct{}{}
+		if place.Kind == PlaceThread {
+			// A thread is projected by participation, not by Workspace
+			// visibility. Everyone who may open it can watch it while it is
+			// open; only its participants carry it when it is not.
+			joined, err := scoped.threadParticipants(ctx, tx, []string{place.PlaceID})
+			if err != nil {
+				return err
+			}
+			for _, participant := range joined[place.PlaceID] {
+				audience.members[participant] = struct{}{}
+			}
+			for _, member := range members {
+				if _, joined := audience.members[member.Participant]; !joined {
+					audience.watchers[member.Participant] = struct{}{}
+				}
+			}
+		} else {
+			for _, member := range members {
+				audience.members[member.Participant] = struct{}{}
+			}
 		}
 	} else {
 		if !boundary.subjectSet {
@@ -104,7 +150,7 @@ func (s *Store) withLiveAudience(
 			return err
 		}
 		for _, membership := range memberships {
-			audience[membership.Participant] = struct{}{}
+			audience.members[membership.Participant] = struct{}{}
 		}
 	}
 	if err := deliver(audience); err != nil {

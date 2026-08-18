@@ -146,16 +146,15 @@ func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
 		t.Fatalf("bootstrap marker place = %v, want thread %s", place, thread.Place.PlaceID)
 	}
 
+	// The promise is the viewer's own, so it is theirs to see. The thread it
+	// points into is still not part of their ledger: they never joined it, and
+	// an unjoined thread carries no unread summary.
 	for _, raw := range body["unread_summaries"].([]any) {
 		summary := raw.(map[string]any)
 		if summary["place"].(map[string]any)["thread_id"] == thread.Place.PlaceID {
-			if summary["unread_count"] != float64(1) || summary["mention_count"] != float64(0) {
-				t.Fatalf("thread unread summary = %v", summary)
-			}
-			return
+			t.Fatalf("bootstrap summarized an unjoined thread: %v", summary)
 		}
 	}
-	t.Fatalf("bootstrap unread summaries omitted visible thread: %v", body["unread_summaries"])
 }
 
 func TestReplyLaterRemindAtNeverLeavesTheOwnersWire(t *testing.T) {

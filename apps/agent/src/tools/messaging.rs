@@ -1391,9 +1391,44 @@ impl MessagingTool {
                 }.map_err(map_messaging_api_error)?;
                 let thread_id = response.get("thread_id").and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                    .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?;
-                state.focused_place_id = Some(thread_id.to_owned());
-                state.visible_messages.clear();
+                    .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?
+                    .to_owned();
+                // Creating a thread opens it (契約: 作成後にそのthreadを現在の
+                // viewとして開く). A new thread is not necessarily empty by the
+                // time this response arrives — someone else can already have
+                // posted into it — so the view comes from an open screen, never
+                // from the assumption that there is nothing to see.
+                let opened = tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.open(scope, OpenMessagingPlaceRequest {
+                        place_id: &thread_id,
+                        before_seq: None,
+                        limit: None,
+                    }) => result,
+                }.map_err(map_messaging_api_error)?;
+                let admission = validate_open_response(&opened, &thread_id, None, None)?;
+                state.focused_place_id = Some(thread_id.clone());
+                state.visible_messages = admission.visible_messages;
+                if let Some(seq) = admission.read_through_seq {
+                    record_pending_read_through(state, &thread_id, seq);
+                    if matches!(execution.post_commit_mode, PostCommitMode::ReturnLiveHook) {
+                        live_post_commit = Some(read_through_post_commit(
+                            self.api.clone(),
+                            scope.clone(),
+                            view.clone(),
+                            thread_id.clone(),
+                            seq,
+                        ));
+                    }
+                }
+                let mut response = response;
+                // The created thread and the screen it opened are one result.
+                response
+                    .as_object_mut()
+                    .ok_or_else(|| ToolError::Protocol(
+                        "Messaging create_thread response is not an object".to_owned(),
+                    ))?
+                    .insert("open".to_owned(), opened);
                 response
             }
             BoundMessagingAction::Write {
@@ -4675,6 +4710,91 @@ mod tests {
         .await
         .expect("write in newly focused thread");
         assert_eq!(api.writes.lock().await[0].0, "th-1");
+    }
+
+    #[tokio::test]
+    async fn thread_creation_opens_the_thread_and_sees_posts_that_arrived_first() {
+        let thread_message = |seq: u64| {
+            json!({
+                "message_id": format!("m{seq}"),
+                "place": {"kind": "thread", "thread_id": "th-1"},
+                "seq": seq,
+                "author": test_participant(),
+                "content": "先に書かれていた",
+                "mentions": [],
+                "urgency": "normal",
+                "reactions": [],
+                "reply_to": null,
+                "client_nonce": format!("nonce-{seq}"),
+                "created_at": "2026-08-12T00:00:00Z",
+                "edited_at": null,
+                "deleted": false,
+                "attachments": []
+            })
+        };
+        let api = Arc::new(FakeMessagingApi::default());
+        api.open_responses.lock().await.extend([
+            test_open_response("general", 7, 5, 1, 7, None),
+            // Someone else posted between the creating commit and this
+            // response. A new thread is not empty by construction, so the view
+            // must come from an open screen rather than from that assumption.
+            json!({
+                "place": {"kind": "thread", "thread_id": "th-1"},
+                "latest_seq": 2,
+                "last_read_seq": 0,
+                "members": [],
+                "messages": [thread_message(1), thread_message(2)]
+            }),
+        ]);
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-parent",
+        )
+        .await
+        .expect("open parent");
+        let created = execute(
+            &tool,
+            json!({"action": "create_thread", "name": "認証リダイレクト"}),
+            "create",
+        )
+        .await
+        .expect("create thread");
+
+        assert_eq!(created.details["thread_id"], "th-1");
+        assert_eq!(created.details["open"]["latest_seq"], 2);
+        assert_eq!(
+            created.details["open"]["messages"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            api.calls.lock().await.as_slice(),
+            &[
+                "open:general".to_owned(),
+                "read:general".to_owned(),
+                "create_thread:general".to_owned(),
+                "open:th-1".to_owned(),
+            ]
+        );
+        // The read cursor covers what the screen actually showed, instead of
+        // claiming an unseen screen was read.
+        assert_eq!(
+            default_state(&tool).await.pending_read_through.get("th-1"),
+            Some(&2)
+        );
+        // What was already there is visible, so the agent can act on it.
+        execute(
+            &tool,
+            json!({"action": "react", "seq": 2, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .expect("react on a post that preceded the response");
+        let reacts = api.reacts.lock().await;
+        assert_eq!(reacts[0].0, "th-1");
+        assert_eq!(reacts[0].1, "m2");
+        assert!(api.calls.lock().await.contains(&"read:th-1".to_owned()));
     }
 
     #[tokio::test]

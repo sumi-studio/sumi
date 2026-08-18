@@ -23,22 +23,22 @@ import { CallStage } from "../call/call-stage";
 import { CallStartButtons } from "../call/call-start-buttons";
 import { IncomingCall } from "../call/incoming-call";
 import {
+  placeKey as keyForPlace,
   type PlaceKey,
   participantKey,
-  placeKey as keyForPlace,
   type ReplyLaterMarker,
 } from "../model";
 import {
   dismissPermissionPrompt,
   isPermissionPromptDismissed,
   type NotificationPermissionState,
-  notificationCountForPlace,
   notificationPermission,
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
 import {
   getMessagingScope,
+  notifiableUnreadCount,
   setNotificationNavigator,
   useMessaging,
 } from "../store";
@@ -434,10 +434,8 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const placeNavigate = usePlaceNavigate();
   const loadPlaceAround = useMessaging((state) => state.loadPlaceAround);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
-  const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
-  const mentionCountByPlace = useMessaging(
-    (state) => state.mentionCountByPlace,
-  );
+  // 参加している場所だけを数えた、タブタイトルに出す件数。
+  const titleUnread = useMessaging(notifiableUnreadCount);
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
   const threadsById = useMessaging((state) => state.threadsById);
@@ -457,12 +455,6 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     : null;
   const display = usePlaceDisplay(selectedPlaceKey);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
-  const notificationLevelByPlace = useMessaging(
-    (state) => state.notificationLevelByPlace,
-  );
-  const notificationDefaultLevel = useMessaging(
-    (state) => state.notificationDefaultLevel,
-  );
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [threadsOpen, setThreadsOpen] = useState(false);
@@ -506,23 +498,8 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
   // mentionsはmention未読だけを数え、「呼ばれている数」を表示する。
   useEffect(() => {
-    let unread = 0;
-    for (const [key, count] of Object.entries(unreadCountByPlace)) {
-      const level = notificationLevelByPlace[key] ?? notificationDefaultLevel;
-      unread += notificationCountForPlace(
-        key,
-        level,
-        count,
-        mentionCountByPlace[key] ?? 0,
-      );
-    }
-    document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
-  }, [
-    unreadCountByPlace,
-    mentionCountByPlace,
-    notificationLevelByPlace,
-    notificationDefaultLevel,
-  ]);
+    document.title = titleUnread > 0 ? `(${titleUnread}) Sumi` : "Sumi";
+  }, [titleUnread]);
 
   // デスクトップ通知のクリック先。URLが現在地の正本なのでrouterに任せる。
   useEffect(() => {

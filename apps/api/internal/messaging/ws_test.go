@@ -610,7 +610,7 @@ func (a *countingHubAuthorizer) withLiveAudience(
 	scope Scope,
 	boundary liveBoundary,
 	requireActor bool,
-	deliver func(map[ParticipantRef]struct{}) error,
+	deliver func(liveAudience) error,
 ) error {
 	if boundary.placeID != "" {
 		a.placeCalls++
@@ -620,7 +620,7 @@ func (a *countingHubAuthorizer) withLiveAudience(
 	if a.store != nil {
 		return a.store.core.withLiveAudience(ctx, scope, boundary, requireActor, deliver)
 	}
-	return deliver(a.audience)
+	return deliver(liveAudience{members: a.audience})
 }
 
 func TestHubBatchesAuthorizationAndVariantFanout(t *testing.T) {

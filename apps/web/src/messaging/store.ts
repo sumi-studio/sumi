@@ -40,6 +40,7 @@ import {
   isNotificationSoundEnabled,
   isTabActive,
   notificationBody,
+  notificationCountForPlace,
   notificationPermission,
   notificationTitle,
   setNotificationSoundEnabled as persistNotificationSound,
@@ -84,6 +85,9 @@ function unboundMessagingBackend(): MessagingBackend {
   const target = {
     capabilities: UNBOUND_CAPABILITIES,
     dispose() {},
+    // 開いている画面の宣言はvolatileなbest-effort。scopeが束ねられていない
+    // 間は伝える相手が居ないだけで、失敗ではない。
+    openPlace() {},
   } as Partial<MessagingBackend>;
   return new Proxy(target as MessagingBackend, {
     get(value, property, receiver) {
@@ -379,6 +383,41 @@ export function notificationLevelFor(
   return state.notificationLevelByPlace[key] ?? state.notificationDefaultLevel;
 }
 
+/** 自分が参加しているthreadか。参加はplace_membersの投影が正本。 */
+export function participatesInThread(
+  state: Pick<MessagingState, "threadsById" | "selfKey">,
+  threadId: string,
+): boolean {
+  const thread = state.threadsById[threadId];
+  if (!thread) return false;
+  return thread.participants.some(
+    (ref) => participantKey(ref) === state.selfKey,
+  );
+}
+
+/**
+ * タブタイトルが出す件数。数えるのは自分の台帳にある場所——channel・DM・
+ * 参加しているthread——だけにする。開いただけのthreadはsidebarにもbootstrapの
+ * threadsにも出ないので、その未読を足すとどのバッジにも無い数字がタイトルに
+ * 出てしまう。
+ */
+export function notifiableUnreadCount(state: MessagingState): number {
+  let unread = 0;
+  for (const [key, count] of Object.entries(state.unreadCountByPlace)) {
+    const place = parsePlaceKey(key);
+    if (!place) continue;
+    if (place.kind === "thread" && !participatesInThread(state, place.threadId))
+      continue;
+    unread += notificationCountForPlace(
+      key,
+      notificationLevelFor(state, key),
+      count,
+      state.mentionCountByPlace[key] ?? 0,
+    );
+  }
+  return unread;
+}
+
 /**
  * 通知の見出しに使う場所の名前。DMは相手の名前が発言者の名前と同じなので
  * 場所を名乗らせない（「Haru — Haru」は情報が無い）。
@@ -538,6 +577,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
       })();
     });
   };
+  /**
+   * A thread's parent-list entry changes for more reasons than a live event:
+   * an ACK-confirmed send whose echo was lost, a tombstone, a mention that
+   * admitted a participant. Every one of them goes through this single refresh
+   * so no route can quietly leave the list describing an older thread.
+   */
+  const noteThreadProjectionChange = (place: Place) => {
+    if (place.kind === "thread") scheduleThreadSummaryRefresh(place.threadId);
+  };
+
   const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
     const key = placeKey(event.place);
     // reactionだけを差し替える。message全体を置き換えると、同時に届いた
@@ -992,24 +1041,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
-      if (event.type === "message_created") {
-        if (event.message.deleted) {
-          if (event.message.place.kind === "thread") {
-            scheduleThreadSummaryRefresh(event.message.place.threadId);
-          }
-        } else {
-          if (event.message.place.kind === "thread") {
-            // Do not calculate a summary from event payloads. The durable
-            // aggregate includes admissions made by mentions and stays right
-            // even when commits reach the Hub out of sequence.
-            scheduleThreadSummaryRefresh(event.message.place.threadId);
-          }
-          presentNotification(event);
-        }
-      } else {
-        if (event.message.place.kind === "thread") {
-          scheduleThreadSummaryRefresh(event.message.place.threadId);
-        }
+      // Do not calculate a summary from event payloads. The durable aggregate
+      // includes admissions made by mentions and stays right even when commits
+      // reach the Hub out of sequence.
+      noteThreadProjectionChange(event.message.place);
+      if (event.type === "message_created" && !event.message.deleted) {
+        presentNotification(event);
       }
       return;
     }
@@ -1049,9 +1086,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
-      if (event.message.place.kind === "thread") {
-        scheduleThreadSummaryRefresh(event.message.place.threadId);
-      }
+      noteThreadProjectionChange(event.message.place);
       return;
     }
     if (event.type === "typing") {
@@ -1089,7 +1124,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const knownThread = thread
         ? Boolean(get().threadsById[thread.threadId])
         : false;
-      if (thread && !knownThread) {
+      // A new thread is news for the whole parent channel, but only its
+      // participants and the panel that is currently listing that channel
+      // have a place to put it. Holding every announced thread would grow
+      // this map with other people's conversations for the whole session.
+      const wantedThread =
+        thread !== undefined &&
+        (thread.participants.some(
+          (ref) => participantKey(ref) === get().selfKey,
+        ) ||
+          Boolean(get().threadsLoadedForPlace[placeKey(thread.parentPlace)]));
+      if (thread && !knownThread && wantedThread) {
         applyThreadSummary(
           thread.threadId,
           thread,
@@ -1305,6 +1350,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 ),
               },
             }));
+            // The receipt is what confirmed this message, so the parent list
+            // has to be refreshed from here too: the live echo that normally
+            // does it is exactly what went missing.
+            noteThreadProjectionChange(place);
             confirmed = true;
           }
         }
@@ -1615,6 +1664,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           [key]: state.lastReadByPlace[key] ?? 0,
         },
       }));
+      // Tell the server which screen is open. A thread the viewer never joined
+      // is delivered live only while it is the open one.
+      backend.openPlace?.(place);
       void loadPlace(place);
     },
 
@@ -1632,6 +1684,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         editingMessageId: null,
         replyTargetId: null,
       });
+      backend.openPlace?.(null);
     },
 
     async createChannel(workspaceId, name, topic, voice) {
@@ -1715,18 +1768,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return;
       }
-      const raced = threads.some(
-        (thread) =>
-          !applyThreadSummary(
-            thread.threadId,
-            thread,
-            versions.get(thread.threadId) ?? 0,
-          ),
-      );
+      // Every thread in the list is applied. A short-circuiting `some` used to
+      // stop at the first one a live invalidation had overtaken, so a single
+      // raced entry kept the rest of the channel's threads out of the store.
+      for (const thread of threads) {
+        applyThreadSummary(
+          thread.threadId,
+          thread,
+          versions.get(thread.threadId) ?? 0,
+        );
+      }
+      // A rejected apply means a newer authoritative projection is already
+      // installed or in flight for that thread, so the list itself is loaded.
+      // Its own failure path is what marks the parent for a re-fetch.
       set((state) => ({
         threadsLoadedForPlace: {
           ...state.threadsLoadedForPlace,
-          [parentKey]: !raced,
+          [parentKey]: true,
         },
       }));
     },

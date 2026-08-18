@@ -611,6 +611,11 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 	if err != nil {
 		return nil, err
 	}
+	// A thread is summarized like a DM, not like a channel: a Workspace member
+	// may open one they never joined, but an unjoined thread is not part of
+	// their ledger. Projecting every thread here would put unread counts on
+	// places that appear in no list, and would make the reconnect handshake
+	// carry one cursor per Workspace thread.
 	rows, err := tx.Query(ctx, `
 		WITH visible_places AS (
 			SELECT p.*, pm.place_member_id, COALESCE(pm.visible_from_seq, 1) AS visible_from_seq
@@ -619,7 +624,8 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 			  ON pm.workspace_id = p.workspace_id AND pm.place_id = p.place_id
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			  AND (p.kind IN ('channel', 'thread') OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
+			  AND (p.kind = 'channel'
+			       OR (p.kind IN ('thread', 'dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.name, vp.topic,
 		       vp.visibility, vp.last_seq, vp.voice, COALESCE(rm.last_read_seq, 0),

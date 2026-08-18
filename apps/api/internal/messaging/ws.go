@@ -27,8 +27,10 @@ const maxHelloCursors = 1024
 // every place the participant can see (契約ドラフト: WS 1本で全Workspace/place
 // をmultiplex)。Authentication is identical to the REST surface. Frames:
 //
-//	client → server: hello{cursors}, send{...}, typing{place_id}
-//	server → client: hello_ack, event{...}, caught_up{place_id, latest_seq},
+//	client → server: hello{cursors}, send{...}, typing{place_id},
+//	                 open{place_id}, close{place_id}
+//	server → client: hello_ack, open_ack{place_id}, event{...},
+//	                 caught_up{place_id, latest_seq},
 //	                 receipt{client_nonce, message_id, seq, created},
 //	                 error{code, client_nonce?}
 //
@@ -265,6 +267,10 @@ func (s *WSServer) readPump(ctx context.Context, conn *websocket.Conn, sub *subs
 			s.handleSend(ctx, sub, claims, frame)
 		case "typing":
 			s.handleTyping(ctx, sub, claims, frame)
+		case "open":
+			s.handleOpen(ctx, sub, frame)
+		case "close":
+			sub.closePlace(frame.PlaceID)
 		default:
 			s.enqueueError(sub, "unknown_frame", "")
 			return
@@ -326,6 +332,28 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 	if created {
 		publishMessageCreated(ctx, sub.store, s.Hub, place, msg)
 	}
+}
+
+// handleOpen records which place this connection is looking at. A place the
+// viewer holds (a channel, a DM, a thread they joined) is delivered from its
+// own audience whether or not it is open; this declaration only lets someone
+// reading a thread they never joined see it arrive while it is on screen.
+// Visibility is checked so the frame cannot probe places, and every delivery
+// remains fenced by the event's own audience snapshot and authorizeWrite.
+func (s *WSServer) handleOpen(ctx context.Context, sub *subscriber, frame wsClientFrame) {
+	if sub == nil || sub.store == nil || frame.PlaceID == "" {
+		s.enqueueError(sub, "not_found", "")
+		return
+	}
+	if _, err := sub.store.PlaceFor(ctx, frame.PlaceID); err != nil {
+		s.enqueueError(sub, storeErrorCode(err), "")
+		return
+	}
+	sub.openPlace(frame.PlaceID)
+	s.enqueueJSONAt(sub, liveBoundary{placeID: frame.PlaceID}, struct {
+		Type    string `json:"type"`
+		PlaceID string `json:"place_id"`
+	}{Type: "open_ack", PlaceID: frame.PlaceID})
 }
 
 func (s *WSServer) handleTyping(

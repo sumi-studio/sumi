@@ -214,7 +214,11 @@
   `parent_message_id`, `client_nonce`）は作成である。同じ作成nonceの再送は最初の
   threadを返す。1 message から作れるthreadは1つだけ。
   bootstrapは閲覧者が参加しているthreadだけを返し、個別open responseは
-  `thread` summaryに親channelを含める。Threadのmessageは既存の送信・添付・検索・
+  `thread` summaryに親channelを含める。未読summaryとlive配信も同じ線で切る:
+  ambientに載るのは参加しているthreadだけで、開けるだけのthreadは読んでも
+  参加者にならない。参加していないthreadをURLで開いた閲覧者には、WSの
+  `open{place_id}` / `close{place_id}`（ackは `open_ack{place_id}`）で宣言した
+  「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可ではない。Threadのmessageは既存の送信・添付・検索・
   tombstone・read markerをそのまま使う。通知候補は参加者と新しいmention先だけで、
   mentionされた人は同じtransactionで参加者になる。
 - 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして

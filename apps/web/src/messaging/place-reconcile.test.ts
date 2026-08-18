@@ -7,6 +7,8 @@ import type {
   MessagingBackend,
   Place,
   PlaceKey,
+  SendMessageInput,
+  SendReceipt,
   ServerEvent,
   ThreadSummary,
 } from "./model";
@@ -142,9 +144,12 @@ class FakeBackend implements MessagingBackend {
     return this.next;
   }
 
-  async fetchMessages() {
-    return [];
-  }
+  fetchMessages = vi.fn(
+    async (
+      _place: Place,
+      _options?: { beforeSeq?: number; limit?: number },
+    ): Promise<Message[]> => [],
+  );
   async searchMessages() {
     return [];
   }
@@ -183,14 +188,14 @@ class FakeBackend implements MessagingBackend {
   attachmentURL(attachmentId: string): string {
     return `/test/attachments/${attachmentId}`;
   }
-  async sendMessage() {
-    return {
-      clientNonce: "unused",
+  sendMessage = vi.fn(
+    async (input: SendMessageInput): Promise<SendReceipt> => ({
+      clientNonce: input.clientNonce,
       messageId: "unused",
       seq: 1,
       created: true,
-    };
-  }
+    }),
+  );
   async editMessage() {}
   async deleteMessage() {}
   async markRead() {}
@@ -580,6 +585,88 @@ describe("place lifecycleの再接続突き合わせ", () => {
 
     expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
     expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+  });
+
+  it("一覧の1件がfenceで弾かれても残りのthreadを取り込む", async () => {
+    const raced = thread("thread-raced");
+    const other = thread("thread-other");
+    const fresh = {
+      ...raced,
+      messageCount: 2,
+      latestSeq: 5,
+      lastMessageAt: 5,
+      lastMessage: "一覧の取得中に届いた返信です",
+    };
+    useMessaging.setState({ threadsById: { [raced.threadId]: raced } });
+    let resolveList!: (threads: ThreadSummary[]) => void;
+    backend.fetchThreads.mockImplementationOnce(
+      () =>
+        new Promise<ThreadSummary[]>((resolve) => {
+          resolveList = resolve;
+        }),
+    );
+    const loading = useMessaging.getState().loadThreads(CHANNEL_1);
+    await settle();
+
+    // 一覧のsnapshotを撮ったあとに、その1件だけ新しい権威ある投影が始まる。
+    backend.fetchThread.mockResolvedValue(fresh);
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(raced.threadId, 5),
+      notify: null,
+    });
+    resolveList([raced, other]);
+    await loading;
+    await settle();
+
+    // 追い越された1件はGET結果が勝つ。残りはその巻き添えにしない。
+    expect(useMessaging.getState().threadsById[raced.threadId]).toEqual(fresh);
+    expect(useMessaging.getState().threadsById[other.threadId]).toEqual(other);
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+  });
+
+  it("live echoを取り逃してACKだけで確定した送信でもsummaryを取り直す", async () => {
+    const known = thread("thread-ack-only");
+    const refreshed = {
+      ...known,
+      messageCount: 2,
+      latestSeq: 2,
+      lastMessageAt: 2,
+      lastMessage: "送りました",
+    };
+    const committed: Message = {
+      ...threadMessage(known.threadId, 2),
+      messageId: "message-ack-only",
+      author: SELF,
+      content: "送りました",
+      mentions: [],
+    };
+    useMessaging.setState({
+      threadsById: { [known.threadId]: known },
+      threadsLoadedForPlace: { [CHANNEL_1]: true },
+    });
+    backend.sendMessage.mockResolvedValueOnce({
+      clientNonce: "unused",
+      messageId: committed.messageId,
+      seq: committed.seq,
+      created: true,
+    });
+    // echoが落ちた送信は、ACKのseqで取り直したときにだけ履歴へ現れる。
+    backend.fetchMessages.mockImplementation(async (_place, options) =>
+      options?.beforeSeq === committed.seq + 1 ? [committed] : [],
+    );
+    backend.fetchThread.mockResolvedValue(refreshed);
+
+    useMessaging.getState().selectPlace(`thread:${known.threadId}` as PlaceKey);
+    useMessaging.getState().send("送りました", "normal");
+    await settle();
+    await settle();
+
+    // 自分の発言でthreadは進んでいる。親一覧に古い件数を残さない。
+    expect(backend.fetchThread).toHaveBeenCalledWith(known.threadId);
+    expect(useMessaging.getState().threadsById[known.threadId]).toEqual(
+      refreshed,
+    );
   });
 
   it("bootstrapが先に取り込んだthread messageをcatch-upで再加算しない", async () => {

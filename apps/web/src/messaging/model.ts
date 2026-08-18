@@ -438,6 +438,12 @@ export interface MessagingBackend {
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**
+   * いま画面に開いているplaceをserverへ宣言する。参加していないthreadをURLで
+   * 開いた閲覧者は、開いている間だけそのplaceのlive eventを受け取る。参加して
+   * いるplaceの配送はこの宣言に依存しない（開いていなくても届く）。
+   */
+  openPlace?(place: Place | null): void;
+  /**
    * durable eventの購読。再接続時はplaceごとの消費済みseqをcursorとして渡し、
    * その次からcatch-upする（volatile eventはreplayしない）。
    */
