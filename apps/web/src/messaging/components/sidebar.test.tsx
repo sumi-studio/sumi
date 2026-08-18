@@ -350,7 +350,7 @@ describe("Sidebar overlay and IME behavior", () => {
         workspaceId="workspace-a"
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Alice 対応可能/ }));
     expect(screen.getByRole("radio", { name: "取り込み中" })).toBeVisible();
 
     fireEvent.pointerDown(screen.getByRole("navigation"));

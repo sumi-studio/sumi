@@ -18,6 +18,7 @@ import {
 } from "../store";
 import { MemberList } from "./member-list";
 import { ParticipantProfilePopover } from "./participant-profile";
+import { Sidebar } from "./sidebar";
 
 const navigation = vi.hoisted(() => ({ navigate: vi.fn() }));
 
@@ -250,6 +251,100 @@ describe("MemberList のプロフィール導線", () => {
 
   it("プロフィールとDMを別のbuttonに分け、入れ子にしない", () => {
     const { container } = render(<MemberList />);
+
+    expect(container.querySelectorAll("button button")).toHaveLength(0);
+  });
+});
+
+describe("Sidebar のプロフィール導線", () => {
+  beforeEach(() => {
+    useMessaging.setState({
+      capabilities: {
+        status: true,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+      },
+      workspaces: [{ workspaceId: "workspace-a", name: "Sumi" }],
+      channels: [],
+      dms: [{ dmId: "dm-a", kind: "dm", participants: [human, agent] }],
+      unreadCountByPlace: {},
+      mentionCountByPlace: {},
+    });
+  });
+
+  function renderSidebar() {
+    return render(
+      <Sidebar selectedPlaceKey={null} workspaceId="workspace-a" />,
+    );
+  }
+
+  it("DM相手のアバターから同じプロフィールカードが開く", async () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
+
+    expect(await screen.findByText("秘書")).toBeInTheDocument();
+    expect(screen.getByText("取り込み中")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "DMを送る" }),
+    ).toBeInTheDocument();
+    expect(navigation.navigate).not.toHaveBeenCalled();
+  });
+
+  it("DM行の名前はこれまで通りplace遷移のまま", () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "墨" }));
+
+    expect(navigation.navigate).toHaveBeenCalledWith("dm:dm-a");
+    expect(screen.queryByText("秘書")).not.toBeInTheDocument();
+  });
+
+  it("グループDMのアバターから先頭参加者のプロフィールを開かない", () => {
+    useMessaging.setState({
+      dms: [
+        {
+          dmId: "group-a",
+          kind: "group_dm",
+          participants: [human, agent, secondAgent],
+        },
+      ],
+    });
+    renderSidebar();
+
+    expect(
+      screen.queryByRole("button", { name: "墨のプロフィール" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "墨、筆" })).toBeInTheDocument();
+    expect(screen.queryByText("秘書")).not.toBeInTheDocument();
+  });
+
+  it("自分のプロフィール行のアバターから同じカードが開く", async () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "余白のプロフィール" }));
+
+    expect(await screen.findByText("創業・デザイン")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "離席中" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("自分の行の名前とステータスはこれまで通りステータス変更のまま", () => {
+    const setStatus = vi.fn();
+    useMessaging.setState({ setStatus });
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "余白 対応可能" }));
+    fireEvent.click(screen.getByRole("radio", { name: /取り込み中/ }));
+
+    expect(setStatus).toHaveBeenCalledWith("busy", "取り込み中");
+    expect(screen.queryByText("創業・デザイン")).not.toBeInTheDocument();
+  });
+
+  it("プロフィールと元の操作を別のbuttonに分け、入れ子にしない", () => {
+    const { container } = renderSidebar();
 
     expect(container.querySelectorAll("button button")).toHaveLength(0);
   });

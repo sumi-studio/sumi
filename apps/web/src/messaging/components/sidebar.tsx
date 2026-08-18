@@ -20,18 +20,17 @@ import {
   useMessaging,
 } from "../store";
 import { useOverlayPanel } from "./overlay";
-import { ParticipantAvatar } from "./participant-avatar";
+import {
+  ParticipantAvatar,
+  STATUS_DOT,
+  STATUS_LABEL,
+} from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 
 const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
-
-const STATUS_LABEL: Record<StatusKind, string> = {
-  available: "対応可能",
-  busy: "取り込み中",
-  away: "離席中",
-};
 
 export const NOTIFICATION_LEVEL_LABEL: Record<NotificationLevel, string> = {
   all: "すべて通知",
@@ -175,6 +174,7 @@ function PlaceRow({
   selectedPlaceKey,
   label,
   icon,
+  leading,
   unread,
   mentions,
 }: {
@@ -182,6 +182,11 @@ function PlaceRow({
   selectedPlaceKey: PlaceKey | null;
   label: React.ReactNode;
   icon: React.ReactNode;
+  /**
+   * 行頭に置く、place遷移とは別の役割を持つ導線。渡すとiconの代わりに
+   * 遷移buttonの外へ出る（buttonの入れ子は作らない）。
+   */
+  leading?: React.ReactNode;
   unread: number;
   mentions: number;
 }) {
@@ -203,6 +208,7 @@ function PlaceRow({
             : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
       }`}
     >
+      {leading}
       <button
         type="button"
         aria-current={active ? "page" : undefined}
@@ -214,7 +220,7 @@ function PlaceRow({
         }}
         className="flex min-w-0 flex-1 items-center gap-2 text-left"
       >
-        {icon}
+        {leading ? null : icon}
         <span className="min-w-0 flex-1 truncate">{label}</span>
       </button>
       {muted ? (
@@ -711,19 +717,36 @@ export function Sidebar({
             )
             .join("、");
           const unread = unreadCountByPlace[key] ?? 0;
+          const firstName = membersByKey[firstKey]?.displayName ?? "?";
+          const avatar = (
+            <ParticipantAvatar
+              participantKey={firstKey}
+              name={firstName}
+              size={18}
+              status={statusByKey[firstKey]?.status}
+            />
+          );
           return (
             <PlaceRow
               key={key}
               placeKey={key}
               selectedPlaceKey={selectedPlaceKey}
               label={name}
-              icon={
-                <ParticipantAvatar
-                  participantKey={firstKey}
-                  name={membersByKey[firstKey]?.displayName ?? "?"}
-                  size={18}
-                  status={statusByKey[firstKey]?.status}
-                />
+              icon={avatar}
+              // 1対1のDMだけ、アバターがその相手のプロフィールを開く。
+              // グループDMのアバターは先頭の1人でしかないので開き口にしない。
+              leading={
+                others.length === 1 ? (
+                  <ParticipantProfilePopover
+                    participantKey={firstKey}
+                    label={`${firstName}のプロフィール`}
+                    side="right"
+                    align="start"
+                    className="flex shrink-0 rounded-full"
+                  >
+                    {avatar}
+                  </ParticipantProfilePopover>
+                ) : undefined
               }
               unread={unread}
               mentions={unread}
@@ -756,15 +779,7 @@ export function Sidebar({
                   }}
                   className="sr-only"
                 />
-                <span
-                  className={`size-2 rounded-full ${
-                    kind === "available"
-                      ? "bg-emerald-500"
-                      : kind === "busy"
-                        ? "bg-rose-500"
-                        : "bg-amber-400"
-                  }`}
-                />
+                <span className={`size-2 rounded-full ${STATUS_DOT[kind]}`} />
                 {STATUS_LABEL[kind]}
                 <Check
                   aria-hidden
@@ -779,23 +794,39 @@ export function Sidebar({
             </p>
           </div>
         ) : null}
-        <button
-          type="button"
-          disabled={!canSetStatus}
-          aria-haspopup="dialog"
-          {...statusOverlay.triggerProps}
-          onClick={() => {
-            if (canSetStatus) statusOverlay.toggle();
-          }}
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
+        {/*
+          アバターは自分のプロフィールカード、名前とステータスは従来どおり
+          ステータス変更。役割の違う2つのbuttonを横に並べる。
+        */}
+        <div
+          className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+            canSetStatus ? "hover:bg-accent/60" : ""
+          }`}
         >
-          <ParticipantAvatar
+          <ParticipantProfilePopover
             participantKey={selfKey}
-            name={selfProfile?.displayName ?? "?"}
-            size={26}
-            status={selfStatus?.status ?? "available"}
-          />
-          <span className="min-w-0 flex-1">
+            label={`${selfProfile?.displayName ?? "自分"}のプロフィール`}
+            side="top"
+            align="start"
+            className="flex shrink-0 rounded-full"
+          >
+            <ParticipantAvatar
+              participantKey={selfKey}
+              name={selfProfile?.displayName ?? "?"}
+              size={26}
+              status={selfStatus?.status ?? "available"}
+            />
+          </ParticipantProfilePopover>
+          <button
+            type="button"
+            disabled={!canSetStatus}
+            aria-haspopup="dialog"
+            {...statusOverlay.triggerProps}
+            onClick={() => {
+              if (canSetStatus) statusOverlay.toggle();
+            }}
+            className="min-w-0 flex-1 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-default"
+          >
             <span className="block truncate font-medium text-[13px]">
               {selfProfile?.displayName ?? "…"}
             </span>
@@ -803,8 +834,8 @@ export function Sidebar({
               {selfStatus ? STATUS_LABEL[selfStatus.status] : "対応可能"}
               {selfStatus?.note ? ` — ${selfStatus.note}` : ""}
             </span>
-          </span>
-        </button>
+          </button>
+        </div>
       </div>
       {openDialog?.kind === "channel" &&
       openDialog.workspaceId === selectedWorkspaceId ? (
