@@ -251,6 +251,7 @@ func (s *WSServer) catchUp(ctx context.Context, sub *subscriber, cursors map[str
 // replayPlace sends one place's durable messages after since and closes it
 // with caught_up{latest_seq}.
 func (s *WSServer) replayPlace(ctx context.Context, sub *subscriber, place Place, since int64) bool {
+	since = sub.replaySince(place.PlaceID, since)
 	messages, err := sub.store.MessagesSince(ctx, place.PlaceID, since, catchUpLimit)
 	if err != nil {
 		return false
@@ -265,6 +266,10 @@ func (s *WSServer) replayPlace(ctx context.Context, sub *subscriber, place Place
 		}{Type: "event", Event: event}) {
 			return false
 		}
+		sub.markReplayed(place.PlaceID, m.Seq)
+	}
+	if !sub.markCaughtUp(place.PlaceID, place.LastSeq) {
+		return true
 	}
 	return s.enqueueJSONAt(sub, liveBoundary{placeID: place.PlaceID}, struct {
 		Type      string `json:"type"`
@@ -314,7 +319,7 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 		s.enqueueError(sub, "invalid_content", frame.ClientNonce)
 		return
 	}
-	if frame.ClientNonce == "" || len(frame.ClientNonce) > 128 {
+	if !clientNonceValid(frame.ClientNonce) {
 		s.enqueueError(sub, "invalid_client_nonce", frame.ClientNonce)
 		return
 	}

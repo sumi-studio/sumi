@@ -133,7 +133,7 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.ParentPlaceID == "" || !threadNameValid(request.Name) || request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+	if request.ParentPlaceID == "" || !threadNameValid(request.Name) || !clientNonceValid(request.ClientNonce) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -412,7 +412,7 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.PlaceID == "" || request.MessageID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || validateReactionEmoji(request.Emoji) != nil {
+	if request.PlaceID == "" || request.MessageID == "" || !clientNonceValid(request.ClientNonce) || validateReactionEmoji(request.Emoji) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}

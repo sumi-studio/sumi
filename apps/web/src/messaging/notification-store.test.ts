@@ -462,6 +462,20 @@ describe("presenting an incoming message", () => {
     );
   });
 
+  it("presents a repeated message_created frame only once", () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const event = {
+      type: "message_created" as const,
+      message: incoming(),
+      notify: { reason: "keyword" as const },
+    };
+
+    backend.emit(event);
+    backend.emit(event);
+
+    expect(FakeNotification.constructed).toHaveLength(1);
+  });
+
   it("names the thread in a called thread notification", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const thread: ThreadSummary = {

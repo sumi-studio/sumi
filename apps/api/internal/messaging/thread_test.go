@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T) {
@@ -88,6 +89,29 @@ func TestThreadRejectsDeletedOriginMessage(t *testing.T) {
 	}
 	if _, _, err := owner.CreateThread(ctx, channel.PlaceID, "削除済み起点", origin.MessageID, "deleted-origin-1"); !errors.Is(err, ErrMessageNotFound) {
 		t.Fatalf("create from deleted origin: got %v, want ErrMessageNotFound", err)
+	}
+}
+
+func TestCreateThreadRejectsNULClientNonceAtBothIngresses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+
+	resp, body := call(t, ts, http.MethodPost,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
+		map[string]any{"name": "NUL nonce", "client_nonce": "bad\x00nonce"})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_client_nonce" {
+		t.Fatalf("browser NUL nonce = %d %v, want 400 invalid_client_nonce", resp.StatusCode, body)
+	}
+
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	status, localBody := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, map[string]any{
+		"workspace_id": workspace.WorkspaceID, "parent_place_id": channel.PlaceID,
+		"name": "NUL nonce", "client_nonce": "bad\x00nonce",
+	}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
+	if status != http.StatusBadRequest || localBody["error"] != "invalid_request" {
+		t.Fatalf("local NUL nonce = %d %v, want 400 invalid_request", status, localBody)
 	}
 }
 
@@ -588,6 +612,65 @@ func TestThreadCatchUpFollowsParticipationNotTheClientsCursor(t *testing.T) {
 	viewerStore := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
 	if threads, err := viewerStore.ThreadsFor(ctx); err != nil || len(threads) != 0 {
 		t.Fatalf("catch-up admitted a participant: threads=%+v err=%v", threads, err)
+	}
+}
+
+// A reconnecting browser sends hello with every held cursor and immediately
+// re-declares its selected place. Those are two transport declarations for one
+// connection, not two requests to replay the same durable range (and not two
+// chances to present the same notification).
+func TestHelloAndOpenShareOnePlaceReplayHighWater(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "再接続の枝", "", "thread-replay-high-water")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	for i, content := range []string{"切断中の一通目", "切断中の二通目"} {
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": fmt.Sprintf("thread-replay-high-water-%d", i)})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+
+	conn := dialWS(t, ts, w.humanA.ID, map[string]int64{thread.Place.PlaceID: 0})
+	messageCount := 0
+	caughtUpCount := 0
+	for range 3 {
+		frame := readFrame(t, conn)
+		switch frame["type"] {
+		case "event":
+			event, _ := frame["event"].(map[string]any)
+			if event["type"] != EventMessageCreated || event["place_id"] != thread.Place.PlaceID {
+				t.Fatalf("unexpected replay event: %v", frame)
+			}
+			messageCount++
+		case "caught_up":
+			if frame["place_id"] != thread.Place.PlaceID {
+				t.Fatalf("unexpected caught_up: %v", frame)
+			}
+			caughtUpCount++
+		default:
+			t.Fatalf("unexpected hello replay frame: %v", frame)
+		}
+	}
+	if messageCount != 2 || caughtUpCount != 1 {
+		t.Fatalf("hello replay messages=%d caught_up=%d, want 2 and 1", messageCount, caughtUpCount)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "open", "place_id": thread.Place.PlaceID, "since": 0,
+	}); err != nil {
+		t.Fatalf("open after hello: %v", err)
+	}
+	// replay and caught_up are ordered before open_ack. Seeing the acknowledgement
+	// next proves neither is queued a second time for the same place/head.
+	if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != thread.Place.PlaceID {
+		t.Fatalf("hello+open replayed a duplicate frame before acknowledgement: %v", frame)
 	}
 }
 

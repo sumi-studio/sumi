@@ -38,7 +38,7 @@ func (s *Server) toggleScopedReaction(ctx context.Context, store *ScopedStore, p
 }
 
 func (s *ScopedStore) ToggleReactionIdempotent(ctx context.Context, placeID, messageID, emoji, clientNonce string) (Message, bool, error) {
-	if clientNonce == "" || len(clientNonce) > 128 {
+	if !clientNonceValid(clientNonce) {
 		return Message{}, false, fmt.Errorf("client nonce must be 1..128 bytes")
 	}
 	if err := validateReactionEmoji(emoji); err != nil {

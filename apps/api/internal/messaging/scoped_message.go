@@ -33,7 +33,7 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
 		return Message{}, false, ErrTooManyAttachments
 	}
-	if in.ClientNonce == "" || len(in.ClientNonce) > 128 {
+	if !clientNonceValid(in.ClientNonce) {
 		return Message{}, false, errors.New("client nonce must be 1..128 bytes")
 	}
 	message, created, err := s.appendScopedOnce(ctx, in)

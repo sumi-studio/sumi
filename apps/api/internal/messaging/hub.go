@@ -104,6 +104,14 @@ type subscriber struct {
 	// thread the viewer merely visited ambient again — and are flushed only if
 	// this connection declares that place open.
 	deferred map[string]int64
+	// replayed is the one durable replay high-water mark for each place on this
+	// connection. Both hello and open pass through it: an open immediately
+	// following a hello must never replay the same durable frame again.
+	replayed map[string]int64
+	// caughtUp remembers the latest caught_up boundary already announced for a
+	// place. It is intentionally distinct from replayed: catchUpLimit can make
+	// the announced head lie beyond the frames put on this socket.
+	caughtUp map[string]int64
 }
 
 // markVisible records a known visibility verdict.
@@ -163,6 +171,44 @@ func (s *subscriber) takeDeferredCursor(placeID string) (int64, bool) {
 		delete(s.deferred, placeID)
 	}
 	return since, ok
+}
+
+// replaySince returns the shared high-water mark for a replay request. A
+// client can advance it with a newer cursor obtained from REST, but neither
+// hello nor open can move it backwards and replay frames already sent here.
+func (s *subscriber) replaySince(placeID string, since int64) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if replayed := s.replayed[placeID]; replayed > since {
+		return replayed
+	}
+	if since > s.replayed[placeID] {
+		s.replayed[placeID] = since
+	}
+	return since
+}
+
+// markReplayed advances one connection's place high-water only after that
+// message has been accepted for delivery by the subscriber queue.
+func (s *subscriber) markReplayed(placeID string, seq int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq > s.replayed[placeID] {
+		s.replayed[placeID] = seq
+	}
+}
+
+// markCaughtUp returns whether this exact/newer durable head still needs its
+// caught_up frame. A same-head open after hello is an acknowledgement only,
+// never a second client-side resync trigger.
+func (s *subscriber) markCaughtUp(placeID string, latestSeq int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if latestSeq <= s.caughtUp[placeID] {
+		return false
+	}
+	s.caughtUp[placeID] = latestSeq
+	return true
 }
 
 func (s *subscriber) watching(placeID string) bool {
@@ -226,9 +272,11 @@ func (h *Hub) subscribe(scope any) *subscriber {
 		store:  store,
 		// Enough headroom for a busy place; overflow means the reader is not
 		// keeping up and replay-on-reconnect is the correct recovery.
-		send:    make(chan outboundFrame, 256),
-		done:    make(chan struct{}),
-		visible: map[string]bool{},
+		send:     make(chan outboundFrame, 256),
+		done:     make(chan struct{}),
+		visible:  map[string]bool{},
+		replayed: map[string]int64{},
+		caughtUp: map[string]int64{},
 	}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}

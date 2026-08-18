@@ -101,6 +101,11 @@ function unboundMessagingBackend(): MessagingBackend {
 
 let backend: MessagingBackend = unboundMessagingBackend();
 
+// The server emits each durable event once, but retaining this connection-local
+// guard keeps presentation side effects idempotent if a transport ever repeats
+// a frame. Timeline reconciliation already deduplicates the message itself.
+const presentedMessageNotifications = new Set<string>();
+
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
  * Fileと AbortController はここで持つ。resetで必ず全部止めて捨てる。
@@ -1077,7 +1082,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       // includes admissions made by mentions and stays right even when commits
       // reach the Hub out of sequence.
       noteThreadProjectionChange(event.message.place);
-      if (event.type === "message_created" && !event.message.deleted) {
+      if (
+        event.type === "message_created" &&
+        !event.message.deleted &&
+        !presentedMessageNotifications.has(event.message.messageId)
+      ) {
+        presentedMessageNotifications.add(event.message.messageId);
         presentNotification(event);
       }
       return;
@@ -2476,6 +2486,7 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
 function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
   reactionProjectionByPlace.clear();
+  presentedMessageNotifications.clear();
   releaseAllDraftFiles();
   backend.dispose();
   useCall.getState().reset();

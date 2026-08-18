@@ -14,6 +14,15 @@ import (
 
 const MaxThreadNameChars = 100
 const ThreadPreviewChars = 120
+const MaxClientNonceBytes = 128
+
+// clientNonceValid is the one ingress/storage rule for idempotency keys. A
+// PostgreSQL text value cannot contain NUL, so reject it before any mutation
+// path can turn malformed client input into a driver error.
+func clientNonceValid(nonce string) bool {
+	return nonce != "" && len(nonce) <= MaxClientNonceBytes &&
+		utf8.ValidString(nonce) && !strings.ContainsRune(nonce, '\x00')
+}
 
 func threadNameValid(name string) bool {
 	name = strings.TrimSpace(name)
@@ -42,7 +51,7 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 	if !threadNameValid(name) {
 		return Thread{}, false, fmt.Errorf("thread name must be 1..%d characters", MaxThreadNameChars)
 	}
-	if clientNonce == "" || len(clientNonce) > 128 {
+	if !clientNonceValid(clientNonce) {
 		return Thread{}, false, errors.New("client nonce must be 1..128 bytes")
 	}
 	tx, err := s.pool.Begin(ctx)

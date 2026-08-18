@@ -940,7 +940,7 @@ func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
-	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+	if !clientNonceValid(req.ClientNonce) {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
@@ -1170,7 +1170,7 @@ func validateSendRequest(content, urgency, clientNonce string, attachments []str
 			return "invalid_attachment"
 		}
 	}
-	if clientNonce == "" || len(clientNonce) > 128 {
+	if !clientNonceValid(clientNonce) {
 		return "invalid_client_nonce"
 	}
 	return ""
@@ -1267,7 +1267,7 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_emoji")
 		return
 	}
-	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+	if !clientNonceValid(req.ClientNonce) {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
