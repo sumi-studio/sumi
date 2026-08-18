@@ -279,6 +279,16 @@ function unreadContribution(
 let initialized = false;
 let messagingSessionGeneration = 0;
 
+function isCurrentMessagingSession(
+  expectedBackend: MessagingBackend,
+  expectedGeneration: number,
+): boolean {
+  return (
+    backend === expectedBackend &&
+    messagingSessionGeneration === expectedGeneration
+  );
+}
+
 type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
 
 interface ReactionProjectionOperation {
@@ -401,7 +411,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
   const threadProjectionVersions = new Map<string, number>();
-  const appliedThreadDeletions = new Set<string>();
   const threadHydrations = new Map<
     string,
     {
@@ -496,24 +505,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
   const applyThreadDeletionSummary = (message: Message) => {
     if (message.place.kind !== "thread") return;
-    const threadId = message.place.threadId;
-    const deletionKey = `${threadId}:${message.messageId}`;
-    if (!appliedThreadDeletions.has(deletionKey)) {
-      appliedThreadDeletions.add(deletionKey);
-      set((state) => {
-        const thread = state.threadsById[threadId];
-        if (!thread) return {};
-        return {
-          threadsById: {
-            ...state.threadsById,
-            [threadId]: {
-              ...thread,
-              messageCount: Math.max(0, thread.messageCount - 1),
-            },
-          },
-        };
-      });
-    }
+    // A reconnect bootstrap can already contain the post-deletion summary
+    // before its catch-up tombstone arrives. Do not decrement locally: the
+    // authoritative parent summary below is the only count projection.
     const version = advanceThreadProjection(message);
     if (version !== null) void refreshThreadSummary(message, version);
   };
@@ -1119,6 +1113,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
    */
   const reconcilePlaces = async () => {
     const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = get().selfKey;
     const snapshot = await currentBackend.bootstrap();
@@ -1193,6 +1188,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
     await Promise.all(
       loadedThreadParents.map((parentKey) => get().loadThreads(parentKey)),
     );
+    if (
+      !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+      getMessagingSessionIdentity() !== currentIdentity ||
+      get().selfKey !== expectedSelfKey
+    ) {
+      return;
+    }
     if (Object.keys(sinceByPlace).length > 0) {
       // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
       // durable eventがreplayされるようにする。applyEventは同一参照なので
@@ -1206,7 +1208,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
     if (get().messagesByPlace[key]) return;
-    const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const messages = await currentBackend.fetchMessages(place, {
+      limit: PAGE_SIZE,
+    });
+    if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
@@ -1224,7 +1231,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const dispatchSend = (key: PlaceKey, pending: PendingMessage) => {
     const place = parsePlaceKey(key);
     if (!place) return;
-    backend
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const isCurrent = () =>
+      isCurrentMessagingSession(currentBackend, sessionGeneration) &&
+      (get().pendingByPlace[key] ?? []).some(
+        (entry) => entry.clientNonce === pending.clientNonce,
+      );
+    currentBackend
       .sendMessage({
         place,
         content: pending.content,
@@ -1234,6 +1248,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         attachments: pending.attachments.map((entry) => entry.attachmentId),
       })
       .then(async (receipt) => {
+        if (!isCurrent()) return;
         let confirmed = (get().messagesByPlace[key] ?? []).some(
           (message) =>
             message.messageId === receipt.messageId ||
@@ -1241,10 +1256,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         if (!confirmed) {
           // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
-          const messages = await backend.fetchMessages(place, {
+          const messages = await currentBackend.fetchMessages(place, {
             beforeSeq: receipt.seq + 1,
             limit: 1,
           });
+          if (!isCurrent()) return;
           const committed = messages.find(
             (message) => message.messageId === receipt.messageId,
           );
@@ -1262,6 +1278,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           }
         }
         if (!confirmed) throw new Error("Committed message was not found");
+        if (!isCurrent()) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -1272,6 +1289,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }));
       })
       .catch(() => {
+        if (!isCurrent()) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -1452,10 +1470,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (initialized) return;
       initialized = true;
       threadProjectionVersions.clear();
-      appliedThreadDeletions.clear();
-      void backend
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      void currentBackend
         .bootstrap()
         .then((snapshot) => {
+          if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+            return;
+          }
           const membersByKey: Record<ParticipantKey, MemberProfile> = {};
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
@@ -1485,7 +1507,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           );
           set({
             ready: true,
-            capabilities: backend.capabilities,
+            capabilities: currentBackend.capabilities,
             self: snapshot.self,
             selfKey: participantKey(snapshot.self),
             workspaces: snapshot.workspaces,
@@ -1508,12 +1530,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
             employedAgents: snapshot.employedAgents,
           });
           scheduleStatusExpiry();
-          backend.subscribe(applyEvent, { sinceByPlace });
+          currentBackend.subscribe(applyEvent, { sinceByPlace });
           // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
           // 再接続なので、replayされないplace lifecycleを読み直す。presenceは
           // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
           let connectedOnce = false;
-          backend.subscribeConnection((connection) => {
+          currentBackend.subscribeConnection((connection) => {
+            if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+              return;
+            }
             set((state) => ({
               connection,
               everConnected: state.everConnected || connection === "connected",
@@ -1529,6 +1554,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           });
         })
         .catch(() => {
+          if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+            return;
+          }
           initialized = false;
           set({ connection: "disconnected" });
         });
@@ -1628,7 +1656,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async updateChannelTopic(channelId, topic) {
-      const channel = await backend.updateChannelTopic(channelId, topic);
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const channel = await currentBackend.updateChannelTopic(channelId, topic);
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        throw new Error(
+          "Messaging session changed during channel topic update",
+        );
+      }
       set((state) => ({
         channels: state.channels.map((entry) =>
           entry.channelId === channel.channelId ? channel : entry,
@@ -1727,13 +1762,26 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const parent = parsePlaceKey(parentKey);
       if (parent?.kind !== "channel")
         throw new Error("Threads require a channel parent");
-      if (!backend.createThread) throw new Error("Threads are unavailable");
-      const thread = await backend.createThread(
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
+      const createThread = currentBackend.createThread;
+      if (!createThread) throw new Error("Threads are unavailable");
+      const thread = await createThread.call(
+        currentBackend,
         parent,
         name,
         originMessageId,
         clientNonce,
       );
+      if (
+        !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during thread creation");
+      }
       set((state) => ({
         threadsById: { ...state.threadsById, [thread.threadId]: thread },
       }));
@@ -1741,7 +1789,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async searchMessages(query) {
-      return backend.searchMessages(query);
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const results = await currentBackend.searchMessages(query);
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        throw new Error("Messaging session changed during message search");
+      }
+      return results;
     },
 
     async loadPlaceAround(key, seq) {
@@ -1754,10 +1808,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return true;
       }
-      const messages = await backend.fetchMessages(place, {
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const messages = await currentBackend.fetchMessages(place, {
         beforeSeq: seq + 1,
         limit: 50,
       });
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+        return false;
+      }
       set((state) => ({
         messagesByPlace: {
           ...state.messagesByPlace,
@@ -2095,10 +2154,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((entry) => ({
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
-      const older = await backend.fetchMessages(place, {
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const older = await currentBackend.fetchMessages(place, {
         beforeSeq: current[0].seq,
         limit: PAGE_SIZE,
       });
+      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
       set((entry) => {
         const existing = entry.messagesByPlace[key] ?? [];
         const known = new Set(existing.map((m) => m.messageId));

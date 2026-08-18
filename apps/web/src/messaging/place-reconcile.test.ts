@@ -398,6 +398,55 @@ describe("place lifecycleの再接続突き合わせ", () => {
     });
   });
 
+  it("bootstrap済みのthread tombstoneをcatch-upで二重減算しない", async () => {
+    const known = { ...thread("thread-known"), messageCount: 2 };
+    const tombstone = {
+      ...threadMessage(known.threadId, 2),
+      content: "",
+      deleted: true,
+      mentions: [],
+    };
+    useMessaging.setState({ threadsById: { [known.threadId]: known } });
+    backend.next = snapshot({
+      channels: [channel("channel-1", "旧トピック")],
+      dms: [],
+      threads: [
+        {
+          ...known,
+          messageCount: 1,
+          latestSeq: tombstone.seq,
+          lastMessageAt: null,
+          lastMessage: "",
+        },
+      ],
+      unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
+    });
+
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+    expect(useMessaging.getState().threadsById[known.threadId]).toMatchObject({
+      messageCount: 1,
+      latestSeq: tombstone.seq,
+    });
+
+    // The summary re-fetch may fail while offline. The bootstrap count remains
+    // authoritative until a later successful refresh, rather than decrementing
+    // a second time when the catch-up tombstone is replayed.
+    backend.fetchThreads.mockRejectedValueOnce(new Error("offline"));
+    backend.emit({
+      type: "message_created",
+      message: tombstone,
+      notify: null,
+    });
+    await settle();
+
+    expect(useMessaging.getState().threadsById[known.threadId]).toMatchObject({
+      messageCount: 1,
+      latestSeq: tombstone.seq,
+    });
+  });
+
   it("切断中に作られたplaceとtopic編集を再接続で取り込む", async () => {
     useMessaging.getState().selectPlace(CHANNEL_1);
     useMessaging.getState().setDraft(CHANNEL_1, "書きかけ");
