@@ -27,8 +27,16 @@ function status(
   kind: StatusKind,
   note = "",
   expiresAt: number | null = null,
+  base: { status: StatusKind; note: string } | null = null,
 ): ParticipantStatus {
-  return { participant, status: kind, note, expiresAt };
+  return {
+    participant,
+    status: kind,
+    note,
+    expiresAt,
+    baseStatus: base?.status ?? null,
+    baseNote: base?.note ?? "",
+  };
 }
 
 function marker(
@@ -149,9 +157,10 @@ class FakePresenceBackend implements MessagingBackend {
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): ReturnType<
-    MessagingBackend["updateChannelTopic"]
-  > {
+  async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): ReturnType<MessagingBackend["duplicateChannel"]> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {

@@ -120,7 +120,10 @@ class FakeBackend implements MessagingBackend {
   async createGroupDM(): Promise<DmSummary> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): Promise<ChannelSummary> {
+  async updateChannel(): Promise<ChannelSummary> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): Promise<ChannelSummary> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {

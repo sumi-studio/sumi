@@ -16,11 +16,6 @@ vi.mock("../place-route", () => ({
 }));
 
 vi.mock("./sidebar", () => ({
-  NOTIFICATION_LEVEL_LABEL: {
-    all: "すべて通知",
-    mentions: "メンションのみ",
-    mute: "ミュート",
-  },
   Sidebar: ({ selectedPlaceKey }: { selectedPlaceKey: PlaceKey | null }) => (
     <aside data-testid="sidebar-selection">
       {selectedPlaceKey ?? "unselected"}
