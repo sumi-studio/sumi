@@ -450,15 +450,71 @@ func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {
 	}
 }
 
-// collectExpiries runs one sweep and records what it announced. The sweep hands
-// each lapse over inside its own transaction, so this is the only way to see
-// what it said — there is no separate read to inspect afterwards.
+// collectExpiries runs one sweep and records what it announced after its
+// transaction has committed.
 func collectExpiries(ctx context.Context, store *Store) ([]StatusExpiry, error) {
 	var announced []StatusExpiry
 	err := store.ExpireStatuses(ctx, func(_ context.Context, expiry StatusExpiry) {
 		announced = append(announced, expiry)
 	})
 	return announced, err
+}
+
+func TestExpireStatusesNeverPublishesARevisionWhoseCommitFailed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	past := time.Now().Add(-time.Minute)
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set lapsed status: %v", err)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `
+		CREATE FUNCTION test_fail_expiry_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'force expiry commit failure';
+		END;
+		$$`); err != nil {
+		t.Fatalf("create deferred failure function: %v", err)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `
+		CREATE CONSTRAINT TRIGGER test_fail_expiry_commit
+		AFTER UPDATE ON participant_statuses DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION test_fail_expiry_commit()`); err != nil {
+		t.Fatalf("create deferred failure trigger: %v", err)
+	}
+	defer func() {
+		_, _ = w.store.core.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS test_fail_expiry_commit ON participant_statuses`)
+		_, _ = w.store.core.pool.Exec(context.Background(), `
+			DROP FUNCTION IF EXISTS test_fail_expiry_commit()`)
+	}()
+
+	announced, err := collectExpiries(ctx, w.store.core)
+	if err == nil {
+		t.Fatal("expiry commit unexpectedly succeeded")
+	}
+	if len(announced) != 0 {
+		t.Fatalf("failed expiry commit announced uncommitted revisions: %+v", announced)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `
+		DROP TRIGGER test_fail_expiry_commit ON participant_statuses`); err != nil {
+		t.Fatalf("drop deferred failure trigger: %v", err)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `DROP FUNCTION test_fail_expiry_commit()`); err != nil {
+		t.Fatalf("drop deferred failure function: %v", err)
+	}
+
+	// The failed sweep rolled back revision 2. The next declaration gets and
+	// publishes that revision, so a client that saw no failed event can apply it.
+	next, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "戻りました", nil)
+	if err != nil {
+		t.Fatalf("set status after failed expiry: %v", err)
+	}
+	if next.Revision != 2 {
+		t.Fatalf("status after failed expiry revision = %d, want 2", next.Revision)
+	}
 }
 
 // A lapse is only worth announcing while it is still the last word. If the

@@ -374,4 +374,27 @@ describe("place lifecycleの再接続突き合わせ", () => {
       revision: 3,
     });
   });
+
+  it("未知のplace_updatedを挿入し、後着の古いplace_createdを退ける", () => {
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-2", "編集済みtopic", 2),
+      });
+    });
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_created",
+        channel: channel("channel-2", "作成時topic", 1),
+      });
+    });
+
+    expect(useMessaging.getState().channels).toContainEqual(
+      expect.objectContaining({
+        channelId: "channel-2",
+        topic: "編集済みtopic",
+        revision: 2,
+      }),
+    );
+  });
 });

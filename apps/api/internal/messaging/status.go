@@ -96,10 +96,9 @@ type StatusExpiry struct {
 }
 
 // ExpireStatuses makes lapsed temporary statuses durable and hands each one to
-// `announce` before the transaction commits. Rows that lapse back to a base
-// keep that base as their lasting state; rows with nothing behind them are
-// removed, because a status that no longer holds is not a statement about
-// anyone.
+// `announce` after the transaction commits. Rows that lapse back to a base keep
+// that base as their lasting state; rows with nothing behind them are removed,
+// because a status that no longer holds is not a statement about anyone.
 //
 // What is announced is only what these statements actually changed, and only
 // the values they themselves produced. The eligibility check lives in each
@@ -107,14 +106,12 @@ type StatusExpiry struct {
 // declares something new in the meantime simply leaves nothing to lapse: zero
 // rows change and nothing is said about them.
 //
-// `announce` runs inside the transaction, with the affected rows still locked.
-// That is what keeps a lapse from arriving after a newer declaration: any
-// concurrent SetStatus is waiting at the same row lock and therefore cannot
-// publish first. Announcing before the commit is safe here in a way it would
-// not be elsewhere — the event states only what every reader already computes
-// for itself from the declaration's own expiry and base, so a transaction that
-// failed to commit could not leave a screen disagreeing with the durable
-// answer.
+// Delivery scopes are resolved inside the transaction, but `announce` runs only
+// after its commit has made each returned revision real. A concurrent SetStatus
+// may commit and publish a newer revision first; recipients apply only strictly
+// newer revisions, so that later declaration remains the projection. Publishing
+// only committed revisions is essential: a failed commit can reuse its trigger
+// revision for the next declaration.
 //
 // Readers resolve expiry themselves through StatusesVisibleTo, so a sweep that
 // never runs costs correctness nothing.
@@ -186,12 +183,14 @@ func (s *Store) ExpireStatuses(
 			return err
 		}
 		expiries[index].Scopes = scopes
-		if announce != nil {
-			announce(ctx, expiries[index])
-		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit expire statuses: %w", err)
+	}
+	if announce != nil {
+		for _, expiry := range expiries {
+			announce(ctx, expiry)
+		}
 	}
 	return nil
 }
