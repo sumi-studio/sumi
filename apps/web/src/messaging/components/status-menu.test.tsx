@@ -67,7 +67,9 @@ describe("StatusMenu", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /取り込み中/ }));
 
-    expect(screen.getByText("期限が来たら「離席中」に戻ります")).toBeVisible();
+    expect(
+      screen.getByText("期限が来たら「離席中 — 在宅です」に戻ります"),
+    ).toBeVisible();
 
     fireEvent.click(screen.getByRole("menuitem", { name: "1時間" }));
 
@@ -85,7 +87,7 @@ describe("StatusMenu", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
     );
-    fireEvent.click(screen.getByRole("button", { name: /離席中/ }));
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
 
     expect(
       screen.getByText("期限が来たら申告そのものが解除されます"),
@@ -94,6 +96,31 @@ describe("StatusMenu", () => {
     // 「解除するまで」は期限なし。
     fireEvent.click(screen.getByRole("menuitem", { name: "解除するまで" }));
     expect(setStatus).toHaveBeenCalledWith("away", "", null);
+  });
+
+  it("同じ申告を期限付きにしても、サーバーが保存する元の一言を戻る先として見せる", () => {
+    setSelfStatus({
+      participant: SELF,
+      revision: 1,
+      status: "away",
+      note: "外出",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "通院中" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+
+    expect(
+      screen.getByText("期限が来たら「離席中 — 外出」に戻ります"),
+    ).toBeVisible();
   });
 
   it("ひとことだけ書き替えたときに、いまの期限を黙って外さない", () => {
