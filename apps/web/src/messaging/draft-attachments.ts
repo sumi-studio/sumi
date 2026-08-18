@@ -1,7 +1,16 @@
 import { MessagingAPIError } from "./api-backend";
 import type { Attachment } from "./model";
 
-export type DraftAttachmentStatus = "uploading" | "ready" | "failed";
+/**
+ * "editing" は送信前の宣言（名前・説明・ネタバレ）をサーバーへ反映している
+ * 最中。uploadingと分けてあるのは、bytesはもう預けてあり、待っているのは
+ * 宣言の確定だけだから。どちらも送信ゲートは閉じる。
+ */
+export type DraftAttachmentStatus =
+  | "uploading"
+  | "editing"
+  | "ready"
+  | "failed";
 
 /**
  * composerに積まれた1ファイル。clientNonceはファイルごとに安定で、再送は
@@ -17,6 +26,11 @@ export interface DraftAttachment {
   errorCode?: string;
   /** upload完了後の受領。sendMessageのattachmentsへこのIDを順に載せる。 */
   attachment?: Attachment;
+  /**
+   * 画像のときだけ、手元のFileから作ったサムネイル用のobject URL。bytesと
+   * 同じくstoreが持ち主で、draftを捨てるときに必ず解放される。
+   */
+  previewUrl?: string;
 }
 
 export function attachmentUploadFailureCode(error: unknown): string {
@@ -40,6 +54,8 @@ const FAILURE_LABELS: Record<string, string> = {
   attachment_upload_in_progress:
     "同じファイルをアップロード中です。少し待ってから再試行してください",
   attachments_unavailable: "このサーバーでは添付を受け付けていません",
+  attachment_already_sent: "送信済みの添付は編集できません",
+  invalid_request: "この内容では保存できません",
   invalid_session: "サインインし直してください",
   app_disabled: "Messagingが無効化されています",
   upload_timeout: "時間内に送り切れませんでした",

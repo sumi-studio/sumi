@@ -2,6 +2,7 @@ import { secureRandomUUID } from "../lib/random-uuid";
 import { hasDisplayMention } from "./mention";
 import type {
   Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -588,6 +589,8 @@ export class MockMessagingServer implements MessagingBackend {
             .filter((entry): entry is Attachment => entry !== undefined)
             .map((entry, position) => ({ ...entry, position })),
         });
+        // 束ねた添付は下書きではなくなる。実APIと同じく、以後の編集は拒む。
+        for (const id of input.attachments) this.uploads.delete(id);
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
         this.emit({
           type: "message_created",
@@ -621,10 +624,34 @@ export class MockMessagingServer implements MessagingBackend {
       sizeBytes: input.body.size,
       sha256: "",
       position: 0,
+      spoiler: false,
+      alt: "",
     };
     this.uploads.set(attachment.attachmentId, attachment);
     this.uploadsByNonce.set(input.clientNonce, attachment);
     return Promise.resolve({ attachment, created: true });
+  }
+
+  /**
+   * 送信前の添付の編集。実APIと同じく、送ってしまった（=uploadsから消えた）
+   * 添付は編集できない。
+   */
+  updateDraftAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment> {
+    const draft = this.uploads.get(attachmentId);
+    if (!draft) {
+      return Promise.reject(new Error("attachment_already_sent"));
+    }
+    const next: Attachment = {
+      ...draft,
+      filename: patch.filename ?? draft.filename,
+      alt: patch.alt ?? draft.alt,
+      spoiler: patch.spoiler ?? draft.spoiler,
+    };
+    this.uploads.set(attachmentId, next);
+    return Promise.resolve(next);
   }
 
   attachmentURL(attachmentId: string): string {

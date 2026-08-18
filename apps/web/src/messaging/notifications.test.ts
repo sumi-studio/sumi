@@ -111,6 +111,8 @@ describe("notification text", () => {
           sizeBytes: 1,
           sha256: "00",
           position: 0,
+          spoiler: false,
+          alt: "",
         },
       ]),
     ).toBe("📎 plan.pdf");
@@ -123,6 +125,8 @@ describe("notification text", () => {
           sizeBytes: 1,
           sha256: "00",
           position: 0,
+          spoiler: false,
+          alt: "",
         },
         {
           attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaab",
@@ -131,6 +135,8 @@ describe("notification text", () => {
           sizeBytes: 1,
           sha256: "00",
           position: 1,
+          spoiler: false,
+          alt: "",
         },
       ]),
     ).toBe("📎 2件のファイル");

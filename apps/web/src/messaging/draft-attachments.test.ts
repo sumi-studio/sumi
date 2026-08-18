@@ -67,6 +67,8 @@ function receipt(
     sizeBytes: 3,
     sha256: "",
     position: 0,
+    spoiler: false,
+    alt: "",
   };
   return { attachment, created: true };
 }
@@ -310,6 +312,8 @@ describe("ApiMessagingBackend attachments", () => {
               size_bytes: 3,
               sha256: "ab",
               position: 0,
+              spoiler: false,
+              alt: "",
             },
             created: true,
           }),
@@ -334,6 +338,8 @@ describe("ApiMessagingBackend attachments", () => {
         sizeBytes: 3,
         sha256: "ab",
         position: 0,
+        spoiler: false,
+        alt: "",
       },
       created: true,
     });
