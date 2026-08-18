@@ -446,6 +446,12 @@ export interface MessagingBackend {
    */
   openPlace?(place: Place | null, sinceSeq?: number): void;
   /**
+   * そのplaceの履歴をもう持っていないと伝える。cursorを手放すので、次の再接続
+   * ではreplayされず、開き直したときにRESTで取り直すことになる。履歴を捨てる
+   * 側（store）と対で呼ぶ。
+   */
+  releasePlace?(place: Place): void;
+  /**
    * durable eventの購読。再接続時はplaceごとの消費済みseqをcursorとして渡し、
    * その次からcatch-upする（volatile eventはreplayしない）。
    */

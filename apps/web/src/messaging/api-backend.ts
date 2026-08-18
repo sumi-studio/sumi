@@ -128,8 +128,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       (entry) => {
         const value = asRecord(entry);
         const place = parsePlace(value.place);
-        // 未読summaryは自分の台帳にあるplaceだけを運ぶ。cursorはsubscribeが
-        // sinceByPlaceで登録するので、ここではeventのrouting先として覚える。
+        // summaryはcursorを作らない。cursorはこのclientが履歴を持っている
+        // placeの分だけで、それを知っているのはstore（台帳の持ち主）である。
+        // ここではeventのrouting先として覚えるだけにする。
         this.registerPlace(place);
         return {
           place,
@@ -139,7 +140,6 @@ export class ApiMessagingBackend implements MessagingBackend {
         };
       },
     );
-    this.adoptThreadLedger(unreadSummaries);
     // status_updated は replay されないvolatile eventなので、現在値はここでしか
     // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
     const presence = parsePresence(body);
@@ -484,6 +484,17 @@ export class ApiMessagingBackend implements MessagingBackend {
     this.declareOpenPlace(previous);
   }
 
+  /**
+   * その場所の履歴をもう持っていないと宣言する。cursorを手放すので次のhello
+   * には載らない。cursorを落としたまま古い履歴を抱えると、再接続を跨いだ穴が
+   * そのまま残るので、この宣言とstore側の履歴破棄は必ず対になる。
+   */
+  releasePlace(place: Place): void {
+    const id = placeID(place);
+    this.followed.delete(id);
+    if (id !== this.openPlaceID) this.cursors.delete(id);
+  }
+
   subscribe(
     listener: (event: ServerEvent) => void,
     options: { sinceByPlace?: Record<PlaceKey, number> } = {},
@@ -491,11 +502,8 @@ export class ApiMessagingBackend implements MessagingBackend {
     this.listeners.add(listener);
     for (const [key, seq] of Object.entries(options.sinceByPlace ?? {})) {
       const place = parsePlaceKey(key);
-      if (!place) continue;
-      // storeが渡すcursorは自分の台帳そのものなので、followとして扱う。
-      this.followed.add(placeID(place));
-      this.places.set(placeID(place), place);
-      this.cursors.set(placeID(place), seq);
+      // storeが渡すcursorは「このclientが履歴を持っている場所」そのもの。
+      if (place) this.followPlace(place, seq);
     }
     this.stopped = false;
     this.connect();
@@ -693,7 +701,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       visibility: asVisibility(wire.visibility),
       voice: asBoolean(wire.voice),
     };
-    this.followPlace({ kind: "channel", channelId: channel.channelId });
+    // channelもcursorは持たない: 在籍しているだけのchannelは何百とあり得るし、
+    // 履歴を持っていないなら replay させるものも無い。未読はbootstrapのsummary
+    // が正本で、開けばRESTが履歴を運ぶ。
+    this.registerPlace({ kind: "channel", channelId: channel.channelId });
     return channel;
   }
 
@@ -705,7 +716,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
-    this.followPlace({ kind: dm.kind, dmId: dm.dmId });
+    this.registerPlace({ kind: dm.kind, dmId: dm.dmId });
     return dm;
   }
 
@@ -743,60 +754,42 @@ export class ApiMessagingBackend implements MessagingBackend {
 
   /**
    * Follows a place: its durable events replay from this cursor after a
-   * reconnect. Only the places this viewer's own ledger carries belong here.
-   * A Workspace's threads are unbounded and mostly other people's, so merely
-   * learning that one exists must not add a cursor: the handshake is refused
-   * outright past its cursor bound, and a bootstrap that rebuilds the same
-   * oversized ledger would keep it refused across reloads.
+   * reconnect. What belongs here is not "every place this viewer can see" but
+   * "every place whose history this client is holding" — the only places a
+   * replay can repair. A Workspace holds unboundedly many channels and
+   * threads; enumerating them would make the handshake grow with the
+   * Workspace and, past its cursor bound, be refused outright with no reload
+   * able to clear it. Everything else is repaired the other way round: the
+   * bootstrap summary carries its unread, and opening it fetches its history.
+   *
+   * A cursor never moves backwards. The declaration may arrive after a live
+   * event has already advanced it.
    */
-  private followPlace(place: Place): void {
+  private followPlace(place: Place, seq: number): void {
     const id = placeID(place);
     this.places.set(id, place);
     this.followed.add(id);
-    if (!this.cursors.has(id)) this.cursors.set(id, 0);
+    this.cursors.set(id, Math.max(this.cursors.get(id) ?? 0, seq));
   }
 
   /**
-   * 見えるだけで自分のものではないplaceか。threadだけがこの状態を持つ:
-   * channelとDMは在籍そのものが台帳で、開いていなくても自分の場所である。
+   * 履歴を持っていないのに、開いているから購読しているだけのplaceか。閉じたら
+   * そのcursorは畳む——残せば次のhelloがそれを運び、開いてもいない場所のevent
+   * が（未読と通知の効果ごと）replayされてしまう。
    */
   private watchOnly(id: string): boolean {
-    return this.places.get(id)?.kind === "thread" && !this.followed.has(id);
+    return !this.followed.has(id);
   }
 
   /**
-   * bootstrapの未読summaryは「この閲覧者が持っている場所」の正本で、threadに
-   * ついては参加しているものだけを運ぶ。cursorを持つthreadをここで台帳へ
-   * 揃え直す——参加しているthreadと、いま開いているthreadだけが残る。
-   * 参加が終わったthreadのcursorが残り続けない、唯一の合流点でもある。
-   */
-  private adoptThreadLedger(summaries: UnreadSummary[]): void {
-    const participating = new Map<string, number>();
-    for (const summary of summaries) {
-      if (summary.place.kind !== "thread") continue;
-      participating.set(placeID(summary.place), summary.latestSeq);
-    }
-    for (const [id, latestSeq] of participating) {
-      this.followed.add(id);
-      // 新しく参加したthreadは、bootstrapが見た時点から先だけを追えばよい。
-      if (!this.cursors.has(id)) this.cursors.set(id, latestSeq);
-    }
-    for (const id of [...this.cursors.keys()]) {
-      if (this.places.get(id)?.kind !== "thread") continue;
-      if (participating.has(id)) continue;
-      this.followed.delete(id);
-      if (id !== this.openPlaceID) this.cursors.delete(id);
-    }
-  }
-
-  /**
-   * live eventが進めるのは、この接続が既に持っているcursorだけ。参加しても
-   * 開いてもいないthreadのeventでcursorを作ると、閉じたあとの再接続でまた
-   * それを運んでしまう。channelとDMは在籍が台帳なので今までどおり作る。
+   * live eventが進めるのは、この接続が既に持っているcursorだけ。届いたことは
+   * cursorを持つ理由にならない——参加しているchannelやthreadのeventは開いて
+   * いなくても届くので、そこでcursorを作ると台帳がworkspaceの大きさに比例して
+   * しまう。
    */
   private advanceCursor(place: Place, seq: number): void {
     const id = placeID(place);
-    if (place.kind === "thread" && !this.cursors.has(id)) return;
+    if (!this.cursors.has(id)) return;
     this.cursors.set(id, seq);
   }
 

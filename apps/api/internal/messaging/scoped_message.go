@@ -614,8 +614,14 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 	// A thread is summarized like a DM, not like a channel: a Workspace member
 	// may open one they never joined, but an unjoined thread is not part of
 	// their ledger. Projecting every thread here would put unread counts on
-	// places that appear in no list, and would make the reconnect handshake
-	// carry one cursor per Workspace thread.
+	// places that appear in no list.
+	//
+	// This projection is the badge ledger, and it is as large as the viewer's
+	// participation — a creator joins every thread they make. It must not be
+	// turned back into a replay ledger: a client that derived one cursor per
+	// summary would grow its handshake with the number of threads and, past
+	// the cursor bound, be refused every reconnect. Replay cursors belong to
+	// the places a client is actually holding history for.
 	rows, err := tx.Query(ctx, `
 		WITH visible_places AS (
 			SELECT p.*, pm.place_member_id, COALESCE(pm.visible_from_seq, 1) AS visible_from_seq

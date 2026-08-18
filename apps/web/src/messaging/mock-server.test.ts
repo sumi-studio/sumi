@@ -76,6 +76,49 @@ describe("MockMessagingServer admission", () => {
     expect(unchanged?.deleted).toBe(false);
   });
 
+  it("threadへの投稿でsummaryの集計を進める", async () => {
+    vi.useFakeTimers();
+    const server = new MockMessagingServer();
+    const thread = await server.createThread(
+      GENERAL,
+      "設計レビュー",
+      null,
+      "thread-aggregate-nonce",
+    );
+    expect(thread).toMatchObject({ messageCount: 0, lastMessage: "" });
+
+    const place = { kind: "thread", threadId: thread.threadId } as const;
+    const receiptPromise = server.sendMessage({
+      place,
+      content: "枝の一通目",
+      urgency: "normal",
+      replyTo: null,
+      clientNonce: "thread-aggregate-post",
+      attachments: [],
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    const receipt = await receiptPromise;
+
+    // 実APIと同じ集計。一覧もmessage上のchipもこの数字を見ている。
+    expect(await server.fetchThread(thread.threadId)).toMatchObject({
+      messageCount: 1,
+      lastMessage: "枝の一通目",
+      latestSeq: receipt.seq,
+    });
+    expect(
+      (await server.fetchThread(thread.threadId)).lastMessageAt,
+    ).not.toBeNull();
+
+    // tombstoneは件数から外れるが、seqは戻らない。
+    await server.deleteMessage(place, receipt.messageId);
+    expect(await server.fetchThread(thread.threadId)).toMatchObject({
+      messageCount: 0,
+      lastMessage: "",
+      lastMessageAt: null,
+      latestSeq: receipt.seq,
+    });
+  });
+
   it("未訪問placeを含む未読集計をbootstrapで返す", async () => {
     const server = new MockMessagingServer();
     const snapshot = await server.bootstrap();

@@ -217,6 +217,7 @@ class FakeBackend implements MessagingBackend {
     throw new Error("unused");
   }
   sendTyping() {}
+  releasePlace = vi.fn((_place: Place): void => {});
 
   subscribe(
     listener: (event: ServerEvent) => void,
@@ -780,11 +781,9 @@ describe("place lifecycleの再接続突き合わせ", () => {
     // 切断中に届いていた分は、新しく見つかったplaceにだけ未読として載る。
     expect(state.unreadCountByPlace[CHANNEL_2]).toBe(2);
     expect(state.unreadCountByPlace[DM_9]).toBe(4);
-    // 次の切断でもこのplaceがreplay対象になるようcursorを登録する。
-    expect(backend.cursorCalls.at(-1)).toEqual({
-      [CHANNEL_2]: 2,
-      [DM_9]: 4,
-    });
+    // cursorを配るのは履歴を持っている場所だけ。新しく見つかったplaceの未読は
+    // このsnapshotが直したので、replayを頼む相手は増えていない。
+    expect(backend.cursorCalls.at(-1)).toEqual({ [CHANNEL_1]: 0 });
     expect(backend.listeners.size).toBe(1);
   });
 
@@ -861,6 +860,56 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(state.activePlaceKey).toBe(CHANNEL_1);
     expect(state.unreadLineByPlace[CHANNEL_1]).toBe(0);
     expect(state.messagesByPlace[CHANNEL_1]).toEqual([]);
+  });
+
+  it("履歴を持っていない場所の未読は再接続のsnapshotが直す", async () => {
+    // 一覧にはあるが開いていないchannel。cursorを配っていないのでreplayは
+    // 来ない——切断中に届いた分はsnapshotがそのまま正本になる。
+    useMessaging.setState((state) => ({
+      unreadCountByPlace: { ...state.unreadCountByPlace, [CHANNEL_1]: 0 },
+      mentionCountByPlace: { ...state.mentionCountByPlace, [CHANNEL_1]: 0 },
+      lastReadByPlace: { ...state.lastReadByPlace, [CHANNEL_1]: 5 },
+    }));
+    backend.next = snapshot({
+      channels: [channel("channel-1", "旧トピック")],
+      dms: [],
+      unread: { [CHANNEL_1]: { latest: 9, unread: 4, mention: 2 } },
+      lastRead: { [CHANNEL_1]: 5 },
+    });
+
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    const state = useMessaging.getState();
+    expect(state.unreadCountByPlace[CHANNEL_1]).toBe(4);
+    expect(state.mentionCountByPlace[CHANNEL_1]).toBe(2);
+  });
+
+  it("開いている間だけ見ていたthreadは閉じるときに履歴もcursorも手放す", async () => {
+    const visiting: ThreadSummary = {
+      ...thread("thread-visiting"),
+      participants: [OTHER],
+    };
+    const key = `thread:${visiting.threadId}` as PlaceKey;
+    useMessaging.setState({ threadsById: { [visiting.threadId]: visiting } });
+    backend.fetchMessages.mockResolvedValueOnce([
+      threadMessage(visiting.threadId, 2),
+    ]);
+
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(1);
+
+    useMessaging.getState().clearPlaceSelection();
+
+    // cursorを返した場所の履歴を抱えたままだと、再接続を跨いだ穴がそのまま
+    // 残る。開き直したときにRESTで取り直せるよう、両方まとめて手放す。
+    expect(useMessaging.getState().messagesByPlace[key]).toBeUndefined();
+    expect(backend.releasePlace).toHaveBeenCalledWith({
+      kind: "thread",
+      threadId: visiting.threadId,
+    });
   });
 
   it("既知threadの既読・未読を再接続snapshotで巻き戻さない", async () => {

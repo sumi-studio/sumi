@@ -219,10 +219,15 @@
   参加者にならない。参加していないthreadをURLで開いた閲覧者には、WSの
   `open{place_id}` / `close{place_id}`（ackは `open_ack{place_id}`）で宣言した
   「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可ではない。
-  cursorを持つ台帳も同じ線で切る。clientがcursorを持つのは参加しているplaceと
-  いま開いているplaceだけで、閉じれば未参加threadのcursorは落とす。serverの
-  catch-upもcursorを購読の根拠にしない: helloでreplayするのは参加しているplace
-  だけで、開いているだけのthreadはその `open` frame のあとにreplayされる。Threadのmessageは既存の送信・添付・検索・
+  cursorを持つ台帳も同じ線で切る。serverのcatch-upはcursorを購読の根拠にしない:
+  helloでreplayするのは参加しているplaceだけで、開いているだけのthreadはその
+  `open` frame のあとにreplayされる。
+- 再接続の握手はWorkspaceの場所数に比例しない。clientがcursorを持つのは**いま
+  履歴を持っている場所**（開いて読み込んだ場所）と、いま開いている場所だけで、
+  手放すときはcursorと履歴を一緒に捨てる（片方だけ残すと穴の空いた履歴になる）。
+  それ以外の場所は、未読はbootstrapのunread summaryが正本、履歴は開いたときの
+  RESTが運ぶ。参加threadを何千持っていてもhelloは大きくならない。未読summary
+  自体は参加の数だけ並ぶので、そちらが重くなったら別途ページングを足す。Threadのmessageは既存の送信・添付・検索・
   tombstone・read markerをそのまま使う。通知候補は参加者と新しいmention先だけで、
   mentionされた人は同じtransactionで参加者になる。
 - 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして

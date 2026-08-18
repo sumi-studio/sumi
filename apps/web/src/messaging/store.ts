@@ -455,6 +455,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
   // A thread message is only an invalidation signal for its summary.  Counts,
   // latest sequence, previews, and participants come from the server's
   // aggregate: event delivery order is not a projection contract.
+  /**
+   * 履歴を持っている場所——再接続でreplayを頼む場所そのもの。cursorを配るのは
+   * ここだけで、他の場所の未読はbootstrapのsummaryが直し、履歴は開いたときに
+   * RESTが運ぶ。こうしないと握手がWorkspaceの場所数に比例し、thread（agentも
+   * 作れる）が増えただけでhelloが上限を超えて二度と繋がらなくなる。
+   *
+   * Mapの並びは触った順（最後に触ったものが末尾）。上限を超えたら最も古い
+   * ものから手放す。
+   */
+  const heldPlaces = new Map<PlaceKey, true>();
+  /**
+   * 一度に履歴を抱える場所の上限。serverのmaxHelloCursorsより十分小さく取り、
+   * 「開き続けたら握手が拒否される」状態に構造的に到達しないようにする。
+   */
+  const HELD_PLACE_LIMIT = 256;
+
   const threadProjectionVersions = new Map<string, number>();
   const threadSummaryRefreshes = new Map<
     string,
@@ -1204,35 +1220,34 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const loadedThreadParents = Object.entries(state.threadsLoadedForPlace)
       .filter(([, loaded]) => loaded)
       .map(([parentKey]) => parentKey);
-    const known = new Set<PlaceKey>([
-      ...state.channels.map((entry) =>
-        placeKey({ kind: "channel", channelId: entry.channelId }),
-      ),
-      ...state.dms.map((entry) =>
-        placeKey({ kind: entry.kind, dmId: entry.dmId }),
-      ),
-      ...Object.values(state.threadsById).map((thread) =>
-        placeKey({ kind: "thread", threadId: thread.threadId }),
-      ),
-    ]);
     const membersByKey: Record<ParticipantKey, MemberProfile> = {};
     for (const member of snapshot.members) {
       membersByKey[participantKey(member.participant)] = member;
     }
+    // 場所は二通りのどちらかで直る。履歴を持っている場所はcursorのreplayが
+    // 直すので、serverのsnapshotで塗り直すと、まだ送っていないローカルの既読が
+    // 巻き戻る。持っていない場所はreplayを頼んでいないので、serverの数字が
+    // そのまま正本になる。この二分がある限り、握手は開いた場所の数までしか
+    // 大きくならない。
     const lastReadByPlace = { ...state.lastReadByPlace };
     for (const marker of snapshot.readMarkers) {
       const key = placeKey(marker.place);
-      if (!known.has(key)) lastReadByPlace[key] = marker.lastReadSeq;
+      if (heldPlaces.has(key)) continue;
+      // 既読は単調。serverがまだ受け取っていない手元の前進は巻き戻さない。
+      lastReadByPlace[key] = Math.max(
+        lastReadByPlace[key] ?? 0,
+        marker.lastReadSeq,
+      );
     }
     const unreadCountByPlace = { ...state.unreadCountByPlace };
     const mentionCountByPlace = { ...state.mentionCountByPlace };
-    const sinceByPlace: Record<PlaceKey, number> = {};
     for (const summary of snapshot.unreadSummaries) {
       const key = placeKey(summary.place);
-      if (known.has(key)) continue;
-      unreadCountByPlace[key] = summary.unreadCount;
-      mentionCountByPlace[key] = summary.mentionCount;
-      sinceByPlace[key] = summary.latestSeq;
+      if (heldPlaces.has(key)) continue;
+      // 手元の既読が最新に追いついているなら、serverの未読はまだ古い数字。
+      const caughtUp = (lastReadByPlace[key] ?? 0) >= summary.latestSeq;
+      unreadCountByPlace[key] = caughtUp ? 0 : summary.unreadCount;
+      mentionCountByPlace[key] = caughtUp ? 0 : summary.mentionCount;
     }
     set({
       workspaces: snapshot.workspaces,
@@ -1271,15 +1286,55 @@ export const useMessaging = create<MessagingState>((set, get) => {
     ) {
       return;
     }
-    if (Object.keys(sinceByPlace).length > 0) {
-      // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
-      // durable eventがreplayされるようにする。applyEventは同一参照なので
-      // listenerは重複しない。
-      currentBackend.subscribe(applyEvent, { sinceByPlace });
-    }
   };
 
   const PAGE_SIZE = 50;
+
+  /**
+   * この場所の履歴を持ったと宣言する。cursorはbackendが握手に載せ、切断中の
+   * 分をここから replay させる。上限を超えたら一番古い場所を手放す——履歴と
+   * cursorは必ず一緒に捨てる。片方だけ残すと、再接続を跨いだ穴の空いた履歴を
+   * 抱えたまま開き直すことになる。
+   */
+  const holdPlace = (place: Place, headSeq: number) => {
+    const key = placeKey(place);
+    heldPlaces.delete(key);
+    heldPlaces.set(key, true);
+    backend.subscribe(applyEvent, { sinceByPlace: { [key]: headSeq } });
+    while (heldPlaces.size > HELD_PLACE_LIMIT) {
+      const oldest = heldPlaces.keys().next().value;
+      if (oldest === undefined || oldest === key) break;
+      releasePlace(oldest);
+    }
+  };
+
+  /** 履歴とcursorを同時に手放す。次に開いたときはRESTが取り直す。 */
+  const releasePlace = (key: PlaceKey) => {
+    heldPlaces.delete(key);
+    const place = parsePlaceKey(key);
+    if (place) backend.releasePlace?.(place);
+    set((state) => {
+      if (!(key in state.messagesByPlace)) return {};
+      const messagesByPlace = { ...state.messagesByPlace };
+      const hasMoreByPlace = { ...state.hasMoreByPlace };
+      delete messagesByPlace[key];
+      delete hasMoreByPlace[key];
+      return { messagesByPlace, hasMoreByPlace };
+    });
+  };
+
+  /**
+   * 開いている間だけ購読していたthreadから離れる。serverはその宣言が無ければ
+   * replayしないので、履歴だけ抱えていると再接続を跨いだ穴がそのまま残る。
+   * cursorと一緒に履歴も手放し、開き直したときにRESTで取り直す。
+   */
+  const releaseWatchOnlyPlace = (key: PlaceKey | null) => {
+    if (!key) return;
+    const place = parsePlaceKey(key);
+    if (place?.kind !== "thread") return;
+    if (participatesInThread(get(), place.threadId)) return;
+    releasePlace(key);
+  };
 
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
@@ -1300,6 +1355,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
         [key]: messages.length >= PAGE_SIZE,
       },
     }));
+    // 履歴を持った場所だけがreplayを頼む。先頭はいま読み込んだ最新seqで、
+    // それより先に届いていたliveがあればbackendのcursorが既に進んでいる。
+    holdPlace(
+      place,
+      messages.reduce((head, message) => Math.max(head, message.seq), 0),
+    );
   };
 
   // 送信・再送の共通経路。ACK(receipt)はecho eventで照合されるため、
@@ -1551,6 +1612,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       initialized = true;
       threadProjectionVersions.clear();
       threadSummaryRefreshes.clear();
+      heldPlaces.clear();
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
       const threadVersions = new Map(threadProjectionVersions);
@@ -1575,12 +1637,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           }
           const unreadCountByPlace: Record<PlaceKey, number> = {};
           const mentionCountByPlace: Record<PlaceKey, number> = {};
-          const sinceByPlace: Record<PlaceKey, number> = {};
           for (const summary of snapshot.unreadSummaries) {
             const key = placeKey(summary.place);
             unreadCountByPlace[key] = summary.unreadCount;
             mentionCountByPlace[key] = summary.mentionCount;
-            sinceByPlace[key] = summary.latestSeq;
           }
           // bootstrapが運ぶ設定はサーバーの確定値。書き込みが失敗したときの
           // 戻り先はここから始まる。
@@ -1613,7 +1673,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
             );
           }
           scheduleStatusExpiry();
-          currentBackend.subscribe(applyEvent, { sinceByPlace });
+          // 最初の接続では何の履歴も持っていない。cursorは場所を開いて履歴を
+          // 持ったときに一つずつ増える——workspaceの場所数では増えない。
+          currentBackend.subscribe(applyEvent, {});
           // bootstrapはsubscribeより前に読まれるため、最初の接続にもその間に
           // 作られたplaceや親thread一覧が欠け得る。connectedをsnapshotのfence
           // として毎回再検証し、live eventはその再取得を促す合図として扱う。
@@ -1655,6 +1717,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
               );
       if (!known) return;
+      if (state.activePlaceKey !== key) {
+        releaseWatchOnlyPlace(state.activePlaceKey);
+      }
       set((state) => ({
         activePlaceKey: key,
         editingMessageId: null,
@@ -1687,6 +1752,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return;
       }
+      releaseWatchOnlyPlace(state.activePlaceKey);
       set({
         activePlaceKey: null,
         editingMessageId: null,
@@ -1913,6 +1979,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
         },
       }));
+      holdPlace(
+        place,
+        messages.reduce((head, message) => Math.max(head, message.seq), 0),
+      );
       return messages.some((message) => message.seq === seq);
     },
 

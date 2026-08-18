@@ -580,7 +580,7 @@ describe("ApiMessagingBackend", () => {
     ]);
   });
 
-  it("replays live-learned places after reconnecting", async () => {
+  it("keeps live-learned places out of the handshake until they are held", async () => {
     vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
@@ -624,9 +624,11 @@ describe("ApiMessagingBackend", () => {
     expect(reconnectSocket).not.toBe(firstSocket);
     reconnectSocket?.open();
 
+    // 履歴を持っていない場所にreplayさせるものは無い。その未読はreconnect後の
+    // bootstrap snapshotが直すので、握手はstoreが宣言した場所のままでよい。
     expect(JSON.parse(reconnectSocket?.sent[0] ?? "{}")).toEqual({
       type: "hello",
-      cursors: { "channel-1": 4, "channel-2": 0, "dm-9": 0 },
+      cursors: { "channel-1": 4 },
     });
   });
 
@@ -915,21 +917,24 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
-  it("drops a visited thread's cursor when it is closed, and keeps a joined one", async () => {
+  it("drops a visited place's cursor when it is closed, and keeps a held one", async () => {
     vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => json(bootstrapWithJoinedThread())),
+      vi.fn(async () => json(bootstrap)),
     );
     vi.stubGlobal("WebSocket", FakeWebSocket);
     const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
     await backend.bootstrap();
-    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    // storeが宣言するのは履歴を持っている場所——参加しているthreadも例外では
+    // なく、開いて読み込んだからここに居る。
+    backend.subscribe(() => {}, {
+      sinceByPlace: { "channel:channel-1": 4, "thread:thread-held": 7 },
+    });
     const socket = FakeWebSocket.instances[0];
     socket?.open();
 
-    // 参加していないthreadをURLで開く。開いている間は購読しているのでcursorも
-    // 持つが、それはこの画面の間だけのものである。
+    // 開いている間だけ購読するthreadはcursorも借り物で、閉じれば返す。
     backend.openPlace({ kind: "thread", threadId: "thread-visiting" }, 3);
     backend.openPlace(null);
 
@@ -937,45 +942,70 @@ describe("ApiMessagingBackend", () => {
     await vi.advanceTimersByTimeAsync(250);
     const reconnected = FakeWebSocket.instances[0];
     reconnected?.open();
-    // 閉じたthreadは載らない。参加しているthreadはbootstrapが運ぶ台帳なので載る。
     expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
       type: "hello",
-      cursors: { "channel-1": 4, "thread-joined": 7 },
+      cursors: { "channel-1": 4, "thread-held": 7 },
     });
   });
 
-  it("re-derives which threads hold a cursor from every bootstrap", async () => {
-    vi.useFakeTimers();
-    let bootstraps = 0;
+  it("keeps the handshake independent of how many places the Workspace holds", async () => {
+    // 作成者は自分が作ったthreadの参加者になる。作った数だけ参加threadが
+    // 増えても、握手はその数に比例してはならない。
+    const threads = Array.from(
+      { length: 1200 },
+      (_, index) => `thread-${index}`,
+    );
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => {
-        bootstraps += 1;
-        // 2度目のbootstrapにはこのthreadが無い——参加が終わった、が唯一の
-        // 伝わり方である。cursorもそこで畳む。
-        return json(bootstraps === 1 ? bootstrapWithJoinedThread() : bootstrap);
-      }),
+      vi.fn(async () =>
+        json({
+          ...bootstrap,
+          threads: threads.map((threadId) => threadSummaryWire(threadId)),
+          unread_summaries: [
+            ...bootstrap.unread_summaries,
+            ...threads.map((threadId) => ({
+              place: threadPlaceWire(threadId),
+              latest_seq: 3,
+              unread_count: 1,
+              mention_count: 0,
+            })),
+          ],
+        }),
+      ),
     );
     vi.stubGlobal("WebSocket", FakeWebSocket);
     const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
-    await backend.bootstrap();
-    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    const snapshot = await backend.bootstrap();
+    expect(snapshot.unreadSummaries).toHaveLength(1201);
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
     const socket = FakeWebSocket.instances[0];
     socket?.open();
-    expect(JSON.parse(socket?.sent[0] ?? "{}")).toEqual({
-      type: "hello",
-      cursors: { "channel-1": 4, "thread-joined": 7 },
-    });
 
-    await backend.bootstrap();
-    socket?.close();
-    await vi.advanceTimersByTimeAsync(250);
-    const reconnected = FakeWebSocket.instances[0];
-    reconnected?.open();
-    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+    // maxHelloCursors(1024)を優に超える参加threadがあっても、握手が運ぶのは
+    // このclientが履歴を持っている場所だけ。
+    expect(JSON.parse(socket?.sent[0] ?? "{}")).toEqual({
       type: "hello",
       cursors: { "channel-1": 4 },
     });
+    // 配送は参加で決まるので、cursorを持たないthreadのeventも届く。
+    socket?.message({
+      type: "event",
+      event: {
+        type: "message_created",
+        message: messageWire(
+          4,
+          "1000番目の枝",
+          [],
+          threadPlaceWire("thread-999"),
+        ),
+      },
+    });
+    expect(events).toMatchObject([
+      { type: "message_created", message: { seq: 4, content: "1000番目の枝" } },
+    ]);
   });
 
   it("declares the open place, re-declares it after reconnecting, and closes it", async () => {
@@ -1068,22 +1098,6 @@ function channelWire() {
 
 function threadPlaceWire(threadId: string) {
   return { kind: "thread", thread_id: threadId };
-}
-
-function bootstrapWithJoinedThread() {
-  return {
-    ...bootstrap,
-    threads: [threadSummaryWire("thread-joined")],
-    unread_summaries: [
-      ...bootstrap.unread_summaries,
-      {
-        place: threadPlaceWire("thread-joined"),
-        latest_seq: 7,
-        unread_count: 2,
-        mention_count: 0,
-      },
-    ],
-  };
 }
 
 function threadSummaryWire(threadId: string) {

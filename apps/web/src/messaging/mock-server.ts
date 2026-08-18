@@ -694,6 +694,7 @@ export class MockMessagingServer implements MessagingBackend {
     message.content = content;
     message.mentions = resolveMentionsAtAdmission(content);
     message.editedAt = Date.now();
+    this.reprojectThread(place);
     this.emit({ type: "message_edited", message: { ...message } });
   }
 
@@ -706,6 +707,7 @@ export class MockMessagingServer implements MessagingBackend {
     // tombstone化: contentは残さず、消えた事実とseqだけが残る。
     message.deleted = true;
     message.content = "";
+    this.reprojectThread(place);
     this.emit({
       type: "message_deleted",
       message: { ...message },
@@ -889,7 +891,27 @@ export class MockMessagingServer implements MessagingBackend {
     };
     messages.push(message);
     this.history.set(key, messages);
+    this.reprojectThread(input.place);
     return message;
+  }
+
+  /**
+   * threadのsummaryは投稿から計算した集計で、実APIと同じ約束を持つ:
+   * messageCountはtombstoneを除いた件数、lastMessage/lastMessageAtは残って
+   * いる最新の投稿、latestSeqはtombstoneも含めたplaceのlast_seq。ここを
+   * 更新しないと、mockでは投稿しても一覧とchipが「0件」のままになる。
+   */
+  private reprojectThread(place: Place): void {
+    if (place.kind !== "thread") return;
+    const thread = this.threads.get(place.threadId);
+    if (!thread) return;
+    const messages = this.history.get(placeKey(place)) ?? [];
+    const live = messages.filter((message) => !message.deleted);
+    const latest = live[live.length - 1];
+    thread.messageCount = live.length;
+    thread.lastMessage = latest ? latest.content.slice(0, 120) : "";
+    thread.lastMessageAt = latest ? latest.createdAt : null;
+    thread.latestSeq = messages[messages.length - 1]?.seq ?? 0;
   }
 
   /**
