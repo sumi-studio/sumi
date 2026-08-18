@@ -1,18 +1,31 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlaceKey } from "../model";
 import { bindMessagingSessionIdentity, useMessaging } from "../store";
 import { MessagingScreen } from "./messaging-screen";
+
+const mocks = vi.hoisted(() => ({ placeNavigate: vi.fn() }));
 
 vi.mock("../../shell/app-rail", () => ({
   AppRail: () => <div data-testid="app-rail" />,
 }));
 
 vi.mock("../place-route", () => ({
-  usePlaceNavigate: () => vi.fn(),
+  usePlaceNavigate: () => mocks.placeNavigate,
+}));
+
+vi.mock("./message-search", () => ({
+  MessageSearch: ({ onJump }: { onJump: (jump: unknown) => void }) => (
+    <button
+      type="button"
+      onClick={() => onJump({ placeKey: CHANNEL_B, seq: 1 })}
+    >
+      jump to old result
+    </button>
+  ),
 }));
 
 vi.mock("./sidebar", () => ({
@@ -38,6 +51,7 @@ const CHANNEL_A: PlaceKey = "channel:channel-a";
 const CHANNEL_B: PlaceKey = "channel:channel-b";
 const realInit = useMessaging.getState().init;
 const realSelectPlace = useMessaging.getState().selectPlace;
+const realLoadPlaceAround = useMessaging.getState().loadPlaceAround;
 
 function seedCurrentPlace() {
   useMessaging.setState({
@@ -103,7 +117,12 @@ describe("MessagingScreen route-owned current place", () => {
 
   afterEach(() => {
     cleanup();
-    useMessaging.setState({ init: realInit, selectPlace: realSelectPlace });
+    mocks.placeNavigate.mockReset();
+    useMessaging.setState({
+      init: realInit,
+      selectPlace: realSelectPlace,
+      loadPlaceAround: realLoadPlaceAround,
+    });
     bindMessagingSessionIdentity(null);
   });
 
@@ -147,6 +166,20 @@ describe("MessagingScreen route-owned current place", () => {
     expect(screen.getByTestId("sidebar-selection")).toHaveTextContent(
       "unselected",
     );
+  });
+
+  it("loads an old search result only after its route has selected and held the place", () => {
+    const loadPlaceAround = vi.fn();
+    useMessaging.setState({ loadPlaceAround });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    expect(mocks.placeNavigate).toHaveBeenCalledWith(CHANNEL_B);
+    expect(loadPlaceAround).not.toHaveBeenCalled();
+
+    view.rerender(<MessagingScreen placeKey={CHANNEL_B} />);
+    expect(useMessaging.getState().activePlaceKey).toBe(CHANNEL_B);
+    expect(loadPlaceAround).toHaveBeenCalledWith(CHANNEL_B, 1);
   });
 
   it("opens a known thread route with its parent channel context", () => {

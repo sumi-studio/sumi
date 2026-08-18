@@ -115,6 +115,11 @@ func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
 		t.Fatalf("create thread: %v", err)
 	}
 	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "この枝をあとで見ます")
+	ownerMarker, _, err := owner.CreateReplyLater(
+		ctx, thread.Place.PlaceID, message.MessageID, "owner only", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("create owner's thread marker: %v", err)
+	}
 
 	viewer := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
 	if _, err := viewer.ThreadFor(ctx, thread.Place.PlaceID); err != nil {
@@ -139,7 +144,7 @@ func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
 	}
 	markers := body["reply_later_markers"].([]any)
 	if len(markers) != 1 || markers[0].(map[string]any)["marker_id"] != markerID {
-		t.Fatalf("bootstrap markers = %v, want durable thread marker %v", markers, markerID)
+		t.Fatalf("bootstrap markers = %v, want only viewer marker %v (not owner marker %s)", markers, markerID, ownerMarker.MarkerID)
 	}
 	place := markers[0].(map[string]any)["place"].(map[string]any)
 	if place["thread_id"] != thread.Place.PlaceID {

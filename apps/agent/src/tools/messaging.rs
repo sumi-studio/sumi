@@ -1380,7 +1380,7 @@ impl MessagingTool {
             }.map_err(map_messaging_api_error)?,
             BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let response = tokio::select! {
+                let mut response = tokio::select! {
                     _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.create_thread(scope, CreateMessagingThreadRequest {
                         parent_place_id: &parent_place_id,
@@ -1393,42 +1393,70 @@ impl MessagingTool {
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?
                     .to_owned();
+                let response_object = response.as_object_mut().ok_or_else(|| ToolError::Protocol(
+                    "Messaging create_thread response is not an object".to_owned(),
+                ))?;
                 // Creating a thread opens it (契約: 作成後にそのthreadを現在の
-                // viewとして開く). A new thread is not necessarily empty by the
-                // time this response arrives — someone else can already have
-                // posted into it — so the view comes from an open screen, never
-                // from the assumption that there is nothing to see.
-                let opened = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.open(scope, OpenMessagingPlaceRequest {
+                // viewとして開く). This happens after the create commit, though:
+                // an open failure or cancellation must not turn the committed
+                // creation into an apparent failure that invites a duplicate.
+                // Retry once in this call, then return an explicit resumable
+                // partial success with the durable thread_id.
+                let open_created_thread = || async {
+                    self.api.open(scope, OpenMessagingPlaceRequest {
                         place_id: &thread_id,
                         before_seq: None,
                         limit: None,
-                    }) => result,
-                }.map_err(map_messaging_api_error)?;
-                let admission = validate_open_response(&opened, &thread_id, None, None)?;
-                state.focused_place_id = Some(thread_id.clone());
-                state.visible_messages = admission.visible_messages;
-                if let Some(seq) = admission.read_through_seq {
-                    record_pending_read_through(state, &thread_id, seq);
-                    if matches!(execution.post_commit_mode, PostCommitMode::ReturnLiveHook) {
-                        live_post_commit = Some(read_through_post_commit(
-                            self.api.clone(),
-                            scope.clone(),
-                            view.clone(),
-                            thread_id.clone(),
-                            seq,
-                        ));
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)
+                    .and_then(|opened| {
+                        validate_open_response(&opened, &thread_id, None, None)
+                            .map(|admission| (opened, admission))
+                    })
+                };
+                let first_open = tokio::select! {
+                    _ = execution.cancel.cancelled() => Err(ToolError::Cancelled),
+                    result = open_created_thread() => result,
+                };
+                let opened = match first_open {
+                    Ok(opened) => Ok(opened),
+                    Err(first_error) => match tokio::select! {
+                        _ = execution.cancel.cancelled() => Err(ToolError::Cancelled),
+                        result = open_created_thread() => result,
+                    } {
+                        Ok(opened) => Ok(opened),
+                        Err(retry_error) => Err((first_error, retry_error)),
+                    },
+                };
+                match opened {
+                    Ok((opened, admission)) => {
+                        state.focused_place_id = Some(thread_id.clone());
+                        state.visible_messages = admission.visible_messages;
+                        if let Some(seq) = admission.read_through_seq {
+                            record_pending_read_through(state, &thread_id, seq);
+                            if matches!(execution.post_commit_mode, PostCommitMode::ReturnLiveHook) {
+                                live_post_commit = Some(read_through_post_commit(
+                                    self.api.clone(),
+                                    scope.clone(),
+                                    view.clone(),
+                                    thread_id.clone(),
+                                    seq,
+                                ));
+                            }
+                        }
+                        response_object.insert("open".to_owned(), opened);
+                    }
+                    Err((first_error, retry_error)) => {
+                        response_object.insert("open_status".to_owned(), Value::String("pending".to_owned()));
+                        response_object.insert(
+                            "open_error".to_owned(),
+                            Value::String(format!(
+                                "thread was created but opening it failed twice: {first_error}; retry: {retry_error}"
+                            )),
+                        );
                     }
                 }
-                let mut response = response;
-                // The created thread and the screen it opened are one result.
-                response
-                    .as_object_mut()
-                    .ok_or_else(|| ToolError::Protocol(
-                        "Messaging create_thread response is not an object".to_owned(),
-                    ))?
-                    .insert("open".to_owned(), opened);
                 response
             }
             BoundMessagingAction::Write {
@@ -3176,6 +3204,12 @@ mod tests {
                 .lock()
                 .await
                 .push(format!("open:{}", request.place_id));
+            let mut failures = self.failures.lock().await;
+            if failures.front() == Some(&"open") {
+                failures.pop_front();
+                return Err(anyhow!("open failed"));
+            }
+            drop(failures);
             if let Some(response) = self.open_responses.lock().await.pop_front() {
                 return Ok(response);
             }
@@ -4795,6 +4829,58 @@ mod tests {
         assert_eq!(reacts[0].0, "th-1");
         assert_eq!(reacts[0].1, "m2");
         assert!(api.calls.lock().await.contains(&"read:th-1".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn thread_creation_returns_the_committed_thread_when_open_cannot_resume() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-parent",
+        )
+        .await
+        .expect("open parent");
+        default_state(&tool).await.pending_read_through.clear();
+        api.failures.lock().await.extend(["open", "open"]);
+
+        let created = execute(
+            &tool,
+            json!({"action": "create_thread", "name": "認証リダイレクト"}),
+            "create-partial",
+        )
+        .await
+        .expect("a committed thread is a partial success, not a tool error");
+
+        assert_eq!(created.details["thread_id"], "th-1");
+        assert_eq!(created.details["open_status"], "pending");
+        assert!(
+            created.details["open_error"]
+                .as_str()
+                .is_some_and(|message| message.contains("thread was created"))
+        );
+        assert_eq!(api.threads.lock().await.len(), 1);
+        assert_eq!(
+            api.calls.lock().await.as_slice(),
+            &[
+                "open:general".to_owned(),
+                "create_thread:general".to_owned(),
+                "open:th-1".to_owned(),
+                "open:th-1".to_owned(),
+            ]
+        );
+
+        // The returned durable id lets the caller resume the missing view
+        // update. It must not issue another create with a fresh nonce.
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": created.details["thread_id"]}),
+            "resume-open",
+        )
+        .await
+        .expect("resume opening the committed thread");
+        assert_eq!(api.threads.lock().await.len(), 1);
     }
 
     #[tokio::test]

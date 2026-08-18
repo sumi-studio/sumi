@@ -524,12 +524,21 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     (jump: PendingJump) => {
       placeNavigate(jump.placeKey);
       setPendingJump(jump);
-      if (jump.seq !== undefined) {
-        void loadPlaceAround(jump.placeKey, jump.seq);
-      }
     },
-    [placeNavigate, loadPlaceAround],
+    [placeNavigate],
   );
+
+  // Route selection creates a history hold synchronously. A jump to an old
+  // result therefore starts only after that selection, never from requestJump.
+  useEffect(() => {
+    if (
+      pendingJump?.seq === undefined ||
+      activePlaceKey !== pendingJump.placeKey
+    ) {
+      return;
+    }
+    void loadPlaceAround(pendingJump.placeKey, pendingJump.seq);
+  }, [pendingJump, activePlaceKey, loadPlaceAround]);
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。
   useEffect(() => {
