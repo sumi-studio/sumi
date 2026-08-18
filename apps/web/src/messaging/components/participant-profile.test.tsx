@@ -88,6 +88,8 @@ function setMembers() {
         status: "busy",
         note: "設計中",
         expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
       },
     },
     startDM,
@@ -493,9 +495,10 @@ describe("Sidebar のプロフィール導線", () => {
     renderSidebar();
 
     fireEvent.click(screen.getByRole("button", { name: "余白 対応可能" }));
-    fireEvent.click(screen.getByRole("radio", { name: /取り込み中/ }));
+    fireEvent.click(screen.getByRole("button", { name: "取り込み中" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "解除するまで" }));
 
-    expect(setStatus).toHaveBeenCalledWith("busy", "取り込み中");
+    expect(setStatus).toHaveBeenCalledWith("busy", "", null);
     expect(screen.queryByText("創業・デザイン")).not.toBeInTheDocument();
   });
 
@@ -525,7 +528,7 @@ describe("Sidebar のプロフィール導線", () => {
     );
 
     expect(
-      screen.getByRole("dialog", { name: "この場所の通知設定" }),
+      screen.getByRole("menu", { name: "この場所のメニュー" }),
     ).toBeInTheDocument();
   });
 
@@ -535,8 +538,11 @@ describe("Sidebar のプロフィール導線", () => {
     allowNotifications();
     renderSidebar();
 
-    fireEvent.click(screen.getAllByRole("button", { name: "通知設定" })[0]);
-    const panel = screen.getByRole("dialog", { name: "この場所の通知設定" });
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: /通知設定/ }));
+    const panel = screen.getByRole("menu", { name: "通知設定" });
     const target = within(panel).getByText("メンションのみ");
     const event = createEvent.contextMenu(target);
     fireEvent(target, event);

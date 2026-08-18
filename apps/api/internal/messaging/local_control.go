@@ -437,21 +437,26 @@ func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorizat
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if len(request.Participants) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request")
-		return
-	}
-	others := make([]ParticipantRef, 0, len(request.Participants))
+	requested := make([]ParticipantRef, 0, len(request.Participants))
 	for _, wire := range request.Participants {
 		ref, err := wire.ref()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_participant")
 			return
 		}
-		others = append(others, ref)
+		requested = append(requested, ref)
 	}
 	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
 	if !ok {
+		return
+	}
+	others, normalizeErr := normalizeDMOthers(store.Scope.Actor, requested)
+	if normalizeErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	var (
