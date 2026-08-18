@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -556,5 +557,129 @@ func TestLocalUploadReleasesLeaseAndReadmitsExactEpoch(t *testing.T) {
 	}
 	if !errors.Is(ctx.Err(), nil) {
 		t.Fatal(ctx.Err())
+	}
+}
+
+// TestAttachmentDraftSpoilerAltAndEditWindow covers「送る前だけ」の編集:
+// the uploader's own still-unbound attachment takes a new display name, a
+// description, and the spoiler flag; an unnamed field is left alone; a
+// stranger learns nothing; and the moment the attachment becomes part of a
+// message the edit is refused. Both declarations then travel with every
+// delivery of that message.
+func TestAttachmentDraftSpoilerAltAndEditWindow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f, ts := newAttachmentTestServer(t, ctx)
+	workspace, channel := f.workspaceWithChannel(t, ctx)
+	image := append(append([]byte{}, pngHeader...), bytes.Repeat([]byte{2}, 64)...)
+
+	resp, body := rawUpload(t, ts, f.humanA.ID, channel.PlaceID, "e-1", "shot.png", "image/png", image, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload: %d %v", resp.StatusCode, body)
+	}
+	att := body["attachment"].(map[string]any)
+	id := att["attachment_id"].(string)
+	// A fresh upload hides nothing and describes nothing.
+	if att["spoiler"] != false || att["alt"] != "" {
+		t.Fatalf("fresh upload: %v", att)
+	}
+	path := "/messaging/attachments/" + id
+	scope := map[string]any{"workspace_id": workspace.WorkspaceID}
+	patch := func(actor string, fields map[string]any) (*http.Response, map[string]any) {
+		t.Helper()
+		merged := map[string]any{}
+		for key, value := range scope {
+			merged[key] = value
+		}
+		for key, value := range fields {
+			merged[key] = value
+		}
+		return call(t, ts, http.MethodPatch, path, actor, merged)
+	}
+
+	// Nobody else may edit it, and learns nothing about its existence.
+	resp, body = patch(f.humanB.ID, map[string]any{"spoiler": true})
+	if resp.StatusCode != http.StatusNotFound || body["error"] != "not_found" {
+		t.Fatalf("stranger patch: %d %v", resp.StatusCode, body)
+	}
+
+	// The uploader covers it and describes it. Control characters in the
+	// description collapse to spaces: it is one paragraph, not a message.
+	resp, body = patch(f.humanA.ID, map[string]any{"spoiler": true, "alt": " 結末の\n一枚 "})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch: %d %v", resp.StatusCode, body)
+	}
+	if body["spoiler"] != true || body["alt"] != "結末の 一枚" || body["filename"] != "shot.png" {
+		t.Fatalf("patched attachment: %v", body)
+	}
+
+	// An unnamed field is「触らない」: renaming keeps the spoiler and the alt.
+	resp, body = patch(f.humanA.ID, map[string]any{"filename": "ending.png"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rename: %d %v", resp.StatusCode, body)
+	}
+	if body["filename"] != "ending.png" || body["spoiler"] != true || body["alt"] != "結末の 一枚" {
+		t.Fatalf("rename dropped the other fields: %v", body)
+	}
+
+	// Naming nothing at all is not an edit, and an oversized description is
+	// refused rather than silently truncated.
+	resp, body = patch(f.humanA.ID, nil)
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("empty patch: %d %v", resp.StatusCode, body)
+	}
+	resp, body = patch(f.humanA.ID, map[string]any{"alt": strings.Repeat("あ", MaxAttachmentAltRunes+1)})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("oversized alt: %d %v", resp.StatusCode, body)
+	}
+
+	// Sent: the declarations ride along with the message.
+	resp, body = call(t, ts, http.MethodPost, "/messaging/places/"+channel.PlaceID+"/messages", f.humanA.ID,
+		map[string]any{"content": "見る?", "client_nonce": "e-send", "attachments": []string{id}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send: %d %v", resp.StatusCode, body)
+	}
+
+	// The recipient's own read of the timeline carries them too.
+	resp, body = call(t, ts, http.MethodGet, "/messaging/places/"+channel.PlaceID+"/messages", f.humanB.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history: %d %v", resp.StatusCode, body)
+	}
+	messages := body["messages"].([]any)
+	received := messages[len(messages)-1].(map[string]any)["attachments"].([]any)
+	if len(received) != 1 {
+		t.Fatalf("received attachments: %v", received)
+	}
+	seen := received[0].(map[string]any)
+	if seen["spoiler"] != true || seen["alt"] != "結末の 一枚" || seen["filename"] != "ending.png" {
+		t.Fatalf("received attachment wire: %v", seen)
+	}
+
+	// After send the window is closed. What was seen was seen.
+	resp, body = patch(f.humanA.ID, map[string]any{"spoiler": false})
+	if resp.StatusCode != http.StatusConflict || body["error"] != "attachment_already_sent" {
+		t.Fatalf("patch after send: %d %v", resp.StatusCode, body)
+	}
+	var stillCovered bool
+	if err := f.store.core.pool.QueryRow(ctx,
+		"SELECT spoiler FROM message_attachments WHERE attachment_id=$1", id).Scan(&stillCovered); err != nil {
+		t.Fatal(err)
+	}
+	if !stillCovered {
+		t.Fatal("a refused edit still changed the durable row")
+	}
+}
+
+func TestSanitizeAttachmentAlt(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"  結末の一枚  ", "結末の一枚"},
+		{"二行の\n説明", "二行の 説明"},
+		{"tab\tここ", "tab ここ"},
+		{"\x00\x7f", ""},
+		{"", ""},
+	} {
+		if got := sanitizeAttachmentAlt(tc.in); got != tc.want {
+			t.Fatalf("sanitizeAttachmentAlt(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

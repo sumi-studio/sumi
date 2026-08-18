@@ -74,6 +74,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
 	mux.HandleFunc("POST /messaging/places/{place_id}/attachments", s.serveUploadAttachment)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
+	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 }
 
 // --- wire shapes (snake_case, ActorRef/PlaceRef-compatible) ---
@@ -1461,6 +1462,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusGone, "attachment_upload_expired")
 	case errors.Is(err, ErrAttachmentUploadRetired):
 		writeError(w, http.StatusGone, "attachment_upload_retired")
+	case errors.Is(err, ErrAttachmentAlreadySent):
+		writeError(w, http.StatusConflict, "attachment_already_sent")
 	case errors.Is(err, ErrTooManyAttachments):
 		writeError(w, http.StatusBadRequest, "too_many_attachments")
 	case errors.Is(err, ErrAttachmentsUnavailable):
