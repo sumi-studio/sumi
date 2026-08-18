@@ -604,6 +604,62 @@ describe("reaction convergence in the messaging store", () => {
       reactions: [{ emoji: "🎉", participants: [self] }],
     });
   });
+
+  it("does not apply a delayed deletion ACK to the replacement session", async () => {
+    const oldHarness = new StubBackend();
+    const deleted = deferred<Message>();
+    oldHarness.deleteMessage = vi.fn(async () => await deleted.promise);
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    const target = {
+      ...message(1, "old session"),
+      author: other,
+      mentions: [self],
+      revision: 1,
+    };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+      lastReadByPlace: { [placeKey]: 0 },
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+    useMessaging.getState().deleteMessage(target.messageId);
+    expect(oldHarness.deleteMessage).toHaveBeenCalledOnce();
+
+    bindMessagingSessionIdentity("reaction-test-delete-new-session");
+    const newHarness = new StubBackend();
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [{ ...target, content: "new session" }] },
+      lastReadByPlace: { [placeKey]: 0 },
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+
+    deleted.resolve({
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: 2,
+    });
+    await oldHarness.settle();
+
+    expect(useMessaging.getState()).toMatchObject({
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ content: "new session", deleted: false });
+  });
 });
 
 const self = { kind: "human", humanId: "human-1" } as const;
@@ -686,7 +742,11 @@ class StubBackend implements MessagingBackend {
   }
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
-    queueMicrotask(() => this.resolveBootstrapped());
+    // Store request fencing validates the response in its own microtask before
+    // applying bootstrap.  Resolve the test readiness marker after that chain.
+    queueMicrotask(() =>
+      queueMicrotask(() => queueMicrotask(() => this.resolveBootstrapped())),
+    );
     return {
       self,
       workspaces: [],
