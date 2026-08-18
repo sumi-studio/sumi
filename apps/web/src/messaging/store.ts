@@ -192,7 +192,13 @@ interface MessagingState {
   hasMoreByPlace: Record<PlaceKey, boolean>;
   loadingOlderByPlace: Record<PlaceKey, boolean>;
   activePlaceKey: PlaceKey | null;
+  /**
+   * 編集セッション。対象IDと書きかけの本文は仮想リストの行の外——ここ——に置く。
+   * 行はいつでもアンマウントされうるので、行ローカルのstateに置くと
+   * スクロールで書きかけが消える。
+   */
   editingMessageId: string | null;
+  editDraft: string;
   replyTargetId: string | null;
   connection: ConnectionState;
   /**
@@ -233,8 +239,10 @@ interface MessagingState {
   retrySend(clientNonce: string): void;
   attachmentURL(attachmentId: string): string;
   startEdit(messageId: string): void;
+  setEditDraft(draft: string): void;
   cancelEdit(): void;
-  submitEdit(content: string): void;
+  /** 編集セッションのドラフトをそのまま送る。引数を取らないのは正本が1つだから。 */
+  submitEdit(): void;
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
@@ -1350,6 +1358,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     loadingOlderByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
+    editDraft: "",
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
@@ -1448,6 +1457,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((state) => ({
         activePlaceKey: key,
         editingMessageId: null,
+        editDraft: "",
         replyTargetId: null,
         unreadLineByPlace: {
           ...state.unreadLineByPlace,
@@ -1469,6 +1479,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set({
         activePlaceKey: null,
         editingMessageId: null,
+        editDraft: "",
         replyTargetId: null,
       });
     },
@@ -1792,22 +1803,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     startEdit(messageId) {
-      set({ editingMessageId: messageId, replyTargetId: null });
+      const state = get();
+      const key = state.activePlaceKey;
+      const message = key
+        ? (state.messagesByPlace[key] ?? []).find(
+            (entry) => entry.messageId === messageId,
+          )
+        : undefined;
+      if (!message) return;
+      set({
+        editingMessageId: messageId,
+        editDraft: message.content,
+        replyTargetId: null,
+      });
+    },
+
+    setEditDraft(draft) {
+      if (get().editingMessageId === null) return;
+      set({ editDraft: draft });
     },
 
     cancelEdit() {
-      set({ editingMessageId: null });
+      set({ editingMessageId: null, editDraft: "" });
     },
 
-    submitEdit(content) {
+    submitEdit() {
       const state = get();
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       const messageId = state.editingMessageId;
-      const trimmed = content.trim();
+      const trimmed = state.editDraft.trim();
       if (!key || !place || !messageId) return;
       if (trimmed) void backend.editMessage(place, messageId, trimmed);
-      set({ editingMessageId: null });
+      set({ editingMessageId: null, editDraft: "" });
     },
 
     deleteMessage(messageId) {
@@ -1820,7 +1848,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     setReplyTarget(messageId) {
-      set({ replyTargetId: messageId, editingMessageId: null });
+      set({ replyTargetId: messageId, editingMessageId: null, editDraft: "" });
     },
 
     noteReadUpTo(key, seq) {
@@ -2117,6 +2145,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     loadingOlderByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
+    editDraft: "",
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,

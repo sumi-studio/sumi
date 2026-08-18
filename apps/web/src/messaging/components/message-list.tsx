@@ -81,6 +81,8 @@ export function MessageList({
   const startEdit = useMessaging((state) => state.startEdit);
   const submitEdit = useMessaging((state) => state.submitEdit);
   const cancelEdit = useMessaging((state) => state.cancelEdit);
+  const editDraft = useMessaging((state) => state.editDraft);
+  const setEditDraft = useMessaging((state) => state.setEditDraft);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
@@ -105,6 +107,15 @@ export function MessageList({
   const highlightTimer = useRef<number | null>(null);
   const visibleIdsRef = useRef<string[]>([]);
   const positionedPlaceRef = useRef<string | null>(null);
+  // 入室直後の位置決めは数フレームに分けて再適用される。その間に別の
+  // 意図的な移動（編集の対象へ運ぶ等）が入ったら、残りの再適用は取り下げる。
+  const positioningTimersRef = useRef<number[]>([]);
+  const abandonInitialPositioning = useCallback(() => {
+    for (const timer of positioningTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    positioningTimersRef.current = [];
+  }, []);
 
   const rows = useMemo(() => {
     if (!messages || !self) return [];
@@ -235,8 +246,10 @@ export function MessageList({
     for (const delay of [0, 120, 300]) {
       timers.push(window.setTimeout(apply, delay));
     }
+    positioningTimersRef.current = timers;
     return () => {
       for (const timer of timers) window.clearTimeout(timer);
+      positioningTimersRef.current = [];
       // StrictModeの二重マウントで未発火のままcleanupされた場合は
       // ガードを解除し、再マウント側で位置決めをやり直せるようにする。
       if (!applied && positionedPlaceRef.current === activePlaceKey) {
@@ -244,6 +257,18 @@ export function MessageList({
       }
     };
   }, [activePlaceKey, rows]);
+
+  // 編集は対象行の位置で起きる。仮想リストは見えている範囲しか行を作らないので、
+  // 画面外のメッセージを編集し始めると編集欄がどこにも現れない。開始と同時に
+  // 対象まで運ぶ（「描画済みの行だけ編集できる」は使う側の期待に反する）。
+  useEffect(() => {
+    if (!editingMessageId) return;
+    abandonInitialPositioning();
+    virtualizerRef.current?.scrollToMessage(editingMessageId, {
+      align: "center",
+      behavior: "auto",
+    });
+  }, [editingMessageId, abandonInitialPositioning]);
 
   // 最下部にいるときだけ新着へ自動追従する（読んでいる視点は奪わない）。
   const lastRowId = rows.length > 0 ? rows[rows.length - 1].id : null;
@@ -379,6 +404,8 @@ export function MessageList({
             onRevealAttachment={onRevealAttachment}
             onOpenImage={onOpenImage}
             editing={editingMessageId === row.message.messageId}
+            editDraft={editDraft}
+            onEditDraftChange={setEditDraft}
             onSubmitEdit={submitEdit}
             onCancelEdit={cancelEdit}
           />
@@ -388,6 +415,8 @@ export function MessageList({
     [
       highlightedId,
       editingMessageId,
+      editDraft,
+      setEditDraft,
       submitEdit,
       cancelEdit,
       selfKey,
