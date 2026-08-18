@@ -242,6 +242,9 @@ pub(crate) enum ProviderReviewOperation {
     ReplyLater,
     ResolveReplyLater,
     GetCallState,
+    Search,
+    NotificationSettings,
+    Attention,
     ReadFile,
     ListDir,
     Glob,
@@ -415,9 +418,18 @@ fn provider_review_operation(
             "resolve_reply_later",
             Mutate,
         ) => Operation::ResolveReplyLater,
-        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "get_call_state", Read) => {
-            Operation::GetCallState
+        (
+            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            "get_call_state",
+            Read,
+        ) => Operation::GetCallState,
+        (Identity::MessagingV3, "search", Read) => Operation::Search,
+        // 何も名指さない問い合わせは読み、一つでも名指せば変更。同じ操作名で
+        // 両方の資格を持つのはこれだけなので、語彙も両方を明示する。
+        (Identity::MessagingV3, "notification_settings", Read | Mutate) => {
+            Operation::NotificationSettings
         }
+        (Identity::MessagingV3, "attention", Mutate) => Operation::Attention,
         (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
         (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
         (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
