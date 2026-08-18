@@ -86,6 +86,12 @@ function ImageAttachment({
       <button
         type="button"
         onClick={() => (covered ? setRevealed(true) : onOpen())}
+        onKeyDown={(event) => {
+          if (covered && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault();
+            setRevealed(true);
+          }
+        }}
         aria-label={
           covered
             ? `${label}のネタバレを開く`
@@ -96,9 +102,25 @@ function ImageAttachment({
             ? "ネタバレ。クリックで表示"
             : `${attachment.filename}（${formatAttachmentSize(attachment.sizeBytes)}）`
         }
-        className="block overflow-hidden rounded-lg border border-border bg-muted/40"
+        className={`block overflow-hidden rounded-lg border border-border bg-muted/40 ${
+          covered
+            ? "flex min-h-28 min-w-48 flex-col items-center justify-center gap-1 px-3 text-center"
+            : ""
+        }`}
       >
-        {covered ? null : (
+        {covered ? (
+          <>
+            <span className="flex items-center gap-1 rounded-full bg-background/85 px-2 py-0.5 font-medium text-[12px]">
+              <EyeOff className="size-3.5" />
+              ネタバレ
+            </span>
+            {attachment.alt ? (
+              <span className="max-w-[80%] truncate rounded bg-background/70 px-1.5 text-[11px] text-muted-foreground">
+                {attachment.alt}
+              </span>
+            ) : null}
+          </>
+        ) : (
           <img
             src={href}
             alt={label}
@@ -109,19 +131,6 @@ function ImageAttachment({
           />
         )}
       </button>
-      {covered ? (
-        <span className="flex min-h-28 min-w-48 flex-col items-center justify-center gap-1 px-3 text-center">
-          <span className="flex items-center gap-1 rounded-full bg-background/85 px-2 py-0.5 font-medium text-[12px]">
-            <EyeOff className="size-3.5" />
-            ネタバレ
-          </span>
-          {attachment.alt ? (
-            <span className="max-w-[80%] truncate rounded bg-background/70 px-1.5 text-[11px] text-muted-foreground">
-              {attachment.alt}
-            </span>
-          ) : null}
-        </span>
-      ) : null}
       {!covered && attachment.alt ? (
         <p className="mt-0.5 max-w-full truncate text-[11px] text-muted-foreground">
           {attachment.alt}

@@ -140,13 +140,18 @@
   "mime": "サーバーがバイト先頭を sniff して決めた型",
   "size_bytes": 12345,
   "sha256": "<hex>",
-  "position": 0
+  "position": 0,
+  "spoiler": false,
+  "alt": "中身を見なくても何のファイルか分かる説明"
 }
 ```
 
 - `Message.attachments` は送信者が選んだ順序で最大 10 件。1 ファイルは最大 20 MiB。
   `content` が空でも attachments が 1 件以上あれば有効なメッセージである
   （DB の deferred trigger が同じ規則を commit 時に強制する）。
+- `spoiler` は受信側が開くまで inline 画像を覆う送信者の宣言であり、必ず boolean として
+  wire に載せる。`alt` は中身を見ずに分かる説明で、空文字を「説明なし」とし、最大
+  1,000 code point（DB 上は最大 4,000 UTF-8 bytes）を必ず string として wire に載せる。
 - upload は message より先に行い、`POST /messaging/places/{place_id}/attachments`
   に生バイトを送る。メタデータは header で運ぶ: `Idempotency-Key`（ファイルごとに
   安定な nonce）、`Content-Length`（宣言サイズ・必須）、`Content-Type`（ヒント）、

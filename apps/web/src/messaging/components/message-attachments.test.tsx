@@ -134,12 +134,28 @@ describe("Attachment spoiler and viewer", () => {
     const cover = screen.getByRole("button", {
       name: "結末の一枚のネタバレを開く",
     });
+    expect(cover).toHaveClass("min-h-28", "min-w-48");
     fireEvent.click(cover);
     expect(screen.getByRole("img", { name: "結末の一枚" })).toHaveAttribute(
       "src",
       `/mock/attachments/${SPOILER.attachmentId}`,
     );
     // 開いても本体を開くのは次のクリック。1クリックでビューアーまで飛ばない。
+    expect(screen.queryByTestId("image-viewer")).toBeNull();
+  });
+
+  it("reveals a spoilered image with Enter", () => {
+    bindMessagingSessionIdentity("human-self");
+    installMessagingBackend(new MockMessagingServer());
+    render(<MessageAttachments attachments={[SPOILER]} />);
+    const cover = screen.getByRole("button", {
+      name: "結末の一枚のネタバレを開く",
+    });
+    fireEvent.keyDown(cover, { key: "Enter" });
+    expect(screen.getByRole("img", { name: "結末の一枚" })).toHaveAttribute(
+      "src",
+      `/mock/attachments/${SPOILER.attachmentId}`,
+    );
     expect(screen.queryByTestId("image-viewer")).toBeNull();
   });
 
