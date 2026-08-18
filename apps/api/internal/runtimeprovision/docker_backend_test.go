@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -202,16 +203,30 @@ func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 }
 
 func TestExecCommandRunnerCancelsThroughSupervisorTermTrap(t *testing.T) {
+	// The runner signals the whole process group, so anything this script waits
+	// on in that same group receives SIGTERM at the same moment the shell does.
+	// A same-group `sleep` therefore races the shell's own trap and makes the
+	// assertion below intermittent. Park the blocker in its own session so only
+	// the shell is signalled and the trap is the one thing under test; the trap
+	// reaps it so no detached process outlives the case.
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Fatalf("setsid is required to isolate the blocker from the signalled group: %v", err)
+	}
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
 	termPath := filepath.Join(dir, "term")
+	script := `trap 'printf term >"$TERM_PATH"; kill "$blocker" 2>/dev/null; exit 143' TERM
+setsid sleep 30 &
+blocker=$!
+printf ready >"$READY_PATH"
+wait "$blocker"`
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
 		_, err := (execCommandRunner{terminationGrace: time.Second, pipeWait: 100 * time.Millisecond}).Run(
 			ctx,
 			"/bin/sh",
-			[]string{"-c", `trap 'printf term >"$TERM_PATH"; exit 143' TERM; printf ready >"$READY_PATH"; while :; do sleep 1; done`},
+			[]string{"-c", script},
 			[]string{"PATH=/usr/bin:/bin", "READY_PATH=" + readyPath, "TERM_PATH=" + termPath},
 		)
 		result <- err

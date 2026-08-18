@@ -167,6 +167,7 @@ func (service *Service) Abort(ctx context.Context, request AbortRequest) (Inspec
 	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
 		return Inspection{}, err
 	}
+	service.settleReapedRecovery(entry)
 	if entry.known && entry.phase == PhaseUnknown {
 		return entry.unknownInspection(request.PersonalityAgentID), nil
 	}
@@ -226,6 +227,7 @@ func (service *Service) Stop(ctx context.Context, request StopRequest) (Inspecti
 	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
 		return Inspection{}, err
 	}
+	service.settleReapedRecovery(entry)
 	if entry.known && entry.phase == PhaseUnknown {
 		return entry.unknownInspection(request.PersonalityAgentID), nil
 	}
@@ -300,6 +302,34 @@ func (service *Service) hydrateEntry(ctx context.Context, personalityAgentID str
 func (service *Service) reapReceiptCovers(personalityAgentID string, generation uint64) bool {
 	reaped, ok := service.reaps.lookup(personalityAgentID)
 	return ok && reaped >= generation
+}
+
+// settleReapedRecovery collapses a cached recovery classification whose
+// generation the durable receipt already covers into the observed-empty result
+// it really is.
+//
+// The allocator volume outlives a verified teardown, so the host keeps
+// answering with the retired epoch identity and the supervisor keeps reporting
+// the empty project as recovery. A provisioner that restarts between persisting
+// the receipt and answering its caller would otherwise reject that caller's
+// retry of the teardown it had already completed, and the API would never close
+// the personality agent's local-control listener. Teardown must be idempotent
+// for the epoch a receipt already covers.
+//
+// Only the teardown paths use this. Inspect and Reconcile keep reporting
+// recovery with its epoch, because the API still needs that epoch to fence
+// local control before it asks for a destructive reconciliation.
+func (service *Service) settleReapedRecovery(entry *serviceEntry) {
+	if !entry.known || entry.phase != PhaseRecovery {
+		return
+	}
+	if !service.reapReceiptCovers(entry.epoch.PersonalityAgentID, entry.epoch.Generation) {
+		return
+	}
+	reaped, _ := service.reaps.lookup(entry.epoch.PersonalityAgentID)
+	entry.phase = PhaseUnknown
+	entry.stopped = true
+	entry.recordReap(reaped)
 }
 
 // verifyReapAttestation recomputes a caller's claimed reap receipt against the

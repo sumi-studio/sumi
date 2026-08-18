@@ -805,6 +805,133 @@ func TestSecondSpawnSucceedsAfterAVerifiedStopLeavesTheAllocatorIdentityBehind(t
 	}
 }
 
+// A provisioner that persists the teardown receipt and then restarts before its
+// answer reaches the caller must let that caller retry. The allocator volume
+// outlives the teardown, so the restarted daemon hydrates the personality agent
+// as PhaseRecovery; the durable receipt, not that classification, decides.
+func TestTeardownRetryAfterAProvisionerRestartIsIdempotent(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		teardown func(*Service, PreparedEpoch) (Inspection, error)
+		calls    func(*fakeBackend) int
+	}{
+		{
+			name: "stop",
+			teardown: func(service *Service, epoch PreparedEpoch) (Inspection, error) {
+				return service.Stop(context.Background(), StopRequest{
+					Version: ProtocolVersion, PreparedEpoch: epoch,
+				})
+			},
+			calls: func(backend *fakeBackend) int { return backend.stopCalls[testPAID] },
+		},
+		{
+			name: "abort",
+			teardown: func(service *Service, epoch PreparedEpoch) (Inspection, error) {
+				return service.Abort(context.Background(), AbortRequest{
+					Version: ProtocolVersion, PreparedEpoch: epoch,
+				})
+			},
+			calls: func(backend *fakeBackend) int { return backend.abortCalls[testPAID] },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.identitySurvivesReap = true
+			stateDirectory := filepath.Join(t.TempDir(), "state")
+			first, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+			if err != nil {
+				t.Fatal(err)
+			}
+			epoch, err := first.Prepare(context.Background(), PrepareRequest{
+				Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "spawn-1",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := first.Activate(context.Background(), ActivateRequest{
+				Version: ProtocolVersion, PreparedEpoch: epoch, Activation: testActivationConfig(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// The receipt reaches durable state; the answer never reaches the caller.
+			if _, err := test.teardown(first, epoch); err != nil {
+				t.Fatal(err)
+			}
+			completed := test.calls(backend)
+
+			restarted, err := NewService(backend, ServiceConfig{StateDirectory: stateDirectory})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inspection, err := restarted.Inspect(context.Background(), InspectRequest{
+				Version: ProtocolVersion, PersonalityAgentID: testPAID,
+			}); err != nil || inspection.Phase != PhaseRecovery {
+				t.Fatalf("fixture does not reproduce the surviving identity: %#v %v", inspection, err)
+			}
+
+			retried, err := test.teardown(restarted, epoch)
+			if err != nil {
+				t.Fatalf("%s retry after a provisioner restart was refused: %v", test.name, err)
+			}
+			if retried.Phase != PhaseUnknown {
+				t.Fatalf("%s retry did not report the personality agent reaped: %#v", test.name, retried)
+			}
+			if retried.ReapedThroughGeneration == nil || *retried.ReapedThroughGeneration != epoch.Generation {
+				t.Fatalf("%s retry lost the durable receipt: %#v", test.name, retried)
+			}
+			if test.calls(backend) != completed {
+				t.Fatalf("%s retry re-ran host teardown: %d then %d", test.name, completed, test.calls(backend))
+			}
+			// The retry is also idempotent against the restarted daemon's own cache.
+			if again, err := test.teardown(restarted, epoch); err != nil ||
+				again.ReapedThroughGeneration == nil || *again.ReapedThroughGeneration != epoch.Generation {
+				t.Fatalf("second %s retry diverged: %#v %v", test.name, again, err)
+			}
+		})
+	}
+}
+
+// A recovery the receipt does not cover is a real one: the host still owns
+// processes this daemon never observed leaving, and teardown must stay
+// fail-closed until a fenced reconcile.
+func TestTeardownStillRefusesAnUncoveredRecovery(t *testing.T) {
+	backend := newFakeBackend()
+	service := newTestService(t, backend)
+	epoch, err := service.Prepare(context.Background(), PrepareRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "spawn-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Activate(context.Background(), ActivateRequest{
+		Version: ProtocolVersion, PreparedEpoch: epoch, Activation: testActivationConfig(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The host wrecked the project without this daemon observing an empty one.
+	wrecked := epoch
+	backend.state[testPAID] = Inspection{
+		PersonalityAgentID: testPAID, Phase: PhaseRecovery, Epoch: &wrecked,
+	}
+	restarted, err := NewService(backend, ServiceConfig{StateDirectory: filepath.Join(t.TempDir(), "state")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Stop(context.Background(), StopRequest{
+		Version: ProtocolVersion, PreparedEpoch: epoch,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stop accepted an unattested recovery: %v", err)
+	}
+	if _, err := restarted.Abort(context.Background(), AbortRequest{
+		Version: ProtocolVersion, PreparedEpoch: epoch,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("abort accepted an unattested recovery: %v", err)
+	}
+	if backend.stopCalls[testPAID] != 0 || backend.abortCalls[testPAID] != 0 {
+		t.Fatal("unattested recovery reached host teardown")
+	}
+}
+
 // The runtime consumes ReapedThroughGeneration as a host observation. The
 // provisioner holds the physical record, so it must recompute the caller's
 // claim against that record instead of forwarding whatever the API declares.
