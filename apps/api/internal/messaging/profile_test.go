@@ -2,12 +2,14 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
@@ -271,5 +273,113 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 	resp, body = call(t, ts, http.MethodGet, "/messaging/profile", w.humanA.ID, nil)
 	if resp.StatusCode != http.StatusOK || body["display_name"] != "余白" || body["tagline"] != "開発" {
 		t.Fatalf("profile after refusals: status %d body %v", resp.StatusCode, body)
+	}
+}
+
+// The PersonalityAgent's 名乗り travels its own transport, but it meets the
+// Human's contract: the same store method, the same wire, the same refusals,
+// and the same participant-scoped event to everyone who can see it. Without a
+// route on this lane the parity SetProfile claims would be a comment only.
+func TestLocalProfileGivesTheAgentTheSameSelfDeclarationAsAHuman(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	server.Hub = NewHub(w.store.core)
+	watcher := server.Hub.subscribe(w.store.mustScopeForActor(t, ctx, w.humanB))
+	t.Cleanup(func() { server.Hub.unsubscribe(watcher) })
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+
+	// Naming no field is a read, the same shape the notification-setting lane
+	// already gives the agent.
+	status, body := callLocal(t, ctx, server.localProfile, LocalProfilePath,
+		map[string]any{}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("agent profile read: status %d body %v", status, body)
+	}
+	if got := body["profile"].(map[string]any); got["display_name"] != "Kuro" || got["tagline"] != "" {
+		t.Fatalf("agent profile read = %v", got)
+	}
+
+	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath, map[string]any{
+		"display_name": "クロ", "tagline": "調べもの",
+	}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("agent names itself: status %d body %v", status, body)
+	}
+	declared := body["profile"].(map[string]any)
+	participant := declared["participant"].(map[string]any)
+	if participant["kind"] != "personality_agent" || participant["personality_agent_id"] != w.agent.ID {
+		t.Fatalf("agent profile participant = %v", participant)
+	}
+	if declared["display_name"] != "クロ" || declared["tagline"] != "調べもの" {
+		t.Fatalf("agent profile = %v", declared)
+	}
+
+	// The same participant-scoped event the Human lane publishes, carrying no
+	// place, reaches a Human who can see the agent.
+	select {
+	case raw := <-watcher.send:
+		var frame struct {
+			Event Event `json:"event"`
+		}
+		if err := json.Unmarshal(raw.payload, &frame); err != nil {
+			t.Fatalf("decode agent profile event: %v", err)
+		}
+		if frame.Event.Type != EventProfileUpdated || frame.Event.PlaceID != "" {
+			t.Fatalf("agent profile event = %+v", frame.Event)
+		}
+		if frame.Event.Profile == nil || frame.Event.Profile.DisplayName != "クロ" ||
+			frame.Event.Profile.Tagline != "調べもの" {
+			t.Fatalf("agent profile event payload = %+v", frame.Event.Profile)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent's 名乗り never reached the Human who can see it")
+	}
+
+	// Naming one field preserves the other, exactly as the REST PUT does.
+	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath,
+		map[string]any{"tagline": "散歩中"}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("agent tagline only: status %d body %v", status, body)
+	}
+	if got := body["profile"].(map[string]any); got["display_name"] != "クロ" || got["tagline"] != "散歩中" {
+		t.Fatalf("agent tagline only = %v", got)
+	}
+
+	// One validation, so this lane is not the looser one.
+	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath,
+		map[string]any{"tagline": strings.Repeat("あ", MaxTaglineChars+1)}, authorization)
+	if status != http.StatusBadRequest || body["error"] != "invalid_tagline" {
+		t.Fatalf("agent overlong tagline: status %d body %v", status, body)
+	}
+	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath,
+		map[string]any{"display_name": "  "}, authorization)
+	if status != http.StatusBadRequest || body["error"] != "invalid_display_name" {
+		t.Fatalf("agent blank display name: status %d body %v", status, body)
+	}
+
+	// Self-declaration only: there is no field for naming anybody else, so the
+	// attempt is refused by the wire itself rather than by a permission check.
+	status, body = callLocal(t, ctx, server.localProfile, LocalProfilePath, map[string]any{
+		"participant": map[string]any{"kind": "human", "human_id": w.humanB.ID},
+		"tagline":     "他人の名乗り",
+	}, authorization)
+	if status != http.StatusBadRequest {
+		t.Fatalf("naming another participant: status %d body %v", status, body)
+	}
+
+	// Nothing the refusals touched was written, and a Human reads the agent's
+	// 名乗り from the ordinary member list rather than from a second route.
+	members, err := w.store.WorkspaceMemberProfiles(ctx, workspace.WorkspaceID, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := profileOf(t, members, w.agent); got.DisplayName != "クロ" || got.Tagline != "散歩中" {
+		t.Fatalf("agent seen by a Human = %+v", got)
+	}
+	if got := profileOf(t, members, w.humanB); got.Tagline != "" {
+		t.Fatalf("the agent's request altered another participant: %+v", got)
 	}
 }

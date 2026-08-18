@@ -29,6 +29,10 @@ const (
 	// uses for a Human. This adapter route does not itself define which agent
 	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
+	// LocalProfilePath reads and writes the same self-declared 名乗り
+	// (display name + tagline) for a PersonalityAgent that the Human settings
+	// screen writes for a Human, through the identical ScopedStore path.
+	LocalProfilePath = "/local-control/v1/messaging:profile"
 	// LocalUploadAttachmentPattern is the PAID-local raw-body upload route. The
 	// exact Messaging scope travels in headers because the body is the file.
 	LocalUploadAttachmentPattern = "/local-control/v1/messaging/places/{place_id}/attachments"
@@ -76,6 +80,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
+		{"POST " + LocalProfilePath, s.localProfile},
 		{"POST " + LocalAttachmentPath, s.localAttachment},
 	}
 	if s.Calls != nil {
@@ -554,6 +559,48 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
+}
+
+// localProfile reads or updates the agent's own 名乗り — its display name and
+// tagline — through the identical store path the Human settings screen uses.
+// Like notification settings a request with no field set is a read, and a named
+// field changes only that field, so an agent that renames itself cannot
+// silently clear its own tagline. The rules for what a name and a tagline may
+// be live in ScopedStore.SetProfile alone; this lane adds none of its own, so
+// Human and PersonalityAgent cannot drift apart.
+func (s *Server) localProfile(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		DisplayName *string `json:"display_name,omitempty"`
+		Tagline     *string `json:"tagline,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	if request.DisplayName == nil && request.Tagline == nil {
+		profile, err := store.Profile(r.Context())
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Profile memberWire `json:"profile"`
+		}{memberToWire(profile)})
+		return
+	}
+	profile, err := store.SetProfile(r.Context(), request.DisplayName, request.Tagline)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishProfile(r.Context(), store, profile)
+	writeJSON(w, http.StatusOK, struct {
+		Profile memberWire `json:"profile"`
+	}{memberToWire(profile)})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

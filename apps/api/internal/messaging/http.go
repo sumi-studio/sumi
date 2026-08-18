@@ -1223,10 +1223,6 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Tagline != nil && utf8.RuneCountInString(*req.Tagline) > MaxTaglineChars {
-		writeError(w, http.StatusBadRequest, "invalid_tagline")
-		return
-	}
 	var profile MemberProfile
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
