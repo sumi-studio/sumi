@@ -505,11 +505,10 @@ func (s *Server) RunStatusExpiry(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// sweepExpiredStatuses announces each lapse from inside the transaction that
-// produced it, while that row is still locked. A participant who declares
-// something new in the meantime leaves nothing to lapse, so nothing is said
-// about them; one who declares afterwards is waiting at the same row lock and
-// therefore cannot be overtaken by this announcement.
+// sweepExpiredStatuses publishes each lapse only after its transaction commits.
+// A participant who declares something new before the sweep leaves nothing to
+// lapse; one who declares afterwards carries a greater database revision, which
+// recipients keep even if this best-effort expiry frame arrives later.
 func (s *Server) sweepExpiredStatuses(ctx context.Context) {
 	announce := func(ctx context.Context, expiry StatusExpiry) {
 		if s.Hub == nil {

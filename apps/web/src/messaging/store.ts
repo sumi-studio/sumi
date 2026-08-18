@@ -1033,11 +1033,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const { channel, dm } = event;
       set((state) => {
         if (channel) {
-          return state.channels.some(
+          const index = state.channels.findIndex(
             (entry) => entry.channelId === channel.channelId,
-          )
-            ? {}
-            : { channels: [...state.channels, channel] };
+          );
+          const next = applyNewer(state.channels[index], channel);
+          if (next === state.channels[index]) return {};
+          if (index < 0) return { channels: [...state.channels, next] };
+          const channels = [...state.channels];
+          channels[index] = next;
+          return { channels };
         }
         if (dm) {
           return state.dms.some((entry) => entry.dmId === dm.dmId)
@@ -1054,8 +1058,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const index = state.channels.findIndex(
           (entry) => entry.channelId === channel.channelId,
         );
-        if (index < 0) return {};
         const next = applyNewer(state.channels[index], channel);
+        if (index < 0) return { channels: [...state.channels, next] };
         if (next === state.channels[index]) return {};
         const channels = [...state.channels];
         channels[index] = next;
@@ -1608,8 +1612,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const index = state.channels.findIndex(
           (entry) => entry.channelId === channel.channelId,
         );
-        if (index < 0) return {};
         const next = applyNewer(state.channels[index], channel);
+        if (index < 0) return { channels: [...state.channels, next] };
         if (next === state.channels[index]) return {};
         const channels = [...state.channels];
         channels[index] = next;
