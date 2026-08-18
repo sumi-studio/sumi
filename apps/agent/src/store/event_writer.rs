@@ -1870,6 +1870,25 @@ impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
     }
 }
 
+impl BootstrapRecoveryGuard<'_> {
+    /// Commit a physical recovery receipt together with everything its intent
+    /// resolution makes necessary, without releasing this guard. The suffix has
+    /// to be planned under the same held gate that will commit it, so boot
+    /// cannot reach `EventWriter::apply_physical_recovery` (which takes the gate
+    /// itself) without splitting the single required transaction.
+    pub(in crate::store) async fn apply_physical_recovery_batch(
+        &mut self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
+        batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        self.writer
+            .apply_physical_recovery_locked(lease, fence, receipt, batch, &mut self.state)
+            .await
+    }
+}
+
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
     admission_open: bool,
@@ -2750,7 +2769,29 @@ impl EventWriter {
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
         receipt: PhysicalRecoveryReceipt,
+        batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        // Idempotency is decided inside the same SQLite transaction as the
+        // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
+        // Reading `already_present` outside the transaction would create a TOCTOU
+        // window where two callers could both observe the receipt as new.
+        let mut guard = self.gate.lock().await;
+        self.apply_physical_recovery_locked(lease, fence, receipt, batch, &mut guard)
+            .await
+    }
+
+    /// Same commit as `apply_physical_recovery`, for a caller that already owns
+    /// the bootstrap recovery guard. Boot needs this because the logical suffix
+    /// this batch carries can only be planned while the writer gate is held, and
+    /// planning it through a second acquisition would split the one transaction
+    /// the receipt contract requires.
+    async fn apply_physical_recovery_locked(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
         mut batch: EventBatch,
+        guard: &mut MutexGuard<'_, WriterState>,
     ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
         lease
             .validate_exact(
@@ -2780,18 +2821,13 @@ impl EventWriter {
                 projections: vec![Projection::PhysicalRecovery(receipt.clone())],
             });
         }
-        // Idempotency is decided inside the same SQLite transaction as the
-        // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
-        // Reading `already_present` outside the transaction would create a TOCTOU
-        // window where two callers could both observe the receipt as new.
-        let mut guard = self.gate.lock().await;
         let context = PhysicalRecoveryContext {
             lease,
             fence,
             receipt: &receipt,
         };
         let outcome = self
-            .apply_locked_with_failpoint(batch, None, None, Some(context), &mut guard)
+            .apply_locked_with_failpoint(batch, None, None, Some(context), guard)
             .await?;
         let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
             anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
@@ -2809,6 +2845,39 @@ impl EventWriter {
         self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
             .await
             .map(|outcome| outcome.seqs)
+    }
+
+    /// Drive the real boot physical-recovery batch through an abrupt
+    /// transaction failpoint, so a hard kill can be taken on the exact
+    /// transaction production commits.
+    #[cfg(all(test, unix))]
+    pub(in crate::store) async fn apply_boot_physical_recovery_with_abrupt_failpoint(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: &PhysicalRecoveryReceipt,
+        mut batch: EventBatch,
+        name: &str,
+        after_commit: bool,
+        readiness_path: &std::path::Path,
+    ) -> Result<Vec<u64>> {
+        batch.writes.push(EventWrite {
+            event: None,
+            projections: vec![Projection::PhysicalRecovery(receipt.clone())],
+        });
+        let context = PhysicalRecoveryContext {
+            lease,
+            fence,
+            receipt,
+        };
+        self.apply_with_abrupt_transaction_failpoint(
+            batch,
+            name,
+            after_commit,
+            readiness_path,
+            Some(context),
+        )
+        .await
     }
 
     #[cfg(all(test, unix))]
@@ -6756,6 +6825,28 @@ fn validate_command_disposition_pairs(batch: &EventBatch) -> Result<()> {
         bail!("command_disposition events must exactly match terminal command projections");
     }
     Ok(())
+}
+
+/// How many durable events an `EventBatch` will occupy once EventWriter
+/// materializes the `command_disposition` event that each terminal command
+/// projection implies.
+///
+/// Physical recovery has to know this before the commit: its receipt names the
+/// exact contiguous sequence range the batch fills, and the batch now carries
+/// the whole logical suffix, including the owner command's disposition.
+pub(in crate::store) fn materialized_event_count(batch: &EventBatch) -> usize {
+    batch
+        .writes
+        .iter()
+        .map(|write| {
+            usize::from(write.event.is_some())
+                + write
+                    .projections
+                    .iter()
+                    .filter(|projection| projection_command_disposition(projection).is_some())
+                    .count()
+        })
+        .sum()
 }
 
 fn materialize_command_dispositions(mut batch: EventBatch) -> Result<EventBatch> {

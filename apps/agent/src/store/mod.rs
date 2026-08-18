@@ -124,7 +124,10 @@ pub(crate) use memory_state::{
     MemoryLayer,
 };
 #[cfg(test)]
-pub(crate) use recovery::tests::{assert_indeterminate_surface, setup_boot_running_tools};
+pub(crate) use recovery::tests::{
+    assert_indeterminate_surface, open_boot_running_tools_store, setup_boot_running_tools,
+    setup_boot_running_tools_on_disk, setup_boot_running_tools_with_rowless_tail,
+};
 #[allow(
     unused_imports,
     reason = "T12 exposes the recovery plan boundary consumed by T15"

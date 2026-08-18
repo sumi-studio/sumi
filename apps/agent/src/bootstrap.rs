@@ -2261,7 +2261,8 @@ mod tests {
     use crate::runtime::contracts::RpcIdentity;
     use crate::store::{
         ApplyReceiptOutcome, EventBatch, HydrationReceiptIdentity, assert_indeterminate_surface,
-        setup_boot_running_tools,
+        open_boot_running_tools_store, setup_boot_running_tools,
+        setup_boot_running_tools_on_disk, setup_boot_running_tools_with_rowless_tail,
     };
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
@@ -3204,6 +3205,192 @@ mod tests {
         .await
         .expect("count grouped physical recovery ledger");
         assert_eq!((receipts, intents), (1, 2));
+    }
+
+    /// The T17 contract is "全件なし／全件あり" across the receipt boundary
+    /// (`docs/agent/implementation-plan.md`). Applying the receipt therefore has
+    /// to carry the whole recovery its intent resolution makes necessary; the
+    /// `hydrate_to_fixed_point` loop may re-verify afterwards, but it must not
+    /// be where state required for correctness is created.
+    #[tokio::test]
+    async fn one_receipt_transaction_commits_the_logical_suffix_it_makes_necessary() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-atomic", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+        let intents = match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate the running boot fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("fixture must require physical recovery: {other:?}"),
+        };
+
+        // Stop here, exactly where a crash right after the receipt commit
+        // would: one transaction, and nothing from the fixed-point loop after
+        // it.
+        let (outcome, _receipt) = SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("apply the boot physical receipt");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+
+        assert_indeterminate_surface(&store, "tool-boot-atomic").await;
+        let observed: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'turn_end'),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'agent_end'),
+                (SELECT COUNT(*) FROM inbound_commands
+                 WHERE status = 'applied' AND run_phase = 'finished')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read the state one receipt transaction leaves behind");
+        assert_eq!(
+            observed,
+            (1, 1, 1, 1),
+            "the receipt transaction must carry the ledger, the terminal and the whole suffix"
+        );
+
+        match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("re-hydrate after the single receipt transaction")
+        {
+            HydrationOutcome::Complete(_) => {}
+            other => panic!("the suffix must already be durable, not planned again: {other:?}"),
+        }
+    }
+
+    /// A ToolCall that never reached policy preparation has no execution row, so
+    /// resolving the physical intents alone leaves the turn open. Its
+    /// pre-execution result belongs to the same receipt transaction.
+    #[tokio::test]
+    async fn one_receipt_transaction_also_closes_a_call_that_never_reached_the_executor() {
+        let (store, _writer) = setup_boot_running_tools_with_rowless_tail(
+            &[
+                ("tool-boot-ran", "read_file", 0),
+                ("tool-boot-rowless", "write_file", 1),
+            ],
+            1,
+        )
+        .await;
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+        let intents = match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate the partially prepared boot fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("fixture must require physical recovery: {other:?}"),
+        };
+        assert_eq!(intents.len(), 1);
+
+        let (outcome, _receipt) = SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("apply the boot physical receipt beside a rowless ToolCall");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+
+        assert_indeterminate_surface(&store, "tool-boot-ran").await;
+        let rowless: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'tool-boot-rowless'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("the co-committed suffix must close the rowless ToolCall");
+        assert_eq!(
+            (rowless.0.as_str(), rowless.1.as_deref()),
+            ("not_started", Some("process_restarted"))
+        );
+
+        match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("re-hydrate after the single receipt transaction")
+        {
+            HydrationOutcome::Complete(_) => {}
+            other => panic!("the suffix must already be durable, not planned again: {other:?}"),
+        }
+    }
+
+    /// The same property observed the way a restart observes it: the process
+    /// that applied the receipt is gone, and a freshly opened Store sees the
+    /// ledger, the `indeterminate` terminal and the whole suffix together.
+    #[tokio::test]
+    async fn a_restart_right_after_the_receipt_transaction_sees_the_whole_suffix() {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t27-receipt-suffix-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create the on-disk fixture root");
+        let database_path = root.join("agent.db");
+
+        {
+            let (store, _writer) = setup_boot_running_tools_on_disk(
+                &database_path,
+                &[("tool-boot-restart", "read_file", 0)],
+            )
+            .await;
+            let authority = authority_for_generation(8);
+            let attestation = reap_attestation_for(&authority, 7);
+            let intents = match store
+                .hydrate(authority.lease(), authority.fence())
+                .await
+                .expect("hydrate the on-disk boot fixture")
+            {
+                HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+                other => panic!("fixture must require physical recovery: {other:?}"),
+            };
+            SuffixRecovery::apply_boot_physical_receipt(
+                &store,
+                authority.lease(),
+                authority.fence(),
+                &attestation,
+                &intents,
+            )
+            .await
+            .expect("apply the boot physical receipt");
+        }
+
+        let reopened = open_boot_running_tools_store(&database_path).await;
+        assert_indeterminate_surface(&reopened, "tool-boot-restart").await;
+        let observed: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'turn_end'),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'agent_end'),
+                (SELECT COUNT(*) FROM inbound_commands
+                 WHERE status = 'applied' AND run_phase = 'finished')",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .expect("read the restarted state");
+        assert_eq!(observed, (1, 1, 1, 1), "the restart must not observe a torn suffix");
+
+        let next = authority_for_generation(9);
+        match reopened
+            .hydrate(next.lease(), next.fence())
+            .await
+            .expect("hydrate the restarted Store")
+        {
+            HydrationOutcome::Complete(_) => {}
+            other => panic!("the restart must not have to rebuild the suffix: {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

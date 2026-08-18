@@ -593,7 +593,14 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             || receipt.logical_suffix_last_seq
                 != *batch_event_seqs.last().expect("non-empty event sequence")
         {
-            bail!("physical recovery receipt does not cover the exact EventWriter suffix");
+            bail!(
+                "physical recovery receipt does not cover the exact EventWriter suffix: \
+                 receipt claims {}..={}, transaction wrote {:?}..={:?}",
+                receipt.logical_suffix_first_seq,
+                receipt.logical_suffix_last_seq,
+                batch_event_seqs.first(),
+                batch_event_seqs.last(),
+            );
         }
         for pair in batch_event_seqs.windows(2) {
             if pair[1] != pair[0].saturating_add(1) {
@@ -925,6 +932,18 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             .iter()
             .map(|intent| intent.tool_call_id.as_str())
             .collect();
+        // The same transaction also carries the logical suffix these intents
+        // make necessary, which closes every remaining ToolCall of the owning
+        // assistant turn. Those calls are not receipt intents, so they are
+        // admitted only through their durable owner: a terminal
+        // `tool_executions` row belonging to one of the receipt's own
+        // (command_id, run_id) pairs. Nothing outside this recovery can be
+        // laundered into the receipt's sequence range that way.
+        let owners: BTreeSet<(&str, &str)> = receipt
+            .intents
+            .iter()
+            .map(|intent| (intent.command_id.as_str(), intent.run_id.as_str()))
+            .collect();
         let rows = sqlx::query(
             "SELECT seq, event_type, envelope FROM agent_events
              WHERE seq BETWEEN ? AND ? ORDER BY seq",
@@ -949,10 +968,15 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                         .ok_or_else(|| {
                             anyhow::anyhow!("recovery terminal event has no tool_call_id")
                         })?;
-                    if !expected_tools.contains(tool)
-                        || !receipt.intents.iter().any(|intent| {
+                    if expected_tools.contains(tool) {
+                        if !receipt.intents.iter().any(|intent| {
                             intent.tool_call_id == tool && intent.indeterminate_terminal_seq == seq
-                        })
+                        }) {
+                            bail!("recovery suffix contains an unrelated tool terminal event");
+                        }
+                    } else if !self
+                        .co_recovered_suffix_tool(transaction, &owners, tool)
+                        .await?
                     {
                         bail!("recovery suffix contains an unrelated tool terminal event");
                     }
@@ -970,7 +994,11 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                         .ok_or_else(|| {
                             anyhow::anyhow!("recovery tool result has no tool_call_id")
                         })?;
-                    if !expected_tools.contains(tool) {
+                    if !expected_tools.contains(tool)
+                        && !self
+                            .co_recovered_suffix_tool(transaction, &owners, tool)
+                            .await?
+                    {
                         bail!("recovery suffix contains a result for an unrelated tool");
                     }
                     let map = if event_type == "message_start" {
@@ -982,11 +1010,57 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                         bail!("recovery suffix contains duplicate {event_type} for tool {tool}");
                     }
                 }
+                "approval_resolved" => {
+                    let request_id = envelope
+                        .get("request_id")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("recovery approval event has no request_id")
+                        })?;
+                    let tool: Option<String> = sqlx::query_scalar(
+                        "SELECT tool_call_id FROM approval_log WHERE id = ? AND state = 'cancelled'",
+                    )
+                    .bind(request_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?;
+                    let admitted = match tool.as_deref() {
+                        Some(tool) => {
+                            self.co_recovered_suffix_tool(transaction, &owners, tool)
+                                .await?
+                        }
+                        None => false,
+                    };
+                    if !admitted {
+                        bail!("recovery suffix contains an unrelated approval resolution");
+                    }
+                }
+                "command_disposition" => {
+                    // EventWriter materializes this when the suffix closes the
+                    // owner command. Only the receipt's own owners may appear.
+                    let command_id = envelope
+                        .get("command_id")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("recovery disposition event has no command_id")
+                        })?;
+                    if !owners.iter().any(|(owner, _)| *owner == command_id) {
+                        bail!("recovery suffix contains an unrelated command disposition");
+                    }
+                }
                 "turn_end" | "agent_end" => {}
                 _ => bail!("recovery suffix contains unrelated event type {event_type}"),
             }
         }
-        for tool in expected_tools {
+        // Every ToolResult in the range must be a complete, ordered pair, and
+        // every intent must have one. Checking the union rather than just the
+        // intents keeps the co-committed suffix under the same rule.
+        let mut result_tools: BTreeSet<String> = expected_tools
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect();
+        result_tools.extend(starts.keys().cloned());
+        result_tools.extend(ends.keys().cloned());
+        for tool in &result_tools {
             let start = starts.get(tool).ok_or_else(|| {
                 anyhow::anyhow!("recovery suffix is missing a MessageStart for tool {tool}")
             })?;
@@ -998,6 +1072,36 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether a ToolCall the receipt does not name may still appear in its
+    /// sequence range, because the same atomic recovery closed it.
+    ///
+    /// The only admissible shapes are the two the logical suffix writes for a
+    /// call that never reached the executor: a pre-policy skip (`not_started`)
+    /// and a prepared call whose pending approval was cancelled. Both must
+    /// already be durable in this transaction and owned by one of the receipt's
+    /// own (command_id, run_id) pairs.
+    async fn co_recovered_suffix_tool(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        owners: &BTreeSet<(&str, &str)>,
+        tool_call_id: &str,
+    ) -> Result<bool> {
+        let Some(row) = sqlx::query(
+            "SELECT command_id, run_id, state FROM tool_executions WHERE tool_call_id = ? LIMIT 1",
+        )
+        .bind(tool_call_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        else {
+            return Ok(false);
+        };
+        let command_id: String = row.try_get("command_id")?;
+        let run_id: String = row.try_get("run_id")?;
+        let state: String = row.try_get("state")?;
+        Ok(owners.contains(&(command_id.as_str(), run_id.as_str()))
+            && matches!(state.as_str(), "not_started" | "cancelled"))
     }
 }
 
