@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2335,9 +2337,22 @@ func (g *DurableGateway) statePath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "runtime-"+safeFileID(personalityAgentID)+".json")
 }
 
-// ValidateLocalControlDurableStateKeyring reports a stale checkout/runtime
-// pairing before the API starts serving spawn requests.  It intentionally
-// reports only key identifiers, never signing material or durable contents.
+// ValidateLocalControlDurableStateKeyring settles what this process does about
+// durable local-control state it cannot verify, before the API starts serving
+// spawn requests.
+//
+// Refusing to start is scoped to the personality agents this process is
+// authorized to control: for those an unknown integrity key is a stale
+// checkout/runtime pairing the operator configured and can fix. State for any
+// other personality agent is debris from an earlier run. Under dynamic runtime
+// provisioning there are no configured authorizations at all, so treating
+// debris as fatal meant one leftover file kept the whole API down, where
+// spawning that one PAID is all that was ever at stake. Debris is unusable by
+// this process either way, so it is moved aside and logged — never deleted,
+// and never a reason to stay down.
+//
+// It intentionally reports only key identifiers, never signing material or
+// durable contents.
 func (g *DurableGateway) ValidateLocalControlDurableStateKeyring() error {
 	keyring, ok := g.localControlIntegrityKeyringSnapshot()
 	if !ok {
@@ -2346,6 +2361,10 @@ func (g *DurableGateway) ValidateLocalControlDurableStateKeyring() error {
 	entries, err := os.ReadDir(g.dir)
 	if err != nil {
 		return fmt.Errorf("list durable runtime state directory: %w", err)
+	}
+	owned := make(map[string]struct{})
+	for _, personalityAgentID := range g.localControlOwnerSnapshot() {
+		owned[filepath.Base(g.statePath(personalityAgentID))] = struct{}{}
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "runtime-") || !strings.HasSuffix(entry.Name(), ".json") {
@@ -2367,14 +2386,60 @@ func (g *DurableGateway) ValidateLocalControlDurableStateKeyring() error {
 		if _, previous := keyring.Previous[savedID]; previous {
 			continue
 		}
-		return fmt.Errorf(
-			"durable local-control state uses an unknown integrity key: file=%q saved_key_id=%s current_key_id=%s; configure SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS to re-sign it, or discard this runtime state",
+		if _, authorized := owned[entry.Name()]; authorized {
+			return fmt.Errorf(
+				"durable local-control state uses an unknown integrity key: file=%q saved_key_id=%s current_key_id=%s; configure SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS to re-sign it, or discard this runtime state",
+				path,
+				savedID,
+				keyring.Current.ID,
+			)
+		}
+		quarantined, err := quarantineUnverifiableDurableState(path, savedID)
+		if err != nil {
+			return fmt.Errorf("quarantine unverifiable durable runtime state %q: %w", path, err)
+		}
+		log.Printf(
+			"local control: durable runtime state %q belongs to no authorized personality agent and uses unknown integrity key %s (current %s); moved to %q. Move it back and configure SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS to re-sign it, or delete it.",
 			path,
 			savedID,
 			keyring.Current.ID,
+			quarantined,
 		)
 	}
 	return nil
+}
+
+// quarantineDurableStateSuffix marks state this process cannot verify. It must
+// not match the "runtime-*.json" scan so a quarantined file is never rescanned
+// and never re-quarantined.
+const quarantineDurableStateSuffix = ".unverifiable"
+
+// quarantineUnverifiableDurableState moves one unusable durable runtime state
+// out of the scanned name space and returns where it went. It renames rather
+// than deletes: the contents are the only record of that epoch, and an
+// operator who later supplies the signing secret that produced them can move
+// the file back. A collision keeps both files rather than overwriting either.
+func quarantineUnverifiableDurableState(path string, savedKeyID string) (string, error) {
+	base := fmt.Sprintf("%s%s-%s", path, quarantineDurableStateSuffix, savedKeyID)
+	target := base
+	for attempt := 1; ; attempt++ {
+		err := os.Link(path, target)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+		if attempt > 64 {
+			return "", fmt.Errorf("no free quarantine name beside %q", base)
+		}
+		target = fmt.Sprintf("%s.%d", base, attempt)
+	}
+	if err := os.Remove(path); err != nil {
+		_ = os.Remove(target)
+		return "", err
+	}
+	return target, nil
 }
 
 func (g *DurableGateway) connectionLeasePath(personalityAgentID string) string {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createConversationStore } from "../src/agent/store.ts";
 import {
+  DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
   DirectChatSocket,
   isDirectChatCommand,
   parseDirectChatServerFrame,
@@ -35,10 +36,14 @@ class FakeWebSocket {
   receive(value) {
     this.onmessage?.({ data: JSON.stringify(value) });
   }
-  close() {
+  close(code = 1005, reason = "") {
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code, reason });
+  }
+  /** A close the browser synthesizes: no status, no reason, no cause. */
+  drop() {
+    this.close(1006, "");
   }
 }
 
@@ -1278,7 +1283,7 @@ test("durable completion supersedes a volatile preview and drops late volatile r
   );
 });
 
-test("an upgrade the API rejects reports the agent as unavailable, not a blip", () => {
+test("only a cause the server states marks the agent unavailable", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
   socket.bindInstallation(binding);
@@ -1288,34 +1293,144 @@ test("an upgrade the API rejects reports the agent as unavailable, not a blip", 
   socket.onReady((state) => readiness.push(state));
   socket.connect();
 
-  // A lazy spawn the API cannot complete answers the upgrade request with HTTP
-  // 503, so the browser socket errors and closes without ever opening.
-  const rejected = FakeWebSocket.instances.at(-1);
-  rejected.onerror?.();
-  rejected.close();
+  // The API accepts the upgrade and then names the failed lazy spawn in the
+  // close frame, which is the only channel a page can read a cause on.
+  const wire = FakeWebSocket.instances.at(-1);
+  wire.open();
+  wire.close(DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE, "runtime_not_ready");
 
-  assert.deepEqual(connections, ["connecting", "closed"]);
-  assert.deepEqual(readiness, ["not_ready"]);
+  assert.deepEqual(connections, ["connecting", "connected", "closed"]);
+  assert.deepEqual(readiness, ["unknown", "not_ready"]);
   socket.close();
 });
 
-test("a dropped established session stays a transport blip", () => {
+test("closes the browser cannot attribute never blame the agent runtime", () => {
+  for (const [name, drive] of [
+    // A refused upgrade: 401, 403, a disallowed origin, an offline network, a
+    // DNS or TLS failure. The page sees one indistinguishable close.
+    ["refused upgrade", (wire) => wire.drop()],
+    // An established session dropped mid-flight.
+    [
+      "dropped session",
+      (wire) => {
+        wire.open();
+        wire.receive({ type: "direct_chat_status", status: "ready" });
+        wire.drop();
+      },
+    ],
+    // A server close that carries a code, but not this contract's code.
+    [
+      "unrelated server close",
+      (wire) => {
+        wire.open();
+        wire.close(1001, "going away");
+      },
+    ],
+  ]) {
+    FakeWebSocket.instances = [];
+    const socket = new DirectChatSocket();
+    socket.bindInstallation(binding);
+    const readiness = [];
+    socket.onReady((state) => readiness.push(state));
+    socket.connect();
+    drive(FakeWebSocket.instances.at(-1));
+    assert.equal(readiness.at(-1), "unknown", name);
+    assert.equal(readiness.includes("not_ready"), false, name);
+    socket.close();
+  }
+});
+
+// Readiness is a claim about now, so the only way to check that a past failure
+// does not outlive its connection is to actually run the backoff timer the
+// close armed. Capturing the timer keeps that deterministic.
+function withCapturedRetryTimer(run) {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const scheduled = [];
+  globalThis.setTimeout = (callback, delay) => {
+    const handle = { callback, delay, cancelled: false, fired: false };
+    scheduled.push(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle && typeof handle === "object") handle.cancelled = true;
+    else realClearTimeout(handle);
+  };
+  try {
+    return run(() => {
+      const handle = scheduled.find(
+        (entry) => !entry.fired && !entry.cancelled,
+      );
+      assert.ok(handle, "the socket never armed a reconnect attempt");
+      handle.fired = true;
+      handle.callback();
+      return handle.delay;
+    });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+}
+
+test("a stated runtime failure does not outlive the connection that stated it", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
   socket.bindInstallation(binding);
   const readiness = [];
   socket.onReady((state) => readiness.push(state));
-  socket.connect();
-  const wire = FakeWebSocket.instances.at(-1);
-  wire.open();
-  wire.receive({ type: "direct_chat_status", status: "ready" });
-  wire.close();
 
-  assert.deepEqual(readiness, ["unknown", "ready", "unknown"]);
+  withCapturedRetryTimer((fireReconnect) => {
+    socket.connect();
+    const rejected = FakeWebSocket.instances.at(-1);
+    rejected.open();
+    rejected.close(
+      DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+      "runtime_not_ready",
+    );
+    assert.equal(readiness.at(-1), "not_ready");
+
+    fireReconnect();
+    const retried = FakeWebSocket.instances.at(-1);
+    assert.notEqual(retried, rejected, "the reconnect opened no new socket");
+    retried.open();
+    assert.equal(
+      readiness.at(-1),
+      "unknown",
+      "a live connection must not inherit the previous connection's verdict",
+    );
+    retried.receive({ type: "direct_chat_status", status: "ready" });
+    assert.equal(readiness.at(-1), "ready");
+  });
   socket.close();
 });
 
-test("the mounted store surfaces a rejected upgrade and clears it on retry", async () => {
+test("a reconnect the browser cannot attribute withdraws the stated cause", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(binding);
+  const readiness = [];
+  socket.onReady((state) => readiness.push(state));
+
+  withCapturedRetryTimer((fireReconnect) => {
+    socket.connect();
+    const rejected = FakeWebSocket.instances.at(-1);
+    rejected.open();
+    rejected.close(
+      DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+      "runtime_not_ready",
+    );
+    assert.equal(readiness.at(-1), "not_ready");
+
+    // API restart, sleep resume, offline: the retry never reaches a server
+    // that can state anything, so the agent stops being the named cause.
+    fireReconnect();
+    FakeWebSocket.instances.at(-1).drop();
+    assert.equal(readiness.at(-1), "unknown");
+  });
+  socket.close();
+});
+
+test("the mounted store surfaces a stated runtime failure and clears it on retry", async () => {
   FakeWebSocket.instances = [];
   const transport = new DirectChatSocket();
   const store = createConversationStore({ transport });
@@ -1323,8 +1438,11 @@ test("the mounted store surfaces a rejected upgrade and clears it on retry", asy
   await new Promise((resolve) => queueMicrotask(resolve));
 
   const rejected = FakeWebSocket.instances.at(-1);
-  rejected.onerror?.();
-  rejected.close();
+  rejected.open();
+  rejected.close(
+    DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE,
+    "runtime_not_ready",
+  );
   assert.equal(store.getState().connection, "closed");
   assert.equal(store.getState().ready, "not_ready");
 

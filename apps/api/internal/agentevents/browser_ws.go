@@ -15,6 +15,18 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
+// DirectChatRuntimeUnavailableCloseCode and its reason tell the browser, over
+// the only channel a page can read, that this authorized session could not get
+// an agent runtime started. A page cannot observe the HTTP status of a refused
+// upgrade, so every other pre-upgrade rejection — expired session, disallowed
+// origin, offline network, DNS or TLS failure — is indistinguishable to it and
+// must stay unattributed. The web client mirrors this in
+// `apps/web/src/lib/direct-chat-socket.ts`.
+const (
+	DirectChatRuntimeUnavailableCloseCode   = 4001
+	DirectChatRuntimeUnavailableCloseReason = "runtime_not_ready"
+)
+
 // BrowserServer is the browser-facing direct-chat WebSocket boundary. It never
 // accepts an agent bearer token or public target: the signed HttpOnly session
 // supplies the target and authenticated provenance.
@@ -446,6 +458,7 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseLifecycle()
+	runtimeUnavailable := false
 	if s.Spawner != nil {
 		// The global browser-session lease authorizes only this bounded,
 		// side-effect-free intent. EnsureRunning owns idempotent provisioning and
@@ -488,11 +501,14 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		err = s.Spawner.EnsureRunning(spawnContext, claims.PersonalityAgentID)
 		cancelSpawn()
 		if err != nil {
-			// The browser only sees 503; the operator needs the cause (the
-			// provisioner's diagnostic is already secret-redacted).
+			// A browser cannot read the HTTP status of a refused upgrade, so a
+			// pre-upgrade 503 reaches the page as an unattributable transport
+			// failure, indistinguishable from being offline or logged out. This
+			// session is already authorized for the socket, so accept the upgrade
+			// and state the cause in a close frame the page can read. The operator
+			// still needs the provisioner's (already secret-redacted) diagnostic.
 			log.Printf("direct chat lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
-			http.Error(w, "agent runtime unavailable", http.StatusServiceUnavailable)
-			return
+			runtimeUnavailable = true
 		}
 	}
 
@@ -566,6 +582,17 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	releaseLifecycle()
 	defer s.removeConnection(conn)
 	defer conn.Close()
+	if runtimeUnavailable {
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(
+				DirectChatRuntimeUnavailableCloseCode,
+				DirectChatRuntimeUnavailableCloseReason,
+			),
+			s.sessionDeadline(claims, s.writeTimeout()),
+		)
+		return
+	}
 	if err := s.run(r.Context(), conn, claims, scope); err != nil && !errors.Is(err, context.Canceled) {
 		deadline := s.sessionDeadline(claims, s.writeTimeout())
 		if deadline.After(time.Now()) {

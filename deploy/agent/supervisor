@@ -48,13 +48,19 @@ else
   exec 3>/dev/null
 fi
 
+# The supervisor's own diagnostics must survive a caller redirecting a command's
+# output. A tracked Compose launch used to be invoked as `... >/dev/null 2>&1`,
+# which discarded the supervisor's own ERROR line along with Compose's chatter
+# and left a failure with no stated cause.
+exec 4>&2
+
 publish_supervisor_control() {
   (( SUPERVISOR_CONTROL_ENABLED )) || return 0
   printf '%s\n' "$1" >&3 || true
 }
 
 log() {
-  printf '[sumi-supervisor] %s\n' "$*" >&2
+  printf '[sumi-supervisor] %s\n' "$*" >&4
 }
 
 fail() {
@@ -499,7 +505,7 @@ run_tracked_compose() {
   setsid docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${compose_file}" \
-    "$@" 3>&- &
+    "$@" 3>&- 4>&- &
   ACTIVE_COMPOSE_PID=$!
   publish_supervisor_control "nested-start ${ACTIVE_COMPOSE_PID}"
   if ! wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
@@ -544,10 +550,16 @@ tracked_compose_child_isolated() {
   [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
 }
 
+# `setsid` makes the child its own session and group within microseconds on an
+# idle host, but this suite starts thirteen Docker fixtures while Cargo builds.
+# A 500ms ceiling lost that race and turned load into a launch failure, so the
+# bound is generous while still bounded.
+readonly TRACKED_COMPOSE_ISOLATION_ATTEMPTS=1500
+
 wait_for_tracked_compose_child_isolation() {
   local pid="$1"
   local attempt
-  for ((attempt = 0; attempt < 50; attempt++)); do
+  for ((attempt = 0; attempt < TRACKED_COMPOSE_ISOLATION_ATTEMPTS; attempt++)); do
     tracked_compose_child_isolated "${pid}" && return 0
     tracked_compose_child_is_zombie "${pid}" && return 1
     kill -0 "${pid}" 2>/dev/null || return 1
@@ -839,11 +851,14 @@ case "${action}" in
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
     run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
-      down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null 2>&1
+      down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null
     remove_runtime_secret_tree
     prepare_status=0
+    # Same bounded stderr contract as activation below: the provisioner captures
+    # and value-redacts it on failure. Discarding it left a failed prepare with
+    # no stated cause at all.
     if run_tracked_compose "${PREPARE_COMPOSE_FILE}" 1 up --detach --wait \
-      >/dev/null 2>&1; then
+      >/dev/null; then
       prepare_status=0
     else
       prepare_status=$?

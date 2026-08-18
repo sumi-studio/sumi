@@ -18,6 +18,15 @@ export type DirectChatCommand =
       decision: { type: "approve_once" } | { type: "deny_once" };
     };
 
+/**
+ * The API accepts the upgrade and closes with this code when an authorized
+ * session could not get an agent runtime started. It is the only channel a page
+ * can read a cause on, and it mirrors
+ * `DirectChatRuntimeUnavailableCloseCode` in
+ * `apps/api/internal/agentevents/browser_ws.go`.
+ */
+export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE = 4001;
+
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
 export type DirectChatReadyState = "unknown" | "ready" | "not_ready";
 
@@ -948,14 +957,8 @@ export class DirectChatSocket {
     });
     const socket = new WebSocket(url);
     this.socket = socket;
-    // A WebSocket that closes without ever opening means the API answered the
-    // upgrade request itself.  Lazy spawn reports a runtime it could not start
-    // as HTTP 503 before the handshake, so this is the readiness answer the
-    // Human actually receives when the agent fails to come up.
-    let upgraded = false;
     socket.onopen = () => {
       if (this.socket !== socket) return;
-      upgraded = true;
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
       this.admissionReady = false;
@@ -998,12 +1001,20 @@ export class DirectChatSocket {
         this.pending.delete(frame.idempotency_key);
       for (const listener of this.listeners) listener(frame);
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.admissionReady = false;
       this.setConnectionState("closed");
-      this.setReadyState(upgraded ? "unknown" : "not_ready");
+      // Only a cause the server states is a cause. A page cannot read the HTTP
+      // status of a refused upgrade, so a logged-out session, a disallowed
+      // origin, an offline network, and a DNS or TLS failure are all the same
+      // unattributable close here and stay "unknown".
+      this.setReadyState(
+        event?.code === DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE
+          ? "not_ready"
+          : "unknown",
+      );
       this.scheduleReconnect();
     };
   }
