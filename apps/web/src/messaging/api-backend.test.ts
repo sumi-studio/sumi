@@ -184,6 +184,34 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("keeps the terminal tombstone on a deleted edit target", async () => {
+    const deleted = {
+      ...messageWire(1, ""),
+      deleted: true,
+      revision: 2,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.endsWith("/messages/message-1")) {
+        return json({ error: "message_deleted", message: deleted }, 409);
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.editMessage(channel, "message-1", "古い書きかけ", 1),
+    ).rejects.toMatchObject({
+      code: "message_deleted",
+      status: 409,
+      responseMessage: expect.objectContaining({
+        deleted: true,
+        revision: 2,
+      }),
+    });
+  });
+
   it("returns the committed message from a successful edit", async () => {
     const committed = {
       ...messageWire(1, "サーバで確定した本文"),

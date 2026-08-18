@@ -27,6 +27,7 @@ export function MessageEditor({
   onSubmit,
   onCancel,
   conflict,
+  failure,
   onReloadConflict,
   membersByKey,
   selfKey,
@@ -36,6 +37,7 @@ export function MessageEditor({
   onSubmit: () => void;
   onCancel: () => void;
   conflict: { content: string; revision: number } | null;
+  failure?: string | null;
   onReloadConflict: () => void;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   selfKey: ParticipantKey;
@@ -136,6 +138,8 @@ export function MessageEditor({
               新しい本文を読み込む
             </button>
           </>
+        ) : failure ? (
+          <span role="alert">{failure}</span>
         ) : (
           <span>Escでキャンセル・Enterで保存</span>
         )}

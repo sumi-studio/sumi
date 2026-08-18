@@ -83,6 +83,7 @@ export function MessageList({
   const cancelEdit = useMessaging((state) => state.cancelEdit);
   const editDraft = useMessaging((state) => state.editDraft);
   const editConflict = useMessaging((state) => state.editConflict);
+  const editFailure = useMessaging((state) => state.editFailure);
   const setEditDraft = useMessaging((state) => state.setEditDraft);
   const reloadEditConflict = useMessaging((state) => state.reloadEditConflict);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
@@ -408,6 +409,7 @@ export function MessageList({
             editing={editingMessageId === row.message.messageId}
             editDraft={editDraft}
             editConflict={editConflict}
+            editFailure={editFailure}
             onEditDraftChange={setEditDraft}
             onSubmitEdit={submitEdit}
             onCancelEdit={cancelEdit}
@@ -421,6 +423,7 @@ export function MessageList({
       editingMessageId,
       editDraft,
       editConflict,
+      editFailure,
       setEditDraft,
       reloadEditConflict,
       submitEdit,

@@ -453,6 +453,127 @@ describe("編集セッションのタイムライン整合性", () => {
     );
   });
 
+  it("WS切断中の409 message_deletedはtombstoneを反映して編集を閉じ、再保存しない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const tombstone = {
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: (target.revision ?? 1) + 1,
+    };
+    // mockはWS eventをemitしない。PATCHの終端応答だけで収束することを見る。
+    const edit = vi.spyOn(backend, "editMessage").mockRejectedValueOnce(
+      new MessagingAPIError("message_deleted", 409, {
+        message: conflictWire(tombstone),
+      }),
+    );
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("WS切断中の保存"));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() => {
+      expect(useMessaging.getState().editingMessageId).toBeNull();
+      expect(
+        useMessaging
+          .getState()
+          .messagesByPlace["channel:ch-general"]?.find(
+            (message) => message.messageId === target.messageId,
+          ),
+      ).toMatchObject({
+        deleted: true,
+        content: "",
+        revision: tombstone.revision,
+      });
+    });
+
+    act(() => useMessaging.getState().submitEdit());
+    expect(edit).toHaveBeenCalledOnce();
+  });
+
+  it("404 not_foundは対象seqを再取得してtombstoneを反映する", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const tombstone = {
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: (target.revision ?? 1) + 1,
+    };
+    vi.spyOn(backend, "editMessage").mockRejectedValueOnce(
+      new MessagingAPIError("not_found", 404),
+    );
+    const fetch = vi
+      .spyOn(backend, "fetchMessages")
+      .mockResolvedValueOnce([tombstone]);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("消えた対象への保存"));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() => {
+      expect(useMessaging.getState().editingMessageId).toBeNull();
+      expect(fetch).toHaveBeenCalledWith(target.place, {
+        beforeSeq: target.seq + 1,
+        limit: 1,
+      });
+      expect(
+        useMessaging
+          .getState()
+          .messagesByPlace["channel:ch-general"]?.find(
+            (message) => message.messageId === target.messageId,
+          ),
+      ).toMatchObject({ deleted: true, revision: tombstone.revision });
+    });
+  });
+
+  it("未知の編集失敗は無視せず編集欄に表示する", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    vi.spyOn(backend, "editMessage").mockRejectedValueOnce(
+      new MessagingAPIError("unexpected_edit_response", 418),
+    );
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("失敗を表示する"));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() =>
+      expect(useMessaging.getState()).toMatchObject({
+        editingMessageId: target.messageId,
+        editFailure: "保存できませんでした。もう一度お試しください。",
+      }),
+    );
+  });
+
   it("revision 3のWS後に遅れて届くrevision 2の409で競合本文と編集基準を戻さない", async () => {
     const backend = await bootStore();
     const target = useMessaging

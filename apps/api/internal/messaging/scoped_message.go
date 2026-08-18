@@ -375,7 +375,10 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, ErrNotAuthor
 	}
 	if message.Deleted {
-		return Message{}, ErrMessageDeleted
+		// The transport must be able to project the authoritative tombstone when
+		// an edit races a deletion. Returning it with the sentinel keeps the
+		// operation rejected while preserving the revision that made it terminal.
+		return message, ErrMessageDeleted
 	}
 	if expectedRevision <= 0 || message.Revision != expectedRevision {
 		return Message{}, currentRevisionConflict(ctx, tx, message)

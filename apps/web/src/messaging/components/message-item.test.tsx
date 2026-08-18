@@ -220,6 +220,17 @@ describe("インライン編集", () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  it("競合でも対象消滅でもない保存失敗を表示する", () => {
+    renderItem(makeMessage(), {
+      editing: true,
+      editFailure: "保存できませんでした。もう一度お試しください。",
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "保存できませんでした。もう一度お試しください。",
+    );
+  });
+
   it("書きかけは行ではなく渡されたドラフトが正本になる", () => {
     // 行が一度アンマウントされて作り直されても、描くのは本文ではなく
     // 編集セッションのドラフト。
