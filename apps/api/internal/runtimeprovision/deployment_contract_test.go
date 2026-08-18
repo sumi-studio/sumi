@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -988,6 +989,73 @@ func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 		if strings.Contains(prepareAction, activationOnly) {
 			t.Fatalf("prepare phase depends on activation-only local-control state %q:\n%s", activationOnly, prepareAction)
 		}
+	}
+}
+
+func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
+	const (
+		millisecondsPerSecond             = 1000
+		composeChildTermAttempts          = 150
+		composeChildTermDelayMilliseconds = 100
+		cleanupMaxAttempts                = 3
+		cleanupRetryDelayMilliseconds     = 100
+		verificationTimeoutSeconds        = 5
+		verificationKillGraceSeconds      = 1
+		schedulingMarginSeconds           = 10
+		composeTimeoutSeconds             = 7
+	)
+
+	supervisorPath, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"/bin/bash", "-c", `exec 3>&1; exec "$1" unsupported-action`, "--", supervisorPath,
+	)
+	command.Env = []string{
+		"PATH=/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_SUPERVISOR_CONTROL_FD=3",
+		"SUMI_COMPOSE_TIMEOUT=" + strconv.Itoa(composeTimeoutSeconds),
+	}
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("supervisor accepted an unsupported action: %s", output)
+	}
+	match := regexp.MustCompile(`(?m)^cleanup-bound-ms ([0-9]+)$`).FindSubmatch(output)
+	if match == nil {
+		t.Fatalf("supervisor did not advertise a cleanup bound: %s", output)
+	}
+	got, err := strconv.ParseInt(string(match[1]), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := int64(
+		composeChildTermAttempts*composeChildTermDelayMilliseconds +
+			cleanupMaxAttempts*composeTimeoutSeconds*millisecondsPerSecond +
+			cleanupMaxAttempts*(verificationTimeoutSeconds+verificationKillGraceSeconds)*millisecondsPerSecond +
+			(cleanupMaxAttempts-1)*cleanupRetryDelayMilliseconds +
+			schedulingMarginSeconds*millisecondsPerSecond,
+	)
+	if got != want {
+		t.Fatalf("advertised cleanup bound = %dms, want %dms for TERM grace, down retries, verification, retry delays, and margin", got, want)
+	}
+
+	compactSupervisor := strings.Join(strings.Fields(readDeploymentFile(t, "supervisor")), " ")
+	for _, term := range []string{
+		"COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS",
+		"CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT * MILLISECONDS_PER_SECOND",
+		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
+		"(CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS",
+		"SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS * MILLISECONDS_PER_SECOND",
+	} {
+		if !strings.Contains(compactSupervisor, term) {
+			t.Fatalf("supervisor cleanup bound omits %q:\n%s", term, compactSupervisor)
+		}
+	}
+	if !strings.Contains(compactSupervisor, "containers=\"$(cleanup_lifecycle_compose ps --all --quiet 2>/dev/null)\"") {
+		t.Fatalf("cleanup emptiness verification is not subject to the advertised timeout: %s", compactSupervisor)
 	}
 }
 

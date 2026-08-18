@@ -463,26 +463,52 @@ declare SUMI_RUNTIME_SECRET_HOST_DIR="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT
 export SUMI_RUNTIME_SECRET_HOST_DIR
 declare CLEANUP_ARMED=0
 declare ACTIVE_COMPOSE_PID=
+readonly MILLISECONDS_PER_SECOND=1000
 readonly CLEANUP_MAX_ATTEMPTS=3
-readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
+readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
+# `cleanup_project_is_empty` runs once after each cleanup `down`. Bound both
+# the query and the time allowed for timeout(1) to join a TERM-resistant
+# Docker CLI before its KILL fallback.
+readonly CLEANUP_VERIFICATION_TIMEOUT_SECONDS=5
+readonly CLEANUP_VERIFICATION_KILL_GRACE_SECONDS=1
 # Keep the post-TERM grace on the same 15s ceiling as initial session/group
 # isolation below: both bounds protect the same tracked Compose child, and a
 # slower host must not classify it as untrackable before its group can be
 # recovered.
 readonly COMPOSE_CHILD_TERM_ATTEMPTS=150
-readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
+readonly COMPOSE_CHILD_TERM_DELAY_MILLISECONDS=100
 # An epoch's live process set is deliberately limited to the roles that outlive
 # allocation. Allocator and prepare are successful one-shot setup evidence, not
 # runtime processes: Compose retains their exited containers after activation.
 readonly LONG_LIVED_ROLES=(runtime executor broker)
-# One explicit bound covers termination of the active detached Compose session,
-# every cleanup retry at the configured Compose timeout, verification calls,
-# retry delays, and a small scheduling margin. The provisioner receives this
-# exact contract over its private control descriptor before lifecycle work.
-readonly SUPERVISOR_CLEANUP_BOUND_SECONDS=$((
-  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT + 10
+readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
+# The cancellation cleanup can first wait for the tracked Compose child to
+# honour TERM, then run each `down --timeout`, verify each attempt, and wait
+# between unsuccessful attempts. `flock -n` has no wait to add: cleanup is
+# armed only after that lock has already been acquired. Keep this in the same
+# constants that drive those waits, rather than a hand-maintained total.
+#
+# timeout(1)'s verification KILL grace and the final scheduling margin cover
+# joining its process plus local secret removal after the bounded Docker calls.
+readonly SUPERVISOR_CLEANUP_BOUND_MILLISECONDS=$((
+  COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS +
+  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT * MILLISECONDS_PER_SECOND +
+  CLEANUP_MAX_ATTEMPTS * (
+    CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS
+  ) * MILLISECONDS_PER_SECOND +
+  (CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS +
+  SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS * MILLISECONDS_PER_SECOND
 ))
-publish_supervisor_control "cleanup-bound-ms $((SUPERVISOR_CLEANUP_BOUND_SECONDS * 1000))"
+publish_supervisor_control "cleanup-bound-ms ${SUPERVISOR_CLEANUP_BOUND_MILLISECONDS}"
+
+sleep_milliseconds() {
+  local milliseconds="$1"
+  local duration
+  printf -v duration '%d.%03d' \
+    "$((milliseconds / MILLISECONDS_PER_SECOND))" \
+    "$((milliseconds % MILLISECONDS_PER_SECOND))"
+  sleep "${duration}"
+}
 
 launch_compose() {
   docker compose \
@@ -496,6 +522,16 @@ lifecycle_compose() {
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${LIFECYCLE_COMPOSE_FILE}" \
     "$@"
+}
+
+cleanup_lifecycle_compose() {
+  timeout --foreground \
+    --kill-after="${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}s" \
+    "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}s" \
+    docker compose \
+      --project-name "${SUMI_COMPOSE_PROJECT}" \
+      --file "${LIFECYCLE_COMPOSE_FILE}" \
+      "$@"
 }
 
 prepare_compose() {
@@ -613,7 +649,7 @@ terminate_active_compose() {
     fi
     for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
       kill -0 "${pid}" 2>/dev/null || break
-      sleep "${COMPOSE_CHILD_TERM_DELAY_SECONDS}"
+      sleep_milliseconds "${COMPOSE_CHILD_TERM_DELAY_MILLISECONDS}"
     done
     if kill -0 "${pid}" 2>/dev/null; then
       if tracked_compose_group_isolated "${pid}"; then
@@ -893,7 +929,7 @@ cleanup_partial_generation() {
         break
       fi
       if (( attempt < CLEANUP_MAX_ATTEMPTS )); then
-        sleep "${CLEANUP_RETRY_DELAY_SECONDS}"
+        sleep_milliseconds "${CLEANUP_RETRY_DELAY_MILLISECONDS}"
       fi
     done
     if (( ! cleanup_complete )); then
