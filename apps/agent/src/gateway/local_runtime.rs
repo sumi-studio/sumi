@@ -48,13 +48,14 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
+    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+    DuplicateMessagingChannelRequest, ExactMessagingScope, GetMessagingCallStateRequest,
     MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
     MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
-    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
-    WriteMessagingMessageRequest, canonical_attachment_filename,
+    StartMessagingDMRequest, UpdateMessagingChannelRequest, UploadMessagingAttachmentRequest,
+    UploadMessagingAttachmentResponse, WriteMessagingMessageRequest, canonical_attachment_filename,
     forbidden_attachment_display_character,
 };
 use crate::apiclient::workspace::{
@@ -965,6 +966,54 @@ impl MessagingApi for LocalControlHttpClient {
     ) -> Result<serde_json::Value> {
         self.post_json(
             "/local-control/v1/messaging:status",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn start_dm(
+        &self,
+        scope: &ExactMessagingScope,
+        request: StartMessagingDMRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:start-dm",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn create_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:create-channel",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn update_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: UpdateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:update-channel",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn duplicate_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: DuplicateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:duplicate-channel",
             &ScopedMessagingRequest::new(scope, request),
         )
         .await
