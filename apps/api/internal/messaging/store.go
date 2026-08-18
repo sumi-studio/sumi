@@ -54,6 +54,9 @@ type Store struct {
 	blobs            AttachmentBlobs
 	attachmentPolicy AttachmentPolicy
 	missingBlobScan  attachmentMissingBlobScan
+	// push is set by UsePush. A nil dispatcher means this deployment simply has
+	// no Web Push; 既存のタブ内通知はそれとは独立に動き続ける。
+	push *PushDispatcher
 }
 
 type attachmentMissingBlobScan struct {

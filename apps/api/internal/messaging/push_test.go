@@ -1,0 +1,330 @@
+package messaging
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// 使い捨てのブラウザ購読鍵。対応する秘密鍵はどこにも無いので、暗号化された
+// payload は誰にも読めない——読ませることが目的ではなく、送信経路そのものが
+// 本物の鍵で成立することを見るために置いている。
+const (
+	testPushP256dh = "BDCBECfmPtnXzdwJgF_TdPNsC6ZfDnFm31D8x6HqxOJ7zq3tJamfSlIVx2cDwsSUKwGiiuucupkLMDwJFObrclE"
+	testPushAuth   = "lRvaLEgVKoLGOxRND8ZCTA"
+)
+
+// recordingPushClient stands in for the push service. 本物の endpoint へ出て
+// いかないまま、「どの endpoint に何回出したか」と「相手が死んだと言ったとき
+// どうするか」だけを見る。
+type recordingPushClient struct {
+	mu     sync.Mutex
+	sent   []string
+	status map[string]int
+	err    error
+}
+
+func (c *recordingPushClient) Do(request *http.Request) (*http.Response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return nil, c.err
+	}
+	c.sent = append(c.sent, request.URL.String())
+	status := http.StatusCreated
+	if override, ok := c.status[request.URL.String()]; ok {
+		status = override
+	}
+	return &http.Response{
+		StatusCode: status,
+		Body:       io.NopCloser(bytes.NewReader(nil)),
+		Header:     http.Header{},
+		Request:    request,
+	}, nil
+}
+
+func (c *recordingPushClient) endpoints() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.sent...)
+}
+
+// dispatcher returns a dispatcher on a real VAPID pair: webpush-go signs the
+// JWT for every send, so a fake string would fail before the transport is
+// exercised at all.
+func (w world) dispatcher(t *testing.T, ctx context.Context, client pushHTTPClient) *PushDispatcher {
+	t.Helper()
+	keys, err := w.store.core.EnsureVAPIDKeys(ctx)
+	if err != nil {
+		t.Fatalf("ensure vapid keys: %v", err)
+	}
+	return &PushDispatcher{store: w.store.core, keys: keys, subject: "mailto:ops@example.test", client: client}
+}
+
+func (w world) subscribe(t *testing.T, ctx context.Context, owner ParticipantRef, endpoint string) {
+	t.Helper()
+	// 実在する P-256 の点。RFC 8291 の暗号化は本物の鍵でしか通らないので、
+	// ここを飾りにすると送信そのものが検証されなくなる（使い捨ての公開鍵で、
+	// 対応する秘密鍵はどこにも無い）。
+	if _, err := w.store.mustScopeForActor(t, ctx, owner).
+		SavePushSubscription(ctx, endpoint, testPushP256dh, testPushAuth); err != nil {
+		t.Fatalf("subscribe %s: %v", endpoint, err)
+	}
+}
+
+func (w world) subscriptionsFor(
+	t *testing.T, ctx context.Context, owners ...ParticipantRef,
+) map[string][]PushSubscription {
+	t.Helper()
+	loaded, err := w.store.core.pushSubscriptionsFor(ctx, owners)
+	if err != nil {
+		t.Fatalf("load subscriptions: %v", err)
+	}
+	return loaded
+}
+
+func TestVAPIDKeysAreMintedOnceAndNeverRotatedUnderneathSubscribers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+
+	first, err := w.store.core.EnsureVAPIDKeys(ctx)
+	if err != nil {
+		t.Fatalf("mint keys: %v", err)
+	}
+	if first.Public == "" || first.Private == "" {
+		t.Fatalf("minted keys = %+v, want both halves", first)
+	}
+	second, err := w.store.core.EnsureVAPIDKeys(ctx)
+	if err != nil {
+		t.Fatalf("reload keys: %v", err)
+	}
+	if second != first {
+		// 鍵が変わると全端末の購読が黙って死ぬ。ここが「一度きり」でなければ
+		// 通知は再起動のたびに壊れる。
+		t.Fatalf("keys rotated across calls: %+v then %+v", first, second)
+	}
+}
+
+func TestPushSubscriptionIsOwnedByTheAuthenticatedHumanOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	w.subscribe(t, ctx, w.humanA, "https://push.example.test/a")
+	subscriptions := w.subscriptionsFor(t, ctx, w.humanA, w.humanB)
+	if len(subscriptions[w.humanA.Key()]) != 1 || len(subscriptions[w.humanB.Key()]) != 0 {
+		t.Fatalf("subscriptions = %+v, want one for humanA only", subscriptions)
+	}
+
+	// endpoint を知っているだけの別人は、異なる鍵で所有者を奪えない。
+	if _, err := w.store.mustScopeForActor(t, ctx, w.humanB).SavePushSubscription(ctx,
+		"https://push.example.test/a", "attacker-p256dh", "attacker-auth"); !errors.Is(err, ErrPushSubscriptionOwned) {
+		t.Fatalf("cross-owner save err = %v, want ErrPushSubscriptionOwned", err)
+	}
+	subscriptions = w.subscriptionsFor(t, ctx, w.humanA, w.humanB)
+	if len(subscriptions[w.humanA.Key()]) != 1 || len(subscriptions[w.humanB.Key()]) != 0 {
+		t.Fatalf("takeover changed ownership: %+v", subscriptions)
+	}
+
+	// 他人の endpoint は消せない。消せると「その人の端末を黙らせる手段」になる。
+	if err := w.store.mustScopeForActor(t, ctx, w.humanB).
+		DeletePushSubscription(ctx, "https://push.example.test/a"); err != nil {
+		t.Fatalf("delete someone else's endpoint should be a silent no-op: %v", err)
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != 1 {
+		t.Fatalf("humanA's endpoint was removed by humanB: %d remaining", got)
+	}
+
+	// 本人が消せば消える。二度目も成功する（解除は冪等）。
+	for range 2 {
+		if err := w.store.mustScopeForActor(t, ctx, w.humanA).
+			DeletePushSubscription(ctx, "https://push.example.test/a"); err != nil {
+			t.Fatalf("owner delete: %v", err)
+		}
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != 0 {
+		t.Fatalf("endpoint survived its owner's delete: %d remaining", got)
+	}
+}
+
+func TestPushSubscriptionRejectsNonHumansAndNonHTTPSEndpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	// agent はブラウザを持たない。同型性は「同じ判定から、それぞれの身体に
+	// 合った出口へ」であって、同じ配送方式を持つことではない。
+	if _, err := w.store.mustScopeForActor(t, ctx, w.agent).SavePushSubscription(ctx,
+		"https://push.example.test/agent", testPushP256dh, testPushAuth); !errors.Is(err, ErrInvalidPushSubscription) {
+		t.Fatalf("agent push subscription err = %v, want ErrInvalidPushSubscription", err)
+	}
+	// https 以外を許すと「任意の URL へサーバーから POST させる」踏み台になる。
+	if _, err := w.store.mustScopeForActor(t, ctx, w.humanA).SavePushSubscription(ctx,
+		"http://push.example.test/a", testPushP256dh, testPushAuth); !errors.Is(err, ErrInvalidPushSubscription) {
+		t.Fatalf("plaintext endpoint err = %v, want ErrInvalidPushSubscription", err)
+	}
+}
+
+func TestPushSubscriptionRequiresALiveMessagingInstallation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	// 端末の登録も Messaging の入口の内側にある。epoch を一つ進めた宛先は
+	// 「今のインストール」ではないので、通らない。
+	stale := &ScopedStore{Store: w.store.core, Scope: Scope{
+		WorkspaceID:    scoped.Scope.WorkspaceID,
+		InstallationID: scoped.Scope.InstallationID,
+		AuthorityEpoch: scoped.Scope.AuthorityEpoch + 1,
+		Actor:          w.humanA,
+	}}
+	if _, err := stale.SavePushSubscription(ctx,
+		"https://push.example.test/stale", testPushP256dh, testPushAuth); err == nil {
+		t.Fatal("a stale authority epoch registered a browser")
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != 0 {
+		t.Fatalf("stale-epoch subscription landed: %d rows", got)
+	}
+}
+
+func TestPushGoesOnlyToTheHumansTheServerDecidedToCall(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
+	quiet := w.mintHuman(t, ctx, "Shizuka")
+	if err := w.store.AddWorkspaceMember(ctx, workspace.WorkspaceID, quiet, RoleMember); err != nil {
+		t.Fatalf("add quiet member: %v", err)
+	}
+	// この人はこの place を mute している。決定は 0015 が下しており、push は
+	// その決定に足を生やすだけなので、ここに届いてはならない。
+	if _, err := w.store.SetNotificationSetting(ctx, quiet, NotifyLevelMute, nil, nil); err != nil {
+		t.Fatalf("mute quiet: %v", err)
+	}
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/haru")
+	w.subscribe(t, ctx, quiet, "https://push.example.test/shizuka")
+
+	client := &recordingPushClient{}
+	dispatcher := w.dispatcher(t, ctx, client)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "デプロイ、今から始めます")
+	// 配送は判定の写しではなく、message と同じ transaction で確定した
+	// intent の正本から読む。
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+	dispatcher.deliver(ctx, ch, msg, decisions, "Yohaku")
+
+	sent := client.endpoints()
+	if len(sent) != 1 || sent[0] != "https://push.example.test/haru" {
+		t.Fatalf("push endpoints = %v, want only Haru's (Shizuka muted the place)", sent)
+	}
+}
+
+func TestPushForgetsAnEndpointThePushServiceDeclaredGone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/dead")
+
+	client := &recordingPushClient{status: map[string]int{
+		"https://push.example.test/dead": http.StatusGone,
+	}}
+	dispatcher := w.dispatcher(t, ctx, client)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "おはようございます")
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+	dispatcher.deliver(ctx, ch, msg, decisions, "Yohaku")
+
+	if got := len(w.subscriptionsFor(t, ctx, w.humanB)[w.humanB.Key()]); got != 0 {
+		t.Fatalf("a 410 endpoint survived: %d rows", got)
+	}
+}
+
+func TestPushLogsUnexpectedServiceStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/rejected")
+
+	client := &recordingPushClient{status: map[string]int{
+		"https://push.example.test/rejected": http.StatusBadRequest,
+	}}
+	dispatcher := w.dispatcher(t, ctx, client)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "設定を見直してください")
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+
+	var logs bytes.Buffer
+	previousWriter, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	dispatcher.deliver(ctx, ch, msg, decisions, "Yohaku")
+
+	if !strings.Contains(logs.String(), "unexpected response status 400") {
+		t.Fatalf("push log = %q, want rejected status", logs.String())
+	}
+	// endpoint は bearer secret である。status は出しても URL は出さない。
+	if strings.Contains(logs.String(), "push.example.test/rejected") {
+		t.Fatalf("push log leaked the endpoint: %q", logs.String())
+	}
+}
+
+func TestPushTitleNamesThePlaceAndTheSpeaker(t *testing.T) {
+	channel := Place{PlaceID: "p", Kind: PlaceChannel, Name: "general"}
+	if got := PushTitle(channel, "Yohaku"); got != "#general — Yohaku" {
+		t.Fatalf("channel title = %q", got)
+	}
+	dm := Place{PlaceID: "p", Kind: PlaceDM}
+	if got := PushTitle(dm, "Yohaku"); got != "Yohaku" {
+		t.Fatalf("dm title = %q", got)
+	}
+}
+
+func TestPushBodyIsAPointerNotTheMessage(t *testing.T) {
+	long := strings.Repeat("あ", pushSnippetRunes+40)
+	body := PushBody(Message{Content: long})
+	if runes := []rune(body); len(runes) != pushSnippetRunes || runes[len(runes)-1] != '…' {
+		t.Fatalf("long body = %d runes ending %q", len(runes), string(runes[len(runes)-1]))
+	}
+	if got := PushBody(Message{Content: "行を\n跨いだ  発言"}); got != "行を 跨いだ 発言" {
+		t.Fatalf("collapsed body = %q", got)
+	}
+	if got := PushBody(Message{Deleted: true, Content: "消えた本文"}); got != "" {
+		t.Fatalf("deleted body = %q, want empty", got)
+	}
+	if got := PushBody(Message{Attachments: []Attachment{{AttachmentID: "a"}}}); got != "（添付ファイル）" {
+		t.Fatalf("attachment-only body = %q", got)
+	}
+}
+
+func TestPushTopicCollapsesOnlyACanonicalPlaceID(t *testing.T) {
+	if got := pushTopic("01900000-0000-7000-8000-000000000002"); got != "01900000000070008000000000000002" {
+		t.Fatalf("topic = %q", got)
+	}
+	if got := pushTopic("not-a-uuid"); got != "" {
+		t.Fatalf("unexpected topic for a malformed place id: %q", got)
+	}
+}

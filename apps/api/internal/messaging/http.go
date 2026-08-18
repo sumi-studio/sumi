@@ -41,6 +41,10 @@ type Server struct {
 	Hub *Hub
 	// Calls is nil when this deployment has no configured media transport.
 	Calls *CallService
+	// Push is nil when this deployment has no configured Web Push (no VAPID
+	// subject). The push routes then answer 503 instead of handing out a key
+	// nobody can send with.
+	Push *PushDispatcher
 	// reactionMu keeps a reaction commit, its authoritative snapshot and the
 	// corresponding live publish in one process-local order. Hub itself is
 	// process-local, so this is the ordering boundary clients can observe.
@@ -70,6 +74,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
+	mux.HandleFunc("GET /messaging/push-key", s.servePushKey)
+	mux.HandleFunc("POST /messaging/push-subscriptions", s.serveSavePushSubscription)
+	mux.HandleFunc("DELETE /messaging/push-subscriptions", s.serveDeletePushSubscription)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
 	mux.HandleFunc("POST /messaging/places/{place_id}/attachments", s.serveUploadAttachment)
@@ -448,6 +455,12 @@ func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, pl
 		Message: &wire, ExceptFor: notified,
 	})
 	_ = hub.PublishVariantsScoped(ctx, store, events)
+	// 同じひとつの intent から、開いていない身体へ分かれる二本。人間には
+	// 登録済みブラウザへ Push、agent には attention inbox（凍結契約 v1
+	// 「Push 通知レイヤーとの対応」）。開いている窓を除外したりはしない——
+	// 「今見ている画面に重ねない」の判断は、その画面を持っている側
+	// （Service Worker / agent 本人）が行う。
+	store.deliverPush(ctx, place, msg, decisions)
 }
 
 // publishStatus fans a self-declared status out to everyone who may see the
@@ -1437,7 +1450,7 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "not_a_member")
 	case errors.Is(err, ErrNotAuthor):
 		writeError(w, http.StatusForbidden, "not_author")
-	case errors.Is(err, ErrForbidden):
+	case errors.Is(err, ErrForbidden), errors.Is(err, ErrPushSubscriptionOwned):
 		writeError(w, http.StatusForbidden, "forbidden")
 	case errors.Is(err, ErrNotReachable):
 		writeError(w, http.StatusForbidden, "not_reachable")
@@ -1471,6 +1484,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+	case errors.Is(err, ErrInvalidPushSubscription):
+		writeError(w, http.StatusBadRequest, "invalid_push_subscription")
 	case errors.Is(err, ErrInvalidScope):
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 	case errors.Is(err, applicationapps.ErrInstallationNotFound):
