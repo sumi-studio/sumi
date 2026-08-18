@@ -1,6 +1,6 @@
 import { EyeOff, X } from "lucide-react";
 import { useRef, useState } from "react";
-import { clampCodePoints } from "../../lib/text-length";
+import { codePointLength } from "../../lib/text-length";
 import { sanitizeAttachmentDisplayText } from "../attachment-display";
 import type { AttachmentDraftPatch } from "../model";
 import { MAX_ATTACHMENT_ALT_LENGTH } from "../model";
@@ -31,17 +31,27 @@ export function AttachmentEditDialog({
   const [nextFilename, setNextFilename] = useState(filename);
   const [nextAlt, setNextAlt] = useState(alt);
   const [nextSpoiler, setNextSpoiler] = useState(spoiler);
+  const [validationError, setValidationError] = useState<string | null>(null);
   const filenameRef = useRef<HTMLInputElement>(null);
 
   const apply = () => {
     const patch: AttachmentDraftPatch = {};
     const trimmed = sanitizeAttachmentDisplayText(nextFilename).trim();
-    const clampedAlt = clampCodePoints(
-      sanitizeAttachmentDisplayText(nextAlt),
-      MAX_ATTACHMENT_ALT_LENGTH,
-    );
-    if (trimmed && trimmed !== filename) patch.filename = trimmed;
-    if (clampedAlt !== alt) patch.alt = clampedAlt;
+    const sanitizedAlt = sanitizeAttachmentDisplayText(nextAlt);
+    if (!trimmed) {
+      setValidationError("ファイル名を入力してください");
+      filenameRef.current?.focus();
+      return;
+    }
+    if (codePointLength(sanitizedAlt) > MAX_ATTACHMENT_ALT_LENGTH) {
+      setValidationError(
+        `説明は${MAX_ATTACHMENT_ALT_LENGTH}文字以内で入力してください`,
+      );
+      return;
+    }
+    setValidationError(null);
+    if (trimmed !== filename) patch.filename = trimmed;
+    if (sanitizedAlt !== alt) patch.alt = sanitizedAlt;
     if (nextSpoiler !== spoiler) patch.spoiler = nextSpoiler;
     onApply(patch);
   };
@@ -87,7 +97,10 @@ export function AttachmentEditDialog({
             <input
               ref={filenameRef}
               value={nextFilename}
-              onChange={(event) => setNextFilename(event.target.value)}
+              onChange={(event) => {
+                setNextFilename(event.target.value);
+                setValidationError(null);
+              }}
               className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none focus:border-ring/60"
             />
           </label>
@@ -96,14 +109,10 @@ export function AttachmentEditDialog({
             <span className="mb-1 block font-medium text-[12px]">説明</span>
             <textarea
               value={nextAlt}
-              onChange={(event) =>
-                setNextAlt(
-                  clampCodePoints(
-                    event.target.value,
-                    MAX_ATTACHMENT_ALT_LENGTH,
-                  ),
-                )
-              }
+              onChange={(event) => {
+                setNextAlt(event.target.value);
+                setValidationError(null);
+              }}
               rows={2}
               placeholder="中身を見なくても何か分かる説明"
               className="w-full resize-none rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/70 focus:border-ring/60"
@@ -120,6 +129,11 @@ export function AttachmentEditDialog({
             <EyeOff className="size-3.5 text-muted-foreground" />
             ネタバレとしてマークする
           </label>
+          {validationError ? (
+            <p role="alert" className="text-[12px] text-destructive">
+              {validationError}
+            </p>
+          ) : null}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-border border-t px-4 py-3">

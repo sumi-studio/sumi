@@ -16,6 +16,7 @@ import {
 } from "../attachment-display";
 import { MockMessagingServer } from "../mock-server";
 import type { Attachment, AttachmentDraftPatch } from "../model";
+import { MAX_ATTACHMENT_ALT_LENGTH } from "../model";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
@@ -316,6 +317,50 @@ describe("AttachmentEditDialog", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     expect(onApply).toHaveBeenCalledWith({ alt: description });
+  });
+
+  it("keeps the dialog open and shows an error instead of dropping an empty filename", () => {
+    const onApply = vi.fn();
+    render(
+      <AttachmentEditDialog
+        filename="shot.png"
+        alt=""
+        spoiler={false}
+        onCancel={vi.fn()}
+        onApply={onApply}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "ファイル名" }), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "ファイル名を入力してください",
+    );
+    expect(
+      screen.getByRole("dialog", { name: "添付ファイルを編集" }),
+    ).toBeVisible();
+    expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("keeps an overlong description intact and shows an error instead of truncating it", () => {
+    const onApply = vi.fn();
+    const description = "😀".repeat(MAX_ATTACHMENT_ALT_LENGTH + 1);
+    render(
+      <AttachmentEditDialog
+        filename="shot.png"
+        alt=""
+        spoiler={false}
+        onCancel={vi.fn()}
+        onApply={onApply}
+      />,
+    );
+    const field = screen.getByRole("textbox", { name: "説明" });
+    fireEvent.change(field, { target: { value: description } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("説明は1000文字以内");
+    expect(field).toHaveValue(description);
+    expect(onApply).not.toHaveBeenCalled();
   });
 });
 

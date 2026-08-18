@@ -841,8 +841,11 @@ function parseAttachment(value: unknown): Attachment {
     sizeBytes,
     sha256: asString(wire.sha256),
     position,
-    spoiler: wire.spoiler === true,
-    alt: typeof wire.alt === "string" ? wire.alt : "",
+    // These declarations are mandatory on every attachment wire. In
+    // particular, inventing `false` for a missing spoiler would reveal an
+    // image the sender asked to keep covered.
+    spoiler: asBoolean(wire.spoiler),
+    alt: asString(wire.alt),
   };
 }
 

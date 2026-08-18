@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1406,7 +1407,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, into any) bool {
 		writeError(w, http.StatusBadRequest, "invalid_json")
 		return false
 	}
-	if dec.More() {
+	// Decoder.More only answers whether another value is available *inside* an
+	// array or object. A second Decode is the only strict top-level check: a
+	// JSON request has exactly one value followed by EOF.
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid_json")
 		return false
 	}
