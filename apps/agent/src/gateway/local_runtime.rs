@@ -55,7 +55,7 @@ use crate::apiclient::messaging::{
     PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
     ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
     UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
-    WriteMessagingMessageRequest, canonical_attachment_filename,
+    WriteMessagingMessageRequest, canonical_attachment_filename, validate_attention_response,
 };
 use crate::apiclient::workspace::{
     WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceInvitationApi,
@@ -1049,11 +1049,13 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: PollMessagingAttentionRequest,
     ) -> Result<serde_json::Value> {
-        self.post_json(
-            "/local-control/v1/messaging:attention",
-            &ScopedMessagingRequest::new(scope, request),
-        )
-        .await
+        let response = self
+            .post_json(
+                "/local-control/v1/messaging:attention",
+                &ScopedMessagingRequest::new(scope, request),
+            )
+            .await?;
+        validate_attention_response(response)
     }
 }
 

@@ -35,12 +35,16 @@ type AttentionCandidate struct {
 	CandidateID string
 	// CandidateSeq は agent ごとの単調増加。place の seq とは別軸である
 	// （凍結契約 v1 §2）。ack はこの軸の cursor を進めることで行う。
-	CandidateSeq int64
-	PlaceID      string
-	PlaceKind    string
-	MessageSeq   int64
-	Reason       string
-	CreatedAt    time.Time
+	CandidateSeq   int64
+	PlaceID        string
+	PlaceKind      string
+	MessageID      string
+	MessageSeq     int64
+	MessageAuthor  ParticipantRef
+	MessageUrgency string
+	Reason         string
+	UnreadFrom     int64
+	CreatedAt      time.Time
 }
 
 // AttentionInbox is one poll's answer: what is still waiting, how much this
@@ -169,23 +173,34 @@ func (s *ScopedStore) PollAttentionCandidates(
 
 	rows, err := tx.Query(ctx, `
 		SELECT ac.candidate_id, ac.candidate_seq, ac.place_id, p.kind,
-		       ac.message_seq, ac.reason, ac.created_at
+		       ac.message_id, ac.message_seq, m.author_kind, m.author_id, m.urgency,
+		       ac.reason,
+		       GREATEST(COALESCE(rm.last_read_seq, 0) + 1, COALESCE(pm.visible_from_seq, 1)),
+		       ac.created_at
 		FROM attention_candidates ac
 		JOIN places p ON p.workspace_id = ac.workspace_id AND p.place_id = ac.place_id
+		JOIN messages m ON m.message_id = ac.message_id
+		LEFT JOIN place_members pm
+		  ON pm.workspace_id = ac.workspace_id AND pm.place_id = ac.place_id
+		 AND pm.member_kind = $3 AND pm.member_id = $2 AND pm.left_at IS NULL
+		LEFT JOIN read_markers rm ON rm.place_id = pm.place_id AND rm.place_member_id = pm.place_member_id
 		WHERE ac.workspace_id = $1 AND ac.agent_id = $2 AND ac.consumed_at IS NULL
 		ORDER BY ac.candidate_seq
-		LIMIT $3`, s.Scope.WorkspaceID, agentID, limit)
+		LIMIT $4`, s.Scope.WorkspaceID, agentID, KindPersonalityAgent, limit)
 	if err != nil {
 		return AttentionInbox{}, fmt.Errorf("query attention candidates: %w", err)
 	}
 	for rows.Next() {
 		var candidate AttentionCandidate
+		var authorKind string
 		if err := rows.Scan(&candidate.CandidateID, &candidate.CandidateSeq, &candidate.PlaceID,
-			&candidate.PlaceKind, &candidate.MessageSeq, &candidate.Reason,
-			&candidate.CreatedAt); err != nil {
+			&candidate.PlaceKind, &candidate.MessageID, &candidate.MessageSeq,
+			&authorKind, &candidate.MessageAuthor.ID, &candidate.MessageUrgency,
+			&candidate.Reason, &candidate.UnreadFrom, &candidate.CreatedAt); err != nil {
 			rows.Close()
 			return AttentionInbox{}, fmt.Errorf("scan attention candidate: %w", err)
 		}
+		candidate.MessageAuthor.Kind = ParticipantKind(authorKind)
 		inbox.Candidates = append(inbox.Candidates, candidate)
 	}
 	if err := rows.Err(); err != nil {

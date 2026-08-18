@@ -53,6 +53,7 @@ const kindToDef = {
   browser_command_accepted: "BrowserCommandAcceptedFrame",
   browser_command_rejected: "BrowserCommandRejectedFrame",
   browser_direct_chat_status: "DirectChatStatusFrame",
+  attention_candidate: "AttentionCandidate",
 };
 
 const validators = new Map();

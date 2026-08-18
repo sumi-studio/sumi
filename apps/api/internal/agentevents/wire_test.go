@@ -59,6 +59,15 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 				t.Fatalf("fixture %q: validate command: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &env)
+		case "attention_candidate":
+			var candidate AttentionCandidate
+			if err := json.Unmarshal(wireRaw, &candidate); err != nil {
+				t.Fatalf("fixture %q: unmarshal AttentionCandidate: %v", name, err)
+			}
+			if err := candidate.Provenance.Validate(); err != nil {
+				t.Fatalf("fixture %q: validate AttentionCandidate provenance: %v", name, err)
+			}
+			roundTripJSON(t, name, wireRaw, &candidate)
 		case "agent_hello":
 			var hello AgentHello
 			if err := json.Unmarshal(wireRaw, &hello); err != nil {

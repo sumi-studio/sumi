@@ -209,8 +209,10 @@ func (s *ScopedStore) DeletePushSubscription(ctx context.Context, endpoint strin
 }
 
 // pushSubscriptionsFor loads every endpoint belonging to the given humans in
-// one round trip, keyed by ParticipantRef.Key(). 配送側の内部読み出しで、
-// 認可は既に済んでいる（intent は message と同じ transaction で確定した）。
+// one round trip, keyed by ParticipantRef.Key(). これは配送側の内部読み出しで、
+// 呼び出し元が current audience の shared lease を保持している間にだけ使う。
+// intent は message と同じ transaction で確定するが、それ自体は後続配送の
+// 認可にはならない。
 func (s *Store) pushSubscriptionsFor(
 	ctx context.Context, recipients []ParticipantRef,
 ) (map[string][]PushSubscription, error) {
@@ -308,8 +310,9 @@ type pushHTTPClient interface {
 type PushDispatcher struct {
 	store *Store
 	keys  VAPIDKeys
-	// subject は VAPID JWT の sub。push service に対する運用連絡先で、
-	// mailto: か https: の URL である必要がある。
+	// subject は webpush-go に渡す正規化済み VAPID JWT sub。設定値は push
+	// service に対する運用連絡先として mailto:ops@example.com か HTTPS URL を
+	// 使う。前者の mailto: は constructor が一度だけ外す。
 	subject string
 	client  pushHTTPClient
 }
@@ -320,7 +323,10 @@ func NewPushDispatcher(ctx context.Context, store *Store, subject string) (*Push
 	if store == nil {
 		return nil, errors.New("push dispatcher requires a store")
 	}
-	subject = strings.TrimSpace(subject)
+	subject, err := normalizeVAPIDSubject(subject)
+	if err != nil {
+		return nil, err
+	}
 	if subject == "" {
 		return nil, errors.New("push dispatcher requires a VAPID subject (mailto: or https: URL)")
 	}
@@ -332,6 +338,28 @@ func NewPushDispatcher(ctx context.Context, store *Store, subject string) (*Push
 	// サーバーが出ていく」経路なので、出口ポリシーを織り込んだ client でしか
 	// 送らない（push_egress.go）。
 	return &PushDispatcher{store: store, keys: keys, subject: subject, client: newPushHTTPClient()}, nil
+}
+
+// normalizeVAPIDSubject adapts the documented VAPID subject to webpush-go's
+// API. That library treats every non-HTTPS value as a bare mailbox and adds
+// "mailto:" itself, so its input must be an address without that prefix.
+// HTTPS subjects are already accepted as-is. Keep this compatibility seam at
+// construction: every send then uses one normalized value.
+func normalizeVAPIDSubject(subject string) (string, error) {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(subject, "https:") {
+		return subject, nil
+	}
+	if strings.HasPrefix(subject, "mailto:") {
+		subject = strings.TrimPrefix(subject, "mailto:")
+	}
+	if subject == "" {
+		return "", errors.New("push dispatcher requires a VAPID subject (mailto: or https: URL)")
+	}
+	return subject, nil
 }
 
 // PublicKey is the application server key a browser must present to
@@ -361,7 +389,7 @@ func (s *ScopedStore) deliverPush(ctx context.Context, place Place, msg Message,
 	detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), pushDeliveryTimeout)
 	go func() {
 		defer cancel()
-		dispatcher.deliver(detached, place, msg, decisions, authorName)
+		dispatcher.deliver(detached, s.Scope, place, msg, decisions, authorName)
 	}()
 }
 
@@ -388,12 +416,36 @@ func (s *ScopedStore) authorDisplayName(ctx context.Context, place Place, msg Me
 const defaultPushTitle = "新しいメッセージ"
 
 func (d *PushDispatcher) deliver(
-	ctx context.Context, place Place, msg Message, decisions []NotificationDecision, authorName string,
+	ctx context.Context, scope Scope, place Place, msg Message, decisions []NotificationDecision, authorName string,
+) {
+	if d == nil || d.store == nil || len(decisions) == 0 {
+		return
+	}
+	// A notification intent is the immutable decision that a recipient should
+	// be called. It is not permission to disclose the message forever. Take the
+	// exact same shared audience lease as live fanout before this process sends
+	// a payload outside; a membership removal that committed first therefore
+	// removes the browser from the only sendable audience.
+	err := d.store.withLiveAudience(ctx, scope, liveBoundary{placeID: place.PlaceID}, false,
+		func(audience map[ParticipantRef]struct{}) error {
+			d.deliverToAudience(ctx, audience, place, msg, decisions, authorName)
+			return nil
+		})
+	if err != nil {
+		log.Printf("messaging push: reauthorize audience: %v", err)
+	}
+}
+
+func (d *PushDispatcher) deliverToAudience(
+	ctx context.Context, audience map[ParticipantRef]struct{}, place Place, msg Message,
+	decisions []NotificationDecision, authorName string,
 ) {
 	humans := make([]ParticipantRef, 0, len(decisions))
 	for _, decision := range decisions {
 		if decision.Participant.Kind == KindHuman {
-			humans = append(humans, decision.Participant)
+			if _, allowed := audience[decision.Participant]; allowed {
+				humans = append(humans, decision.Participant)
+			}
 		}
 	}
 	if len(humans) == 0 {
@@ -412,6 +464,9 @@ func (d *PushDispatcher) deliver(
 	}
 	for _, decision := range decisions {
 		if decision.Participant.Kind != KindHuman {
+			continue
+		}
+		if _, allowed := audience[decision.Participant]; !allowed {
 			continue
 		}
 		endpoints := subscriptions[decision.Participant.Key()]

@@ -611,17 +611,98 @@ func (s *Server) localSearch(w http.ResponseWriter, r *http.Request, authorizati
 	}{wires})
 }
 
-// attentionCandidateWire is one queued「呼ばれた」. actor / message_id / 本文は
-// 載せない：候補は message ref であって本文の注入ではない（凍結契約 v1）。
-// 続きは place を open して読む——人間が通知から place を開くのと同じ動きで、
-// そこで read cursor も正しく進む。
+// attentionCandidateWire is one queued「呼ばれた」. The frozen contract keeps
+// actor, place, message reference, reason, urgency, and authority together in
+// provenance; it only keeps the message body behind the later place-open
+// authorization boundary. Candidate-local fields must not duplicate provenance.
 type attentionCandidateWire struct {
-	CandidateID  string    `json:"candidate_id"`
-	CandidateSeq int64     `json:"candidate_seq"`
-	Place        placeWire `json:"place"`
-	MessageSeq   int64     `json:"message_seq"`
-	Reason       string    `json:"reason"`
-	ArrivalTime  time.Time `json:"arrival_time"`
+	Kind         string                          `json:"kind"`
+	CandidateID  string                          `json:"candidate_id"`
+	CandidateSeq int64                           `json:"candidate_seq"`
+	Provenance   agentevents.InboundProvenanceV1 `json:"provenance"`
+	UnreadRange  attentionUnreadRangeWire        `json:"unread_range"`
+	ArrivalTime  time.Time                       `json:"arrival_time"`
+	Attachments  map[string]any                  `json:"attachments"`
+}
+
+type attentionUnreadRangeWire struct {
+	PlaceSeqFrom int64 `json:"place_seq_from"`
+	PlaceSeqTo   int64 `json:"place_seq_to"`
+}
+
+func attentionCandidateToWire(candidate AttentionCandidate, tenantID, workspaceID, agentID string) (attentionCandidateWire, error) {
+	// The PAID-local authorization normally supplies the tenant. Messaging is a
+	// Workspace-owned surface, so older local-control leases without that claim
+	// still have one canonical tenancy boundary to record.
+	if tenantID == "" {
+		tenantID = workspaceID
+	}
+	actor := inboundActor(candidate.MessageAuthor)
+	addressee := inboundActor(PersonalityAgent(agentID))
+	workspace := workspaceID
+	provenance := agentevents.InboundProvenanceV1{
+		Version:            1,
+		TenantID:           tenantID,
+		PersonalityAgentID: agentID,
+		Actor:              actor,
+		Source: agentevents.InboundSource{
+			Surface:     "messaging",
+			WorkspaceID: &workspace,
+			Place:       inboundPlace(candidate.PlaceID, candidate.PlaceKind),
+			Delivery: &agentevents.InboundDeliveryProvenance{
+				MessageID:     candidate.MessageID,
+				Seq:           candidate.MessageSeq,
+				Addressees:    []agentevents.InboundActorRef{addressee},
+				TriggerReason: attentionTriggerReason(candidate.Reason),
+				Urgency:       candidate.MessageUrgency,
+				CorrelationID: nil,
+				CausationID:   nil,
+			},
+		},
+		Authority: agentevents.AdmissionAuthority{Basis: "place_membership", DecisionID: nil},
+	}
+	if err := provenance.Validate(); err != nil {
+		return attentionCandidateWire{}, err
+	}
+	return attentionCandidateWire{
+		Kind:         "attention_candidate",
+		CandidateID:  candidate.CandidateID,
+		CandidateSeq: candidate.CandidateSeq,
+		Provenance:   provenance,
+		UnreadRange: attentionUnreadRangeWire{
+			PlaceSeqFrom: candidate.UnreadFrom,
+			PlaceSeqTo:   candidate.MessageSeq,
+		},
+		ArrivalTime: candidate.CreatedAt,
+		Attachments: map[string]any{},
+	}, nil
+}
+
+func inboundActor(participant ParticipantRef) agentevents.InboundActorRef {
+	if participant.Kind == KindHuman {
+		return agentevents.InboundActorRef{Kind: string(KindHuman), HumanID: participant.ID}
+	}
+	return agentevents.InboundActorRef{Kind: string(KindPersonalityAgent), PersonalityAgentID: participant.ID}
+}
+
+func inboundPlace(placeID, kind string) *agentevents.InboundPlaceRef {
+	if kind == PlaceChannel {
+		return &agentevents.InboundPlaceRef{Kind: kind, ChannelID: placeID}
+	}
+	return &agentevents.InboundPlaceRef{Kind: kind, DMID: placeID}
+}
+
+func attentionTriggerReason(reason string) string {
+	switch reason {
+	case NotifyReasonDM:
+		return "direct_message"
+	case NotifyReasonMention:
+		return "mention"
+	default:
+		// keyword and all are delivery-eligibility facts, but neither asserts a
+		// resolved address in this candidate; both are place activity.
+		return "place_activity"
+	}
 }
 
 // localAttention hands the agent its own unconsumed AttentionCandidates and, in
@@ -665,14 +746,13 @@ func (s *Server) localAttention(w http.ResponseWriter, r *http.Request, authoriz
 	}
 	wires := make([]attentionCandidateWire, len(inbox.Candidates))
 	for i, candidate := range inbox.Candidates {
-		wires[i] = attentionCandidateWire{
-			CandidateID:  candidate.CandidateID,
-			CandidateSeq: candidate.CandidateSeq,
-			Place:        placeToWire(Place{PlaceID: candidate.PlaceID, Kind: candidate.PlaceKind}),
-			MessageSeq:   candidate.MessageSeq,
-			Reason:       candidate.Reason,
-			ArrivalTime:  candidate.CreatedAt,
+		wire, err := attentionCandidateToWire(candidate, authorization.TenantID,
+			store.Scope.WorkspaceID, store.Scope.Actor.ID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
 		}
+		wires[i] = wire
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Candidates []attentionCandidateWire `json:"candidates"`

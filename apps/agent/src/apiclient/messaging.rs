@@ -6,13 +6,14 @@
 
 use std::os::fd::OwnedFd;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::apps::AppInstallationResolver;
+use crate::runtime::contracts::InboundProvenanceV1;
 use crate::tools::executor::TransferredSource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +333,55 @@ pub(crate) struct PollMessagingAttentionRequest {
     pub consume_through: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u16>,
+}
+
+/// The provisional local-control route is still an adapter, but its candidate
+/// payload itself is frozen. Deserialize it here before it reaches the tool so
+/// an API shape drift cannot silently become an untyped agent input.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingAttentionResponse {
+    pub candidates: Vec<MessagingAttentionCandidate>,
+    pub consumed: u64,
+    pub latest_seq: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingAttentionCandidate {
+    pub kind: MessagingAttentionCandidateKind,
+    pub candidate_id: String,
+    pub candidate_seq: u64,
+    pub provenance: InboundProvenanceV1,
+    pub unread_range: MessagingUnreadRange,
+    pub arrival_time: String,
+    pub attachments: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MessagingAttentionCandidateKind {
+    AttentionCandidate,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingUnreadRange {
+    pub place_seq_from: u64,
+    pub place_seq_to: u64,
+}
+
+pub(crate) fn validate_attention_response(value: Value) -> Result<Value> {
+    let response: MessagingAttentionResponse = serde_json::from_value(value.clone())
+        .context("decode frozen messaging AttentionCandidate response")?;
+    for candidate in &response.candidates {
+        if candidate.unread_range.place_seq_from == 0
+            || candidate.unread_range.place_seq_from > candidate.unread_range.place_seq_to
+        {
+            anyhow::bail!("invalid messaging AttentionCandidate unread range");
+        }
+    }
+    Ok(value)
 }
 
 #[async_trait]

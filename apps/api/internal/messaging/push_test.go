@@ -3,6 +3,8 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -28,10 +30,11 @@ const (
 // いかないまま、「どの endpoint に何回出したか」と「相手が死んだと言ったとき
 // どうするか」だけを見る。
 type recordingPushClient struct {
-	mu     sync.Mutex
-	sent   []string
-	status map[string]int
-	err    error
+	mu             sync.Mutex
+	sent           []string
+	authorizations []string
+	status         map[string]int
+	err            error
 }
 
 func (c *recordingPushClient) Do(request *http.Request) (*http.Response, error) {
@@ -41,6 +44,7 @@ func (c *recordingPushClient) Do(request *http.Request) (*http.Response, error) 
 		return nil, c.err
 	}
 	c.sent = append(c.sent, request.URL.String())
+	c.authorizations = append(c.authorizations, request.Header.Get("Authorization"))
 	status := http.StatusCreated
 	if override, ok := c.status[request.URL.String()]; ok {
 		status = override
@@ -51,6 +55,12 @@ func (c *recordingPushClient) Do(request *http.Request) (*http.Response, error) 
 		Header:     http.Header{},
 		Request:    request,
 	}, nil
+}
+
+func (c *recordingPushClient) authorizationHeaders() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.authorizations...)
 }
 
 func (c *recordingPushClient) endpoints() []string {
@@ -348,7 +358,7 @@ func TestPushGoesOnlyToTheHumansTheServerDecidedToCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("intents: %v", err)
 	}
-	dispatcher.deliver(ctx, ch, msg, decisions, "Yohaku")
+	dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope, ch, msg, decisions, "Yohaku")
 
 	sent := client.endpoints()
 	if len(sent) != 1 || sent[0] != "https://push.example.test/haru" {
@@ -356,11 +366,87 @@ func TestPushGoesOnlyToTheHumansTheServerDecidedToCall(t *testing.T) {
 	}
 }
 
+func TestPushDoesNotSendToAMemberRemovedAfterMessageCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/removed")
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "削除後には届かない本文")
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+	if err := w.workspaces.RemoveMember(ctx, workspace.WorkspaceID,
+		activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.humanB), w.humanA); err != nil {
+		t.Fatalf("remove committed recipient: %v", err)
+	}
+
+	client := &recordingPushClient{}
+	dispatcher := w.dispatcher(t, ctx, client)
+	dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope,
+		ch, msg, decisions, "Yohaku")
+	if sent := client.endpoints(); len(sent) != 0 {
+		t.Fatalf("push sent to member removed after commit: %v", sent)
+	}
+}
+
+func TestVAPIDMailtoSubjectIsNormalizedBeforeWebpushBuildsJWT(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/vapid-subject")
+
+	dispatcher, err := NewPushDispatcher(ctx, w.store.core, "mailto:ops@example.test")
+	if err != nil {
+		t.Fatalf("new dispatcher: %v", err)
+	}
+	client := &recordingPushClient{}
+	dispatcher.client = client
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "VAPID subject を確認")
+	decisions, err := w.store.NotificationIntentsForMessage(ctx, msg.MessageID)
+	if err != nil {
+		t.Fatalf("intents: %v", err)
+	}
+	dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope,
+		ch, msg, decisions, "Yohaku")
+
+	headers := client.authorizationHeaders()
+	if len(headers) != 1 {
+		t.Fatalf("VAPID authorization headers = %d, want 1", len(headers))
+	}
+	if !strings.HasPrefix(headers[0], "vapid t=") {
+		t.Fatalf("VAPID authorization = %q", headers[0])
+	}
+	token, _, found := strings.Cut(strings.TrimPrefix(headers[0], "vapid t="), ", k=")
+	if !found {
+		t.Fatalf("parse VAPID authorization %q", headers[0])
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("VAPID JWT = %q, want three segments", token)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode VAPID JWT payload: %v", err)
+	}
+	var claims struct {
+		Subject string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("decode VAPID JWT claims: %v", err)
+	}
+	if claims.Subject != "mailto:ops@example.test" {
+		t.Fatalf("VAPID JWT sub = %q, want one mailto prefix", claims.Subject)
+	}
+}
+
 func TestPushForgetsAnEndpointThePushServiceDeclaredGone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	_, ch := w.workspaceWithChannel(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
 	w.subscribe(t, ctx, w.humanB, "https://push.example.test/dead")
 
 	client := &recordingPushClient{status: map[string]int{
@@ -372,7 +458,7 @@ func TestPushForgetsAnEndpointThePushServiceDeclaredGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("intents: %v", err)
 	}
-	dispatcher.deliver(ctx, ch, msg, decisions, "Yohaku")
+	dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope, ch, msg, decisions, "Yohaku")
 
 	if got := len(w.subscriptionsFor(t, ctx, w.humanB)[w.humanB.Key()]); got != 0 {
 		t.Fatalf("a 410 endpoint survived: %d rows", got)
@@ -383,7 +469,7 @@ func TestPushLogsUnexpectedServiceStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	_, ch := w.workspaceWithChannel(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
 	w.subscribe(t, ctx, w.humanB, "https://push.example.test/rejected")
 
 	client := &recordingPushClient{status: map[string]int{
@@ -404,7 +490,7 @@ func TestPushLogsUnexpectedServiceStatus(t *testing.T) {
 		log.SetOutput(previousWriter)
 		log.SetFlags(previousFlags)
 	})
-	dispatcher.deliver(ctx, ch, msg, decisions, "Yohaku")
+	dispatcher.deliver(ctx, w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA).Scope, ch, msg, decisions, "Yohaku")
 
 	if !strings.Contains(logs.String(), "unexpected response status 400") {
 		t.Fatalf("push log = %q, want rejected status", logs.String())

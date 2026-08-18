@@ -750,6 +750,99 @@ $defs:
         properties:
           surface: { const: direct_chat }
 
+  InboundActorRef:
+    oneOf:
+      - type: object
+        required: [kind, human_id]
+        additionalProperties: false
+        properties:
+          kind: { const: human }
+          human_id: { $ref: '#/$defs/PersonalityAgentId' }
+      - type: object
+        required: [kind, personality_agent_id]
+        additionalProperties: false
+        properties:
+          kind: { const: personality_agent }
+          personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+
+  InboundPlaceRef:
+    oneOf:
+      - type: object
+        required: [kind, channel_id]
+        additionalProperties: false
+        properties:
+          kind: { const: channel }
+          channel_id: { $ref: '#/$defs/TenantId' }
+      - type: object
+        required: [kind, dm_id]
+        additionalProperties: false
+        properties:
+          kind: { enum: [dm, group_dm] }
+          dm_id: { $ref: '#/$defs/TenantId' }
+
+  InboundDeliveryProvenance:
+    type: object
+    required: [message_id, seq, addressees, trigger_reason, urgency, correlation_id, causation_id]
+    additionalProperties: false
+    properties:
+      message_id: { $ref: '#/$defs/TenantId' }
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+      addressees:
+        type: array
+        maxItems: 64
+        items: { $ref: '#/$defs/InboundActorRef' }
+      trigger_reason: { enum: [mention, direct_message, place_activity] }
+      urgency: { enum: [urgent, normal, fyi] }
+      correlation_id:
+        oneOf: [{ $ref: '#/$defs/TenantId' }, { type: 'null' }]
+      causation_id:
+        oneOf: [{ $ref: '#/$defs/TenantId' }, { type: 'null' }]
+
+  InboundProvenanceV1:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source, authority]
+    additionalProperties: false
+    properties:
+      version: { const: 1 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor: { $ref: '#/$defs/InboundActorRef' }
+      source:
+        type: object
+        required: [surface, workspace_id, place, delivery]
+        additionalProperties: false
+        properties:
+          surface: { const: messaging }
+          workspace_id: { $ref: '#/$defs/PersonalityAgentId' }
+          place: { $ref: '#/$defs/InboundPlaceRef' }
+          delivery: { $ref: '#/$defs/InboundDeliveryProvenance' }
+      authority:
+        type: object
+        required: [basis, decision_id]
+        additionalProperties: false
+        properties:
+          basis: { const: place_membership }
+          decision_id: { type: 'null' }
+
+  AttentionCandidate:
+    type: object
+    required: [kind, candidate_id, candidate_seq, provenance, unread_range, arrival_time, attachments]
+    additionalProperties: false
+    properties:
+      kind: { const: attention_candidate }
+      candidate_id: { $ref: '#/$defs/PersonalityAgentId' }
+      candidate_seq: { $ref: '#/$defs/JsonSafeInteger' }
+      provenance: { $ref: '#/$defs/InboundProvenanceV1' }
+      unread_range:
+        type: object
+        required: [place_seq_from, place_seq_to]
+        additionalProperties: false
+        properties:
+          place_seq_from: { $ref: '#/$defs/JsonSafeInteger' }
+          place_seq_to: { $ref: '#/$defs/JsonSafeInteger' }
+      arrival_time: { type: string, format: date-time }
+      attachments: { $ref: '#/$defs/AnyJSONObject' }
+
   CommandEnvelope:
     type: object
     required: [seq, command_id, personality_agent_id, provenance, command]

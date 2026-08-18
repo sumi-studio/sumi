@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func (w world) poll(
 	t *testing.T, ctx context.Context, server *Server, body map[string]any,
 ) map[string]any {
 	t.Helper()
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID, TenantID: "tenant-1"}
 	status, decoded := callLocal(t, ctx, server.localAttention, LocalAttentionPath, body, authorization)
 	if status != http.StatusOK {
 		t.Fatalf("poll attention: status %d body %v", status, decoded)
@@ -42,7 +43,7 @@ func TestMentioningAnAgentQueuesACandidateItCanTakeIn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	_, ch := w.workspaceWithChannel(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
 	server := NewServer(w.store.core, nil)
 
 	mention := w.send(t, ctx, ch.PlaceID, w.humanA, "@Kuro（Yohaku） この件おねがいします")
@@ -53,21 +54,56 @@ func TestMentioningAnAgentQueuesACandidateItCanTakeIn(t *testing.T) {
 		t.Fatalf("candidates = %v, want the mention", body)
 	}
 	first := candidates[0]
-	if first["reason"] != NotifyReasonMention {
-		t.Fatalf("reason = %v, want the server's own verdict", first["reason"])
+	if first["kind"] != "attention_candidate" {
+		t.Fatalf("kind = %v, want attention_candidate", first["kind"])
 	}
-	if first["message_seq"] != float64(mention.Seq) {
-		t.Fatalf("message_seq = %v, want %d", first["message_seq"], mention.Seq)
+	provenance, _ := first["provenance"].(map[string]any)
+	if provenance["version"] != float64(1) || provenance["tenant_id"] != "tenant-1" ||
+		provenance["personality_agent_id"] != w.agent.ID {
+		t.Fatalf("provenance header = %v", provenance)
 	}
-	// 候補は message ref であって本文の注入ではない（凍結契約 v1）。
-	for _, leaked := range []string{"content", "author", "message_id"} {
+	source, _ := provenance["source"].(map[string]any)
+	if source["surface"] != "messaging" || source["workspace_id"] != workspace.WorkspaceID {
+		t.Fatalf("provenance source = %v", source)
+	}
+	place, _ := source["place"].(map[string]any)
+	if place["channel_id"] != ch.PlaceID {
+		t.Fatalf("provenance place = %v, want the channel the agent must open", place)
+	}
+	delivery, _ := source["delivery"].(map[string]any)
+	if delivery["message_id"] != mention.MessageID || delivery["seq"] != float64(mention.Seq) ||
+		delivery["trigger_reason"] != "mention" || delivery["urgency"] != UrgencyNormal {
+		t.Fatalf("provenance delivery = %v", delivery)
+	}
+	actor, _ := provenance["actor"].(map[string]any)
+	if actor["kind"] != "human" || actor["human_id"] != w.humanA.ID {
+		t.Fatalf("provenance actor = %v", actor)
+	}
+	unreadRange, _ := first["unread_range"].(map[string]any)
+	if unreadRange["place_seq_from"] != float64(1) || unreadRange["place_seq_to"] != float64(mention.Seq) {
+		t.Fatalf("unread_range = %v", unreadRange)
+	}
+	// 候補は message ref を provenance に持つが、本文を注入しない。
+	for _, leaked := range []string{"content", "place", "message_seq", "reason", "message_id", "author"} {
 		if _, present := first[leaked]; present {
 			t.Fatalf("candidate carried %q: %v", leaked, first)
 		}
 	}
-	place, _ := first["place"].(map[string]any)
-	if place["channel_id"] != ch.PlaceID {
-		t.Fatalf("place = %v, want the channel the agent must open", place)
+	if _, present := delivery["content"]; present {
+		t.Fatalf("provenance delivery leaked content: %v", delivery)
+	}
+	// The actual local-control response—not merely the fixture—must decode as
+	// the frozen contract's Go type.
+	wireJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal attention candidate: %v", err)
+	}
+	var frozen agentevents.AttentionCandidate
+	if err := json.Unmarshal(wireJSON, &frozen); err != nil {
+		t.Fatalf("decode frozen attention candidate: %v", err)
+	}
+	if err := frozen.Provenance.Validate(); err != nil {
+		t.Fatalf("validate frozen candidate provenance: %v", err)
 	}
 
 	// ack すれば消える。二度目の poll では出てこない。
@@ -256,7 +292,13 @@ func TestReadingThroughSupersedesCandidatesInsteadOfWakingTwice(t *testing.T) {
 		t.Fatalf("read through: %v", err)
 	}
 	candidates := candidateList(t, w.poll(t, ctx, server, map[string]any{}))
-	if len(candidates) != 1 || candidates[0]["message_seq"] != float64(second.Seq) {
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %+v, want only the still-unread one", candidates)
+	}
+	provenance, _ := candidates[0]["provenance"].(map[string]any)
+	source, _ := provenance["source"].(map[string]any)
+	delivery, _ := source["delivery"].(map[string]any)
+	if delivery["seq"] != float64(second.Seq) {
 		t.Fatalf("candidates = %+v, want only the still-unread one", candidates)
 	}
 }
