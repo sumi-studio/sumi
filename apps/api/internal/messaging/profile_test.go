@@ -170,7 +170,7 @@ func TestSetProfileRefusesUnusableNamesAndOverlongTaglines(t *testing.T) {
 			t.Fatalf("display name %q: got %v, want ErrInvalidDisplayName", name, err)
 		}
 	}
-	for _, tagline := range []string{strings.Repeat("あ", MaxTaglineChars+1), "a\nb", "a\n"} {
+	for _, tagline := range []string{strings.Repeat("あ", MaxTaglineChars+1), "a\nb", "a\n", "safe\u202edanger", "safe\u2066danger", "a\u0085b", "a\u2028b", "a\u2029b"} {
 		if _, err := w.store.SetProfile(ctx, w.humanA, nil, ptr(tagline)); !errors.Is(err, ErrInvalidTagline) {
 			t.Fatalf("invalid tagline %q: got %v, want ErrInvalidTagline", tagline, err)
 		}
@@ -187,6 +187,9 @@ func TestSetProfileRefusesUnusableNamesAndOverlongTaglines(t *testing.T) {
 	if _, err := w.store.SetProfile(ctx, w.humanA, nil,
 		ptr(strings.Repeat("あ", MaxTaglineChars))); err != nil {
 		t.Fatalf("tagline of exactly %d runes: %v", MaxTaglineChars, err)
+	}
+	if _, err := w.store.SetProfile(ctx, w.humanA, nil, ptr("家族\u200d👩")); err != nil {
+		t.Fatalf("ZWJ tagline: %v", err)
 	}
 	profile, err = w.store.SetProfile(ctx, w.humanA, nil, ptr("  開発  "))
 	if err != nil || profile.Tagline != "開発" {
@@ -304,13 +307,25 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_tagline" {
 		t.Fatalf("multiline tagline: status %d body %v", resp.StatusCode, body)
 	}
+	for _, tagline := range []string{"safe\u202edanger", "safe\u2066danger"} {
+		resp, body = call(t, ts, http.MethodPut, "/messaging/profile", w.humanA.ID,
+			map[string]any{"tagline": tagline})
+		if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_tagline" {
+			t.Fatalf("format-control tagline %q: status %d body %v", tagline, resp.StatusCode, body)
+		}
+	}
+	resp, body = call(t, ts, http.MethodPut, "/messaging/profile", w.humanA.ID,
+		map[string]any{"tagline": "家族\u200d👩"})
+	if resp.StatusCode != http.StatusOK || body["tagline"] != "家族\u200d👩" {
+		t.Fatalf("ZWJ tagline: status %d body %v", resp.StatusCode, body)
+	}
 	resp, body = call(t, ts, http.MethodPut, "/messaging/profile", w.humanA.ID,
 		map[string]any{"display_name": "  "})
 	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_display_name" {
 		t.Fatalf("blank display name: status %d body %v", resp.StatusCode, body)
 	}
 	resp, body = call(t, ts, http.MethodGet, "/messaging/profile", w.humanA.ID, nil)
-	if resp.StatusCode != http.StatusOK || body["display_name"] != "余白" || body["tagline"] != "開発" {
+	if resp.StatusCode != http.StatusOK || body["display_name"] != "余白" || body["tagline"] != "家族\u200d👩" {
 		t.Fatalf("profile after refusals: status %d body %v", resp.StatusCode, body)
 	}
 }

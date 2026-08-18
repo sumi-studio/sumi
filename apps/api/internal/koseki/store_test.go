@@ -101,13 +101,13 @@ func TestNewUUIDv7FormatAndUniqueness(t *testing.T) {
 }
 
 func TestHumanDisplayNameValidation(t *testing.T) {
-	if got, err := normalizeHumanDisplayName("  薄明色\nの忘れ路  "); err != nil || got != "薄明色 の忘れ路" {
+	if got, err := normalizeHumanDisplayName("  薄明色　の忘れ路  "); err != nil || got != "薄明色 の忘れ路" {
 		t.Fatalf("normalized name = %q, %v", got, err)
 	}
 	if got, err := normalizeHumanDisplayName("家族\u200d👩"); err != nil || got != "家族\u200d👩" {
 		t.Fatalf("ZWJ name = %q, %v", got, err)
 	}
-	for _, invalid := range []string{"", "\u200d", "\ufe0f", "\u0301", "safe\u202edanger", strings.Repeat("名", MaxHumanDisplayNameRunes+1)} {
+	for _, invalid := range []string{"", "\u200d", "\ufe0f", "\u0301", "safe\u202edanger", "safe\u2066danger", "a\nb", "a\u0085b", "a\u2028b", "a\u2029b", strings.Repeat("名", MaxHumanDisplayNameRunes+1)} {
 		if _, err := normalizeHumanDisplayName(invalid); !errors.Is(err, ErrInvalidDisplayName) {
 			t.Fatalf("invalid name accepted: %q, %v", invalid, err)
 		}

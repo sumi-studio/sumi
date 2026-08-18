@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -158,14 +157,12 @@ func (s *ScopedStore) SetProfile(ctx context.Context, displayName, tagline *stri
 	}, publish)
 }
 
-// normalizeTagline applies the profile text rule at the one shared write
-// boundary. A tagline is deliberately less restrictive than a display name,
-// but it is still a trimmed, single display line with no control characters.
+// normalizeTagline applies the shared display-text rule at the one profile
+// write boundary. A tagline may be empty and has its own length limit, but its
+// permitted characters and single-line rule are the same as a display name.
 func normalizeTagline(raw string) (string, error) {
-	for _, r := range raw {
-		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
-			return "", ErrInvalidTagline
-		}
+	if err := koseki.ValidateDisplayText(raw); err != nil {
+		return "", ErrInvalidTagline
 	}
 	value := strings.TrimSpace(raw)
 	if utf8.RuneCountInString(value) > MaxTaglineChars {

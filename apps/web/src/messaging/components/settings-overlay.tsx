@@ -2,7 +2,11 @@ import { Check, Copy, Settings, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { create } from "zustand";
 import { useSelfProfile } from "../../auth/self-profile";
-import { clampCodePoints, codePointLength } from "../../lib/text-length";
+import {
+  clampCodePoints,
+  codePointLength,
+  hasSafeDisplayCharacters,
+} from "../../lib/text-length";
 import type { ParticipantRef } from "../model";
 import { useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -158,10 +162,13 @@ function ProfileSection() {
   const dirty =
     displayName !== form.baseline.displayName ||
     tagline !== form.baseline.tagline;
+  const displayNameIsValid =
+    displayName.trim() !== "" && hasSafeDisplayCharacters(displayName);
+  const taglineIsValid = hasSafeDisplayCharacters(tagline);
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (busy || !dirty) return;
+    if (busy || !dirty || !displayNameIsValid || !taglineIsValid) return;
     setBusy(true);
     setFailed("");
     setSaved(false);
@@ -261,7 +268,7 @@ function ProfileSection() {
       <div className="flex items-center gap-3">
         <button
           type="submit"
-          disabled={busy || !dirty || displayName.trim() === ""}
+          disabled={busy || !dirty || !displayNameIsValid || !taglineIsValid}
           className="rounded-md bg-primary px-3 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >
           保存

@@ -15,23 +15,34 @@ const MaxHumanDisplayNameRunes = 80
 
 var ErrInvalidDisplayName = errors.New("invalid Human display name")
 
+// ValidateDisplayText rejects characters that can change how a displayed
+// string is laid out or interpreted. ZWNJ and ZWJ are the only format
+// controls retained: scripts and emoji sequences use them as joiners.
+//
+// This is shared by every sender-controlled display string. Keep the
+// single-line rule here too, so a field cannot become a looser display path.
+func ValidateDisplayText(raw string) error {
+	for _, r := range raw {
+		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return ErrInvalidDisplayName
+		}
+		if unicode.In(r, unicode.Cf) && r != '\u200c' && r != '\u200d' {
+			return ErrInvalidDisplayName
+		}
+	}
+	return nil
+}
+
 // normalizeHumanDisplayName makes profile text safe to persist while
 // preserving ordinary Unicode names and the joiners used by emoji/scripts.
 func normalizeHumanDisplayName(raw string) (string, error) {
+	if err := ValidateDisplayText(raw); err != nil {
+		return "", err
+	}
 	var cleaned strings.Builder
 	cleaned.Grow(len(raw))
 	visible := false
 	for _, r := range raw {
-		if unicode.IsControl(r) {
-			if unicode.IsSpace(r) {
-				cleaned.WriteByte(' ')
-				continue
-			}
-			return "", ErrInvalidDisplayName
-		}
-		if unicode.In(r, unicode.Cf) && r != '\u200c' && r != '\u200d' {
-			return "", ErrInvalidDisplayName
-		}
 		if !unicode.IsSpace(r) && !unicode.In(r, unicode.Cf) && !unicode.Is(unicode.M, r) {
 			visible = true
 		}

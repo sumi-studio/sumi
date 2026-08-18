@@ -197,6 +197,34 @@ describe("個人設定", () => {
     expect(updateProfile).not.toHaveBeenCalled();
   });
 
+  it("表示文字列の禁止書式制御はtaglineでも保存しない", () => {
+    render(<SettingsOverlay />);
+
+    fireEvent.change(screen.getByLabelText("ひとこと"), {
+      target: { value: "safe\u202edanger" },
+    });
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("ひとこと"), {
+      target: { value: "safe\u2066danger" },
+    });
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    expect(updateProfile).not.toHaveBeenCalled();
+  });
+
+  it("ZWJを含むtaglineは表示文字列として保存できる", async () => {
+    render(<SettingsOverlay />);
+
+    fireEvent.change(screen.getByLabelText("ひとこと"), {
+      target: { value: "家族\u200d👩" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateProfile).toHaveBeenCalledWith({ tagline: "家族\u200d👩" }),
+    );
+  });
+
   it("非BMP文字をcode pointで数え、80文字までは入力できる", () => {
     render(<SettingsOverlay />);
     const eighty = "😀".repeat(80);
