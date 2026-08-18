@@ -82,7 +82,9 @@ export function MessageList({
   const submitEdit = useMessaging((state) => state.submitEdit);
   const cancelEdit = useMessaging((state) => state.cancelEdit);
   const editDraft = useMessaging((state) => state.editDraft);
+  const editConflict = useMessaging((state) => state.editConflict);
   const setEditDraft = useMessaging((state) => state.setEditDraft);
+  const reloadEditConflict = useMessaging((state) => state.reloadEditConflict);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
@@ -405,9 +407,11 @@ export function MessageList({
             onOpenImage={onOpenImage}
             editing={editingMessageId === row.message.messageId}
             editDraft={editDraft}
+            editConflict={editConflict}
             onEditDraftChange={setEditDraft}
             onSubmitEdit={submitEdit}
             onCancelEdit={cancelEdit}
+            onReloadEditConflict={reloadEditConflict}
           />
         </div>
       );
@@ -416,7 +420,9 @@ export function MessageList({
       highlightedId,
       editingMessageId,
       editDraft,
+      editConflict,
       setEditDraft,
+      reloadEditConflict,
       submitEdit,
       cancelEdit,
       selfKey,

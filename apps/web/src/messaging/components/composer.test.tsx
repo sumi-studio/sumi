@@ -242,16 +242,17 @@ describe("Composer 送信ボタン", () => {
     expect(mocks.send).not.toHaveBeenCalled();
   });
 
-  it("Enterでも編集を保存する（ボタンと同じsubmitを通る）", () => {
+  it("行内編集中でもcomposerは下書きの送信経路を保つ", () => {
     useMessaging.setState({
       editingMessageId: "m1",
       messagesByPlace: { [placeKey]: [ownMessage("もとの本文")] },
     });
     render(<Composer />);
-    fireEvent.change(composer(), { target: { value: "直した本文" } });
+    fireEvent.change(composer(), { target: { value: "別の投稿" } });
 
     expect(fireEvent.keyDown(composer(), { key: "Enter" })).toBe(false);
-    expect(mocks.submitEdit).toHaveBeenCalledWith("直した本文");
+    expect(mocks.send).toHaveBeenCalledWith("別の投稿", "normal");
+    expect(mocks.submitEdit).not.toHaveBeenCalled();
   });
 
   it("添付の準備が終わるまで押せない（Enter送信と同じ判定）", () => {
@@ -274,22 +275,20 @@ describe("Composer 送信ボタン", () => {
     expect(screen.getByRole("button", { name: "送信" })).toBeDisabled();
   });
 
-  it("編集中は同じ場所が編集の保存になる", () => {
+  it("行内編集中でもcomposerは送信ボタンのまま", () => {
     useMessaging.setState({
       editingMessageId: "m1",
       messagesByPlace: { [placeKey]: [ownMessage("もとの本文")] },
     });
     render(<Composer />);
 
-    expect(
-      screen.queryByRole("button", { name: "送信" }),
-    ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "編集を保存" }));
+    fireEvent.change(composer(), { target: { value: "別の投稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "送信" }));
 
-    expect(mocks.submitEdit).toHaveBeenCalledWith("もとの本文");
+    expect(mocks.send).toHaveBeenCalledWith("別の投稿", "normal");
   });
 
-  it("編集中に本文を空にするとEnterもボタンも保存せず、理由を出す", () => {
+  it("行内編集中でも空のcomposerは送信しない", () => {
     useMessaging.setState({
       editingMessageId: "m1",
       messagesByPlace: { [placeKey]: [ownMessage("もとの本文")] },
@@ -297,13 +296,11 @@ describe("Composer 送信ボタン", () => {
     render(<Composer />);
     fireEvent.change(composer(), { target: { value: "  " } });
 
-    // ボタンは押せず、Enterも同じく何もしない（片方だけ編集を破棄しない）。
-    expect(screen.getByRole("button", { name: "編集を保存" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "送信" })).toBeDisabled();
     fireEvent.keyDown(composer(), { key: "Enter" });
     expect(mocks.submitEdit).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
     expect(useMessaging.getState().editingMessageId).toBe("m1");
-    // 押せない理由と、取り消しの明示の口を出す。
-    expect(screen.getByText(/Escで取り消し/)).toBeInTheDocument();
   });
 });
 
@@ -431,7 +428,7 @@ describe("Composer ＋メニュー", () => {
     });
   });
 
-  it("編集中は＋メニューを出さない", () => {
+  it("行内編集中でもcomposerの＋メニューは使える", () => {
     useMessaging.setState({
       editingMessageId: "m1",
       messagesByPlace: { [placeKey]: [ownMessage("もとの本文")] },
@@ -439,7 +436,7 @@ describe("Composer ＋メニュー", () => {
     render(<Composer />);
 
     expect(
-      screen.queryByRole("button", { name: "作成メニューを開く" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "作成メニューを開く" }),
+    ).toBeInTheDocument();
   });
 });

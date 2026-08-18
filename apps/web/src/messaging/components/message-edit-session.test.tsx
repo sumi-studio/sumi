@@ -184,7 +184,9 @@ describe("編集セッションは仮想リストの行より長生きする", (
 
     const target = messages[OFFSCREEN_INDEX].messageId;
     act(() => useMessaging.getState().startEdit(target));
-    const textarea = await screen.findByLabelText("メッセージを編集");
+    const textarea = (await screen.findByLabelText(
+      "メッセージを編集",
+    )) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: "書きかけの続き" } });
     expect(useMessaging.getState().editDraft).toBe("書きかけの続き");
 
@@ -218,7 +220,9 @@ describe("編集セッションは仮想リストの行より長生きする", (
     act(() =>
       useMessaging.getState().startEdit(messages[OFFSCREEN_INDEX].messageId),
     );
-    const textarea = await screen.findByLabelText("メッセージを編集");
+    const textarea = (await screen.findByLabelText(
+      "メッセージを編集",
+    )) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: "@" } });
 
     const suggestions = screen.getByTestId("mention-suggestions");
@@ -228,6 +232,27 @@ describe("編集セッションは仮想リストの行より長生きする", (
     );
 
     await waitFor(() => expect(textarea).toHaveValue("@墨 "));
+  });
+
+  it("候補表示後にキャレットを@から外してTabしても古い範囲を置換しない", async () => {
+    const messages = makeMessages(MESSAGE_COUNT);
+    seedStore(messages);
+    render(<MessageList />);
+
+    act(() =>
+      useMessaging.getState().startEdit(messages[OFFSCREEN_INDEX].messageId),
+    );
+    const textarea = (await screen.findByLabelText(
+      "メッセージを編集",
+    )) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "@" } });
+    expect(screen.getByTestId("mention-suggestions")).toBeVisible();
+
+    textarea.setSelectionRange(0, 0);
+    fireEvent.keyUp(textarea, { key: "Home" });
+    fireEvent.keyDown(textarea, { key: "Tab" });
+
+    expect(useMessaging.getState().editDraft).toBe("@");
   });
 });
 
@@ -297,5 +322,38 @@ describe("編集セッションのタイムライン整合性", () => {
       editingMessageId: target.messageId,
       editDraft: "保存前の書きかけ",
     });
+  });
+
+  it("編集中に対象の message_edited を受けると書きかけを残して保存を止める", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("自分の書きかけ"));
+    await backend.editMessage(
+      target.place,
+      target.messageId,
+      "別の場所の本文",
+      target.revision ?? 1,
+    );
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: "自分の書きかけ",
+      editConflict: {
+        content: "別の場所の本文",
+        revision: 2,
+      },
+    });
+    const edit = vi.spyOn(backend, "editMessage");
+    act(() => useMessaging.getState().submitEdit());
+    expect(edit).not.toHaveBeenCalled();
   });
 });

@@ -1,8 +1,10 @@
 import {
   type ChangeEvent,
+  type CompositionEvent,
   type KeyboardEvent,
   type MouseEvent,
   type RefObject,
+  type SyntheticEvent,
   useCallback,
   useMemo,
   useRef,
@@ -37,7 +39,10 @@ export interface MentionAutocomplete {
   dismiss(): void;
   insertTrigger(): void;
   onInputChange(event: ChangeEvent<HTMLTextAreaElement>): void;
+  onCompositionEnd(event: CompositionEvent<HTMLTextAreaElement>): void;
   onInputClick(event: MouseEvent<HTMLTextAreaElement>): void;
+  onSelectionChange(event: SyntheticEvent<HTMLTextAreaElement>): void;
+  onKeyUp(event: KeyboardEvent<HTMLTextAreaElement>): void;
   /** 候補操作を処理したときだけ true。送信・取消などは入力欄自身に委ねる。 */
   onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): boolean;
   select(member: MemberProfile): void;
@@ -112,18 +117,18 @@ export function useMentionAutocomplete({
   }, [inputRef, updateValue]);
 
   const select = useCallback(
-    (member: MemberProfile) => {
-      if (!mention) return;
+    (member: MemberProfile, query = mention) => {
+      if (!query) return;
       const inserted = `@${member.displayName} `;
       const current = valueRef.current;
       const next =
-        current.slice(0, mention.start) + inserted + current.slice(mention.end);
+        current.slice(0, query.start) + inserted + current.slice(query.end);
       updateValue(next);
       setMention(null);
       window.requestAnimationFrame(() => {
         const textarea = inputRef.current;
         if (!textarea) return;
-        const caret = mention.start + inserted.length;
+        const caret = query.start + inserted.length;
         textarea.setSelectionRange(caret, caret);
         textarea.focus();
       });
@@ -141,7 +146,24 @@ export function useMentionAutocomplete({
       updateValue(next);
       updateMention(next, event.target.selectionStart ?? next.length);
     },
+    onCompositionEnd(event) {
+      const next = event.currentTarget.value;
+      updateValue(next);
+      updateMention(next, event.currentTarget.selectionStart ?? next.length);
+    },
     onInputClick(event) {
+      updateMention(
+        valueRef.current,
+        event.currentTarget.selectionStart ?? valueRef.current.length,
+      );
+    },
+    onSelectionChange(event) {
+      updateMention(
+        valueRef.current,
+        event.currentTarget.selectionStart ?? valueRef.current.length,
+      );
+    },
+    onKeyUp(event) {
       updateMention(
         valueRef.current,
         event.currentTarget.selectionStart ?? valueRef.current.length,
@@ -162,9 +184,35 @@ export function useMentionAutocomplete({
         return true;
       }
       if (event.key === "Enter" || event.key === "Tab") {
+        // 候補を開いた時点の範囲は使わない。キャレットが移っていれば、
+        // この瞬間の値と選択位置から改めて範囲と候補を決める。
+        const current = valueRef.current;
+        const fresh = findMentionQuery(
+          current,
+          event.currentTarget.selectionStart ?? current.length,
+        );
+        if (!fresh) {
+          dismiss();
+          return false;
+        }
+        const freshCandidates = Object.values(membersByKey)
+          .filter((member) => participantKey(member.participant) !== selfKey)
+          .filter((member) =>
+            member.displayName
+              .toLowerCase()
+              .includes(fresh.query.toLowerCase()),
+          )
+          .slice(0, 6);
+        const candidate =
+          freshCandidates[
+            Math.min(mentionIndex, Math.max(freshCandidates.length - 1, 0))
+          ];
+        if (!candidate) {
+          dismiss();
+          return false;
+        }
         event.preventDefault();
-        const candidate = candidates[activeIndex];
-        if (candidate) select(candidate);
+        select(candidate, fresh);
         return true;
       }
       if (event.key === "Escape") {

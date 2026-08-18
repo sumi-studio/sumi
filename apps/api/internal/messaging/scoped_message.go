@@ -151,7 +151,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	message := Message{
 		MessageID: newUUIDv7(), PlaceID: in.PlaceID, Seq: seq,
 		Author: s.Scope.Actor, Content: in.Content, Urgency: in.Urgency,
-		Mentions: mentions, ReplyTo: in.ReplyTo, ClientNonce: in.ClientNonce,
+		Mentions: mentions, ReplyTo: in.ReplyTo, ClientNonce: in.ClientNonce, Revision: 1,
 	}
 	var replyTo *string
 	if in.ReplyTo != "" {
@@ -195,7 +195,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendInput) (Message, []byte, bool, error) {
 	rows, err := q.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages
 		WHERE workspace_id = $1 AND place_id = $2
 		  AND author_kind = $3 AND author_id = $4 AND client_nonce = $5`,
@@ -275,7 +275,7 @@ func (s *ScopedStore) historyAfterAuthorization(
 	}
 	rows, err := q.Query(ctx, fmt.Sprintf(`
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages
 		WHERE workspace_id = $1 AND place_id = $2 AND seq >= $3 %s
 		ORDER BY seq DESC LIMIT $4`, before), args...)
@@ -321,7 +321,7 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages
 		WHERE workspace_id = $1 AND place_id = $2 AND seq >= $3
 		ORDER BY seq ASC LIMIT $4`, s.Scope.WorkspaceID, placeID, lower, limit)
@@ -341,7 +341,7 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 	return messages, nil
 }
 
-func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, content string) (Message, error) {
+func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, content string, expectedRevision int64) (Message, error) {
 	if content == "" {
 		return Message{}, errors.New("content must not be empty")
 	}
@@ -377,6 +377,9 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	if message.Deleted {
 		return Message{}, ErrMessageDeleted
 	}
+	if expectedRevision <= 0 || message.Revision != expectedRevision {
+		return Message{}, ErrMessageRevisionConflict
+	}
 	members, err := s.activeMembersScoped(ctx, tx, place)
 	if err != nil {
 		return Message{}, err
@@ -384,9 +387,13 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	mentions := resolveMentions(content, members)
 	var editedAt time.Time
 	if err := tx.QueryRow(ctx, `
-		UPDATE messages SET content = $1, edited_at = now()
-		WHERE workspace_id = $2 AND message_id = $3 RETURNING edited_at`,
-		content, s.Scope.WorkspaceID, messageID).Scan(&editedAt); err != nil {
+		UPDATE messages SET content = $1, edited_at = now(), revision = revision + 1
+		WHERE workspace_id = $2 AND message_id = $3 AND revision = $4
+		RETURNING edited_at, revision`,
+		content, s.Scope.WorkspaceID, messageID, expectedRevision).Scan(&editedAt, &message.Revision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Message{}, ErrMessageRevisionConflict
+		}
 		return Message{}, fmt.Errorf("update scoped message: %w", err)
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM message_mentions WHERE message_id = $1", messageID); err != nil {
@@ -734,7 +741,7 @@ func attachReactionsWith(ctx context.Context, q querier, messages []Message) err
 func lockMessageScoped(ctx context.Context, tx pgx.Tx, workspaceID, placeID, messageID string) (Message, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages WHERE workspace_id = $1 AND place_id = $2 AND message_id = $3
 		FOR UPDATE`, workspaceID, placeID, messageID)
 	if err != nil {

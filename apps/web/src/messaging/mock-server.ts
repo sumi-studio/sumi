@@ -665,15 +665,20 @@ export class MockMessagingServer implements MessagingBackend {
     place: Place,
     messageId: string,
     content: string,
+    expectedRevision: number,
   ): Promise<void> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
     if (!message || message.deleted || !sameParticipant(message.author, SELF)) {
       return;
     }
+    if ((message.revision ?? 1) !== expectedRevision) {
+      throw new Error("edit_conflict");
+    }
     message.content = content;
     message.mentions = resolveMentionsAtAdmission(content);
     message.editedAt = Date.now();
+    message.revision = (message.revision ?? 1) + 1;
     this.emit({ type: "message_edited", message: { ...message } });
   }
 

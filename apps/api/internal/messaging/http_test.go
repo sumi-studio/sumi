@@ -237,6 +237,28 @@ func TestMessagingJSONTrailingGarbageReturnsInvalidJSONBeforeMutation(t *testing
 	}
 }
 
+func TestEditPatchRejectsStaleRevision(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "編集前")
+	path := "/messaging/places/" + ch.PlaceID + "/messages/" + msg.MessageID
+
+	response, _ := call(t, ts, http.MethodPatch, path, w.humanA.ID, map[string]any{
+		"content": "先に保存された本文", "revision": 1,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("first PATCH: status %d, want 200", response.StatusCode)
+	}
+	response, body := call(t, ts, http.MethodPatch, path, w.humanA.ID, map[string]any{
+		"content": "古い書きかけ", "revision": 1,
+	})
+	if response.StatusCode != http.StatusConflict || body["error"] != "edit_conflict" {
+		t.Fatalf("stale PATCH: status %d body %v, want 409 edit_conflict", response.StatusCode, body)
+	}
+}
+
 func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

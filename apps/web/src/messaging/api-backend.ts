@@ -324,10 +324,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     content: string,
+    expectedRevision: number,
   ): Promise<void> {
     await this.request(
       `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "PATCH", body: { content } },
+      { method: "PATCH", body: { content, revision: expectedRevision } },
     );
   }
 
@@ -823,6 +824,7 @@ function parseMessage(value: unknown): Message {
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
+    revision: asSeq(wire.revision),
     deleted: asBoolean(wire.deleted),
   };
 }

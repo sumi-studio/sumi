@@ -199,9 +199,11 @@ export interface MessageItemProps {
   editing: boolean;
   /** 編集セッションの書きかけ本文。持ち主は行ではなくstore。 */
   editDraft: string;
+  editConflict: { content: string; revision: number } | null;
   onEditDraftChange: (content: string) => void;
   onSubmitEdit: () => void;
   onCancelEdit: () => void;
+  onReloadEditConflict: () => void;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -228,9 +230,11 @@ export const MessageItem = memo(function MessageItem({
   onOpenImage,
   editing,
   editDraft,
+  editConflict,
   onEditDraftChange,
   onSubmitEdit,
   onCancelEdit,
+  onReloadEditConflict,
 }: MessageItemProps) {
   // パレット類はportalで一覧の外に出る。その上でのホイールは一覧へ渡す。
   const passthroughRef = useWheelPassthrough<HTMLDivElement>();
@@ -406,6 +410,8 @@ export const MessageItem = memo(function MessageItem({
                 onChange={onEditDraftChange}
                 onSubmit={onSubmitEdit}
                 onCancel={onCancelEdit}
+                conflict={editConflict}
+                onReloadConflict={onReloadEditConflict}
                 membersByKey={membersByKey}
                 selfKey={selfKey}
               />

@@ -25,6 +25,8 @@ export function MessageEditor({
   onChange,
   onSubmit,
   onCancel,
+  conflict,
+  onReloadConflict,
   membersByKey,
   selfKey,
 }: {
@@ -32,6 +34,8 @@ export function MessageEditor({
   onChange: (content: string) => void;
   onSubmit: () => void;
   onCancel: () => void;
+  conflict: { content: string; revision: number } | null;
+  onReloadConflict: () => void;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   selfKey: ParticipantKey;
 }) {
@@ -66,6 +70,7 @@ export function MessageEditor({
   }, [value]);
 
   const submit = () => {
+    if (conflict) return;
     // 空にするのは削除であって編集ではない。取消として扱う。
     if (!value.trim()) {
       onCancel();
@@ -87,6 +92,8 @@ export function MessageEditor({
         rows={1}
         onChange={mentionAutocomplete.onInputChange}
         onClick={mentionAutocomplete.onInputClick}
+        onKeyUp={mentionAutocomplete.onKeyUp}
+        onSelect={mentionAutocomplete.onSelectionChange}
         onKeyDown={(event) => {
           // IME変換中のEnter/Escは変換の操作。編集の操作として横取りしない。
           if (isImeComposing(event)) return;
@@ -107,7 +114,20 @@ export function MessageEditor({
         className="block w-full resize-none rounded-lg border border-border bg-background px-2.5 py-1.5 text-[13.5px] leading-6 outline-none focus:border-ring/60"
       />
       <div className="mt-0.5 flex items-center gap-2 text-[11px] text-muted-foreground">
-        <span>Escでキャンセル・Enterで保存</span>
+        {conflict ? (
+          <>
+            <span role="alert">別の場所で編集されました</span>
+            <button
+              type="button"
+              onClick={onReloadConflict}
+              className="rounded px-1.5 py-0.5 transition-colors hover:bg-accent hover:text-foreground"
+            >
+              新しい本文を読み込む
+            </button>
+          </>
+        ) : (
+          <span>Escでキャンセル・Enterで保存</span>
+        )}
         <button
           type="button"
           onClick={onCancel}
@@ -118,6 +138,7 @@ export function MessageEditor({
         <button
           type="button"
           onClick={submit}
+          disabled={conflict !== null}
           className="rounded bg-primary px-1.5 py-0.5 font-medium text-primary-foreground transition-opacity hover:opacity-90"
         >
           保存
