@@ -1015,16 +1015,36 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * メッセージが未読へ巻き戻る。未読を採用するのはこのクライアントがまだ
    * 知らなかったplaceだけにする。
    */
-  const reconcilePlaces = async () => {
+  /**
+   * awaitの前にsessionを控え、応答が返ったところで同じsessionのままかを
+   * 確かめる。Workspaceの切り替えとsign-inのやり直しはbackendもgenerationも
+   * 別物にするので、前のsession宛ての応答は新しいsessionのstateへ入れない
+   * ——複製の最中に別のWorkspaceへ移ったとき、移った先の一覧に前の
+   * Workspaceのchannelが現れて、しかもそこへ遷移する、ということが起きない。
+   * backendをawaitするstore actionは全てこの同じ形を通す。
+   */
+  const openSession = () => {
     const currentBackend = backend;
     const currentIdentity = getMessagingSessionIdentity();
+    const currentGeneration = messagingSessionGeneration;
     const expectedSelfKey = get().selfKey;
-    const snapshot = await currentBackend.bootstrap();
+    return {
+      backend: currentBackend,
+      selfKey: expectedSelfKey,
+      isCurrent: () =>
+        backend === currentBackend &&
+        getMessagingSessionIdentity() === currentIdentity &&
+        messagingSessionGeneration === currentGeneration &&
+        get().selfKey === expectedSelfKey,
+    };
+  };
+
+  const reconcilePlaces = async () => {
+    const session = openSession();
+    const snapshot = await session.backend.bootstrap();
     if (
-      backend !== currentBackend ||
-      getMessagingSessionIdentity() !== currentIdentity ||
-      get().selfKey !== expectedSelfKey ||
-      participantKey(snapshot.self) !== expectedSelfKey
+      !session.isCurrent() ||
+      participantKey(snapshot.self) !== session.selfKey
     ) {
       // セッション境界を越えた応答は別人のsnapshotなので捨てる。
       return;
@@ -1070,7 +1090,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
       // durable eventがreplayされるようにする。applyEventは同一参照なので
       // listenerは重複しない。
-      currentBackend.subscribe(applyEvent, { sinceByPlace });
+      session.backend.subscribe(applyEvent, { sinceByPlace });
     }
   };
 
@@ -1439,20 +1459,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async createChannel(workspaceId, name, topic, voice) {
-      const currentBackend = backend;
-      const currentIdentity = getMessagingSessionIdentity();
-      const expectedSelfKey = get().selfKey;
-      const channel = await currentBackend.createChannel(
+      const session = openSession();
+      const channel = await session.backend.createChannel(
         workspaceId,
         name,
         topic,
         voice,
       );
-      if (
-        backend !== currentBackend ||
-        getMessagingSessionIdentity() !== currentIdentity ||
-        get().selfKey !== expectedSelfKey
-      ) {
+      if (!session.isCurrent()) {
         throw new Error("Messaging session changed during channel creation");
       }
       set((state) =>
@@ -1469,21 +1483,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (get().startingDM !== null) {
         throw new Error("A DM start is already pending");
       }
-      const currentBackend = backend;
-      const currentIdentity = getMessagingSessionIdentity();
-      const expectedSelfKey = get().selfKey;
+      const session = openSession();
       const token = ++nextDMStartToken;
       set({ startingDM: { participants, token } });
       try {
         const dm =
           participants.length === 1
-            ? await currentBackend.ensureDM(first)
-            : await currentBackend.createGroupDM(participants);
-        if (
-          backend !== currentBackend ||
-          getMessagingSessionIdentity() !== currentIdentity ||
-          get().selfKey !== expectedSelfKey
-        ) {
+            ? await session.backend.ensureDM(first)
+            : await session.backend.createGroupDM(participants);
+        if (!session.isCurrent()) {
           throw new Error("Messaging session changed during DM start");
         }
         set((state) =>
@@ -1502,7 +1510,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async updateChannel(channelId, input) {
-      const channel = await backend.updateChannel(channelId, input);
+      const session = openSession();
+      const channel = await session.backend.updateChannel(channelId, input);
+      if (!session.isCurrent()) {
+        throw new Error("Messaging session changed during channel edit");
+      }
       set((state) => ({
         channels: state.channels.map((entry) =>
           entry.channelId === channel.channelId ? channel : entry,
@@ -1511,7 +1523,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async duplicateChannel(channelId) {
-      const channel = await backend.duplicateChannel(channelId);
+      const session = openSession();
+      const channel = await session.backend.duplicateChannel(channelId);
+      if (!session.isCurrent()) {
+        throw new Error("Messaging session changed during channel duplication");
+      }
       set((state) =>
         state.channels.some((entry) => entry.channelId === channel.channelId)
           ? {}
@@ -1767,16 +1783,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
     setStatus(status, note, expiresAt = null) {
-      const currentBackend = backend;
-      const sessionGeneration = messagingSessionGeneration;
-      void currentBackend.setStatus(status, note, expiresAt).then(
+      const session = openSession();
+      void session.backend.setStatus(status, note, expiresAt).then(
         (canonical) => {
-          if (
-            backend !== currentBackend ||
-            messagingSessionGeneration !== sessionGeneration
-          ) {
-            return;
-          }
+          if (!session.isCurrent()) return;
           applyPresenceProjection({ type: "status", status: canonical });
         },
         () => undefined,

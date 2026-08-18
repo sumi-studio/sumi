@@ -339,6 +339,12 @@ const TYPING_INTERVAL_MS = 3_000;
 const REPLY_LATER_REMIND_MS = 9_000;
 
 /**
+ * places.name のスキーマCHECKと同じ上限（apps/api/internal/messaging/scoped_core.go
+ * の MaxChannelNameChars）。
+ */
+const MAX_CHANNEL_NAME_CHARS = 200;
+
+/**
  * 複製の既定名。本番の `copyChannelName`（apps/api/internal/messaging/scoped_core.go）
  * と同じ規則で、末尾の「 のコピー」を剥がしてから付け直す——コピーのコピーで
  * サフィックスが積み上がると、元の名前を探すのに単語を数えることになる。
@@ -346,10 +352,14 @@ const REPLY_LATER_REMIND_MS = 9_000;
  */
 function copyChannelName(source: string): string {
   const suffix = " のコピー";
-  const base = source.endsWith(suffix)
+  const trimmed = source.endsWith(suffix)
     ? source.slice(0, -suffix.length)
     : source;
-  return `${base === "" ? source : base}${suffix}`;
+  const base = trimmed === "" ? source : trimmed;
+  // 上限は本番と同じ200文字ぶんの「文字」——サロゲートペアを半分に切ると
+  // 名前が壊れるので、コードユニットではなくコードポイントで数えて切る。
+  const room = MAX_CHANNEL_NAME_CHARS - [...suffix].length;
+  return `${[...base].slice(0, room).join("")}${suffix}`;
 }
 
 export class MockMessagingServer implements MessagingBackend {

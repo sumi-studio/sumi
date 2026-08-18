@@ -105,6 +105,18 @@ describe("MockMessagingServer place edits", () => {
     expect(named.name).toBe("general-2");
   });
 
+  it("長すぎる名前は本番と同じ上限で切り詰めてから「 のコピー」を付ける", async () => {
+    const server = new MockMessagingServer();
+    const long = "あ".repeat(200);
+    await server.updateChannel("ch-general", { name: long });
+
+    const copy = await server.duplicateChannel("ch-general");
+    // 200文字の上限は places.name のCHECKそのもの。mockがここで超えた名前を
+    // 返すと、手で確かめたときだけ通って本番で弾かれる。
+    expect([...copy.name].length).toBe(200);
+    expect(copy.name).toBe(`${"あ".repeat(195)} のコピー`);
+  });
+
   it("何も指名しない編集は成功として返さない", async () => {
     const server = new MockMessagingServer();
 
