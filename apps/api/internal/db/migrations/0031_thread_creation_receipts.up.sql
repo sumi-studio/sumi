@@ -1,4 +1,4 @@
--- 0030_thread_creation_receipts: a thread create is a durable operation, not
+-- 0031_thread_creation_receipts: a thread create is a durable operation, not
 -- merely an insert. Keep the caller's nonce receipt so a lost response can be
 -- retried without minting another thread.
 CREATE TABLE thread_creation_receipts (

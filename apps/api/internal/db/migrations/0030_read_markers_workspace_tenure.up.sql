@@ -1,4 +1,4 @@
--- 0029_read_markers_workspace_tenure: thread viewers need a cursor without
+-- 0030_read_markers_workspace_tenure: thread viewers need a cursor without
 -- becoming thread participants. The Workspace membership tenure scopes that
 -- cursor so leaving and rejoining cannot revive it.
 DROP TABLE read_markers;

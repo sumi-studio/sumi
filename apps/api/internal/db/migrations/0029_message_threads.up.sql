@@ -1,4 +1,4 @@
--- 0028_message_threads: channel-scoped side conversations are ordinary places.
+-- 0029_message_threads: channel-scoped side conversations are ordinary places.
 DO $$
 DECLARE constraint_name text;
 BEGIN
