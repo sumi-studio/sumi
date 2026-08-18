@@ -233,7 +233,11 @@ test("retries an uncertain command with its original key and stops after accepta
   assert.deepEqual(second.sent.map(JSON.parse), [
     { type: "hello", last_event_seq: 0 },
   ]);
-  second.receive({ type: "direct_chat_status", status: "unavailable" });
+  second.receive({
+    type: "direct_chat_status",
+    status: "unavailable",
+    reason: "unavailable",
+  });
   assert.equal(
     second.sent.map(JSON.parse).filter((frame) => frame.type === "command")
       .length,
@@ -501,7 +505,8 @@ test("missing or unknown unavailable reasons fail closed instead of claiming a t
     const wire = FakeWebSocket.instances.at(-1);
     wire.open();
     wire.receive(frame);
-    assert.deepEqual(readiness, ["unknown", "unavailable"]);
+    assert.deepEqual(readiness, ["unknown", "unknown"]);
+    assert.equal(wire.readyState, FakeWebSocket.CLOSED);
     socket.close();
   }
 });
