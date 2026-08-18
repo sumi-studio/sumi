@@ -276,6 +276,44 @@ func TestLatestSeqNeverRunsAheadOfWhatThePollActuallyHandedOver(t *testing.T) {
 	}
 }
 
+func TestAttentionRetryAfterLostResponseReturnsItsOwnTail(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+
+	for i := 0; i < MaxAttentionCandidates+1; i++ {
+		w.send(t, ctx, ch.PlaceID, w.humanA, "attention retry")
+	}
+
+	// This transaction commits, but imagine its HTTP response is lost. The
+	// server remembers it for a defensive clamp, yet that past response must
+	// not make a smaller retry claim it handed over candidate 50.
+	lost := w.poll(t, ctx, server, map[string]any{"limit": MaxAttentionCandidates})
+	if got := len(candidateList(t, lost)); got != MaxAttentionCandidates || lost["latest_seq"] != float64(MaxAttentionCandidates) {
+		t.Fatalf("lost response = %v, want %d candidates through %d", lost, MaxAttentionCandidates, MaxAttentionCandidates)
+	}
+
+	retry := w.poll(t, ctx, server, map[string]any{"limit": 20})
+	if candidates := candidateList(t, retry); len(candidates) != 20 || candidates[19]["candidate_seq"] != float64(20) {
+		t.Fatalf("small retry candidates = %v, want 1 through 20", candidates)
+	}
+	if retry["latest_seq"] != float64(20) {
+		t.Fatalf("small retry latest_seq = %v, want its own tail 20", retry["latest_seq"])
+	}
+
+	// Using exactly that retry cursor can acknowledge only what the retry
+	// actually returned. The next candidate proves 21..50 survived.
+	afterAck := w.poll(t, ctx, server, map[string]any{"consume_through": retry["latest_seq"], "limit": 20})
+	if afterAck["consumed"] != float64(20) {
+		t.Fatalf("retry ack consumed = %v, want 20", afterAck["consumed"])
+	}
+	if candidates := candidateList(t, afterAck); len(candidates) != 20 || candidates[0]["candidate_seq"] != float64(21) {
+		t.Fatalf("retry ack erased unreceived candidates: %v, want 21 onward", candidates)
+	}
+}
+
 func TestReadingThroughSupersedesCandidatesInsteadOfWakingTwice(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

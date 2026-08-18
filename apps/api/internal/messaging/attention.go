@@ -52,11 +52,14 @@ type AttentionCandidate struct {
 type AttentionInbox struct {
 	Candidates []AttentionCandidate
 	Consumed   int64
-	// LatestSeq はこの Workspace での **配布済み高水位** である。candidate_seq は
-	// agent ごとに単調だが、poll / ack は Workspace binding ごとの local-control
-	// request なので、別 Workspace の配布はここへ含めない。server が実際に配った
-	// 範囲を越えないため、caller が任意に大きい consume_through を渡しても、この
-	// Workspace で未配布の候補は消えず次の poll で再配送される。
+	// LatestSeq is this response's tail: the final candidate actually included
+	// in Candidates. It is therefore the only candidate_seq this response
+	// authorizes a later consume_through to acknowledge. An empty response
+	// returns the already-consumed/resolved boundary, never a delivery
+	// high-water mark for candidates omitted from this response.
+	//
+	// candidate_seq is agent-wide, while poll / ack are Workspace-bound local
+	// control. A caller must never acknowledge a different Workspace's tail.
 	LatestSeq int64
 }
 
@@ -101,8 +104,9 @@ func (s *ScopedStore) PollAttentionCandidates(
 	}
 	agentID := s.Scope.Actor.ID
 	// 番号の軸は agent なので、Workspace を混ぜずに直列化する。二つの Workspace
-	// から同時に poll しても同じ番号を取り合わない。配布済み高水位はこの後に
-	// Workspace ごとに読む。
+	// から同時に poll しても同じ番号を取り合わない。前回**応答単位**の cursor は
+	// この後に Workspace ごとに読む。これは server-side clamp 用で、過去応答の
+	// high-water を latest_seq として wire に返してはならない。
 	if _, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock(hashtext($1))",
 		agentID); err != nil {
@@ -210,18 +214,33 @@ func (s *ScopedStore) PollAttentionCandidates(
 	rows.Close()
 
 	if n := len(inbox.Candidates); n > 0 {
-		// ORDER BY candidate_seq なので末尾が返した中の最大。新規採番は
-		// 必ずこの応答へ入るため、ここまでが安全な Workspace ごとの ack cursor。
+		// ORDER BY candidate_seq なので末尾がこの応答で実際に渡した最大。
+		// delivered_through はこの**応答単位**の server-side clamp であり、past
+		// poll の high-water を混ぜない。
+		inbox.LatestSeq = inbox.Candidates[n-1].CandidateSeq
+	} else {
+		// Empty responses have no new delivery tail. Their cursor only states
+		// what this Workspace has already resolved, not candidates a prior lost
+		// response may have carried. Resolve-by-read is a terminal disposition,
+		// so its sequence is safe despite never being a delivery acknowledgement.
 		if err := tx.QueryRow(ctx, `
-			UPDATE attention_workspace_inboxes
-			SET delivered_through = GREATEST(delivered_through, $2)
-			WHERE agent_id = $1 AND workspace_id = $3
-			RETURNING delivered_through`, agentID, inbox.Candidates[n-1].CandidateSeq, s.Scope.WorkspaceID).
-			Scan(&deliveredThrough); err != nil {
-			return AttentionInbox{}, fmt.Errorf("advance attention delivery cursor: %w", err)
+			SELECT COALESCE(MAX(candidate_seq), 0) FROM attention_candidates
+			WHERE workspace_id = $1 AND agent_id = $2 AND consumed_at IS NOT NULL`,
+			s.Scope.WorkspaceID, agentID).Scan(&inbox.LatestSeq); err != nil {
+			return AttentionInbox{}, fmt.Errorf("read resolved attention cursor: %w", err)
 		}
 	}
-	inbox.LatestSeq = deliveredThrough
+	// Store only this response's acknowledgement boundary. In particular, a
+	// retry whose smaller limit returns 1..20 replaces a lost 1..50 response's
+	// boundary, so even an erroneous large cursor is clamped to 20.
+	if err := tx.QueryRow(ctx, `
+		UPDATE attention_workspace_inboxes
+		SET delivered_through = $2
+		WHERE agent_id = $1 AND workspace_id = $3
+		RETURNING delivered_through`, agentID, inbox.LatestSeq, s.Scope.WorkspaceID).
+		Scan(&deliveredThrough); err != nil {
+		return AttentionInbox{}, fmt.Errorf("store attention response cursor: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return AttentionInbox{}, fmt.Errorf("commit attention poll: %w", err)
 	}

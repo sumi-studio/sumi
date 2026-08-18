@@ -29,6 +29,10 @@ const (
 	maxPushEndpointBytes = 2000
 	maxPushP256dhBytes   = 200
 	maxPushAuthBytes     = 100
+	// Eight covers a person's usual phone, desktop browsers and a spare device,
+	// while capping one recipient's durable rows, fan-out goroutines, and
+	// outbound connections at a small constant for every notification.
+	maxPushSubscriptionsPerHuman = 8
 )
 
 // pushTTL は push service が端末を待つ秒数。呼びかけは鮮度が命で、半日後に
@@ -67,6 +71,9 @@ var (
 	// ErrPushSubscriptionOwned keeps an endpoint bearer from being enough to
 	// move another Human's browser subscription to the caller.
 	ErrPushSubscriptionOwned = errors.New("push subscription belongs to another human")
+	// ErrPushSubscriptionLimit marks a Human that has already registered the
+	// bounded number of browser endpoints.
+	ErrPushSubscriptionLimit = errors.New("push subscription limit reached")
 )
 
 // EnsureVAPIDKeys returns the deployment's VAPID key pair, minting it on first
@@ -143,6 +150,22 @@ func (s *ScopedStore) SavePushSubscription(
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return PushSubscription{}, err
+	}
+	// This is global to a human rather than a Workspace. The advisory lock makes
+	// the count-and-upsert atomic even when the same person has active sessions
+	// in several Workspaces. Re-registering this exact endpoint excludes it from
+	// the prospective count, so an upsert never consumes another slot.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", owner.ID); err != nil {
+		return PushSubscription{}, fmt.Errorf("lock push subscriptions: %w", err)
+	}
+	var otherEndpoints int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM push_subscriptions
+		WHERE human_id = $1 AND endpoint <> $2`, owner.ID, endpoint).Scan(&otherEndpoints); err != nil {
+		return PushSubscription{}, fmt.Errorf("count push subscriptions: %w", err)
+	}
+	if otherEndpoints >= maxPushSubscriptionsPerHuman {
+		return PushSubscription{}, ErrPushSubscriptionLimit
 	}
 	subscription := PushSubscription{
 		SubscriptionID: newUUIDv7(),

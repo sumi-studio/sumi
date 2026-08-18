@@ -323,9 +323,10 @@ pub(crate) struct MessagingNotificationSettingsRequest<'a> {
     pub keywords: Option<Vec<&'a str>>,
 }
 
-/// Taking in one's own AttentionCandidates.  `consume_through` acknowledges
-/// everything up to that candidate_seq before the remaining ones are listed:
-/// one says what one has taken in, then asks what is left.
+/// Taking in one's own AttentionCandidates. `consume_through` may name only
+/// the tail returned in a response this runtime actually received; it
+/// acknowledges everything up to that candidate_seq before the remaining ones
+/// are listed.
 #[derive(Debug, Default, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PollMessagingAttentionRequest {
@@ -374,12 +375,23 @@ pub(crate) struct MessagingUnreadRange {
 pub(crate) fn validate_attention_response(value: Value) -> Result<Value> {
     let response: MessagingAttentionResponse = serde_json::from_value(value.clone())
         .context("decode frozen messaging AttentionCandidate response")?;
+    let mut previous_seq = 0;
     for candidate in &response.candidates {
+        if candidate.candidate_seq == 0 || candidate.candidate_seq <= previous_seq {
+            anyhow::bail!("invalid messaging AttentionCandidate sequence order");
+        }
         if candidate.unread_range.place_seq_from == 0
             || candidate.unread_range.place_seq_from > candidate.unread_range.place_seq_to
         {
             anyhow::bail!("invalid messaging AttentionCandidate unread range");
         }
+        previous_seq = candidate.candidate_seq;
+    }
+    // latest_seq is an acknowledgement cursor, not a global high-water mark:
+    // a smaller retry after a lost response can legitimately end earlier than
+    // an older response. It must still exactly equal this response's tail.
+    if !response.candidates.is_empty() && response.latest_seq != previous_seq {
+        anyhow::bail!("messaging AttentionCandidate latest_seq is not this response's tail");
     }
     Ok(value)
 }
@@ -469,7 +481,8 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_attachment_filename;
+    use super::{canonical_attachment_filename, validate_attention_response};
+    use serde_json::json;
 
     #[test]
     fn attachment_filename_canonicalization_matches_the_go_wire_contract() {
@@ -496,5 +509,22 @@ mod tests {
         let bounded = canonical_attachment_filename(&multibyte);
         assert_eq!(bounded.as_bytes().len(), 254);
         assert_eq!(bounded, "é".repeat(127));
+    }
+
+    #[test]
+    fn attention_response_latest_seq_must_be_its_actual_tail() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixtures: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(manifest.join("../../contracts/agent-events-fixtures.json"))
+                .expect("read contract fixtures"),
+        )
+        .expect("parse contract fixtures");
+        let candidate = fixtures["attention_candidate"]["wire"].clone();
+        let valid = json!({"candidates": [candidate], "consumed": 0, "latest_seq": 42});
+        assert!(validate_attention_response(valid.clone()).is_ok());
+
+        let mut stale_high_water = valid;
+        stale_high_water["latest_seq"] = json!(50);
+        assert!(validate_attention_response(stale_high_water).is_err());
     }
 }

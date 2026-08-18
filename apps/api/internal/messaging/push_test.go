@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -188,6 +189,39 @@ func TestPushSubscriptionIsOwnedByTheAuthenticatedHumanOnly(t *testing.T) {
 	}
 	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != 0 {
 		t.Fatalf("endpoint survived its owner's delete: %d remaining", got)
+	}
+}
+
+func TestPushSubscriptionsAreBoundedPerHumanAndReregistrationDoesNotAddASlot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScopeForActor(t, ctx, w.humanA)
+
+	for i := 0; i < maxPushSubscriptionsPerHuman; i++ {
+		endpoint := fmt.Sprintf("https://push.example.test/slot-%d", i)
+		if _, err := scoped.SavePushSubscription(ctx, endpoint, testPushP256dh, testPushAuth); err != nil {
+			t.Fatalf("save subscription %d: %v", i, err)
+		}
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != maxPushSubscriptionsPerHuman {
+		t.Fatalf("subscriptions before limit = %d, want %d", got, maxPushSubscriptionsPerHuman)
+	}
+
+	// The same endpoint is an upsert, including while every slot is occupied.
+	if _, err := scoped.SavePushSubscription(ctx, "https://push.example.test/slot-0", testPushP256dh, testPushAuth); err != nil {
+		t.Fatalf("re-register existing endpoint: %v", err)
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != maxPushSubscriptionsPerHuman {
+		t.Fatalf("re-registration changed subscription count: %d", got)
+	}
+
+	if _, err := scoped.SavePushSubscription(ctx, "https://push.example.test/slot-overflow", testPushP256dh, testPushAuth); !errors.Is(err, ErrPushSubscriptionLimit) {
+		t.Fatalf("overflow err = %v, want ErrPushSubscriptionLimit", err)
+	}
+	if got := len(w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()]); got != maxPushSubscriptionsPerHuman {
+		t.Fatalf("overflow subscription landed: %d", got)
 	}
 }
 

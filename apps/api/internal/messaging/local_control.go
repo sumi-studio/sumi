@@ -717,11 +717,12 @@ func attentionTriggerReason(reason string) string {
 // consume_through は先に適用する：本人が「ここまで取り込んだ」と言ってから
 // 「次は何か」を聞く順である。
 //
-// latest_seq はこの Workspace の poll が「実際に配った範囲」の高水位で、そのまま
-// 次の consume_through に渡してよい上限である。candidate_seq は agent ごとに
-// 単調だが、別 Workspace の配布は含まない。limit で切られた残りも含まれない。
-// 任意に大きい cursor でも server がこの Workspace の高水位へ clamp するので、
-// 未配布の呼びかけが消えることはなく、次の poll で再配送される。
+// candidates が非空なら latest_seq は**この応答に実際に載せた末尾**であり、それ
+// だけを次の consume_through に渡せる。過去の poll の高水位、limit で切れた残り、
+// 別 Workspace の配布は含まない。空なら latest_seq は既に consumed / superseded
+// の境界であって、未配布候補の高水位ではない。agent は自分が受け取った非空応答の
+// 末尾以外を consume_through に送らない。server は大き過ぎる cursor をこの
+// Workspace の直前応答の境界へ clamp するが、これは client の受領証明を代替しない。
 func (s *Server) localAttention(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		localScopeWire

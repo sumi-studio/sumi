@@ -29,6 +29,7 @@ use crate::{
         PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
         ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
         UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
+        validate_attention_response,
     },
     approval::authority::MessagingSourceSigningContinuation,
     provider::types::{ToolDefinition, UserContent},
@@ -433,6 +434,10 @@ struct MessagingViewState {
     visible_messages: Vec<VisibleMessage>,
     self_participant: Option<ParticipantIdentity>,
     visible_reply_later_markers: Vec<VisibleReplyLaterMarker>,
+    // The only cursor this runtime is allowed to acknowledge next. It is set
+    // from a non-empty response that reached this process, not from a server
+    // delivery high-water or a caller-supplied number.
+    attention_ackable_through: Option<u64>,
 }
 
 struct CachedMessagingView {
@@ -838,7 +843,7 @@ fn messaging_parameters_schema() -> Value {
                 "minimum": 1,
                 "description": concat!(
                     "Optional for attention and omitted for other actions. The candidate_seq you ",
-                    "have taken in; everything up to and including it stops being offered. ",
+                    "received as latest_seq in this tool view; everything up to and including it stops being offered. ",
                     "Acknowledging is idempotent and never moves the cursor backwards."
                 )
             }
@@ -1707,14 +1712,32 @@ impl MessagingTool {
             BoundMessagingAction::Attention {
                 consume_through,
                 limit,
-            } => tokio::select! {
-                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                result = self.api.attention(scope, PollMessagingAttentionRequest {
-                    consume_through,
-                    limit,
-                }) => result,
+            } => {
+                // Binding may be resumed from a persisted descriptor, so enforce
+                // the received-tail rule again at the point that could send the
+                // RPC. A caller-supplied sequence never becomes an ack merely
+                // because it passed through a binding cache.
+                if consume_through.is_some() && consume_through != state.attention_ackable_through {
+                    return Err(ToolError::InvalidArguments);
+                }
+                let response = tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.attention(scope, PollMessagingAttentionRequest {
+                        consume_through,
+                        limit,
+                    }) => result,
+                }
+                .map_err(map_messaging_api_error)?;
+                let response = validate_attention_response(response)
+                    .map_err(|error| ToolError::Protocol(error.to_string()))?;
+                state.attention_ackable_through = response
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .filter(|candidates| !candidates.is_empty())
+                    .and_then(|_| response.get("latest_seq"))
+                    .and_then(Value::as_u64);
+                response
             }
-            .map_err(map_messaging_api_error)?,
         };
         Ok(ExactMessagingOutcome {
             response: ExactMessagingResponse::Json(response),
@@ -2152,10 +2175,15 @@ fn resolve_raw_action(
         MessagingAction::Attention {
             consume_through,
             limit,
-        } => Ok(BoundMessagingAction::Attention {
-            consume_through,
-            limit,
-        }),
+        } => {
+            if consume_through.is_some() && consume_through != state.attention_ackable_through {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(BoundMessagingAction::Attention {
+                consume_through,
+                limit,
+            })
+        }
     }
 }
 
@@ -3761,12 +3789,33 @@ mod tests {
             ));
             Ok(json!({
                 "candidates": [{
+                    "kind": "attention_candidate",
                     "candidate_id": "01900000-0000-7000-8000-0000000000c1",
                     "candidate_seq": 1,
-                    "place": {"kind": "channel", "channel_id": "general"},
-                    "message_seq": 7,
-                    "reason": "mention",
-                    "arrival_time": "2026-08-17T00:00:00Z"
+                    "provenance": {
+                        "version": 1,
+                        "tenant_id": "tenant-1",
+                        "personality_agent_id": "01900000-0000-7000-8000-0000000000a1",
+                        "actor": {"kind": "human", "human_id": "human-1"},
+                        "source": {
+                            "surface": "messaging",
+                            "workspace_id": TEST_WORKSPACE_ID,
+                            "place": {"kind": "channel", "channel_id": "general"},
+                            "delivery": {
+                                "message_id": "message-1",
+                                "seq": 7,
+                                "addressees": [{"kind": "personality_agent", "personality_agent_id": "01900000-0000-7000-8000-0000000000a1"}],
+                                "trigger_reason": "mention",
+                                "urgency": "normal",
+                                "correlation_id": null,
+                                "causation_id": null
+                            }
+                        },
+                        "authority": {"basis": "place_membership", "decision_id": null}
+                    },
+                    "unread_range": {"place_seq_from": 1, "place_seq_to": 7},
+                    "arrival_time": "2026-08-17T00:00:00Z",
+                    "attachments": {}
                 }],
                 "consumed": request.consume_through.unwrap_or(0),
                 "latest_seq": 1
@@ -5052,10 +5101,16 @@ mod tests {
     async fn attention_takes_candidates_in_and_advances_ones_own_cursor() {
         let (api, _tool, registry) = binding_fixture().await;
 
+        let first =
+            execute_bound_action(&registry, "attention-first", json!({"action": "attention"}))
+                .await
+                .expect("receive attention");
+        assert_eq!(first.output.details["latest_seq"], 1);
+
         let bound = bind_action(
             &registry,
             "attention",
-            json!({"action": "attention", "consume_through": 3}),
+            json!({"action": "attention", "consume_through": 1}),
         )
         .await
         .expect("bind attention");
@@ -5074,17 +5129,32 @@ mod tests {
         let outcome = execute_bound_action(
             &registry,
             "attention-run",
-            json!({"action": "attention", "consume_through": 3}),
+            json!({"action": "attention", "consume_through": 1}),
         )
         .await
         .expect("run attention");
         let candidate = &outcome.output.details["candidates"][0];
-        assert_eq!(candidate["reason"], "mention");
+        assert_eq!(
+            candidate["provenance"]["source"]["delivery"]["trigger_reason"],
+            "mention"
+        );
         // 候補は message ref であって本文の注入ではない（凍結契約 v1）。
         assert!(candidate.get("content").is_none());
         assert_eq!(
             api.calls.lock().await.last().map(String::as_str),
-            Some("attention:3")
+            Some("attention:1")
+        );
+
+        // An arbitrary cursor is not an acknowledgement. The only permitted
+        // one is the tail this view actually received in the prior response.
+        assert!(
+            execute_bound_action(
+                &registry,
+                "attention-unreceived-tail",
+                json!({"action": "attention", "consume_through": 2}),
+            )
+            .await
+            .is_err()
         );
 
         // 0 は「何も ack しない」で、それは項目を省くことが既に言っている。
@@ -6052,10 +6122,7 @@ mod tests {
                     "keywords": ["リリース"]
                 }),
             ),
-            (
-                "attention",
-                json!({"action": "attention", "consume_through": 2, "limit": 5}),
-            ),
+            ("attention", json!({"action": "attention", "limit": 5})),
         ];
 
         for (id, action) in cases {

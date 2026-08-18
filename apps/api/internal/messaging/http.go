@@ -1486,6 +1486,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
 	case errors.Is(err, ErrInvalidPushSubscription):
 		writeError(w, http.StatusBadRequest, "invalid_push_subscription")
+	case errors.Is(err, ErrPushSubscriptionLimit):
+		writeError(w, http.StatusTooManyRequests, "push_subscription_limit")
 	case errors.Is(err, ErrInvalidScope):
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 	case errors.Is(err, applicationapps.ErrInstallationNotFound):
