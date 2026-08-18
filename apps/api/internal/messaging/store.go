@@ -81,6 +81,7 @@ type Place struct {
 	PlaceID     string
 	Kind        string
 	WorkspaceID string
+	Revision    int64
 	Name        string
 	Topic       string
 	Visibility  string

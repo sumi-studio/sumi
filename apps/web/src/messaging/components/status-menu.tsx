@@ -27,7 +27,7 @@ const STATUS_DOT: Record<StatusKind, string> = {
 
 /** 申告を一行で読む形にする。何も言っていない人は既定値で埋めない。 */
 export function statusSummary(status: ParticipantStatus | undefined): string {
-  if (!status) return "対応可能";
+  if (!status) return "未設定";
   const label = STATUS_LABEL[status.status];
   return status.note ? `${label} — ${status.note}` : label;
 }

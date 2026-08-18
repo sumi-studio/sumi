@@ -17,6 +17,7 @@ const bootstrap = {
     {
       channel_id: "channel-1",
       workspace_id: "workspace-1",
+      revision: 1,
       name: "general",
       topic: "",
       visibility: "public",
@@ -385,6 +386,7 @@ describe("ApiMessagingBackend", () => {
     ).resolves.toEqual({
       channelId: "channel-2",
       workspaceId: "workspace-1",
+      revision: 1,
       name: "dev",
       topic: "開発の相談",
       visibility: "public",
@@ -842,6 +844,7 @@ function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
     workspace_id: "workspace-1",
+    revision: 1,
     name: "dev",
     topic,
     visibility: "public",

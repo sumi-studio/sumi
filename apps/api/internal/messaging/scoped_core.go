@@ -101,9 +101,9 @@ func (s *ScopedStore) insertChannelInTx(ctx context.Context, tx pgx.Tx, name, to
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
 		VALUES ($1, 'channel', $2, $3, $4, $5)
-		RETURNING place_id, kind, workspace_id, name, topic, visibility, last_seq, voice`,
+		RETURNING place_id, kind, workspace_id, revision, name, topic, visibility, last_seq, voice`,
 		newUUIDv7(), s.Scope.WorkspaceID, name, topic, voice,
-	).Scan(&place.PlaceID, &place.Kind, &place.WorkspaceID, &storedName,
+	).Scan(&place.PlaceID, &place.Kind, &place.WorkspaceID, &place.Revision, &storedName,
 		&place.Topic, &place.Visibility, &place.LastSeq, &place.Voice); err != nil {
 		return Place{}, err
 	}
@@ -160,9 +160,9 @@ func (s *ScopedStore) UpdateChannel(ctx context.Context, placeID string, name, t
 	if err := tx.QueryRow(ctx, `
 		UPDATE places SET name = COALESCE($1, name), topic = COALESCE($2, topic)
 		WHERE workspace_id = $3 AND place_id = $4
-		RETURNING place_id, kind, workspace_id, name, topic, visibility, last_seq, voice`,
+		RETURNING place_id, kind, workspace_id, revision, name, topic, visibility, last_seq, voice`,
 		name, topic, s.Scope.WorkspaceID, placeID,
-	).Scan(&updated.PlaceID, &updated.Kind, &updated.WorkspaceID, &updatedName,
+	).Scan(&updated.PlaceID, &updated.Kind, &updated.WorkspaceID, &updated.Revision, &updatedName,
 		&updated.Topic, &updated.Visibility, &updated.LastSeq, &updated.Voice); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Place{}, ErrPlaceNotFound
@@ -436,10 +436,10 @@ func (s *ScopedStore) loadScopedPlaceWithClause(
 	var place Place
 	var name *string
 	err := q.QueryRow(ctx, `
-		SELECT place_id, kind, workspace_id, name, topic, visibility, last_seq, voice
+		SELECT place_id, kind, workspace_id, revision, name, topic, visibility, last_seq, voice
 		FROM places WHERE workspace_id = $1 AND place_id = $2`+lockClause,
 		s.Scope.WorkspaceID, placeID).Scan(&place.PlaceID, &place.Kind, &place.WorkspaceID,
-		&name, &place.Topic, &place.Visibility, &place.LastSeq, &place.Voice)
+		&place.Revision, &name, &place.Topic, &place.Visibility, &place.LastSeq, &place.Voice)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Place{}, ErrPlaceNotFound
 	}

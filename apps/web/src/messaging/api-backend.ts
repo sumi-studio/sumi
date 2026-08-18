@@ -619,6 +619,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     const channel: ChannelSummary = {
       channelId: asString(wire.channel_id),
       workspaceId: asString(wire.workspace_id),
+      revision: asSeq(wire.revision),
       name: asString(wire.name),
       topic: asString(wire.topic),
       visibility: asVisibility(wire.visibility),

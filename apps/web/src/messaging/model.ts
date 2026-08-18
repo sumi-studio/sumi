@@ -140,6 +140,8 @@ export interface WorkspaceSummary {
 export interface ChannelSummary {
   channelId: string;
   workspaceId: string;
+  /** Monotonic database projection revision for volatile lifecycle frames. */
+  revision: number;
   name: string;
   topic: string;
   visibility: "public" | "private";

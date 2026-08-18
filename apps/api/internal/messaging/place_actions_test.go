@@ -12,6 +12,21 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
+func TestChannelWireCarriesPlaceRevision(t *testing.T) {
+	wire := channelToWire(Place{PlaceID: "place-a", WorkspaceID: "workspace-a", Revision: 7})
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal channel wire: %v", err)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(encoded, &projected); err != nil {
+		t.Fatalf("unmarshal channel wire: %v", err)
+	}
+	if projected["revision"] != float64(7) {
+		t.Fatalf("channel wire revision = %#v, want 7", projected["revision"])
+	}
+}
+
 // A channel's name and its topic are the same one answer to「このチャンネルは
 // 何か」. Editing one must not silently answer the other, and an edit that
 // names nothing has to be refused rather than reported as done — a caller that
@@ -31,6 +46,9 @@ func TestUpdateChannelChangesOnlyWhatWasNamed(t *testing.T) {
 	if place.Name != "設計" || place.Topic != "日々のこと" {
 		t.Fatalf("renamed place = %+v, want the topic left alone", place)
 	}
+	if place.Revision != 2 {
+		t.Fatalf("renamed place revision = %d, want 2", place.Revision)
+	}
 
 	retopic := ""
 	place, err = scoped.UpdateChannel(ctx, channel.PlaceID, nil, &retopic)
@@ -41,6 +59,9 @@ func TestUpdateChannelChangesOnlyWhatWasNamed(t *testing.T) {
 	// omitting it, which is why the arguments are pointers.
 	if place.Name != "設計" || place.Topic != "" {
 		t.Fatalf("retopiced place = %+v", place)
+	}
+	if place.Revision != 3 {
+		t.Fatalf("retopiced place revision = %d, want 3", place.Revision)
 	}
 
 	if _, err := scoped.UpdateChannel(ctx, channel.PlaceID, nil, nil); !errors.Is(err, ErrEmptyChannelUpdate) {

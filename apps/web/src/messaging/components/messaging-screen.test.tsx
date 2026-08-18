@@ -60,6 +60,7 @@ function seedCurrentPlace() {
       {
         channelId: "channel-a",
         workspaceId: "workspace-a",
+        revision: 1,
         name: "alpha",
         topic: "",
         visibility: "public",
@@ -68,6 +69,7 @@ function seedCurrentPlace() {
       {
         channelId: "channel-b",
         workspaceId: "workspace-b",
+        revision: 1,
         name: "beta",
         topic: "",
         visibility: "public",
