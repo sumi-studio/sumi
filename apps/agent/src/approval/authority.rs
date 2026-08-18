@@ -12,8 +12,8 @@ use crate::{
     approval::{
         route_policy::{PolicySnapshot, PolicySourceState, RoutePolicy},
         route_reviewer::{
-            EscalationReviewEvidence, EscalationReviewOutcome, ExecutionReviewEvidence,
-            ExecutionReviewOutcome, RiskLevel,
+            EscalationObjectionOutcome, EscalationReviewEvidence, EscalationReviewOutcome,
+            ExecutionReviewEvidence, ExecutionReviewOutcome, RiskLevel,
         },
     },
     provider::types::ToolInvocationRoute,
@@ -231,7 +231,24 @@ impl ToolExecutionAuthorizationEvidence {
                 None,
                 Some(review),
                 Some(human),
-            ) if review.decision.outcome == EscalationReviewOutcome::AskHuman
+            ) if (review.decision.outcome == EscalationReviewOutcome::AskHuman
+                || (review.decision.outcome == EscalationReviewOutcome::Block
+                    && (review
+                        .pa_objection_response
+                        .as_ref()
+                        .and_then(|response| response.answer.as_ref())
+                        .is_some_and(|answer| {
+                            answer.outcome == EscalationObjectionOutcome::Proceed
+                        })
+                        || (review
+                            .pa_objection_failure
+                            .as_deref()
+                            .is_some_and(|failure| !failure.trim().is_empty())
+                            && review
+                                .pa_objection_response
+                                .as_ref()
+                                .and_then(|response| response.answer.as_ref())
+                                .is_none()))))
                 && human.decision == CurrentCallDecision::ApproveOnce
                 && !human.request_id.trim().is_empty()
                 && !human.command_id.trim().is_empty()
@@ -297,7 +314,7 @@ impl ToolExecutionDenialEvidence {
         Ok(())
     }
 
-    pub const fn error_code(&self) -> &'static str {
+    pub fn error_code(&self) -> &'static str {
         match self.policy_decision {
             PolicyDecisionRecord::Deny => "policy_denied",
             PolicyDecisionRecord::Unavailable => "policy_unavailable",
@@ -1076,6 +1093,8 @@ mod executor_projection_tests {
                     misunderstanding: Some(format!("private-misunderstanding-{hidden}")),
                     rationale: format!("private-rationale-{hidden}"),
                 },
+                pa_objection_response: None,
+                pa_objection_failure: None,
             }),
             human_decision: Some(HumanDecisionEvidence {
                 request_id: format!("request-{hidden}"),
@@ -1107,9 +1126,9 @@ mod executor_projection_tests {
             outcome => panic!("fixture mutate policy must be unmatched: {outcome:?}"),
         };
         let review = ExecutionReviewEvidence {
-            reviewer_version: "execution-reviewer/v6".to_owned(),
-            prompt_version: "execution-review-prompt/v6".to_owned(),
-            schema_version: "execution-review-schema/v6".to_owned(),
+            reviewer_version: "execution-reviewer/v7".to_owned(),
+            prompt_version: "execution-review-prompt/v7".to_owned(),
+            schema_version: "execution-review-schema/v7".to_owned(),
             model_id: "fixture".to_owned(),
             model_binding_digest: "fixture-binding".to_owned(),
             budget: ReviewerBudgetEvidence {
@@ -1198,6 +1217,8 @@ mod executor_projection_tests {
                 misunderstanding: None,
                 rationale: "ask".to_owned(),
             },
+            pa_objection_response: None,
+            pa_objection_failure: None,
         };
         let mut encoded = serde_json::to_value(escalation).unwrap();
         assert_eq!(encoded.get("tool_trace"), Some(&serde_json::json!([])));

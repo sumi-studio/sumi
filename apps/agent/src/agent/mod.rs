@@ -1500,7 +1500,18 @@ impl<G: Gateway + 'static> Session<G> {
         Ok(true)
     }
 
-    async fn route_active_control(
+    // Keep the hard-steer control path out of `admit_and_route`'s concrete
+    // future. That path can synchronously reach durable event preflight while
+    // a terminal event is buffered, and embedding both state machines exceeds
+    // a standard Tokio worker stack.
+    fn route_active_control<'a>(
+        &'a mut self,
+        command: AdmittedCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SessionFailure>> + Send + 'a>> {
+        Box::pin(self.route_active_control_inner(command))
+    }
+
+    async fn route_active_control_inner(
         &mut self,
         command: AdmittedCommand,
     ) -> Result<bool, SessionFailure> {

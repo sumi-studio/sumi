@@ -39,9 +39,11 @@ use crate::{
         route_broker::RouteApprovalBroker,
         route_policy::RoutePolicy,
         route_reviewer::{
-            EscalationReviewer, ExecutionReviewer, ProviderEscalationReviewerTransport,
-            ProviderExecutionReviewerTransport, ReviewerBudgetV1,
-            ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels, ReviewerToolRuntime,
+            EscalationObjectionResponder, EscalationReviewer, ExecutionReviewer,
+            PersonalityAgentPromptContextHandle, ProviderEscalationObjectionResponderTransport,
+            ProviderEscalationReviewerTransport, ProviderExecutionReviewerTransport,
+            ReviewerBudgetV1, ReviewerModelSpec as RouteReviewerModelSpec, ReviewerModels,
+            ReviewerToolRuntime,
         },
     },
     config::Config,
@@ -1132,14 +1134,8 @@ async fn run_after_not_ready(
                 )),
                 ReviewerBudgetV1::escalation(),
             )
-            .context("construct fail-closed Escalation AutoReview")?,
+            .context("construct advisory Escalation AutoReview")?,
         );
-        let approval = Arc::new(RouteApprovalBroker::with_shared_policy(
-            policy,
-            Redactor::v1(),
-            execution_reviewer,
-            escalation_reviewer,
-        ));
         let prompt = PromptContext {
             system_prompt: config.system_prompt.clone(),
             memory_blocks: Vec::new(),
@@ -1148,6 +1144,32 @@ async fn run_after_not_ready(
             tools: registry.definitions(),
             replay_provenance: None,
         };
+        // The objection responder uses the PA's model and strict schema, so
+        // reject a configured model that cannot ever perform its retry.
+        RouteReviewerModelSpec::require_structured_output(&model_spec)
+            .context("validate held-call Escalation objection responder model")?;
+        let personality_agent_context = PersonalityAgentPromptContextHandle::new(&prompt);
+        let escalation_objection_model = RouteReviewerModelSpec::from_provider(&model_spec);
+        let escalation_objection_responder = Arc::new(
+            EscalationObjectionResponder::new(
+                escalation_objection_model,
+                Arc::new(ProviderEscalationObjectionResponderTransport::new(
+                    model_spec.clone(),
+                )),
+                ReviewerBudgetV1::escalation(),
+                personality_agent_context.clone(),
+            )
+            .context("construct held-call Escalation objection responder")?,
+        );
+        let approval = Arc::new(
+            RouteApprovalBroker::with_shared_policy(
+                policy,
+                Redactor::v1(),
+                execution_reviewer,
+                escalation_reviewer,
+            )
+            .with_escalation_objection_responder(escalation_objection_responder),
+        );
         let driver = InjectedRunDriver::new(
             model_spec,
             RequestOptions::default(),
@@ -1157,6 +1179,7 @@ async fn run_after_not_ready(
             Some(context.authority.generation()),
         )
         .context("compose real provider RunDriver")?
+        .with_personality_agent_prompt_context(personality_agent_context)
         .with_hydrated_memory(
             store.clone(),
             context.authority.lease(),

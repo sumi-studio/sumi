@@ -2349,6 +2349,10 @@ mod tests {
                 ToolInvocationRoute::Elevated,
                 bound,
                 &Redactor::v1(),
+                None,
+                None,
+                None,
+                None,
             )
             .expect("exact local Human request")
             .public_request();

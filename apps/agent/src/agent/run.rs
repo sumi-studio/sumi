@@ -812,7 +812,7 @@ impl Runner {
                             .await?
                     } else {
                         self.consecutive_length_batches = 0;
-                        self.execute_calls(&assistant_message_id, &message, &calls)
+                        Box::pin(self.execute_calls(&assistant_message_id, &message, &calls))
                             .await?
                     };
                     if !length_guarded {
@@ -1475,11 +1475,14 @@ impl Runner {
             .as_ref()
             .and_then(super::ApprovalRuntime::route)
             .cloned();
-        #[cfg(not(test))]
-        let _ = assistant_message;
         if let Some(broker) = route_broker {
-            self.execute_route_calls(assistant_message_id, calls, broker)
-                .await
+            Box::pin(self.execute_route_calls(
+                assistant_message_id,
+                assistant_message,
+                calls,
+                broker,
+            ))
+            .await
         } else {
             #[cfg(test)]
             {
@@ -1499,6 +1502,7 @@ impl Runner {
     async fn execute_route_calls(
         &mut self,
         assistant_message_id: &str,
+        assistant_message: &PublicMessage,
         calls: &[ToolCall],
         broker: Arc<RouteApprovalBroker>,
     ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
@@ -1540,8 +1544,11 @@ impl Runner {
 
             'authorize: loop {
                 authorization_attempts = authorization_attempts.saturating_add(1);
+                let mut current_turn = Vec::with_capacity(results.len() + 1);
+                current_turn.push(assistant_message.clone());
+                current_turn.extend(results.iter().cloned().map(PublicMessage::ToolResult));
                 match self
-                    .evaluate_route_call(broker.clone(), sealed, call.route)
+                    .evaluate_route_call(broker.clone(), sealed, call.route, &current_turn)
                     .await?
                 {
                     RouteCallDisposition::Allowed { grant } => {
@@ -1801,6 +1808,7 @@ impl Runner {
         broker: Arc<RouteApprovalBroker>,
         sealed: SealedBoundToolInvocation,
         route: crate::provider::types::ToolInvocationRoute,
+        current_turn: &[PublicMessage],
     ) -> Result<RouteCallDisposition, WorkerFailure> {
         let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
@@ -1812,13 +1820,14 @@ impl Runner {
             personality_agent_id: binding.provenance.personality_agent_id().to_string(),
             human_principal_id: binding.provenance.actor().principal_id().to_owned(),
         };
-        let transcript = self
+        let mut transcript = self
             .context
             .iter()
             .map(|message| message_to_public(context_message(message).clone()))
             .collect::<Vec<_>>();
+        transcript.extend_from_slice(current_turn);
         let review_cancel = self.cancel.child_token();
-        let request = broker.start_request(
+        let mut request = Box::pin(broker.start_request(
             sealed,
             route,
             &transcript,
@@ -1826,8 +1835,7 @@ impl Runner {
             &run_id,
             &turn_id,
             review_cancel.clone(),
-        );
-        tokio::pin!(request);
+        ));
         let runtime_cancel = self.cancel.clone();
         let outcome = loop {
             tokio::select! {
@@ -4452,9 +4460,27 @@ fn route_denial_tool_result(
         (text, Some(details))
     } else if let Some(review) = evidence.escalation_review.as_ref() {
         let judged = review.budget.terminal.is_judged();
-        let text = if judged {
+        let pa_answer = review
+            .pa_objection_response
+            .as_ref()
+            .and_then(|response| response.answer.as_ref());
+        let text = if pa_answer.is_some_and(|answer| {
+            answer.outcome == crate::approval::route_reviewer::EscalationObjectionOutcome::Withdraw
+        }) {
             format!(
-                "本人へ確認を出す前のレビューで止まりました。理由: {}",
+                "AutoReviewの異議を受け、保留中のcallをPAが取り下げました。異議: {}",
+                review.decision.rationale
+            )
+        } else if review.pa_objection_response.is_none()
+            || review
+                .pa_objection_response
+                .as_ref()
+                .is_some_and(|response| response.answer.is_none())
+        {
+            evidence.reason.clone()
+        } else if judged {
+            format!(
+                "AutoReviewの異議に対するPAの回答を処理できませんでした。異議: {}",
                 review.decision.rationale
             )
         } else {

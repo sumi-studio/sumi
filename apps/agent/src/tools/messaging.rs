@@ -3526,6 +3526,10 @@ mod tests {
                 ToolInvocationRoute::Elevated,
                 &bound,
                 &Redactor::v1(),
+                None,
+                None,
+                None,
+                None,
             )
             .expect("Human approval request")
             .public_request();

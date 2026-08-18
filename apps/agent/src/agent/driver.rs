@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    approval::authority::AuthorizedBoundInvocation,
+    approval::{
+        authority::AuthorizedBoundInvocation, route_reviewer::PersonalityAgentPromptContextHandle,
+    },
     memory::{
         ThreeLayerMemory,
         compactor::apply_ready_memory,
@@ -155,6 +157,7 @@ pub(crate) struct InjectedRunDriver {
     timing_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     memory_maintenance: Option<HydratedMemoryMaintenance>,
     send_view_progress: Mutex<SendViewProgress>,
+    personality_agent_context: Option<PersonalityAgentPromptContextHandle>,
 }
 
 struct HydratedMemoryMaintenance {
@@ -228,6 +231,7 @@ impl InjectedRunDriver {
             timing_tasks: Mutex::new(Vec::new()),
             memory_maintenance: None,
             send_view_progress: Mutex::new(SendViewProgress::default()),
+            personality_agent_context: None,
         })
     }
 
@@ -241,6 +245,14 @@ impl InjectedRunDriver {
 
     pub(crate) fn with_broker(mut self, broker: ArtifactBrokerClient) -> Self {
         self.assembler.set_broker(broker);
+        self
+    }
+
+    pub(crate) fn with_personality_agent_prompt_context(
+        mut self,
+        context: PersonalityAgentPromptContextHandle,
+    ) -> Self {
+        self.personality_agent_context = Some(context);
         self
     }
 
@@ -305,6 +317,9 @@ impl InjectedRunDriver {
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         let prompt = assembled.prompt;
+        if let Some(context) = &self.personality_agent_context {
+            context.replace_from_prompt(&prompt);
+        }
         let uncalibrated_prompt_estimate = assembled.uncalibrated_prompt_estimate;
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
