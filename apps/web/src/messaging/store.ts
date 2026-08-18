@@ -325,7 +325,7 @@ function latestMessageContent(
 ): MessageContentRevision | undefined {
   let latest: MessageContentRevision | undefined;
   for (const version of versions) {
-    if (version) latest = applyMessageRevision(latest, version);
+    if (version) latest = applyMessageRevision(latest, version, "revision");
   }
   return latest;
 }
@@ -939,7 +939,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const existing = (state.messagesByPlace[key] ?? []).find(
         (entry) => entry.messageId === message.messageId,
       );
-      if (applyMessageRevision(existing, message) !== message) return {};
+      if (applyMessageRevision(existing, message, "revision") !== message) {
+        return {};
+      }
       const previous = existing ?? { ...message, deleted: false };
       const contribution = unreadContribution(
         previous,
@@ -950,7 +952,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return {
         messagesByPlace: {
           ...state.messagesByPlace,
-          [key]: upsertMessage(state.messagesByPlace[key] ?? [], message),
+          [key]: upsertMessage(
+            state.messagesByPlace[key] ?? [],
+            message,
+            "revision",
+          ),
         },
         unreadCountByPlace: {
           ...state.unreadCountByPlace,
@@ -992,12 +998,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
-        if (applyMessageRevision(existing, event.message) !== event.message) {
+        if (
+          applyMessageRevision(existing, event.message, "revision") !==
+          event.message
+        ) {
           return {};
         }
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           event.message,
+          "revision",
         );
         const nonce = event.message.clientNonce;
         const pending = nonce
@@ -1208,7 +1218,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
-        [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+        [key]: mergeMessages(
+          state.messagesByPlace[key] ?? [],
+          messages,
+          "snapshot",
+        ),
       },
       hasMoreByPlace: {
         ...state.hasMoreByPlace,
@@ -1260,6 +1274,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 [key]: upsertMessage(
                   state.messagesByPlace[key] ?? [],
                   committed,
+                  "snapshot",
                 ),
               },
             }));
@@ -1741,7 +1756,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((state) => ({
         messagesByPlace: {
           ...state.messagesByPlace,
-          [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+          [key]: mergeMessages(
+            state.messagesByPlace[key] ?? [],
+            messages,
+            "snapshot",
+          ),
         },
       }));
       return messages.some((message) => message.seq === seq);
@@ -2061,6 +2080,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                   [key]: upsertMessage(
                     current.messagesByPlace[key] ?? [],
                     committed,
+                    "revision",
                   ),
                 },
                 ...(isCurrentEditSession(current, session)
@@ -2090,6 +2110,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 [key]: upsertMessage(
                   current.messagesByPlace[key] ?? [],
                   latest,
+                  "revision",
                 ),
               };
               if (!isCurrentEditSession(current, session)) {
@@ -2287,7 +2308,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         return {
           messagesByPlace: {
             ...entry.messagesByPlace,
-            [key]: mergeMessages(existing, older),
+            [key]: mergeMessages(existing, older, "snapshot"),
           },
           hasMoreByPlace: {
             ...entry.hasMoreByPlace,
