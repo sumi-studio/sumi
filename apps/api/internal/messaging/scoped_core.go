@@ -240,13 +240,35 @@ func copyChannelName(source string) string {
 	return string(runes) + suffix
 }
 
+// normalizeDMOthers is the one entrance for a requested DM member set. The
+// actor is never an "other", and each remaining participant occurs once in
+// request order. REST and the agent-local lane use it before choosing the
+// one-to-one/group path and before placing members on the wire.
+func normalizeDMOthers(actor ParticipantRef, requested []ParticipantRef) ([]ParticipantRef, error) {
+	seen := map[string]bool{actor.Key(): true}
+	others := make([]ParticipantRef, 0, len(requested))
+	for _, ref := range requested {
+		if err := ref.Validate(); err != nil {
+			return nil, err
+		}
+		if seen[ref.Key()] {
+			continue
+		}
+		seen[ref.Key()] = true
+		others = append(others, ref)
+	}
+	return others, nil
+}
+
 func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place, bool, error) {
-	if err := other.Validate(); err != nil {
+	others, err := normalizeDMOthers(s.Scope.Actor, []ParticipantRef{other})
+	if err != nil {
 		return Place{}, false, err
 	}
-	if other == s.Scope.Actor {
+	if len(others) != 1 {
 		return Place{}, false, errors.New("a dm needs two distinct participants")
 	}
+	other = others[0]
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Place{}, false, fmt.Errorf("begin ensure dm: %w", err)
@@ -296,17 +318,11 @@ func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place
 }
 
 func (s *ScopedStore) CreateGroupDM(ctx context.Context, others []ParticipantRef) (Place, error) {
-	seen := map[string]bool{s.Scope.Actor.Key(): true}
-	members := []ParticipantRef{s.Scope.Actor}
-	for _, ref := range others {
-		if err := ref.Validate(); err != nil {
-			return Place{}, err
-		}
-		if !seen[ref.Key()] {
-			seen[ref.Key()] = true
-			members = append(members, ref)
-		}
+	others, err := normalizeDMOthers(s.Scope.Actor, others)
+	if err != nil {
+		return Place{}, err
 	}
+	members := append([]ParticipantRef{s.Scope.Actor}, others...)
 	if len(members) < 3 {
 		return Place{}, errors.New("a group dm needs at least three distinct participants")
 	}

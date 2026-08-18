@@ -361,7 +361,7 @@ describe("Sidebar overlay and IME behavior", () => {
         workspaceId="workspace-a"
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Alice 対応可能/ }));
     expect(screen.getByRole("button", { name: /取り込み中/ })).toBeVisible();
 
     fireEvent.pointerDown(screen.getByRole("navigation"));
@@ -455,6 +455,35 @@ describe("place menu channel actions", () => {
     await waitFor(() =>
       expect(updateChannel).toHaveBeenCalledWith("channel-a", {
         topic: "設計の話",
+      }),
+    );
+  });
+
+  it("keeps the opening snapshot when a place update arrives before a topic-only save", async () => {
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+
+    // 自分の編集とは別の更新が、ダイアログを開いた後に届く。
+    useMessaging.setState((state) => ({
+      channels: state.channels.map((channel) =>
+        channel.channelId === "channel-a"
+          ? { ...channel, name: "別の名前", topic: "別の話題" }
+          : channel,
+      ),
+    }));
+
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
+    fireEvent.change(
+      within(dialog).getByRole("textbox", { name: "トピック" }),
+      {
+        target: { value: "自分の話題" },
+      },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateChannel).toHaveBeenCalledWith("channel-a", {
+        topic: "自分の話題",
       }),
     );
   });

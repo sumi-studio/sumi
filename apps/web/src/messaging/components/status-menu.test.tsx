@@ -53,7 +53,9 @@ describe("StatusMenu", () => {
     });
     render(<StatusMenu />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /取り込み中/ }));
 
     expect(screen.getByText("期限が来たら「離席中」に戻ります")).toBeVisible();
@@ -71,7 +73,9 @@ describe("StatusMenu", () => {
     setSelfStatus(undefined);
     render(<StatusMenu />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /離席中/ }));
 
     expect(
@@ -98,7 +102,9 @@ describe("StatusMenu", () => {
     // アカウント行は、いま出ている申告と期限をそのまま読める形で見せる。
     expect(screen.getByText(/取り込み中 — 会議中/)).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
     const note = screen.getByRole("textbox");
     fireEvent.change(note, { target: { value: "電話中" } });
     fireEvent.keyDown(note, { key: "Enter" });
@@ -110,7 +116,9 @@ describe("StatusMenu", () => {
     setSelfStatus(undefined);
     render(<StatusMenu />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
     const note = screen.getByRole("textbox");
     fireEvent.change(note, { target: { value: "会議" } });
     fireEvent.keyDown(note, { key: "Enter", isComposing: true });

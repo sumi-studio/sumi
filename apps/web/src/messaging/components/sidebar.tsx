@@ -343,8 +343,14 @@ function EditChannelDialog({
     state.channels.find((entry) => entry.channelId === channelId),
   );
   const updateChannel = useMessaging((state) => state.updateChannel);
-  const [name, setName] = useState(channel?.name ?? "");
-  const [topic, setTopic] = useState(channel?.topic ?? "");
+  // 開いたときの値が、この編集セッションの比較対象。後から届く更新は
+  // channel を新しくしても、本人が触っていない項目を「変更」とはしない。
+  const [initial] = useState(() => ({
+    name: channel?.name ?? "",
+    topic: channel?.topic ?? "",
+  }));
+  const [name, setName] = useState(initial.name);
+  const [topic, setTopic] = useState(initial.topic);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -362,8 +368,8 @@ function EditChannelDialog({
   const nextName = name.trim();
   const nextTopic = topic.trim();
   const changed =
-    (nextName !== "" && nextName !== channel.name) ||
-    nextTopic !== channel.topic;
+    (nextName !== "" && nextName !== initial.name) ||
+    nextTopic !== initial.topic;
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -373,10 +379,10 @@ function EditChannelDialog({
     setFailed(false);
     try {
       await updateChannel(channelId, {
-        ...(nextName !== "" && nextName !== channel.name
+        ...(nextName !== "" && nextName !== initial.name
           ? { name: nextName }
           : {}),
-        ...(nextTopic !== channel.topic ? { topic: nextTopic } : {}),
+        ...(nextTopic !== initial.topic ? { topic: nextTopic } : {}),
       });
       onClose();
     } catch {

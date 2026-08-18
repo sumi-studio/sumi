@@ -9,6 +9,7 @@ import {
 import { useMessaging } from "../store";
 import { useOverlayPanel } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 
 const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 
@@ -236,23 +237,34 @@ export function StatusMenu() {
           </p>
         </div>
       ) : null}
-      <button
-        type="button"
-        disabled={!canSetStatus}
-        aria-haspopup="dialog"
-        {...overlay.triggerProps}
-        onClick={() => {
-          if (canSetStatus) overlay.toggle();
-        }}
-        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
-      >
-        <ParticipantAvatar
+      <div className="flex w-full items-center gap-2 rounded-md px-2 py-1.5">
+        <ParticipantProfilePopover
           participantKey={selfKey}
-          name={selfProfile?.displayName ?? "?"}
-          size={26}
-          status={selfStatus?.status ?? "available"}
-        />
-        <span className="min-w-0 flex-1">
+          label={`${selfProfile?.displayName ?? "自分"}のプロフィール`}
+          side="top"
+          align="start"
+          scrollPassthrough={() =>
+            document.querySelector<HTMLElement>(SIDEBAR_PLACES)
+          }
+          className="flex shrink-0 rounded-full"
+        >
+          <ParticipantAvatar
+            participantKey={selfKey}
+            name={selfProfile?.displayName ?? "?"}
+            size={26}
+            status={selfStatus?.status ?? "available"}
+          />
+        </ParticipantProfilePopover>
+        <button
+          type="button"
+          disabled={!canSetStatus}
+          aria-haspopup="dialog"
+          {...overlay.triggerProps}
+          onClick={() => {
+            if (canSetStatus) overlay.toggle();
+          }}
+          className="min-w-0 flex-1 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 enabled:hover:bg-accent/60 disabled:cursor-default"
+        >
           <span className="block truncate font-medium text-[13px]">
             {selfProfile?.displayName ?? "…"}
           </span>
@@ -262,8 +274,8 @@ export function StatusMenu() {
               ? `（${formatUntil(selfStatus.expiresAt, Date.now())}）`
               : ""}
           </span>
-        </span>
-      </button>
+        </button>
+      </div>
     </div>
   );
 }

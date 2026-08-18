@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -232,6 +233,8 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	w := newWorld(t, ctx)
 	workspace, channel := w.workspaceWithChannel(t, ctx)
 	server := NewServer(w.store.core, nil)
+	hub := NewHub(w.store.core)
+	server.Hub = hub
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 
 	// A member without the channel-management capability is refused, exactly as
@@ -286,9 +289,16 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 		t.Fatalf("duplicated channel = %v", body)
 	}
 
-	// One participant is a DM, and asking twice returns the same conversation.
+	// The actor can appear in an agent request, but it is not an "other": with
+	// one actual other this remains a 1:1 DM, and both the response and event
+	// describe each real member exactly once.
+	observer := hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA))
+	defer hub.unsubscribe(observer)
 	status, body = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
-		"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}},
+		"participants": []any{
+			map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
+			map[string]any{"kind": "human", "human_id": w.humanA.ID},
+		},
 	}, authorization)
 	if status != http.StatusOK {
 		t.Fatalf("start dm: status %d body %v", status, body)
@@ -296,6 +306,27 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	dm := body["dm"].(map[string]any)
 	if dm["kind"] != "dm" || body["created"] != true {
 		t.Fatalf("start dm = %v", body)
+	}
+	assertDMParticipantsOnce(t, dm["participants"], w.agent, w.humanA)
+	select {
+	case frame := <-observer.send:
+		var eventFrame struct {
+			Event struct {
+				Type string `json:"type"`
+				DM   struct {
+					Participants any `json:"participants"`
+				} `json:"dm"`
+			} `json:"event"`
+		}
+		if err := json.Unmarshal(frame.payload, &eventFrame); err != nil {
+			t.Fatalf("decode place-created event: %v", err)
+		}
+		if eventFrame.Event.Type != EventPlaceCreated {
+			t.Fatalf("event type = %q, want %q", eventFrame.Event.Type, EventPlaceCreated)
+		}
+		assertDMParticipantsOnce(t, eventFrame.Event.DM.Participants, w.agent, w.humanA)
+	case <-ctx.Done():
+		t.Fatal("did not receive place_created for normalized DM")
 	}
 	status, again := callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
 		"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}},
@@ -327,6 +358,30 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	}, authorization)
 	if status != http.StatusBadRequest {
 		t.Fatalf("empty participants: status %d, want 400", status)
+	}
+}
+
+func assertDMParticipantsOnce(t *testing.T, raw any, actor, other ParticipantRef) {
+	t.Helper()
+	participants, ok := raw.([]any)
+	if !ok || len(participants) != 2 {
+		t.Fatalf("dm participants = %v, want exactly two", raw)
+	}
+	seen := map[string]int{}
+	for _, rawParticipant := range participants {
+		participant, ok := rawParticipant.(map[string]any)
+		if !ok {
+			t.Fatalf("dm participant = %T, want object", rawParticipant)
+		}
+		kind, _ := participant["kind"].(string)
+		id, _ := participant["human_id"].(string)
+		if kind == string(KindPersonalityAgent) {
+			id, _ = participant["personality_agent_id"].(string)
+		}
+		seen[kind+":"+id]++
+	}
+	if seen[actor.Key()] != 1 || seen[other.Key()] != 1 {
+		t.Fatalf("dm participants = %v, want %s and %s once", raw, actor.Key(), other.Key())
 	}
 }
 

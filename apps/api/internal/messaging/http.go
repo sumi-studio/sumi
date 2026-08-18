@@ -895,6 +895,16 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_participant")
 		return
 	}
+	others, err := normalizeDMOthers(viewer, []ParticipantRef{other})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) != 1 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	other = others[0]
 	var (
 		place   Place
 		created bool
@@ -932,14 +942,23 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	others := make([]ParticipantRef, 0, len(req.Participants))
+	requested := make([]ParticipantRef, 0, len(req.Participants))
 	for _, pw := range req.Participants {
 		ref, err := pw.ref()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_participant")
 			return
 		}
-		others = append(others, ref)
+		requested = append(requested, ref)
+	}
+	others, err := normalizeDMOthers(viewer, requested)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) < 2 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
 	}
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
@@ -956,7 +975,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 	wire := dmWire{
 		DMID: place.PlaceID, Kind: place.Kind,
-		Participants: append([]participantWire{participantToWire(viewer)}, req.Participants...),
+		Participants: append([]participantWire{participantToWire(viewer)}, participantsToWire(others)...),
 	}
 	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
 	writeJSON(w, http.StatusCreated, wire)
