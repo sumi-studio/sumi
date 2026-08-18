@@ -141,6 +141,7 @@ export function notificationBody(
   const collapsed = content.replace(/\s+/g, " ").trim();
   if (!collapsed && attachments.length > 0) {
     const first = attachments[0];
+    if (first.spoiler) return "📎 添付（ネタバレ）";
     return attachments.length === 1
       ? `📎 ${first.filename}`
       : `📎 ${attachments.length}件のファイル`;

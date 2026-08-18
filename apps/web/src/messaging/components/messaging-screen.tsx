@@ -31,7 +31,9 @@ import {
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
+import { ImageViewer } from "./image-viewer";
 import { MemberList } from "./member-list";
+import type { ImageViewerRequest } from "./message-attachments";
 import { MessageList, type MessageListHandle } from "./message-list";
 import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
@@ -43,6 +45,13 @@ interface PendingJump {
   messageId?: string;
   seq?: number;
 }
+
+interface ViewingImage {
+  placeKey: PlaceKey;
+  request: ImageViewerRequest;
+}
+
+const NO_REVEALED_ATTACHMENTS: ReadonlySet<string> = new Set();
 
 function relativeTime(target: number, now: number): string {
   const delta = target - now;
@@ -450,6 +459,42 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
+  const [viewingImage, setViewingImage] = useState<ViewingImage | null>(null);
+  const [revealedForPlace, setRevealedForPlace] = useState<{
+    placeKey: PlaceKey | null;
+    attachmentIds: ReadonlySet<string>;
+  }>({ placeKey: null, attachmentIds: new Set() });
+  const attachmentURL = useMessaging((state) => state.attachmentURL);
+
+  const revealAttachment = useCallback(
+    (attachmentId: string) => {
+      if (!selectedPlaceKey) return;
+      setRevealedForPlace((current) => {
+        const attachmentIds =
+          current.placeKey === selectedPlaceKey
+            ? current.attachmentIds
+            : new Set<string>();
+        if (attachmentIds.has(attachmentId)) return current;
+        return {
+          placeKey: selectedPlaceKey,
+          attachmentIds: new Set(attachmentIds).add(attachmentId),
+        };
+      });
+    },
+    [selectedPlaceKey],
+  );
+
+  const openImage = useCallback(
+    (request: ImageViewerRequest) => {
+      if (selectedPlaceKey)
+        setViewingImage({ placeKey: selectedPlaceKey, request });
+    },
+    [selectedPlaceKey],
+  );
+  const revealedAttachmentIds =
+    revealedForPlace.placeKey === selectedPlaceKey
+      ? revealedForPlace.attachmentIds
+      : NO_REVEALED_ATTACHMENTS;
 
   // URLが現在地の正本。route paramのplaceをstoreへ同期する。
   // homeまたはbootstrapに存在しないplace URLは「未選択」が正本。表示だけを
@@ -469,6 +514,20 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     selectPlace,
     clearPlaceSelection,
   ]);
+
+  // 開示とビューアーはこのplaceを見ている画面だけの状態。履歴行の仮想化では
+  // 忘れず、placeを離れたら永続化せずに捨てる。
+  useEffect(() => {
+    if (viewingImage && viewingImage.placeKey !== selectedPlaceKey) {
+      setViewingImage(null);
+    }
+    if (revealedForPlace.placeKey !== selectedPlaceKey) {
+      setRevealedForPlace({
+        placeKey: selectedPlaceKey ?? null,
+        attachmentIds: new Set(),
+      });
+    }
+  }, [selectedPlaceKey, viewingImage, revealedForPlace]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
@@ -625,7 +684,15 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             {selectedPlaceIsLoaded ? (
               <>
                 <CallStage />
-                <MessageList handleRef={listRef} />
+                <MessageList
+                  handleRef={listRef}
+                  revealedAttachmentIds={revealedAttachmentIds}
+                  onRevealAttachment={revealAttachment}
+                  onOpenImage={openImage}
+                  followNewMessages={
+                    viewingImage?.placeKey !== selectedPlaceKey
+                  }
+                />
                 <TypingIndicator />
                 <Composer />
               </>
@@ -655,6 +722,15 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       </div>
       <IncomingCall />
       {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}
+      {viewingImage?.placeKey === selectedPlaceKey ? (
+        <ImageViewer
+          attachment={viewingImage.request.attachment}
+          href={attachmentURL(viewingImage.request.attachment.attachmentId)}
+          authorName={viewingImage.request.authorName}
+          createdAt={viewingImage.request.createdAt}
+          onClose={() => setViewingImage(null)}
+        />
+      ) : null}
     </div>
   );
 }

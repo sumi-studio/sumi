@@ -3,14 +3,13 @@ import {
   ExternalLink,
   Info,
   Link as LinkIcon,
+  Maximize2,
   X,
-  ZoomIn,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { isImeComposing } from "../../lib/ime";
 import { formatAttachmentSize } from "../draft-attachments";
 import type { Attachment } from "../model";
+import { ModalDialog } from "./modal-dialog";
 
 /**
  * アプリ内の画像ビューアー。添付画像を新規タブで開くと会話から離れてしまい、
@@ -72,10 +71,6 @@ export function ImageViewer({
   const closeRef = useRef<HTMLButtonElement>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    closeRef.current?.focus();
-  }, []);
-
   useEffect(
     () => () => {
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
@@ -88,17 +83,6 @@ export function ImageViewer({
     if (noticeTimer.current) clearTimeout(noticeTimer.current);
     noticeTimer.current = setTimeout(() => setNotice(null), NOTICE_MS);
   }, []);
-
-  // ビューアーは会話の上に重なっているので、Escは下のUIへ渡さず自分で止める。
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || isImeComposing(event)) return;
-      event.stopPropagation();
-      onClose();
-    };
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [onClose]);
 
   const copyLink = useCallback(async () => {
     let absolute = href;
@@ -115,68 +99,62 @@ export function ImageViewer({
     }
   }, [href, announce]);
 
-  return createPortal(
-    // biome-ignore lint/a11y/useKeyWithClickEvents: 背景クリックは閉じるための冗長な手段。キーボードからはEscと✕で閉じられる
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={`${attachment.filename} の画像ビューアー`}
-      data-testid="image-viewer"
+  return (
+    <ModalDialog
+      label={`${attachment.filename} の画像ビューアー`}
+      onClose={onClose}
+      initialFocusRef={closeRef}
+      testId="image-viewer"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
-      onClick={(event) => {
-        // 画像やツールバーの上のクリックは閉じない。
-        if (event.target !== event.currentTarget) return;
-        onClose();
+      onBackdropClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
       }}
     >
-      {zoomed ? null : (
-        <div className="pointer-events-none absolute top-3 left-4 z-10 max-w-[50vw] text-white/90">
-          {authorName ? (
-            <p className="truncate font-semibold text-[13px]">{authorName}</p>
-          ) : null}
-          {createdAt ? (
-            <p className="text-[11px] text-white/60 tabular-nums">
-              {FULL_FORMAT.format(createdAt)}
-            </p>
-          ) : null}
-        </div>
-      )}
+      <div className="pointer-events-none absolute top-3 left-4 z-10 max-w-[50vw] text-white/90">
+        {authorName ? (
+          <p className="truncate font-semibold text-[13px]">{authorName}</p>
+        ) : null}
+        {createdAt ? (
+          <p className="text-[11px] text-white/60 tabular-nums">
+            {FULL_FORMAT.format(createdAt)}
+          </p>
+        ) : null}
+      </div>
       <div className="absolute top-3 right-4 z-10 flex items-start gap-1.5">
-        {zoomed ? null : (
-          <>
-            <ToolbarButton label="ズーム" onClick={() => setZoomed(true)}>
-              <ZoomIn className="size-4" />
-            </ToolbarButton>
-            <ToolbarButton
-              label="詳細"
-              onClick={() => setDetailsOpen((open) => !open)}
-            >
-              <Info className="size-4" />
-            </ToolbarButton>
-            <ToolbarButton label="リンクをコピー" onClick={copyLink}>
-              <LinkIcon className="size-4" />
-            </ToolbarButton>
-            <a
-              href={href}
-              download={attachment.filename}
-              title="保存"
-              aria-label="保存"
-              className="flex size-8 items-center justify-center rounded-md border border-transparent bg-black/40 text-white/80 backdrop-blur-xs transition-colors hover:border-white/25 hover:bg-black/70 hover:text-white"
-            >
-              <Download className="size-4" />
-            </a>
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              title="ブラウザで開く"
-              aria-label="ブラウザで開く"
-              className="flex size-8 items-center justify-center rounded-md border border-transparent bg-black/40 text-white/80 backdrop-blur-xs transition-colors hover:border-white/25 hover:bg-black/70 hover:text-white"
-            >
-              <ExternalLink className="size-4" />
-            </a>
-          </>
-        )}
+        <ToolbarButton
+          label={zoomed ? "通常表示" : "最大表示"}
+          onClick={() => setZoomed((on) => !on)}
+        >
+          <Maximize2 className="size-4" />
+        </ToolbarButton>
+        <ToolbarButton
+          label="詳細"
+          onClick={() => setDetailsOpen((open) => !open)}
+        >
+          <Info className="size-4" />
+        </ToolbarButton>
+        <ToolbarButton label="リンクをコピー" onClick={copyLink}>
+          <LinkIcon className="size-4" />
+        </ToolbarButton>
+        <a
+          href={href}
+          download={attachment.filename}
+          title="保存"
+          aria-label="保存"
+          className="flex size-8 items-center justify-center rounded-md border border-transparent bg-black/40 text-white/80 backdrop-blur-xs transition-colors hover:border-white/25 hover:bg-black/70 hover:text-white"
+        >
+          <Download className="size-4" />
+        </a>
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="ブラウザで開く"
+          aria-label="ブラウザで開く"
+          className="flex size-8 items-center justify-center rounded-md border border-transparent bg-black/40 text-white/80 backdrop-blur-xs transition-colors hover:border-white/25 hover:bg-black/70 hover:text-white"
+        >
+          <ExternalLink className="size-4" />
+        </a>
         <button
           type="button"
           ref={closeRef}
@@ -189,11 +167,11 @@ export function ImageViewer({
         </button>
       </div>
 
-      {/* 画像そのものがワンクリックの拡大トグル。カーソルで今どちらかを示す。 */}
+      {/* 画像そのものが表示領域を切り替える。等倍表示やパンは提供しない。 */}
       <button
         type="button"
         onClick={() => setZoomed((on) => !on)}
-        aria-label={zoomed ? "通常サイズに戻す" : "最大表示にする"}
+        aria-label={zoomed ? "通常表示" : "最大表示"}
         aria-pressed={zoomed}
         className={
           zoomed
@@ -212,7 +190,7 @@ export function ImageViewer({
         />
       </button>
 
-      {detailsOpen && !zoomed ? (
+      {detailsOpen ? (
         <div className="absolute bottom-4 left-4 z-10 max-w-[70vw] rounded-lg border border-white/15 bg-black/60 px-3 py-2 text-[12px] text-white/85 backdrop-blur-xs">
           <p className="truncate font-medium">{attachment.filename}</p>
           <p className="text-white/60">
@@ -232,7 +210,6 @@ export function ImageViewer({
       >
         {notice}
       </output>
-    </div>,
-    document.body,
+    </ModalDialog>
   );
 }

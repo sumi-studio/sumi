@@ -111,6 +111,8 @@ export function ComposerAttachments({
 }) {
   const [editingNonce, setEditingNonce] = useState<string | null>(null);
   const editing = drafts.find((entry) => entry.clientNonce === editingNonce);
+  const requestEdit = (draft: DraftAttachment, patch: AttachmentDraftPatch) =>
+    onEdit(draft.clientNonce, { ...draft.editPatch, ...patch });
   if (drafts.length === 0) return null;
   return (
     <AttachmentGroup className="px-3 pt-2.5" data-testid="composer-attachments">
@@ -119,9 +121,10 @@ export function ComposerAttachments({
         const spoiler =
           draft.editPatch?.spoiler ?? draft.attachment?.spoiler ?? false;
         const alt = draft.editPatch?.alt ?? draft.attachment?.alt;
-        // 宣言は預かりが済んでから付ける。まだ受領が無いあいだは操作を出さない。
+        // 受領済みなら常に操作をDOMに置く。保存中だけdisabledにして、失敗時は
+        // 同じ入口から宣言を直せるようにする。
         const declarable =
-          draft.attachment !== undefined && draft.status === "ready";
+          draft.attachment !== undefined && draft.status !== "failed";
         const busy = draft.status === "uploading" || draft.status === "editing";
         const failed =
           draft.status === "failed" || draft.status === "edit_failed";
@@ -172,9 +175,7 @@ export function ComposerAttachments({
                     aria-pressed={spoiler}
                     title={spoiler ? "ネタバレを解除" : "ネタバレとしてマーク"}
                     disabled={busy}
-                    onClick={() =>
-                      onEdit(draft.clientNonce, { spoiler: !spoiler })
-                    }
+                    onClick={() => requestEdit(draft, { spoiler: !spoiler })}
                     className={`bg-background/80 opacity-60 focus-visible:opacity-100 group-hover/attachment:opacity-100 ${
                       spoiler ? "opacity-100" : ""
                     }`}
@@ -238,15 +239,15 @@ export function ComposerAttachments({
       })}
       {editing?.attachment ? (
         <AttachmentEditDialog
-          filename={editing.filename}
-          alt={editing.attachment.alt}
-          spoiler={editing.attachment.spoiler}
+          filename={editing.editPatch?.filename ?? editing.filename}
+          alt={editing.editPatch?.alt ?? editing.attachment.alt}
+          spoiler={editing.editPatch?.spoiler ?? editing.attachment.spoiler}
           previewUrl={editing.previewUrl}
           onCancel={() => setEditingNonce(null)}
           onApply={(patch) => {
             setEditingNonce(null);
             if (Object.keys(patch).length > 0) {
-              onEdit(editing.clientNonce, patch);
+              requestEdit(editing, patch);
             }
           }}
         />

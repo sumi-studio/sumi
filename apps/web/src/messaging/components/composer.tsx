@@ -15,8 +15,8 @@ import type { MemberProfile, Message, Urgency } from "../model";
 import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
-import type { ComposerPlusMenuItem } from "./composer-plus-menu";
 import { ComposerAttachments } from "./composer-attachments";
+import type { ComposerPlusMenuItem } from "./composer-plus-menu";
 import { ComposerPlusMenu } from "./composer-plus-menu";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -420,9 +420,11 @@ export function Composer() {
       : "本文が空だと保存できません（Escで取り消し）"
     : attachmentOverflow > 0
       ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
-      : draftAttachments.length > 0 && !attachmentsSettled
-        ? "添付の準備ができると送信できます"
-        : null;
+      : draftAttachments.some((entry) => entry.status === "edit_failed")
+        ? "添付の保存に失敗しました。鉛筆から内容を直すか、再送してください"
+        : draftAttachments.length > 0 && !attachmentsSettled
+          ? "添付の準備ができると送信できます"
+          : null;
 
   return (
     <section

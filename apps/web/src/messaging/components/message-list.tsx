@@ -16,6 +16,7 @@ import { type Message, participantKey } from "../model";
 import { placePath } from "../place-route";
 import { getMessagingScope, useMessaging } from "../store";
 import { buildRows, type PendingMessage, type TimelineRow } from "../timeline";
+import type { ImageViewerRequest } from "./message-attachments";
 import { MessageItem } from "./message-item";
 
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
@@ -46,8 +47,16 @@ function estimateRowSize(row: ListRow): number {
 
 export function MessageList({
   handleRef,
+  revealedAttachmentIds,
+  onRevealAttachment,
+  onOpenImage,
+  followNewMessages = true,
 }: {
   handleRef?: Ref<MessageListHandle>;
+  revealedAttachmentIds: ReadonlySet<string>;
+  onRevealAttachment: (attachmentId: string) => void;
+  onOpenImage: (request: ImageViewerRequest) => void;
+  followNewMessages?: boolean;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const messages = useMessaging((state) =>
@@ -239,10 +248,10 @@ export function MessageList({
   const lastRowId = rows.length > 0 ? rows[rows.length - 1].id : null;
   useEffect(() => {
     if (lastRowId === null) return;
-    if (atEndRef.current) {
+    if (followNewMessages && atEndRef.current) {
       virtualizerRef.current?.scrollToEnd({ behavior: "auto" });
     }
-  }, [lastRowId]);
+  }, [lastRowId, followNewMessages]);
 
   const advanceRead = useCallback(
     (ids: string[]) => {
@@ -364,6 +373,9 @@ export function MessageList({
             onEdit={(message) => startEdit(message.messageId)}
             onDelete={deleteMessage2}
             onJumpTo={flashMessage}
+            revealedAttachmentIds={revealedAttachmentIds}
+            onRevealAttachment={onRevealAttachment}
+            onOpenImage={onOpenImage}
           />
         </div>
       );
@@ -386,6 +398,9 @@ export function MessageList({
       deleteMessage2,
       flashMessage,
       loadOlderAnchored,
+      revealedAttachmentIds,
+      onRevealAttachment,
+      onOpenImage,
     ],
   );
 

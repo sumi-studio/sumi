@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -67,10 +68,9 @@ type attachmentWire struct {
 	SizeBytes    int64  `json:"size_bytes"`
 	SHA256       string `json:"sha256"`
 	Position     int    `json:"position"`
-	// Spoiler and Alt are the sender's declarations about the file. They ride
-	// on every delivery — REST, WebSocket, and the agent's local control lane
-	// — so a PersonalityAgent reading a timeline learns「これはネタバレ画像だ」
-	// exactly as a human's screen does.
+	// Spoiler and Alt are the sender's declarations in attachment metadata
+	// deliveries — REST, WebSocket, and the agent's local open view. Byte
+	// responses deliberately carry only delivery headers.
 	Spoiler bool   `json:"spoiler"`
 	Alt     string `json:"alt"`
 }
@@ -386,12 +386,23 @@ func (s *Server) serveUpdateAttachment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, attachmentToWire(att))
 }
 
-// sanitizeAttachmentAlt keeps a one-paragraph description: no control
-// characters, newlines included. Length is bounded by the caller afterwards,
-// on the sanitized value.
+// forbiddenAttachmentDisplayRune is the shared display-text policy: C0/C1
+// controls (including NEL), line/paragraph separators, bidi controls, and
+// zero-width format controls do not belong in sender-controlled one-line text.
+// The agent and web implementations carry the same explicit set.
+func forbiddenAttachmentDisplayRune(r rune) bool {
+	return unicode.IsControl(r) || r == 0x180e ||
+		(r >= 0x200b && r <= 0x200f) ||
+		r == 0x2028 || r == 0x2029 ||
+		(r >= 0x202a && r <= 0x202e) || r == 0x2060 ||
+		(r >= 0x2066 && r <= 0x2069) || r == 0xfeff
+}
+
+// sanitizeAttachmentAlt keeps a one-paragraph display description. Length is
+// bounded by the caller afterwards, on the sanitized value.
 func sanitizeAttachmentAlt(alt string) string {
 	return strings.TrimSpace(strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if forbiddenAttachmentDisplayRune(r) {
 			return ' '
 		}
 		return r
@@ -466,13 +477,13 @@ func writeAttachmentHeaders(header http.Header, att Attachment) {
 	header.Set(AttachmentUploadFilenameHeader, url.PathEscape(att.Filename))
 }
 
-// sanitizeAttachmentFilename keeps a display name only: no directories, no
-// control characters, bounded length. It is never used as a storage path.
+// sanitizeAttachmentFilename keeps a display name only: no directories,
+// forbidden display characters, bounded length. It is never used as a storage path.
 func sanitizeAttachmentFilename(name string) string {
 	name = strings.ReplaceAll(name, "\\", "/")
 	name = path.Base(strings.TrimSpace(name))
 	name = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if forbiddenAttachmentDisplayRune(r) {
 			return -1
 		}
 		return r

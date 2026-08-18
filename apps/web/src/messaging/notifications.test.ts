@@ -119,6 +119,20 @@ describe("notification text", () => {
     expect(
       notificationBody("", [
         {
+          attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaac",
+          filename: "ending_dies.png",
+          mime: "image/png",
+          sizeBytes: 1,
+          sha256: "00",
+          position: 0,
+          spoiler: true,
+          alt: "",
+        },
+      ]),
+    ).toBe("📎 添付（ネタバレ）");
+    expect(
+      notificationBody("", [
+        {
           attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
           filename: "one.txt",
           mime: "text/plain",

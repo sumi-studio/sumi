@@ -180,6 +180,21 @@ describe("composer draft attachments", () => {
     expect(server.sent).toEqual([{ content: "", attachments: ["att-only"] }]);
   });
 
+  it("shows the server-canonical filename after upload", async () => {
+    const server = new UploadControlledServer();
+    bootstrapStore(server);
+    useMessaging
+      .getState()
+      .addDraftAttachments([
+        new File(["x"], "a-very-long-local-name.txt", { type: "text/plain" }),
+      ]);
+    server.pendingUploads[0]?.deferred.resolve(receipt("att-name", "name.txt"));
+    await settle();
+    expect(
+      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+    ).toMatchObject({ filename: "name.txt", status: "ready" });
+  });
+
   it("marks failed uploads, retries with the same nonce, and drops removed drafts", async () => {
     const server = new UploadControlledServer();
     bootstrapStore(server);

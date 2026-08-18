@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
 import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
@@ -1237,6 +1238,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         patch({
           status: "ready",
           attachment: receipt.attachment,
+          filename: receipt.attachment.filename,
           errorCode: undefined,
         });
       })
@@ -1632,7 +1634,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const clientNonce = secureRandomUUID();
         const draft: DraftAttachment = {
           clientNonce,
-          filename: file.name || "file",
+          filename: sanitizeAttachmentFilenameForDisplay(file.name),
           sizeBytes: file.size,
           contentType: file.type,
           status: "uploading",
@@ -1739,8 +1741,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const attachment = draft?.attachment;
       // 預かりが済んでいない添付には宣言を付けられない。"editing" を先に置く
       // ことが二重送信の関門でもある（zustandのsetは同期的なので、次の呼び
-      // 出しはもう ready ではない）。
-      if (!draft || !attachment || draft.status !== "ready") return;
+      // 出しはもう ready ではない）。編集失敗後は、同じ入口から宣言を直して
+      // 新しいpatchへ置き換えられる。
+      if (
+        !draft ||
+        !attachment ||
+        (draft.status !== "ready" && draft.status !== "edit_failed")
+      )
+        return;
       set((current) => ({
         draftAttachmentsByPlace: {
           ...current.draftAttachmentsByPlace,

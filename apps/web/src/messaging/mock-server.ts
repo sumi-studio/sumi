@@ -1,4 +1,5 @@
 import { secureRandomUUID } from "../lib/random-uuid";
+import { MessagingAPIError } from "./api-backend";
 import { hasDisplayMention } from "./mention";
 import type {
   Attachment,
@@ -642,7 +643,9 @@ export class MockMessagingServer implements MessagingBackend {
   ): Promise<Attachment> {
     const draft = this.uploads.get(attachmentId);
     if (!draft) {
-      return Promise.reject(new Error("attachment_already_sent"));
+      return Promise.reject(
+        new MessagingAPIError("attachment_already_sent", 409),
+      );
     }
     const next: Attachment = {
       ...draft,

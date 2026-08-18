@@ -676,10 +676,25 @@ func TestSanitizeAttachmentAlt(t *testing.T) {
 		{"二行の\n説明", "二行の 説明"},
 		{"tab\tここ", "tab ここ"},
 		{"\x00\x7f", ""},
+		{"before\u0085after", "before after"},
+		{"before\u2028after\u2029end", "before after end"},
+		{"before\u202eafter\u200bend", "before after end"},
 		{"", ""},
 	} {
 		if got := sanitizeAttachmentAlt(tc.in); got != tc.want {
 			t.Fatalf("sanitizeAttachmentAlt(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSanitizeAttachmentFilenameRemovesForbiddenDisplayCharacters(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"before\u0085after.txt", "beforeafter.txt"},
+		{"before\u2028after\u2029end.txt", "beforeafterend.txt"},
+		{"before\u202eafter\u200bend.txt", "beforeafterend.txt"},
+	} {
+		if got := sanitizeAttachmentFilename(tc.in); got != tc.want {
+			t.Fatalf("sanitizeAttachmentFilename(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

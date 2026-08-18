@@ -4,7 +4,12 @@ import { formatAttachmentSize } from "../draft-attachments";
 import type { Attachment } from "../model";
 import { isInlineImageMime } from "../model";
 import { useMessaging } from "../store";
-import { ImageViewer } from "./image-viewer";
+
+export interface ImageViewerRequest {
+  attachment: Attachment;
+  authorName?: string;
+  createdAt?: number;
+}
 
 /**
  * メッセージが運ぶ添付の描画。画像はサーバーが安全と判定した型だけをinlineで
@@ -12,19 +17,25 @@ import { ImageViewer } from "./image-viewer";
  * 現在のexact scopeから引く: 古いWorkspaceのURLを描画に残さない。
  *
  * 送り手がネタバレと宣言した添付は覆ったまま出す。開くのは受け手の操作で、
- * 開いたかどうかはどこにも記録しない（この描画だけの状態）。
+ * 開いた印はplace画面がattachment IDごとに持つ。仮想行のunmountで覆い直さず、
+ * 画面を離れたときだけ忘れる（永続化はしない）。
  */
 export function MessageAttachments({
   attachments,
   authorName,
   createdAt,
+  revealedAttachmentIds,
+  onReveal,
+  onOpenImage,
 }: {
   attachments: Attachment[];
   authorName?: string;
   createdAt?: number;
+  revealedAttachmentIds: ReadonlySet<string>;
+  onReveal: (attachmentId: string) => void;
+  onOpenImage: (request: ImageViewerRequest) => void;
 }) {
   const attachmentURL = useMessaging((state) => state.attachmentURL);
-  const [viewing, setViewing] = useState<Attachment | null>(null);
   if (attachments.length === 0) return null;
   const images = attachments.filter((entry) => isInlineImageMime(entry.mime));
   const files = attachments.filter((entry) => !isInlineImageMime(entry.mime));
@@ -40,7 +51,11 @@ export function MessageAttachments({
               key={entry.attachmentId}
               attachment={entry}
               href={attachmentURL(entry.attachmentId)}
-              onOpen={() => setViewing(entry)}
+              revealed={revealedAttachmentIds.has(entry.attachmentId)}
+              onReveal={() => onReveal(entry.attachmentId)}
+              onOpen={() =>
+                onOpenImage({ attachment: entry, authorName, createdAt })
+              }
             />
           ))}
         </div>
@@ -52,15 +67,6 @@ export function MessageAttachments({
           href={attachmentURL(entry.attachmentId)}
         />
       ))}
-      {viewing ? (
-        <ImageViewer
-          attachment={viewing}
-          href={attachmentURL(viewing.attachmentId)}
-          authorName={authorName}
-          createdAt={createdAt}
-          onClose={() => setViewing(null)}
-        />
-      ) : null}
     </div>
   );
 }
@@ -68,14 +74,17 @@ export function MessageAttachments({
 function ImageAttachment({
   attachment,
   href,
+  revealed,
+  onReveal,
   onOpen,
 }: {
   attachment: Attachment;
   href: string;
+  revealed: boolean;
+  onReveal: () => void;
   onOpen: () => void;
 }) {
   const [broken, setBroken] = useState(false);
-  const [revealed, setRevealed] = useState(false);
   if (broken) {
     return <FileAttachment attachment={attachment} href={href} icon="image" />;
   }
@@ -85,11 +94,11 @@ function ImageAttachment({
     <div className="relative w-fit max-w-full">
       <button
         type="button"
-        onClick={() => (covered ? setRevealed(true) : onOpen())}
+        onClick={() => (covered ? onReveal() : onOpen())}
         onKeyDown={(event) => {
           if (covered && (event.key === "Enter" || event.key === " ")) {
             event.preventDefault();
-            setRevealed(true);
+            onReveal();
           }
         }}
         aria-label={

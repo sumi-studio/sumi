@@ -25,7 +25,10 @@ import {
 import { memo, type ReactNode, useMemo } from "react";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
-import { MessageAttachments } from "./message-attachments";
+import {
+  type ImageViewerRequest,
+  MessageAttachments,
+} from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { conversationViewport, useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -163,6 +166,9 @@ export interface MessageItemProps {
   onDelete: (message: Message) => void;
   onJumpTo: (messageId: string) => void;
   onRetry: (message: Message) => void;
+  revealedAttachmentIds: ReadonlySet<string>;
+  onRevealAttachment: (attachmentId: string) => void;
+  onOpenImage: (request: ImageViewerRequest) => void;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -184,6 +190,9 @@ export const MessageItem = memo(function MessageItem({
   onDelete,
   onJumpTo,
   onRetry,
+  revealedAttachmentIds,
+  onRevealAttachment,
+  onOpenImage,
 }: MessageItemProps) {
   const passthroughRef = useWheelPassthrough<HTMLDivElement>();
   const authorKey = participantKey(message.author);
@@ -282,6 +291,9 @@ export const MessageItem = memo(function MessageItem({
               attachments={message.attachments}
               authorName={author?.displayName}
               createdAt={message.createdAt}
+              revealedAttachmentIds={revealedAttachmentIds}
+              onReveal={onRevealAttachment}
+              onOpenImage={onOpenImage}
             />
           )}
           {allowReactions ? (

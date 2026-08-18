@@ -49,13 +49,13 @@ use crate::apiclient::apps::{
 };
 use crate::apiclient::messaging::{
     CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-    MessagingApi, MessagingApiFailure,
-    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
-    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
     UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
     WriteMessagingMessageRequest, canonical_attachment_filename,
+    forbidden_attachment_display_character,
 };
 use crate::apiclient::workspace::{
     WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceInvitationApi,
@@ -1322,7 +1322,9 @@ fn messaging_attachment_from_wire(
     if wire.position >= 10 {
         bail!("invalid Messaging attachment position");
     }
-    if wire.alt.chars().count() > 1000 || wire.alt.contains('\n') || wire.alt.contains('\0') {
+    if wire.alt.chars().count() > 1000
+        || wire.alt.chars().any(forbidden_attachment_display_character)
+    {
         bail!("invalid Messaging attachment description");
     }
     Ok(MessagingAttachmentMetadata {

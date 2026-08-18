@@ -170,6 +170,12 @@
   削除確認後だけに行う。
   tombstone 済みの nonce は historical logical-upload identity として retired になり、
   ready receipt に化けず `410 attachment_upload_retired` を返す。
+- 送信前の宣言は `PATCH /messaging/attachments/{attachment_id}`（exact scope query 付き）で
+  編集する。body は `filename` / `alt` / `spoiler` の任意の非空サブセットだけで、未知の
+  field と空 patch は `400 invalid_request`。省略した field は不変である。編集できるのは
+  upload した本人の未 bind attachment だけで、送信済みの本人の attachment は
+  `409 attachment_already_sent`、それ以外（見えない・削除中・他人のものを含む）は
+  `404 not_found` になる。
 - 送信 `POST /messaging/places/{place_id}/messages` の body に
   `attachments: [attachment_id, ...]` を順序付きで載せる。bind は message insert・
   mention・seq 割当・notification intent と同じ transaction で行われ、1 件でも

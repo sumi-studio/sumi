@@ -1,10 +1,10 @@
 import { EyeOff, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { isImeComposing } from "../../lib/ime";
+import { useRef, useState } from "react";
 import { clampCodePoints } from "../../lib/text-length";
+import { sanitizeAttachmentDisplayText } from "../attachment-display";
 import type { AttachmentDraftPatch } from "../model";
 import { MAX_ATTACHMENT_ALT_LENGTH } from "../model";
+import { ModalDialog } from "./modal-dialog";
 
 /**
  * 送信前の添付に付ける三つの宣言——表示名・説明・ネタバレ——を決めるダイアログ。
@@ -33,38 +33,27 @@ export function AttachmentEditDialog({
   const [nextSpoiler, setNextSpoiler] = useState(spoiler);
   const filenameRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    filenameRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || isImeComposing(event)) return;
-      event.stopPropagation();
-      onCancel();
-    };
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [onCancel]);
-
   const apply = () => {
     const patch: AttachmentDraftPatch = {};
-    const trimmed = nextFilename.trim();
-    const clampedAlt = clampCodePoints(nextAlt, MAX_ATTACHMENT_ALT_LENGTH);
+    const trimmed = sanitizeAttachmentDisplayText(nextFilename).trim();
+    const clampedAlt = clampCodePoints(
+      sanitizeAttachmentDisplayText(nextAlt),
+      MAX_ATTACHMENT_ALT_LENGTH,
+    );
     if (trimmed && trimmed !== filename) patch.filename = trimmed;
     if (clampedAlt !== alt) patch.alt = clampedAlt;
     if (nextSpoiler !== spoiler) patch.spoiler = nextSpoiler;
     onApply(patch);
   };
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="添付ファイルを編集"
-        className="flex max-h-full w-full max-w-md flex-col overflow-hidden rounded-xl border border-border bg-background shadow-xl"
-      >
+  return (
+    <ModalDialog
+      label="添付ファイルを編集"
+      onClose={onCancel}
+      initialFocusRef={filenameRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+    >
+      <div className="flex max-h-full w-full max-w-md flex-col overflow-hidden rounded-xl border border-border bg-background shadow-xl">
         <div className="flex items-center justify-between border-border border-b px-4 py-3">
           <h2 className="font-semibold text-[14px]">添付ファイルを編集</h2>
           <button
@@ -150,7 +139,6 @@ export function AttachmentEditDialog({
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </ModalDialog>
   );
 }

@@ -965,7 +965,23 @@ func (s *ScopedStore) UpdateDraftAttachment(ctx context.Context, attachmentID st
 		attachmentID, s.Scope.WorkspaceID, patch.Filename, patch.Alt, patch.Spoiler,
 		s.Scope.Actor.Kind, s.Scope.Actor.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Attachment{}, ErrAttachmentAlreadySent
+		// Only a concurrent bind deserves the special 409. A reconciler can
+		// move an orphan to deleting in the same window; that attachment is
+		// unavailable, not already sent.
+		var messageID *string
+		recheckErr := tx.QueryRow(ctx, `
+			SELECT message_id FROM message_attachments
+			WHERE attachment_id = $1 AND workspace_id = $2
+			  AND uploader_kind = $3 AND uploader_id = $4`,
+			attachmentID, s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID,
+		).Scan(&messageID)
+		if recheckErr == nil && messageID != nil {
+			return Attachment{}, ErrAttachmentAlreadySent
+		}
+		if recheckErr != nil && !errors.Is(recheckErr, pgx.ErrNoRows) {
+			return Attachment{}, fmt.Errorf("recheck attachment edit: %w", recheckErr)
+		}
+		return Attachment{}, ErrAttachmentNotFound
 	}
 	if err != nil {
 		return Attachment{}, fmt.Errorf("update attachment: %w", err)

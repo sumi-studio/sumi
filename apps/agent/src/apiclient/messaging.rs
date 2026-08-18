@@ -217,7 +217,7 @@ pub(crate) fn canonical_attachment_filename(source: &str) -> String {
     };
     let mut name = base
         .chars()
-        .filter(|character| !(*character < '\u{20}' || *character == '\u{7f}'))
+        .filter(|character| !forbidden_attachment_display_character(*character))
         .collect::<String>();
     name = name.trim().to_owned();
     if name.is_empty() || matches!(name.as_str(), "." | ".." | "/") {
@@ -231,6 +231,24 @@ pub(crate) fn canonical_attachment_filename(source: &str) -> String {
     } else {
         name
     }
+}
+
+/// Keep agent metadata aligned with the API/web display-text gate: C0/C1
+/// controls (including NEL), Unicode line/paragraph separators, bidi controls,
+/// and zero-width format controls never enter sender-controlled display text.
+pub(crate) fn forbidden_attachment_display_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -359,7 +377,7 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_attachment_filename;
+    use super::{canonical_attachment_filename, forbidden_attachment_display_character};
 
     #[test]
     fn attachment_filename_canonicalization_matches_the_go_wire_contract() {
@@ -370,6 +388,9 @@ mod tests {
             ("a/b/..", "file"),
             ("///", "file"),
             ("\u{0001}hello\u{007f}.txt", "hello.txt"),
+            ("before\u{0085}after.txt", "beforeafter.txt"),
+            ("before\u{2028}after\u{2029}end.txt", "beforeafterend.txt"),
+            ("before\u{202e}after\u{200b}end.txt", "beforeafterend.txt"),
             ("\u{2003}wide\u{2003}", "wide"),
             ("", "file"),
             (".", "file"),
@@ -386,5 +407,16 @@ mod tests {
         let bounded = canonical_attachment_filename(&multibyte);
         assert_eq!(bounded.as_bytes().len(), 254);
         assert_eq!(bounded, "é".repeat(127));
+    }
+
+    #[test]
+    fn attachment_display_character_set_covers_controls_bidi_and_zero_width() {
+        for character in ['\u{0085}', '\u{2028}', '\u{2029}', '\u{202e}', '\u{200b}'] {
+            assert!(
+                forbidden_attachment_display_character(character),
+                "{character:?}"
+            );
+        }
+        assert!(!forbidden_attachment_display_character('名'));
     }
 }

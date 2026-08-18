@@ -23,10 +23,10 @@ use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
         CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-        MessagingApi, MessagingApiFailure,
-        MessagingApiFailureClass, MessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
-        OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
-        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+        MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
+        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
         UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
     },
     approval::authority::MessagingSourceSigningContinuation,
@@ -2503,8 +2503,10 @@ fn validate_attachment_metadata(
         // The sender's description is one sentence about the file, bounded by
         // the same rule the API enforces, and never a second message body.
         || attachment.alt.chars().count() > MAX_ATTACHMENT_ALT_CHARS
-        || attachment.alt.contains('\n')
-        || attachment.alt.contains('\0')
+        || attachment
+            .alt
+            .chars()
+            .any(crate::apiclient::messaging::forbidden_attachment_display_character)
     {
         return Err(ToolError::Protocol(
             "invalid Messaging attachment metadata".to_owned(),
