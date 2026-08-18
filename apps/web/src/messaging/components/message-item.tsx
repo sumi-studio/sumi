@@ -406,6 +406,8 @@ export const MessageItem = memo(function MessageItem({
                 onChange={onEditDraftChange}
                 onSubmit={onSubmitEdit}
                 onCancel={onCancelEdit}
+                membersByKey={membersByKey}
+                selfKey={selfKey}
               />
             ) : (
               <>
