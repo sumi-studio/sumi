@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Status values (契約ドラフト: 自己申告のStatus。監視による自動表示はしない).
@@ -102,78 +104,115 @@ type StatusExpiry struct {
 	Scopes []Scope
 }
 
-// ExpireStatuses makes lapsed temporary statuses durable and reports what each
-// participant now says. Rows that lapse back to a base keep that base as their
-// lasting state; rows with nothing behind them are removed, because a status
-// that no longer holds is not a statement about anyone.
+// ExpireStatuses makes lapsed temporary statuses durable and hands each one to
+// `announce` before the transaction commits. Rows that lapse back to a base
+// keep that base as their lasting state; rows with nothing behind them are
+// removed, because a status that no longer holds is not a statement about
+// anyone.
 //
-// Readers already resolve expiry themselves through StatusesVisibleTo, so a
-// sweep that never runs costs correctness nothing — only the liveness of the
-// announcement on a screen that is already open.
-func (s *Store) ExpireStatuses(ctx context.Context) ([]StatusExpiry, error) {
-	rows, err := s.pool.Query(ctx, `
-		WITH lapsed AS (
-		  SELECT member_kind, member_id, base_status, base_note
-		  FROM participant_statuses
-		  WHERE expires_at IS NOT NULL AND expires_at <= now()
-		  FOR UPDATE
-		), restored AS (
-		  UPDATE participant_statuses ps
-		  SET status = lapsed.base_status, note = lapsed.base_note,
-		      expires_at = NULL, base_status = NULL, base_note = '', updated_at = now()
-		  FROM lapsed
-		  WHERE ps.member_kind = lapsed.member_kind AND ps.member_id = lapsed.member_id
-		    AND lapsed.base_status IS NOT NULL
-		  RETURNING ps.member_id
-		), cleared AS (
-		  DELETE FROM participant_statuses ps
-		  USING lapsed
-		  WHERE ps.member_kind = lapsed.member_kind AND ps.member_id = lapsed.member_id
-		    AND lapsed.base_status IS NULL
-		  RETURNING ps.member_id
-		)
-		SELECT member_kind, member_id, base_status, base_note FROM lapsed`)
+// What is announced is only what these statements actually changed, and only
+// the values they themselves produced. The eligibility check lives in each
+// statement's own WHERE rather than in an earlier read, so a participant who
+// declares something new in the meantime simply leaves nothing to lapse: zero
+// rows change and nothing is said about them.
+//
+// `announce` runs inside the transaction, with the affected rows still locked.
+// That is what keeps a lapse from arriving after a newer declaration: any
+// concurrent SetStatus is waiting at the same row lock and therefore cannot
+// publish first. Announcing before the commit is safe here in a way it would
+// not be elsewhere — the event states only what every reader already computes
+// for itself from the declaration's own expiry and base, so a transaction that
+// failed to commit could not leave a screen disagreeing with the durable
+// answer.
+//
+// Readers resolve expiry themselves through StatusesVisibleTo, so a sweep that
+// never runs costs correctness nothing.
+func (s *Store) ExpireStatuses(
+	ctx context.Context,
+	announce func(context.Context, StatusExpiry),
+) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("expire statuses: %w", err)
+		return fmt.Errorf("begin expire statuses: %w", err)
 	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
 	var expiries []StatusExpiry
-	for rows.Next() {
-		var (
-			participant ParticipantRef
-			baseStatus  *string
-			baseNote    string
-		)
-		if err := rows.Scan(&participant.Kind, &participant.ID, &baseStatus, &baseNote); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan expired status: %w", err)
-		}
-		status := ParticipantStatus{Participant: participant}
-		if baseStatus != nil {
-			status.Status = *baseStatus
-			status.Note = baseNote
+	restored, err := tx.Query(ctx, `
+		UPDATE participant_statuses
+		SET status = base_status, note = base_note,
+		    expires_at = NULL, base_status = NULL, base_note = '', updated_at = now()
+		WHERE expires_at IS NOT NULL AND expires_at <= now()
+		  AND base_status IS NOT NULL
+		RETURNING member_kind, member_id, status, note`)
+	if err != nil {
+		return fmt.Errorf("restore lapsed statuses: %w", err)
+	}
+	for restored.Next() {
+		var status ParticipantStatus
+		if err := restored.Scan(
+			&status.Participant.Kind, &status.Participant.ID, &status.Status, &status.Note,
+		); err != nil {
+			restored.Close()
+			return fmt.Errorf("scan restored status: %w", err)
 		}
 		expiries = append(expiries, StatusExpiry{Status: status})
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("iterate expired statuses: %w", err)
+	if err := restored.Err(); err != nil {
+		restored.Close()
+		return fmt.Errorf("iterate restored statuses: %w", err)
 	}
-	rows.Close()
+	restored.Close()
+
+	cleared, err := tx.Query(ctx, `
+		DELETE FROM participant_statuses
+		WHERE expires_at IS NOT NULL AND expires_at <= now()
+		  AND base_status IS NULL
+		RETURNING member_kind, member_id`)
+	if err != nil {
+		return fmt.Errorf("clear lapsed statuses: %w", err)
+	}
+	for cleared.Next() {
+		// An empty status is how a clear says「もう何も言っていない」.
+		var status ParticipantStatus
+		if err := cleared.Scan(&status.Participant.Kind, &status.Participant.ID); err != nil {
+			cleared.Close()
+			return fmt.Errorf("scan cleared status: %w", err)
+		}
+		expiries = append(expiries, StatusExpiry{Status: status})
+	}
+	if err := cleared.Err(); err != nil {
+		cleared.Close()
+		return fmt.Errorf("iterate cleared statuses: %w", err)
+	}
+	cleared.Close()
+
 	for index := range expiries {
-		scopes, err := s.messagingScopesOf(ctx, expiries[index].Status.Participant)
+		scopes, err := s.messagingScopesOfInTx(ctx, tx, expiries[index].Status.Participant)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		expiries[index].Scopes = scopes
+		if announce != nil {
+			announce(ctx, expiries[index])
+		}
 	}
-	return expiries, nil
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit expire statuses: %w", err)
+	}
+	return nil
 }
 
-// messagingScopesOf lists the enabled Messaging installations of every
-// Workspace the participant currently belongs to. Only these addresses can
-// carry a statement about them, and each is re-authorized at delivery.
-func (s *Store) messagingScopesOf(ctx context.Context, participant ParticipantRef) ([]Scope, error) {
-	rows, err := s.pool.Query(ctx, `
+// messagingScopesOfInTx lists the enabled Messaging installations of every
+// Workspace the participant currently belongs to, read inside the caller's
+// transaction. Only these addresses can carry a statement about them, and each
+// is re-authorized at delivery.
+func (s *Store) messagingScopesOfInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	participant ParticipantRef,
+) ([]Scope, error) {
+	rows, err := tx.Query(ctx, `
 		SELECT wm.workspace_id, ai.installation_id, ai.authority_epoch
 		FROM workspace_members wm
 		JOIN app_installations ai

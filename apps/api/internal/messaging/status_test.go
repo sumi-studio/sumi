@@ -283,7 +283,7 @@ func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {
 		t.Fatalf("set lapsed status without a base: %v", err)
 	}
 
-	expiries, err := w.store.core.ExpireStatuses(ctx)
+	expiries, err := collectExpiries(ctx, w.store.core)
 	if err != nil {
 		t.Fatalf("expire statuses: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {
 	}
 
 	// Sweeping is idempotent: the second pass finds nothing left to lapse.
-	again, err := w.store.core.ExpireStatuses(ctx)
+	again, err := collectExpiries(ctx, w.store.core)
 	if err != nil {
 		t.Fatalf("second expire: %v", err)
 	}
@@ -330,5 +330,92 @@ func TestExpireStatusesRestoresTheBaseAndClearsWhatHasNone(t *testing.T) {
 	}
 	if _, ok := statusOf(t, statuses, w.humanB); ok {
 		t.Fatalf("cleared status must be gone, got %+v", statuses)
+	}
+}
+
+// collectExpiries runs one sweep and records what it announced. The sweep hands
+// each lapse over inside its own transaction, so this is the only way to see
+// what it said — there is no separate read to inspect afterwards.
+func collectExpiries(ctx context.Context, store *Store) ([]StatusExpiry, error) {
+	var announced []StatusExpiry
+	err := store.ExpireStatuses(ctx, func(_ context.Context, expiry StatusExpiry) {
+		announced = append(announced, expiry)
+	})
+	return announced, err
+}
+
+// A lapse is only worth announcing while it is still the last word. If the
+// participant declares something new before the sweep runs, there is nothing
+// left to lapse — and saying so anyway would put a stale state on every open
+// screen, after the newer declaration had already arrived.
+func TestSweepSaysNothingAboutAParticipantWhoDeclaredSomethingNewFirst(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	past := time.Now().Add(-time.Minute)
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "在宅です", nil); err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set lapsed status: %v", err)
+	}
+	// The row is already eligible to lapse. The participant speaks again first.
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAvailable, "戻りました", nil); err != nil {
+		t.Fatalf("declare something new: %v", err)
+	}
+
+	announced, err := collectExpiries(ctx, w.store.core)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(announced) != 0 {
+		t.Fatalf("sweep announced %+v, want silence", announced)
+	}
+
+	// And it changed nothing: the newest declaration is still what everyone reads.
+	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := statusOf(t, statuses, w.humanA)
+	if !ok || got.Status != StatusAvailable || got.Note != "戻りました" || got.ExpiresAt != nil {
+		t.Fatalf("status after the silent sweep = %+v (found %v)", got, ok)
+	}
+}
+
+// A participant with nothing left to lapse must not be swept a second time: a
+// clear is a one-time transition, not a state the sweep keeps re-announcing.
+func TestSweepAnnouncesOnlyWhatItsOwnStatementsChanged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	past := time.Now().Add(-time.Minute)
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set lapsed status: %v", err)
+	}
+	announced, err := collectExpiries(ctx, w.store.core)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(announced) != 1 || announced[0].Status.Participant != w.humanA ||
+		announced[0].Status.Status != "" {
+		t.Fatalf("first sweep announced %+v", announced)
+	}
+
+	// Declaring again after the clear is a fresh statement, not a lapse, so the
+	// next sweep still has nothing of its own to say.
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "", nil); err != nil {
+		t.Fatalf("declare again: %v", err)
+	}
+	announced, err = collectExpiries(ctx, w.store.core)
+	if err != nil {
+		t.Fatalf("second expire: %v", err)
+	}
+	if len(announced) != 0 {
+		t.Fatalf("second sweep announced %+v, want silence", announced)
 	}
 }
