@@ -107,6 +107,10 @@ export function Composer() {
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const lastTypingAt = useRef(0);
+  // IME変換中か。keydownはeventからisComposingを見られる（lib/ime.ts）が、
+  // クリックのイベントには変換の状態が乗らない。入口によらず同じ判断ができるよう、
+  // compositionの生死をここで持つ（message-searchと同じ流儀）。
+  const composing = useRef(false);
   const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
 
   const editingMessage = editingMessageId
@@ -234,20 +238,34 @@ export function Composer() {
     (value.trim().length > 0 || readyAttachmentCount > 0);
   const attachmentsFull =
     draftAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
-  // 送信ボタンの活殺はEnter送信と同じ条件を使う。押せる見た目と実際に送れるかを
-  // ずらさないため。編集中の空本文はsubmitEditが握り潰す（＝送らない）ので無効。
+  // 送れるか（＝編集なら保存できるか）。ボタンの活殺とsubmitの関門が同じ式を見るので、
+  // 押せる見た目と実際に起きることがずれない。編集中の空本文はsubmitEditが黙って
+  // 捨てるだけなので「保存できない」に倒し、取り消しはEsc・×の明示の口に一本化する。
   const canSubmit = editing ? value.trim().length > 0 : canSend;
 
+  /**
+   * 送信・保存の唯一の関門。Enterもボタンもここを通る。
+   *
+   * 入口ごとに規律を書き分けると必ずずれるので、IME変換中の遮断・送れるかの判定・
+   * 送ったあとのフォーカスの行き先をすべてここに集める。呼ぶ側は「押された」ことだけを
+   * 伝える。
+   */
   const submit = useCallback(() => {
+    // 変換中のEnterは「確定」の意味しか持たない（lib/ime.ts）。クリックも同じ扱いにする。
+    // ここで止めても、確定後にもう一度押せば送れる。
+    if (composing.current) return;
+    if (!canSubmit) return;
     if (editing) {
-      submitEdit(editValue);
-      return;
+      submitEdit(value);
+    } else {
+      send(value, urgency);
+      setUrgency("normal");
+      setMention(null);
     }
-    if (!canSend) return;
-    send(value, urgency);
-    setUrgency("normal");
-    setMention(null);
-  }, [editing, editValue, submitEdit, value, send, urgency, canSend]);
+    // どの入口から送っても、次の一文字は入力欄に入る。ボタンを押して送った直後に
+    // ボタンがdisabledになってフォーカスが行き場を失うのを防ぐ意味もある。
+    textareaRef.current?.focus();
+  }, [canSubmit, editing, submitEdit, value, send, urgency]);
 
   const acceptFiles = useCallback(
     (list: FileList | File[] | null | undefined) => {
@@ -381,9 +399,13 @@ export function Composer() {
       ? `#${display.name} へメッセージ`
       : `${display.name} へメッセージ`;
 
-  // ツールバー右端の一言。添付まわりの状態は送信できない理由なので幅が狭くても隠さない。
-  const attachmentNotice =
-    attachmentOverflow > 0
+  // ツールバー右端の一言。送れない理由があるときは、それをEnterにもボタンにも
+  // 共通の理由として出す（幅が狭くても隠さない）。無ければキーボードの案内に戻す。
+  const blockedNotice = editing
+    ? canSubmit
+      ? null
+      : "本文が空だと保存できません（Escで取り消し）"
+    : attachmentOverflow > 0
       ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
       : draftAttachments.length > 0 && !attachmentsSettled
         ? "添付の準備ができると送信できます"
@@ -496,6 +518,14 @@ export function Composer() {
           value={value}
           onChange={(event) => updateValue(event.target.value)}
           onKeyDown={onKeyDown}
+          onCompositionStart={() => {
+            composing.current = true;
+          }}
+          onCompositionEnd={(event) => {
+            composing.current = false;
+            // 変換中のonChangeは未変換の読みを見ている。確定した値で組み直す。
+            updateValue(event.currentTarget.value);
+          }}
           onPaste={onPaste}
           onClick={(event) => {
             const caret = event.currentTarget.selectionStart ?? 0;
@@ -549,23 +579,23 @@ export function Composer() {
             </>
           ) : null}
           <div className="ml-auto flex min-w-0 items-center gap-2">
-            {/* 編集中は上の編集帯が同じことを言うので出さない。
-                キーボードの案内は狭い幅では送信ボタンに場所を譲る。 */}
-            {editing ? null : attachmentNotice ? (
+            {/* 送れない理由は常に出す。理由が無いときのキーボードの案内だけは、
+                編集中は上の編集帯が同じことを言うので出さず、狭い幅では
+                送信ボタンに場所を譲る。 */}
+            {blockedNotice ? (
               <span className="truncate text-[11px] text-muted-foreground/60">
-                {attachmentNotice}
+                {blockedNotice}
               </span>
-            ) : (
+            ) : editing ? null : (
               <span className="hidden truncate text-[11px] text-muted-foreground/60 sm:inline">
                 Enterで送信・Shift+Enterで改行
               </span>
             )}
-            {/* キーボードを使わずに送れる口。Enter送信と同じsubmitを呼ぶ。
-                mousedownの既定を止めてキャレットを入力欄に残す（送信後そのまま
-                打ち続けられるように）。キーボード操作の活性化には影響しない。 */}
+            {/* キーボードを使わずに送れる口。Enter送信と同じsubmitを呼ぶだけで、
+                規律（変換中は送らない・送ったら入力欄へ戻す）はsubmitが持つ。
+                mousedownの既定は止めない。止めるとblurによる変換確定を潰してしまう。 */}
             <button
               type="button"
-              onMouseDown={(event) => event.preventDefault()}
               onClick={submit}
               disabled={!canSubmit}
               title={editing ? "編集を保存（Enter）" : "送信（Enter）"}
