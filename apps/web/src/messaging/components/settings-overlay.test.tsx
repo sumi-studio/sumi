@@ -8,6 +8,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MemberProfile, ParticipantRef } from "../model";
@@ -277,6 +278,25 @@ describe("個人設定", () => {
     render(<SettingsOverlay />);
 
     expect(screen.getByText(SELF.humanId)).toBeInTheDocument();
+    expect(screen.queryByLabelText("表示名")).toBeNull();
+  });
+
+  it("小画面でも表示されるセクションナビからアカウントへ移れる", () => {
+    render(<SettingsOverlay />);
+
+    const navigation = screen.getByRole("navigation", {
+      name: "設定セクション",
+    });
+    expect(navigation).not.toHaveClass("hidden");
+
+    fireEvent.click(
+      within(navigation).getByRole("button", { name: "アカウント" }),
+    );
+
+    expect(screen.getByText(SELF.humanId)).toBeInTheDocument();
+    expect(
+      within(navigation).getByRole("button", { name: "アカウント" }),
+    ).toHaveAttribute("aria-current", "page");
     expect(screen.queryByLabelText("表示名")).toBeNull();
   });
 

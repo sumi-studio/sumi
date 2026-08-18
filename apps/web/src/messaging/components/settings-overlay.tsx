@@ -66,7 +66,7 @@ function SectionButton({
       type="button"
       onClick={() => onSelect(section)}
       aria-current={active ? "page" : undefined}
-      className={`block w-full rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+      className={`shrink-0 rounded-md px-2.5 py-1.5 text-center text-[13px] transition-colors sm:block sm:w-full sm:text-left ${
         active
           ? "bg-accent font-medium text-foreground"
           : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
@@ -373,10 +373,13 @@ export function SettingsOverlay() {
       role="dialog"
       aria-modal="true"
       aria-label="個人設定"
-      className="fixed inset-0 z-50 flex bg-background"
+      className="fixed inset-0 z-50 flex flex-col bg-background sm:flex-row"
     >
-      <nav className="hidden w-56 shrink-0 flex-col overflow-y-auto border-border/70 border-r bg-muted/20 p-3 sm:flex">
-        <p className="px-2.5 pt-2 pb-1 font-medium text-[11px] text-muted-foreground/80">
+      <nav
+        aria-label="設定セクション"
+        className="flex w-full shrink-0 gap-1 overflow-x-auto border-border/70 border-b bg-muted/20 p-2 sm:w-56 sm:flex-col sm:overflow-y-auto sm:border-r sm:border-b-0 sm:p-3"
+      >
+        <p className="sr-only px-2.5 pt-2 pb-1 font-medium text-[11px] text-muted-foreground/80 sm:not-sr-only">
           ユーザー設定
         </p>
         {(["profile", "account"] as SettingsSection[]).map((candidate) => (

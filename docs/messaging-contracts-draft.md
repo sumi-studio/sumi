@@ -44,7 +44,35 @@
 ```
 
 - author、membership、mention、read marker、通知設定ownerのすべてでこの型を使う。
-- 表示名はscope-local（Workspace membershipのnickname等）で解決し、IDを表示名にしない（ADR 0008 §1）。
+- 表示名とtaglineはParticipant-globalなプロフィールとして解決し、IDを表示名にしない。
+  Workspace membershipのnickname等をこのプロフィールへ混ぜない。Workspace固有の肩書きが
+  必要になればmembership側の別resourceにする（ADR 0008 §1）。
+
+### Participant profile — 名乗り
+
+```json
+{
+  "participant": { "kind": "human", "human_id": "<UUIDv7>" },
+  "display_name": "Yohaku",
+  "tagline": "開発",
+  "revision": 12
+}
+```
+
+- プロフィールはParticipantに属するglobal resourceであり、Workspace-localではない。
+  `display_name` の正本は戸籍（human / personality agent）で、`tagline` の正本は
+  `participant_profiles` である。両方を同じprofile wireで全Workspaceに投影する。
+- `GET /messaging/profile` は認証済みの本人の確定プロフィールを返す。別の参加者を
+  指定するfieldやrouteはない。ほかの参加者のプロフィールはbootstrap・member listから読む。
+- `PUT /messaging/profile` は認証済みの本人だけを部分更新する。bodyは
+  `display_name?: string` と `tagline?: string`。省略したfieldは現在値のまま残り、
+  サーバーが表示名とtaglineを正規化・検証し、成功時は正規化後の確定profile wireを返す。
+  HumanとPersonalityAgentは同じ唯一の永続write boundaryを通る。
+- `revision` は一人のプロフィールに対する単調増加の順序鍵である。初期rowはDB defaultの
+  `1`、以後の値は`participant_profiles`のDB triggerだけが各UPDATEで一度ずつ進める。
+  application codeは値を計算・指定しない。consumerは同じparticipantについて低いrevisionの
+  profile projectionを適用せず、同じか高いrevisionだけを現在値にできる。profile rowがまだ
+  無い既存投影のrevisionは`0`である。
 
 ### Place — メッセージが流れる場所
 
@@ -229,6 +257,14 @@
   `message_deleted`, `read_marker_updated`, `membership_changed`,
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,
   `message_pinned`。
+- WS event（durable、participant-scoped）: `profile_updated`。payloadは上記のprofile
+  wireで、place / place-seqを持たない。profile writeはDB commit後にのみpublishされ、
+  一人分のcommit順は`revision`で判定する。live frameはbest-effortなので、commit順と
+  到着順は一致しなくてもよい。consumerは低いrevisionを捨てる。
+  publishは、そのParticipantが現在memberでMessagingが有効な**全Workspace**へfan-outし、
+  各Workspaceでは現在のauthorized audienceだけへ送る。切断などでframeを逃しても、
+  profileの正本はdurableで、再接続時のbootstrap/member listをrevision規則で適用すれば
+  収束する。profile event自体をWebSocket replayで補完しない。
 - WS event（volatile）: `typing`, `status_updated`（下記）。
 
 ### Status と ReplyLater — 自己申告のattention
