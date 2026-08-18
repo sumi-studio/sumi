@@ -93,6 +93,8 @@ function renderItem(
       onJumpTo={noop}
       onRetry={noop}
       editing={false}
+      editDraft=""
+      onEditDraftChange={noop}
       onSubmitEdit={noop}
       onCancelEdit={noop}
       {...props}
@@ -187,25 +189,49 @@ describe("リンクのコピー", () => {
 
 describe("インライン編集", () => {
   it("編集中は本文の位置に入力欄とヒントが出て、操作チップは引っ込む", () => {
-    renderItem(makeMessage({ content: "編集前" }), { editing: true });
+    renderItem(makeMessage({ content: "編集前" }), {
+      editing: true,
+      editDraft: "編集前",
+    });
     const textarea = screen.getByLabelText("メッセージを編集");
     expect(textarea).toHaveValue("編集前");
     expect(screen.getByText("Escでキャンセル・Enterで保存")).toBeVisible();
     expect(screen.queryByLabelText("返信")).toBeNull();
   });
 
-  it("Enterで保存し、Escで取り消す", () => {
+  it("書きかけは行ではなく渡されたドラフトが正本になる", () => {
+    // 行が一度アンマウントされて作り直されても、描くのは本文ではなく
+    // 編集セッションのドラフト。
+    const { unmount } = renderItem(makeMessage({ content: "元の本文" }), {
+      editing: true,
+      editDraft: "書きかけ",
+    });
+    expect(screen.getByLabelText("メッセージを編集")).toHaveValue("書きかけ");
+    unmount();
+    cleanup();
+    renderItem(makeMessage({ content: "元の本文" }), {
+      editing: true,
+      editDraft: "書きかけ",
+    });
+    expect(screen.getByLabelText("メッセージを編集")).toHaveValue("書きかけ");
+  });
+
+  it("入力はドラフトの持ち主へ渡り、Enterで保存・Escで取り消す", () => {
+    const onEditDraftChange = vi.fn();
     const onSubmitEdit = vi.fn();
     const onCancelEdit = vi.fn();
     renderItem(makeMessage({ content: "編集前" }), {
       editing: true,
+      editDraft: "編集前",
+      onEditDraftChange,
       onSubmitEdit,
       onCancelEdit,
     });
     const textarea = screen.getByLabelText("メッセージを編集");
     fireEvent.change(textarea, { target: { value: "編集後" } });
+    expect(onEditDraftChange).toHaveBeenCalledWith("編集後");
     fireEvent.keyDown(textarea, { key: "Enter" });
-    expect(onSubmitEdit).toHaveBeenCalledWith("編集後");
+    expect(onSubmitEdit).toHaveBeenCalledTimes(1);
     fireEvent.keyDown(textarea, { key: "Escape" });
     expect(onCancelEdit).toHaveBeenCalledTimes(1);
   });
@@ -215,6 +241,7 @@ describe("インライン編集", () => {
     const onCancelEdit = vi.fn();
     renderItem(makeMessage(), {
       editing: true,
+      editDraft: "本文です",
       onSubmitEdit,
       onCancelEdit,
     });
@@ -231,6 +258,7 @@ describe("インライン編集", () => {
     const onSubmitEdit = vi.fn();
     renderItem(makeMessage({ content: "```ts" }), {
       editing: true,
+      editDraft: "```ts",
       onSubmitEdit,
     });
     const textarea = screen.getByLabelText("メッセージを編集");
@@ -245,11 +273,10 @@ describe("インライン編集", () => {
     const onCancelEdit = vi.fn();
     renderItem(makeMessage({ content: "編集前" }), {
       editing: true,
+      editDraft: "   ",
       onSubmitEdit,
       onCancelEdit,
     });
-    const textarea = screen.getByLabelText("メッセージを編集");
-    fireEvent.change(textarea, { target: { value: "   " } });
     fireEvent.click(screen.getByText("保存"));
     expect(onSubmitEdit).not.toHaveBeenCalled();
     expect(onCancelEdit).toHaveBeenCalledTimes(1);

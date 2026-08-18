@@ -197,7 +197,10 @@ export interface MessageItemProps {
   onOpenImage: (request: ImageViewerRequest) => void;
   /** このメッセージをインライン編集中か。 */
   editing: boolean;
-  onSubmitEdit: (content: string) => void;
+  /** 編集セッションの書きかけ本文。持ち主は行ではなくstore。 */
+  editDraft: string;
+  onEditDraftChange: (content: string) => void;
+  onSubmitEdit: () => void;
   onCancelEdit: () => void;
 }
 
@@ -224,6 +227,8 @@ export const MessageItem = memo(function MessageItem({
   onRevealAttachment,
   onOpenImage,
   editing,
+  editDraft,
+  onEditDraftChange,
   onSubmitEdit,
   onCancelEdit,
 }: MessageItemProps) {
@@ -397,7 +402,8 @@ export const MessageItem = memo(function MessageItem({
             {editing ? (
               // 編集は本文の位置で起きる。画面下のcomposerへ視線を飛ばさない。
               <MessageEditor
-                initialValue={message.content}
+                value={editDraft}
+                onChange={onEditDraftChange}
                 onSubmit={onSubmitEdit}
                 onCancel={onCancelEdit}
               />

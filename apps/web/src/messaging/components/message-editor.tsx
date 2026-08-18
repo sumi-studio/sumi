@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 
@@ -10,17 +10,22 @@ const MAX_HEIGHT_PX = 220;
  * 編集は「その場」で起きる操作なので、画面下のcomposerへ視線と入力位置を
  * 飛ばさず、対象メッセージの本文位置に入力枠を出す。Enterで保存・Escで
  * 取消はcomposerと同じ手癖に揃え、IME変換中のEnter/Escは奪わない。
+ *
+ * 書きかけの本文はこの欄が持たない。仮想リストの行はスクロールで
+ * アンマウントされるので、行ローカルのstateに置くと書きかけが消える。
+ * 値と更新は編集セッションの持ち主（store）から渡ってくる。
  */
 export function MessageEditor({
-  initialValue,
+  value,
+  onChange,
   onSubmit,
   onCancel,
 }: {
-  initialValue: string;
-  onSubmit: (content: string) => void;
+  value: string;
+  onChange: (content: string) => void;
+  onSubmit: () => void;
   onCancel: () => void;
 }) {
-  const [value, setValue] = useState(initialValue);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // 開いた瞬間に本文末尾へキャレットを置く（続きを書き足す方が多い）。
@@ -45,13 +50,12 @@ export function MessageEditor({
   }, [value]);
 
   const submit = () => {
-    const trimmed = value.trim();
     // 空にするのは削除であって編集ではない。取消として扱う。
-    if (!trimmed) {
+    if (!value.trim()) {
       onCancel();
       return;
     }
-    onSubmit(trimmed);
+    onSubmit();
   };
 
   return (
@@ -61,7 +65,7 @@ export function MessageEditor({
         value={value}
         aria-label="メッセージを編集"
         rows={1}
-        onChange={(event) => setValue(event.target.value)}
+        onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event) => {
           // IME変換中のEnter/Escは変換の操作。編集の操作として横取りしない。
           if (isImeComposing(event)) return;
