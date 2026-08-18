@@ -627,6 +627,39 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
   });
 
+  it("親一覧の取得中に届いたthread_createdをsnapshotの後に取り込む", async () => {
+    const listed = thread("thread-listed-before-response");
+    const created = {
+      ...thread("thread-created-during-list"),
+      participants: [OTHER],
+    };
+    let resolveList!: (threads: ThreadSummary[]) => void;
+    backend.fetchThreads.mockImplementationOnce(
+      () =>
+        new Promise<ThreadSummary[]>((resolve) => {
+          resolveList = resolve;
+        }),
+    );
+
+    const loading = useMessaging.getState().loadThreads(CHANNEL_1);
+    await settle();
+    backend.emit({ type: "place_created", thread: created });
+
+    // The event is held behind the still-in-flight snapshot, rather than
+    // being lost because this parent is not loaded yet.
+    expect(
+      useMessaging.getState().threadsById[created.threadId],
+    ).toBeUndefined();
+    resolveList([listed]);
+    await loading;
+
+    expect(useMessaging.getState().threadsById).toMatchObject({
+      [listed.threadId]: listed,
+      [created.threadId]: created,
+    });
+    expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
+  });
+
   it("live echoを取り逃してACKだけで確定した送信でもsummaryを取り直す", async () => {
     const known = thread("thread-ack-only");
     const refreshed = {
@@ -911,6 +944,39 @@ describe("place lifecycleの再接続突き合わせ", () => {
       kind: "thread",
       threadId: visiting.threadId,
     });
+  });
+
+  it("閉じたwatch-only threadへ遅い履歴応答がholdとcursorを復活させない", async () => {
+    const visiting: ThreadSummary = {
+      ...thread("thread-late-history"),
+      participants: [OTHER],
+    };
+    const key = `thread:${visiting.threadId}` as PlaceKey;
+    let resolveHistory!: (messages: Message[]) => void;
+    backend.fetchMessages.mockImplementationOnce(
+      () =>
+        new Promise<Message[]>((resolve) => {
+          resolveHistory = resolve;
+        }),
+    );
+    useMessaging.setState({ threadsById: { [visiting.threadId]: visiting } });
+
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    useMessaging.getState().clearPlaceSelection();
+    const cursorsBeforeResponse = [...backend.cursorCalls];
+
+    resolveHistory([threadMessage(visiting.threadId, 2)]);
+    await settle();
+
+    expect(useMessaging.getState().messagesByPlace[key]).toBeUndefined();
+    expect(backend.releasePlace).toHaveBeenCalledWith({
+      kind: "thread",
+      threadId: visiting.threadId,
+    });
+    // A late completion must not call holdPlace again, which is the path that
+    // registers this place in the next hello cursor collection.
+    expect(backend.cursorCalls).toEqual(cursorsBeforeResponse);
   });
 
   it("activeなplaceの履歴取得失敗も保持とcursorをまとめて手放す", async () => {

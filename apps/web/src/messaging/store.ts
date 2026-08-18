@@ -471,6 +471,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
    */
   const heldPlaces = new Map<PlaceKey, true>();
   /**
+   * 履歴の取得は、開始時に持ちたかっただけでは完了を適用できない。場所を
+   * 手放してから同じ場所を開き直すこともあるため、holdごとの世代を持つ。
+   */
+  const placeHoldGenerations = new Map<PlaceKey, number>();
+  /**
    * 「この場所はここまで在ると知っている」。開く宣言が運ぶcursorはここから作る。
    * 履歴を持っていない場所で0を名乗ると、serverは先頭からreplayしてしまう——
    * 欲しいのは最後のpageと宣言の隙間だけなので、知っている最新seqから頼む。
@@ -504,6 +509,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
       backend: MessagingBackend;
       sessionGeneration: number;
       request: Promise<boolean>;
+    }
+  >();
+  const threadListLoads = new Map<
+    PlaceKey,
+    {
+      backend: MessagingBackend;
+      sessionGeneration: number;
+      /** 取得中に来た新規thread。snapshotの後に同じ投影経路で重ねる。 */
+      created: Map<string, { summary: ThreadSummary; version: number }>;
+      request: Promise<void>;
     }
   >();
 
@@ -1167,6 +1182,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const knownThread = thread
         ? Boolean(get().threadsById[thread.threadId])
         : false;
+      const parentKey = thread ? placeKey(thread.parentPlace) : null;
+      const loadingParent = parentKey
+        ? threadListLoads.get(parentKey)
+        : undefined;
       // A new thread is news for the whole parent channel, but only its
       // participants and the panel that is currently listing that channel
       // have a place to put it. Holding every announced thread would grow
@@ -1176,13 +1195,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
         (thread.participants.some(
           (ref) => participantKey(ref) === get().selfKey,
         ) ||
-          Boolean(get().threadsLoadedForPlace[placeKey(thread.parentPlace)]));
+          Boolean(get().threadsLoadedForPlace[placeKey(thread.parentPlace)]) ||
+          (loadingParent?.backend === backend &&
+            loadingParent.sessionGeneration === messagingSessionGeneration));
       if (thread && !knownThread && wantedThread) {
-        applyThreadSummary(
-          thread.threadId,
-          thread,
-          threadProjectionVersions.get(thread.threadId) ?? 0,
-        );
+        // A parent-list GET is a point-in-time snapshot. Its response may not
+        // contain a thread announced while it was in flight, so keep this
+        // lifecycle event until that snapshot has been installed.
+        if (
+          loadingParent?.backend === backend &&
+          loadingParent.sessionGeneration === messagingSessionGeneration
+        ) {
+          loadingParent.created.set(thread.threadId, {
+            summary: thread,
+            version: threadProjectionVersions.get(thread.threadId) ?? 0,
+          });
+        } else {
+          applyThreadSummary(
+            thread.threadId,
+            thread,
+            threadProjectionVersions.get(thread.threadId) ?? 0,
+          );
+        }
       }
       set((state) => {
         if (channel) {
@@ -1324,8 +1358,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * cursorは必ず一緒に捨てる。片方だけ残すと、再接続を跨いだ穴の空いた履歴を
    * 抱えたまま開き直すことになる。
    */
-  const holdPlace = (place: Place, headSeq: number) => {
+  const holdPlace = (place: Place, headSeq: number): number => {
     const key = placeKey(place);
+    if (!heldPlaces.has(key)) {
+      placeHoldGenerations.set(key, (placeHoldGenerations.get(key) ?? 0) + 1);
+    }
     heldPlaces.delete(key);
     heldPlaces.set(key, true);
     backend.subscribe(applyEvent, { sinceByPlace: { [key]: headSeq } });
@@ -1334,20 +1371,36 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (oldest === undefined || oldest === key) break;
       releasePlace(oldest);
     }
+    return placeHoldGenerations.get(key) ?? 0;
   };
+
+  const holdsPlaceGeneration = (key: PlaceKey, generation: number): boolean =>
+    heldPlaces.has(key) && placeHoldGenerations.get(key) === generation;
 
   /** 履歴とcursorを同時に手放す。次に開いたときはRESTが取り直す。 */
   const releasePlace = (key: PlaceKey) => {
-    heldPlaces.delete(key);
+    const wasHeld = heldPlaces.delete(key);
+    if (wasHeld) {
+      // 同じkeyを開き直したときに、前回の遅い応答を新しいholdへ混ぜない。
+      placeHoldGenerations.set(key, (placeHoldGenerations.get(key) ?? 0) + 1);
+    }
     const place = parsePlaceKey(key);
     if (place) backend.releasePlace?.(place);
     set((state) => {
-      if (!(key in state.messagesByPlace)) return {};
+      if (
+        !(key in state.messagesByPlace) &&
+        !(key in state.hasMoreByPlace) &&
+        !(key in state.loadingOlderByPlace)
+      ) {
+        return {};
+      }
       const messagesByPlace = { ...state.messagesByPlace };
       const hasMoreByPlace = { ...state.hasMoreByPlace };
+      const loadingOlderByPlace = { ...state.loadingOlderByPlace };
       delete messagesByPlace[key];
       delete hasMoreByPlace[key];
-      return { messagesByPlace, hasMoreByPlace };
+      delete loadingOlderByPlace[key];
+      return { messagesByPlace, hasMoreByPlace, loadingOlderByPlace };
     });
   };
 
@@ -1375,7 +1428,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 取得を待つ前にheldへ入る。この往復の間に届いたliveを持っていない扱いで
     // 捨てると、RESTのpageにも載らないままcursorだけが進み、二度と埋まらない
     // 穴になる。cursorはここでは動かさない（0はfollowPlaceのmaxで無視される）。
-    holdPlace(place, 0);
+    const holdGeneration = holdPlace(place, 0);
     let messages: Message[];
     try {
       messages = await currentBackend.fetchMessages(place, {
@@ -1383,12 +1436,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
     } catch (error) {
       // 取れなかったのにheldのままにすると、開き直しても取りに行かない。
-      if (isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+      if (
+        isCurrentMessagingSession(currentBackend, sessionGeneration) &&
+        holdsPlaceGeneration(key, holdGeneration)
+      ) {
         releasePlace(key);
       }
       throw error;
     }
-    if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
+    if (
+      !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+      !holdsPlaceGeneration(key, holdGeneration)
+    ) {
+      return;
+    }
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
@@ -1439,11 +1500,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         if (!confirmed) {
           // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
+          // ここで履歴を足せるのも、送信時点ではなく今もこのplaceを保持して
+          // いるときだけ。離れたwatch-only threadをACKの遅延で復活させない。
+          const holdGeneration = placeHoldGenerations.get(key);
+          if (
+            holdGeneration === undefined ||
+            !holdsPlaceGeneration(key, holdGeneration)
+          ) {
+            set((state) => ({
+              pendingByPlace: {
+                ...state.pendingByPlace,
+                [key]: (state.pendingByPlace[key] ?? []).filter(
+                  (entry) => entry.clientNonce !== pending.clientNonce,
+                ),
+              },
+            }));
+            return;
+          }
           const messages = await currentBackend.fetchMessages(place, {
             beforeSeq: receipt.seq + 1,
             limit: 1,
           });
           if (!isCurrent()) return;
+          if (!holdsPlaceGeneration(key, holdGeneration)) {
+            set((state) => ({
+              pendingByPlace: {
+                ...state.pendingByPlace,
+                [key]: (state.pendingByPlace[key] ?? []).filter(
+                  (entry) => entry.clientNonce !== pending.clientNonce,
+                ),
+              },
+            }));
+            return;
+          }
           const committed = messages.find(
             (message) => message.messageId === receipt.messageId,
           );
@@ -1658,7 +1747,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       initialized = true;
       threadProjectionVersions.clear();
       threadSummaryRefreshes.clear();
+      threadListLoads.clear();
       heldPlaces.clear();
+      placeHoldGenerations.clear();
       knownLatestSeq.clear();
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
@@ -1890,33 +1981,81 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (parent?.kind !== "channel") return;
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
-      const versions = new Map(threadProjectionVersions);
-      const threads = (await currentBackend.fetchThreads?.(parent)) ?? [];
+      const existing = threadListLoads.get(parentKey);
       if (
-        backend !== currentBackend ||
-        messagingSessionGeneration !== sessionGeneration
+        existing &&
+        existing.backend === currentBackend &&
+        existing.sessionGeneration === sessionGeneration
       ) {
-        return;
+        return existing.request;
       }
-      // Every thread in the list is applied. A short-circuiting `some` used to
-      // stop at the first one a live invalidation had overtaken, so a single
-      // raced entry kept the rest of the channel's threads out of the store.
-      for (const thread of threads) {
-        applyThreadSummary(
-          thread.threadId,
-          thread,
-          versions.get(thread.threadId) ?? 0,
-        );
-      }
-      // A rejected apply means a newer authoritative projection is already
-      // installed or in flight for that thread, so the list itself is loaded.
-      // Its own failure path is what marks the parent for a re-fetch.
-      set((state) => ({
-        threadsLoadedForPlace: {
-          ...state.threadsLoadedForPlace,
-          [parentKey]: true,
-        },
-      }));
+      const versions = new Map(threadProjectionVersions);
+      const load = {
+        backend: currentBackend,
+        sessionGeneration,
+        created: new Map<string, { summary: ThreadSummary; version: number }>(),
+        request: Promise.resolve(),
+      };
+      // Register before invoking the backend: a test or transport adapter may
+      // synchronously deliver a lifecycle frame while constructing its GET.
+      const request = Promise.resolve().then(async () => {
+        try {
+          const threads = (await currentBackend.fetchThreads?.(parent)) ?? [];
+          if (
+            !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+            threadListLoads.get(parentKey) !== load
+          ) {
+            return;
+          }
+          // Every thread in the list is applied. A short-circuiting `some`
+          // used to stop at the first one a live invalidation had overtaken,
+          // so a single raced entry kept the rest of the channel's threads
+          // out of the store.
+          for (const thread of threads) {
+            applyThreadSummary(
+              thread.threadId,
+              thread,
+              versions.get(thread.threadId) ?? 0,
+            );
+          }
+          // Lifecycle events received during this GET belong after its
+          // snapshot. Use the same versioned projection path as every other
+          // server aggregate so a later invalidation still wins.
+          for (const { summary, version } of load.created.values()) {
+            applyThreadSummary(summary.threadId, summary, version);
+          }
+          // A rejected apply means a newer authoritative projection is
+          // already installed or in flight for that thread, so the list itself
+          // is loaded. Its own failure path is what marks the parent for a
+          // re-fetch.
+          set((state) => ({
+            threadsLoadedForPlace: {
+              ...state.threadsLoadedForPlace,
+              [parentKey]: true,
+            },
+          }));
+        } catch (error) {
+          // Even if the snapshot failed, do not discard a lifecycle event
+          // that arrived while waiting for it. The parent stays unloadable so
+          // a later panel open can still fetch the complete authoritative list.
+          if (
+            isCurrentMessagingSession(currentBackend, sessionGeneration) &&
+            threadListLoads.get(parentKey) === load
+          ) {
+            for (const { summary, version } of load.created.values()) {
+              applyThreadSummary(summary.threadId, summary, version);
+            }
+          }
+          throw error;
+        } finally {
+          if (threadListLoads.get(parentKey) === load) {
+            threadListLoads.delete(parentKey);
+          }
+        }
+      });
+      load.request = request;
+      threadListLoads.set(parentKey, load);
+      return request;
     },
 
     async loadThread(threadId) {
@@ -2022,11 +2161,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
+      // permalink由来の追加取得も、いま開いて保持している場所へしか足さない。
+      // 遷移直後の古いeffectは次の画面の履歴を復活させてはいけない。
+      const holdGeneration = placeHoldGenerations.get(key);
+      if (
+        holdGeneration === undefined ||
+        !holdsPlaceGeneration(key, holdGeneration)
+      ) {
+        return false;
+      }
       const messages = await currentBackend.fetchMessages(place, {
         beforeSeq: seq + 1,
         limit: 50,
       });
-      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) {
+      if (
+        !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+        !holdsPlaceGeneration(key, holdGeneration)
+      ) {
         return false;
       }
       set((state) => ({
@@ -2367,16 +2518,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const current = state.messagesByPlace[key];
       if (!place || !current || current.length === 0) return;
       if (state.loadingOlderByPlace[key] || !state.hasMoreByPlace[key]) return;
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const holdGeneration = placeHoldGenerations.get(key);
+      if (
+        holdGeneration === undefined ||
+        !holdsPlaceGeneration(key, holdGeneration)
+      ) {
+        return;
+      }
       set((entry) => ({
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
-      const currentBackend = backend;
-      const sessionGeneration = messagingSessionGeneration;
       const older = await currentBackend.fetchMessages(place, {
         beforeSeq: current[0].seq,
         limit: PAGE_SIZE,
       });
-      if (!isCurrentMessagingSession(currentBackend, sessionGeneration)) return;
+      if (
+        !isCurrentMessagingSession(currentBackend, sessionGeneration) ||
+        !holdsPlaceGeneration(key, holdGeneration)
+      ) {
+        return;
+      }
       set((entry) => {
         const existing = entry.messagesByPlace[key] ?? [];
         const known = new Set(existing.map((m) => m.messageId));
