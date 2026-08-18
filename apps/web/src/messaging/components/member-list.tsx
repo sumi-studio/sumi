@@ -27,7 +27,9 @@ export function MemberList() {
   // 保留はstoreに一つだけある。行もカードも同じ一つを見るので、
   // 保留中に別の入口から2本目のstartDMが走ることはない。
   const pendingKey =
-    startingDM?.length === 1 ? participantKey(startingDM[0]) : null;
+    startingDM?.participants.length === 1
+      ? participantKey(startingDM.participants[0])
+      : null;
   const dmPending = startingDM !== null;
 
   const members = useMemo(

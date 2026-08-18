@@ -168,6 +168,9 @@ describe("ParticipantProfilePopover", () => {
 
     openCard("墨");
 
+    expect(
+      screen.getByRole("dialog", { name: "墨のプロフィール" }),
+    ).toBeInTheDocument();
     expect(await screen.findByText("秘書")).toBeInTheDocument();
     expect(screen.getByText("取り込み中")).toBeInTheDocument();
     expect(screen.getByText(/設計中/)).toBeInTheDocument();

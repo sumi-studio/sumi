@@ -183,6 +183,9 @@ export function ParticipantProfilePopover({
   children: ReactNode;
 }) {
   const selfKey = useMessaging((state) => state.selfKey);
+  const displayName = useMessaging(
+    (state) => state.membersByKey[key]?.displayName,
+  );
   const passthroughRef = useWheelPassthrough<HTMLDivElement>(scrollPassthrough);
   // カードは「誰を、誰のauthorityで見ているか」に束縛する。開いているか
   // どうかは、その束縛が今のprops/storeと一致しているかというrender時の
@@ -221,6 +224,7 @@ export function ParticipantProfilePopover({
         side={side}
         align={align}
         className="w-64 p-2"
+        aria-label={`${displayName ?? "参加者"}のプロフィール`}
       >
         <ParticipantProfileCard
           participantKey={key}

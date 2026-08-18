@@ -94,6 +94,7 @@ function unboundMessagingBackend(): MessagingBackend {
 }
 
 let backend: MessagingBackend = unboundMessagingBackend();
+let nextDMStartToken = 0;
 
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
@@ -142,7 +143,7 @@ interface MessagingState {
    * カードから2本のstartDMが走り、完了順で意図しないplaceへ飛ぶ。保留は
    * 同時に一つで、その一つをここに置く——入口はここだけを見る。
    */
-  startingDM: ParticipantRef[] | null;
+  startingDM: PendingDMStart | null;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -230,6 +231,15 @@ interface MessagingState {
   loadOlder(key: PlaceKey): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
+}
+
+/**
+ * 進行中のDM開始。participantsはUIが「誰にDMを始めているか」を表示するための値で、
+ * tokenは開始を一意に識別して、古い開始のfinallyが新しい保留を解放しないための値。
+ */
+interface PendingDMStart {
+  participants: ParticipantRef[];
+  token: number;
 }
 
 function resolveMentions(
@@ -1417,7 +1427,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const currentBackend = backend;
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
-      set({ startingDM: participants });
+      const token = ++nextDMStartToken;
+      set({ startingDM: { participants, token } });
       try {
         const dm =
           participants.length === 1
@@ -1437,9 +1448,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         return placeKey({ kind: dm.kind, dmId: dm.dmId });
       } finally {
-        // sessionのresetで既にnullなら、そのnullを塗り替えない。
+        // session/scopeのreset後に新しい開始が同じparticipants配列を再利用しても、
+        // 古いfinallyは自分のtoken以外の保留を解放しない。
         set((state) =>
-          state.startingDM === participants ? { startingDM: null } : {},
+          state.startingDM?.token === token ? { startingDM: null } : {},
         );
       }
     },

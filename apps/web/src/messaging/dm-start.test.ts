@@ -53,7 +53,7 @@ describe("DM開始の保留", () => {
     vi.spyOn(server, "ensureDM").mockReturnValue(pending.promise);
 
     const attempt = useMessaging.getState().startDM([BOB]);
-    expect(useMessaging.getState().startingDM).toEqual([BOB]);
+    expect(useMessaging.getState().startingDM?.participants).toEqual([BOB]);
 
     pending.resolve({ dmId: "dm-bob", kind: "dm", participants: [SELF, BOB] });
 
@@ -69,7 +69,7 @@ describe("DM開始の保留", () => {
       .mockReturnValueOnce(failing.promise);
 
     const attempt = useMessaging.getState().startDM([BOB]);
-    expect(useMessaging.getState().startingDM).toEqual([BOB]);
+    expect(useMessaging.getState().startingDM?.participants).toEqual([BOB]);
 
     failing.reject(new Error("offline"));
 
@@ -99,10 +99,42 @@ describe("DM開始の保留", () => {
     );
     expect(server.ensureDM).toHaveBeenCalledTimes(1);
     expect(server.ensureDM).toHaveBeenCalledWith(BOB);
-    expect(useMessaging.getState().startingDM).toEqual([BOB]);
+    expect(useMessaging.getState().startingDM?.participants).toEqual([BOB]);
 
     pending.resolve({ dmId: "dm-bob", kind: "dm", participants: [SELF, BOB] });
     await expect(first).resolves.toBe("dm:dm-bob");
+    expect(useMessaging.getState().startingDM).toBeNull();
+  });
+
+  it("古い開始の完了は、新しい保留を解放しない", async () => {
+    const participants = [BOB];
+    const firstServer = signIn();
+    const firstPending = deferred<DmSummary>();
+    vi.spyOn(firstServer, "ensureDM").mockReturnValue(firstPending.promise);
+    const first = useMessaging.getState().startDM(participants);
+
+    // session reset後に同じ配列を再利用して次の開始ができる形を再現する。
+    const secondServer = signIn();
+    const secondPending = deferred<DmSummary>();
+    vi.spyOn(secondServer, "ensureDM").mockReturnValue(secondPending.promise);
+    const second = useMessaging.getState().startDM(participants);
+
+    firstPending.resolve({
+      dmId: "dm-first",
+      kind: "dm",
+      participants: [SELF, BOB],
+    });
+    await expect(first).rejects.toThrow(
+      "Messaging session changed during DM start",
+    );
+    expect(useMessaging.getState().startingDM?.participants).toBe(participants);
+
+    secondPending.resolve({
+      dmId: "dm-second",
+      kind: "dm",
+      participants: [SELF, BOB],
+    });
+    await expect(second).resolves.toBe("dm:dm-second");
     expect(useMessaging.getState().startingDM).toBeNull();
   });
 });
