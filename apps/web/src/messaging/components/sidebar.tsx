@@ -27,6 +27,7 @@ import {
   STATUS_LABEL,
 } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
+import { SettingsTrigger } from "./settings-overlay";
 
 const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 
@@ -726,6 +727,7 @@ export function Sidebar({
               name={firstName}
               size={18}
               status={statusByKey[firstKey]?.status}
+              src={membersByKey[firstKey]?.avatarUrl}
             />
           );
           return (
@@ -819,6 +821,7 @@ export function Sidebar({
               name={selfProfile?.displayName ?? "?"}
               size={26}
               status={selfStatus?.status ?? "available"}
+              src={selfProfile?.avatarUrl}
             />
           </ParticipantProfilePopover>
           <button
@@ -839,6 +842,7 @@ export function Sidebar({
               {selfStatus?.note ? ` — ${selfStatus.note}` : ""}
             </span>
           </button>
+          <SettingsTrigger />
         </div>
       </div>
       {openDialog?.kind === "channel" &&

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ConnectionState,
+  MemberProfile,
   Message,
   MessagingBackend,
   ParticipantRef,
@@ -172,6 +173,14 @@ class FakePresenceBackend implements MessagingBackend {
   async markRead(): Promise<void> {}
   async setStatus(): Promise<ParticipantStatus> {
     return this.nextStatus;
+  }
+  nextProfile: MemberProfile = {
+    participant: SELF,
+    displayName: "Yohaku",
+    tagline: "",
+  };
+  async updateProfile(): Promise<MemberProfile> {
+    return this.nextProfile;
   }
   async createReplyLater(): Promise<ReplyLaterMarker> {
     return this.nextMarker;
@@ -435,6 +444,45 @@ describe("messaging presence convergence", () => {
     expect(settled?.resolved).toBe(true);
     // 相手向けwireにはremind_atが載らない。一度知った自分の予定は消さない。
     expect(settled?.remindAt).toBe(1_800_000);
+  });
+
+  it("takes the名乗り from the REST acknowledgement and from the live event", async () => {
+    const backend = new FakePresenceBackend();
+    backend.nextProfile = {
+      participant: SELF,
+      displayName: "余白",
+      tagline: "開発",
+    };
+    await startMessaging(backend);
+
+    await useMessaging.getState().updateProfile({ tagline: "開発" });
+    expect(useMessaging.getState().membersByKey["human:human-1"]).toEqual(
+      backend.nextProfile,
+    );
+
+    // 他人の名乗りは自分のmutationではなくeventで届く。
+    backend.emit({
+      type: "profile_updated",
+      profile: { participant: OTHER, displayName: "はる", tagline: "秘書" },
+    });
+    expect(useMessaging.getState().membersByKey["human:human-2"]).toEqual({
+      participant: OTHER,
+      displayName: "はる",
+      tagline: "秘書",
+    });
+
+    // membershipを決めるのはbootstrapで、eventが参加者を増やしたりはしない。
+    backend.emit({
+      type: "profile_updated",
+      profile: {
+        participant: { kind: "human", humanId: "human-3" },
+        displayName: "知らない人",
+        tagline: "",
+      },
+    });
+    expect(
+      useMessaging.getState().membersByKey["human:human-3"],
+    ).toBeUndefined();
   });
 
   it("replays a status REST acknowledgement over an older presence snapshot", async () => {

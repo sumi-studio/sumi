@@ -690,6 +690,22 @@ func (s *testMessagingStore) StatusesVisibleTo(ctx context.Context, actor Partic
 	return scoped.StatusesVisibleTo(ctx)
 }
 
+func (s *testMessagingStore) Profile(ctx context.Context, actor ParticipantRef) (MemberProfile, error) {
+	scoped, err := s.scopeForActor(ctx, actor)
+	if err != nil {
+		return MemberProfile{}, err
+	}
+	return scoped.Profile(ctx)
+}
+
+func (s *testMessagingStore) SetProfile(ctx context.Context, actor ParticipantRef, displayName, tagline *string) (MemberProfile, error) {
+	scoped, err := s.scopeForActor(ctx, actor)
+	if err != nil {
+		return MemberProfile{}, err
+	}
+	return scoped.SetProfile(ctx, displayName, tagline)
+}
+
 func (s *testMessagingStore) ParticipantVisible(ctx context.Context, actor, target ParticipantRef) (bool, error) {
 	scoped, err := s.scopeForActor(ctx, actor)
 	if err != nil {

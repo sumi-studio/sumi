@@ -18,6 +18,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ProfileInput,
   ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
@@ -94,6 +95,7 @@ const DMS: DmSummary[] = [
   { dmId: "dm-haru", kind: "dm", participants: [SELF, HARU] },
 ];
 
+// 名乗りは書き換わるので、モックでも定数ではなく可変の一覧として持つ。
 const MEMBERS: MemberProfile[] = [
   { participant: SELF, displayName: "yohaku", tagline: "Founder / デザイン" },
   { participant: HARU, displayName: "Haru", tagline: "エンジニア" },
@@ -722,6 +724,25 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.statuses.set(participantKey(SELF), next);
     this.emit({ type: "status_updated", status: next });
+    return next;
+  }
+
+  /** 自分の名乗りだけを置き換える。実APIと同じく対象は常にSELF。 */
+  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
+    const index = MEMBERS.findIndex((member) =>
+      sameParticipant(member.participant, SELF),
+    );
+    const current = MEMBERS[index];
+    if (!current) throw new Error("mock server lost its own profile");
+    const next: MemberProfile = {
+      ...current,
+      ...(input.displayName === undefined
+        ? {}
+        : { displayName: input.displayName }),
+      ...(input.tagline === undefined ? {} : { tagline: input.tagline }),
+    };
+    MEMBERS[index] = next;
+    this.emit({ type: "profile_updated", profile: next });
     return next;
   }
 

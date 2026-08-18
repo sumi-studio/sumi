@@ -38,6 +38,7 @@ import { MessageList, type MessageListHandle } from "./message-list";
 import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
+import { SettingsOverlay } from "./settings-overlay";
 import { Sidebar } from "./sidebar";
 
 interface PendingJump {
@@ -728,6 +729,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           onClose={() => setViewingImage(null)}
         />
       ) : null}
+      <SettingsOverlay />
     </div>
   );
 }

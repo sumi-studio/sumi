@@ -461,6 +461,7 @@ export function Composer() {
                   participantKey={key}
                   name={member.displayName}
                   size={20}
+                  src={member.avatarUrl}
                 />
                 <span className="shrink-0 font-medium">
                   {member.displayName}

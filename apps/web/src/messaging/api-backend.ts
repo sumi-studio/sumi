@@ -17,6 +17,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ProfileInput,
   ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
@@ -100,14 +101,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     const dms: DmSummary[] = asArray(body.dms).map((entry) =>
       this.registerDm(entry),
     );
-    const members: MemberProfile[] = asArray(body.members).map((entry) => {
-      const value = asRecord(entry);
-      return {
-        participant: parseParticipant(value.participant),
-        displayName: asString(value.display_name),
-        tagline: typeof value.tagline === "string" ? value.tagline : "",
-      };
-    });
+    const members: MemberProfile[] = asArray(body.members).map(parseMember);
     const readMarkers: ReadMarker[] = asArray(body.read_markers).map(
       (entry) => {
         const value = asRecord(entry);
@@ -358,6 +352,19 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  /**
+   * 自分の名乗りだけを置き換える。statusと同じく参加者はsessionが決め、
+   * bodyには載せない。省いたfieldは送らず、サーバー側の現在値を残す。
+   */
+  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
+    const body: Record<string, string> = {};
+    if (input.displayName !== undefined) body.display_name = input.displayName;
+    if (input.tagline !== undefined) body.tagline = input.tagline;
+    return parseMember(
+      await this.request("/messaging/profile", { method: "PUT", body }),
+    );
+  }
+
   async createReplyLater(
     place: Place,
     messageId: string,
@@ -559,6 +566,9 @@ export class ApiMessagingBackend implements MessagingBackend {
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
       parsed = { type: eventType, status: parseStatus(wire.status) };
+    } else if (eventType === "profile_updated") {
+      // 名乗りの変更。statusと同じ参加者スコープで届き、placeを持たない。
+      parsed = { type: eventType, profile: parseMember(wire.profile) };
     } else if (eventType === "reply_later_created") {
       parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
     } else if (eventType === "reply_later_resolved") {
@@ -678,6 +688,25 @@ export class ApiMessagingBackend implements MessagingBackend {
     if (response.status === 204) return null;
     return response.json() as Promise<unknown>;
   }
+}
+
+/**
+ * 一人分の名乗り。member list・bootstrap・profile_updatedが同じ形を運ぶので、
+ * 読み取りも一か所に置く。avatar_urlはまだサーバーが出さないため、無ければ
+ * undefinedのままにしてイニシャル表示へ落とす。
+ */
+function parseMember(value: unknown): MemberProfile {
+  const wire = asRecord(value);
+  const avatarUrl =
+    typeof wire.avatar_url === "string" && wire.avatar_url !== ""
+      ? wire.avatar_url
+      : undefined;
+  return {
+    participant: parseParticipant(wire.participant),
+    displayName: asString(wire.display_name),
+    tagline: typeof wire.tagline === "string" ? wire.tagline : "",
+    ...(avatarUrl === undefined ? {} : { avatarUrl }),
+  };
 }
 
 function placeID(place: Place): string {

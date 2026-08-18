@@ -24,6 +24,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ProfileInput,
   ReactionSummary,
   ReplyLaterMarker,
   ServerEvent,
@@ -239,6 +240,11 @@ interface MessagingState {
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
   setStatus(status: StatusKind, note: string): void;
+  /**
+   * 自分の名乗りを置き換える。サーバーが正規化した確定値をそのまま取り込むので、
+   * 失敗した保存が手元にだけ残ることはない。
+   */
+  updateProfile(input: ProfileInput): Promise<void>;
   setPlaceNotificationLevel(
     key: PlaceKey,
     level: NotificationLevel,
@@ -539,6 +545,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       };
     });
+  };
+
+  /**
+   * 名乗りの確定値を一覧へ取り込む。REST ACKとWS eventの両方がここを通るので、
+   * どちらが先に届いても同じ形に収束する。まだ知らない参加者は無視する:
+   * membershipはbootstrapが決めるもので、eventで増えたりはしない。
+   */
+  const applyProfile = (profile: MemberProfile) => {
+    const key = participantKey(profile.participant);
+    set((state) =>
+      state.membersByKey[key]
+        ? { membersByKey: { ...state.membersByKey, [key]: profile } }
+        : {},
+    );
   };
 
   const applyPresenceProjection = (
@@ -940,6 +960,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "status_updated") {
       applyPresenceProjection({ type: "status", status: event.status });
+      return;
+    }
+    if (event.type === "profile_updated") {
+      applyProfile(event.profile);
       return;
     }
     if (event.type === "reply_later_created") {
@@ -1851,6 +1875,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
+    async updateProfile(input) {
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const canonical = await currentBackend.updateProfile(input);
+      if (
+        backend !== currentBackend ||
+        messagingSessionGeneration !== sessionGeneration
+      ) {
+        // 別のsessionのbackendが答えた値を今の一覧へ混ぜない。
+        return;
+      }
+      applyProfile(canonical);
+    },
     setStatus(status, note) {
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;

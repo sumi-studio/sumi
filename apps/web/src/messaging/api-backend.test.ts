@@ -707,6 +707,101 @@ describe("ApiMessagingBackend", () => {
     ]);
   });
 
+  it("carries the canonical profile on members, PUT and the live event", async () => {
+    const profileBootstrap = {
+      ...bootstrap,
+      members: [
+        {
+          participant: { kind: "human", human_id: "human-1" },
+          display_name: "Yohaku",
+          tagline: "デザイン",
+        },
+        // taglineを出さないサーバー（古い版・別の実装）は空として読む。
+        {
+          participant: {
+            kind: "personality_agent",
+            personality_agent_id: "agent-1",
+          },
+          display_name: "Kuro",
+        },
+      ],
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(profileBootstrap);
+        if (path === "/messaging/profile" && init?.method === "PUT") {
+          return json({
+            participant: { kind: "human", human_id: "human-1" },
+            display_name: "余白",
+            tagline: "開発",
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    const snapshot = await backend.bootstrap();
+    expect(snapshot.members).toEqual([
+      {
+        participant: { kind: "human", humanId: "human-1" },
+        displayName: "Yohaku",
+        tagline: "デザイン",
+      },
+      {
+        participant: {
+          kind: "personality_agent",
+          personalityAgentId: "agent-1",
+        },
+        displayName: "Kuro",
+        tagline: "",
+      },
+    ]);
+
+    // 省いたfieldは送らない。サーバー側の現在値をこちらの空文字で潰さない。
+    await expect(backend.updateProfile({ tagline: "開発" })).resolves.toEqual({
+      participant: { kind: "human", humanId: "human-1" },
+      displayName: "余白",
+      tagline: "開発",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/profile"),
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ tagline: "開発" }),
+      }),
+    );
+
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    socket?.message({
+      type: "event",
+      event: {
+        type: "profile_updated",
+        profile: {
+          participant: { kind: "human", human_id: "human-1" },
+          display_name: "余白",
+          tagline: "開発",
+        },
+      },
+    });
+    expect(events).toEqual([
+      {
+        type: "profile_updated",
+        profile: {
+          participant: { kind: "human", humanId: "human-1" },
+          displayName: "余白",
+          tagline: "開発",
+        },
+      },
+    ]);
+  });
+
   it("carries the receiver's notification setting and the per-recipient notify", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
