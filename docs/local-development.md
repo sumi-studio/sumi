@@ -314,7 +314,9 @@ or not at all:
   `${XDG_STATE_HOME:-~/.local/state}/sumi/real-stack/messaging-attachments`
   (override with `SUMI_REAL_STACK_STATE_ROOT`; the path must be absolute, and
   an existing directory must already be mode 0700 and owned by you — the
-  launcher will not relax or tighten a directory it did not create).
+  launcher will not relax or tighten a directory it did not create). Its
+  ancestors may only be group/other-writable when sticky; the default path
+  beneath your home directory needs no extra setup.
 
 Keeping the bytes inside the temporary directory left the database naming
 objects that shutdown had already deleted, so attachments referred to missing

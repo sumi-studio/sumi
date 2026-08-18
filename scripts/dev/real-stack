@@ -106,6 +106,22 @@ require_value() {
 # rather than the one make dev was invoked from: a relative root would have the
 # launcher provision one parent while the API demands another, and would move
 # the store whenever the stack is started from somewhere else.
+validate_persistent_state_root_ancestors() {
+  local root="$1" ancestor metadata mode
+  ancestor="$(dirname -- "${root}")"
+  while :; do
+    metadata="$(stat -c '%a' -- "${ancestor}")" ||
+      fail "cannot inspect an ancestor of the persistent local state root: ${ancestor}"
+    mode="${metadata%% *}"
+    if [[ "${mode: -2:1}" =~ [2367] || "${mode: -1}" =~ [2367] ]]; then
+      (( (8#${mode} & 8#1000) != 0 )) ||
+        fail "the persistent local state root is unsafe: ancestor ${ancestor} is writable by group or other and is not sticky"
+    fi
+    [[ "${ancestor}" == "/" ]] && return 0
+    ancestor="$(dirname -- "${ancestor}")"
+  done
+}
+
 provision_persistent_state_root() {
   local root="$1" metadata mode owner
   # Normalize trailing separators once before every subsequent path check.
@@ -117,6 +133,7 @@ provision_persistent_state_root() {
     fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${root}"
   (umask 077; mkdir -p -- "$(dirname -- "${root}")") ||
     fail "cannot create the parent of the persistent local state root: ${root}"
+  validate_persistent_state_root_ancestors "${root}"
   # mkdir without -p reports the difference between "created for us" and
   # "already there", which is exactly the line the launcher must not cross.
   if [[ ! -e "${root}" && ! -L "${root}" ]]; then

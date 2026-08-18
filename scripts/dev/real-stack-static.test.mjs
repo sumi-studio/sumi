@@ -405,6 +405,7 @@ function attachmentRootFor(launcher, environment) {
 /** Runs the launcher's own provisioner against a real path on disk. */
 function provisionStateRoot(launcher, root) {
   const script = [
+    launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
     launcherFunction(launcher, "provision_persistent_state_root"),
     `provision_persistent_state_root ${JSON.stringify(root)}`,
   ].join("\n");
@@ -530,6 +531,46 @@ test("the launcher never re-modes a state root it did not create", async () => {
     );
     assert.equal(trailingSlashRejected.code, 3);
     assert.match(trailingSlashRejected.stderr, /must be a real directory/);
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
+});
+
+test("a state root under a writable non-sticky ancestor is refused", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    const writableAncestor = join(scratch, "writable");
+    const root = join(writableAncestor, "real-stack");
+    await mkdir(writableAncestor, { mode: 0o777 });
+    await chmod(writableAncestor, 0o777);
+    await mkdir(root, { mode: 0o700 });
+    await chmod(root, 0o700);
+
+    const refused = await provisionStateRoot(launcher, root);
+    assert.equal(refused.code, 3);
+    assert.match(
+      refused.stderr,
+      new RegExp(`ancestor ${writableAncestor} is writable by group or other`),
+    );
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
+});
+
+test("a state root under a writable sticky ancestor is accepted", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    const stickyAncestor = join(scratch, "sticky");
+    const root = join(stickyAncestor, "real-stack");
+    await mkdir(stickyAncestor, { mode: 0o777 });
+    await chmod(stickyAncestor, 0o1777);
+    await mkdir(root, { mode: 0o700 });
+    await chmod(root, 0o700);
+
+    const accepted = await provisionStateRoot(launcher, root);
+    assert.equal(accepted.code, 0);
   } finally {
     await rm(scratch, { force: true, recursive: true });
   }
