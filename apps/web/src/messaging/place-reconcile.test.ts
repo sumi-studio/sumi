@@ -152,6 +152,16 @@ class FakeBackend implements MessagingBackend {
     throw new Error("unused");
   });
   fetchThreads = vi.fn(async (_parent: Place): Promise<ThreadSummary[]> => []);
+  createThread = vi.fn(
+    async (
+      _parent: Place,
+      _name: string,
+      _originMessageId: string | null,
+      _clientNonce: string,
+    ): Promise<ThreadSummary> => {
+      throw new Error("unused");
+    },
+  );
   async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
     return { statuses: [], replyLaterMarkers: [] };
   }
@@ -454,6 +464,87 @@ describe("place lifecycleの再接続突き合わせ", () => {
     // place_created is synchronous; a stale write here would be visible even
     // if the follow-up authoritative GET happened to complete immediately.
     expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+    await settle();
+
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+  });
+
+  it("作成応答がlive refresh済みのthread aggregateを巻き戻さない", async () => {
+    const stale = thread("thread-create-response-race");
+    const fresh = {
+      ...stale,
+      messageCount: 2,
+      latestSeq: 2,
+      lastMessageAt: 2,
+      lastMessage: "作成応答より新しい返信です",
+    };
+    let resolveCreate!: (summary: ThreadSummary) => void;
+    backend.createThread.mockImplementationOnce(
+      () =>
+        new Promise<ThreadSummary>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+    backend.fetchThread.mockResolvedValue(fresh);
+
+    const creating = useMessaging
+      .getState()
+      .createThread(
+        CHANNEL_1,
+        stale.name,
+        stale.parentMessageId,
+        "create-race",
+      );
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 2),
+      notify: null,
+    });
+    await settle();
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+
+    resolveCreate(stale);
+    await expect(creating).resolves.toBe(`thread:${stale.threadId}`);
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+  });
+
+  it("再接続bootstrapがlive refresh済みのthread aggregateを巻き戻さない", async () => {
+    const stale = thread("thread-reconnect-bootstrap-race");
+    const fresh = {
+      ...stale,
+      messageCount: 2,
+      latestSeq: 2,
+      lastMessageAt: 2,
+      lastMessage: "bootstrapより新しい返信です",
+    };
+    useMessaging.setState({ threadsById: { [stale.threadId]: stale } });
+    let resolveBootstrap!: (snapshot: BootstrapSnapshot) => void;
+    backend.bootstrap = vi.fn(
+      () =>
+        new Promise<BootstrapSnapshot>((resolve) => {
+          resolveBootstrap = resolve;
+        }),
+    );
+    backend.fetchThread.mockResolvedValue(fresh);
+
+    backend.emitConnection("connected");
+    await Promise.resolve();
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 2),
+      notify: null,
+    });
+    await settle();
+    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+
+    resolveBootstrap(
+      snapshot({
+        channels: [channel("channel-1", "旧トピック")],
+        dms: [],
+        threads: [stale],
+        unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
+      }),
+    );
     await settle();
 
     expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);

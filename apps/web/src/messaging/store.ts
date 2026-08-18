@@ -442,6 +442,27 @@ export const useMessaging = create<MessagingState>((set, get) => {
     return version;
   };
 
+  // This is the only path that installs a server thread aggregate. Every
+  // asynchronous source captures its projection version before issuing the
+  // request, so a response that raced a live invalidation cannot overwrite a
+  // newer authoritative projection.
+  const applyThreadSummary = (
+    threadId: string,
+    summary: ThreadSummary,
+    version: number,
+  ): boolean => {
+    if (
+      summary.threadId !== threadId ||
+      (threadProjectionVersions.get(threadId) ?? 0) !== version
+    ) {
+      return false;
+    }
+    set((state) => ({
+      threadsById: { ...state.threadsById, [threadId]: summary },
+    }));
+    return true;
+  };
+
   const scheduleThreadSummaryRefresh = (threadId: string) => {
     const currentBackend = backend;
     const sessionGeneration = messagingSessionGeneration;
@@ -477,14 +498,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           const thread = await fetchThread.call(currentBackend, threadId);
           if (
             backend !== currentBackend ||
-            messagingSessionGeneration !== sessionGeneration ||
-            threadProjectionVersions.get(threadId) !== version
+            messagingSessionGeneration !== sessionGeneration
           ) {
             return;
           }
-          set((state) => ({
-            threadsById: { ...state.threadsById, [thread.threadId]: thread },
-          }));
+          applyThreadSummary(threadId, thread, version);
         } catch {
           // Do not strand a stale aggregate behind a successful parent-list
           // cache entry. A later panel open must fetch the authoritative list
@@ -1068,15 +1086,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "place_created") {
       const { channel, dm, thread } = event;
-      let knownThread = false;
+      const knownThread = thread
+        ? Boolean(get().threadsById[thread.threadId])
+        : false;
+      if (thread && !knownThread) {
+        applyThreadSummary(
+          thread.threadId,
+          thread,
+          threadProjectionVersions.get(thread.threadId) ?? 0,
+        );
+      }
       set((state) => {
-        if (thread) {
-          knownThread = Boolean(state.threadsById[thread.threadId]);
-          if (knownThread) return {};
-          return {
-            threadsById: { ...state.threadsById, [thread.threadId]: thread },
-          };
-        }
         if (channel) {
           return state.channels.some(
             (entry) => entry.channelId === channel.channelId,
@@ -1124,6 +1144,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const sessionGeneration = messagingSessionGeneration;
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = get().selfKey;
+    const threadVersions = new Map(threadProjectionVersions);
     const snapshot = await currentBackend.bootstrap();
     if (
       backend !== currentBackend ||
@@ -1172,15 +1193,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
       workspaces: snapshot.workspaces,
       channels: snapshot.channels,
       dms: snapshot.dms,
-      // Threads are participation-scoped lifecycle data just like DMs. Keep
-      // what this client already learned while adding threads it was admitted
-      // to during the disconnect.
-      threadsById: {
-        ...state.threadsById,
-        ...Object.fromEntries(
-          (snapshot.threads ?? []).map((thread) => [thread.threadId, thread]),
-        ),
-      },
       // snapshot.threads only contains participating threads. The parent list
       // includes all workspace-visible threads, and its lifecycle events are
       // not replayed, so every list fetched before a disconnect is stale.
@@ -1190,6 +1202,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       unreadCountByPlace,
       mentionCountByPlace,
     });
+    // Threads are participation-scoped lifecycle data just like DMs. Keep
+    // what this client already learned while adding threads it was admitted
+    // to during the disconnect, but only if no live invalidation overtook the
+    // bootstrap response.
+    for (const thread of snapshot.threads ?? []) {
+      applyThreadSummary(
+        thread.threadId,
+        thread,
+        threadVersions.get(thread.threadId) ?? 0,
+      );
+    }
     // The currently mounted parent panel does not re-run its effect merely
     // because a reconnect completed. Refresh the lists that had been loaded
     // before the disconnect after invalidating their cache entries above.
@@ -1481,6 +1504,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       threadSummaryRefreshes.clear();
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
+      const threadVersions = new Map(threadProjectionVersions);
       void currentBackend
         .bootstrap()
         .then((snapshot) => {
@@ -1522,12 +1546,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
             workspaces: snapshot.workspaces,
             channels: snapshot.channels,
             dms: snapshot.dms,
-            threadsById: Object.fromEntries(
-              (snapshot.threads ?? []).map((thread) => [
-                thread.threadId,
-                thread,
-              ]),
-            ),
             threadsLoadedForPlace: {},
             membersByKey,
             statusByKey,
@@ -1538,6 +1556,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
             ...confirmedNotificationSetting,
             employedAgents: snapshot.employedAgents,
           });
+          for (const thread of snapshot.threads ?? []) {
+            applyThreadSummary(
+              thread.threadId,
+              thread,
+              threadVersions.get(thread.threadId) ?? 0,
+            );
+          }
           scheduleStatusExpiry();
           currentBackend.subscribe(applyEvent, { sinceByPlace });
           // bootstrapはsubscribeより前に読まれるため、最初の接続にもその間に
@@ -1690,22 +1715,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return;
       }
-      let raced = false;
-      set((state) => ({
-        threadsById: {
-          ...state.threadsById,
-          ...Object.fromEntries(
-            threads
-              .filter((thread) => {
-                const unchanged =
-                  (threadProjectionVersions.get(thread.threadId) ?? 0) ===
-                  (versions.get(thread.threadId) ?? 0);
-                if (!unchanged) raced = true;
-                return unchanged;
-              })
-              .map((thread) => [thread.threadId, thread]),
+      const raced = threads.some(
+        (thread) =>
+          !applyThreadSummary(
+            thread.threadId,
+            thread,
+            versions.get(thread.threadId) ?? 0,
           ),
-        },
+      );
+      set((state) => ({
         threadsLoadedForPlace: {
           ...state.threadsLoadedForPlace,
           [parentKey]: !raced,
@@ -1744,13 +1762,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ) {
             return false;
           }
-          if ((threadProjectionVersions.get(threadId) ?? 0) !== version) {
+          if (!applyThreadSummary(threadId, thread, version)) {
             scheduleThreadSummaryRefresh(threadId);
             return false;
           }
-          set((state) => ({
-            threadsById: { ...state.threadsById, [thread.threadId]: thread },
-          }));
           return true;
         } catch {
           return false;
@@ -1789,9 +1804,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         throw new Error("Messaging session changed during thread creation");
       }
-      set((state) => ({
-        threadsById: { ...state.threadsById, [thread.threadId]: thread },
-      }));
+      // A live message can arrive before the create response. The response is
+      // only usable at the zero version of this as-yet unknown thread.
+      if (!applyThreadSummary(thread.threadId, thread, 0)) {
+        scheduleThreadSummaryRefresh(thread.threadId);
+      }
       return `thread:${thread.threadId}`;
     },
 

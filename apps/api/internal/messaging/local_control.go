@@ -328,13 +328,8 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
 	}
 	var thread *threadWire
-	if snapshot.Place.Kind == PlaceThread {
-		summary, err := store.ThreadFor(r.Context(), snapshot.Place.PlaceID)
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		wire := threadToWire(summary)
+	if snapshot.Thread != nil {
+		wire := threadToWire(*snapshot.Thread)
 		thread = &wire
 	}
 	writeJSON(w, http.StatusOK, struct {

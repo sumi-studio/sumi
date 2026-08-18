@@ -30,7 +30,8 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 		t.Fatalf("begin reader snapshot: %v", err)
 	}
 	defer func() { _ = reader.Rollback(ctx) }()
-	if _, err := scoped.authorizeSnapshotInTx(ctx, reader); err != nil {
+	membership, err := scoped.authorizeSnapshotInTx(ctx, reader)
+	if err != nil {
 		t.Fatalf("authorize exact reader scope: %v", err)
 	}
 	place, err := scoped.loadScopedPlace(ctx, reader, channel.PlaceID)
@@ -56,7 +57,7 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 		t.Fatalf("advance concurrent Agent cursor: %v", err)
 	}
 
-	old, err := scoped.openSnapshotFromPlace(ctx, reader, place, access, HistoryOptions{Limit: 10})
+	old, err := scoped.openSnapshotFromPlace(ctx, reader, membership.WorkspaceMemberID, place, access, HistoryOptions{Limit: 10})
 	if err != nil {
 		t.Fatalf("finish reader snapshot: %v", err)
 	}
@@ -77,6 +78,57 @@ func TestOpenSnapshotStaysCoherentAcrossConcurrentAppendAndCursorAdvance(t *test
 	if fresh.Place.LastSeq != second.Seq || fresh.LastReadSeq != second.Seq ||
 		len(fresh.Messages) != 2 || fresh.Messages[1].MessageID != second.MessageID {
 		t.Fatalf("fresh snapshot missed the concurrent commit: %+v", fresh)
+	}
+}
+
+func TestOpenSnapshotKeepsThreadSummaryInTheSameSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	thread, _, err := scoped.CreateThread(ctx, channel.PlaceID, "snapshot summary", "", "thread-snapshot-summary")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	first := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "first")
+
+	// Hold the exact REPEATABLE READ transaction OpenSnapshot uses, then append
+	// after its place read. The summary must remain on this old snapshot rather
+	// than leaking the later append through a second transaction.
+	reader, err := scoped.Store.beginOpenSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("begin reader snapshot: %v", err)
+	}
+	defer func() { _ = reader.Rollback(ctx) }()
+	membership, err := scoped.authorizeSnapshotInTx(ctx, reader)
+	if err != nil {
+		t.Fatalf("authorize reader snapshot: %v", err)
+	}
+	place, err := scoped.loadScopedPlace(ctx, reader, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread place: %v", err)
+	}
+	access, err := scoped.placeAccessAfterAuthorization(ctx, reader, place, w.agent)
+	if err != nil {
+		t.Fatalf("authorize thread place: %v", err)
+	}
+
+	second := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "second")
+	snapshot, err := scoped.openSnapshotFromPlace(ctx, reader, membership.WorkspaceMemberID, place, access, HistoryOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("finish reader snapshot: %v", err)
+	}
+	if snapshot.Thread == nil || snapshot.Place.LastSeq != first.Seq ||
+		snapshot.Thread.Place.LastSeq != first.Seq || snapshot.Thread.MessageCount != 1 ||
+		len(snapshot.Messages) != 1 || snapshot.Messages[0].MessageID != first.MessageID {
+		t.Fatalf("thread screen mixed old and new commits: %+v", snapshot)
+	}
+	if snapshot.Thread.Place.LastSeq == second.Seq {
+		t.Fatalf("thread summary leaked concurrent append: %+v", snapshot.Thread)
+	}
+	if err := reader.Commit(ctx); err != nil {
+		t.Fatalf("commit reader snapshot: %v", err)
 	}
 }
 

@@ -241,15 +241,30 @@ func (s *ScopedStore) ThreadFor(ctx context.Context, threadID string) (Thread, e
 	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
 		return Thread{}, err
 	}
-	threads, err := s.threadsWhere(ctx, tx, membership.WorkspaceMemberID, "t.place_id = $3", threadID)
+	thread, err := s.threadForAuthorizedPlace(ctx, tx, membership.WorkspaceMemberID, place)
+	if err != nil {
+		return Thread{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Thread{}, err
+	}
+	return thread, nil
+}
+
+// threadForAuthorizedPlace projects one thread through the caller's existing
+// authorization and database snapshot. OpenSnapshot uses this helper so its
+// top-level place/history and nested thread aggregate cannot observe different
+// commits.
+func (s *ScopedStore) threadForAuthorizedPlace(ctx context.Context, q querier, workspaceMemberID string, place Place) (Thread, error) {
+	if place.Kind != PlaceThread {
+		return Thread{}, ErrPlaceNotFound
+	}
+	threads, err := s.threadsWhere(ctx, q, workspaceMemberID, "t.place_id = $3", place.PlaceID)
 	if err != nil {
 		return Thread{}, err
 	}
 	if len(threads) == 0 {
 		return Thread{}, ErrPlaceNotFound
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Thread{}, err
 	}
 	return threads[0], nil
 }
