@@ -25,7 +25,12 @@ const state = vi.hoisted(() => ({
   acquireConnection: vi.fn(),
   disconnect: vi.fn(),
   resumeMountedConnection: vi.fn(),
-  ready: "ready" as "ready" | "unavailable" | "not_ready",
+  ready: "ready" as
+    | "ready"
+    | "rehydrating"
+    | "stopped"
+    | "unavailable"
+    | "not_ready",
   connection: "connected" as "connecting" | "connected" | "closed",
 }));
 
@@ -275,8 +280,8 @@ describe("SDUI action boundary", () => {
     expect(state.resumeMountedConnection).toHaveBeenCalledTimes(1);
   });
 
-  it("describes an in-band unavailable status as a transition, not a failed start", () => {
-    state.ready = "unavailable";
+  it("waits for server-stated rehydration without offering a manual retry", () => {
+    state.ready = "rehydrating";
     render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
 
     expect(screen.getAllByRole("status")[0]).toHaveTextContent(
@@ -288,6 +293,22 @@ describe("SDUI action boundary", () => {
     expect(screen.getByRole("alert")).not.toHaveTextContent(
       "エージェントを起動できませんでした",
     );
+    expect(screen.queryByRole("button", { name: "再試行" })).toBeNull();
+  });
+
+  it("offers retry after the server states that idle shutdown stopped the runtime", () => {
+    state.ready = "stopped";
+    render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
+
+    expect(screen.getAllByRole("status")[0]).toHaveTextContent(
+      "エージェント利用不可",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "エージェントは停止しています。再試行して起動してください。",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+    expect(state.disconnect).toHaveBeenCalledTimes(1);
+    expect(state.resumeMountedConnection).toHaveBeenCalledTimes(1);
   });
 
   it("keeps an automatic reconnect visible while the agent stays unavailable", () => {

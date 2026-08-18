@@ -29,11 +29,13 @@ export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE = 4001;
 export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON = "runtime_not_ready";
 
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
-// An in-band unavailable frame is transient lifecycle state (replacement or
-// re-hydration). A 4001 close is the distinct, attributed failure to start.
+// Only a server-stated unavailable reason can describe lifecycle progress. A
+// 4001 close is the distinct, attributed failure to start.
 export type DirectChatReadyState =
   | "unknown"
   | "ready"
+  | "rehydrating"
+  | "stopped"
   | "unavailable"
   | "not_ready";
 
@@ -44,6 +46,7 @@ export type DirectChatEventFrame = {
 export type DirectChatStatusFrame = {
   type: "direct_chat_status";
   status: "ready" | "unavailable";
+  reason?: string;
 };
 export type DirectChatAcceptedFrame = {
   type: "command_accepted";
@@ -767,7 +770,11 @@ export function parseDirectChatServerFrame(
   if (
     value.type === "direct_chat_status" &&
     (value.status === "ready" || value.status === "unavailable") &&
-    hasOnlyKeys(value, ["type", "status"])
+    hasOnlyKeys(value, ["type", "status", "reason"]) &&
+    (value.status === "ready"
+      ? !("reason" in value)
+      : !("reason" in value) ||
+        (typeof value.reason === "string" && value.reason.length <= 64))
   ) {
     return value as DirectChatStatusFrame;
   }
@@ -998,7 +1005,15 @@ export class DirectChatSocket {
       }
       if (frame.type === "direct_chat_status") {
         this.admissionReady = frame.status === "ready";
-        this.setReadyState(frame.status === "ready" ? "ready" : "unavailable");
+        this.setReadyState(
+          frame.status === "ready"
+            ? "ready"
+            : frame.reason === "rehydrating"
+              ? "rehydrating"
+              : frame.reason === "stopped"
+                ? "stopped"
+                : "unavailable",
+        );
         if (this.admissionReady) {
           // An accepted upgrade can still immediately report a failed lazy
           // runtime spawn. Only an explicit ready frame proves this connection
