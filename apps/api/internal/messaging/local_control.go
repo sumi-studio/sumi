@@ -636,10 +636,11 @@ type attentionCandidateWire struct {
 // consume_through は先に適用する：本人が「ここまで取り込んだ」と言ってから
 // 「次は何か」を聞く順である。
 //
-// latest_seq は agent ごとの「実際に配った連続範囲」の高水位で、そのまま次の
-// consume_through に渡してよい上限である。limit で切られた残りは含まれない。
-// 任意に大きい cursor でも server がこの高水位へ clamp するので、未配布の
-// 呼びかけが消えることはなく、次の poll で再配送される。
+// latest_seq はこの Workspace の poll が「実際に配った範囲」の高水位で、そのまま
+// 次の consume_through に渡してよい上限である。candidate_seq は agent ごとに
+// 単調だが、別 Workspace の配布は含まない。limit で切られた残りも含まれない。
+// 任意に大きい cursor でも server がこの Workspace の高水位へ clamp するので、
+// 未配布の呼びかけが消えることはなく、次の poll で再配送される。
 func (s *Server) localAttention(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		localScopeWire

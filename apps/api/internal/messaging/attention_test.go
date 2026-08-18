@@ -143,7 +143,47 @@ func TestCandidateSeqIsPerAgentAcrossWorkspacesAndMonotonic(t *testing.T) {
 			firstInbox.Candidates[0].CandidateSeq, secondInbox.Candidates[0].CandidateSeq)
 	}
 	if secondInbox.LatestSeq != 2 {
-		t.Fatalf("agent delivery high-water = %d, want 2", secondInbox.LatestSeq)
+		t.Fatalf("second Workspace delivery high-water = %d, want 2", secondInbox.LatestSeq)
+	}
+	if firstInbox.LatestSeq != 1 {
+		t.Fatalf("first Workspace delivery high-water = %d, want 1", firstInbox.LatestSeq)
+	}
+}
+
+func TestAttentionAckCannotConsumeAnotherWorkspaceAfterLostResponse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	firstWorkspace, firstChannel := w.workspaceWithChannel(t, ctx)
+	secondWorkspace, secondChannel := w.workspaceWithChannel(t, ctx)
+	w.send(t, ctx, firstChannel.PlaceID, w.humanA, "A だけの呼びかけ")
+	w.send(t, ctx, secondChannel.PlaceID, w.humanA, "B だけの呼びかけ")
+
+	firstScope := w.store.mustScope(t, ctx, firstWorkspace.WorkspaceID, w.agent)
+	secondScope := w.store.mustScope(t, ctx, secondWorkspace.WorkspaceID, w.agent)
+	// A の poll は DB commit の後に応答を落とした、とする。候補を返した事実だけを
+	// 残し、caller は cursor を受け取らなかったため ack しない。
+	firstInbox, err := firstScope.PollAttentionCandidates(ctx, 0, 1)
+	if err != nil || len(firstInbox.Candidates) != 1 || firstInbox.Candidates[0].CandidateSeq != 1 {
+		t.Fatalf("first poll = %+v, %v; want A candidate 1", firstInbox, err)
+	}
+
+	secondInbox, err := secondScope.PollAttentionCandidates(ctx, 0, 1)
+	if err != nil || len(secondInbox.Candidates) != 1 || secondInbox.Candidates[0].CandidateSeq != 2 {
+		t.Fatalf("second poll = %+v, %v; want B candidate 2", secondInbox, err)
+	}
+	// B が自身の latest_seq を ack しても、A が配布した候補には触れない。
+	acked, err := secondScope.PollAttentionCandidates(ctx, secondInbox.LatestSeq, 1)
+	if err != nil || acked.Consumed != 1 {
+		t.Fatalf("ack second Workspace = %+v, %v; want one consumed", acked, err)
+	}
+
+	firstRetry, err := firstScope.PollAttentionCandidates(ctx, 0, 1)
+	if err != nil {
+		t.Fatalf("retry first Workspace: %v", err)
+	}
+	if len(firstRetry.Candidates) != 1 || firstRetry.Candidates[0].CandidateSeq != 1 {
+		t.Fatalf("A candidate was consumed by B ack: %+v", firstRetry)
 	}
 }
 
@@ -218,6 +258,35 @@ func TestReadingThroughSupersedesCandidatesInsteadOfWakingTwice(t *testing.T) {
 	candidates := candidateList(t, w.poll(t, ctx, server, map[string]any{}))
 	if len(candidates) != 1 || candidates[0]["message_seq"] != float64(second.Seq) {
 		t.Fatalf("candidates = %+v, want only the still-unread one", candidates)
+	}
+}
+
+func TestAlreadyReadIntentIsNotNumbered(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, ch := w.workspaceWithChannel(t, ctx)
+	message := w.send(t, ctx, ch.PlaceID, w.humanA, "@Kuro（Yohaku） もう読みました")
+	if err := w.store.ReadThrough(ctx, ch.PlaceID, w.agent, message.Seq); err != nil {
+		t.Fatalf("read through before first poll: %v", err)
+	}
+
+	inbox, err := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent).
+		PollAttentionCandidates(ctx, 0, 1)
+	if err != nil {
+		t.Fatalf("poll after read through: %v", err)
+	}
+	if len(inbox.Candidates) != 0 || inbox.LatestSeq != 0 {
+		t.Fatalf("already-read message was offered or sequenced: %+v", inbox)
+	}
+	var candidates int
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM attention_candidates WHERE agent_id = $1 AND message_id = $2`,
+		w.agent.ID, message.MessageID).Scan(&candidates); err != nil {
+		t.Fatalf("count candidates: %v", err)
+	}
+	if candidates != 0 {
+		t.Fatalf("already-read message was numbered: %d rows", candidates)
 	}
 }
 

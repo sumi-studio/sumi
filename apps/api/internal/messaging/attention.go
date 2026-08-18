@@ -48,11 +48,11 @@ type AttentionCandidate struct {
 type AttentionInbox struct {
 	Candidates []AttentionCandidate
 	Consumed   int64
-	// LatestSeq は agent ごとの **配布済み高水位** である。ack はこの軸の
-	// cursor を進める操作で、server が実際に配った連続範囲を越えない。したがって
-	// caller が任意に大きい consume_through を渡しても、未配布の候補は消えず次の
-	// poll で再配送される。別 Workspace で既に配った候補も同じ agent の高水位に
-	// 含むので、agent は一つの cursor で横断して ack できる。
+	// LatestSeq はこの Workspace での **配布済み高水位** である。candidate_seq は
+	// agent ごとに単調だが、poll / ack は Workspace binding ごとの local-control
+	// request なので、別 Workspace の配布はここへ含めない。server が実際に配った
+	// 範囲を越えないため、caller が任意に大きい consume_through を渡しても、この
+	// Workspace で未配布の候補は消えず次の poll で再配送される。
 	LatestSeq int64
 }
 
@@ -96,8 +96,9 @@ func (s *ScopedStore) PollAttentionCandidates(
 		return AttentionInbox{}, err
 	}
 	agentID := s.Scope.Actor.ID
-	// 番号・ack の軸は agent なので、Workspace を混ぜずに直列化する。二つの
-	// Workspace から同時に poll しても同じ番号を取り合わない。
+	// 番号の軸は agent なので、Workspace を混ぜずに直列化する。二つの Workspace
+	// から同時に poll しても同じ番号を取り合わない。配布済み高水位はこの後に
+	// Workspace ごとに読む。
 	if _, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock(hashtext($1))",
 		agentID); err != nil {
@@ -108,10 +109,15 @@ func (s *ScopedStore) PollAttentionCandidates(
 		ON CONFLICT (agent_id) DO NOTHING`, agentID); err != nil {
 		return AttentionInbox{}, fmt.Errorf("ensure attention inbox: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO attention_workspace_inboxes (agent_id, workspace_id) VALUES ($1, $2)
+		ON CONFLICT (agent_id, workspace_id) DO NOTHING`, agentID, s.Scope.WorkspaceID); err != nil {
+		return AttentionInbox{}, fmt.Errorf("ensure workspace attention inbox: %w", err)
+	}
 	var deliveredThrough int64
 	if err := tx.QueryRow(ctx, `
-		SELECT delivered_through FROM attention_agent_inboxes
-		WHERE agent_id = $1 FOR UPDATE`, agentID).Scan(&deliveredThrough); err != nil {
+		SELECT delivered_through FROM attention_workspace_inboxes
+		WHERE agent_id = $1 AND workspace_id = $2 FOR UPDATE`, agentID, s.Scope.WorkspaceID).Scan(&deliveredThrough); err != nil {
 		return AttentionInbox{}, fmt.Errorf("read attention delivery cursor: %w", err)
 	}
 
@@ -128,8 +134,8 @@ func (s *ScopedStore) PollAttentionCandidates(
 		// 再起動を理由に候補を捨てないという決定（ADR 0011 §9）に、残すことで従う。
 		tag, err := tx.Exec(ctx, `
 			UPDATE attention_candidates SET consumed_at = now()
-			WHERE agent_id = $1 AND candidate_seq <= $2 AND consumed_at IS NULL`,
-			agentID, consumeThrough)
+			WHERE workspace_id = $1 AND agent_id = $2 AND candidate_seq <= $3 AND consumed_at IS NULL`,
+			s.Scope.WorkspaceID, agentID, consumeThrough)
 		if err != nil {
 			return AttentionInbox{}, fmt.Errorf("consume attention candidates: %w", err)
 		}
@@ -153,6 +159,12 @@ func (s *ScopedStore) PollAttentionCandidates(
 		if err := s.numberAttentionCandidates(ctx, tx, membership.WorkspaceMemberID, limit-waiting); err != nil {
 			return AttentionInbox{}, err
 		}
+	}
+	// read marker は採番の直前にも query で見るが、ReadThrough が採番と同時に
+	// commit することもある。返却直前にも同じ supersede を通し、既読済みの
+	// candidate をこの応答へ載せない。
+	if err := s.supersedeReadAttentionCandidates(ctx, tx); err != nil {
+		return AttentionInbox{}, err
 	}
 
 	rows, err := tx.Query(ctx, `
@@ -184,12 +196,12 @@ func (s *ScopedStore) PollAttentionCandidates(
 
 	if n := len(inbox.Candidates); n > 0 {
 		// ORDER BY candidate_seq なので末尾が返した中の最大。新規採番は
-		// 必ずこの応答へ入るため、ここまでが安全な agent-wide ack cursor。
+		// 必ずこの応答へ入るため、ここまでが安全な Workspace ごとの ack cursor。
 		if err := tx.QueryRow(ctx, `
-			UPDATE attention_agent_inboxes
+			UPDATE attention_workspace_inboxes
 			SET delivered_through = GREATEST(delivered_through, $2)
-			WHERE agent_id = $1
-			RETURNING delivered_through`, agentID, inbox.Candidates[n-1].CandidateSeq).
+			WHERE agent_id = $1 AND workspace_id = $3
+			RETURNING delivered_through`, agentID, inbox.Candidates[n-1].CandidateSeq, s.Scope.WorkspaceID).
 			Scan(&deliveredThrough); err != nil {
 			return AttentionInbox{}, fmt.Errorf("advance attention delivery cursor: %w", err)
 		}
@@ -218,11 +230,14 @@ func (s *ScopedStore) numberAttentionCandidates(
 	}
 	rows, err := tx.Query(ctx, `
 		WITH visible_places AS (
-			SELECT p.place_id, COALESCE(pm.visible_from_seq, 1) AS visible_from_seq
+			SELECT p.place_id, COALESCE(pm.visible_from_seq, 1) AS visible_from_seq,
+			       COALESCE(rm.last_read_seq, 0) AS last_read_seq
 			FROM places p
 			LEFT JOIN place_members pm
 			  ON pm.workspace_id = p.workspace_id AND pm.place_id = p.place_id
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
+			LEFT JOIN read_markers rm
+			  ON rm.place_id = p.place_id AND rm.place_member_id = pm.place_member_id
 			WHERE p.workspace_id = $1
 			  AND (p.kind = 'channel'
 			       OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
@@ -239,6 +254,7 @@ func (s *ScopedStore) numberAttentionCandidates(
 		  AND m.workspace_id = $1
 		  AND m.deleted_at IS NULL
 		  AND m.seq >= vp.visible_from_seq
+		  AND m.seq > vp.last_read_seq
 		  AND ac.candidate_id IS NULL
 		ORDER BY i.issued_at, m.message_id
 		LIMIT $5`,

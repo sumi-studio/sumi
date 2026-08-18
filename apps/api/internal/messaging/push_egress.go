@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"syscall"
@@ -132,48 +133,57 @@ func guardDialAddress(address string) error {
 	return nil
 }
 
-// pushIPIsPublicUnicast is the one predicate. 「公開のユニキャストだけ」を
-// 許可の側で書く：拒否の列挙は取りこぼすが、許可の側で書けば知らない範囲は
-// 自動的に外れる。
+// pushSpecialPurposePrefixes is IANA's special-purpose address space that is
+// not globally routable unicast. Keep this as data, not a handful of ad-hoc
+// switches: registration and the dial-time fence then reject the same complete
+// registry set, and the test exercises every prefix below.
+var pushSpecialPurposePrefixes = []netip.Prefix{
+	// IPv4
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("255.255.255.255/32"),
+	// IPv6
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("::ffff:0:0/96"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2001:2::/48"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+// pushIPIsPublicUnicast is the one predicate. IPv4-mapped IPv6 addresses are
+// deliberately reduced to IPv4 before the registry lookup: ::ffff:10.0.0.1
+// must not bypass the IPv4 private-range entry.
 func pushIPIsPublicUnicast(ip net.IP) bool {
-	if ip == nil {
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return false
 	}
-	// ::ffff:10.0.0.1 のような写像は IPv4 として判定する。
-	if mapped := ip.To4(); mapped != nil {
-		ip = mapped
-	}
-	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		switch {
-		case v4[0] == 0:
-			return false
-		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // CGNAT 100.64.0.0/10
-			return false
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // IETF protocol assignments
-			return false
-		case v4[0] == 255 && v4[1] == 255 && v4[2] == 255 && v4[3] == 255:
-			return false
-		case v4[0] >= 240: // 240.0.0.0/4（将来用）
+	address = address.Unmap()
+	for _, prefix := range pushSpecialPurposePrefixes {
+		if prefix.Contains(address) {
 			return false
 		}
-		return true
-	}
-	// IPv6: unique local (fc00::/7) と、IPv4 を包む形（6to4 / Teredo）は通さない。
-	if len(ip) != net.IPv6len {
-		return false
-	}
-	switch {
-	case ip[0]&0xfe == 0xfc:
-		return false
-	case ip[0] == 0x20 && ip[1] == 0x02: // 2002::/16 6to4
-		return false
-	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00: // 2001::/32 Teredo
-		return false
 	}
 	return true
 }

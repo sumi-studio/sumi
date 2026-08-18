@@ -48,14 +48,21 @@ CREATE INDEX push_subscriptions_by_human ON push_subscriptions (human_id, create
 --    取りに来る。本設計が入るとき、この inbox は捨てるのではなく wake gate の
 --    入力になる。
 --
--- 採番と ack の cursor は Workspace ではなく agent の持ち物である。同じ agent
--- が複数の Workspace に参加しても一つの runtime が受け取る inbox は一つなので、
--- この行が candidate_seq の正本と「ここまで実際に渡した」の上限を持つ。
+-- candidate_seq は agent ごとの単調な軸なので、その採番だけは agent が持つ。
+-- 一方 poll / ack は Workspace binding ごとの local-control request である。
+-- 配布済み高水位を agent 全体に置くと、一方の Workspace の ack が、応答を
+-- 失った別 Workspace の未受領候補を解決できてしまう。高水位は下の
+-- attention_workspace_inboxes に分ける。
 CREATE TABLE attention_agent_inboxes (
     agent_id          uuidv7      PRIMARY KEY REFERENCES agents(personality_agent_id) ON DELETE CASCADE,
-    next_candidate_seq bigint     NOT NULL DEFAULT 1 CHECK (next_candidate_seq > 0),
+    next_candidate_seq bigint     NOT NULL DEFAULT 1 CHECK (next_candidate_seq > 0)
+);
+
+CREATE TABLE attention_workspace_inboxes (
+    agent_id          uuidv7      NOT NULL REFERENCES agents(personality_agent_id) ON DELETE CASCADE,
+    workspace_id      uuidv7      NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     delivered_through bigint      NOT NULL DEFAULT 0 CHECK (delivered_through >= 0),
-    CHECK (delivered_through < next_candidate_seq)
+    PRIMARY KEY (agent_id, workspace_id)
 );
 
 CREATE TABLE attention_candidates (
@@ -81,5 +88,5 @@ CREATE TABLE attention_candidates (
 );
 
 CREATE INDEX attention_candidates_pending
-    ON attention_candidates (agent_id, candidate_seq)
+    ON attention_candidates (workspace_id, agent_id, candidate_seq)
     WHERE consumed_at IS NULL;

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -64,7 +65,7 @@ func (c *recordingPushClient) endpoints() []string {
 //
 //	internal.*     → 10.0.0.7（内部アドレスを指す名前）
 //	unresolvable.* → 名前が引けない
-//	その他          → 203.0.113.10（公開ユニキャスト）
+//	その他          → 8.8.8.8（公開ユニキャスト）
 func testPushEgress() *pushEgress {
 	return &pushEgress{
 		resolve: func(_ context.Context, host string) ([]net.IP, error) {
@@ -74,7 +75,7 @@ func testPushEgress() *pushEgress {
 			case strings.HasPrefix(host, "unresolvable."):
 				return nil, errors.New("no such host")
 			default:
-				return []net.IP{net.ParseIP("203.0.113.10")}, nil
+				return []net.IP{net.ParseIP("8.8.8.8")}, nil
 			}
 		},
 	}
@@ -282,7 +283,7 @@ func TestPushSendingCannotReachAnAddressTheRegistrationWouldHaveRefused(t *testi
 
 	// 述語そのもの：公開ユニキャストだけが通る。
 	for address, want := range map[string]bool{
-		"203.0.113.10:443":      true,
+		"8.8.8.8:443":           true,
 		"[2606:4700::1]:443":    true,
 		"127.0.0.1:443":         false,
 		"10.0.0.7:443":          false,
@@ -298,6 +299,26 @@ func TestPushSendingCannotReachAnAddressTheRegistrationWouldHaveRefused(t *testi
 		if (err == nil) != want {
 			t.Fatalf("guardDialAddress(%s) err = %v, want allowed=%v", address, err, want)
 		}
+	}
+}
+
+func TestEverySpecialPurposeRangeIsRefusedAtDial(t *testing.T) {
+	for _, prefix := range pushSpecialPurposePrefixes {
+		prefix := prefix
+		t.Run(prefix.String(), func(t *testing.T) {
+			if err := guardDialAddress(net.JoinHostPort(prefix.Addr().String(), "443")); err == nil {
+				t.Fatalf("dial to %s was allowed", prefix)
+			}
+			if !prefix.Addr().Is4() {
+				return
+			}
+			// IPv4-mapped IPv6 has to take the same IPv4 path. A mapped form
+			// of each denied IPv4 range must therefore be denied as well.
+			mapped := netip.MustParseAddr("::ffff:" + prefix.Addr().String())
+			if err := guardDialAddress(net.JoinHostPort(mapped.String(), "443")); err == nil {
+				t.Fatalf("dial to mapped %s was allowed", prefix)
+			}
+		})
 	}
 }
 

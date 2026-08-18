@@ -78,7 +78,7 @@ shell 経由ではない。人間が UI から行うのと同じ経路・同じ�
 | --- | --- |
 | 正本 | **shared control plane の per-agent inbox**。runtime 停止中に届いたものを受け取れるのは shared 側だけである。agent-private DB は projection（ADR 0011 §10） |
 | 識別 | `candidate_id`（UUIDv7、冪等キー）と `candidate_seq`（agent ごと単調増加） |
-| ack | agent が cursor を進める。server は agent ごとの「実際に配布した連続した最大 seq」までに clamp し、その以下だけを配送済みとみなす |
+| ack | agent が cursor を進める。`candidate_seq` は agent ごとに単調だが、ack の範囲は**同じ Workspace の poll が配布した候補だけ**である。server はその `(agent, Workspace)` の実配布高水位まで clamp し、その Workspace の候補だけを解決する |
 | 再配送 | at-least-once。cursor より後ろを再送する。重複は `candidate_id` で冪等に落とす |
 | generation fence | agent runtime の generation を hello で提示する。既存の `ProcessGeneration` と同じ仕組みを使い、古い generation の ack で cursor を巻き戻さない |
 | read_through との連動 | place の read cursor が候補の seq を超えたら、その place の未 ack 候補は **superseded** として解決する。既に読んだものでもう一度起こさない |

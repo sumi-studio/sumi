@@ -269,6 +269,11 @@ agentにとってより適した方法があるときだけそちらで代替す
    rate limit）を通過した出来事が、認証済みprovenance付きの候補として本人の
    private runtimeへ渡る。**現在のprovider turnへ直接注入しない。**
 
+   `candidate_seq` は agent ごとに単調増加するが、poll と ack は Workspace binding
+   ごとの操作である。したがって ack は、同じ Workspace の poll が実際に配布した
+   候補だけを、その Workspace の配布済み高水位まで解決する。別 Workspace の poll
+   が進めた高水位で、応答を受け取れなかった候補を解決してはならない。
+
 ```json
 {
   "kind": "attention_candidate",
