@@ -392,6 +392,9 @@ function notificationPlaceLabel(state: MessagingState, key: PlaceKey): string {
     );
     return channel ? `#${channel.name}` : "";
   }
+  if (place.kind === "thread") {
+    return state.threadsById[place.threadId]?.name ?? "";
+  }
   if (place.kind === "dm") return "";
   const dm = state.dms.find(
     (entry) => entry.kind === place.kind && entry.dmId === place.dmId,
@@ -410,7 +413,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+  // A thread message is only an invalidation signal for its summary.  Counts,
+  // latest sequence, previews, and participants come from the server's
+  // aggregate: event delivery order is not a projection contract.
   const threadProjectionVersions = new Map<string, number>();
+  const threadSummaryRefreshes = new Map<
+    string,
+    {
+      backend: MessagingBackend;
+      sessionGeneration: number;
+      dirty: boolean;
+      scheduled: boolean;
+      request: Promise<void> | null;
+    }
+  >();
   const threadHydrations = new Map<
     string,
     {
@@ -420,96 +436,71 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
   >();
 
-  const advanceThreadProjection = (message: Message): number | null => {
-    if (message.place.kind !== "thread") return null;
-    const threadId = message.place.threadId;
+  const invalidateThreadSummary = (threadId: string): number => {
     const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
     threadProjectionVersions.set(threadId, version);
     return version;
   };
 
-  const refreshThreadSummary = async (message: Message, version: number) => {
-    if (message.place.kind !== "thread") return;
-    const threadId = message.place.threadId;
-    const thread = get().threadsById[threadId];
-    const fetchThreads = backend.fetchThreads;
-    if (!thread || !fetchThreads) return;
+  const scheduleThreadSummaryRefresh = (threadId: string) => {
     const currentBackend = backend;
     const sessionGeneration = messagingSessionGeneration;
-    const parentKey = placeKey(thread.parentPlace);
-    try {
-      const summaries = await fetchThreads.call(
-        currentBackend,
-        thread.parentPlace,
-      );
-      if (
-        backend !== currentBackend ||
-        messagingSessionGeneration !== sessionGeneration ||
-        threadProjectionVersions.get(threadId) !== version
-      ) {
-        return;
-      }
-      const refreshed = summaries.find((entry) => entry.threadId === threadId);
-      if (!refreshed) return;
-      set((state) => ({
-        threadsById: { ...state.threadsById, [threadId]: refreshed },
-      }));
-    } catch {
-      if (
-        backend !== currentBackend ||
-        messagingSessionGeneration !== sessionGeneration ||
-        threadProjectionVersions.get(threadId) !== version
-      ) {
-        return;
-      }
-      set((state) => ({
-        threadsLoadedForPlace: {
-          ...state.threadsLoadedForPlace,
-          [parentKey]: false,
-        },
-      }));
-    }
-  };
-
-  const noteThreadActivity = (message: Message) => {
-    if (message.place.kind !== "thread") return;
-    const threadId = message.place.threadId;
-    set((state) => {
-      const thread = state.threadsById[threadId];
-      if (!thread) return {};
-      // bootstrap's summary can arrive before the same durable event during
-      // reconnect catch-up. Its latestSeq then already includes this commit,
-      // even though the lazy timeline does not; do not count it twice.
-      if (thread.latestSeq >= message.seq) return {};
-      const known = thread.participants.some(
-        (participant) =>
-          participantKey(participant) === participantKey(message.author),
-      );
-      return {
-        threadsById: {
-          ...state.threadsById,
-          [threadId]: {
-            ...thread,
-            messageCount: thread.messageCount + (message.deleted ? 0 : 1),
-            lastMessageAt: message.createdAt,
-            lastMessage: message.content,
-            latestSeq: Math.max(thread.latestSeq, message.seq),
-            participants: known
-              ? thread.participants
-              : [...thread.participants, message.author],
-          },
-        },
+    let refresh = threadSummaryRefreshes.get(threadId);
+    if (
+      !refresh ||
+      refresh.backend !== currentBackend ||
+      refresh.sessionGeneration !== sessionGeneration
+    ) {
+      refresh = {
+        backend: currentBackend,
+        sessionGeneration,
+        dirty: false,
+        scheduled: false,
+        request: null,
       };
+      threadSummaryRefreshes.set(threadId, refresh);
+    }
+    refresh.dirty = true;
+    invalidateThreadSummary(threadId);
+    if (refresh.scheduled || refresh.request) return;
+    refresh.scheduled = true;
+    const queuedRefresh = refresh;
+    queueMicrotask(() => {
+      queuedRefresh.scheduled = false;
+      if (queuedRefresh.request || !queuedRefresh.dirty) return;
+      const version = threadProjectionVersions.get(threadId) ?? 0;
+      queuedRefresh.dirty = false;
+      queuedRefresh.request = (async () => {
+        try {
+          const fetchThread = currentBackend.fetchThread;
+          if (!fetchThread) return;
+          const thread = await fetchThread.call(currentBackend, threadId);
+          if (
+            backend !== currentBackend ||
+            messagingSessionGeneration !== sessionGeneration ||
+            threadProjectionVersions.get(threadId) !== version
+          ) {
+            return;
+          }
+          set((state) => ({
+            threadsById: { ...state.threadsById, [thread.threadId]: thread },
+          }));
+        } catch {
+          // The next event or explicit load retries; no local approximation is
+          // allowed to stand in for the server aggregate.
+        } finally {
+          queuedRefresh.request = null;
+          if (
+            threadSummaryRefreshes.get(threadId) === queuedRefresh &&
+            queuedRefresh.dirty
+          ) {
+            scheduleThreadSummaryRefresh(threadId);
+          } else if (threadSummaryRefreshes.get(threadId) === queuedRefresh) {
+            threadSummaryRefreshes.delete(threadId);
+          }
+        }
+      })();
     });
-  };
-
-  const applyThreadDeletionSummary = (message: Message) => {
-    if (message.place.kind !== "thread") return;
-    // A reconnect bootstrap can already contain the post-deletion summary
-    // before its catch-up tombstone arrives. Do not decrement locally: the
-    // authoritative parent summary below is the only count projection.
-    const version = advanceThreadProjection(message);
-    if (version !== null) void refreshThreadSummary(message, version);
   };
   const applyReactionUpdateRaw = (event: ReactionUpdatedEvent) => {
     const key = placeKey(event.place);
@@ -911,12 +902,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "message_created" || event.type === "message_edited") {
       const key = placeKey(event.message.place);
-      let created = false;
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
-        created = !existing;
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           event.message,
@@ -969,31 +958,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
       if (event.type === "message_created") {
         if (event.message.deleted) {
-          // Catch-up serializes deletions as message_created tombstones. They
-          // must take the same projection path as a live deletion, rather
-          // than becoming apparent new thread activity.
-          applyThreadDeletionSummary(event.message);
+          if (event.message.place.kind === "thread") {
+            scheduleThreadSummaryRefresh(event.message.place.threadId);
+          }
         } else {
-          advanceThreadProjection(event.message);
-          // A WebSocket event can race the cursored catch-up that carries the
-          // same commit. The timeline is an upsert, so only project a new
-          // thread message into its summary when that upsert inserted it.
-          if (created) noteThreadActivity(event.message);
-          if (
-            event.message.place.kind === "thread" &&
-            !get().threadsById[event.message.place.threadId]
-          ) {
-            // place_created is not replayed. A thread first learned through a
-            // message event still needs its summary before it can be selected
-            // from the route or parent thread panel. loadThread coalesces
-            // repeated messages for the same unknown thread.
-            void get().loadThread(event.message.place.threadId);
+          if (event.message.place.kind === "thread") {
+            // Do not calculate a summary from event payloads. The durable
+            // aggregate includes admissions made by mentions and stays right
+            // even when commits reach the Hub out of sequence.
+            scheduleThreadSummaryRefresh(event.message.place.threadId);
           }
           presentNotification(event);
         }
       } else {
-        const version = advanceThreadProjection(event.message);
-        if (version !== null) void refreshThreadSummary(event.message, version);
+        if (event.message.place.kind === "thread") {
+          scheduleThreadSummaryRefresh(event.message.place.threadId);
+        }
       }
       return;
     }
@@ -1033,7 +1013,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
-      applyThreadDeletionSummary(event.message);
+      if (event.message.place.kind === "thread") {
+        scheduleThreadSummaryRefresh(event.message.place.threadId);
+      }
       return;
     }
     if (event.type === "typing") {
@@ -1470,6 +1452,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (initialized) return;
       initialized = true;
       threadProjectionVersions.clear();
+      threadSummaryRefreshes.clear();
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
       void currentBackend
@@ -1736,9 +1719,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           const thread = await fetchThread.call(currentBackend, threadId);
           if (
             backend !== currentBackend ||
-            messagingSessionGeneration !== sessionGeneration ||
-            (threadProjectionVersions.get(threadId) ?? 0) !== version
+            messagingSessionGeneration !== sessionGeneration
           ) {
+            return false;
+          }
+          if ((threadProjectionVersions.get(threadId) ?? 0) !== version) {
+            scheduleThreadSummaryRefresh(threadId);
             return false;
           }
           set((state) => ({

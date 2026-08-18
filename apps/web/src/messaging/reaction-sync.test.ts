@@ -491,10 +491,8 @@ describe("reaction convergence in the messaging store", () => {
     });
     await harness.settle();
 
-    expect(harness.fetchThreads).toHaveBeenCalledWith(thread.parentPlace);
-    expect(
-      useMessaging.getState().threadsById[thread.threadId],
-    ).toMatchObject({
+    expect(harness.fetchThread).toHaveBeenCalledWith(thread.threadId);
+    expect(useMessaging.getState().threadsById[thread.threadId]).toMatchObject({
       messageCount: 1,
       lastMessageAt: 2,
       lastMessage: "survives",
@@ -740,6 +738,14 @@ class StubBackend implements MessagingBackend {
   }
 
   fetchThreads = vi.fn(async (_parent: Place) => this.threadSummaries);
+
+  fetchThread = vi.fn(async (threadId: string) => {
+    const thread = this.threadSummaries.find(
+      (summary) => summary.threadId === threadId,
+    );
+    if (!thread) throw new Error("thread not found");
+    return thread;
+  });
 
   async searchMessages(): Promise<import("./model").MessageSearchResult[]> {
     return [];

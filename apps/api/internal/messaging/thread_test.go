@@ -45,6 +45,21 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	}
 }
 
+func TestThreadRejectsDeletedOriginMessage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	origin := w.send(t, ctx, channel.PlaceID, w.humanA, "削除する起点")
+	if _, err := owner.DeleteMessage(ctx, channel.PlaceID, origin.MessageID); err != nil {
+		t.Fatalf("delete origin: %v", err)
+	}
+	if _, _, err := owner.CreateThread(ctx, channel.PlaceID, "削除済み起点", origin.MessageID, "deleted-origin-1"); !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("create from deleted origin: got %v, want ErrMessageNotFound", err)
+	}
+}
+
 func TestNonparticipantThreadReadMarkerSurvivesBootstrap(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

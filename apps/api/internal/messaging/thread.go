@@ -81,14 +81,21 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 	}
 	var origin *string
 	if originMessageID != "" {
-		var exists bool
+		// Take the same row lock as DeleteMessage before deciding that an
+		// origin is usable. Without it, a delete can commit after an unlocked
+		// existence check and leave this transaction creating a thread rooted at
+		// a tombstone.
+		var active bool
 		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM messages
-			 WHERE workspace_id=$1 AND place_id=$2 AND message_id=$3 AND deleted_at IS NULL)`,
-			s.Scope.WorkspaceID, parentPlaceID, originMessageID).Scan(&exists); err != nil {
-			return Thread{}, false, fmt.Errorf("check thread origin: %w", err)
+			SELECT deleted_at IS NULL FROM messages
+			WHERE workspace_id=$1 AND place_id=$2 AND message_id=$3
+			FOR UPDATE`, s.Scope.WorkspaceID, parentPlaceID, originMessageID).Scan(&active); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return Thread{}, false, ErrMessageNotFound
+			}
+			return Thread{}, false, fmt.Errorf("lock thread origin: %w", err)
 		}
-		if !exists {
+		if !active {
 			return Thread{}, false, ErrMessageNotFound
 		}
 		origin = &originMessageID

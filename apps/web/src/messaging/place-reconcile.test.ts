@@ -313,12 +313,21 @@ describe("place lifecycleの再接続突き合わせ", () => {
   it("未知threadのhydrate中の新活動で古いGET summaryを戻さない", async () => {
     const stale = thread("thread-hydration-race");
     let resolveFetch!: (summary: ThreadSummary) => void;
-    backend.fetchThread.mockImplementation(
-      () =>
-        new Promise<ThreadSummary>((resolve) => {
-          resolveFetch = resolve;
-        }),
-    );
+    const fresh = {
+      ...stale,
+      messageCount: 3,
+      latestSeq: 3,
+      lastMessageAt: 3,
+      lastMessage: "新しい返信です",
+    };
+    backend.fetchThread
+      .mockImplementationOnce(
+        () =>
+          new Promise<ThreadSummary>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(fresh);
 
     backend.emit({
       type: "message_created",
@@ -335,36 +344,64 @@ describe("place lifecycleの再接続突き合わせ", () => {
       message: threadMessage(stale.threadId, 3),
       notify: null,
     });
-    const fresh = {
-      ...stale,
-      messageCount: 3,
-      latestSeq: 3,
-      lastMessageAt: 3,
-      lastMessage: "新しい返信です",
-    };
-    backend.fetchThreads.mockResolvedValue([fresh]);
-    await useMessaging.getState().loadThreads(CHANNEL_1);
-    expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
-
     resolveFetch(stale);
     await settle();
 
     expect(useMessaging.getState().threadsById[stale.threadId]).toEqual(fresh);
+    expect(backend.fetchThread).toHaveBeenCalledTimes(2);
   });
 
-  it("重複したthread message_createdで件数を二重加算しない", async () => {
+  it("重複したthread message_createdを一度の権威あるsummary取得に合流する", async () => {
     const known = thread("thread-known");
     useMessaging.setState({ threadsById: { [known.threadId]: known } });
     const incoming = threadMessage(known.threadId, 2);
+    const aggregate = {
+      ...known,
+      messageCount: known.messageCount + 1,
+      latestSeq: incoming.seq,
+      lastMessageAt: incoming.createdAt,
+      lastMessage: incoming.content,
+    };
+    backend.fetchThread.mockResolvedValue(aggregate);
 
     backend.emit({ type: "message_created", message: incoming, notify: null });
     backend.emit({ type: "message_created", message: incoming, notify: null });
     await settle();
 
-    expect(useMessaging.getState().threadsById[known.threadId]).toMatchObject({
-      messageCount: known.messageCount + 1,
-      latestSeq: incoming.seq,
+    expect(backend.fetchThread).toHaveBeenCalledTimes(1);
+    expect(useMessaging.getState().threadsById[known.threadId]).toEqual(
+      aggregate,
+    );
+  });
+
+  it("順不同のthread作成イベントでもserver aggregateの件数と参加者を採用する", async () => {
+    const known = thread("thread-authoritative");
+    const mentioned = { kind: "human", humanId: "human-c" } as const;
+    const aggregate = {
+      ...known,
+      messageCount: 3,
+      latestSeq: 3,
+      lastMessageAt: 3,
+      participants: [...known.participants, mentioned],
+    };
+    backend.fetchThread.mockResolvedValue(aggregate);
+    useMessaging.setState({ threadsById: { [known.threadId]: known } });
+
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(known.threadId, 3),
+      notify: null,
     });
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(known.threadId, 2),
+      notify: null,
+    });
+    await settle();
+
+    expect(useMessaging.getState().threadsById[known.threadId]).toEqual(
+      aggregate,
+    );
   });
 
   it("bootstrapが先に取り込んだthread messageをcatch-upで再加算しない", async () => {
@@ -433,7 +470,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     // The summary re-fetch may fail while offline. The bootstrap count remains
     // authoritative until a later successful refresh, rather than decrementing
     // a second time when the catch-up tombstone is replayed.
-    backend.fetchThreads.mockRejectedValueOnce(new Error("offline"));
+    backend.fetchThread.mockRejectedValueOnce(new Error("offline"));
     backend.emit({
       type: "message_created",
       message: tombstone,

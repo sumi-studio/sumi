@@ -10,6 +10,7 @@ import type {
   Place,
   PlaceKey,
   ServerEvent,
+  ThreadSummary,
 } from "./model";
 import { resetNotificationAudio } from "./notifications";
 import {
@@ -439,6 +440,33 @@ describe("presenting an incoming message", () => {
     expect(FakeNotification.constructed[0]?.options.body).toBe(
       "デプロイの件です",
     );
+  });
+
+  it("names the thread in a called thread notification", () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const thread: ThreadSummary = {
+      threadId: "thread-1",
+      workspaceId: "ws",
+      parentPlace: CHANNEL,
+      parentMessageId: "message-0",
+      name: "設計レビュー",
+      messageCount: 1,
+      lastMessageAt: 1,
+      lastMessage: "",
+      participants: [SELF, OTHER],
+      latestSeq: 1,
+    };
+    useMessaging.setState({ threadsById: { [thread.threadId]: thread } });
+
+    backend.emit({
+      type: "message_created",
+      message: incoming({
+        place: { kind: "thread", threadId: thread.threadId },
+      }),
+      notify: { reason: "mention" },
+    });
+
+    expect(FakeNotification.constructed[0]?.title).toBe("設計レビュー — Kuro");
   });
 
   it("stays quiet when the server did not call this person", () => {
