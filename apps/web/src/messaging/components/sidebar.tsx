@@ -19,7 +19,7 @@ import {
   notificationLevelFor,
   useMessaging,
 } from "../store";
-import { useOverlayPanel } from "./overlay";
+import { fromOwnSubtree, useOverlayPanel } from "./overlay";
 import {
   ParticipantAvatar,
   STATUS_DOT,
@@ -202,10 +202,12 @@ function PlaceRow({
     // 右クリックは行そのものが受ける。leadingへ切り出したアバターの上でも
     // 同じ導線が出る（行の右クリック契約はアバター領域を含む）。行内の
     // buttonへフォーカスしたままのShift+F10もここへ上がってくる。
+    // 行が所有するのはDOM上で行の中にあるターゲットのイベントだけで、
+    // 行から開いたportal（プロフィールカード等）の中は「行の中」ではない。
     // biome-ignore lint/a11y/noStaticElementInteractions: 右クリックは補助導線で、正規の入口は同じ行の「…」button。
     <div
       onContextMenu={(event) => {
-        if (!canConfigure) return;
+        if (!canConfigure || !fromOwnSubtree(event)) return;
         event.preventDefault();
         setMenuOpen(true);
       }}

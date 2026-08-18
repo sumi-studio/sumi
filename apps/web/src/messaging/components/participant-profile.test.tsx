@@ -4,6 +4,7 @@ import "@testing-library/jest-dom/vitest";
 import {
   act,
   cleanup,
+  createEvent,
   fireEvent,
   render,
   screen,
@@ -397,7 +398,7 @@ describe("Sidebar のプロフィール導線", () => {
     expect(container.querySelectorAll("button button")).toHaveLength(0);
   });
 
-  it("DM行のアバターを右クリックしても行の通知メニューが開く", () => {
+  function allowNotifications() {
     useMessaging.setState({
       capabilities: {
         status: true,
@@ -406,6 +407,10 @@ describe("Sidebar のプロフィール導線", () => {
         notifications: true,
       },
     });
+  }
+
+  it("DM行のアバターを右クリックしても行の通知メニューが開く", () => {
+    allowNotifications();
     renderSidebar();
 
     fireEvent.contextMenu(
@@ -415,5 +420,23 @@ describe("Sidebar のプロフィール導線", () => {
     expect(
       screen.getByRole("dialog", { name: "この場所の通知設定" }),
     ).toBeInTheDocument();
+  });
+
+  // Reactの合成イベントはportalの子からもReactの親へ上がる。行が所有するのは
+  // DOM上で行の中にあるターゲットだけで、行から開いたカードの中は行の外。
+  it("行から開いたプロフィールカードの中の右クリックは行の通知メニューを開かない", async () => {
+    allowNotifications();
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
+    const inCard = await screen.findByRole("button", { name: "DMを送る" });
+    const event = createEvent.contextMenu(inCard);
+    fireEvent(inCard, event);
+
+    expect(
+      screen.queryByRole("dialog", { name: "この場所の通知設定" }),
+    ).not.toBeInTheDocument();
+    // ブラウザ標準のメニューも奪わない。
+    expect(event.defaultPrevented).toBe(false);
   });
 });

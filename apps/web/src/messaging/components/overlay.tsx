@@ -1,6 +1,7 @@
 import {
   type RefCallback,
   type RefObject,
+  type SyntheticEvent,
   useCallback,
   useEffect,
   useRef,
@@ -10,6 +11,24 @@ import { applyUserScrollDelta } from "../../lib/user-scroll-intent";
 
 /** 開いているオーバーレイの「閉じる」手続き。排他のために 1 か所へ集める。 */
 const openOverlays = new Set<() => void>();
+
+/**
+ * その合成イベントが、ハンドラを置いた要素の DOM 部分木から出たものか。
+ *
+ * React の合成イベントは portal の子からも React の親へ上がってくる。行や
+ * リストが「自分の中の操作」として扱ってよいのは、DOM 上でも自分の部分木に
+ * あるターゲットだけで、portal の子は「行の中」ではない。個々の overlay 側で
+ * stopPropagation する形にすると、次に増えた portal がまた同じ穴を踏む——
+ * 判定はイベントを所有する側に置く。
+ */
+export function fromOwnSubtree(event: SyntheticEvent): boolean {
+  const { currentTarget, target } = event;
+  return (
+    currentTarget instanceof Node &&
+    target instanceof Node &&
+    currentTarget.contains(target)
+  );
+}
 
 /** オーバーレイ上のホイールを渡す既定のメッセージ一覧。 */
 export function conversationViewport(): HTMLElement | null {
