@@ -32,18 +32,6 @@ const AGENT: ParticipantRef = {
 };
 
 const updateProfile = vi.fn();
-const auth = vi.hoisted(() => ({
-  syncDisplayName: vi.fn(),
-  user: {
-    id: "0199aaaa-0000-7000-8000-000000000001",
-    displayName: "yohaku",
-  },
-}));
-
-vi.mock("../../auth/auth-context", () => ({
-  useAuth: () => auth,
-}));
-
 function seed(
   member: Partial<MemberProfile> = {},
   self: ParticipantRef = SELF,
@@ -182,25 +170,6 @@ describe("個人設定", () => {
 
     await waitFor(() =>
       expect(updateProfile).toHaveBeenCalledWith({ displayName: "余白" }),
-    );
-  });
-
-  it("Humanの保存後は確定した表示名をAuthContextにも同期する", async () => {
-    updateProfile.mockResolvedValueOnce({
-      participant: SELF,
-      displayName: "確定名",
-      tagline: "デザイン",
-      revision: 2,
-    });
-    render(<SettingsOverlay />);
-
-    fireEvent.change(screen.getByLabelText("表示名"), {
-      target: { value: "入力値" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
-
-    await waitFor(() =>
-      expect(auth.syncDisplayName).toHaveBeenCalledWith(SELF.humanId, "確定名"),
     );
   });
 

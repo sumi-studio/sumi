@@ -22,6 +22,7 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import { useMessaging } from "../messaging/store";
 import {
   clearPendingConfirmation,
   loadPendingConfirmation,
@@ -147,8 +148,6 @@ export interface AuthContextValue {
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
   updateDisplayName: (displayName: string) => Promise<void>;
-  /** Messaging profile writeが確定したHuman名を、同じsessionへ反映する。 */
-  syncDisplayName: (userId: string, displayName: string) => void;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -827,17 +826,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [isCurrentGeneration, nextGeneration, serializeSessionMutation],
   );
 
-  const syncDisplayName = useCallback((userId: string, displayName: string) => {
-    const current = serverSession.current;
-    if (!current.authenticated || current.user.id !== userId) return;
-    const nextSession: SumiSessionStatus = {
-      ...current,
-      user: { ...current.user, displayName },
-    };
-    serverSession.current = nextSession;
-    setSession(nextSession);
-  }, []);
-
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
     // the already-upgraded socket before the cookie is cleared server-side.
@@ -879,6 +867,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
 
+  const messagingSelf = useMessaging((state) => state.self);
+  const messagingSelfProfile = useMessaging((state) =>
+    state.self ? state.membersByKey[state.selfKey] : undefined,
+  );
+
   const user = useMemo<AuthUser | null>(() => {
     if (sessionState === "preissued" && preissuedUserID) {
       return {
@@ -891,13 +884,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!session.authenticated) {
       return null;
     }
+    // Messaging has the authoritative, revisioned presentation profile once
+    // its self participant is known. The session copy remains only as the
+    // bootstrap fallback before that projection exists.
+    const messagingDisplayName =
+      messagingSelf?.kind === "human" &&
+      messagingSelf.humanId === session.user.id
+        ? messagingSelfProfile?.displayName
+        : undefined;
     return {
       id: session.user.id,
-      displayName: session.user.displayName,
+      displayName: messagingDisplayName ?? session.user.displayName,
       email: null,
       photoURL: null,
     };
-  }, [session, sessionState]);
+  }, [messagingSelf, messagingSelfProfile, session, sessionState]);
 
   const authorityBindingId =
     sessionState === "authenticated" && session.authenticated
@@ -926,7 +927,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       cancelIntentTransition,
       dismissOutcomeNotice,
       updateDisplayName,
-      syncDisplayName,
       logout,
       refreshSession,
     }),
@@ -949,7 +949,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       outcomeNotice,
       user,
       updateDisplayName,
-      syncDisplayName,
     ],
   );
 

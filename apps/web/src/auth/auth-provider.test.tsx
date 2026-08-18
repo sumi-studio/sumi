@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { TooltipProvider } from "@sumi/ui/components/tooltip";
 import "@testing-library/jest-dom/vitest";
 import {
   cleanup,
@@ -9,6 +10,14 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SettingsPopover } from "../components/app-navigation";
+import { Sidebar } from "../messaging/components/sidebar";
+import { MockMessagingServer } from "../messaging/mock-server";
+import {
+  bindMessagingSessionIdentity,
+  installMessagingBackend,
+  useMessaging,
+} from "../messaging/store";
 import { AuthProvider, useAuth } from "./auth-context";
 import { AuthAPIError, SumiSessionCompensatedError } from "./session-client";
 
@@ -103,8 +112,25 @@ vi.mock("firebase/auth", () => ({
   signOut: authMocks.signOut,
 }));
 
+vi.mock("../messaging/place-route", () => ({
+  usePlaceNavigate: () => vi.fn(),
+}));
+
+vi.mock("./provider-settings", () => ({
+  ProviderSettings: () => null,
+}));
+
+vi.mock("../theme/theme-provider", () => ({
+  useTheme: () => ({ theme: "system", setTheme: vi.fn() }),
+}));
+
+vi.mock("../participant/app-menu", () => ({
+  ParticipantAppsMenu: () => null,
+}));
+
 afterEach(() => {
   cleanup();
+  bindMessagingSessionIdentity(null);
 });
 
 beforeEach(() => {
@@ -197,12 +223,6 @@ function AuthStateProbe() {
       >
         update display name
       </button>
-      <button
-        type="button"
-        onClick={() => auth.syncDisplayName("user-a", "After")}
-      >
-        sync display name
-      </button>
     </>
   );
 }
@@ -238,27 +258,37 @@ describe("canonical Human profile", () => {
     expect(authMocks.updateSumiProfile).toHaveBeenCalledWith("After");
   });
 
-  it("accepts the Messaging profile write's confirmed Human name", async () => {
+  it("projects a self profile_updated into the sidebar and settings from one confirmed profile", async () => {
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
       authorityBindingId: authorityBindingA,
-      user: { id: "user-a", displayName: "Before" },
+      user: { id: "h-yohaku", displayName: "session fallback" },
     });
+    const server = new MockMessagingServer();
+    bindMessagingSessionIdentity("h-yohaku");
+    installMessagingBackend(server);
+    useMessaging.getState().init();
 
     render(
       <AuthProvider>
-        <AuthStateProbe />
+        <TooltipProvider>
+          <Sidebar selectedPlaceKey={null} workspaceId="ws-sumi" />
+          <SettingsPopover />
+        </TooltipProvider>
       </AuthProvider>,
     );
-    await waitFor(() => {
-      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
-    });
+    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+    await waitFor(() => expect(screen.getByText("yohaku")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "sync display name" }));
+    // 別タブでの保存はこのtabではprofile_updatedだけとして届く。
+    await server.updateProfile({ displayName: "別タブの確定名" });
 
-    await waitFor(() => {
-      expect(screen.getByTestId("display-name")).toHaveTextContent("After");
-    });
+    await waitFor(() =>
+      expect(screen.getByText("別タブの確定名")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "設定" }));
+    const displayName = screen.getByRole("textbox", { name: "表示名" });
+    expect(displayName).toHaveValue("別タブの確定名");
   });
 
   it("reconciles a committed profile update whose response was lost", async () => {

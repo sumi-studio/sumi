@@ -101,12 +101,28 @@ function applyProfile(
   return { ...membersByKey, [key]: profile };
 }
 
-function mergeProfilesByRevision(
+/**
+ * サーバーが確定したprofileを一つの規則で投影する。
+ *
+ * profile_updatedとREST ACKは既知のmembershipだけを更新する。一方bootstrap
+ * snapshotはmembershipの全体像なので、snapshotにあるprofileだけで一覧を作り
+ * 直す。ただし、どちらもrevisionが新しい確定値だけを採用する。
+ */
+function applyConfirmedProfiles(
   current: Record<ParticipantKey, MemberProfile>,
-  snapshot: MemberProfile[],
+  profiles: readonly MemberProfile[],
+  options: { knownOnly?: boolean; snapshot?: boolean } = {},
 ): Record<ParticipantKey, MemberProfile> {
+  if (!options.snapshot) {
+    let next = current;
+    for (const profile of profiles) {
+      next = applyProfile(next, profile, !options.knownOnly);
+    }
+    return next;
+  }
+
   let merged: Record<ParticipantKey, MemberProfile> = {};
-  for (const profile of snapshot) {
+  for (const profile of profiles) {
     const currentProfile = current[participantKey(profile.participant)];
     const winner =
       currentProfile &&
@@ -583,14 +599,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 
   /**
-   * 名乗りの確定値を一覧へ取り込む。REST ACK・WS event・bootstrapは同じ
-   * revision規則に従うので、到着順がcommit順と異なっても古い値に戻らない。
-   * まだ知らない参加者は無視する:
-   * membershipはbootstrapが決めるもので、eventで増えたりはしない。
+   * 名乗りの確定値を一覧へ取り込む。REST ACK・WS event・bootstrap・再接続
+   * snapshot・明示refreshはapplyConfirmedProfilesだけを通るので、到着順が
+   * commit順と異なっても古い値に戻らない。認証側の表示名もこのself profile
+   * から導出されるため、ここが更新されれば同じ確定値へ追従する。
    */
   const applyProfileEvent = (profile: MemberProfile) => {
     set((state) => {
-      const membersByKey = applyProfile(state.membersByKey, profile, false);
+      const membersByKey = applyConfirmedProfiles(
+        state.membersByKey,
+        [profile],
+        { knownOnly: true },
+      );
       return membersByKey === state.membersByKey ? {} : { membersByKey };
     });
   };
@@ -1075,9 +1095,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         placeKey({ kind: entry.kind, dmId: entry.dmId }),
       ),
     ]);
-    const membersByKey = mergeProfilesByRevision(
+    const membersByKey = applyConfirmedProfiles(
       state.membersByKey,
       snapshot.members,
+      { snapshot: true },
     );
     const lastReadByPlace = { ...state.lastReadByPlace };
     for (const marker of snapshot.readMarkers) {
@@ -1419,9 +1440,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend
         .bootstrap()
         .then((snapshot) => {
-          const membersByKey = mergeProfilesByRevision(
+          const membersByKey = applyConfirmedProfiles(
             get().membersByKey,
             snapshot.members,
+            { snapshot: true },
           );
           const statusByKey = applyStatuses(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
@@ -2110,9 +2132,10 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
   }
 
   useMessaging.setState((current) => ({
-    membersByKey: mergeProfilesByRevision(
+    membersByKey: applyConfirmedProfiles(
       current.membersByKey,
       snapshot.members,
+      { snapshot: true },
     ),
   }));
 }
