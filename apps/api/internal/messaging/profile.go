@@ -8,6 +8,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
@@ -49,16 +50,23 @@ func (s *ScopedStore) Profile(ctx context.Context) (MemberProfile, error) {
 	return profile, nil
 }
 
-// SetProfile replaces the actor's own profile. There is no route for setting
-// anyone else's: the participant is the authenticated scope actor, never a
-// request field — the same rule as Status (自己申告). Humans and
-// PersonalityAgents go through this one path, so neither side can hold a
-// capability the other lacks.
+// profileAuthorization holds the caller-specific authority check inside the
+// same transaction as the profile write. The browser's account settings route
+// has already bound its Human through AuthorizeSession, while a scoped
+// Messaging request must also hold its exact Workspace installation fence.
+type profileAuthorization func(context.Context, pgx.Tx) error
+
+// setProfile replaces one participant's profile through the only durable
+// profile write boundary. displayName is written back to the 戸籍, which stays
+// the canonical registry of names; only the tagline lands in
+// participant_profiles. A nil field is preserved, so a caller who changes one
+// field cannot silently clear the other.
 //
-// displayName is written back to the 戸籍, which stays the canonical registry
-// of names; only the tagline lands in participant_profiles. A nil field is
-// preserved, so a caller who changes one field cannot silently clear the other.
-func (s *ScopedStore) SetProfile(ctx context.Context, displayName, tagline *string, publish profilePublisher) (MemberProfile, error) {
+// The optional authorization is deliberately part of this transaction. It
+// lets every transport share the same 戸籍 resolution, revision allocation,
+// post-commit ordering, and all-Workspace publication while retaining its own
+// authenticated actor boundary.
+func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayName, tagline *string, authorize profileAuthorization, publish profilePublisher) (MemberProfile, error) {
 	if tagline != nil {
 		normalized, err := normalizeTagline(*tagline)
 		if err != nil {
@@ -78,14 +86,15 @@ func (s *ScopedStore) SetProfile(ctx context.Context, displayName, tagline *stri
 		return MemberProfile{}, fmt.Errorf("begin set profile: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
-		return MemberProfile{}, err
+	if authorize != nil {
+		if err := authorize(ctx, tx); err != nil {
+			return MemberProfile{}, err
+		}
 	}
 
 	// Resolving the canonical row first takes the participant-level row lock, so
 	// two concurrent profile writes for one participant run in a serial order
 	// while unrelated participants stay independent.
-	actor := s.Scope.Actor
 	switch actor.Kind {
 	case KindHuman:
 		if _, err := koseki.ResolveHumanDisplayNameTx(ctx, tx, actor.ID, displayName); err != nil {
@@ -137,6 +146,18 @@ func (s *ScopedStore) SetProfile(ctx context.Context, displayName, tagline *stri
 	return profile, nil
 }
 
+// SetProfile replaces the authenticated scope actor's profile. There is no
+// route for setting anyone else's: the participant is the authenticated scope
+// actor, never a request field — the same rule as Status (自己申告). Humans and
+// PersonalityAgents go through Store.setProfile, so neither side can hold a
+// capability the other lacks.
+func (s *ScopedStore) SetProfile(ctx context.Context, displayName, tagline *string, publish profilePublisher) (MemberProfile, error) {
+	return s.Store.setProfile(ctx, s.Scope.Actor, displayName, tagline, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := s.authorizeMutationInTx(ctx, tx)
+		return err
+	}, publish)
+}
+
 // normalizeTagline applies the profile text rule at the one shared write
 // boundary. A tagline is deliberately less restrictive than a display name,
 // but it is still a trimmed, single display line with no control characters.
@@ -157,7 +178,7 @@ func normalizeTagline(raw string) (string, error) {
 // which this participant is currently visible. The profile itself is global;
 // the Hub remains responsible for taking each address's audience snapshot and
 // excluding connections whose exact installation is no longer current.
-func (s *ScopedStore) profileAudienceScopesInTx(ctx context.Context, tx querier, actor ParticipantRef) ([]Scope, error) {
+func (s *Store) profileAudienceScopesInTx(ctx context.Context, tx querier, actor ParticipantRef) ([]Scope, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT wm.workspace_id, ai.installation_id, ai.authority_epoch
 		FROM workspace_members wm

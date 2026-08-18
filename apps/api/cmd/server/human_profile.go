@@ -8,7 +8,7 @@ import (
 	"net/http"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
-	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 )
 
 const maxHumanProfileRequestBytes = 4 * 1024
@@ -17,13 +17,13 @@ const maxHumanProfileRequestBytes = 4 * 1024
 // comes only from the signed browser session; clients cannot nominate another
 // Human whose profile should be changed.
 type humanProfileServer struct {
-	store          *koseki.Store
+	messaging      *messaging.Server
 	sessions       agentevents.UserSessionAuthorizer
 	allowedOrigins []string
 }
 
-func newHumanProfileServer(store *koseki.Store, sessions agentevents.UserSessionAuthorizer, allowedOrigins []string) *humanProfileServer {
-	return &humanProfileServer{store: store, sessions: sessions, allowedOrigins: append([]string(nil), allowedOrigins...)}
+func newHumanProfileServer(messagingServer *messaging.Server, sessions agentevents.UserSessionAuthorizer, allowedOrigins []string) *humanProfileServer {
+	return &humanProfileServer{messaging: messagingServer, sessions: sessions, allowedOrigins: append([]string(nil), allowedOrigins...)}
 }
 
 func (s *humanProfileServer) RegisterRoutes(mux *http.ServeMux) {
@@ -45,7 +45,7 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	cookies := r.CookiesNamed(agentevents.BrowserSessionCookie)
-	if len(cookies) != 1 || s.sessions == nil || s.store == nil {
+	if len(cookies) != 1 || s.sessions == nil || s.messaging == nil {
 		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
 		return
 	}
@@ -71,8 +71,8 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 	var displayName string
 	err = s.sessions.AuthorizeSession(r.Context(), claims, func() error {
 		called = true
-		var updateErr error
-		displayName, updateErr = s.store.UpdateHumanDisplayName(r.Context(), claims.UserID, request.DisplayName)
+		profile, updateErr := s.messaging.SetHumanProfile(r.Context(), claims.UserID, request.DisplayName)
+		displayName = profile.DisplayName
 		return updateErr
 	})
 	if !called {
@@ -81,9 +81,9 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 	}
 	if err != nil {
 		switch {
-		case errors.Is(err, koseki.ErrInvalidDisplayName):
+		case errors.Is(err, messaging.ErrInvalidDisplayName):
 			writeHumanProfileError(w, http.StatusBadRequest, "invalid_display_name")
-		case errors.Is(err, koseki.ErrHumanNotFound):
+		case errors.Is(err, messaging.ErrParticipantNotFound):
 			// A valid signed session must always name a live Human. Treat a
 			// missing row as control-plane inconsistency, not caller error.
 			writeHumanProfileError(w, http.StatusServiceUnavailable, "profile_unavailable")

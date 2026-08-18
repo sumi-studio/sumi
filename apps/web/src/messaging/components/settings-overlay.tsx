@@ -136,13 +136,20 @@ function ProfileSection() {
     setFailed("");
     setSaved(false);
     try {
-      const canonical = await updateProfile({
-        displayName: clampCodePoints(
+      const input: {
+        displayName?: string;
+        tagline?: string;
+      } = {};
+      if (displayName !== canonicalName) {
+        input.displayName = clampCodePoints(
           displayName.trim(),
           MAX_DISPLAY_NAME_CHARS,
-        ),
-        tagline: clampCodePoints(tagline.trim(), MAX_TAGLINE_CHARS),
-      });
+        );
+      }
+      if (tagline !== canonicalTagline) {
+        input.tagline = clampCodePoints(tagline.trim(), MAX_TAGLINE_CHARS);
+      }
+      const canonical = await updateProfile(input);
       if (
         canonical.participant.kind === "human" &&
         canonical.participant.humanId === user?.id

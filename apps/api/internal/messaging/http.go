@@ -495,11 +495,18 @@ func (s *Server) publishProfile(ctx context.Context, scopes []Scope, profile Mem
 	}
 }
 
-// setProfile is the one transport-independent profile write path. Both the
-// Human REST route and PA local-control publish only after the durable commit.
-// Receivers resolve any delivery reordering through the profile revision.
+// setProfile is the scoped transport adapter for Store.setProfile. Receivers
+// resolve any delivery reordering through the profile revision.
 func (s *Server) setProfile(ctx context.Context, store *ScopedStore, displayName, tagline *string) (MemberProfile, error) {
 	return store.SetProfile(ctx, displayName, tagline, s.publishProfile)
+}
+
+// SetHumanProfile lets the account settings surface use the exact same
+// profile write boundary as Messaging. Session authorization belongs to that
+// outer transport; this method owns the durable name/revision write and the
+// post-commit fan-out to every Workspace where the Human is visible.
+func (s *Server) SetHumanProfile(ctx context.Context, humanID string, displayName string) (MemberProfile, error) {
+	return s.Store.setProfile(ctx, ParticipantRef{Kind: KindHuman, ID: humanID}, &displayName, nil, nil, s.publishProfile)
 }
 
 type unreadSummaryWire struct {

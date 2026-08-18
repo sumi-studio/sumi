@@ -111,7 +111,7 @@ describe("個人設定", () => {
     expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
   });
 
-  it("保存は前後の空白を落とした値を両方まとめて送る", async () => {
+  it("保存は変更した値だけを前後の空白を落として送る", async () => {
     render(<SettingsOverlay />);
 
     fireEvent.change(screen.getByLabelText("表示名"), {
@@ -127,6 +127,31 @@ describe("個人設定", () => {
         displayName: "余白",
         tagline: "開発",
       }),
+    );
+  });
+
+  it("別経路で変わった未編集のひとことを保存時に上書きしない", async () => {
+    render(<SettingsOverlay />);
+
+    fireEvent.change(screen.getByLabelText("表示名"), {
+      target: { value: "余白" },
+    });
+    act(() => {
+      useMessaging.setState({
+        membersByKey: {
+          [SELF_KEY]: {
+            participant: SELF,
+            displayName: "yohaku",
+            tagline: "別タブの更新",
+            revision: 2,
+          },
+        },
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateProfile).toHaveBeenCalledWith({ displayName: "余白" }),
     );
   });
 

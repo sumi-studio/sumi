@@ -315,6 +315,41 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 	}
 }
 
+// Account settings have no selected Workspace, but a Human rename is still a
+// Messaging profile write: it advances the durable revision and reaches every
+// current Workspace audience just like the scoped /messaging/profile route.
+func TestHumanProfileFromAccountSettingsUpdatesWorkspaceMembersAndPublishes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	viewer := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	hub := NewHub(w.store.core)
+	server := NewServer(w.store.core, nil)
+	server.Hub = hub
+	sub := hub.subscribe(viewer)
+	defer hub.unsubscribe(sub)
+
+	profile, err := server.SetHumanProfile(ctx, w.humanA.ID, "余白")
+	if err != nil {
+		t.Fatalf("set account profile: %v", err)
+	}
+	if profile.DisplayName != "余白" || profile.Revision != 1 {
+		t.Fatalf("account profile = %+v", profile)
+	}
+	published := readPublishedProfile(t, sub)
+	if published.DisplayName != "余白" || published.Revision != 1 {
+		t.Fatalf("published account profile = %+v", published)
+	}
+	members, err := w.store.WorkspaceMemberProfiles(ctx, workspace.WorkspaceID, w.humanB)
+	if err != nil {
+		t.Fatalf("workspace members: %v", err)
+	}
+	if got := profileOf(t, members, w.humanA); got.DisplayName != "余白" || got.Revision != 1 {
+		t.Fatalf("workspace member after account profile = %+v", got)
+	}
+}
+
 // The PersonalityAgent's 名乗り travels its own transport, but it meets the
 // Human's contract: the same store method, the same wire, the same refusals,
 // and the same participant-scoped event to everyone who can see it. Without a

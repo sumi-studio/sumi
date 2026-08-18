@@ -14,6 +14,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -65,7 +66,7 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
 	request := profileRequest(`{"display_name":"  かずい\nさん  "}`)
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, request)
@@ -95,6 +96,15 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 	if stored != "かずい さん" || !customized {
 		t.Fatalf("stored name=%q customized=%v", stored, customized)
 	}
+	var revision int64
+	if err := pool.QueryRow(ctx, `
+		SELECT revision FROM participant_profiles
+		WHERE member_kind = 'human' AND member_id = $1`, profileTestHumanID).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 {
+		t.Fatalf("profile revision = %d, want 1", revision)
+	}
 
 	// A client-nominated identity is never accepted; the signed session is the
 	// sole subject of the update.
@@ -110,7 +120,7 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(koseki.New(nil), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(messaging.NewServer(messaging.New(nil, nil, nil), nil), sessions, []string{testBrowserOrigin})
 	tests := []struct {
 		name string
 		req  func() *http.Request
@@ -170,7 +180,7 @@ func TestHumanProfileDatabaseFailureIsUnavailable(t *testing.T) {
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, profileRequest(`{"display_name":"Human"}`))
 	if response.Code != http.StatusServiceUnavailable {

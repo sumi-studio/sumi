@@ -153,23 +153,3 @@ func (s *Store) HumanDisplayName(ctx context.Context, humanID string) (string, e
 	}
 	return name, nil
 }
-
-// UpdateHumanDisplayName is the explicit self-service override. Setting the
-// customized bit in the same statement prevents every later Firebase login
-// from silently replacing the Human's chosen name.
-func (s *Store) UpdateHumanDisplayName(ctx context.Context, humanID, raw string) (string, error) {
-	name, err := normalizeHumanDisplayName(raw)
-	if err != nil {
-		return "", err
-	}
-	var stored string
-	if err := s.pool.QueryRow(ctx, `UPDATE humans
-		SET display_name=$2, display_name_customized=true, display_name_initialized=true
-		WHERE human_id=$1 RETURNING display_name`, humanID, name).Scan(&stored); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrHumanNotFound
-		}
-		return "", fmt.Errorf("update Human display name: %w", err)
-	}
-	return stored, nil
-}
