@@ -35,6 +35,7 @@ var (
 	ErrNotAuthor               = errors.New("only the author may do this")
 	ErrNotAChannel             = errors.New("place is not a channel")
 	ErrInvalidChannelName      = errors.New("channel name must be 1..200 characters")
+	ErrEmptyChannelUpdate      = errors.New("a channel edit must name something to change")
 	ErrForbidden               = errors.New("participant lacks the required role")
 	ErrMessageDeleted          = errors.New("message is deleted")
 	ErrMessageRevisionConflict = errors.New("message revision conflict")

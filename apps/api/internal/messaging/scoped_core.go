@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -57,8 +60,17 @@ func (s *ScopedStore) WorkspaceMembers(ctx context.Context) ([]MemberProfile, er
 	return members, nil
 }
 
+// MaxChannelNameChars matches the schema CHECK on places.name. The rule lives
+// in the Store rather than in one route, so REST and local-control obey the
+// same bound (PostgreSQL length() counts characters, so this counts runes).
+const MaxChannelNameChars = 200
+
+func validChannelName(name string) bool {
+	return name != "" && utf8.RuneCountInString(name) <= MaxChannelNameChars
+}
+
 func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string, voice bool) (Place, error) {
-	if name == "" || len(name) > 200 {
+	if !validChannelName(name) {
 		return Place{}, ErrInvalidChannelName
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -85,7 +97,23 @@ func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string, voi
 	return place, nil
 }
 
+// UpdateChannelTopic keeps the topic-only shape for callers that only ever
+// retopic. It delegates, so there is one implementation of what an edit is.
 func (s *ScopedStore) UpdateChannelTopic(ctx context.Context, placeID, topic string) (Place, error) {
+	return s.UpdateChannel(ctx, placeID, nil, &topic)
+}
+
+// UpdateChannel rewrites a channel's mutable identity. A nil field is left
+// alone: renaming a channel can never be the reason its topic disappeared.
+// Naming neither is not an edit — a silent no-op reads to its caller as a
+// successful rename, so it is refused.
+func (s *ScopedStore) UpdateChannel(ctx context.Context, placeID string, name, topic *string) (Place, error) {
+	if name == nil && topic == nil {
+		return Place{}, ErrEmptyChannelUpdate
+	}
+	if name != nil && !validChannelName(*name) {
+		return Place{}, ErrInvalidChannelName
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Place{}, fmt.Errorf("begin update channel: %w", err)
@@ -104,16 +132,92 @@ func (s *ScopedStore) UpdateChannelTopic(ctx context.Context, placeID, topic str
 	if place.Kind != PlaceChannel {
 		return Place{}, ErrNotAChannel
 	}
+	// COALESCE keeps the omitted column exactly as it was, in the database
+	// rather than in the caller's memory of it.
 	if _, err := tx.Exec(ctx, `
-		UPDATE places SET topic = $1 WHERE workspace_id = $2 AND place_id = $3`,
-		topic, s.Scope.WorkspaceID, placeID); err != nil {
-		return Place{}, fmt.Errorf("update channel topic: %w", err)
+		UPDATE places SET name = COALESCE($1, name), topic = COALESCE($2, topic)
+		WHERE workspace_id = $3 AND place_id = $4`,
+		name, topic, s.Scope.WorkspaceID, placeID); err != nil {
+		return Place{}, fmt.Errorf("update channel: %w", err)
 	}
-	place.Topic = topic
+	if name != nil {
+		place.Name = *name
+	}
+	if topic != nil {
+		place.Topic = *topic
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Place{}, fmt.Errorf("commit update channel: %w", err)
 	}
 	return place, nil
+}
+
+// DuplicateChannel opens a new, empty channel shaped like an existing one. It
+// carries the name and topic and nothing else: messages, read state and
+// per-place notification settings belong to the original, and the copy is born
+// empty. An empty name takes the derived default, so the human menu and the
+// agent tool cannot disagree about what a copy is called.
+func (s *ScopedStore) DuplicateChannel(ctx context.Context, placeID, name string) (Place, error) {
+	if name != "" && !validChannelName(name) {
+		return Place{}, ErrInvalidChannelName
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Place{}, fmt.Errorf("begin duplicate channel: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := s.authorizeManageChannelsInTx(ctx, tx); err != nil {
+		return Place{}, err
+	}
+	source, err := s.loadScopedPlace(ctx, tx, placeID)
+	if err != nil {
+		return Place{}, err
+	}
+	if _, err := s.placeAccessAfterAuthorization(ctx, tx, source, s.Scope.Actor); err != nil {
+		return Place{}, err
+	}
+	if source.Kind != PlaceChannel {
+		return Place{}, ErrNotAChannel
+	}
+	if name == "" {
+		name = copyChannelName(source.Name)
+	}
+	place := Place{
+		PlaceID: newUUIDv7(), Kind: PlaceChannel, WorkspaceID: s.Scope.WorkspaceID,
+		Name: name, Topic: source.Topic, Visibility: "public", Voice: source.Voice,
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
+		VALUES ($1, 'channel', $2, $3, $4, $5)`,
+		place.PlaceID, place.WorkspaceID, place.Name, place.Topic, place.Voice); err != nil {
+		return Place{}, fmt.Errorf("insert duplicated channel: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Place{}, fmt.Errorf("commit duplicate channel: %w", err)
+	}
+	return place, nil
+}
+
+// copyChannelName derives the default name of a copy. The server owns it so
+// that the human menu and the agent tool never disagree about what「コピー」is
+// called. When the result would pass the schema bound the base is shortened
+// rather than the suffix dropped: what the name has to say is that this is a
+// copy.
+// copyChannelName derives the name of a copy. Copying a copy does not stack
+// the suffix: 「general のコピー のコピー」names nothing the shorter name did
+// not, and the reader has to count words to find the original.
+func copyChannelName(source string) string {
+	const suffix = " のコピー"
+	base := strings.TrimSuffix(source, suffix)
+	if base == "" {
+		base = source
+	}
+	runes := []rune(base)
+	room := MaxChannelNameChars - utf8.RuneCountInString(suffix)
+	if len(runes) > room {
+		runes = runes[:room]
+	}
+	return string(runes) + suffix
 }
 
 func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place, bool, error) {
