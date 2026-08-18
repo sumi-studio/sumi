@@ -14,12 +14,12 @@ import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { ComposerAttachments } from "./composer-attachments";
+import type { ComposerPlusMenuItem } from "./composer-plus-menu";
+import { ComposerPlusMenu } from "./composer-plus-menu";
 import {
   MentionSuggestions,
   useMentionAutocomplete,
 } from "./mention-autocomplete";
-import type { ComposerPlusMenuItem } from "./composer-plus-menu";
-import { ComposerPlusMenu } from "./composer-plus-menu";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
@@ -325,15 +325,17 @@ export function Composer() {
           value={value}
           onChange={mentionAutocomplete.onInputChange}
           onKeyDown={onKeyDown}
+          onKeyUp={mentionAutocomplete.onKeyUp}
           onCompositionStart={() => {
             composing.current = true;
           }}
           onCompositionEnd={(event) => {
             composing.current = false;
-            mentionAutocomplete.onInputChange(event);
+            mentionAutocomplete.onCompositionEnd(event);
           }}
           onPaste={onPaste}
           onClick={mentionAutocomplete.onInputClick}
+          onSelect={mentionAutocomplete.onSelectionChange}
           rows={1}
           placeholder={placeholder}
           aria-label={placeholder}

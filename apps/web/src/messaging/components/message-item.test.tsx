@@ -94,9 +94,11 @@ function renderItem(
       onRetry={noop}
       editing={false}
       editDraft=""
+      editConflict={null}
       onEditDraftChange={noop}
       onSubmitEdit={noop}
       onCancelEdit={noop}
+      onReloadEditConflict={noop}
       {...props}
     />,
   );
@@ -197,6 +199,25 @@ describe("インライン編集", () => {
     expect(textarea).toHaveValue("編集前");
     expect(screen.getByText("Escでキャンセル・Enterで保存")).toBeVisible();
     expect(screen.queryByLabelText("返信")).toBeNull();
+  });
+
+  it("外部編集との衝突は書きかけを残して保存を止め、新しい本文を読み込める", () => {
+    const reload = vi.fn();
+    renderItem(makeMessage({ content: "別の場所の本文" }), {
+      editing: true,
+      editDraft: "自分の書きかけ",
+      editConflict: { content: "別の場所の本文", revision: 2 },
+      onReloadEditConflict: reload,
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "別の場所で編集されました",
+    );
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "新しい本文を読み込む" }),
+    );
+    expect(reload).toHaveBeenCalledOnce();
   });
 
   it("書きかけは行ではなく渡されたドラフトが正本になる", () => {

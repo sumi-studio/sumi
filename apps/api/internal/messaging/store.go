@@ -26,19 +26,20 @@ const (
 // never reveals whether a place exists to a caller who cannot see it
 // (ErrPlaceNotFound doubles as the authorization failure for reads).
 var (
-	ErrWorkspaceNotFound   = errors.New("workspace not found")
-	ErrPlaceNotFound       = errors.New("place not found")
-	ErrParticipantNotFound = errors.New("participant not found in the 戸籍")
-	ErrNotAMember          = errors.New("participant is not an active member of the place")
-	ErrNotReachable        = errors.New("participants share no active workspace membership")
-	ErrMessageNotFound     = errors.New("message not found")
-	ErrNotAuthor           = errors.New("only the author may do this")
-	ErrNotAChannel         = errors.New("place is not a channel")
-	ErrInvalidChannelName  = errors.New("channel name must be 1..200 characters")
-	ErrForbidden           = errors.New("participant lacks the required role")
-	ErrMessageDeleted      = errors.New("message is deleted")
-	ErrIdempotencyConflict = errors.New("idempotency key was already used for another reaction mutation")
-	ErrSeqBeyondLatest     = errors.New("seq is beyond the place's latest seq")
+	ErrWorkspaceNotFound       = errors.New("workspace not found")
+	ErrPlaceNotFound           = errors.New("place not found")
+	ErrParticipantNotFound     = errors.New("participant not found in the 戸籍")
+	ErrNotAMember              = errors.New("participant is not an active member of the place")
+	ErrNotReachable            = errors.New("participants share no active workspace membership")
+	ErrMessageNotFound         = errors.New("message not found")
+	ErrNotAuthor               = errors.New("only the author may do this")
+	ErrNotAChannel             = errors.New("place is not a channel")
+	ErrInvalidChannelName      = errors.New("channel name must be 1..200 characters")
+	ErrForbidden               = errors.New("participant lacks the required role")
+	ErrMessageDeleted          = errors.New("message is deleted")
+	ErrMessageRevisionConflict = errors.New("message revision conflict")
+	ErrIdempotencyConflict     = errors.New("idempotency key was already used for another reaction mutation")
+	ErrSeqBeyondLatest         = errors.New("seq is beyond the place's latest seq")
 )
 
 // Store persists the messaging surface. All authorization decisions the

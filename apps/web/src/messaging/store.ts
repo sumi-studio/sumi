@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
-import { ApiMessagingBackend } from "./api-backend";
+import { ApiMessagingBackend, MessagingAPIError } from "./api-backend";
 import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
 import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
@@ -199,6 +199,10 @@ interface MessagingState {
    */
   editingMessageId: string | null;
   editDraft: string;
+  /** 編集開始時の版。外部更新との衝突判定の基準。 */
+  editBaseRevision: number | null;
+  /** 書きかけを保持したまま保存を止めるための、受信済みの新しい本文。 */
+  editConflict: { content: string; revision: number } | null;
   replyTargetId: string | null;
   connection: ConnectionState;
   /**
@@ -241,6 +245,7 @@ interface MessagingState {
   startEdit(messageId: string): void;
   setEditDraft(draft: string): void;
   cancelEdit(): void;
+  reloadEditConflict(): void;
   /** 編集セッションのドラフトをそのまま送る。引数を取らないのは正本が1つだから。 */
   submitEdit(): void;
   deleteMessage(messageId: string): void;
@@ -865,6 +870,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
           lastRead,
           state.selfKey,
         );
+        const incomingRevision = event.message.revision ?? 1;
+        const editConflict =
+          event.type === "message_edited" &&
+          state.editingMessageId === event.message.messageId &&
+          state.editBaseRevision !== null &&
+          incomingRevision !== state.editBaseRevision
+            ? { content: event.message.content, revision: incomingRevision }
+            : state.editConflict;
         return {
           messagesByPlace: { ...state.messagesByPlace, [key]: messages },
           pendingByPlace: { ...state.pendingByPlace, [key]: pending },
@@ -888,6 +901,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 nextContribution.mentions,
             ),
           },
+          editConflict,
         };
       });
       if (event.type === "message_created") presentNotification(event);
@@ -905,6 +919,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           state.lastReadByPlace[key] ?? 0,
           state.selfKey,
         );
+        const editingDeleted =
+          state.editingMessageId === event.message.messageId;
         return {
           messagesByPlace: {
             ...state.messagesByPlace,
@@ -927,6 +943,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
               (state.mentionCountByPlace[key] ?? 0) - contribution.mentions,
             ),
           },
+          ...(editingDeleted
+            ? {
+                editingMessageId: null,
+                editDraft: "",
+                editBaseRevision: null,
+                editConflict: null,
+              }
+            : {}),
         };
       });
       return;
@@ -1359,6 +1383,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     activePlaceKey: null,
     editingMessageId: null,
     editDraft: "",
+    editBaseRevision: null,
+    editConflict: null,
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
@@ -1458,6 +1484,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
         activePlaceKey: key,
         editingMessageId: null,
         editDraft: "",
+        editBaseRevision: null,
+        editConflict: null,
         replyTargetId: null,
         unreadLineByPlace: {
           ...state.unreadLineByPlace,
@@ -1480,6 +1508,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
         activePlaceKey: null,
         editingMessageId: null,
         editDraft: "",
+        editBaseRevision: null,
+        editConflict: null,
         replyTargetId: null,
       });
     },
@@ -1814,6 +1844,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set({
         editingMessageId: messageId,
         editDraft: message.content,
+        editBaseRevision: message.revision ?? 1,
+        editConflict: null,
         replyTargetId: null,
       });
     },
@@ -1824,7 +1856,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     cancelEdit() {
-      set({ editingMessageId: null, editDraft: "" });
+      set({
+        editingMessageId: null,
+        editDraft: "",
+        editBaseRevision: null,
+        editConflict: null,
+      });
+    },
+
+    reloadEditConflict() {
+      const state = get();
+      if (!state.editConflict) return;
+      set({
+        editDraft: state.editConflict.content,
+        editBaseRevision: state.editConflict.revision,
+        editConflict: null,
+      });
     },
 
     submitEdit() {
@@ -1833,9 +1880,37 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const place = key ? parsePlaceKey(key) : null;
       const messageId = state.editingMessageId;
       const trimmed = state.editDraft.trim();
-      if (!key || !place || !messageId) return;
-      if (trimmed) void backend.editMessage(place, messageId, trimmed);
-      set({ editingMessageId: null, editDraft: "" });
+      const expectedRevision = state.editBaseRevision;
+      if (
+        !key ||
+        !place ||
+        !messageId ||
+        !expectedRevision ||
+        state.editConflict ||
+        !trimmed
+      )
+        return;
+      void backend
+        .editMessage(place, messageId, trimmed, expectedRevision)
+        .then(
+          () => get().cancelEdit(),
+          (error: unknown) => {
+            if (!(error instanceof MessagingAPIError) || error.status !== 409)
+              return;
+            set((current) => {
+              if (current.editingMessageId !== messageId) return current;
+              const latest = (current.messagesByPlace[key] ?? []).find(
+                (message) => message.messageId === messageId,
+              );
+              return {
+                editConflict: {
+                  content: latest?.content ?? current.editDraft,
+                  revision: latest?.revision ?? expectedRevision,
+                },
+              };
+            });
+          },
+        );
     },
 
     deleteMessage(messageId) {
@@ -1848,7 +1923,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     setReplyTarget(messageId) {
-      set({ replyTargetId: messageId, editingMessageId: null, editDraft: "" });
+      set({
+        replyTargetId: messageId,
+        editingMessageId: null,
+        editDraft: "",
+        editBaseRevision: null,
+        editConflict: null,
+      });
     },
 
     noteReadUpTo(key, seq) {
@@ -2064,7 +2145,12 @@ useMessaging.subscribe((state, previous) => {
     return;
   }
   if (state.editingMessageId !== null && !hasEditingTarget(state)) {
-    useMessaging.setState({ editingMessageId: null, editDraft: "" });
+    useMessaging.setState({
+      editingMessageId: null,
+      editDraft: "",
+      editBaseRevision: null,
+      editConflict: null,
+    });
   }
 });
 
@@ -2179,6 +2265,8 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     activePlaceKey: null,
     editingMessageId: null,
     editDraft: "",
+    editBaseRevision: null,
+    editConflict: null,
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,

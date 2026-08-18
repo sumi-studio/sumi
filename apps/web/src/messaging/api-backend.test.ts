@@ -872,6 +872,7 @@ function messageWire(
     client_nonce: `nonce-${seq}`,
     created_at: "2026-08-01T10:00:00Z",
     edited_at: null,
+    revision: 1,
     deleted: false,
   };
 }
