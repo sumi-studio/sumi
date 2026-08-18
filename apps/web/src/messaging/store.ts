@@ -159,6 +159,34 @@ interface EditSession {
 
 type EditConflict = Required<MessageContentRevision>;
 
+type EditResponseDisposition = "conflict" | "terminal" | "failure";
+
+/**
+ * PATCH /messages/{message_id} の失敗応答を、保存を続けられるかで分類する。
+ *
+ * | HTTP | code | 処理 |
+ * | --- | --- | --- |
+ * | 409 | edit_conflict | 現在メッセージを競合として提示 |
+ * | 409 | message_deleted | tombstone を投影して編集を終了 |
+ * | 404 | not_found | 対象seqを再取得して反映し、編集を終了 |
+ * | その他 | 任意 | 編集欄に失敗を表示 |
+ *
+ * API が新しいコードを足しても無言で無視しないよう、既知の終端・競合以外は
+ * 必ず failure に落とす。
+ */
+function editResponseDisposition(error: unknown): EditResponseDisposition {
+  if (!(error instanceof MessagingAPIError)) return "failure";
+  switch (`${error.status}:${error.code}`) {
+    case "409:edit_conflict":
+      return "conflict";
+    case "409:message_deleted":
+    case "404:not_found":
+      return "terminal";
+    default:
+      return "failure";
+  }
+}
+
 interface MessagingState {
   capabilities: MessagingCapabilities;
   ready: boolean;
@@ -215,6 +243,8 @@ interface MessagingState {
   editSession: EditSession | null;
   /** 書きかけを保持したまま保存を止めるための、受信済みの新しい本文。 */
   editConflict: EditConflict | null;
+  /** 競合でも対象消滅でもない保存失敗。無言で失敗を捨てない。 */
+  editFailure: string | null;
   replyTargetId: string | null;
   connection: ConnectionState;
   /**
@@ -306,6 +336,7 @@ function clearedEditSession(): Pick<
   | "editBaseRevision"
   | "editSession"
   | "editConflict"
+  | "editFailure"
 > {
   return {
     editingMessageId: null,
@@ -313,6 +344,7 @@ function clearedEditSession(): Pick<
     editBaseRevision: null,
     editSession: null,
     editConflict: null,
+    editFailure: null,
   };
 }
 
@@ -977,6 +1009,76 @@ export const useMessaging = create<MessagingState>((set, get) => {
     });
   };
 
+  const closeCurrentEditSession = (session: EditSession) => {
+    set((state) =>
+      isCurrentEditSession(state, session) ? clearedEditSession() : {},
+    );
+  };
+
+  // 409 message_deleted は通常 revision付きtombstoneを返す。古いサーバーや
+  // 404 not_found は本文を返さないため、編集中だったseqを一点だけ読み直して
+  // 同じ tombstone 投影に載せる。終端応答を受けた以上、再取得失敗時も保存欄は
+  // 開いたままにしない。
+  const reconcileTerminalEditResponse = (
+    session: EditSession,
+    request: MessagingBackendRequest,
+    responseMessage: Message | null,
+  ) => {
+    if (
+      responseMessage?.deleted &&
+      responseMessage.messageId === session.messageId &&
+      placeKey(responseMessage.place) === session.placeKey
+    ) {
+      applyMessageDeleted(responseMessage);
+      return;
+    }
+    const place = parsePlaceKey(session.placeKey);
+    const cached = (get().messagesByPlace[session.placeKey] ?? []).find(
+      (message) => message.messageId === session.messageId,
+    );
+    if (!place || !cached) {
+      closeCurrentEditSession(session);
+      return;
+    }
+    void request
+      .wait((backend) =>
+        backend.fetchMessages(place, { beforeSeq: cached.seq + 1, limit: 1 }),
+      )
+      .then(
+        (messages) => {
+          if (!messages || !request.isCurrent()) return;
+          const refreshed = messages.find(
+            (message) => message.messageId === session.messageId,
+          );
+          if (refreshed?.deleted) {
+            applyMessageDeleted(refreshed);
+            return;
+          }
+          set((state) => {
+            if (!isCurrentEditSession(state, session)) return {};
+            return {
+              ...(refreshed
+                ? {
+                    messagesByPlace: {
+                      ...state.messagesByPlace,
+                      [session.placeKey]: upsertMessage(
+                        state.messagesByPlace[session.placeKey] ?? [],
+                        refreshed,
+                        "snapshot",
+                      ),
+                    },
+                  }
+                : {}),
+              ...clearedEditSession(),
+            };
+          });
+        },
+        () => {
+          if (request.isCurrent()) closeCurrentEditSession(session);
+        },
+      );
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
@@ -1524,6 +1626,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     editBaseRevision: null,
     editSession: null,
     editConflict: null,
+    editFailure: null,
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
@@ -2006,6 +2109,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           token: ++nextEditSessionToken,
         },
         editConflict: null,
+        editFailure: null,
         replyTargetId: null,
       });
     },
@@ -2037,6 +2141,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           token: ++nextEditSessionToken,
         },
         editConflict: null,
+        editFailure: null,
       });
     },
 
@@ -2055,6 +2160,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         !trimmed
       )
         return;
+      set({ editFailure: null });
       const request = beginMessagingBackendRequest();
       void request
         .wait((backend) =>
@@ -2091,13 +2197,32 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
           (error: unknown) => {
             if (!request.isCurrent()) return;
-            if (
-              !(error instanceof MessagingAPIError) ||
-              error.status !== 409 ||
-              error.code !== "edit_conflict" ||
-              !error.currentMessage
-            )
+            const disposition = editResponseDisposition(error);
+            if (disposition === "terminal") {
+              reconcileTerminalEditResponse(
+                session,
+                request,
+                error instanceof MessagingAPIError
+                  ? error.responseMessage
+                  : null,
+              );
               return;
+            }
+            if (
+              disposition !== "conflict" ||
+              !(error instanceof MessagingAPIError) ||
+              !error.currentMessage
+            ) {
+              set((current) =>
+                isCurrentEditSession(current, session)
+                  ? {
+                      editFailure:
+                        "保存できませんでした。もう一度お試しください。",
+                    }
+                  : {},
+              );
+              return;
+            }
             const latest = error.currentMessage;
             set((current) => {
               if (
@@ -2128,6 +2253,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
               return {
                 messagesByPlace,
                 editConflict: conflict,
+                editFailure: null,
               };
             });
           },
@@ -2490,6 +2616,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editBaseRevision: null,
     editSession: null,
     editConflict: null,
+    editFailure: null,
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,

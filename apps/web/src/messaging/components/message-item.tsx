@@ -200,6 +200,7 @@ export interface MessageItemProps {
   /** 編集セッションの書きかけ本文。持ち主は行ではなくstore。 */
   editDraft: string;
   editConflict: { content: string; revision: number } | null;
+  editFailure?: string | null;
   onEditDraftChange: (content: string) => void;
   onSubmitEdit: () => void;
   onCancelEdit: () => void;
@@ -231,6 +232,7 @@ export const MessageItem = memo(function MessageItem({
   editing,
   editDraft,
   editConflict,
+  editFailure,
   onEditDraftChange,
   onSubmitEdit,
   onCancelEdit,
@@ -411,6 +413,7 @@ export const MessageItem = memo(function MessageItem({
                 onSubmit={onSubmitEdit}
                 onCancel={onCancelEdit}
                 conflict={editConflict}
+                failure={editFailure}
                 onReloadConflict={onReloadEditConflict}
                 membersByKey={membersByKey}
                 selfKey={selfKey}

@@ -424,10 +424,15 @@ func TestEditAndDeleteMapAuthorizationOverHTTP(t *testing.T) {
 	if !ok || deleted["revision"] != float64(3) || deleted["deleted"] != true {
 		t.Fatalf("deleted message = %v, want revision 3 tombstone", body)
 	}
-	// Editing the tombstone conflicts.
+	// Editing the tombstone conflicts, and returns the terminal revision so a
+	// disconnected client can project it without waiting for a WS replay.
 	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "復活", "revision": 2})
 	if resp.StatusCode != http.StatusConflict || body["error"] != "message_deleted" {
 		t.Fatalf("edit tombstone: status %d body %v", resp.StatusCode, body)
+	}
+	terminal, ok := body["message"].(map[string]any)
+	if !ok || terminal["revision"] != float64(3) || terminal["deleted"] != true {
+		t.Fatalf("edit tombstone response = %v, want revision 3 tombstone", body)
 	}
 }
 

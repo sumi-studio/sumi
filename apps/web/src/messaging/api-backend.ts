@@ -46,14 +46,17 @@ export class MessagingAPIError extends Error {
   readonly status: number;
   /** 409 edit_conflict が返す、サーバで確定した現在のメッセージ。 */
   readonly currentMessage: Message | null;
+  /** 失敗応答が返した対象メッセージ。tombstone を含み得る。 */
+  readonly responseMessage: Message | null;
 
   constructor(code: string, status: number, body: unknown = null) {
     super(code);
     this.name = "MessagingAPIError";
     this.code = code;
     this.status = status;
+    this.responseMessage = parseResponseMessage(body);
     this.currentMessage =
-      code === "edit_conflict" ? parseConflictMessage(body) : null;
+      code === "edit_conflict" ? this.responseMessage : null;
   }
 }
 
@@ -693,7 +696,7 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 }
 
-function parseConflictMessage(body: unknown): Message | null {
+function parseResponseMessage(body: unknown): Message | null {
   try {
     return parseMessage(asRecord(body).message);
   } catch {

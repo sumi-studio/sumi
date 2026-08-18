@@ -1094,6 +1094,16 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if errors.Is(err, ErrMessageDeleted) {
+			writeJSON(w, http.StatusConflict, struct {
+				Error   string      `json:"error"`
+				Message messageWire `json:"message"`
+			}{
+				Error:   "message_deleted",
+				Message: messageToWire(place, msg),
+			})
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
