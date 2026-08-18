@@ -1,10 +1,13 @@
 import {
+  AtSign,
+  Check,
   CornerUpLeft,
   FileText,
   Loader2,
   Paperclip,
   Pencil,
   RotateCw,
+  SendHorizontal,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,6 +22,8 @@ import type { MemberProfile, Message, Urgency } from "../model";
 import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
+import type { ComposerPlusMenuItem } from "./composer-plus-menu";
+import { ComposerPlusMenu } from "./composer-plus-menu";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 
@@ -102,6 +107,11 @@ export function Composer() {
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const lastTypingAt = useRef(0);
+  // IME変換中か。keydownはeventからisComposingを見られる（lib/ime.ts）が、
+  // クリックのイベントには変換の状態が乗らない。ボタンで送るときに変換を
+  // 終わらせるべきか判断するために、compositionの生死をここで持つ
+  // （message-searchと同じ流儀）。送るか止めるかの判断には使わない。
+  const composing = useRef(false);
   const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
 
   const editingMessage = editingMessageId
@@ -147,24 +157,56 @@ export function Composer() {
       .slice(0, 6);
   }, [mention, membersByKey, selfKey]);
 
-  const updateValue = useCallback(
+  // 入力値の置き場所（編集中はeditValue、通常はdraft）だけを面倒みる。
+  // メンション候補の開閉は呼び出し側の事情で変わるのでここには含めない。
+  const writeValue = useCallback(
     (next: string) => {
       if (editing) {
         setEditValue(next);
-      } else if (activePlaceKey) {
-        setDraft(activePlaceKey, next);
-        const now = Date.now();
-        if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
-          lastTypingAt.current = now;
-          sendTyping();
-        }
+        return;
       }
+      if (!activePlaceKey) return;
+      setDraft(activePlaceKey, next);
+      const now = Date.now();
+      if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
+        lastTypingAt.current = now;
+        sendTyping();
+      }
+    },
+    [editing, activePlaceKey, setDraft, sendTyping],
+  );
+
+  const updateValue = useCallback(
+    (next: string) => {
+      writeValue(next);
       const caret = textareaRef.current?.selectionStart ?? next.length;
       setMention(findMentionQuery(next, caret));
       setMentionIndex(0);
     },
-    [editing, activePlaceKey, setDraft, sendTyping],
+    [writeValue],
   );
+
+  /**
+   * カーソル位置に @ を差し込み、キーボードで打ったのと同じ候補パネルを開く。
+   * 直前が文字ならスペースを補う（findMentionQueryが語頭の @ しか拾わないため）。
+   * DOMのcaretはまだ更新前なので、候補の範囲は挿入後の位置から直接組み立てる。
+   */
+  const insertMentionTrigger = useCallback(() => {
+    const caret = textareaRef.current?.selectionStart ?? value.length;
+    const before = value.slice(0, caret);
+    const inserted = before === "" || /\s$/.test(before) ? "@" : " @";
+    const next = before + inserted + value.slice(caret);
+    const nextCaret = caret + inserted.length;
+    writeValue(next);
+    setMention({ query: "", start: nextCaret - 1, end: nextCaret });
+    setMentionIndex(0);
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(nextCaret, nextCaret);
+    });
+  }, [value, writeValue]);
 
   const applyMention = useCallback(
     (member: MemberProfile) => {
@@ -191,21 +233,55 @@ export function Composer() {
   const readyAttachmentCount = draftAttachments.filter(
     (entry) => entry.status === "ready",
   ).length;
-  const canSend =
-    !editing &&
-    attachmentsSettled &&
-    (value.trim().length > 0 || readyAttachmentCount > 0);
+  const attachmentsFull =
+    draftAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
+  // 送れるか（＝編集なら保存できるか）を、対象の文字列から決める。ボタンの活殺は
+  // 描画時のReactの値で、submitの関門は送る直前の入力欄の中身で、同じ規則を見る。
+  // 編集中の空本文はsubmitEditが黙って捨てるだけなので「保存できない」に倒し、
+  // 取り消しはEsc・×の明示の口に一本化する。
+  const canSubmitText = useCallback(
+    (text: string) =>
+      editing
+        ? text.trim().length > 0
+        : attachmentsSettled &&
+          (text.trim().length > 0 || readyAttachmentCount > 0),
+    [editing, attachmentsSettled, readyAttachmentCount],
+  );
+  const canSubmit = canSubmitText(value);
 
+  /**
+   * 送信・保存の唯一の関門。Enterもボタンもここを通る。
+   *
+   * 押されたら「いま入力欄の箱に入っているもの」を確定して送る。変換中かどうかで
+   * 仕事を変えない。変換中のEnterを止めるのは、そのEnterがIMEの確定という見える
+   * 仕事をするからで、それはEnter経路（onKeyDown）だけの事情。ボタンには対応する
+   * 仕事が無いので、ここで同じように止めると、画面が何も変わらず理由も出ないまま
+   * enabledで居続ける死んだボタンになる。狭い幅ではこれが唯一の送信口なので、
+   * 押されたら必ず「送る」か「送れない理由を出す」のどちらかにする。
+   */
   const submit = useCallback(() => {
-    if (editing) {
-      submitEdit(editValue);
-      return;
+    // 変換の途中で押されたら、まず終わらせる。blurでcompositionendが来る環境
+    // （Chromeデスクトップ）ではそこで確定し、来ない環境（Safari・ソフトキーボード）
+    // でも、いま見えている文字を下でそのまま採る。どちらでも押した瞬間に見えている
+    // ものが送られ、送ったあとに変換の残りが空の入力欄へ戻ることも無い。
+    if (composing.current) {
+      composing.current = false;
+      textareaRef.current?.blur();
     }
-    if (!canSend) return;
-    send(value, urgency);
-    setUrgency("normal");
-    setMention(null);
-  }, [editing, editValue, submitEdit, value, send, urgency, canSend]);
+    // 送る値は入力欄の実際の中身。上のblurで確定した直後は、こちらがReactの値より新しい。
+    const text = textareaRef.current?.value ?? value;
+    if (!canSubmitText(text)) return;
+    if (editing) {
+      submitEdit(text);
+    } else {
+      send(text, urgency);
+      setUrgency("normal");
+      setMention(null);
+    }
+    // どの入口から送っても、次の一文字は入力欄に入る。ボタンを押して送った直後に
+    // ボタンがdisabledになってフォーカスが行き場を失うのを防ぐ意味もある。
+    textareaRef.current?.focus();
+  }, [canSubmitText, editing, submitEdit, value, send, urgency]);
 
   const acceptFiles = useCallback(
     (list: FileList | File[] | null | undefined) => {
@@ -214,6 +290,30 @@ export function Composer() {
       if (files.length > 0) addDraftAttachments(files);
     },
     [editing, addDraftAttachments],
+  );
+
+  // ＋メニューの品書き。入口が増えてもツールバーにボタンを生やさずここへ足す。
+  const plusItems = useMemo<ComposerPlusMenuItem[]>(
+    () => [
+      {
+        id: "attach",
+        label: "ファイルを添付",
+        hint: attachmentsFull
+          ? `1通につき${MAX_ATTACHMENTS_PER_MESSAGE}件まで`
+          : "貼り付け・ドロップも可",
+        icon: Paperclip,
+        disabled: attachmentsFull,
+        onSelect: () => fileInputRef.current?.click(),
+      },
+      {
+        id: "mention",
+        label: "メンション",
+        hint: "@ で相手を呼ぶ",
+        icon: AtSign,
+        onSelect: insertMentionTrigger,
+      },
+    ],
+    [attachmentsFull, insertMentionTrigger],
   );
 
   const onPaste = useCallback(
@@ -315,8 +415,17 @@ export function Composer() {
       ? `#${display.name} へメッセージ`
       : `${display.name} へメッセージ`;
 
-  const attachmentsFull =
-    draftAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
+  // ツールバー右端の一言。送れない理由があるときは、それをEnterにもボタンにも
+  // 共通の理由として出す（幅が狭くても隠さない）。無ければキーボードの案内に戻す。
+  const blockedNotice = editing
+    ? canSubmit
+      ? null
+      : "本文が空だと保存できません（Escで取り消し）"
+    : attachmentOverflow > 0
+      ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
+      : draftAttachments.length > 0 && !attachmentsSettled
+        ? "添付の準備ができると送信できます"
+        : null;
 
   return (
     <section
@@ -354,8 +463,11 @@ export function Composer() {
                   name={member.displayName}
                   size={20}
                 />
-                <span className="font-medium">{member.displayName}</span>
-                <span className="truncate text-muted-foreground text-xs">
+                <span className="shrink-0 font-medium">
+                  {member.displayName}
+                </span>
+                {/* 説明は右端に寄せて、名前だけを縦に目で追えるようにする。 */}
+                <span className="ml-auto truncate text-muted-foreground text-xs">
                   {member.tagline}
                 </span>
               </button>
@@ -422,6 +534,14 @@ export function Composer() {
           value={value}
           onChange={(event) => updateValue(event.target.value)}
           onKeyDown={onKeyDown}
+          onCompositionStart={() => {
+            composing.current = true;
+          }}
+          onCompositionEnd={(event) => {
+            composing.current = false;
+            // 変換中のonChangeは未変換の読みを見ている。確定した値で組み直す。
+            updateValue(event.currentTarget.value);
+          }}
           onPaste={onPaste}
           onClick={(event) => {
             const caret = event.currentTarget.selectionStart ?? 0;
@@ -471,29 +591,40 @@ export function Composer() {
                   event.currentTarget.value = "";
                 }}
               />
-              <button
-                type="button"
-                title={
-                  attachmentsFull
-                    ? `添付は1件のメッセージにつき${MAX_ATTACHMENTS_PER_MESSAGE}件まで`
-                    : "ファイルを添付（貼り付け・ドロップも可）"
-                }
-                aria-label="ファイルを添付"
-                disabled={attachmentsFull}
-                onClick={() => fileInputRef.current?.click()}
-                className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
-              >
-                <Paperclip className="size-4" />
-              </button>
+              <ComposerPlusMenu items={plusItems} finalFocusRef={textareaRef} />
             </>
           ) : null}
-          <span className="ml-auto text-[11px] text-muted-foreground/60">
-            {!editing && attachmentOverflow > 0
-              ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
-              : !editing && draftAttachments.length > 0 && !attachmentsSettled
-                ? "添付の準備ができると送信できます"
-                : "Enterで送信・Shift+Enterで改行"}
-          </span>
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+            {/* 送れない理由は常に出す。理由が無いときのキーボードの案内だけは、
+                編集中は上の編集帯が同じことを言うので出さず、狭い幅では
+                送信ボタンに場所を譲る。 */}
+            {blockedNotice ? (
+              <span className="truncate text-[11px] text-muted-foreground/60">
+                {blockedNotice}
+              </span>
+            ) : editing ? null : (
+              <span className="hidden truncate text-[11px] text-muted-foreground/60 sm:inline">
+                Enterで送信・Shift+Enterで改行
+              </span>
+            )}
+            {/* キーボードを使わずに送れる口。Enter送信と同じsubmitを呼ぶだけで、
+                規律（押されたら確定して送る・送ったら入力欄へ戻す）はsubmitが持つ。
+                mousedownの既定は止めない。止めるとblurによる変換確定を潰してしまう。 */}
+            <button
+              type="button"
+              onClick={submit}
+              disabled={!canSubmit}
+              title={editing ? "編集を保存（Enter）" : "送信（Enter）"}
+              aria-label={editing ? "編集を保存" : "送信"}
+              className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-opacity enabled:hover:opacity-90 disabled:bg-muted disabled:text-muted-foreground/60"
+            >
+              {editing ? (
+                <Check className="size-3.5" />
+              ) : (
+                <SendHorizontal className="size-3.5" />
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </section>
