@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const repositoryRoot = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -290,7 +303,10 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
     launcher,
     /SUMI_MODEL_API_KEY_ENV \\\n+\s+SUMI_EXECUTION_REVIEWER_MODEL_PRESET/,
   );
-  assert.match(launcher, /\[\[ -z "\$\{reviewer_api_key_env\}" \]\] && continue/);
+  assert.match(
+    launcher,
+    /\[\[ -z "\$\{reviewer_api_key_env\}" \]\] && continue/,
+  );
 });
 
 test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async () => {
@@ -329,4 +345,309 @@ test("the allocator exception is bounded to one locked disposable generation", a
   assert.match(launcher, /rm -rf -- "\$\{RUNTIME_ROOT\}"/);
   assert.match(launcher, /fail "a required Sumi process exited"/);
   assert.doesNotMatch(launcher, /--supervisor-allocate/);
+});
+
+/** Lifts one top-level function out of the launcher so a test can drive it. */
+function launcherFunction(launcher, name) {
+  const start = launcher.indexOf(`\n${name}() {\n`);
+  assert.ok(start > 0);
+  const end = launcher.indexOf("\n}\n", start);
+  assert.ok(end > start);
+  return launcher.slice(start + 1, end + 3);
+}
+
+async function runBash(script, environment) {
+  const options = {
+    env: {
+      PATH: process.env.PATH,
+      DISPOSABLE_RUNTIME_ROOT: "/tmp/sumi-real-stack.disposable",
+      HOME: "/home/example",
+      ...environment,
+    },
+  };
+  const preamble = [
+    "set -Eeuo pipefail",
+    'fail() { printf "fail: %s\\n" "$*" >&2; exit 3; }',
+  ].join("\n");
+  try {
+    return {
+      ...(await execFileAsync(
+        "bash",
+        ["-c", `${preamble}\n${script}`],
+        options,
+      )),
+      code: 0,
+    };
+  } catch (error) {
+    return { stdout: error.stdout, stderr: error.stderr, code: error.code };
+  }
+}
+
+/**
+ * Expands the configured attachment root definition, so this test covers the
+ * default and override selection without provisioning a real user-state path.
+ */
+function attachmentRootFor(launcher, environment) {
+  const start = launcher.indexOf('readonly CONFIGURED_PERSISTENT_STATE_ROOT="');
+  const end = launcher.indexOf(
+    "\n",
+    launcher.indexOf('\nPERSISTENT_STATE_ROOT="$(provision_persistent_state_root'),
+  );
+  assert.ok(start > 0 && end > start);
+  const script = [
+    'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
+    launcher.slice(start, end),
+    'printf %s "${CONFIGURED_PERSISTENT_STATE_ROOT}/messaging-attachments"',
+  ].join("\n");
+  return runBash(script, environment);
+}
+
+/** Runs the launcher's own provisioner against a real path on disk. */
+function provisionStateRoot(launcher, root) {
+  const script = [
+    launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
+    launcherFunction(launcher, "provision_persistent_state_root"),
+    `provision_persistent_state_root ${JSON.stringify(root)}`,
+  ].join("\n");
+  return runBash(script, {});
+}
+
+test("uploaded attachment bytes outlive the disposable runtime root", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+
+  // Postgres survives a restart in a named Compose volume, so attachment bytes
+  // must not sit in the tree that shutdown deletes; otherwise the rows outlive
+  // the objects they name and every stored image comes back missing.
+  assert.match(launcher, /rm -rf -- "\$\{RUNTIME_ROOT\}"/);
+  const disposableDirectories = launcher.match(
+    /mkdir -m 0700 \\\n(?:\s+"\$\{[A-Z_]+\}" \\\n)*\s+"\$\{[A-Z_]+\}"\n/,
+  );
+  assert.ok(disposableDirectories);
+  assert.doesNotMatch(disposableDirectories[0], /MESSAGING_ATTACHMENT_DIR/);
+
+  // The disposable-boundary documentation already drifted from the launcher
+  // once, telling developers that shutdown removes all state. Keep the
+  // exception named where they read about shutdown.
+  const guide = await source("docs/local-development.md");
+  assert.doesNotMatch(guide, /deletes all\s+state on shutdown/);
+  assert.match(guide, /SUMI_REAL_STACK_STATE_ROOT/);
+  assert.match(guide, /sumi\/real-stack\/messaging-attachments/);
+
+  for (const [environment, expected] of [
+    [{}, "/home/example/.local/state/sumi/real-stack/messaging-attachments"],
+    [
+      { XDG_STATE_HOME: "/home/example/state" },
+      "/home/example/state/sumi/real-stack/messaging-attachments",
+    ],
+    [
+      {
+        SUMI_REAL_STACK_STATE_ROOT: "/srv/sumi-dev",
+        XDG_STATE_HOME: "/home/example/state",
+      },
+      "/srv/sumi-dev/messaging-attachments",
+    ],
+  ]) {
+    const resolved = await attachmentRootFor(launcher, environment);
+    assert.equal(resolved.code, 0);
+    assert.equal(resolved.stdout, expected);
+  }
+});
+
+test("a relative state root is refused instead of splitting the store", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+
+  // The API runs from apps/api and resolves SUMI_MESSAGING_ATTACHMENT_ROOT from
+  // there, while the launcher creates directories from the invocation
+  // directory. A relative root would therefore point the two at different
+  // places, and would move the store every time the stack is started from
+  // somewhere else.
+  assert.match(
+    launcher.slice(launcher.indexOf('log "starting API"')),
+    /cd "\$\{REPOSITORY_ROOT\}\/apps\/api"/,
+  );
+
+  for (const root of ["sumi-dev-state", "./sumi-dev-state", "../sumi-dev"]) {
+    const refused = await provisionStateRoot(launcher, root);
+    assert.equal(refused.code, 3);
+    assert.match(refused.stderr, /must be an absolute path/);
+    assert.match(
+      refused.stderr,
+      /SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME/,
+    );
+  }
+});
+
+test("the launcher never re-modes a state root it did not create", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  assert.match(
+    launcher,
+    /^PERSISTENT_STATE_ROOT="\$\(provision_persistent_state_root "\$\{CONFIGURED_PERSISTENT_STATE_ROOT\}"\)"$/m,
+  );
+
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    // A root the launcher creates itself is private from the first byte.
+    const created = join(scratch, "new-parent", "nested", "real-stack");
+    const fresh = await provisionStateRoot(launcher, created);
+    assert.equal(fresh.code, 0);
+    assert.equal((await stat(created)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(scratch, "new-parent"))).mode & 0o777, 0o700);
+    assert.equal(
+      (await stat(join(scratch, "new-parent", "nested"))).mode & 0o777,
+      0o700,
+    );
+
+    // A root that already exists may be $HOME, $TMPDIR, or any other directory
+    // with duties of its own. Forcing it to 0700 would strip access the rest of
+    // the system depends on, so the launcher refuses and leaves it untouched.
+    const shared = join(scratch, "shared");
+    await mkdir(shared, { mode: 0o755 });
+    await chmod(shared, 0o755);
+    const refused = await provisionStateRoot(launcher, shared);
+    assert.equal(refused.code, 3);
+    assert.match(refused.stderr, /mode 0700/);
+    assert.equal((await stat(shared)).mode & 0o777, 0o755);
+
+    // An existing root that already satisfies the contract is accepted as is.
+    const private_ = join(scratch, "private");
+    await mkdir(private_, { mode: 0o700 });
+    await chmod(private_, 0o700);
+    const reused = await provisionStateRoot(launcher, private_);
+    assert.equal(reused.code, 0);
+    assert.equal((await stat(private_)).mode & 0o777, 0o700);
+
+    // A symlink is refused too: its target is someone else's directory.
+    const linked = join(scratch, "linked");
+    await symlink(private_, linked);
+    const rejected = await provisionStateRoot(launcher, linked);
+    assert.equal(rejected.code, 3);
+    assert.match(rejected.stderr, /must be a real directory/);
+
+    // Normalizing at the provisioner's entrance keeps a trailing slash from
+    // making bash inspect the symlink target instead of the link itself.
+    const trailingSlashRejected = await provisionStateRoot(
+      launcher,
+      `${linked}/`,
+    );
+    assert.equal(trailingSlashRejected.code, 3);
+    assert.match(trailingSlashRejected.stderr, /must be a real directory/);
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
+});
+
+test("a state root under a writable non-sticky ancestor is refused", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    const writableAncestor = join(scratch, "writable");
+    const root = join(writableAncestor, "real-stack");
+    await mkdir(writableAncestor, { mode: 0o777 });
+    await chmod(writableAncestor, 0o777);
+    await mkdir(root, { mode: 0o700 });
+    await chmod(root, 0o700);
+
+    const refused = await provisionStateRoot(launcher, root);
+    assert.equal(refused.code, 3);
+    assert.match(
+      refused.stderr,
+      new RegExp(`ancestor ${writableAncestor} is writable by group or other`),
+    );
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
+});
+
+test("a state root under an ancestor owned by another user is refused", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const script = [
+    launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
+    "stat() {",
+    '  case "$4" in',
+    '    /foreign-owner) printf "755 4242\\n" ;;',
+    '    /) printf "755 0\\n" ;;',
+    '    *) fail "unexpected stat path: $4" ;;',
+    "  esac",
+    "}",
+    "validate_persistent_state_root_ancestors /foreign-owner/real-stack",
+  ].join("\n");
+
+  const refused = await runBash(script, {});
+  assert.equal(refused.code, 3);
+  assert.match(refused.stderr, /ancestor \/foreign-owner.*owner uid 4242/);
+});
+
+test("a root-owned writable sticky ancestor is accepted", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const script = [
+    launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
+    "stat() {",
+    '  case "$4" in',
+    '    /tmp) printf "1777 0\\n" ;;',
+    '    /) printf "755 0\\n" ;;',
+    '    *) fail "unexpected stat path: $4" ;;',
+    "  esac",
+    "}",
+    "validate_persistent_state_root_ancestors /tmp/real-stack",
+  ].join("\n");
+
+  const accepted = await runBash(script, {});
+  assert.equal(accepted.code, 0);
+});
+
+test("a state root under a writable sticky ancestor is accepted", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    const stickyAncestor = join(scratch, "sticky");
+    const root = join(stickyAncestor, "real-stack");
+    await mkdir(stickyAncestor, { mode: 0o777 });
+    await chmod(stickyAncestor, 0o1777);
+    await mkdir(root, { mode: 0o700 });
+    await chmod(root, 0o700);
+
+    const accepted = await provisionStateRoot(launcher, root);
+    assert.equal(accepted.code, 0);
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
+});
+
+test("a state root with a symlink ancestor passes its canonical path to the API", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));
+  try {
+    const realParent = join(scratch, "real-parent");
+    const linkedParent = join(scratch, "linked-parent");
+    const configuredRoot = join(linkedParent, "real-stack");
+    const canonicalRoot = join(realParent, "real-stack");
+    await mkdir(realParent, { mode: 0o700 });
+    await chmod(realParent, 0o700);
+    await symlink(realParent, linkedParent);
+
+    const provisioned = await provisionStateRoot(launcher, configuredRoot);
+    assert.equal(provisioned.code, 0);
+    assert.equal(provisioned.stdout, `${canonicalRoot}\n`);
+
+    // The launcher constructs the API root from the provisioner's returned
+    // real path, rather than from the configured spelling with its link.
+    assert.match(
+      launcher,
+      /PERSISTENT_STATE_ROOT="\$\(provision_persistent_state_root "\$\{CONFIGURED_PERSISTENT_STATE_ROOT\}"\)"/,
+    );
+    assert.match(
+      launcher,
+      /readonly MESSAGING_ATTACHMENT_DIR="\$\{PERSISTENT_STATE_ROOT\}\/messaging-attachments"/,
+    );
+    assert.match(
+      launcher,
+      /"SUMI_MESSAGING_ATTACHMENT_ROOT=\$\{MESSAGING_ATTACHMENT_DIR\}"/,
+    );
+    assert.equal(
+      `${provisioned.stdout.trim()}/messaging-attachments`,
+      `${canonicalRoot}/messaging-attachments`,
+    );
+  } finally {
+    await rm(scratch, { force: true, recursive: true });
+  }
 });
