@@ -13,6 +13,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -22,7 +23,6 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
-import { useMessaging } from "../messaging/store";
 import {
   clearPendingConfirmation,
   loadPendingConfirmation,
@@ -56,6 +56,7 @@ import {
 } from "./email-link-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
+import { seedSelfProfileFromSession, useSelfProfile } from "./self-profile";
 import {
   AuthAPIError,
   canonicalizeSumiDisplayName,
@@ -867,10 +868,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
 
-  const messagingSelf = useMessaging((state) => state.self);
-  const messagingSelfProfile = useMessaging((state) =>
-    state.self ? state.membersByKey[state.selfKey] : undefined,
-  );
+  const selfProfilesByKey = useSelfProfile((state) => state.profilesByKey);
+
+  // The auth response supplies only the initial presentation value. The
+  // application-level self projection survives Messaging scope replacement and
+  // is later overwritten only by a revisioned confirmed profile.
+  useLayoutEffect(() => {
+    seedSelfProfileFromSession(
+      session.authenticated ? session.user.id : null,
+      session.authenticated ? session.user.displayName : null,
+    );
+  }, [session]);
 
   const user = useMemo<AuthUser | null>(() => {
     if (sessionState === "preissued" && preissuedUserID) {
@@ -884,21 +892,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!session.authenticated) {
       return null;
     }
-    // Messaging has the authoritative, revisioned presentation profile once
-    // its self participant is known. The session copy remains only as the
-    // bootstrap fallback before that projection exists.
-    const messagingDisplayName =
-      messagingSelf?.kind === "human" &&
-      messagingSelf.humanId === session.user.id
-        ? messagingSelfProfile?.displayName
-        : undefined;
+    const profileDisplayName =
+      selfProfilesByKey[`human:${session.user.id}`]?.displayName ?? null;
     return {
       id: session.user.id,
-      displayName: messagingDisplayName ?? session.user.displayName,
+      displayName: profileDisplayName,
       email: null,
       photoURL: null,
     };
-  }, [messagingSelf, messagingSelfProfile, session, sessionState]);
+  }, [selfProfilesByKey, session, sessionState]);
 
   const authorityBindingId =
     sessionState === "authenticated" && session.authenticated

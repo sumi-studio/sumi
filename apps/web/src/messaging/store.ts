@@ -1,4 +1,8 @@
 import { create } from "zustand";
+import {
+  applyConfirmedSelfProfile,
+  seedSelfProfileFromSession,
+} from "../auth/self-profile";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
 import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
@@ -111,18 +115,28 @@ function applyProfile(
 function applyConfirmedProfiles(
   current: Record<ParticipantKey, MemberProfile>,
   profiles: readonly MemberProfile[],
-  options: { knownOnly?: boolean; snapshot?: boolean } = {},
+  options: {
+    knownOnly?: boolean;
+    snapshot?: boolean;
+    selfKey?: ParticipantKey;
+  } = {},
 ): Record<ParticipantKey, MemberProfile> {
+  const projected = profiles.map((profile) => {
+    if (participantKey(profile.participant) !== options.selfKey) return profile;
+    // The self profile is participant-global. Messaging only takes a scoped
+    // copy of the independently maintained projection.
+    return applyConfirmedSelfProfile(profile);
+  });
   if (!options.snapshot) {
     let next = current;
-    for (const profile of profiles) {
+    for (const profile of projected) {
       next = applyProfile(next, profile, !options.knownOnly);
     }
     return next;
   }
 
   let merged: Record<ParticipantKey, MemberProfile> = {};
-  for (const profile of profiles) {
+  for (const profile of projected) {
     const currentProfile = current[participantKey(profile.participant)];
     const winner =
       currentProfile &&
@@ -609,7 +623,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const membersByKey = applyConfirmedProfiles(
         state.membersByKey,
         [profile],
-        { knownOnly: true },
+        { knownOnly: true, selfKey: state.selfKey },
       );
       return membersByKey === state.membersByKey ? {} : { membersByKey };
     });
@@ -1098,7 +1112,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const membersByKey = applyConfirmedProfiles(
       state.membersByKey,
       snapshot.members,
-      { snapshot: true },
+      { snapshot: true, selfKey: state.selfKey },
     );
     const lastReadByPlace = { ...state.lastReadByPlace };
     for (const marker of snapshot.readMarkers) {
@@ -1443,7 +1457,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           const membersByKey = applyConfirmedProfiles(
             get().membersByKey,
             snapshot.members,
-            { snapshot: true },
+            { snapshot: true, selfKey: participantKey(snapshot.self) },
           );
           const statusByKey = applyStatuses(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
@@ -2135,7 +2149,7 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
     membersByKey: applyConfirmedProfiles(
       current.membersByKey,
       snapshot.members,
-      { snapshot: true },
+      { snapshot: true, selfKey: current.selfKey },
     ),
   }));
 }
@@ -2143,6 +2157,7 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  seedSelfProfileFromSession(identity);
   setActiveMessagingScope(null);
   resetMessagingRuntime(unboundMessagingBackend());
 }

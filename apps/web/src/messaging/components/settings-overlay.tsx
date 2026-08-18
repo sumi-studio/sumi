@@ -1,6 +1,7 @@
 import { Check, Copy, Settings, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { create } from "zustand";
+import { useSelfProfile } from "../../auth/self-profile";
 import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import type { ParticipantRef } from "../model";
 import { useMessaging } from "../store";
@@ -102,7 +103,7 @@ function Field({
 /** 名乗り: 表示名とひとこと。 */
 function ProfileSection() {
   const selfKey = useMessaging((state) => state.selfKey);
-  const member = useMessaging((state) => state.membersByKey[selfKey]);
+  const member = useSelfProfile((state) => state.profilesByKey[selfKey]);
   const updateProfile = useMessaging((state) => state.updateProfile);
 
   const canonicalName = member?.displayName ?? "";

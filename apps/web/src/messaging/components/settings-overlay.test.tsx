@@ -11,6 +11,10 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  applyConfirmedSelfProfile,
+  clearSelfProfiles,
+} from "../../auth/self-profile";
 import type { MemberProfile, ParticipantRef } from "../model";
 import { participantKey } from "../model";
 import { useMessaging } from "../store";
@@ -37,20 +41,22 @@ function seed(
   self: ParticipantRef = SELF,
 ) {
   const key = participantKey(self);
+  const profile = {
+    participant: self,
+    displayName: "yohaku",
+    tagline: "デザイン",
+    revision: 1,
+    ...member,
+  };
   useMessaging.setState({
     self,
     selfKey: key,
     membersByKey: {
-      [key]: {
-        participant: self,
-        displayName: "yohaku",
-        tagline: "デザイン",
-        revision: 1,
-        ...member,
-      },
+      [key]: profile,
     },
     updateProfile,
   });
+  applyConfirmedSelfProfile(profile);
 }
 
 beforeEach(() => {
@@ -66,6 +72,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  clearSelfProfiles();
   useSettingsOverlay.setState({ open: false, section: "profile" });
   vi.clearAllMocks();
 });
@@ -165,6 +172,12 @@ describe("個人設定", () => {
           },
         },
       });
+      applyConfirmedSelfProfile({
+        participant: SELF,
+        displayName: "yohaku",
+        tagline: "別タブの更新",
+        revision: 2,
+      });
     });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
@@ -225,8 +238,15 @@ describe("個人設定", () => {
             participant: SELF,
             displayName: "余白",
             tagline: "秘書",
+            revision: 2,
           },
         },
+      });
+      applyConfirmedSelfProfile({
+        participant: SELF,
+        displayName: "余白",
+        tagline: "秘書",
+        revision: 2,
       });
     });
 

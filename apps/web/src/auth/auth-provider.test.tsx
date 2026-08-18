@@ -13,7 +13,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsPopover } from "../components/app-navigation";
 import { Sidebar } from "../messaging/components/sidebar";
 import { MockMessagingServer } from "../messaging/mock-server";
+import { setActiveMessagingScope } from "../messaging/scope";
 import {
+  bindMessagingScope,
   bindMessagingSessionIdentity,
   installMessagingBackend,
   useMessaging,
@@ -272,23 +274,49 @@ describe("canonical Human profile", () => {
     render(
       <AuthProvider>
         <TooltipProvider>
+          <AuthStateProbe />
           <Sidebar selectedPlaceKey={null} workspaceId="ws-sumi" />
           <SettingsPopover />
         </TooltipProvider>
       </AuthProvider>,
     );
     await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
-    await waitFor(() => expect(screen.getByText("yohaku")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("display-name")).toHaveTextContent("yohaku"),
+    );
 
     // 別タブでの保存はこのtabではprofile_updatedだけとして届く。
     await server.updateProfile({ displayName: "別タブの確定名" });
 
     await waitFor(() =>
-      expect(screen.getByText("別タブの確定名")).toBeInTheDocument(),
+      expect(screen.getByTestId("display-name")).toHaveTextContent(
+        "別タブの確定名",
+      ),
     );
+    expect(screen.getAllByText("別タブの確定名")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "設定" }));
     const displayName = screen.getByRole("textbox", { name: "表示名" });
     expect(displayName).toHaveValue("別タブの確定名");
+
+    // Workspace transportを外しても、認証UIはparticipant-globalな投影を読む。
+    setActiveMessagingScope({
+      workspaceId: "ws-sumi",
+      installationId: "installation-sumi",
+      authorityEpoch: "1",
+    });
+    bindMessagingScope(null);
+    expect(useMessaging.getState().self).toBeNull();
+    expect(screen.getByTestId("display-name")).toHaveTextContent(
+      "別タブの確定名",
+    );
+
+    // 同じ参加者で再bindしても、bootstrapと認証UIは同じ確定値に収束する。
+    installMessagingBackend(server);
+    useMessaging.getState().init();
+    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+    expect(screen.getByTestId("display-name")).toHaveTextContent(
+      "別タブの確定名",
+    );
   });
 
   it("reconciles a committed profile update whose response was lost", async () => {
