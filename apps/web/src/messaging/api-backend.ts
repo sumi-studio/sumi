@@ -44,12 +44,16 @@ const UPLOAD_TIMEOUT_MS = 120_000;
 export class MessagingAPIError extends Error {
   readonly code: string;
   readonly status: number;
+  /** 409 edit_conflict が返す、サーバで確定した現在のメッセージ。 */
+  readonly currentMessage: Message | null;
 
-  constructor(code: string, status: number) {
+  constructor(code: string, status: number, body: unknown = null) {
     super(code);
     this.name = "MessagingAPIError";
     this.code = code;
     this.status = status;
+    this.currentMessage =
+      code === "edit_conflict" ? parseConflictMessage(body) : null;
   }
 }
 
@@ -668,16 +672,26 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
     if (!response.ok) {
       let code = "messaging_request_failed";
+      let body: unknown = null;
       try {
-        const body = asRecord(await response.json());
-        if (typeof body.error === "string") code = body.error;
+        body = await response.json();
+        const error = asRecord(body);
+        if (typeof error.error === "string") code = error.error;
       } catch {
         // Status remains the authoritative non-sensitive signal.
       }
-      throw new MessagingAPIError(code, response.status);
+      throw new MessagingAPIError(code, response.status, body);
     }
     if (response.status === 204) return null;
     return response.json() as Promise<unknown>;
+  }
+}
+
+function parseConflictMessage(body: unknown): Message | null {
+  try {
+    return parseMessage(asRecord(body).message);
+  } catch {
+    return null;
   }
 }
 

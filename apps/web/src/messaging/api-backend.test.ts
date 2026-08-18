@@ -149,6 +149,41 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("keeps the server current message on an edit conflict", async () => {
+    const current = {
+      ...messageWire(1, "サーバで確定した本文"),
+      edited_at: "2026-08-18T12:00:00Z",
+      revision: 2,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.endsWith("/messages/message-1")) {
+        return json({ error: "edit_conflict", message: current }, 409);
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.editMessage(channel, "message-1", "古い書きかけ", 1),
+    ).rejects.toMatchObject({
+      code: "edit_conflict",
+      status: 409,
+      currentMessage: expect.objectContaining({
+        content: "サーバで確定した本文",
+        revision: 2,
+      }),
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/places/channel-1/messages/message-1"),
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ content: "古い書きかけ", revision: 1 }),
+      }),
+    );
+  });
+
   it("requests the scoped bounded search projection", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = expectScopedMessagingPath(input);

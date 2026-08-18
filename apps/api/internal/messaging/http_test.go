@@ -257,6 +257,10 @@ func TestEditPatchRejectsStaleRevision(t *testing.T) {
 	if response.StatusCode != http.StatusConflict || body["error"] != "edit_conflict" {
 		t.Fatalf("stale PATCH: status %d body %v, want 409 edit_conflict", response.StatusCode, body)
 	}
+	current, ok := body["message"].(map[string]any)
+	if !ok || current["content"] != "先に保存された本文" || current["revision"] != float64(2) || current["edited_at"] == nil {
+		t.Fatalf("stale PATCH must return the current message: %v", body)
+	}
 }
 
 func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
@@ -396,16 +400,19 @@ func TestEditAndDeleteMapAuthorizationOverHTTP(t *testing.T) {
 	msg := w.send(t, ctx, ch.PlaceID, w.humanB, "元の本文")
 
 	base := "/messaging/places/" + ch.PlaceID + "/messages/" + msg.MessageID
-	resp, body := call(t, ts, http.MethodPatch, base, w.humanA.ID, map[string]any{"content": "書き換え"})
+	resp, body := call(t, ts, http.MethodPatch, base, w.humanA.ID, map[string]any{"content": "書き換え", "revision": 1})
 	if resp.StatusCode != http.StatusForbidden || body["error"] != "not_author" {
 		t.Fatalf("non-author edit: status %d body %v", resp.StatusCode, body)
 	}
-	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "本人の編集"})
+	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "本人の編集", "revision": 1})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("author edit: status %d body %v", resp.StatusCode, body)
 	}
 	if body["message"].(map[string]any)["content"] != "本人の編集" {
 		t.Fatalf("edited message = %v", body["message"])
+	}
+	if body["message"].(map[string]any)["revision"] != float64(2) {
+		t.Fatalf("edited message revision = %v, want 2", body["message"])
 	}
 
 	// Owner (humanA) deletes another's message in a channel.
@@ -414,7 +421,7 @@ func TestEditAndDeleteMapAuthorizationOverHTTP(t *testing.T) {
 		t.Fatalf("owner delete: status %d", resp.StatusCode)
 	}
 	// Editing the tombstone conflicts.
-	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "復活"})
+	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "復活", "revision": 2})
 	if resp.StatusCode != http.StatusConflict || body["error"] != "message_deleted" {
 		t.Fatalf("edit tombstone: status %d body %v", resp.StatusCode, body)
 	}

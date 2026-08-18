@@ -11,6 +11,7 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "../api-backend";
 import { MockMessagingServer } from "../mock-server";
 import type {
   MemberProfile,
@@ -98,6 +99,37 @@ function seedStore(messages: Message[]) {
       notifications: false,
     },
   });
+}
+
+function conflictWire(message: Message) {
+  return {
+    message_id: message.messageId,
+    place:
+      message.place.kind === "channel"
+        ? { kind: "channel", channel_id: message.place.channelId }
+        : { kind: message.place.kind, dm_id: message.place.dmId },
+    seq: message.seq,
+    author:
+      message.author.kind === "human"
+        ? { kind: "human", human_id: message.author.humanId }
+        : {
+            kind: "personality_agent",
+            personality_agent_id: message.author.personalityAgentId,
+          },
+    content: message.content,
+    mentions: [],
+    urgency: message.urgency,
+    reactions: [],
+    attachments: [],
+    reply_to: null,
+    client_nonce: "conflict-nonce",
+    created_at: new Date(message.createdAt).toISOString(),
+    edited_at: message.editedAt
+      ? new Date(message.editedAt).toISOString()
+      : null,
+    revision: message.revision,
+    deleted: message.deleted,
+  };
 }
 
 beforeEach(() => {
@@ -355,5 +387,65 @@ describe("編集セッションのタイムライン整合性", () => {
     const edit = vi.spyOn(backend, "editMessage");
     act(() => useMessaging.getState().submitEdit());
     expect(edit).not.toHaveBeenCalled();
+  });
+
+  it("409の現在メッセージを再読込の版として使い、次の保存を通す", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const current = {
+      ...target,
+      content: "サーバで確定した本文",
+      editedAt: Date.UTC(2026, 7, 18, 12, 0, 0),
+      revision: (target.revision ?? 1) + 1,
+    };
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockRejectedValueOnce(
+        new MessagingAPIError("edit_conflict", 409, {
+          message: conflictWire(current),
+        }),
+      )
+      .mockResolvedValueOnce();
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("自分の書きかけ"));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() => {
+      expect(useMessaging.getState().editConflict).toEqual({
+        content: "サーバで確定した本文",
+        revision: 2,
+      });
+    });
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        ),
+    ).toMatchObject({ content: "サーバで確定した本文", revision: 2 });
+
+    act(() => useMessaging.getState().reloadEditConflict());
+    act(() => useMessaging.getState().setEditDraft("再読込後の保存"));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() =>
+      expect(edit).toHaveBeenLastCalledWith(
+        target.place,
+        target.messageId,
+        "再読込後の保存",
+        2,
+      ),
+    );
+    await waitFor(() =>
+      expect(useMessaging.getState().editingMessageId).toBeNull(),
+    );
   });
 });
