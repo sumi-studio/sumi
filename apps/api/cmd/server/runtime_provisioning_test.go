@@ -58,6 +58,7 @@ type fakeRuntimeProvisioner struct {
 	recovery        map[string]bool
 	reconcileReaps  map[string]bool
 	omitReapReceipt bool
+	inspectErr      error
 }
 
 func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvisioner {
@@ -182,6 +183,9 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 
 func (p *fakeRuntimeProvisioner) Inspect(_ context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
 	p.recorder.add("inspect:" + request.PersonalityAgentID)
+	if p.inspectErr != nil {
+		return runtimeprovision.Inspection{}, p.inspectErr
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	epoch, exists := p.epochs[request.PersonalityAgentID]
@@ -490,6 +494,72 @@ func TestProvisionedProcessStaleStopCannotCloseReplacementListener(t *testing.T)
 	}
 	if current := authorizations.current[paid]; current.Generation != replacement.Generation || current.RPCBootNonce != replacement.RPCBootNonce {
 		t.Fatalf("stale stop fenced replacement authorization: %#v", current)
+	}
+}
+
+func TestProvisionedProcessMonitorFencesAndReconcilesRecoveryBeforeReturning(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	provisioned := process.(*provisionedProcess)
+	provisioned.monitorInterval = time.Millisecond
+
+	if err := provisioned.Wait(); err == nil || !strings.Contains(err.Error(), "left its active epoch") {
+		t.Fatalf("monitor error = %v, want non-active epoch failure", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatalf("monitor retained local runtime authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("monitor returned before fenced recovery reconcile: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedProcessMonitorFencesAndReconcilesAfterInspectError(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	provisioner.inspectErr = errors.New("inspect unavailable")
+	provisioned := process.(*provisionedProcess)
+	provisioned.monitorInterval = time.Millisecond
+
+	if err := provisioned.Wait(); err == nil || !strings.Contains(err.Error(), "inspect unavailable") {
+		t.Fatalf("monitor error = %v, want inspect failure", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatalf("monitor retained local runtime authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("monitor inspect failure returned before fenced reconcile: %v", recorder.calls)
 	}
 }
 

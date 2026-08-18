@@ -1,6 +1,7 @@
 package runtimeprovision
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,101 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestSupervisorRecoveryInspectionDecodesAndPinsFencedReconcile(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+case "$*" in
+  "compose version")
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet runtime"*|*"compose.lifecycle.yaml ps --all --quiet runtime"*)
+    printf '0123456789ab\n'
+    ;;
+  *"compose.lifecycle.yaml ps --status running --quiet executor"*|*"compose.lifecycle.yaml ps --status running --quiet broker"*|*"compose.lifecycle.yaml ps --all --quiet executor"*|*"compose.lifecycle.yaml ps --all --quiet broker"*)
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=recovery-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" inspect-epoch`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real supervisor recovery inspection failed: %v\n%s", err, output)
+	}
+
+	runner := &recordingRunner{outputs: map[string]string{
+		"inspect-epoch": string(output),
+		"reconcile":     `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":7}`,
+	}}
+	backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}
+	inspection, err := backend.Inspect(context.Background(), testPAID)
+	if err != nil {
+		t.Fatalf("decode real supervisor recovery response: %v\n%s", err, output)
+	}
+	if inspection.Phase != PhaseRecovery || inspection.Epoch == nil ||
+		inspection.Epoch.Generation != 7 || inspection.Epoch.RPCBootNonce != "recovery-nonce" {
+		t.Fatalf("decoded recovery inspection = %#v", inspection)
+	}
+	if err := inspection.Validate(); err != nil {
+		t.Fatalf("decoded recovery inspection did not validate: %v", err)
+	}
+	if _, err := backend.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, FencedEpoch: inspection.Epoch,
+	}); err != nil {
+		t.Fatalf("fenced reconcile after decoded recovery inspection: %v", err)
+	}
+	if len(runner.actions) != 2 || runner.actions[0] != "inspect-epoch" || runner.actions[1] != "reconcile" {
+		t.Fatalf("backend actions = %#v, want inspect then fenced reconcile", runner.actions)
+	}
+	for _, expected := range []string{"SUMI_EXPECTED_RPC_GENERATION=7", "SUMI_EXPECTED_RPC_NONCE=recovery-nonce"} {
+		if !strings.Contains(strings.Join(runner.envs[1], "\n"), expected) {
+			t.Fatalf("fenced reconcile omitted %q: %#v", expected, runner.envs[1])
+		}
+	}
+}
 
 func TestSupervisorPrepareDoesNotRequireActivationEnvironment(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {

@@ -616,7 +616,7 @@ func parseSupervisorInspection(output []byte, expectedPersonalityAgentID string)
 		Phase:                   wire.Phase,
 		ReapedThroughGeneration: wire.ReapedThroughGeneration,
 	}
-	if wire.Phase == PhasePrepared || wire.Phase == PhaseActive {
+	if wire.Phase == PhasePrepared || wire.Phase == PhaseActive || wire.Phase == PhaseRecovery {
 		epoch := PreparedEpoch{
 			PersonalityAgentID:   wire.PersonalityAgentID,
 			Generation:           wire.Generation,

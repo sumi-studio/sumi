@@ -214,6 +214,7 @@ func (s *provisionedRuntimeSpawner) Spawn(
 		epoch:           epoch,
 		timeout:         s.config.LifecycleTimeout,
 		teardownTimeout: s.config.TeardownTimeout,
+		monitorInterval: 5 * time.Second,
 		done:            make(chan struct{}),
 	}, nil
 }
@@ -380,13 +381,18 @@ type provisionedProcess struct {
 	epoch           runtimeprovision.PreparedEpoch
 	timeout         time.Duration
 	teardownTimeout time.Duration
+	monitorInterval time.Duration
 	done            chan struct{}
 	stopOnce        sync.Once
 	stopErr         error
 }
 
 func (p *provisionedProcess) Wait() error {
-	ticker := time.NewTicker(5 * time.Second)
+	interval := p.monitorInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -400,14 +406,88 @@ func (p *provisionedProcess) Wait() error {
 			})
 			cancel()
 			if err != nil {
-				return fmt.Errorf("monitor provisioned runtime: %w", err)
+				return p.retireAfterMonitorFailure(fmt.Errorf("monitor provisioned runtime: %w", err))
 			}
 			if inspection.Phase != runtimeprovision.PhaseActive ||
 				inspection.Epoch == nil || *inspection.Epoch != p.epoch {
-				return errors.New("provisioned runtime left its active epoch")
+				return p.retireAfterMonitorFailure(errors.New("provisioned runtime left its active epoch"))
 			}
 		}
 	}
+}
+
+// retireAfterMonitorFailure owns an observed-bad runtime until it has fenced
+// its exact epoch and reconciled it to an observed-empty receipt.  Wait must
+// not simply return here: Manager removes a completed process from its map and
+// does not call Stop after Wait, so returning would strand a surviving local
+// runtime outside lifecycle ownership.
+func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
+	p.stopOnce.Do(func() {
+		defer close(p.done)
+		ctx, cancel := context.WithTimeout(context.Background(), p.teardownTimeout)
+		defer cancel()
+
+		if err := p.authorizations.FenceLocalRuntimeAuthorization(
+			ctx,
+			p.epoch.PersonalityAgentID,
+			p.epoch.Generation,
+			p.epoch.RPCBootNonce,
+		); err != nil {
+			p.stopErr = fmt.Errorf("fence monitored runtime before reconcile: %w", err)
+			return
+		}
+		if err := p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID); err != nil {
+			p.stopErr = fmt.Errorf("close monitored runtime before reconcile: %w", err)
+			return
+		}
+
+		inspection, err := p.provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+			Version:            runtimeprovision.ProtocolVersion,
+			PersonalityAgentID: p.epoch.PersonalityAgentID,
+			FencedEpoch:        &p.epoch,
+		})
+		if err != nil {
+			p.stopErr = fmt.Errorf("reconcile monitored runtime: %w", err)
+			return
+		}
+		if inspection.Phase == runtimeprovision.PhaseUnknown {
+			if inspection.ReapedThroughGeneration == nil ||
+				*inspection.ReapedThroughGeneration != p.epoch.Generation {
+				p.stopErr = errors.New("monitored runtime reconcile did not return an exact observed-empty reap receipt")
+			}
+			return
+		}
+		if inspection.Epoch == nil || *inspection.Epoch != p.epoch {
+			p.stopErr = errors.New("monitored runtime reconcile returned a different live epoch")
+			return
+		}
+
+		var teardown runtimeprovision.Inspection
+		switch inspection.Phase {
+		case runtimeprovision.PhasePrepared:
+			teardown, err = p.provisioner.Abort(ctx, runtimeprovision.AbortRequest{
+				Version: runtimeprovision.ProtocolVersion, PreparedEpoch: p.epoch,
+			})
+		case runtimeprovision.PhaseActive:
+			teardown, err = p.provisioner.Stop(ctx, runtimeprovision.StopRequest{
+				Version: runtimeprovision.ProtocolVersion, PreparedEpoch: p.epoch,
+			})
+		default:
+			p.stopErr = fmt.Errorf("reconcile monitored runtime returned unsupported phase %q", inspection.Phase)
+			return
+		}
+		if err != nil {
+			p.stopErr = fmt.Errorf("retire reconciled monitored runtime: %w", err)
+			return
+		}
+		if teardown.Phase != runtimeprovision.PhaseUnknown ||
+			teardown.PersonalityAgentID != p.epoch.PersonalityAgentID ||
+			teardown.ReapedThroughGeneration == nil ||
+			*teardown.ReapedThroughGeneration != p.epoch.Generation {
+			p.stopErr = errors.New("monitored runtime teardown did not return an exact observed-empty reap receipt")
+		}
+	})
+	return errors.Join(cause, p.stopErr)
 }
 
 func (p *provisionedProcess) Stop() error {
