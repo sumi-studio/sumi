@@ -742,7 +742,7 @@ project_containers_match_expected_roles() {
     --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}' 2>/dev/null)" || return 1
   while IFS=$'\t' read -r container_id service; do
     [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ && -n "${service}" && \
-      -z "${expected[${service}]+set}" && -z "${observed[${service}]+set}" ]] || return 1
+      -n "${expected[${service}]+set}" && -z "${observed[${service}]+set}" ]] || return 1
     observed["${service}"]=1
   done <<< "${output}"
 

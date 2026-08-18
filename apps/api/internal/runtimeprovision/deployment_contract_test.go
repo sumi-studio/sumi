@@ -335,11 +335,21 @@ func TestSupervisorReconcileKeepsFullyRunningProjectActive(t *testing.T) {
 set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
+  "compose version")
+    ;;
+  *"ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\n'
+    printf 'bbbbbbbbbbbb\texecutor\n'
+    printf 'cccccccccccc\tbroker\n'
+    ;;
   *"compose.lifecycle.yaml ps --status running --quiet runtime"*|*"compose.lifecycle.yaml ps --status running --quiet executor"*|*"compose.lifecycle.yaml ps --status running --quiet broker"*)
     printf '0123456789ab\n'
     ;;
   *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=active-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
     ;;
 esac
 `
@@ -387,6 +397,9 @@ exec /usr/bin/stat "$@"
 	}
 	if strings.Contains(string(calls), "compose.lifecycle.yaml down") {
 		t.Fatalf("fully running project unexpectedly ran teardown:\n%s", calls)
+	}
+	if !strings.Contains(string(calls), "ps --all --filter label=com.docker.compose.project=") {
+		t.Fatalf("fully running reconcile did not enumerate all project containers:\n%s", calls)
 	}
 }
 
