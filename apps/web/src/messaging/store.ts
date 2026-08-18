@@ -389,6 +389,36 @@ function unreadContribution(
 let initialized = false;
 let messagingSessionGeneration = 0;
 
+/**
+ * A backend response belongs to the exact transport authority that issued the
+ * request.  Do not let a completion from a disposed backend project into the
+ * replacement session, even when both sessions happen to contain the same
+ * place key.
+ */
+interface MessagingBackendRequest {
+  backend: MessagingBackend;
+  isCurrent(): boolean;
+  wait<T>(
+    operation: (backend: MessagingBackend) => Promise<T>,
+  ): Promise<T | undefined>;
+}
+
+function beginMessagingBackendRequest(): MessagingBackendRequest {
+  const requestBackend = backend;
+  const sessionGeneration = messagingSessionGeneration;
+  const isCurrent = () =>
+    backend === requestBackend &&
+    messagingSessionGeneration === sessionGeneration;
+  return {
+    backend: requestBackend,
+    isCurrent,
+    async wait<T>(operation: (requestBackend: MessagingBackend) => Promise<T>) {
+      const response = await operation(requestBackend);
+      return isCurrent() ? response : undefined;
+    },
+  };
+}
+
 type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
 
 interface ReactionProjectionOperation {
@@ -401,6 +431,7 @@ interface ReactionProjectionCoordinator {
   backend: MessagingBackend;
   epoch: number;
   pending: number;
+  request: MessagingBackendRequest;
   sessionGeneration: number;
   tail: Promise<void>;
 }
@@ -664,10 +695,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
     produce: (
       operationBackend: MessagingBackend,
       isCurrent: () => boolean,
+      request: MessagingBackendRequest,
     ) => Promise<() => void>,
   ): Promise<void> => {
     const key = placeKey(place);
-    const operationBackend = backend;
+    const request = beginMessagingBackendRequest();
+    const operationBackend = request.backend;
     const sessionGeneration = messagingSessionGeneration;
     let coordinator = reactionProjectionByPlace.get(key);
     if (
@@ -680,6 +713,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         backend: operationBackend,
         epoch: 0,
         pending: 0,
+        request,
         sessionGeneration,
         tail: Promise.resolve(),
       };
@@ -689,9 +723,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     target.pending += 1;
     const task = target.tail.then(async () => {
       const isCurrent = () =>
-        backend === operationBackend &&
-        messagingSessionGeneration === sessionGeneration &&
-        reactionProjectionByPlace.get(key) === target;
+        request.isCurrent() && reactionProjectionByPlace.get(key) === target;
       if (!isCurrent()) return;
       const operation: ReactionProjectionOperation = {
         epoch: ++target.epoch,
@@ -699,7 +731,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       };
       target.active = operation;
       try {
-        const applySnapshot = await produce(operationBackend, isCurrent);
+        const applySnapshot = await produce(
+          operationBackend,
+          isCurrent,
+          target.request,
+        );
         if (
           !isCurrent() ||
           target.active !== operation ||
@@ -738,74 +774,77 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * serverの上限ごとに遡って読み直す。
    */
   const resyncReactions = (place: Place): Promise<void> =>
-    enqueueReactionProjection(place, async (resyncBackend, isCurrent) => {
-      const key = placeKey(place);
-      const loaded = get().messagesByPlace[key];
-      if (!loaded || loaded.length === 0) return () => undefined;
-      const reactionsById = new Map<string, ReactionSummary[]>();
-      const ranges: { oldestSeq: number; newestSeq: number }[] = [];
-      for (const message of [...loaded].sort(
-        (left, right) => left.seq - right.seq,
-      )) {
-        const current = ranges[ranges.length - 1];
-        if (current && message.seq <= current.newestSeq + 1) {
-          current.newestSeq = Math.max(current.newestSeq, message.seq);
-        } else {
-          ranges.push({ oldestSeq: message.seq, newestSeq: message.seq });
-        }
-      }
-
-      // loadPlaceAroundで離れたwindowが併存し得るため、件数ではなく連続seq範囲
-      // ごとに取得する。gapをページ送りで横断せず、各windowを確実に覆う。
-      for (const range of ranges.reverse()) {
-        let beforeSeq = range.newestSeq + 1;
-        while (beforeSeq > range.oldestSeq) {
-          const limit = Math.min(
-            beforeSeq - range.oldestSeq,
-            REACTION_RESYNC_LIMIT,
-          );
-          const fresh = await resyncBackend.fetchMessages(place, {
-            beforeSeq,
-            limit,
-          });
-          if (!isCurrent()) return () => undefined;
-          if (fresh.length === 0) break;
-          for (const message of fresh) {
-            reactionsById.set(message.messageId, message.reactions);
+    enqueueReactionProjection(
+      place,
+      async (_resyncBackend, isCurrent, request) => {
+        const key = placeKey(place);
+        const loaded = get().messagesByPlace[key];
+        if (!loaded || loaded.length === 0) return () => undefined;
+        const reactionsById = new Map<string, ReactionSummary[]>();
+        const ranges: { oldestSeq: number; newestSeq: number }[] = [];
+        for (const message of [...loaded].sort(
+          (left, right) => left.seq - right.seq,
+        )) {
+          const current = ranges[ranges.length - 1];
+          if (current && message.seq <= current.newestSeq + 1) {
+            current.newestSeq = Math.max(current.newestSeq, message.seq);
+          } else {
+            ranges.push({ oldestSeq: message.seq, newestSeq: message.seq });
           }
-          const nextBeforeSeq = Math.min(
-            ...fresh.map((message) => message.seq),
-          );
-          if (nextBeforeSeq >= beforeSeq) break;
-          beforeSeq = nextBeforeSeq;
         }
-      }
 
-      return () => {
-        set((state) => {
-          const current = state.messagesByPlace[key];
-          if (!current) return {};
-          let changed = false;
-          const next = current.map((message) => {
-            const reactions = reactionsById.get(message.messageId);
-            if (
-              message.deleted ||
-              !reactions ||
-              reactionsFingerprint(reactions) ===
-                reactionsFingerprint(message.reactions)
-            ) {
-              return message;
+        // loadPlaceAroundで離れたwindowが併存し得るため、件数ではなく連続seq範囲
+        // ごとに取得する。gapをページ送りで横断せず、各windowを確実に覆う。
+        for (const range of ranges.reverse()) {
+          let beforeSeq = range.newestSeq + 1;
+          while (beforeSeq > range.oldestSeq) {
+            const limit = Math.min(
+              beforeSeq - range.oldestSeq,
+              REACTION_RESYNC_LIMIT,
+            );
+            const fresh = await request.wait((backend) =>
+              backend.fetchMessages(place, { beforeSeq, limit }),
+            );
+            if (!fresh) return () => undefined;
+            if (!isCurrent()) return () => undefined;
+            if (fresh.length === 0) break;
+            for (const message of fresh) {
+              reactionsById.set(message.messageId, message.reactions);
             }
-            changed = true;
-            return { ...message, reactions };
+            const nextBeforeSeq = Math.min(
+              ...fresh.map((message) => message.seq),
+            );
+            if (nextBeforeSeq >= beforeSeq) break;
+            beforeSeq = nextBeforeSeq;
+          }
+        }
+
+        return () => {
+          set((state) => {
+            const current = state.messagesByPlace[key];
+            if (!current) return {};
+            let changed = false;
+            const next = current.map((message) => {
+              const reactions = reactionsById.get(message.messageId);
+              if (
+                message.deleted ||
+                !reactions ||
+                reactionsFingerprint(reactions) ===
+                  reactionsFingerprint(message.reactions)
+              ) {
+                return message;
+              }
+              changed = true;
+              return { ...message, reactions };
+            });
+            if (!changed) return {};
+            return {
+              messagesByPlace: { ...state.messagesByPlace, [key]: next },
+            };
           });
-          if (!changed) return {};
-          return {
-            messagesByPlace: { ...state.messagesByPlace, [key]: next },
-          };
-        });
-      };
-    });
+        };
+      },
+    );
 
   const applyReactionUpdate = (event: ReactionUpdatedEvent) => {
     const coordinator = reactionProjectionByPlace.get(placeKey(event.place));
@@ -824,8 +863,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 変えたりmarkerを作った／解いたりした分は、cursorでは戻らない。
    */
   const resyncPresence = async () => {
-    const currentBackend = backend;
-    const sessionGeneration = messagingSessionGeneration;
+    const request = beginMessagingBackendRequest();
     const resync = {
       generation: ++presenceResyncGeneration,
       // このfetchより前のprojectionはsnapshotに含まれる。先行generationの
@@ -834,12 +872,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
     };
     pendingPresenceResync = resync;
     try {
-      const presence = await currentBackend.fetchPresence();
+      const presence = await request.wait((backend) => backend.fetchPresence());
+      if (!presence) return;
       if (
-        backend !== currentBackend ||
+        !request.isCurrent() ||
         pendingPresenceResync !== resync ||
-        presenceResyncGeneration !== resync.generation ||
-        messagingSessionGeneration !== sessionGeneration
+        presenceResyncGeneration !== resync.generation
       ) {
         return;
       }
@@ -1098,12 +1136,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 知らなかったplaceだけにする。
    */
   const reconcilePlaces = async () => {
-    const currentBackend = backend;
+    const request = beginMessagingBackendRequest();
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = get().selfKey;
-    const snapshot = await currentBackend.bootstrap();
+    const snapshot = await request.wait((backend) => backend.bootstrap());
+    if (!snapshot) return;
     if (
-      backend !== currentBackend ||
+      !request.isCurrent() ||
       getMessagingSessionIdentity() !== currentIdentity ||
       get().selfKey !== expectedSelfKey ||
       participantKey(snapshot.self) !== expectedSelfKey
@@ -1152,7 +1191,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
       // durable eventがreplayされるようにする。applyEventは同一参照なので
       // listenerは重複しない。
-      currentBackend.subscribe(applyEvent, { sinceByPlace });
+      request.backend.subscribe(applyEvent, { sinceByPlace });
     }
   };
 
@@ -1161,7 +1200,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
     if (get().messagesByPlace[key]) return;
-    const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
+    const request = beginMessagingBackendRequest();
+    const messages = await request.wait((backend) =>
+      backend.fetchMessages(place, { limit: PAGE_SIZE }),
+    );
+    if (!messages || !request.isCurrent()) return;
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
@@ -1179,16 +1222,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const dispatchSend = (key: PlaceKey, pending: PendingMessage) => {
     const place = parsePlaceKey(key);
     if (!place) return;
-    backend
-      .sendMessage({
-        place,
-        content: pending.content,
-        urgency: pending.urgency,
-        replyTo: pending.replyTo,
-        clientNonce: pending.clientNonce,
-        attachments: pending.attachments.map((entry) => entry.attachmentId),
-      })
+    const request = beginMessagingBackendRequest();
+    request
+      .wait((backend) =>
+        backend.sendMessage({
+          place,
+          content: pending.content,
+          urgency: pending.urgency,
+          replyTo: pending.replyTo,
+          clientNonce: pending.clientNonce,
+          attachments: pending.attachments.map((entry) => entry.attachmentId),
+        }),
+      )
       .then(async (receipt) => {
+        if (!receipt || !request.isCurrent()) return;
         let confirmed = (get().messagesByPlace[key] ?? []).some(
           (message) =>
             message.messageId === receipt.messageId ||
@@ -1196,10 +1243,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
         );
         if (!confirmed) {
           // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
-          const messages = await backend.fetchMessages(place, {
-            beforeSeq: receipt.seq + 1,
-            limit: 1,
-          });
+          const messages = await request.wait((backend) =>
+            backend.fetchMessages(place, {
+              beforeSeq: receipt.seq + 1,
+              limit: 1,
+            }),
+          );
+          if (!messages || !request.isCurrent()) return;
           const committed = messages.find(
             (message) => message.messageId === receipt.messageId,
           );
@@ -1227,6 +1277,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         }));
       })
       .catch(() => {
+        if (!request.isCurrent()) return;
         set((state) => ({
           pendingByPlace: {
             ...state.pendingByPlace,
@@ -1307,11 +1358,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     if (!entry) return;
     const controller = new AbortController();
     entry.controller = controller;
-    const currentBackend = backend;
-    const sessionGeneration = messagingSessionGeneration;
+    const request = beginMessagingBackendRequest();
     const stillLive = () =>
-      backend === currentBackend &&
-      messagingSessionGeneration === sessionGeneration &&
+      request.isCurrent() &&
       (get().draftAttachmentsByPlace[key] ?? []).some(
         (candidate) => candidate.clientNonce === draft.clientNonce,
       );
@@ -1327,17 +1376,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ),
         },
       }));
-    currentBackend
-      .uploadAttachment({
-        place,
-        clientNonce: draft.clientNonce,
-        filename: draft.filename,
-        contentType: draft.contentType,
-        body: entry.file,
-        signal: controller.signal,
-      })
+    request
+      .wait((backend) =>
+        backend.uploadAttachment({
+          place,
+          clientNonce: draft.clientNonce,
+          filename: draft.filename,
+          contentType: draft.contentType,
+          body: entry.file,
+          signal: controller.signal,
+        }),
+      )
       .then((receipt) => {
-        if (!stillLive()) return;
+        if (!receipt || !stillLive()) return;
         patch({
           status: "ready",
           attachment: receipt.attachment,
@@ -1365,7 +1416,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     levelByPlace: Record<PlaceKey, NotificationLevel>;
     keywords: string[];
   }): Promise<NotificationWriteResult> => {
-    const sessionBackend = backend;
+    const request = beginMessagingBackendRequest();
     const state = get();
     const previous: NotificationSettingState = {
       notificationDefaultLevel: state.notificationDefaultLevel,
@@ -1384,7 +1435,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         // already queued on the old promise still exists. Never let it use the
         // replacement backend or mutate the replacement session's confirmed
         // rollback point.
-        if (backend !== sessionBackend) return "superseded";
+        if (!request.isCurrent()) return "superseded";
         // 送る番が来るまでにもっと新しい設定になっていたら、この一本は要らない。
         if (generation !== notificationWriteGeneration) return "superseded";
         const perPlace: { place: Place; level: NotificationLevel }[] = [];
@@ -1393,14 +1444,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
           if (place) perPlace.push({ place, level });
         }
         try {
-          const confirmed = notificationSettingState(
-            await sessionBackend.setNotificationSetting({
+          const response = await request.wait((backend) =>
+            backend.setNotificationSetting({
               defaults: { level: next.defaultLevel },
               perPlace,
               keywords: next.keywords,
             }),
           );
-          if (backend !== sessionBackend) return "superseded";
+          if (!response || !request.isCurrent()) return "superseded";
+          const confirmed = notificationSettingState(response);
           confirmedNotificationSetting = confirmed;
           // 追い越されていれば後続の書き込みが正。確定値は覚えるが手元は触らない。
           if (generation !== notificationWriteGeneration) return "superseded";
@@ -1408,7 +1460,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           return "confirmed";
         } catch {
           if (
-            backend !== sessionBackend ||
+            !request.isCurrent() ||
             generation !== notificationWriteGeneration
           ) {
             return "superseded";
@@ -1465,9 +1517,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
-      void backend
-        .bootstrap()
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) => backend.bootstrap())
         .then((snapshot) => {
+          if (!snapshot || !request.isCurrent()) return;
           const membersByKey: Record<ParticipantKey, MemberProfile> = {};
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
@@ -1497,7 +1551,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           );
           set({
             ready: true,
-            capabilities: backend.capabilities,
+            capabilities: request.backend.capabilities,
             self: snapshot.self,
             selfKey: participantKey(snapshot.self),
             workspaces: snapshot.workspaces,
@@ -1513,12 +1567,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
             employedAgents: snapshot.employedAgents,
           });
           scheduleStatusExpiry();
-          backend.subscribe(applyEvent, { sinceByPlace });
+          request.backend.subscribe(applyEvent, { sinceByPlace });
           // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
           // 再接続なので、replayされないplace lifecycleを読み直す。presenceは
           // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
           let connectedOnce = false;
-          backend.subscribeConnection((connection) => {
+          request.backend.subscribeConnection((connection) => {
             set((state) => ({
               connection,
               everConnected: state.everConnected || connection === "connected",
@@ -1534,6 +1588,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           });
         })
         .catch(() => {
+          if (!request.isCurrent()) return;
           initialized = false;
           set({ connection: "disconnected" });
         });
@@ -1581,17 +1636,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async createChannel(workspaceId, name, topic, voice) {
-      const currentBackend = backend;
+      const request = beginMessagingBackendRequest();
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
-      const channel = await currentBackend.createChannel(
-        workspaceId,
-        name,
-        topic,
-        voice,
+      const channel = await request.wait((backend) =>
+        backend.createChannel(workspaceId, name, topic, voice),
       );
       if (
-        backend !== currentBackend ||
+        !channel ||
+        !request.isCurrent() ||
         getMessagingSessionIdentity() !== currentIdentity ||
         get().selfKey !== expectedSelfKey
       ) {
@@ -1611,7 +1664,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (get().startingDM !== null) {
         throw new Error("A DM start is already pending");
       }
-      const currentBackend = backend;
+      const request = beginMessagingBackendRequest();
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
       const token = ++nextDMStartToken;
@@ -1619,10 +1672,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
       try {
         const dm =
           participants.length === 1
-            ? await currentBackend.ensureDM(first)
-            : await currentBackend.createGroupDM(participants);
+            ? await request.wait((backend) => backend.ensureDM(first))
+            : await request.wait((backend) =>
+                backend.createGroupDM(participants),
+              );
         if (
-          backend !== currentBackend ||
+          !dm ||
+          !request.isCurrent() ||
           getMessagingSessionIdentity() !== currentIdentity ||
           get().selfKey !== expectedSelfKey
         ) {
@@ -1644,7 +1700,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async updateChannelTopic(channelId, topic) {
-      const channel = await backend.updateChannelTopic(channelId, topic);
+      const request = beginMessagingBackendRequest();
+      const channel = await request.wait((backend) =>
+        backend.updateChannelTopic(channelId, topic),
+      );
+      if (!channel || !request.isCurrent()) return;
       set((state) => ({
         channels: state.channels.map((entry) =>
           entry.channelId === channel.channelId ? channel : entry,
@@ -1653,7 +1713,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async searchMessages(query) {
-      return backend.searchMessages(query);
+      const request = beginMessagingBackendRequest();
+      const messages = await request.wait((backend) =>
+        backend.searchMessages(query),
+      );
+      if (!messages || !request.isCurrent()) {
+        throw new Error("Messaging session changed during message search");
+      }
+      return messages;
     },
 
     async loadPlaceAround(key, seq) {
@@ -1666,10 +1733,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return true;
       }
-      const messages = await backend.fetchMessages(place, {
-        beforeSeq: seq + 1,
-        limit: 50,
-      });
+      const request = beginMessagingBackendRequest();
+      const messages = await request.wait((backend) =>
+        backend.fetchMessages(place, { beforeSeq: seq + 1, limit: 50 }),
+      );
+      if (!messages || !request.isCurrent()) return false;
       set((state) => ({
         messagesByPlace: {
           ...state.messagesByPlace,
@@ -1968,10 +2036,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
         !trimmed
       )
         return;
-      void backend
-        .editMessage(place, session.messageId, trimmed, session.revision)
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) =>
+          backend.editMessage(
+            place,
+            session.messageId,
+            trimmed,
+            session.revision,
+          ),
+        )
         .then(
           (committed) => {
+            if (!committed || !request.isCurrent()) return;
             set((current) => {
               if (
                 committed.messageId !== session.messageId ||
@@ -1993,6 +2070,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             });
           },
           (error: unknown) => {
+            if (!request.isCurrent()) return;
             if (
               !(error instanceof MessagingAPIError) ||
               error.status !== 409 ||
@@ -2040,14 +2118,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       if (!key || !place) return;
-      void backend.deleteMessage(place, messageId).then((committed) => {
-        if (
-          committed.messageId !== messageId ||
-          placeKey(committed.place) !== key
-        )
-          return;
-        applyMessageDeleted(committed);
-      });
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) => backend.deleteMessage(place, messageId))
+        .then((committed) => {
+          if (!committed || !request.isCurrent()) return;
+          if (
+            committed.messageId !== messageId ||
+            placeKey(committed.place) !== key
+          )
+            return;
+          applyMessageDeleted(committed);
+        });
     },
 
     setReplyTarget(messageId) {
@@ -2080,26 +2162,25 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ).length,
         },
       }));
-      void backend.markRead(place, seq);
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) => backend.markRead(place, seq))
+        .catch(() => undefined);
     },
 
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
     setStatus(status, note) {
-      const currentBackend = backend;
-      const sessionGeneration = messagingSessionGeneration;
-      void currentBackend.setStatus(status, note).then(
-        (canonical) => {
-          if (
-            backend !== currentBackend ||
-            messagingSessionGeneration !== sessionGeneration
-          ) {
-            return;
-          }
-          applyPresenceProjection({ type: "status", status: canonical });
-        },
-        () => undefined,
-      );
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) => backend.setStatus(status, note))
+        .then(
+          (canonical) => {
+            if (!canonical || !request.isCurrent()) return;
+            applyPresenceProjection({ type: "status", status: canonical });
+          },
+          () => undefined,
+        );
     },
 
     setPlaceNotificationLevel(key, level) {
@@ -2137,22 +2218,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
-      const currentBackend = backend;
-      const sessionGeneration = messagingSessionGeneration;
-      void currentBackend
-        .createReplyLater(
-          message.place,
-          message.messageId,
-          Date.now() + delayMs,
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) =>
+          backend.createReplyLater(
+            message.place,
+            message.messageId,
+            Date.now() + delayMs,
+          ),
         )
         .then(
           (canonical) => {
-            if (
-              backend !== currentBackend ||
-              messagingSessionGeneration !== sessionGeneration
-            ) {
-              return;
-            }
+            if (!canonical || !request.isCurrent()) return;
             applyPresenceProjection({ type: "reply_later", marker: canonical });
           },
           () => undefined,
@@ -2163,13 +2240,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const clientNonce = secureRandomUUID();
       void enqueueReactionProjection(
         message.place,
-        async (operationBackend, isCurrent) => {
-          const canonical = await operationBackend.toggleReaction(
-            message.place,
-            message.messageId,
-            emoji,
-            clientNonce,
+        async (_operationBackend, isCurrent, request) => {
+          const canonical = await request.wait((backend) =>
+            backend.toggleReaction(
+              message.place,
+              message.messageId,
+              emoji,
+              clientNonce,
+            ),
           );
+          if (!canonical || !request.isCurrent()) return () => undefined;
           if (!isCurrent()) return () => undefined;
           if (canonical.messageId !== message.messageId) {
             throw new Error("Reaction acknowledgement target mismatch");
@@ -2194,10 +2274,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((entry) => ({
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
-      const older = await backend.fetchMessages(place, {
-        beforeSeq: current[0].seq,
-        limit: PAGE_SIZE,
-      });
+      const request = beginMessagingBackendRequest();
+      const older = await request.wait((backend) =>
+        backend.fetchMessages(place, {
+          beforeSeq: current[0].seq,
+          limit: PAGE_SIZE,
+        }),
+      );
+      if (!older || !request.isCurrent()) return;
       set((entry) => {
         const existing = entry.messagesByPlace[key] ?? [];
         return {
@@ -2215,20 +2299,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     resolveReplyLater(markerId) {
-      const currentBackend = backend;
-      const sessionGeneration = messagingSessionGeneration;
-      void currentBackend.resolveReplyLater(markerId).then(
-        (canonical) => {
-          if (
-            backend !== currentBackend ||
-            messagingSessionGeneration !== sessionGeneration
-          ) {
-            return;
-          }
-          applyPresenceProjection({ type: "reply_later", marker: canonical });
-        },
-        () => undefined,
-      );
+      const request = beginMessagingBackendRequest();
+      void request
+        .wait((backend) => backend.resolveReplyLater(markerId))
+        .then(
+          (canonical) => {
+            if (!canonical || !request.isCurrent()) return;
+            applyPresenceProjection({ type: "reply_later", marker: canonical });
+          },
+          () => undefined,
+        );
     },
 
     sendTyping() {
@@ -2291,12 +2371,15 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
   const state = useMessaging.getState();
   if (!state.ready || !state.selfKey) return;
 
-  const currentBackend = backend;
+  const request = beginMessagingBackendRequest();
   const currentIdentity = messagingSessionIdentity;
   const expectedSelfKey = state.selfKey;
-  const snapshot = await currentBackend.bootstrap();
+  const snapshot = await request.wait((backend) => backend.bootstrap());
+  if (!snapshot) {
+    throw new Error("Messaging session changed during profile refresh");
+  }
   if (
-    backend !== currentBackend ||
+    !request.isCurrent() ||
     messagingSessionIdentity !== currentIdentity ||
     useMessaging.getState().selfKey !== expectedSelfKey ||
     participantKey(snapshot.self) !== expectedSelfKey
