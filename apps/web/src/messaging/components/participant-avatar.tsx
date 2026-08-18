@@ -13,10 +13,17 @@ function hueFor(key: string): number {
   return ((hash % 360) + 360) % 360;
 }
 
-const STATUS_DOT: Record<StatusKind, string> = {
+/** 自己申告ステータスの色と日本語表示。参加者UI全体で1か所に持つ。 */
+export const STATUS_DOT: Record<StatusKind, string> = {
   available: "bg-emerald-500",
   busy: "bg-rose-500",
   away: "bg-amber-400",
+};
+
+export const STATUS_LABEL: Record<StatusKind, string> = {
+  available: "対応可能",
+  busy: "取り込み中",
+  away: "離席中",
 };
 
 export function ParticipantAvatar({

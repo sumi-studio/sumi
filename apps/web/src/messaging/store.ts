@@ -1,9 +1,9 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
-import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
   ChannelSummary,
@@ -94,6 +94,7 @@ function unboundMessagingBackend(): MessagingBackend {
 }
 
 let backend: MessagingBackend = unboundMessagingBackend();
+let nextDMStartToken = 0;
 
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
@@ -137,6 +138,12 @@ interface MessagingState {
   workspaces: WorkspaceSummary[];
   channels: ChannelSummary[];
   dms: DmSummary[];
+  /**
+   * 進行中のDM開始。導線ごとにpendingを持つと、メンバーリストとプロフィール
+   * カードから2本のstartDMが走り、完了順で意図しないplaceへ飛ぶ。保留は
+   * 同時に一つで、その一つをここに置く——入口はここだけを見る。
+   */
+  startingDM: PendingDMStart | null;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -224,6 +231,15 @@ interface MessagingState {
   loadOlder(key: PlaceKey): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
+}
+
+/**
+ * 進行中のDM開始。participantsはUIが「誰にDMを始めているか」を表示するための値で、
+ * tokenは開始を一意に識別して、古い開始のfinallyが新しい保留を解放しないための値。
+ */
+interface PendingDMStart {
+  participants: ParticipantRef[];
+  token: number;
 }
 
 function resolveMentions(
@@ -1231,6 +1247,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     workspaces: [],
     channels: [],
     dms: [],
+    startingDM: null,
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -1404,26 +1421,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
     async startDM(participants) {
       const [first] = participants;
       if (!first) throw new Error("participants are required");
+      if (get().startingDM !== null) {
+        throw new Error("A DM start is already pending");
+      }
       const currentBackend = backend;
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
-      const dm =
-        participants.length === 1
-          ? await currentBackend.ensureDM(first)
-          : await currentBackend.createGroupDM(participants);
-      if (
-        backend !== currentBackend ||
-        getMessagingSessionIdentity() !== currentIdentity ||
-        get().selfKey !== expectedSelfKey
-      ) {
-        throw new Error("Messaging session changed during DM start");
+      const token = ++nextDMStartToken;
+      set({ startingDM: { participants, token } });
+      try {
+        const dm =
+          participants.length === 1
+            ? await currentBackend.ensureDM(first)
+            : await currentBackend.createGroupDM(participants);
+        if (
+          backend !== currentBackend ||
+          getMessagingSessionIdentity() !== currentIdentity ||
+          get().selfKey !== expectedSelfKey
+        ) {
+          throw new Error("Messaging session changed during DM start");
+        }
+        set((state) =>
+          state.dms.some((entry) => entry.dmId === dm.dmId)
+            ? {}
+            : { dms: [...state.dms, dm] },
+        );
+        return placeKey({ kind: dm.kind, dmId: dm.dmId });
+      } finally {
+        // session/scopeのreset後に新しい開始が同じparticipants配列を再利用しても、
+        // 古いfinallyは自分のtoken以外の保留を解放しない。
+        set((state) =>
+          state.startingDM?.token === token ? { startingDM: null } : {},
+        );
       }
-      set((state) =>
-        state.dms.some((entry) => entry.dmId === dm.dmId)
-          ? {}
-          : { dms: [...state.dms, dm] },
-      );
-      return placeKey({ kind: dm.kind, dmId: dm.dmId });
     },
 
     async updateChannelTopic(channelId, topic) {
@@ -1924,6 +1954,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     workspaces: [],
     channels: [],
     dms: [],
+    startingDM: null,
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},

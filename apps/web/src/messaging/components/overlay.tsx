@@ -1,6 +1,7 @@
 import {
   type RefCallback,
   type RefObject,
+  type SyntheticEvent,
   useCallback,
   useEffect,
   useRef,
@@ -10,6 +11,33 @@ import { applyUserScrollDelta } from "../../lib/user-scroll-intent";
 
 /** 開いているオーバーレイの「閉じる」手続き。排他のために 1 か所へ集める。 */
 const openOverlays = new Set<() => void>();
+
+/** 行やリストが自分の中に描くだけで、中身は自分のものではないもの。 */
+const HOSTED_OVERLAY = '[role="dialog"],[role="menu"],[role="listbox"]';
+
+/**
+ * その合成イベントを、ハンドラを置いた要素が「自分の操作」として扱ってよいか。
+ *
+ * 二つの意味で「自分の外」がある。
+ * - portal の子: React の合成イベントは portal からも React の親へ上がってくる
+ *   が、DOM 上は自分の部分木ではない。
+ * - 自分の部分木に inline で描いた overlay（通知パネル等）の中: DOM 上は自分の
+ *   中だが、host しているだけで、その中の操作は overlay のもの。
+ *
+ * 個々の overlay 側で stopPropagation する形にすると、次に増えた overlay が
+ * また同じ穴を踏む——判定はイベントを所有する側の1か所に置く。
+ */
+export function ownsEvent(event: SyntheticEvent): boolean {
+  const { currentTarget, target } = event;
+  if (!(currentTarget instanceof Element) || !(target instanceof Node)) {
+    return false;
+  }
+  if (!currentTarget.contains(target)) return false;
+  const element =
+    target instanceof Element ? target : (target.parentElement ?? null);
+  const hosted = element?.closest(HOSTED_OVERLAY) ?? null;
+  return hosted === null || !currentTarget.contains(hosted);
+}
 
 /** オーバーレイ上のホイールを渡す既定のメッセージ一覧。 */
 export function conversationViewport(): HTMLElement | null {
