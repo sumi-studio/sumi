@@ -926,35 +926,75 @@ export const useMessaging = create<MessagingState>((set, get) => {
     scheduleStatusExpiry();
   };
 
-  /** Apply a snapshot participant-by-participant; a late snapshot cannot regress one. */
-  const applyStatusSnapshot = (
-    statuses: ParticipantStatus[],
-    clearedStatuses: StatusCleared[] = [],
+  /**
+   * Presence snapshots are the complete set at the fetch boundary. Rebuild
+   * both status maps before replaying projections buffered while that fetch
+   * was in flight: otherwise a participant who left the snapshot keeps an
+   * old status forever, while applying a late snapshot after a live event
+   * would erase that event.
+   */
+  const applyPresenceSnapshot = (
+    presence: Awaited<ReturnType<MessagingBackend["fetchPresence"]>>,
+    projections: PresenceProjection[],
   ) => {
-    set((state) => {
-      let statusByKey = state.statusByKey;
-      let statusRevisionByKey = state.statusRevisionByKey;
-      for (const status of statuses) {
+    set((_state) => {
+      const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
+      const statusRevisionByKey: Record<ParticipantKey, { revision: number }> =
+        {};
+      for (const status of presence.statuses) {
         const key = participantKey(status.participant);
         if (applyNewer(statusRevisionByKey[key], status) !== status) continue;
-        if (statusByKey === state.statusByKey) statusByKey = { ...statusByKey };
-        if (statusRevisionByKey === state.statusRevisionByKey)
-          statusRevisionByKey = { ...statusRevisionByKey };
         statusByKey[key] = status;
         statusRevisionByKey[key] = status;
       }
-      for (const cleared of clearedStatuses) {
+      for (const cleared of presence.clearedStatuses ?? []) {
         const key = participantKey(cleared.participant);
         if (applyNewer(statusRevisionByKey[key], cleared) !== cleared) continue;
-        if (statusByKey === state.statusByKey) statusByKey = { ...statusByKey };
-        if (statusRevisionByKey === state.statusRevisionByKey)
-          statusRevisionByKey = { ...statusRevisionByKey };
         delete statusByKey[key];
         statusRevisionByKey[key] = cleared;
+      }
+      const replyLaterById: Record<string, ReplyLaterMarker> = {};
+      for (const marker of presence.replyLaterMarkers) {
+        replyLaterById[marker.markerId] = marker;
+      }
+      for (const projection of projections) {
+        if (projection.type === "status") {
+          const key = participantKey(projection.status.participant);
+          if (
+            applyNewer(statusRevisionByKey[key], projection.status) !==
+            projection.status
+          )
+            continue;
+          statusByKey[key] = projection.status;
+          statusRevisionByKey[key] = projection.status;
+          continue;
+        }
+        if (projection.type === "status_cleared") {
+          const key = participantKey(projection.participant);
+          if (applyNewer(statusRevisionByKey[key], projection) !== projection)
+            continue;
+          delete statusByKey[key];
+          statusRevisionByKey[key] = projection;
+          continue;
+        }
+        if (projection.type === "reply_later") {
+          const known = replyLaterById[projection.marker.markerId];
+          replyLaterById[projection.marker.markerId] = {
+            ...projection.marker,
+            remindAt: projection.marker.remindAt ?? known?.remindAt ?? null,
+            resolved: projection.marker.resolved || (known?.resolved ?? false),
+          };
+          continue;
+        }
+        const marker = replyLaterById[projection.markerId];
+        if (marker) {
+          replyLaterById[projection.markerId] = { ...marker, resolved: true };
+        }
       }
       return {
         statusByKey: withoutExpired(statusByKey, Date.now()),
         statusRevisionByKey,
+        replyLaterById,
       };
     });
   };
@@ -1211,20 +1251,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return;
       }
-      const replyLaterById: Record<string, ReplyLaterMarker> = {};
-      for (const marker of presence.replyLaterMarkers) {
-        replyLaterById[marker.markerId] = marker;
-      }
       // Stop buffering before replaying, otherwise the replay would append to
-      // its own queue forever. Events were already applied live; replaying them
-      // now restores anything the older wholesale snapshot replaced.
+      // its own queue forever. applyPresenceSnapshot replaces the complete
+      // snapshot and then restores every projection it displaced.
       pendingPresenceResync = null;
-      applyStatusSnapshot(presence.statuses, presence.clearedStatuses);
-      set({ replyLaterById });
+      applyPresenceSnapshot(presence, resync.projections);
       scheduleStatusExpiry();
-      for (const projection of resync.projections) {
-        applyPresenceProjection(projection, false);
-      }
     } finally {
       if (pendingPresenceResync === resync) pendingPresenceResync = null;
     }
@@ -1566,11 +1598,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 既読進行が正本で、bootstrapのスナップショットで塗り直すと読んだはずの
    * メッセージが未読へ巻き戻る。未読を採用するのはこのクライアントがまだ
    * 知らなかったplaceだけにする。
-   */
+  */
   const reconcilePlaces = async () => {
     const request = beginMessagingBackendRequest();
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = get().selfKey;
+    // A live lifecycle event can arrive while bootstrap is in flight. Retain
+    // only entries that appeared or advanced after this boundary; entries
+    // already known here and omitted by the complete snapshot are gone.
+    const channelsBeforeFetch = new Map(
+      get().channels.map((channel) => [channel.channelId, channel]),
+    );
+    const dmIDsBeforeFetch = new Set(get().dms.map((dm) => dm.dmId));
     const snapshot = await request.wait((backend) => backend.bootstrap());
     if (!snapshot) return;
     if (
@@ -1610,19 +1649,33 @@ export const useMessaging = create<MessagingState>((set, get) => {
       mentionCountByPlace[key] = summary.mentionCount;
       sinceByPlace[key] = summary.latestSeq;
     }
-    const channelsByID = new Map(
+    const currentChannels = new Map(
       state.channels.map((channel) => [channel.channelId, channel]),
     );
-    for (const channel of snapshot.channels) {
-      channelsByID.set(
-        channel.channelId,
-        applyNewer(channelsByID.get(channel.channelId), channel),
-      );
+    const snapshotChannelIDs = new Set(
+      snapshot.channels.map((channel) => channel.channelId),
+    );
+    const channels = snapshot.channels.map((channel) =>
+      applyNewer(currentChannels.get(channel.channelId), channel),
+    );
+    for (const [channelID, current] of currentChannels) {
+      if (snapshotChannelIDs.has(channelID)) continue;
+      // This channel reached the client after the fetch began, so a snapshot
+      // that predates its creation must not erase it.
+      if (channelsBeforeFetch.get(channelID) !== current)
+        channels.push(current);
     }
+    const snapshotDMIDs = new Set(snapshot.dms.map((dm) => dm.dmId));
+    const dms = [
+      ...snapshot.dms,
+      ...state.dms.filter(
+        (dm) => !snapshotDMIDs.has(dm.dmId) && !dmIDsBeforeFetch.has(dm.dmId),
+      ),
+    ];
     set({
       workspaces: snapshot.workspaces,
-      channels: [...channelsByID.values()],
-      dms: snapshot.dms,
+      channels,
+      dms,
       membersByKey,
       lastReadByPlace,
       unreadCountByPlace,

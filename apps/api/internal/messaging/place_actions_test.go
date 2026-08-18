@@ -270,13 +270,13 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
 
 	status, body = callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
-		"name": "設計", "topic": "構造の話",
+		"name": "設計", "topic": "構造の話", "voice": true,
 	}, authorization)
 	if status != http.StatusCreated {
 		t.Fatalf("create channel: status %d body %v", status, body)
 	}
 	created := body["channel"].(map[string]any)
-	if created["name"] != "設計" || created["topic"] != "構造の話" {
+	if created["name"] != "設計" || created["topic"] != "構造の話" || created["voice"] != true {
 		t.Fatalf("created channel = %v", created)
 	}
 

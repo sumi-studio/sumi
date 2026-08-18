@@ -502,6 +502,7 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 		localScopeWire
 		Name  string `json:"name"`
 		Topic string `json:"topic,omitempty"`
+		Voice bool   `json:"voice"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -515,7 +516,7 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 	if !ok {
 		return
 	}
-	place, err := store.CreateChannel(r.Context(), request.Name, request.Topic, false)
+	place, err := store.CreateChannel(r.Context(), request.Name, request.Topic, request.Voice)
 	if err != nil {
 		writeStoreError(w, err)
 		return

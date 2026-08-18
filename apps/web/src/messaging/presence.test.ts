@@ -316,6 +316,25 @@ describe("messaging presence convergence", () => {
     expect(backend.presenceFetches).toBe(1);
   });
 
+  it("removes a departed participant's status and revision from a full snapshot", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [status(OTHER, "busy", "before leaving", null, null, 4)],
+      replyLaterMarkers: [],
+    };
+    await startMessaging(backend);
+
+    backend.presence = { statuses: [], replyLaterMarkers: [] };
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+
+    await vi.waitFor(() => {
+      const state = useMessaging.getState();
+      expect(state.statusByKey["human:human-2"]).toBeUndefined();
+      expect(state.statusRevisionByKey["human:human-2"]).toBeUndefined();
+    });
+  });
+
   it("replays live presence events that arrive during the snapshot fetch", async () => {
     const backend = new FakePresenceBackend();
     backend.presence = {
