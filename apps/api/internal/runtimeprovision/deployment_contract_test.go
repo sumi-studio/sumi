@@ -426,6 +426,38 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 	}
 }
 
+func TestSupervisorRedactsReapAttestationNonceDiagnostics(t *testing.T) {
+	supervisor := readDeploymentFile(t, "supervisor")
+	start := strings.Index(supervisor, "redact_activation_diagnostic_stream() {")
+	if start < 0 {
+		t.Fatal("supervisor diagnostic redaction function not found")
+	}
+	end := strings.Index(supervisor[start:], "\n}\n\nreport_long_lived_role_logs()")
+	if end < 0 {
+		t.Fatal("supervisor diagnostic redaction function is incomplete")
+	}
+	function := supervisor[start : start+end+2]
+	scriptPath := filepath.Join(t.TempDir(), "redact-diagnostic.sh")
+	script := "#!/bin/bash\nset -euo pipefail\n" + function + "\nredact_activation_diagnostic_stream\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const nonce = "reap-attestation-rpc-boot-nonce"
+	command := exec.Command("/bin/bash", scriptPath)
+	command.Env = append(os.Environ(), "SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE="+nonce)
+	command.Stdin = strings.NewReader("activation failed: " + nonce + "\n")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run supervisor diagnostic redaction: %v\n%s", err, output)
+	}
+	if strings.Contains(string(output), nonce) {
+		t.Fatalf("reap attestation nonce leaked in supervisor diagnostic: %s", output)
+	}
+	if !strings.Contains(string(output), "<redacted:SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE>") {
+		t.Fatalf("supervisor did not mark reap attestation nonce redacted: %s", output)
+	}
+}
+
 func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	prepare := readDeploymentFile(t, "compose.prepare.yaml")
 	for _, service := range []string{"runtime", "executor", "broker"} {

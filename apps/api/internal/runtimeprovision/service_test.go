@@ -452,6 +452,28 @@ func TestDurableReapStateRejectsMissingGeneration(t *testing.T) {
 	}
 }
 
+func TestDurableReapStateCreatesSearchableSharedParentAndPrivateLeaf(t *testing.T) {
+	sharedParent := filepath.Join(t.TempDir(), "runtime-provisioner")
+	stateDirectory := filepath.Join(sharedParent, "state")
+	if _, err := newDurableReapState(stateDirectory); err != nil {
+		t.Fatal(err)
+	}
+	parentInfo, err := os.Stat(sharedParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentInfo.Mode().Perm() != 0o755 {
+		t.Fatalf("shared socket parent mode = %o, want 0755", parentInfo.Mode().Perm())
+	}
+	stateInfo, err := os.Stat(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("private reap state directory mode = %o, want 0700", stateInfo.Mode().Perm())
+	}
+}
+
 func TestDurableReapStateAtMaximumSizeRoundTrips(t *testing.T) {
 	stateDirectory := filepath.Join(t.TempDir(), "state")
 	state, err := newDurableReapState(stateDirectory)

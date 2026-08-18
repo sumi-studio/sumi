@@ -307,7 +307,7 @@ func sanitizeSupervisorError(message string, environment []string) string {
 		case "SUMI_LOCAL_CONTROL_BEARER", "SUMI_AGENT_WRAPPING_KEY",
 			"SUMI_APPROVAL_SECRET_DIGEST_KEY", "SUMI_PROVIDER_API_KEY",
 			"SUMI_EXECUTION_REVIEWER_API_KEY", "SUMI_ESCALATION_REVIEWER_API_KEY",
-			"SUMI_EXPECTED_RPC_NONCE":
+			"SUMI_EXPECTED_RPC_NONCE", "SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE":
 			message = strings.ReplaceAll(message, value, "<redacted:"+name+">")
 		}
 	}

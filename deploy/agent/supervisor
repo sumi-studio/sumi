@@ -661,6 +661,7 @@ redact_activation_diagnostic_stream() {
     SUMI_EXECUTION_REVIEWER_API_KEY
     SUMI_ESCALATION_REVIEWER_API_KEY
     SUMI_EXPECTED_RPC_NONCE
+    SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE
   )
   while IFS= read -r line || [[ -n "${line}" ]]; do
     for name in "${names[@]}"; do

@@ -40,6 +40,16 @@ func newDurableReapState(directory string) (*durableReapState, error) {
 	if directory == "" || !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
 		return nil, errors.New("runtime provision state directory must be canonical and absolute")
 	}
+	// The state leaf shares its parent with the API-facing provisioner socket.
+	// Prepare that parent separately so API's non-root socket group can traverse
+	// it, while keeping the durable state leaf owner-only.
+	parent := filepath.Dir(directory)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return nil, fmt.Errorf("create runtime provision shared parent: %w", err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		return nil, fmt.Errorf("set runtime provision shared parent permissions: %w", err)
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
 	}

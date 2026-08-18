@@ -164,6 +164,20 @@ func TestDockerBackendRejectsAuthorityEnvironmentOverridesAndRedactsFailure(t *t
 	}
 }
 
+func TestSanitizeSupervisorErrorRedactsReapAttestationNonce(t *testing.T) {
+	const nonce = "reap-attestation-rpc-boot-nonce"
+	diagnostic := sanitizeSupervisorError(
+		"compose activation failed with SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE="+nonce,
+		[]string{"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE=" + nonce},
+	)
+	if strings.Contains(diagnostic, nonce) {
+		t.Fatalf("reap attestation nonce leaked in diagnostic: %s", diagnostic)
+	}
+	if !strings.Contains(diagnostic, "<redacted:SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE>") {
+		t.Fatalf("reap attestation nonce was not marked redacted: %s", diagnostic)
+	}
+}
+
 func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 	_, err := parseSupervisorInspection([]byte(`{"personality_agent_id":"`+testPAID+`","phase":"unknown"} trailing`), testPAID)
 	if err == nil {
