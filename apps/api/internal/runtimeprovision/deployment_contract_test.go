@@ -1068,16 +1068,17 @@ func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 
 func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	const (
-		millisecondsPerSecond             = 1000
-		composeChildTermAttempts          = 150
-		composeChildTermDelayMilliseconds = 100
-		cleanupMaxAttempts                = 3
-		cleanupRetryDelayMilliseconds     = 100
-		downKillGraceSeconds              = 1
-		verificationTimeoutSeconds        = 5
-		verificationKillGraceSeconds      = 1
-		schedulingMarginSeconds           = 10
-		composeTimeoutSeconds             = 7
+		millisecondsPerSecond               = 1000
+		composeChildTermAttempts            = 150
+		composeChildTermDelayMilliseconds   = 100
+		cleanupMaxAttempts                  = 3
+		cleanupRetryDelayMilliseconds       = 100
+		composeDownPostStopAllowanceSeconds = 5
+		downKillGraceSeconds                = 1
+		verificationTimeoutSeconds          = 5
+		verificationKillGraceSeconds        = 1
+		schedulingMarginSeconds             = 10
+		composeTimeoutSeconds               = 7
 	)
 
 	supervisorPath, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
@@ -1108,7 +1109,7 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	}
 	want := int64(
 		composeChildTermAttempts*composeChildTermDelayMilliseconds +
-			cleanupMaxAttempts*(composeTimeoutSeconds+downKillGraceSeconds)*millisecondsPerSecond +
+			cleanupMaxAttempts*(composeTimeoutSeconds+composeDownPostStopAllowanceSeconds+downKillGraceSeconds)*millisecondsPerSecond +
 			cleanupMaxAttempts*(verificationTimeoutSeconds+verificationKillGraceSeconds)*millisecondsPerSecond +
 			(cleanupMaxAttempts-1)*cleanupRetryDelayMilliseconds +
 			schedulingMarginSeconds*millisecondsPerSecond,
@@ -1120,6 +1121,7 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	compactSupervisor := strings.Join(strings.Fields(readDeploymentFile(t, "supervisor")), " ")
 	for _, term := range []string{
 		"COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS",
+		"SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS",
 		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
 		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
 		"(CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS",
@@ -1127,6 +1129,14 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	} {
 		if !strings.Contains(compactSupervisor, term) {
 			t.Fatalf("supervisor cleanup bound omits %q:\n%s", term, compactSupervisor)
+		}
+	}
+	for _, row := range []string{
+		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance",
+		"ps --all --quiet none CLEANUP_VERIFICATION_TIMEOUT_SECONDS",
+	} {
+		if !strings.Contains(compactSupervisor, row) {
+			t.Fatalf("supervisor cleanup timeout table omits %q:\n%s", row, compactSupervisor)
 		}
 	}
 	if !strings.Contains(compactSupervisor, "cleanup_down_lifecycle_compose down --remove-orphans --timeout \"${SUMI_COMPOSE_TIMEOUT}\"") {
@@ -1267,6 +1277,104 @@ exec /usr/bin/stat "$@"
 	if elapsed > 8*time.Second {
 		t.Fatalf("hung cleanup down escaped its timeout wrapper: cleanup took %s", elapsed)
 	}
+}
+
+func TestSupervisorCleanupAllowsPostStopComposeFinalization(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	prepareReady := filepath.Join(testRoot, "prepare-ready")
+	delayCleanupDown := filepath.Join(testRoot, "delay-cleanup-down")
+	cleanupDownFinished := filepath.Join(testRoot, "cleanup-down-finished")
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  *"compose.lifecycle.yaml down"*)
+    if [ -e "$SUMI_DELAY_CLEANUP_DOWN" ]; then
+      # Model a container using all of Docker's --timeout stop grace before
+      # Compose records completion and removes the remaining project state.
+      sleep "$SUMI_COMPOSE_TIMEOUT"
+      sleep 0.2
+      printf finished > "$SUMI_CLEANUP_DOWN_FINISHED"
+    fi
+    ;;
+  *"compose.prepare.yaml up --detach --wait"*)
+    printf ready > "$SUMI_PREPARE_READY"
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStat := filepath.Join(testRoot, "stat")
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" prepare`, "--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_PREPARE_READY=" + prepareReady,
+		"SUMI_DELAY_CLEANUP_DOWN=" + delayCleanupDown,
+		"SUMI_CLEANUP_DOWN_FINISHED=" + cleanupDownFinished,
+		"SUMI_COMPOSE_TIMEOUT=1",
+	}
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForSupervisorFile(t, prepareReady, 5*time.Second)
+	if err := os.WriteFile(delayCleanupDown, []byte("delay"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("supervisor prepare unexpectedly succeeded after TERM: %s", output.String())
+		}
+	case <-time.After(8 * time.Second):
+		_ = command.Process.Kill()
+		<-done
+		t.Fatal("supervisor cleanup did not complete a post-stop compose finalization")
+	}
+	waitForSupervisorFile(t, cleanupDownFinished, time.Second)
 }
 
 func waitForSupervisorFile(t *testing.T, path string, limit time.Duration) {

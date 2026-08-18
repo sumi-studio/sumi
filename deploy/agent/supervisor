@@ -473,10 +473,21 @@ declare ACTIVE_COMPOSE_PID=
 readonly MILLISECONDS_PER_SECOND=1000
 readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
-# Every cleanup-path Docker CLI call has a wall-clock cap.  `down --timeout`
-# is Docker's container-stop grace, not a cap on the CLI or daemon response;
-# therefore the outer timeout is the cleanup stage's actual bound.
-readonly CLEANUP_DOWN_TIMEOUT_SECONDS="${SUMI_COMPOSE_TIMEOUT}"
+# Every cleanup-path Docker CLI call has a wall-clock cap:
+#
+# Docker call                         Inner operation                 Outer CLI deadline
+# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop grace + post-stop allowance
+# ps --all --quiet                    none                             CLEANUP_VERIFICATION_TIMEOUT_SECONDS
+#
+# `down --timeout` is Docker's container-stop grace, not a cap on the CLI or
+# daemon response. After that grace expires, Compose still has to observe the
+# exits and remove containers, networks, and orphans. Five seconds (the same
+# bounded allowance used for the follow-up `ps`) reserves that local teardown
+# work, so the outer timeout does not TERM Compose at the stop-grace boundary.
+readonly COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS=5
+readonly CLEANUP_DOWN_TIMEOUT_SECONDS=$((
+  SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS
+))
 readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
 # `cleanup_project_is_empty` runs once after each cleanup `down`. Bound both
 # its query and the time allowed for timeout(1) to join a TERM-resistant
@@ -498,8 +509,8 @@ readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
 # honour TERM, then run each bounded `down`, verify each attempt, and wait
 # between unsuccessful attempts. `flock -n` has no wait to add: cleanup is
 # armed only after that lock has already been acquired. Keep this in the same
-# constants that drive those waits, rather than a hand-maintained total.  The
-# inner `down --timeout` is intentionally the same value as its outer CLI cap.
+# constants that drive those waits, rather than a hand-maintained total. The
+# outer `down` cap includes its inner stop grace plus post-stop allowance.
 #
 # Each timeout(1) KILL grace and the final scheduling margin cover joining its
 # process plus local secret removal after the bounded Docker calls.
