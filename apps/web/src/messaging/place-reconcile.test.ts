@@ -913,6 +913,20 @@ describe("place lifecycleの再接続突き合わせ", () => {
     });
   });
 
+  it("activeなplaceの履歴取得失敗も保持とcursorをまとめて手放す", async () => {
+    backend.fetchMessages.mockRejectedValueOnce(new Error("history timed out"));
+
+    useMessaging.getState().selectPlace(CHANNEL_1);
+    await settle();
+
+    expect(useMessaging.getState().activePlaceKey).toBe(CHANNEL_1);
+    expect(useMessaging.getState().messagesByPlace[CHANNEL_1]).toBeUndefined();
+    expect(backend.releasePlace).toHaveBeenCalledWith({
+      kind: "channel",
+      channelId: "channel-1",
+    });
+  });
+
   it("初めて開く場所の宣言は知っている最新seqを名乗る", async () => {
     // 宣言のcursorはserverのreplay開始点。持っていないからと0を名乗ると、
     // 画面を開くたびにその場所の先頭から流れてくる。欲しいのは、いま取りに

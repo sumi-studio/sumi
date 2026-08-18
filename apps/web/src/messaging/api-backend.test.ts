@@ -948,6 +948,55 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
+  it("does not replay an active cursor after its history request fails", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path.includes("/messages?")) {
+          throw new Error("history request timed out");
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    backend.subscribe(() => {}, { sinceByPlace: { "channel:channel-1": 4 } });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    const thread = {
+      kind: "thread",
+      threadId: "thread-history-failed",
+    } as const;
+    // selectPlace declares the active delivery scope before its REST history
+    // promise resolves. The store releases that history on failure.
+    backend.openPlace(thread, 12);
+    await expect(backend.fetchMessages(thread, { limit: 50 })).rejects.toThrow(
+      "history request timed out",
+    );
+    backend.releasePlace(thread);
+
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4 },
+    });
+    // The screen remains selected, so it is re-declared with an empty cursor
+    // instead of the stale pre-failure seq 12.
+    expect(JSON.parse(reconnected?.sent[1] ?? "{}")).toEqual({
+      type: "open",
+      place_id: "thread-history-failed",
+      since: 0,
+    });
+  });
+
   it("keeps the handshake independent of how many places the Workspace holds", async () => {
     // 作成者は自分が作ったthreadの参加者になる。作った数だけ参加threadが
     // 増えても、握手はその数に比例してはならない。

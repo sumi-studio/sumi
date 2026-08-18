@@ -492,7 +492,12 @@ export class ApiMessagingBackend implements MessagingBackend {
   releasePlace(place: Place): void {
     const id = placeID(place);
     this.followed.delete(id);
-    if (id !== this.openPlaceID) this.cursors.delete(id);
+    // `open` is delivery scope, not ownership of history. An active screen
+    // can fail to load its REST history; keeping its cursor in that case
+    // would make a later hello skip data the store deliberately discarded.
+    // Therefore every history release, including the active place, removes
+    // the replay cursor.
+    this.cursors.delete(id);
   }
 
   subscribe(

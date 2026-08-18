@@ -749,7 +749,7 @@ impl MessagingApi for LocalControlHttpClient {
                                 client_nonce: request.client_nonce,
                             },
                         ),
-                        MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                        MAX_MESSAGING_RESPONSE_BYTES,
                     )
                     .await
                     .map_err(|error| {
@@ -3897,6 +3897,15 @@ mod tests {
         }))
     }
 
+    async fn oversized_thread_creation_fixture(
+        State(payload_bytes): State<usize>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "thread_id": "0198f0f4-9b72-7000-8000-000000000799",
+            "participants": ["x".repeat(payload_bytes)]
+        }))
+    }
+
     #[derive(Clone, Default)]
     struct CompactWriteFixtureState {
         request_body: Arc<StdMutex<Option<Vec<u8>>>>,
@@ -5134,6 +5143,10 @@ mod tests {
                 "/local-control/v1/messaging:open",
                 post(bounded_json_fixture),
             )
+            .route(
+                "/local-control/v1/messaging:create-thread",
+                post(oversized_thread_creation_fixture),
+            )
             .route("/default", post(bounded_json_fixture))
             .with_state(payload_bytes);
         let server = tokio::spawn(async move {
@@ -5181,6 +5194,34 @@ mod tests {
             .await
             .expect_err("non-messaging local control responses remain capped at 64 KiB");
         assert!(error.to_string().contains("exceeds bounded size"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_thread_creation_uses_the_messaging_response_bound() {
+        let payload_bytes = MAX_LOCAL_CONTROL_RESPONSE_BYTES + 1024;
+        let (client, server) = response_limit_fixture(payload_bytes).await;
+
+        let response = client
+            .create_thread(
+                &messaging_scope(),
+                CreateMessagingThreadRequest {
+                    parent_place_id: "01900000-0000-7000-8000-000000000002",
+                    name: "large participant list",
+                    parent_message_id: None,
+                    client_nonce: "thread-large-response",
+                },
+            )
+            .await
+            .expect("a thread create response larger than 64 KiB remains readable");
+
+        assert_eq!(
+            response["thread_id"],
+            "0198f0f4-9b72-7000-8000-000000000799"
+        );
+        assert!(
+            response["participants"][0].as_str().unwrap().len() > MAX_LOCAL_CONTROL_RESPONSE_BYTES
+        );
         server.abort();
     }
 

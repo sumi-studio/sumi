@@ -1784,7 +1784,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
             : 0,
         ),
       );
-      void loadPlace(place);
+      // 選択は同期APIなので、取得失敗はloadPlace内で履歴/cursorを手放した後に
+      // ここで消費する。未処理rejectionにして次の選択や再接続を妨げない。
+      void loadPlace(place).catch(() => undefined);
     },
 
     clearPlaceSelection() {
