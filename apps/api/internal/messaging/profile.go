@@ -22,12 +22,10 @@ var (
 	ErrInvalidTagline     = errors.New("tagline is not a single usable line")
 )
 
-// profilePublisher receives the immutable profile value and every currently
-// enabled Messaging address where its participant is visible. SetProfile
-// invokes it while it still owns the participant row lock, before committing,
-// so a later profile write cannot overtake this value at a live subscriber.
-// Publication is intentionally best-effort; the durable profile is repaired
-// by bootstrap after a missed frame.
+// profilePublisher receives a committed immutable profile value and every
+// currently enabled Messaging address where its participant is visible.
+// Publication is intentionally best-effort. Revision makes a later snapshot
+// or event win when delivery order differs from commit order.
 type profilePublisher func(context.Context, []Scope, MemberProfile)
 
 // Profile returns the actor's own canonical profile: the 戸籍 display name plus
@@ -101,35 +99,40 @@ func (s *ScopedStore) SetProfile(ctx context.Context, displayName, tagline *stri
 		return MemberProfile{}, fmt.Errorf("unknown participant kind %q", actor.Kind)
 	}
 
+	// Always touch the profile row, including a display-name-only update. The
+	// database trigger allocates the next revision; application code never does.
+	// A missing tagline stays missing on conflict while a newly-created row gets
+	// the empty default.
+	var requestedTagline any
 	if tagline != nil {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO participant_profiles (member_kind, member_id, tagline)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (member_kind, member_id)
-			DO UPDATE SET tagline = EXCLUDED.tagline, updated_at = now()`,
-			actor.Kind, actor.ID, *tagline); err != nil {
-			return MemberProfile{}, fmt.Errorf("upsert participant profile: %w", err)
-		}
+		requestedTagline = *tagline
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO participant_profiles (member_kind, member_id, tagline)
+		VALUES ($1, $2, COALESCE($3::text, ''))
+		ON CONFLICT (member_kind, member_id)
+		DO UPDATE SET tagline = COALESCE($3::text, participant_profiles.tagline),
+		              updated_at = now()`,
+		actor.Kind, actor.ID, requestedTagline); err != nil {
+		return MemberProfile{}, fmt.Errorf("upsert participant profile: %w", err)
 	}
 
 	profile, err := memberProfileFor(ctx, tx, actor)
 	if err != nil {
 		return MemberProfile{}, err
 	}
-	if publish != nil {
-		scopes, err := s.profileAudienceScopesInTx(ctx, tx, actor)
-		if err != nil {
-			return MemberProfile{}, err
-		}
-		// Do this before commit, while the canonical participant row remains
-		// locked. A concurrent update cannot enqueue a newer profile and then
-		// let this older one arrive afterwards. This is safe for best-effort
-		// live delivery because profile is the transaction's final immutable
-		// value, and bootstrap repairs any missed frame.
-		publish(ctx, scopes, profile)
+	scopes, err := s.profileAudienceScopesInTx(ctx, tx, actor)
+	if err != nil {
+		return MemberProfile{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return MemberProfile{}, fmt.Errorf("commit set profile: %w", err)
+	}
+	// A receiver can bootstrap immediately after this frame, so publication
+	// must follow a successful commit. Concurrent committed publications can
+	// pass each other; revision is the ordering rule at every receiver.
+	if publish != nil {
+		publish(ctx, scopes, profile)
 	}
 	return profile, nil
 }
@@ -202,14 +205,15 @@ func memberProfileFor(ctx context.Context, q querier, subject ParticipantRef) (M
 	}
 	profile := MemberProfile{Participant: subject}
 	err := q.QueryRow(ctx, `
-		SELECT COALESCE(h.display_name, a.display_name, ''), COALESCE(pp.tagline, '')
+		SELECT COALESCE(h.display_name, a.display_name, ''), COALESCE(pp.tagline, ''),
+		       COALESCE(pp.revision, 0)
 		FROM (SELECT $1::text AS member_kind, $2::uuidv7 AS member_id) target
 		LEFT JOIN humans h ON target.member_kind = 'human' AND h.human_id = target.member_id
 		LEFT JOIN agents a ON target.member_kind = 'personality_agent'
 		                  AND a.personality_agent_id = target.member_id
 		LEFT JOIN participant_profiles pp ON pp.member_kind = target.member_kind
 		                                AND pp.member_id = target.member_id`,
-		string(subject.Kind), subject.ID).Scan(&profile.DisplayName, &profile.Tagline)
+		string(subject.Kind), subject.ID).Scan(&profile.DisplayName, &profile.Tagline, &profile.Revision)
 	if err != nil {
 		return MemberProfile{}, fmt.Errorf("load member profile: %w", err)
 	}

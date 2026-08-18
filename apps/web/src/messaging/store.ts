@@ -548,17 +548,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 
   /**
-   * 名乗りの確定値を一覧へ取り込む。REST ACKとWS eventの両方がここを通るので、
-   * どちらが先に届いても同じ形に収束する。まだ知らない参加者は無視する:
+   * 名乗りの確定値を一覧へ取り込む。REST ACK・WS event・bootstrapは同じ
+   * revision規則に従うので、到着順がcommit順と異なっても古い値に戻らない。
+   * まだ知らない参加者は無視する:
    * membershipはbootstrapが決めるもので、eventで増えたりはしない。
    */
+  const profileRevision = (profile: MemberProfile): number =>
+    profile.revision ?? 0;
+
   const applyProfile = (profile: MemberProfile) => {
     const key = participantKey(profile.participant);
     set((state) =>
-      state.membersByKey[key]
+      state.membersByKey[key] &&
+      profileRevision(profile) > profileRevision(state.membersByKey[key])
         ? { membersByKey: { ...state.membersByKey, [key]: profile } }
         : {},
     );
+  };
+
+  const mergeProfilesByRevision = (
+    current: Record<ParticipantKey, MemberProfile>,
+    snapshot: MemberProfile[],
+  ): Record<ParticipantKey, MemberProfile> => {
+    const merged: Record<ParticipantKey, MemberProfile> = {};
+    for (const profile of snapshot) {
+      const key = participantKey(profile.participant);
+      const currentProfile = current[key];
+      merged[key] =
+        currentProfile &&
+        profileRevision(currentProfile) > profileRevision(profile)
+          ? currentProfile
+          : profile;
+    }
+    return merged;
   };
 
   const applyPresenceProjection = (
@@ -1041,10 +1063,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         placeKey({ kind: entry.kind, dmId: entry.dmId }),
       ),
     ]);
-    const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-    for (const member of snapshot.members) {
-      membersByKey[participantKey(member.participant)] = member;
-    }
+    const membersByKey = mergeProfilesByRevision(
+      state.membersByKey,
+      snapshot.members,
+    );
     const lastReadByPlace = { ...state.lastReadByPlace };
     for (const marker of snapshot.readMarkers) {
       const key = placeKey(marker.place);
@@ -1385,10 +1407,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend
         .bootstrap()
         .then((snapshot) => {
-          const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-          for (const member of snapshot.members) {
-            membersByKey[participantKey(member.participant)] = member;
-          }
+          const membersByKey = mergeProfilesByRevision(
+            get().membersByKey,
+            snapshot.members,
+          );
           const statusByKey = applyStatuses(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
           for (const marker of snapshot.readMarkers) {

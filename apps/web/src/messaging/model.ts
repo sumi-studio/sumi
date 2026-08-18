@@ -178,6 +178,8 @@ export interface MemberProfile {
   participant: ParticipantRef;
   displayName: string;
   tagline: string;
+  /** Monotonic server revision used to discard stale profile projections. */
+  revision?: number;
   /**
    * 顔写真のbytes取得URL。まだ誰も出していない段階では常にundefinedで、
    * 受け手はイニシャルへ落ちる。読み込みに失敗したときも同じ落とし方をする。

@@ -29,6 +29,7 @@ const bootstrap = {
     {
       participant: { kind: "human", human_id: "human-1" },
       display_name: "Yohaku",
+      revision: 0,
     },
   ],
   read_markers: [{ place: channelWire(), last_read_seq: 0 }],
@@ -715,14 +716,16 @@ describe("ApiMessagingBackend", () => {
           participant: { kind: "human", human_id: "human-1" },
           display_name: "Yohaku",
           tagline: "デザイン",
+          revision: 3,
         },
-        // taglineを出さないサーバー（古い版・別の実装）は空として読む。
+        // taglineを出さない参加者は空として読む。revisionはprofile wireの必須順序鍵。
         {
           participant: {
             kind: "personality_agent",
             personality_agent_id: "agent-1",
           },
           display_name: "Kuro",
+          revision: 0,
         },
       ],
     };
@@ -735,6 +738,7 @@ describe("ApiMessagingBackend", () => {
             participant: { kind: "human", human_id: "human-1" },
             display_name: "余白",
             tagline: "開発",
+            revision: 4,
           });
         }
         throw new Error(`unexpected request ${path}`);
@@ -750,6 +754,7 @@ describe("ApiMessagingBackend", () => {
         participant: { kind: "human", humanId: "human-1" },
         displayName: "Yohaku",
         tagline: "デザイン",
+        revision: 3,
       },
       {
         participant: {
@@ -758,6 +763,7 @@ describe("ApiMessagingBackend", () => {
         },
         displayName: "Kuro",
         tagline: "",
+        revision: 0,
       },
     ]);
 
@@ -766,6 +772,7 @@ describe("ApiMessagingBackend", () => {
       participant: { kind: "human", humanId: "human-1" },
       displayName: "余白",
       tagline: "開発",
+      revision: 4,
     });
     expect(fetchMock).toHaveBeenCalledWith(
       scopedMessagingTestPath("/messaging/profile"),
@@ -787,6 +794,7 @@ describe("ApiMessagingBackend", () => {
           participant: { kind: "human", human_id: "human-1" },
           display_name: "余白",
           tagline: "開発",
+          revision: 5,
         },
       },
     });
@@ -797,6 +805,7 @@ describe("ApiMessagingBackend", () => {
           participant: { kind: "human", humanId: "human-1" },
           displayName: "余白",
           tagline: "開発",
+          revision: 5,
         },
       },
     ]);

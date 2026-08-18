@@ -101,6 +101,9 @@ type MemberProfile struct {
 	// Workspace をまたいで続くので、肩書きが Workspace ごとに要るようになっても
 	// global tagline を上書きせず membership 側に別に持たせる。
 	Tagline string
+	// Revision is assigned by participant_profiles on every profile update.
+	// Receivers use it to reject an older live event or bootstrap snapshot.
+	Revision int64
 }
 
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple

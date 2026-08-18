@@ -108,8 +108,8 @@ class FakePresenceBackend implements MessagingBackend {
       ],
       dms: [],
       members: [
-        { participant: SELF, displayName: "Yohaku", tagline: "" },
-        { participant: OTHER, displayName: "Haru", tagline: "" },
+        { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
+        { participant: OTHER, displayName: "Haru", tagline: "", revision: 1 },
       ],
       statuses: this.presence.statuses,
       readMarkers: [],
@@ -178,6 +178,7 @@ class FakePresenceBackend implements MessagingBackend {
     participant: SELF,
     displayName: "Yohaku",
     tagline: "",
+    revision: 1,
   };
   async updateProfile(): Promise<MemberProfile> {
     return this.nextProfile;
@@ -452,6 +453,7 @@ describe("messaging presence convergence", () => {
       participant: SELF,
       displayName: "余白",
       tagline: "開発",
+      revision: 2,
     };
     await startMessaging(backend);
 
@@ -463,12 +465,35 @@ describe("messaging presence convergence", () => {
     // 他人の名乗りは自分のmutationではなくeventで届く。
     backend.emit({
       type: "profile_updated",
-      profile: { participant: OTHER, displayName: "はる", tagline: "秘書" },
+      profile: {
+        participant: OTHER,
+        displayName: "はる",
+        tagline: "秘書",
+        revision: 2,
+      },
     });
     expect(useMessaging.getState().membersByKey["human:human-2"]).toEqual({
       participant: OTHER,
       displayName: "はる",
       tagline: "秘書",
+      revision: 2,
+    });
+
+    // commit後の配信は互いに追い越せる。古いeventはrevisionで捨てる。
+    backend.emit({
+      type: "profile_updated",
+      profile: {
+        participant: OTHER,
+        displayName: "Haru",
+        tagline: "",
+        revision: 1,
+      },
+    });
+    expect(useMessaging.getState().membersByKey["human:human-2"]).toEqual({
+      participant: OTHER,
+      displayName: "はる",
+      tagline: "秘書",
+      revision: 2,
     });
 
     // membershipを決めるのはbootstrapで、eventが参加者を増やしたりはしない。
@@ -478,6 +503,7 @@ describe("messaging presence convergence", () => {
         participant: { kind: "human", humanId: "human-3" },
         displayName: "知らない人",
         tagline: "",
+        revision: 1,
       },
     });
     expect(

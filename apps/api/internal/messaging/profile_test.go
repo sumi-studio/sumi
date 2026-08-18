@@ -247,6 +247,9 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 	if body["display_name"] != "余白" || body["tagline"] != "開発" {
 		t.Fatalf("profile body = %v", body)
 	}
+	if body["revision"] != float64(1) {
+		t.Fatalf("profile revision = %v, want 1", body["revision"])
+	}
 
 	// profile_updated carries no place: it is scoped to the participant, and the
 	// subscriber receives it because they can see that participant.
@@ -261,6 +264,9 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 	profile := event["profile"].(map[string]any)
 	if profile["display_name"] != "余白" || profile["tagline"] != "開発" {
 		t.Fatalf("event profile = %v", profile)
+	}
+	if profile["revision"] != float64(1) {
+		t.Fatalf("event profile revision = %v, want 1", profile["revision"])
 	}
 
 	// Bootstrap is where a fresh client learns it; the tagline rides on the
@@ -277,6 +283,9 @@ func TestProfileOverHTTPIsSelfDeclaredAndPublishedToWhoCanSeeIt(t *testing.T) {
 			found = true
 			if member["display_name"] != "余白" || member["tagline"] != "開発" {
 				t.Fatalf("bootstrap member = %v", member)
+			}
+			if member["revision"] != float64(1) {
+				t.Fatalf("bootstrap member revision = %v, want 1", member["revision"])
 			}
 		}
 	}
@@ -453,7 +462,7 @@ func TestProfileUpdateFansOutToEveryWorkspaceAudience(t *testing.T) {
 	}
 }
 
-func TestConcurrentProfileUpdatesPublishInDatabaseOrder(t *testing.T) {
+func TestConcurrentProfileUpdatesCanPublishOutOfOrderWithIncreasingRevisions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
@@ -466,13 +475,13 @@ func TestConcurrentProfileUpdatesPublishInDatabaseOrder(t *testing.T) {
 
 	firstEntered := make(chan struct{})
 	allowFirst := make(chan struct{})
-	published := make(chan string, 2)
+	published := make(chan MemberProfile, 2)
 	publisher := func(ctx context.Context, scopes []Scope, profile MemberProfile) {
 		if profile.Tagline == "古い" {
 			close(firstEntered)
 			<-allowFirst
 		}
-		published <- profile.Tagline
+		published <- profile
 		server.publishProfile(ctx, scopes, profile)
 	}
 	firstDone := make(chan error, 1)
@@ -487,10 +496,15 @@ func TestConcurrentProfileUpdatesPublishInDatabaseOrder(t *testing.T) {
 		_, err := actor.SetProfile(ctx, nil, ptr("新しい"), publisher)
 		secondDone <- err
 	}()
+	// SetProfile now publishes after committing. Therefore the second write can
+	// commit and publish while the first publisher is still blocked.
 	select {
-	case tagline := <-published:
-		t.Fatalf("later write published %q before the earlier write released its row lock", tagline)
-	case <-time.After(150 * time.Millisecond):
+	case profile := <-published:
+		if profile.Tagline != "新しい" || profile.Revision != 2 {
+			t.Fatalf("second committed profile = %+v", profile)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second committed profile was not published")
 	}
 	close(allowFirst)
 	if err := <-firstDone; err != nil {
@@ -500,20 +514,57 @@ func TestConcurrentProfileUpdatesPublishInDatabaseOrder(t *testing.T) {
 		t.Fatalf("second update: %v", err)
 	}
 
-	if got := <-published; got != "古い" {
-		t.Fatalf("first published profile = %q", got)
+	if profile := <-published; profile.Tagline != "古い" || profile.Revision != 1 {
+		t.Fatalf("first committed profile = %+v", profile)
 	}
-	if got := <-published; got != "新しい" {
-		t.Fatalf("second published profile = %q", got)
+	if event := readPublishedProfile(t, watcher); event.Tagline != "新しい" || event.Revision != 2 {
+		t.Fatalf("newer live profile = %+v", event)
 	}
-	if got := readPublishedProfile(t, watcher).Tagline; got != "古い" {
-		t.Fatalf("first live profile = %q", got)
-	}
-	if got := readPublishedProfile(t, watcher).Tagline; got != "新しい" {
-		t.Fatalf("second live profile = %q", got)
+	if event := readPublishedProfile(t, watcher); event.Tagline != "古い" || event.Revision != 1 {
+		t.Fatalf("older live profile = %+v", event)
 	}
 	profile, err := actor.Profile(ctx)
-	if err != nil || profile.Tagline != "新しい" {
+	if err != nil || profile.Tagline != "新しい" || profile.Revision != 2 {
 		t.Fatalf("durable profile = %+v, err %v", profile, err)
+	}
+}
+
+func TestSetProfileDoesNotPublishWhenCommitFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	server.Hub = NewHub(w.store.core)
+	watcher := server.Hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB))
+	t.Cleanup(func() { server.Hub.unsubscribe(watcher) })
+
+	// A deferred constraint makes PostgreSQL reject the transaction at COMMIT,
+	// after every profile statement has succeeded. This proves publication is
+	// not merely after the upsert; it is after the durable commit.
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION reject_profile_commit_for_test() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject profile commit'; END; $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE CONSTRAINT TRIGGER reject_profile_commit_for_test
+		AFTER INSERT OR UPDATE ON participant_profiles DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION reject_profile_commit_for_test()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = w.store.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_profile_commit_for_test ON participant_profiles`)
+		_, _ = w.store.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS reject_profile_commit_for_test()`)
+	})
+
+	actor := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	if _, err := server.setProfile(ctx, actor, nil, ptr("失敗する更新")); err == nil {
+		t.Fatal("set profile unexpectedly committed")
+	}
+	select {
+	case frame := <-watcher.send:
+		t.Fatalf("rolled-back profile was published: %s", frame.payload)
+	case <-time.After(150 * time.Millisecond):
 	}
 }

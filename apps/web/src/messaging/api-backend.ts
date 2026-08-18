@@ -705,8 +705,16 @@ function parseMember(value: unknown): MemberProfile {
     participant: parseParticipant(wire.participant),
     displayName: asString(wire.display_name),
     tagline: typeof wire.tagline === "string" ? wire.tagline : "",
+    revision: asProfileRevision(wire.revision),
     ...(avatarUrl === undefined ? {} : { avatarUrl }),
   };
+}
+
+function asProfileRevision(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error("invalid profile revision");
+  }
+  return Number(value);
 }
 
 function placeID(place: Place): string {

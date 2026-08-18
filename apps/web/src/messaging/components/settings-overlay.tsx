@@ -1,6 +1,7 @@
 import { Check, Copy, Settings, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { create } from "zustand";
+import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import type { ParticipantRef } from "../model";
 import { useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -134,8 +135,11 @@ function ProfileSection() {
     setSaved(false);
     try {
       await updateProfile({
-        displayName: displayName.trim(),
-        tagline: tagline.trim(),
+        displayName: clampCodePoints(
+          displayName.trim(),
+          MAX_DISPLAY_NAME_CHARS,
+        ),
+        tagline: clampCodePoints(tagline.trim(), MAX_TAGLINE_CHARS),
       });
       setSaved(true);
     } catch {
@@ -161,28 +165,32 @@ function ProfileSection() {
       <Field
         id="settings-display-name"
         label="表示名"
-        hint="他の参加者に見える名前です"
+        hint={`他の参加者に見える名前です（${codePointLength(displayName)} / ${MAX_DISPLAY_NAME_CHARS}）`}
       >
         <input
           id="settings-display-name"
           value={displayName}
-          onChange={(event) => setDisplayName(event.target.value)}
+          onChange={(event) =>
+            setDisplayName(
+              clampCodePoints(event.target.value, MAX_DISPLAY_NAME_CHARS),
+            )
+          }
           disabled={busy}
-          maxLength={MAX_DISPLAY_NAME_CHARS}
           className={INPUT_CLASS}
         />
       </Field>
       <Field
         id="settings-tagline"
         label="ひとこと"
-        hint="担っていることを一行で（例: 秘書、開発）。空でも構いません"
+        hint={`担っていることを一行で（例: 秘書、開発）。空でも構いません（${codePointLength(tagline)} / ${MAX_TAGLINE_CHARS}）`}
       >
         <input
           id="settings-tagline"
           value={tagline}
-          onChange={(event) => setTagline(event.target.value)}
+          onChange={(event) =>
+            setTagline(clampCodePoints(event.target.value, MAX_TAGLINE_CHARS))
+          }
           disabled={busy}
-          maxLength={MAX_TAGLINE_CHARS}
           placeholder="例: 開発"
           className={INPUT_CLASS}
         />

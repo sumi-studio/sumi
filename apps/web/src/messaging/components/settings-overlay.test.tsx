@@ -45,6 +45,7 @@ function seed(
         participant: self,
         displayName: "yohaku",
         tagline: "デザイン",
+        revision: 1,
         ...member,
       },
     },
@@ -122,6 +123,18 @@ describe("個人設定", () => {
 
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
     expect(updateProfile).not.toHaveBeenCalled();
+  });
+
+  it("非BMP文字をcode pointで数え、80文字までは入力できる", () => {
+    render(<SettingsOverlay />);
+    const eighty = "😀".repeat(80);
+    fireEvent.change(screen.getByLabelText("表示名"), {
+      target: { value: eighty },
+    });
+    expect(screen.getByLabelText("表示名")).toHaveValue(eighty);
+    expect(
+      screen.getByText("他の参加者に見える名前です（80 / 80）"),
+    ).toBeInTheDocument();
   });
 
   it("保存が拒まれたら理由を出し、入力を捨てない", async () => {

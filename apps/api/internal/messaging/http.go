@@ -286,6 +286,7 @@ type memberWire struct {
 	Participant participantWire `json:"participant"`
 	DisplayName string          `json:"display_name"`
 	Tagline     string          `json:"tagline"`
+	Revision    int64           `json:"revision"`
 }
 
 func memberToWire(profile MemberProfile) memberWire {
@@ -293,6 +294,7 @@ func memberToWire(profile MemberProfile) memberWire {
 		Participant: participantToWire(profile.Participant),
 		DisplayName: profile.ProjectedDisplayName(),
 		Tagline:     profile.Tagline,
+		Revision:    profile.Revision,
 	}
 }
 
@@ -494,8 +496,8 @@ func (s *Server) publishProfile(ctx context.Context, scopes []Scope, profile Mem
 }
 
 // setProfile is the one transport-independent profile write path. Both the
-// Human REST route and PA local-control publish before SetProfile releases its
-// participant lock, preserving the database order at every live subscriber.
+// Human REST route and PA local-control publish only after the durable commit.
+// Receivers resolve any delivery reordering through the profile revision.
 func (s *Server) setProfile(ctx context.Context, store *ScopedStore, displayName, tagline *string) (MemberProfile, error) {
 	return store.SetProfile(ctx, displayName, tagline, s.publishProfile)
 }
