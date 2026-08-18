@@ -837,6 +837,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "workspace-1",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",

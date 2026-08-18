@@ -33,6 +33,7 @@ describe("messaging session boundary", () => {
         {
           channelId: "private-a",
           workspaceId: "workspace",
+          revision: 1,
           name: "A",
           topic: "",
           visibility: "private",
@@ -108,6 +109,7 @@ describe("messaging session boundary", () => {
     const original: ChannelSummary = {
       channelId: "ch-general",
       workspaceId: "workspace-1",
+      revision: 1,
       name: "general",
       topic: "",
       visibility: "public",
@@ -282,6 +284,7 @@ describe("messaging session boundary", () => {
     resolveChannel({
       channelId: "stale-channel",
       workspaceId: "workspace-a",
+      revision: 1,
       name: "private-a",
       topic: "A only",
       visibility: "private",

@@ -59,6 +59,7 @@ const MAX_MARKER_ID_BYTES: usize = 256;
 const MAX_PARTICIPANT_ID_BYTES: usize = 256;
 // The server bounds a channel name at 200 characters and a topic at 1000
 // bytes; four bytes per character covers any UTF-8 within the name bound.
+const MAX_CHANNEL_NAME_CHARS: usize = 200;
 const MAX_CHANNEL_NAME_BYTES: usize = 800;
 const MAX_TOPIC_BYTES: usize = 1000;
 // A group dm the agent opens in one gesture. Far beyond any real conversation,
@@ -2306,7 +2307,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         }
         MessagingAction::StartDm { participants } => validate_dm_participants(participants),
         MessagingAction::CreateChannel { name, topic } => {
-            validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES)?;
+            validate_channel_name(name)?;
             validate_optional_bounded(topic, MAX_TOPIC_BYTES)
         }
         MessagingAction::UpdateChannel {
@@ -2320,18 +2321,20 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             if name.is_none() && topic.is_none() {
                 return Err(ToolError::InvalidArguments);
             }
-            if name.as_deref().is_some_and(|name| {
-                validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES).is_err()
-            }) {
+            if name
+                .as_deref()
+                .is_some_and(|name| validate_channel_name(name).is_err())
+            {
                 return Err(ToolError::InvalidArguments);
             }
             validate_optional_bounded(topic, MAX_TOPIC_BYTES)
         }
         MessagingAction::DuplicateChannel { place_id, name } => {
             validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
-            if name.as_deref().is_some_and(|name| {
-                validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES).is_err()
-            }) {
+            if name
+                .as_deref()
+                .is_some_and(|name| validate_channel_name(name).is_err())
+            {
                 return Err(ToolError::InvalidArguments);
             }
             Ok(())
@@ -2367,6 +2370,17 @@ fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(),
         if !seen.insert(format!("{}:{id}", participant.kind)) {
             return Err(ToolError::InvalidArguments);
         }
+    }
+    Ok(())
+}
+
+/// Keep the local admission boundary in the same units as the server's
+/// `length(name) <= 200`, while retaining the byte ceiling before binding or
+/// approval.
+fn validate_channel_name(value: &str) -> Result<(), ToolError> {
+    validate_bounded_nonempty(value, MAX_CHANNEL_NAME_BYTES)?;
+    if value.chars().count() > MAX_CHANNEL_NAME_CHARS {
+        return Err(ToolError::InvalidArguments);
     }
     Ok(())
 }
@@ -6896,6 +6910,33 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments));
         assert_eq!(api.promises.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn channel_names_are_bounded_by_characters_like_the_server() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        for name in ["a".repeat(200), "あ".repeat(200)] {
+            execute(
+                &tool,
+                json!({"action": "create_channel", "name": name}),
+                "channel-name",
+            )
+            .await
+            .unwrap();
+        }
+        for action in [
+            json!({"action": "create_channel", "name": "あ".repeat(201)}),
+            json!({"action": "update_channel", "place_id": "place-a", "name": "あ".repeat(201)}),
+            json!({"action": "duplicate_channel", "place_id": "place-a", "name": "あ".repeat(201)}),
+        ] {
+            let error = execute(&tool, action, "channel-name-too-long")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.created_channels.lock().await.len(), 2);
     }
 
     #[tokio::test]

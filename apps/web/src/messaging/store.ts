@@ -82,6 +82,20 @@ const UNBOUND_CAPABILITIES: MessagingCapabilities = {
   notifications: false,
 };
 
+/**
+ * Lifecycle frames do not replay. A late frame or bootstrap answer can
+ * describe an already superseded state, so only a strictly newer database
+ * revision can replace what this client has projected.
+ */
+function applyNewerChannel(
+  current: ChannelSummary | undefined,
+  candidate: ChannelSummary,
+): ChannelSummary {
+  return !current || candidate.revision > current.revision
+    ? candidate
+    : current;
+}
+
 function unboundMessagingBackend(): MessagingBackend {
   const target = {
     capabilities: UNBOUND_CAPABILITIES,
@@ -1482,11 +1496,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "place_updated") {
       const { channel } = event;
-      set((state) => ({
-        channels: state.channels.map((entry) =>
-          entry.channelId === channel.channelId ? channel : entry,
-        ),
-      }));
+      set((state) => {
+        const index = state.channels.findIndex(
+          (entry) => entry.channelId === channel.channelId,
+        );
+        if (index < 0) return {};
+        const next = applyNewerChannel(state.channels[index], channel);
+        if (next === state.channels[index]) return {};
+        const channels = [...state.channels];
+        channels[index] = next;
+        return { channels };
+      });
     }
   };
 
@@ -1545,9 +1565,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
       mentionCountByPlace[key] = summary.mentionCount;
       sinceByPlace[key] = summary.latestSeq;
     }
+    const channelsByID = new Map(
+      state.channels.map((channel) => [channel.channelId, channel]),
+    );
+    for (const channel of snapshot.channels) {
+      channelsByID.set(
+        channel.channelId,
+        applyNewerChannel(channelsByID.get(channel.channelId), channel),
+      );
+    }
     set({
       workspaces: snapshot.workspaces,
-      channels: snapshot.channels,
+      channels: [...channelsByID.values()],
       dms: snapshot.dms,
       membersByKey,
       lastReadByPlace,
@@ -2089,11 +2118,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         throw new Error("Messaging session changed during channel edit");
       }
-      set((state) => ({
-        channels: state.channels.map((entry) =>
-          entry.channelId === channel.channelId ? channel : entry,
-        ),
-      }));
+      set((state) => {
+        const index = state.channels.findIndex(
+          (entry) => entry.channelId === channel.channelId,
+        );
+        if (index < 0) return {};
+        const next = applyNewerChannel(state.channels[index], channel);
+        if (next === state.channels[index]) return {};
+        const channels = [...state.channels];
+        channels[index] = next;
+        return { channels };
+      });
     },
 
     async duplicateChannel(channelId) {

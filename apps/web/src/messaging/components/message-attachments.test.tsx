@@ -173,6 +173,7 @@ describe("Composer attachments", () => {
         {
           channelId: "ch-general",
           workspaceId: "ws",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",

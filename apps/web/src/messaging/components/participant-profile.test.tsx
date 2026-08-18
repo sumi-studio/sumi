@@ -494,7 +494,7 @@ describe("Sidebar のプロフィール導線", () => {
     useMessaging.setState({ setStatus });
     renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: "余白 対応可能" }));
+    fireEvent.click(screen.getByRole("button", { name: "余白 未設定" }));
     fireEvent.click(screen.getByRole("button", { name: "取り込み中" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "解除するまで" }));
 

@@ -257,6 +257,7 @@ type workspaceWire struct {
 type channelWire struct {
 	ChannelID   string `json:"channel_id"`
 	WorkspaceID string `json:"workspace_id"`
+	Revision    int64  `json:"revision"`
 	Name        string `json:"name"`
 	Topic       string `json:"topic"`
 	Visibility  string `json:"visibility"`
@@ -267,6 +268,7 @@ func channelToWire(p Place) channelWire {
 	return channelWire{
 		ChannelID:   p.PlaceID,
 		WorkspaceID: p.WorkspaceID,
+		Revision:    p.Revision,
 		Name:        p.Name,
 		Topic:       p.Topic,
 		Visibility:  p.Visibility,

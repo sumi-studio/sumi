@@ -223,6 +223,9 @@
   `/direct-chat/ws` とは混ぜない（privacy・認可・replay・backpressureの境界が違う）。
 - bootstrap/place一覧は各placeの `latest_seq`、未読数、mention未読数を返す。履歴を
   lazy loadしていても、未訪問placeのバッジを欠落させないための投影である。
+- channel は `revision`（JSON safe integer、作成時は1・`places` の更新ごとに+1）も
+  運ぶ。`place_updated` はreplayされないため、clientは既に持つchannelより**新しい**
+  revisionだけを適用し、遅れて届いた過去の全量projectionで名前やtopicを戻さない。
 - `GET /messaging/search?q=&place_id=&limit=` は、現在の正確なWorkspace app
   scopeの中で、閲覧者が今見られるlive messageだけを部分一致検索する。結果は
   `message_id`、`place`、`seq`、`author`、`created_at` と、全文ではなくサーバー側で

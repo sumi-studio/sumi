@@ -66,6 +66,7 @@ const CHANNELS: ChannelSummary[] = [
   {
     channelId: "ch-general",
     workspaceId: "ws-sumi",
+    revision: 1,
     name: "general",
     topic: "雑談と全体連絡",
     visibility: "public",
@@ -74,6 +75,7 @@ const CHANNELS: ChannelSummary[] = [
   {
     channelId: "ch-dev",
     workspaceId: "ws-sumi",
+    revision: 1,
     name: "dev",
     topic: "開発の相談と進捗",
     visibility: "public",
@@ -82,6 +84,7 @@ const CHANNELS: ChannelSummary[] = [
   {
     channelId: "ch-design",
     workspaceId: "ws-sumi",
+    revision: 1,
     name: "design",
     topic: "デザインレビュー",
     visibility: "public",
@@ -538,6 +541,7 @@ export class MockMessagingServer implements MessagingBackend {
     const channel: ChannelSummary = {
       channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
       workspaceId,
+      revision: 1,
       name,
       topic,
       visibility: "public",
@@ -587,6 +591,7 @@ export class MockMessagingServer implements MessagingBackend {
     }
     if (input.name !== undefined) channel.name = input.name;
     if (input.topic !== undefined) channel.topic = input.topic;
+    channel.revision += 1;
     this.emit({ type: "place_updated", channel });
     return channel;
   }
@@ -601,6 +606,7 @@ export class MockMessagingServer implements MessagingBackend {
     const copy: ChannelSummary = {
       channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
       workspaceId: source.workspaceId,
+      revision: 1,
       name: name && name !== "" ? name : copyChannelName(source.name),
       topic: source.topic,
       visibility: "public",

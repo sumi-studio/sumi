@@ -42,6 +42,14 @@ afterEach(() => {
 });
 
 describe("StatusMenu", () => {
+  it("申告が無い人を対応可能とは表示しない", () => {
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    expect(screen.getByText("未設定")).toBeVisible();
+    expect(screen.queryByText("対応可能")).not.toBeInTheDocument();
+  });
+
   it("期限を選ぶ前に、その期限が切れたときどこへ戻るかを見せる", () => {
     setSelfStatus({
       participant: SELF,
