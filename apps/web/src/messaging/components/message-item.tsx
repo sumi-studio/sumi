@@ -218,19 +218,40 @@ export const MessageItem = memo(function MessageItem({
 
   return (
     <div
-      className={`group relative px-4 transition-colors hover:bg-accent/55 sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
+      className={`group relative px-4 transition-colors hover:bg-accent sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
         mentionsSelf ? "bg-amber-500/6" : ""
       } ${pending && !failed ? "opacity-55" : ""}`}
     >
+      {/* 行の左端の目印。右端の操作チップだけでは対象行が読み取りにくいので、
+          本文側にも「今どの行に触れているか」を出す。 */}
+      <span
+        aria-hidden
+        className="pointer-events-none absolute inset-y-0 left-0 w-0.5 bg-transparent transition-colors group-focus-within:bg-primary/50 group-hover:bg-primary/50"
+      />
       {replyTarget && replyAuthor ? (
         <button
           type="button"
           onClick={() => onJumpTo(replyTarget.messageId)}
-          className="mb-0.5 ml-11 flex max-w-full items-center gap-1.5 truncate text-muted-foreground text-xs hover:text-foreground"
+          title={`${replyAuthor.displayName} の返信元へ移動`}
+          className="mb-0.5 flex w-full items-center gap-1.5 text-left text-[12px] text-muted-foreground hover:text-foreground"
         >
-          <CornerUpLeft className="size-3 shrink-0" />
-          <span className="font-medium">{replyAuthor.displayName}</span>
-          <span className="truncate">{replyTarget.content}</span>
+          {/* 本体アバターの中心から立ち上がるカギ線。返信引用・アバター・
+              投稿者名・本文を一つの階層として読ませるための繋ぎ。 */}
+          <span
+            aria-hidden
+            className="mt-2.5 ml-4 w-[22px] shrink-0 self-stretch rounded-tl-[6px] border-border border-t-2 border-l-2"
+          />
+          <ParticipantAvatar
+            participantKey={participantKey(replyTarget.author)}
+            name={replyAuthor.displayName}
+            size={16}
+          />
+          <span className="shrink-0 font-medium text-foreground/80">
+            {replyAuthor.displayName}
+          </span>
+          <span className="truncate">
+            {replyTarget.content || "添付ファイル"}
+          </span>
         </button>
       ) : null}
       <div className="flex gap-3">
@@ -324,8 +345,10 @@ export const MessageItem = memo(function MessageItem({
           ) : null}
         </div>
       </div>
+      {/* 操作チップは対象行の内側（右上）に置く。行の外へはみ出すと
+          どのメッセージに効くのかが読み取れなくなる。 */}
       {pending ? null : (
-        <div className="pointer-events-none absolute top-0 right-4 flex -translate-y-1/2 items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+        <div className="pointer-events-none absolute top-0.5 right-3 flex items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
           {allowReactions ? (
             <Popover>
               <PopoverTrigger
