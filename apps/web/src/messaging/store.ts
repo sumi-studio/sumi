@@ -1895,17 +1895,32 @@ export const useMessaging = create<MessagingState>((set, get) => {
         .then(
           () => get().cancelEdit(),
           (error: unknown) => {
-            if (!(error instanceof MessagingAPIError) || error.status !== 409)
+            if (
+              !(error instanceof MessagingAPIError) ||
+              error.status !== 409 ||
+              error.code !== "edit_conflict" ||
+              !error.currentMessage
+            )
               return;
+            const latest = error.currentMessage;
             set((current) => {
               if (current.editingMessageId !== messageId) return current;
-              const latest = (current.messagesByPlace[key] ?? []).find(
-                (message) => message.messageId === messageId,
-              );
+              if (
+                latest.messageId !== messageId ||
+                placeKey(latest.place) !== key
+              )
+                return current;
               return {
+                messagesByPlace: {
+                  ...current.messagesByPlace,
+                  [key]: upsertMessage(
+                    current.messagesByPlace[key] ?? [],
+                    latest,
+                  ),
+                },
                 editConflict: {
-                  content: latest?.content ?? current.editDraft,
-                  revision: latest?.revision ?? expectedRevision,
+                  content: latest.content,
+                  revision: latest.revision ?? 1,
                 },
               };
             });

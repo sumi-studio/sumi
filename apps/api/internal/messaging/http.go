@@ -1083,6 +1083,17 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		var conflict *messageRevisionConflictError
+		if errors.As(err, &conflict) {
+			writeJSON(w, http.StatusConflict, struct {
+				Error   string      `json:"error"`
+				Message messageWire `json:"message"`
+			}{
+				Error:   "edit_conflict",
+				Message: messageToWire(place, conflict.Current),
+			})
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}

@@ -378,7 +378,7 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, ErrMessageDeleted
 	}
 	if expectedRevision <= 0 || message.Revision != expectedRevision {
-		return Message{}, ErrMessageRevisionConflict
+		return Message{}, currentRevisionConflict(ctx, tx, message)
 	}
 	members, err := s.activeMembersScoped(ctx, tx, place)
 	if err != nil {
@@ -392,7 +392,7 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		RETURNING edited_at, revision`,
 		content, s.Scope.WorkspaceID, messageID, expectedRevision).Scan(&editedAt, &message.Revision); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return Message{}, ErrMessageRevisionConflict
+			return Message{}, currentRevisionConflict(ctx, tx, message)
 		}
 		return Message{}, fmt.Errorf("update scoped message: %w", err)
 	}
@@ -411,6 +411,17 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, fmt.Errorf("commit scoped edit: %w", err)
 	}
 	return parts[0], nil
+}
+
+// currentRevisionConflict completes the locked message before returning it to
+// the transport. The caller has already checked exact scope, visibility and
+// authorship, so the response cannot disclose a message the editor may not see.
+func currentRevisionConflict(ctx context.Context, q querier, message Message) error {
+	current := []Message{message}
+	if err := attachMessagePartsWith(ctx, q, current); err != nil {
+		return fmt.Errorf("load current scoped message for edit conflict: %w", err)
+	}
+	return &messageRevisionConflictError{Current: current[0]}
 }
 
 func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID string) (Message, error) {

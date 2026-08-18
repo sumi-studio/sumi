@@ -42,6 +42,22 @@ var (
 	ErrSeqBeyondLatest         = errors.New("seq is beyond the place's latest seq")
 )
 
+// messageRevisionConflictError carries the current, already-authorized message
+// back to the HTTP boundary. A client may have missed message_edited while its
+// socket was disconnected, so deriving a replacement from its local timeline
+// would preserve the stale revision that caused the conflict.
+type messageRevisionConflictError struct {
+	Current Message
+}
+
+func (e *messageRevisionConflictError) Error() string {
+	return ErrMessageRevisionConflict.Error()
+}
+
+func (e *messageRevisionConflictError) Unwrap() error {
+	return ErrMessageRevisionConflict
+}
+
 // Store persists the messaging surface. All authorization decisions the
 // contract assigns to the service — membership, roles, reachability — are made
 // here so REST, WS, and the agent tool path cannot diverge (凍結契約 v1 §4:
