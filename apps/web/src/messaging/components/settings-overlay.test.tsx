@@ -130,6 +130,35 @@ describe("個人設定", () => {
     );
   });
 
+  it("保存後はサーバー確定値を入力と基準値にして、同じ内容を再送しない", async () => {
+    updateProfile.mockResolvedValueOnce({
+      participant: SELF,
+      displayName: "行内 空白",
+      tagline: "デザイン",
+      revision: 2,
+    });
+    render(<SettingsOverlay />);
+
+    fireEvent.change(screen.getByLabelText("表示名"), {
+      target: { value: "  行内   空白  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateProfile).toHaveBeenCalledWith({
+        displayName: "行内   空白",
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("表示名")).toHaveValue("行内 空白"),
+    );
+    expect(screen.getByText("保存しました")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(updateProfile).toHaveBeenCalledTimes(1);
+  });
+
   it("別経路で変わった未編集のひとことを保存時に上書きしない", async () => {
     render(<SettingsOverlay />);
 

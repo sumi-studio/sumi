@@ -109,8 +109,20 @@ function ProfileSection() {
 
   const canonicalName = member?.displayName ?? "";
   const canonicalTagline = member?.tagline ?? "";
-  const [displayName, setDisplayName] = useState(canonicalName);
-  const [tagline, setTagline] = useState(canonicalTagline);
+  const [form, setForm] = useState(() => ({
+    baseline: {
+      displayName: canonicalName,
+      tagline: canonicalTagline,
+    },
+    values: {
+      displayName: canonicalName,
+      tagline: canonicalTagline,
+    },
+    observed: {
+      displayName: canonicalName,
+      tagline: canonicalTagline,
+    },
+  }));
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState("");
   const [saved, setSaved] = useState(false);
@@ -118,16 +130,35 @@ function ProfileSection() {
   // 名乗りは別の経路（別のタブ、PA側の道具）でも変わる。正本が動いたら、手を
   // 付けていない欄だけ新しい値へ合わせ、編集中の欄は上書きしない — statusの
   // ひとことと同じ扱い。
-  const [seen, setSeen] = useState({
-    displayName: canonicalName,
-    tagline: canonicalTagline,
-  });
-  if (seen.displayName !== canonicalName || seen.tagline !== canonicalTagline) {
-    if (displayName === seen.displayName) setDisplayName(canonicalName);
-    if (tagline === seen.tagline) setTagline(canonicalTagline);
-    setSeen({ displayName: canonicalName, tagline: canonicalTagline });
+  if (
+    form.observed.displayName !== canonicalName ||
+    form.observed.tagline !== canonicalTagline
+  ) {
+    setForm((current) => ({
+      baseline: {
+        displayName: canonicalName,
+        tagline: canonicalTagline,
+      },
+      values: {
+        displayName:
+          current.values.displayName === current.baseline.displayName
+            ? canonicalName
+            : current.values.displayName,
+        tagline:
+          current.values.tagline === current.baseline.tagline
+            ? canonicalTagline
+            : current.values.tagline,
+      },
+      observed: {
+        displayName: canonicalName,
+        tagline: canonicalTagline,
+      },
+    }));
   }
-  const dirty = displayName !== canonicalName || tagline !== canonicalTagline;
+  const { displayName, tagline } = form.values;
+  const dirty =
+    displayName !== form.baseline.displayName ||
+    tagline !== form.baseline.tagline;
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -140,13 +171,13 @@ function ProfileSection() {
         displayName?: string;
         tagline?: string;
       } = {};
-      if (displayName !== canonicalName) {
+      if (displayName !== form.baseline.displayName) {
         input.displayName = clampCodePoints(
           displayName.trim(),
           MAX_DISPLAY_NAME_CHARS,
         );
       }
-      if (tagline !== canonicalTagline) {
+      if (tagline !== form.baseline.tagline) {
         input.tagline = clampCodePoints(tagline.trim(), MAX_TAGLINE_CHARS);
       }
       const canonical = await updateProfile(input);
@@ -156,6 +187,17 @@ function ProfileSection() {
       ) {
         syncDisplayName(user.id, canonical.displayName);
       }
+      setForm((current) => ({
+        ...current,
+        baseline: {
+          displayName: canonical.displayName,
+          tagline: canonical.tagline,
+        },
+        values: {
+          displayName: canonical.displayName,
+          tagline: canonical.tagline,
+        },
+      }));
       setSaved(true);
     } catch {
       setFailed("保存できませんでした。表示名は1文字以上必要です");
@@ -186,9 +228,16 @@ function ProfileSection() {
           id="settings-display-name"
           value={displayName}
           onChange={(event) =>
-            setDisplayName(
-              clampCodePoints(event.target.value, MAX_DISPLAY_NAME_CHARS),
-            )
+            setForm((current) => ({
+              ...current,
+              values: {
+                ...current.values,
+                displayName: clampCodePoints(
+                  event.target.value,
+                  MAX_DISPLAY_NAME_CHARS,
+                ),
+              },
+            }))
           }
           disabled={busy}
           className={INPUT_CLASS}
@@ -203,7 +252,13 @@ function ProfileSection() {
           id="settings-tagline"
           value={tagline}
           onChange={(event) =>
-            setTagline(clampCodePoints(event.target.value, MAX_TAGLINE_CHARS))
+            setForm((current) => ({
+              ...current,
+              values: {
+                ...current.values,
+                tagline: clampCodePoints(event.target.value, MAX_TAGLINE_CHARS),
+              },
+            }))
           }
           disabled={busy}
           placeholder="例: 開発"
