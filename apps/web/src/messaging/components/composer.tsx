@@ -1,4 +1,5 @@
 import {
+  BarChart3,
   CornerUpLeft,
   FileText,
   Loader2,
@@ -21,6 +22,7 @@ import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
+import { PollCreateDialog } from "./poll-create-dialog";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
@@ -50,6 +52,7 @@ function findMentionQuery(value: string, caret: number): MentionQuery | null {
 }
 
 export function Composer() {
+  const pollsEnabled = useMessaging((state) => state.capabilities.polls);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const draft = useMessaging((state) =>
     state.activePlaceKey
@@ -94,6 +97,7 @@ export function Composer() {
   );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
+  const [pollOpen, setPollOpen] = useState(false);
 
   const display = usePlaceDisplay(activePlaceKey);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -485,6 +489,17 @@ export function Composer() {
               >
                 <Paperclip className="size-4" />
               </button>
+              {pollsEnabled ? (
+                <button
+                  type="button"
+                  title="投票を作成"
+                  aria-label="投票を作成"
+                  onClick={() => setPollOpen(true)}
+                  className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <BarChart3 className="size-4" />
+                </button>
+              ) : null}
             </>
           ) : null}
           <span className="ml-auto text-[11px] text-muted-foreground/60">
@@ -496,6 +511,9 @@ export function Composer() {
           </span>
         </div>
       </div>
+      {pollOpen ? (
+        <PollCreateDialog onClose={() => setPollOpen(false)} />
+      ) : null}
     </section>
   );
 }

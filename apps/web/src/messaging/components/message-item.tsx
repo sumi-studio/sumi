@@ -27,6 +27,7 @@ import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
+import { MessagePoll } from "./message-poll";
 import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -269,6 +270,7 @@ export const MessageItem = memo(function MessageItem({
           {message.deleted ? null : (
             <MessageAttachments attachments={message.attachments} />
           )}
+          {message.deleted ? null : <MessagePoll message={message} />}
           <MessageThreadChip message={message} />
           {allowReactions ? (
             <ReactionChips

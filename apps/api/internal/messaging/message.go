@@ -45,7 +45,8 @@ type Message struct {
 	Mentions    []ParticipantRef
 	Reactions   []ReactionSummary
 	Attachments []Attachment // sender-ordered; empty for tombstones
-	ReplyTo     string       // empty when not a reply
+	Poll        *Poll
+	ReplyTo     string // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
 	EditedAt    *time.Time
@@ -65,6 +66,8 @@ type AppendInput struct {
 	// AttachmentIDs are the author's own finalized uploads in the sender's
 	// order. They bind inside the send transaction; any miss rolls it back.
 	AttachmentIDs []string
+	// Poll commits in the same transaction as the message it belongs to.
+	Poll *PollInput
 }
 
 type HistoryOptions struct {

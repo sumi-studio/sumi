@@ -327,6 +327,36 @@ func TestLocalCreateThreadRejectsNULName(t *testing.T) {
 	}
 }
 
+func TestLocalCreatePollReplayWithRelativeDeadlineReturnsOriginalReceipt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	body := map[string]any{
+		"place_id": channel.PlaceID, "question": "いつ？", "options": []string{"今日", "明日"},
+		"client_nonce": "relative-deadline-replay", "closes_in_minutes": 30,
+	}
+	firstStatus, first := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, body, authorization)
+	if firstStatus != http.StatusCreated || first["created"] != true {
+		t.Fatalf("first relative poll = %d %v, want 201 created", firstStatus, first)
+	}
+	firstMessage, ok := first["message"].(map[string]any)
+	if !ok || firstMessage["message_id"] == "" {
+		t.Fatalf("first relative poll receipt = %v", first)
+	}
+
+	secondStatus, second := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, body, authorization)
+	if secondStatus != http.StatusOK || second["created"] != false {
+		t.Fatalf("relative poll replay = %d %v, want 200 replay", secondStatus, second)
+	}
+	secondMessage, ok := second["message"].(map[string]any)
+	if !ok || secondMessage["message_id"] != firstMessage["message_id"] {
+		t.Fatalf("relative poll replay receipt = %v, first %v", second, first)
+	}
+}
+
 func TestLocalExactCallStateReconcilesAfterRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

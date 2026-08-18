@@ -963,20 +963,52 @@ func enqueueAttachmentDeletionsInTx(ctx context.Context, tx pgx.Tx, workspaceID,
 // replay compares it so a changed request under the same nonce is a conflict.
 // Attachment identities are server-minted and one-to-one with immutable
 // manifests, so listing them in order fixes the manifests as well.
-func messageRequestDigest(content, urgency, replyTo string, attachmentIDs []string) []byte {
+func messageRequestDigest(content, urgency, replyTo string, attachmentIDs []string, poll *PollInput) []byte {
 	ids := attachmentIDs
 	if ids == nil {
 		ids = []string{}
 	}
+	if poll == nil {
+		canonical, err := json.Marshal(struct {
+			Content     string   `json:"content"`
+			Urgency     string   `json:"urgency"`
+			ReplyTo     string   `json:"reply_to"`
+			Attachments []string `json:"attachments"`
+		}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids})
+		if err != nil {
+			panic(fmt.Sprintf("marshal message request digest: %v", err))
+		}
+		sum := sha256.Sum256(append([]byte("sumi-messaging-request-v1\x00"), canonical...))
+		return sum[:]
+	}
+	// The local agent API accepts a relative deadline. Its absolute conversion
+	// changes on each transport retry, so canonicalize it as the supplied
+	// duration and deliberately omit that attempt's derived wall-clock time.
+	type canonicalPoll struct {
+		Question                string     `json:"question"`
+		AllowMulti              bool       `json:"allow_multi"`
+		ClosesAt                *time.Time `json:"closes_at"`
+		RelativeClosesInMinutes uint32     `json:"closes_in_minutes,omitempty"`
+		Options                 []string   `json:"options"`
+	}
+	closesAt := poll.ClosesAt
+	if poll.RelativeClosesInMinutes > 0 {
+		closesAt = nil
+	}
 	canonical, err := json.Marshal(struct {
-		Content     string   `json:"content"`
-		Urgency     string   `json:"urgency"`
-		ReplyTo     string   `json:"reply_to"`
-		Attachments []string `json:"attachments"`
-	}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids})
+		Content     string        `json:"content"`
+		Urgency     string        `json:"urgency"`
+		ReplyTo     string        `json:"reply_to"`
+		Attachments []string      `json:"attachments"`
+		Poll        canonicalPoll `json:"poll"`
+	}{
+		Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids,
+		Poll: canonicalPoll{Question: poll.Question, AllowMulti: poll.AllowMulti, ClosesAt: closesAt,
+			RelativeClosesInMinutes: poll.RelativeClosesInMinutes, Options: poll.Options},
+	})
 	if err != nil {
 		panic(fmt.Sprintf("marshal message request digest: %v", err))
 	}
-	sum := sha256.Sum256(append([]byte("sumi-messaging-request-v1\x00"), canonical...))
+	sum := sha256.Sum256(append([]byte("sumi-messaging-request-v2\x00"), canonical...))
 	return sum[:]
 }

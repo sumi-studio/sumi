@@ -68,6 +68,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/poll/vote", s.serveVotePoll)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
@@ -199,11 +200,51 @@ type messageWire struct {
 	Urgency     string            `json:"urgency"`
 	Reactions   []reactionWire    `json:"reactions"`
 	Attachments []attachmentWire  `json:"attachments"`
+	Poll        *pollWire         `json:"poll,omitempty"`
 	ReplyTo     *string           `json:"reply_to"`
 	ClientNonce string            `json:"client_nonce"`
 	CreatedAt   time.Time         `json:"created_at"`
 	EditedAt    *time.Time        `json:"edited_at"`
 	Deleted     bool              `json:"deleted"`
+}
+
+type pollOptionWire struct {
+	OptionID string            `json:"option_id"`
+	Text     string            `json:"text"`
+	Voters   []participantWire `json:"voters"`
+}
+
+type pollWire struct {
+	Question   string           `json:"question"`
+	AllowMulti bool             `json:"allow_multi"`
+	ClosesAt   *time.Time       `json:"closes_at"`
+	Revision   int64            `json:"revision"`
+	Options    []pollOptionWire `json:"options"`
+}
+
+func pollToWire(poll *Poll) *pollWire {
+	if poll == nil {
+		return nil
+	}
+	options := make([]pollOptionWire, len(poll.Options))
+	for i, option := range poll.Options {
+		options[i] = pollOptionWire{OptionID: option.OptionID, Text: option.Text, Voters: participantsToWire(option.Voters)}
+	}
+	return &pollWire{Question: poll.Question, AllowMulti: poll.AllowMulti, ClosesAt: poll.ClosesAt, Revision: poll.Revision, Options: options}
+}
+
+type pollRequestWire struct {
+	Question   string     `json:"question"`
+	AllowMulti bool       `json:"allow_multi"`
+	ClosesAt   *time.Time `json:"closes_at"`
+	Options    []string   `json:"options"`
+}
+
+func (wire *pollRequestWire) input() *PollInput {
+	if wire == nil {
+		return nil
+	}
+	return &PollInput{Question: wire.Question, AllowMulti: wire.AllowMulti, ClosesAt: wire.ClosesAt, Options: wire.Options}
 }
 
 // searchResultWire deliberately excludes full message content. A result has
@@ -283,6 +324,7 @@ func messageToWire(place Place, m Message) messageWire {
 		Urgency:     m.Urgency,
 		Reactions:   reactionsToWire(m.Reactions),
 		Attachments: attachmentsToWire(m.Attachments),
+		Poll:        pollToWire(m.Poll),
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
@@ -1100,16 +1142,17 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Content     string   `json:"content"`
-		Urgency     string   `json:"urgency"`
-		ReplyTo     string   `json:"reply_to"`
-		ClientNonce string   `json:"client_nonce"`
-		Attachments []string `json:"attachments"`
+		Content     string           `json:"content"`
+		Urgency     string           `json:"urgency"`
+		ReplyTo     string           `json:"reply_to"`
+		ClientNonce string           `json:"client_nonce"`
+		Attachments []string         `json:"attachments"`
+		Poll        *pollRequestWire `json:"poll"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if code := validateSendRequest(req.Content, req.Urgency, req.ClientNonce, req.Attachments); code != "" {
+	if code := validateSendRequest(req.Content, req.Urgency, req.ClientNonce, req.Attachments, req.Poll != nil); code != "" {
 		writeError(w, http.StatusBadRequest, code)
 		return
 	}
@@ -1128,7 +1171,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		msg, created, opErr = store.AppendMessage(r.Context(), AppendInput{
 			PlaceID: placeID, Author: viewer, Content: req.Content,
 			Urgency: req.Urgency, ReplyTo: req.ReplyTo, ClientNonce: req.ClientNonce,
-			AttachmentIDs: req.Attachments,
+			AttachmentIDs: req.Attachments, Poll: req.Poll.input(),
 		})
 		return opErr
 	})
@@ -1153,13 +1196,13 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 // validateSendRequest is the transport-shape check shared by the browser and
 // PA send routes. It returns the error code, or "" when the shape is valid.
 // Attachment-only messages are legitimate; empty and attachment-less is not.
-func validateSendRequest(content, urgency, clientNonce string, attachments []string) string {
+func validateSendRequest(content, urgency, clientNonce string, attachments []string, hasPoll bool) string {
 	switch urgency {
 	case "", UrgencyUrgent, UrgencyNormal, UrgencyFYI:
 	default:
 		return "invalid_urgency"
 	}
-	if (content == "" && len(attachments) == 0) || !messageContentFitsStorage(content) {
+	if (content == "" && len(attachments) == 0 && !hasPoll) || !messageContentFitsStorage(content) {
 		return "invalid_content"
 	}
 	if len(attachments) > MaxAttachmentsPerMessage {
@@ -1174,6 +1217,44 @@ func validateSendRequest(content, urgency, clientNonce string, attachments []str
 		return "invalid_client_nonce"
 	}
 	return ""
+}
+
+func (s *Server) serveVotePoll(w http.ResponseWriter, r *http.Request) {
+	_, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	placeID := r.PathValue("place_id")
+	var request struct {
+		OptionIDs []string `json:"option_ids"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	store := scopedStoreForRequest(r)
+	place, err := store.PlaceFor(r.Context(), placeID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var message Message
+	done, err := s.mutate(w, r, claims, func() error {
+		var operationErr error
+		message, operationErr = store.VotePoll(r.Context(), placeID, r.PathValue("message_id"), request.OptionIDs)
+		return operationErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, message)
+	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventPollUpdated, PlaceID: placeID, Message: &wire})
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: wire})
 }
 
 func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
@@ -1604,6 +1685,12 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_threadable")
 	case errors.Is(err, ErrThreadExists):
 		writeError(w, http.StatusConflict, "thread_exists")
+	case errors.Is(err, ErrInvalidPoll), errors.Is(err, ErrPollSingleChoice):
+		writeError(w, http.StatusBadRequest, "invalid_poll")
+	case errors.Is(err, ErrPollNotFound), errors.Is(err, ErrPollOptionNotFound):
+		writeError(w, http.StatusNotFound, "poll_not_found")
+	case errors.Is(err, ErrPollClosed):
+		writeError(w, http.StatusConflict, "poll_closed")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
 	case errors.Is(err, ErrInvalidScope):

@@ -1,4 +1,4 @@
-import type { Message, ParticipantKey, Urgency } from "./model";
+import type { Message, ParticipantKey, PollInput, Urgency } from "./model";
 import { participantKey } from "./model";
 
 /**
@@ -17,6 +17,7 @@ export interface PendingMessage {
   replyTo: string | null;
   /** upload済みの受領。送信者の順序で、楽観的描画にそのまま出す。 */
   attachments: Message["attachments"];
+  poll?: PollInput | null;
   createdAt: number;
   /** 送信失敗。UIは再送を促し、再送は同じclientNonceで冪等に行う。 */
   failed?: boolean;
@@ -212,6 +213,19 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         urgency: entry.urgency,
         reactions: [],
         attachments: entry.attachments,
+        poll:
+          entry.poll == null
+            ? null
+            : {
+                question: entry.poll.question,
+                allowMulti: entry.poll.allowMulti,
+                closesAt: entry.poll.closesAt,
+                options: entry.poll.options.map((text, index) => ({
+                  optionId: `pending:${index}`,
+                  text,
+                  voters: [],
+                })),
+              },
         replyTo: entry.replyTo,
         createdAt: entry.createdAt,
         editedAt: null,

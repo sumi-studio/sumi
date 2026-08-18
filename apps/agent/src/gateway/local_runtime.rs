@@ -48,13 +48,13 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest, ExactMessagingScope,
-    GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure,
-    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
-    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    CreateMessagingPollRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
+    ExactMessagingScope, GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
+    MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
-    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
+    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse, VoteMessagingPollRequest,
     WriteMessagingMessageRequest, canonical_attachment_filename,
 };
 use crate::apiclient::workspace::{
@@ -781,6 +781,77 @@ impl MessagingApi for LocalControlHttpClient {
         unreachable!("the bounded Messaging retry loop always returns")
     }
 
+    async fn create_poll(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingPollRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        let mut first_indeterminate = None;
+        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
+            // Poll creation has the same server-side nonce replay contract as
+            // a write. Preserve this exact request when a committed response
+            // is lost, but never replay a definite rejection.
+            let result = async {
+                let (status, body) = self
+                    .post_json_bounded_raw(
+                        "/local-control/v1/messaging:create-poll",
+                        &ScopedMessagingRequest::new(
+                            scope,
+                            CreateMessagingPollRequest {
+                                place_id: request.place_id,
+                                question: request.question,
+                                options: request.options,
+                                allow_multi: request.allow_multi,
+                                content: request.content,
+                                client_nonce: request.client_nonce,
+                                closes_in_minutes: request.closes_in_minutes,
+                            },
+                        ),
+                        MAX_MESSAGING_RESPONSE_BYTES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging poll creation",
+                            format!("transport or response framing failed: {error}"),
+                        )
+                    })?;
+                validate_messaging_poll_creation_response(status, body.as_slice())
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
+                        && is_indeterminate_messaging_failure(&error) =>
+                {
+                    first_indeterminate = Some(error);
+                    continue;
+                }
+                Err(_replay_error) if first_indeterminate.is_some() => {
+                    return Err(first_indeterminate
+                        .take()
+                        .expect("only a replay has an initial indeterminate result"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded Messaging retry loop always returns")
+    }
+
+    async fn vote_poll(
+        &self,
+        scope: &ExactMessagingScope,
+        request: VoteMessagingPollRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:vote-poll",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
     async fn write(
         &self,
         scope: &ExactMessagingScope,
@@ -1221,6 +1292,35 @@ fn validate_messaging_thread_creation_response(
         return Err(MessagingApiFailure::indeterminate(
             OPERATION,
             "committed success receipt omitted thread_id",
+        )
+        .into());
+    }
+    Ok(response)
+}
+
+fn validate_messaging_poll_creation_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> Result<serde_json::Value> {
+    const OPERATION: &str = "Messaging poll creation";
+    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
+        return Err(messaging_mutation_rejection(status, body, OPERATION));
+    }
+    let response: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
+        MessagingApiFailure::indeterminate(
+            OPERATION,
+            format!("committed success receipt was malformed: {error}"),
+        )
+    })?;
+    if response
+        .get("message")
+        .is_none_or(|message| !message.is_object())
+        || response.get("created").and_then(serde_json::Value::as_bool)
+            != Some(status == reqwest::StatusCode::CREATED)
+    {
+        return Err(MessagingApiFailure::indeterminate(
+            OPERATION,
+            "committed success receipt does not match its status",
         )
         .into());
     }
@@ -4025,6 +4125,36 @@ mod tests {
             .into_response()
     }
 
+    async fn poll_response_loss_then_replay_fixture(
+        State(state): State<MessagingReplayFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        let request: serde_json::Value =
+            serde_json::from_slice(&body).expect("strict JSON poll creation");
+        let nonce = request["client_nonce"]
+            .as_str()
+            .expect("poll nonce")
+            .to_owned();
+        let mut requests = state.requests.lock().unwrap();
+        requests.push((nonce, "create_poll".to_owned(), body.to_vec()));
+        if requests.len() == 1 {
+            return committed_response_loss();
+        }
+        drop(requests);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "message": {
+                    "message_id": "0198f0f4-9b72-7000-8000-000000000699",
+                    "seq": 10,
+                    "attachments": []
+                },
+                "created": false
+            })),
+        )
+            .into_response()
+    }
+
     #[derive(Clone)]
     struct CountedMutationFixture {
         status: StatusCode,
@@ -4429,8 +4559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messaging_thread_creation_retries_committed_response_loss_with_same_nonce_and_wire_body()
-     {
+    async fn messaging_thread_creation_retries_lost_response_with_same_wire_body() {
         let state = MessagingReplayFixtureState::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4477,6 +4606,58 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1], "replay must be wire-identical");
         assert_eq!(requests[0].0, "thread-nonce-2");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_poll_creation_retries_lost_response_with_same_wire_body() {
+        let state = MessagingReplayFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-poll",
+                post(poll_response_loss_then_replay_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let options = vec!["today".to_owned(), "tomorrow".to_owned()];
+
+        let response = client
+            .create_poll(
+                &messaging_scope(),
+                CreateMessagingPollRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    question: "When?",
+                    options: &options,
+                    allow_multi: false,
+                    content: Some("release"),
+                    client_nonce: "poll-nonce-2",
+                    closes_in_minutes: Some(30),
+                },
+            )
+            .await
+            .expect("same-nonce replay resolves the committed poll");
+        assert_eq!(response["created"], false);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1], "replay must be wire-identical");
+        assert_eq!(requests[0].0, "poll-nonce-2");
         server.abort();
     }
 

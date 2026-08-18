@@ -76,6 +76,42 @@ export interface ReactionMutationResult {
   reactions: ReactionSummary[];
 }
 
+export interface PollOption {
+  optionId: string;
+  text: string;
+  voters: ParticipantRef[];
+}
+
+export interface MessagePoll {
+  question: string;
+  allowMulti: boolean;
+  closesAt: number | null;
+  /** Monotonically increasing committed vote snapshot version. */
+  revision?: number;
+  options: PollOption[];
+}
+
+export interface PollInput {
+  question: string;
+  allowMulti: boolean;
+  closesAt: number | null;
+  options: string[];
+}
+
+export const MIN_POLL_OPTIONS = 2;
+export const MAX_POLL_OPTIONS = 10;
+
+export function isPollClosed(poll: MessagePoll, now: number): boolean {
+  return poll.closesAt !== null && now >= poll.closesAt;
+}
+
+export function pollVoteCount(poll: MessagePoll): number {
+  return poll.options.reduce(
+    (total, option) => total + option.voters.length,
+    0,
+  );
+}
+
 /** 1ファイルの上限（20 MiB）と1メッセージあたりの添付数。サーバーと同じ値。 */
 export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
@@ -116,6 +152,7 @@ export interface Message {
   reactions: ReactionSummary[];
   /** 送信者が選んだ順序。tombstoneでは空。 */
   attachments: Attachment[];
+  poll?: MessagePoll | null;
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -276,6 +313,7 @@ export type ServerEvent =
       messageId: string;
       reactions: ReactionSummary[];
     }
+  | { type: "poll_updated"; message: Message }
   /**
    * placeのcatch-up完了。cursorより手前のmessageに付いたreactionはreplayされ
    * ないので、受け手はロード済み範囲を読み直して収束させる。
@@ -302,6 +340,7 @@ export interface SendMessageInput {
   clientNonce: string;
   /** upload済みattachmentのIDを送信者の順序で。contentが空でも1件あれば送れる。 */
   attachments: string[];
+  poll?: PollInput | null;
 }
 
 export interface UploadAttachmentInput {
@@ -336,6 +375,7 @@ export interface MessagingCapabilities {
   reactions: boolean;
   notifications: boolean;
   threads?: boolean;
+  polls?: boolean;
 }
 
 /**
@@ -427,6 +467,11 @@ export interface MessagingBackend {
     emoji: string,
     clientNonce: string,
   ): Promise<ReactionMutationResult>;
+  votePoll?(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<Message>;
   /**
    * 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。
    * 返すのはサーバーが正規化した確定値。手元がそれと食い違ったまま残らないよう、

@@ -163,6 +163,31 @@ describe("composer draft attachments", () => {
     expect(server.sent).toEqual([{ content: "", attachments: ["att-only"] }]);
   });
 
+  it("does not send or discard a poll when the composer has an attachment", async () => {
+    const server = new UploadControlledServer();
+    bootstrapStore(server);
+    useMessaging
+      .getState()
+      .addDraftAttachments([new File(["x"], "agenda.txt")]);
+    server.pendingUploads[0]?.deferred.resolve(
+      receipt("att-poll", "agenda.txt"),
+    );
+    await settle();
+
+    useMessaging.getState().send("release notes", "normal", {
+      question: "When?",
+      options: ["today", "tomorrow"],
+      allowMulti: false,
+      closesAt: null,
+    });
+
+    expect(server.sent).toHaveLength(0);
+    expect(
+      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY],
+    ).toHaveLength(1);
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY]).toBeUndefined();
+  });
+
   it("marks failed uploads, retries with the same nonce, and drops removed drafts", async () => {
     const server = new UploadControlledServer();
     bootstrapStore(server);
