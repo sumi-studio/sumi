@@ -36,7 +36,7 @@ export type TimelineRow =
 
 /**
  * seq昇順を保ってメッセージを挿入・置換する。
- * 同じmessageIdは置換（編集反映）、同じseqの別IDは後着を採用しない。
+ * 同じmessageIdではrevisionを単調に保ち、同じseqの別IDは後着を採用しない。
  */
 export function upsertMessage(
   messages: readonly Message[],
@@ -46,6 +46,10 @@ export function upsertMessage(
     (entry) => entry.messageId === incoming.messageId,
   );
   if (byId >= 0) {
+    const current = messages[byId];
+    if ((incoming.revision ?? 1) < (current.revision ?? 1)) {
+      return [...messages];
+    }
     const next = [...messages];
     next[byId] = incoming;
     return next;

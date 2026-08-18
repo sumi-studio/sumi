@@ -49,6 +49,21 @@ describe("upsertMessage", () => {
     expect(next[1].content).toBe("edited");
   });
 
+  it("同じmessageIdへ遅れて届いた古いrevisionは捨てる", () => {
+    const current = message({
+      seq: 1,
+      content: "revision 3",
+      revision: 3,
+    });
+
+    const next = upsertMessage(
+      [current],
+      message({ seq: 1, content: "revision 2", revision: 2 }),
+    );
+
+    expect(next).toEqual([current]);
+  });
+
   it("同じseqの別IDは受け入れない", () => {
     const list = [message({ seq: 1 })];
     const next = upsertMessage(list, {
