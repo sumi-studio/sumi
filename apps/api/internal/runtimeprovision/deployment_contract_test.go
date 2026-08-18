@@ -197,8 +197,8 @@ func TestSupervisorReconcileAttestsPartialProjectOnlyAfterObservedEmpty(t *testi
 set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
-  *"compose.lifecycle.yaml ps --status running --quiet runtime"*)
-    [ -e "$SUMI_FAKE_DOCKER_STATE" ] || printf '0123456789ab\n'
+  "ps --all --filter label=com.docker.compose.project="*)
+    [ -e "$SUMI_FAKE_DOCKER_STATE" ] || printf '0123456789ab\truntime\texited\n'
     ;;
   *"compose.lifecycle.yaml down"*)
     : > "$SUMI_FAKE_DOCKER_STATE"
@@ -255,7 +255,7 @@ exec /usr/bin/stat "$@"
 		t.Fatal(err)
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
-	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	emptyObservation := strings.LastIndex(string(calls), "ps --all --filter label=com.docker.compose.project=")
 	durableGeneration := strings.LastIndex(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("reconcile did not observe empty before deriving its durable generation:\n%s", calls)
@@ -328,7 +328,7 @@ exec /usr/bin/stat "$@"
 		t.Fatal(err)
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
-	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	emptyObservation := strings.LastIndex(string(calls), "ps --all --filter label=com.docker.compose.project=")
 	durableGeneration := strings.LastIndex(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("reconcile did not verify emptiness before re-attesting the durable generation:\n%s", calls)
@@ -352,6 +352,9 @@ func TestSupervisorReconcileRemovesAllocatorOnlyProjectBeforeReattesting(t *test
 set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
+  "ps --all --filter label=com.docker.compose.project="*)
+    [ -e "$SUMI_FAKE_DOCKER_STATE" ] || printf '0123456789ab\tallocator\texited\n'
+    ;;
   *"compose.lifecycle.yaml ps --all --quiet runtime"*|*"compose.lifecycle.yaml ps --all --quiet executor"*|*"compose.lifecycle.yaml ps --all --quiet broker"*|*"compose.lifecycle.yaml ps --all --quiet prepare"*)
     ;;
   *"compose.lifecycle.yaml ps --all --quiet allocator"*)
@@ -415,22 +418,20 @@ exec /usr/bin/stat "$@"
 		t.Fatal(err)
 	}
 	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
-	emptyObservation := strings.LastIndex(string(calls), "compose.lifecycle.yaml ps --all --quiet")
+	emptyObservation := strings.LastIndex(string(calls), "ps --all --filter label=com.docker.compose.project=")
 	durableGeneration := strings.LastIndex(string(calls), "compose.prepare.yaml run")
 	if down < 0 || emptyObservation <= down || durableGeneration <= emptyObservation {
 		t.Fatalf("allocator-only reconcile did not tear down and observe empty before re-attesting:\n%s", calls)
 	}
 }
 
-// A project can carry a complete set of running roles and still be unusable
-// when an interrupted Compose operation left an extra labelled container beside
-// them. Reconcile must treat that shape as destructive: fence on the exact
-// epoch, remove everything, and only then attest.
+// A completed one-shot or another project-labelled one-off does not change the
+// active epoch: only runtime, executor, and broker define live epoch state.
 //
 // The Rust fixture for this path binds the host's real /run, so it cannot run
 // on a machine with a live control plane. This drives the same supervisor
 // branch inside a private mount namespace over a tmpfs /run instead.
-func TestSupervisorReconcileReapsAnOrphanBesideCompleteActiveRoles(t *testing.T) {
+func TestSupervisorReconcileKeepsActiveEpochWithOneShotBesideLongLivedRoles(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
 	}
@@ -445,25 +446,10 @@ case "$*" in
   "compose version")
     ;;
   "ps --all --filter label=com.docker.compose.project="*)
-    [ -e "$SUMI_FAKE_REAPED" ] && exit 0
-    printf 'aaaaaaaaaaaa\truntime\n'
-    printf 'bbbbbbbbbbbb\texecutor\n'
-    printf 'cccccccccccc\tbroker\n'
-    printf 'dddddddddddd\torphan-one-off\n'
-    ;;
-  *"compose.lifecycle.yaml ps --status running --quiet runtime"*)
-    [ -e "$SUMI_FAKE_REAPED" ] || printf 'aaaaaaaaaaaa\n'
-    ;;
-  *"compose.lifecycle.yaml ps --status running --quiet executor"*)
-    [ -e "$SUMI_FAKE_REAPED" ] || printf 'bbbbbbbbbbbb\n'
-    ;;
-  *"compose.lifecycle.yaml ps --status running --quiet broker"*)
-    [ -e "$SUMI_FAKE_REAPED" ] || printf 'cccccccccccc\n'
-    ;;
-  *"compose.lifecycle.yaml down --remove-orphans"*)
-    : > "$SUMI_FAKE_REAPED"
-    ;;
-  *"compose.lifecycle.yaml ps --all --quiet"*)
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'cccccccccccc\tbroker\trunning\n'
+    printf 'dddddddddddd\torphan-one-off\texited\n'
     ;;
   *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=orphan-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
@@ -482,7 +468,7 @@ if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
 fi
 exec /usr/bin/stat "$@"
 `
-	reconcile := func(t *testing.T, fenced bool) ([]byte, string, error) {
+	reconcile := func(t *testing.T) ([]byte, string, error) {
 		t.Helper()
 		testRoot := t.TempDir()
 		dockerLog := filepath.Join(testRoot, "docker.log")
@@ -508,12 +494,6 @@ exec /usr/bin/stat "$@"
 			"SUMI_FAKE_REAPED=" + filepath.Join(testRoot, "reaped"),
 			"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
 		}
-		if fenced {
-			command.Env = append(command.Env,
-				"SUMI_EXPECTED_RPC_GENERATION=7",
-				"SUMI_EXPECTED_RPC_NONCE=orphan-nonce",
-			)
-		}
 		output, err := command.CombinedOutput()
 		calls, readErr := os.ReadFile(dockerLog)
 		if readErr != nil && !os.IsNotExist(readErr) {
@@ -522,34 +502,16 @@ exec /usr/bin/stat "$@"
 		return output, string(calls), err
 	}
 
-	t.Run("fenced reconcile removes the orphan and attests", func(t *testing.T) {
-		output, calls, err := reconcile(t, true)
+	t.Run("reconcile preserves the active epoch", func(t *testing.T) {
+		output, calls, err := reconcile(t)
 		if err != nil {
 			t.Fatalf("real supervisor reconcile failed: %v\n%s", err, output)
 		}
-		if !strings.Contains(string(output), `"phase":"unknown","reaped_through_generation":7`) {
-			t.Fatalf("reconcile did not attest the exact reaped generation: %s", output)
-		}
-		if !strings.Contains(calls, "compose.lifecycle.yaml down --remove-orphans") {
-			t.Fatalf("reconcile reported the project active instead of removing the orphan:\n%s", calls)
-		}
-		down := strings.Index(calls, "compose.lifecycle.yaml down --remove-orphans")
-		fence := strings.Index(calls, "compose.prepare.yaml run")
-		emptyObservation := strings.LastIndex(calls, "compose.lifecycle.yaml ps --all --quiet")
-		if fence < 0 || fence >= down || emptyObservation <= down {
-			t.Fatalf("reconcile did not fence before, and observe empty after, its destructive down:\n%s", calls)
-		}
-	})
-
-	// Without the fenced epoch the API never revoked this generation's
-	// local-control authority, so the supervisor must refuse rather than reap.
-	t.Run("unfenced reconcile refuses to reap", func(t *testing.T) {
-		output, calls, err := reconcile(t, false)
-		if err == nil {
-			t.Fatalf("unfenced reconcile of a durable epoch was accepted: %s", output)
+		if !strings.Contains(string(output), `"phase":"active","generation":7,"rpc_boot_nonce":"orphan-nonce"`) {
+			t.Fatalf("reconcile did not preserve the active epoch: %s", output)
 		}
 		if strings.Contains(calls, "compose.lifecycle.yaml down --remove-orphans") {
-			t.Fatalf("unfenced reconcile still destroyed the project:\n%s", calls)
+			t.Fatalf("active epoch unexpectedly entered destructive reconciliation:\n%s", calls)
 		}
 	})
 }
@@ -573,12 +535,9 @@ case "$*" in
   "compose version")
     ;;
   *"ps --all --filter label=com.docker.compose.project="*)
-    printf 'aaaaaaaaaaaa\truntime\n'
-    printf 'bbbbbbbbbbbb\texecutor\n'
-    printf 'cccccccccccc\tbroker\n'
-    ;;
-  *"compose.lifecycle.yaml ps --status running --quiet runtime"*|*"compose.lifecycle.yaml ps --status running --quiet executor"*|*"compose.lifecycle.yaml ps --status running --quiet broker"*)
-    printf '0123456789ab\n'
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'cccccccccccc\tbroker\trunning\n'
     ;;
   *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=active-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
@@ -646,7 +605,7 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 	}
 	reconcile := supervisor[reconcileStart:]
 	for _, required := range []string{
-		"cleanup_project_is_empty || fail",
+		"long_lived_epoch_is_empty || fail",
 		"if epoch_identity; then",
 		`print_reaped_json "${reaped_generation}"`,
 		"print_unknown_json",
@@ -656,7 +615,7 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 		}
 	}
 	if strings.Index(reconcile, "require_expected_epoch") > strings.Index(reconcile, "lifecycle_compose down") ||
-		strings.Index(reconcile, "cleanup_project_is_empty") > strings.LastIndex(reconcile, "if epoch_identity; then") ||
+		strings.Index(reconcile, "long_lived_epoch_is_empty") > strings.LastIndex(reconcile, "if epoch_identity; then") ||
 		strings.LastIndex(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
 		t.Fatalf("reconcile can attest before observed-empty verification and durable generation recovery:\n%s", reconcile)
 	}
