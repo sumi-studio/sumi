@@ -27,7 +27,7 @@ import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
-import { useWheelPassthrough } from "./overlay";
+import { conversationViewport, useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
 
@@ -234,6 +234,7 @@ export const MessageItem = memo(function MessageItem({
             <ParticipantProfilePopover
               participantKey={authorKey}
               label={`${author?.displayName ?? "参加者"}のプロフィール`}
+              scrollPassthrough={conversationViewport}
               className="rounded-full"
             >
               <ParticipantAvatar
@@ -249,6 +250,7 @@ export const MessageItem = memo(function MessageItem({
             <div className="flex items-baseline gap-2">
               <ParticipantProfilePopover
                 participantKey={authorKey}
+                scrollPassthrough={conversationViewport}
                 className="rounded font-semibold text-[13.5px] hover:underline"
               >
                 {author?.displayName ?? "不明な参加者"}

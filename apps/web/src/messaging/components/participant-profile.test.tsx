@@ -10,11 +10,14 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "../mock-server";
 import type {
   DmSummary,
   MemberProfile,
+  Message,
+  ParticipantKey,
   ParticipantRef,
   PlaceKey,
 } from "../model";
@@ -26,6 +29,7 @@ import {
   useMessaging,
 } from "../store";
 import { MemberList } from "./member-list";
+import { MessageItem } from "./message-item";
 import { ParticipantProfilePopover } from "./participant-profile";
 import { Sidebar } from "./sidebar";
 
@@ -46,6 +50,7 @@ const secondAgent: ParticipantRef = {
 };
 const humanKey = participantKey(human);
 const agentKey = participantKey(agent);
+const secondAgentKey = participantKey(secondAgent);
 
 const members: MemberProfile[] = [
   { participant: human, displayName: "余白", tagline: "創業・デザイン" },
@@ -95,9 +100,36 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  for (const node of document.querySelectorAll(
+    '[data-slot="conversation-viewport"]',
+  )) {
+    node.remove();
+  }
   bindMessagingSessionIdentity(null);
   vi.clearAllMocks();
 });
+
+/** 会話欄の代わり。jsdomはscrollTopを動かさないので自前で持つ。 */
+function conversationViewportStub() {
+  const element = document.createElement("div");
+  element.setAttribute("data-slot", "conversation-viewport");
+  document.body.append(element);
+  let top = 0;
+  Object.defineProperty(element, "scrollTop", {
+    configurable: true,
+    get: () => top,
+    set: (value: number) => {
+      top = value;
+    },
+  });
+  return () => top;
+}
+
+function wheelOver(element: HTMLElement) {
+  const event = createEvent.wheel(element, { deltaY: 120 });
+  fireEvent(element, event);
+  return event;
+}
 
 function openCard(name: string) {
   fireEvent.click(screen.getByRole("button", { name }));
@@ -438,5 +470,116 @@ describe("Sidebar のプロフィール導線", () => {
     ).not.toBeInTheDocument();
     // ブラウザ標準のメニューも奪わない。
     expect(event.defaultPrevented).toBe(false);
+  });
+});
+
+describe("カードの束縛と転送先", () => {
+  // 束縛が変わったrenderで一瞬でも別人が描かれていないかを見るため、
+  // 各commit直後のDOMを記録する。passive effectで後から閉じる実装だと、
+  // 閉じる前の1commitがここに写る。
+  function Probe({ onCommit }: { onCommit: () => void }) {
+    useLayoutEffect(() => {
+      onCommit();
+    });
+    return null;
+  }
+
+  it("束縛が変わったrenderで別参加者の内容が一瞬も描かれない", async () => {
+    const commits: string[] = [];
+    const record = () => {
+      commits.push(document.body.textContent ?? "");
+    };
+    function Harness({ target }: { target: ParticipantKey }) {
+      return (
+        <>
+          <ParticipantProfilePopover participantKey={target}>
+            対象
+          </ParticipantProfilePopover>
+          <Probe onCommit={record} />
+        </>
+      );
+    }
+    const { rerender } = render(<Harness target={agentKey} />);
+    openCard("対象");
+    expect(await screen.findByText("秘書")).toBeInTheDocument();
+
+    commits.length = 0;
+    rerender(<Harness target={secondAgentKey} />);
+
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.some((text) => text.includes("編集"))).toBe(false);
+    expect(commits.some((text) => text.includes("秘書"))).toBe(false);
+    expect(screen.queryByText("編集")).not.toBeInTheDocument();
+  });
+
+  it("sidebarから開いたカードのホイールは会話欄を動かさない", async () => {
+    const readTop = conversationViewportStub();
+    useMessaging.setState({
+      capabilities: {
+        status: true,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+      },
+      workspaces: [{ workspaceId: "workspace-a", name: "Sumi" }],
+      channels: [],
+      dms: [{ dmId: "dm-a", kind: "dm", participants: [human, agent] }],
+      unreadCountByPlace: {},
+      mentionCountByPlace: {},
+    });
+    render(<Sidebar selectedPlaceKey={null} workspaceId="workspace-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
+    const event = wheelOver(await screen.findByText("秘書"));
+
+    expect(readTop()).toBe(0);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("会話欄から開いたカードのホイールは会話欄を動かす", async () => {
+    const readTop = conversationViewportStub();
+    const message: Message = {
+      messageId: "m1",
+      place: { kind: "channel", channelId: "c1" },
+      seq: 1,
+      author: agent,
+      content: "こんにちは",
+      mentions: [],
+      urgency: "normal",
+      reactions: [],
+      attachments: [],
+      replyTo: null,
+      createdAt: Date.now(),
+      editedAt: null,
+      deleted: false,
+    };
+    render(
+      <MessageItem
+        message={message}
+        grouped={false}
+        pending={false}
+        failed={false}
+        selfKey={humanKey}
+        membersByKey={useMessaging.getState().membersByKey}
+        replyLaterBy={[]}
+        allowReactions={false}
+        allowReplyLater={false}
+        findMessage={() => undefined}
+        onReply={vi.fn()}
+        onReplyLater={vi.fn()}
+        onToggleReaction={vi.fn()}
+        onCopyLink={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onJumpTo={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
+    const event = wheelOver(await screen.findByText("秘書"));
+
+    expect(readTop()).toBe(120);
+    expect(event.defaultPrevented).toBe(true);
   });
 });

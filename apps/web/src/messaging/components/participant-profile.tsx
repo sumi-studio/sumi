@@ -3,7 +3,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@sumi/ui/components/popover";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useState } from "react";
 import type { ParticipantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { getMessagingSessionIdentity, useMessaging } from "../store";
@@ -148,6 +148,15 @@ function ParticipantProfileCard({
   );
 }
 
+/** カードが開いた時点の束縛。誰を、誰のauthorityで見ているか。 */
+interface ProfileBinding {
+  selfKey: ParticipantKey;
+  key: ParticipantKey;
+}
+
+/** 既定の転送先。開いた側が渡さなければ、カードの上のホイールは何も動かさない。 */
+const noPassthrough = () => null;
+
 /**
  * 参加者を指すあらゆる表示（アバター・著者名・メンバーリストの行）を
  * プロフィールカードの開き口にする。Esc・外側クリックで閉じる挙動は
@@ -159,6 +168,7 @@ export function ParticipantProfilePopover({
   className,
   side = "bottom",
   align = "start",
+  scrollPassthrough = noPassthrough,
   children,
 }: {
   participantKey: ParticipantKey;
@@ -167,24 +177,37 @@ export function ParticipantProfilePopover({
   className?: string;
   side?: "top" | "bottom" | "left" | "right";
   align?: "start" | "center" | "end";
+  /**
+   * カードの上のホイールを渡す先。カードはportalで開くので、下に何がある
+   * かは開いた側しか知らない。既定は転送しない——会話欄から開いたときだけ
+   * 会話欄を渡す。
+   */
+  scrollPassthrough?: () => HTMLElement | null;
   children: ReactNode;
 }) {
   const selfKey = useMessaging((state) => state.selfKey);
-  const passthroughRef = useWheelPassthrough<HTMLDivElement>();
-  const [open, setOpen] = useState(false);
-  // 開いているカードは「誰を、誰のauthorityで見ているか」に束縛する。
-  // 参加者が差し替わってもidentityが切り替わっても、開いたままの枠に
-  // 別人が入ることはない。
-  const boundRef = useRef({ selfKey, key });
-  useEffect(() => {
-    const bound = boundRef.current;
-    if (bound.selfKey === selfKey && bound.key === key) return;
-    boundRef.current = { selfKey, key };
-    setOpen(false);
-  }, [selfKey, key]);
+  const passthroughRef = useWheelPassthrough<HTMLDivElement>(scrollPassthrough);
+  // カードは「誰を、誰のauthorityで見ているか」に束縛する。開いているか
+  // どうかは、その束縛が今のprops/storeと一致しているかというrender時の
+  // 関数で決まる。effectで後から閉じると、閉じるまでの1コミットで別人の
+  // プロフィールが開いた枠に描かれてしまう。
+  const [openedFor, setOpenedFor] = useState<ProfileBinding | null>(null);
+  const open =
+    openedFor !== null &&
+    openedFor.selfKey === selfKey &&
+    openedFor.key === key;
+  if (openedFor !== null && !open) {
+    // 一致しなくなった束縛はこのrenderで捨てる（Reactはcommit前に描き直す）。
+    setOpenedFor(null);
+  }
+  const setOpen = (next: boolean) =>
+    setOpenedFor(next ? { selfKey, key } : null);
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    // 枠そのものを束縛でkeyする。閉じる時のPopoverは中身を残したまま
+    // 消えていくので、keyを持たないと束縛が変わった瞬間に「消えかけの枠に
+    // 別人が描き直される」。束縛が変われば枠ごと別物として作り直す。
+    <Popover key={`${selfKey}\u001f${key}`} open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         render={
           <button
