@@ -116,50 +116,34 @@ func TestAttentionFollowsTheAgentsOwnNotificationSetting(t *testing.T) {
 	}
 }
 
-func TestCandidateSeqIsPerAgentAndMonotonic(t *testing.T) {
+func TestCandidateSeqIsPerAgentAcrossWorkspacesAndMonotonic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	_, ch := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
+	firstWorkspace, firstChannel := w.workspaceWithChannel(t, ctx)
+	secondWorkspace, secondChannel := w.workspaceWithChannel(t, ctx)
+	w.send(t, ctx, firstChannel.PlaceID, w.humanA, "最初の Workspace です")
+	w.send(t, ctx, secondChannel.PlaceID, w.humanA, "次の Workspace です")
 
-	for _, content := range []string{"ひとつめ", "ふたつめ"} {
-		w.send(t, ctx, ch.PlaceID, w.humanA, content)
-	}
-	body := w.poll(t, ctx, server, map[string]any{})
-	candidates := candidateList(t, body)
-	if len(candidates) != 2 {
-		t.Fatalf("candidates = %d, want 2", len(candidates))
-	}
-	for i, candidate := range candidates {
-		// place の seq とは別軸の、agent ごとの目盛り（凍結契約 v1 §2）。
-		if candidate["candidate_seq"] != float64(i+1) {
-			t.Fatalf("candidate_seq[%d] = %v, want %d", i, candidate["candidate_seq"], i+1)
-		}
-	}
-
-	// 番号は「本人が受け取った順」に振られる。後から届いたものは、既に配った
-	// どの番号よりも後ろに並ぶ——cursor が未読を飛び越さない、ということ。
-	w.send(t, ctx, ch.PlaceID, w.humanA, "みっつめ")
-	body = w.poll(t, ctx, server, map[string]any{})
-	candidates = candidateList(t, body)
-	if len(candidates) != 3 || candidates[2]["candidate_seq"] != float64(3) {
-		t.Fatalf("later arrivals are numbered after the earlier ones: %v", candidates)
-	}
-	if body["latest_seq"] != float64(3) {
-		t.Fatalf("latest attention seq = %v, want 3", body["latest_seq"])
-	}
-
-	// 番号の軸は agent であって place ではない。別の place の呼びかけも同じ
-	// 目盛りの続きになる。
-	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	firstInbox, err := w.store.mustScope(t, ctx, firstWorkspace.WorkspaceID, w.agent).
+		PollAttentionCandidates(ctx, 0, 1)
 	if err != nil {
-		t.Fatalf("ensure dm: %v", err)
+		t.Fatalf("poll first workspace: %v", err)
 	}
-	w.send(t, ctx, dm.PlaceID, w.humanA, "こちらもおねがい")
-	candidates = candidateList(t, w.poll(t, ctx, server, map[string]any{}))
-	if len(candidates) != 4 || candidates[3]["candidate_seq"] != float64(4) {
-		t.Fatalf("a second place restarted the numbering: %v", candidates)
+	secondInbox, err := w.store.mustScope(t, ctx, secondWorkspace.WorkspaceID, w.agent).
+		PollAttentionCandidates(ctx, 0, 1)
+	if err != nil {
+		t.Fatalf("poll second workspace: %v", err)
+	}
+	if len(firstInbox.Candidates) != 1 || len(secondInbox.Candidates) != 1 {
+		t.Fatalf("candidates = first %v, second %v", firstInbox.Candidates, secondInbox.Candidates)
+	}
+	if firstInbox.Candidates[0].CandidateSeq != 1 || secondInbox.Candidates[0].CandidateSeq != 2 {
+		t.Fatalf("candidate sequences = first %d, second %d; want the one agent-wide sequence 1, 2",
+			firstInbox.Candidates[0].CandidateSeq, secondInbox.Candidates[0].CandidateSeq)
+	}
+	if secondInbox.LatestSeq != 2 {
+		t.Fatalf("agent delivery high-water = %d, want 2", secondInbox.LatestSeq)
 	}
 }
 
@@ -174,20 +158,21 @@ func TestLatestSeqNeverRunsAheadOfWhatThePollActuallyHandedOver(t *testing.T) {
 		w.send(t, ctx, ch.PlaceID, w.humanA, content)
 	}
 
-	// limit で切った poll。採番は三つとも済むが、本人が受け取ったのは一つ。
+	// limit で切った poll。採番も配布枠に限るので、本人が受け取ったのは一つだけ。
 	body := w.poll(t, ctx, server, map[string]any{"limit": 1})
 	candidates := candidateList(t, body)
 	if len(candidates) != 1 || candidates[0]["candidate_seq"] != float64(1) {
 		t.Fatalf("limited poll = %v, want only the first candidate", candidates)
 	}
-	// latest_seq は「配られたところまで」。ここが採番済みの最大（3）になると、
-	// 素直に ack した本人が、見ていない二つを永久に落とす。
+	// latest_seq は「配られたところまで」。ここが未配布まで先行すると、素直に
+	// ack した本人が、見ていない二つを永久に落とす。
 	if body["latest_seq"] != float64(1) {
 		t.Fatalf("latest_seq = %v, want 1 — the last candidate actually handed over", body["latest_seq"])
 	}
 
-	// 本人はその latest_seq を信じて ack する。残りは残っていなければならない。
-	body = w.poll(t, ctx, server, map[string]any{"consume_through": body["latest_seq"], "limit": 1})
+	// 任意に大きい cursor でも server は配布済み高水位へ clamp する。残りは
+	// 消えず、次の poll で返さなければならない。
+	body = w.poll(t, ctx, server, map[string]any{"consume_through": 200, "limit": 1})
 	if body["consumed"] != float64(1) {
 		t.Fatalf("consumed = %v, want the single acked candidate", body["consumed"])
 	}

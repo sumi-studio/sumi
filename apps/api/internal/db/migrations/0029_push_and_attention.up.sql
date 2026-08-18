@@ -47,10 +47,21 @@ CREATE INDEX push_subscriptions_by_human ON push_subscriptions (human_id, create
 --    到着そのものが本人を起こす。ここには自動覚醒が無く、起きている本人が自分で
 --    取りに来る。本設計が入るとき、この inbox は捨てるのではなく wake gate の
 --    入力になる。
+--
+-- 採番と ack の cursor は Workspace ではなく agent の持ち物である。同じ agent
+-- が複数の Workspace に参加しても一つの runtime が受け取る inbox は一つなので、
+-- この行が candidate_seq の正本と「ここまで実際に渡した」の上限を持つ。
+CREATE TABLE attention_agent_inboxes (
+    agent_id          uuidv7      PRIMARY KEY REFERENCES agents(personality_agent_id) ON DELETE CASCADE,
+    next_candidate_seq bigint     NOT NULL DEFAULT 1 CHECK (next_candidate_seq > 0),
+    delivered_through bigint      NOT NULL DEFAULT 0 CHECK (delivered_through >= 0),
+    CHECK (delivered_through < next_candidate_seq)
+);
+
 CREATE TABLE attention_candidates (
     candidate_id  uuidv7      PRIMARY KEY,
     workspace_id  uuidv7      NOT NULL REFERENCES workspaces(workspace_id),
-    agent_id      uuidv7      NOT NULL,
+    agent_id      uuidv7      NOT NULL REFERENCES agents(personality_agent_id),
     -- candidate_seq は agent ごとの単調増加（凍結契約 v1 §2）。place の seq とは
     -- 別軸なので、message_seq では ack の cursor になれない。
     candidate_seq bigint      NOT NULL CHECK (candidate_seq > 0),
@@ -62,13 +73,13 @@ CREATE TABLE attention_candidates (
     -- 行は消さない。予算切れや再起動を理由に候補を捨てないという決定
     -- （ADR 0011 §9）に、残すことで従う。
     consumed_at   timestamptz,
-    UNIQUE (workspace_id, agent_id, candidate_seq),
+    UNIQUE (agent_id, candidate_seq),
     -- 同じ message で同じ agent を二度呼ばない。
-    UNIQUE (workspace_id, agent_id, message_id),
+    UNIQUE (agent_id, message_id),
     FOREIGN KEY (workspace_id, place_id)
         REFERENCES places (workspace_id, place_id) ON DELETE CASCADE
 );
 
 CREATE INDEX attention_candidates_pending
-    ON attention_candidates (workspace_id, agent_id, candidate_seq)
+    ON attention_candidates (agent_id, candidate_seq)
     WHERE consumed_at IS NULL;

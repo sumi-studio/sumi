@@ -48,16 +48,11 @@ type AttentionCandidate struct {
 type AttentionInbox struct {
 	Candidates []AttentionCandidate
 	Consumed   int64
-	// LatestSeq は **配られたところまで** の目盛りである。ack はこの軸の
-	// cursor を進める操作で、cursor は「まだ見ていないもの」を飛び越えては
-	// いけない。だから一回の poll が limit で切って返したときの LatestSeq は
-	// 「返した最後の候補」までであり、採番だけ済んでまだ渡していない候補は
-	// 含めない。含めると、caller が素直に latest_seq を consume_through へ
-	// 渡した瞬間に、見ていない呼びかけが consumed になって永久に落ちる。
-	//
-	// 何も返さなかった poll（未消化が無い）では、既に ack 済みの最大値を返す。
-	// 未消化が一つも無いとき、その値は採番済み全体の最大値と一致し、かつ
-	// 再度 ack しても冪等なので、cursor は後戻りしない。
+	// LatestSeq は agent ごとの **配布済み高水位** である。ack はこの軸の
+	// cursor を進める操作で、server が実際に配った連続範囲を越えない。したがって
+	// caller が任意に大きい consume_through を渡しても、未配布の候補は消えず次の
+	// poll で再配送される。別 Workspace で既に配った候補も同じ agent の高水位に
+	// 含むので、agent は一つの cursor で横断して ack できる。
 	LatestSeq int64
 }
 
@@ -67,11 +62,6 @@ type AttentionInbox struct {
 const MaxAttentionCandidates = 50
 
 const defaultAttentionCandidates = 20
-
-// maxAttentionNumberingBatch bounds how many not-yet-numbered intents one poll
-// turns into candidates. 長く止まっていた本人が戻ったときに、一回の poll が
-// 無制限の書き込みにならないための上限で、残りは次の poll が古い順に続ける。
-const maxAttentionNumberingBatch = 200
 
 // PollAttentionCandidates acknowledges through the given candidate_seq, numbers
 // whatever notification intents this agent has not been offered yet, resolves
@@ -106,35 +96,63 @@ func (s *ScopedStore) PollAttentionCandidates(
 		return AttentionInbox{}, err
 	}
 	agentID := s.Scope.Actor.ID
-	// 番号の軸は agent なので、place ではなく (workspace, agent) に掛ける。
-	// 二つの poll が同時に走っても同じ番号を取り合わない。
+	// 番号・ack の軸は agent なので、Workspace を混ぜずに直列化する。二つの
+	// Workspace から同時に poll しても同じ番号を取り合わない。
 	if _, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock(hashtext($1))",
-		s.Scope.WorkspaceID+":"+agentID); err != nil {
+		agentID); err != nil {
 		return AttentionInbox{}, fmt.Errorf("lock attention sequence: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO attention_agent_inboxes (agent_id) VALUES ($1)
+		ON CONFLICT (agent_id) DO NOTHING`, agentID); err != nil {
+		return AttentionInbox{}, fmt.Errorf("ensure attention inbox: %w", err)
+	}
+	var deliveredThrough int64
+	if err := tx.QueryRow(ctx, `
+		SELECT delivered_through FROM attention_agent_inboxes
+		WHERE agent_id = $1 FOR UPDATE`, agentID).Scan(&deliveredThrough); err != nil {
+		return AttentionInbox{}, fmt.Errorf("read attention delivery cursor: %w", err)
 	}
 
 	inbox := AttentionInbox{Candidates: []AttentionCandidate{}}
 	if consumeThrough > 0 {
+		// The server, not the caller, enforces the delivery boundary. A large
+		// cursor is accepted as a convenient idempotent retry, but it cannot
+		// consume a candidate that has not been handed to this agent yet.
+		if consumeThrough > deliveredThrough {
+			consumeThrough = deliveredThrough
+		}
 		// ack は冪等で単調である：既に consumed の行には触れないので、古い
 		// generation の ack が cursor を巻き戻さない。行は消さない——予算切れや
 		// 再起動を理由に候補を捨てないという決定（ADR 0011 §9）に、残すことで従う。
 		tag, err := tx.Exec(ctx, `
 			UPDATE attention_candidates SET consumed_at = now()
-			WHERE workspace_id = $1 AND agent_id = $2
-			  AND candidate_seq <= $3 AND consumed_at IS NULL`,
-			s.Scope.WorkspaceID, agentID, consumeThrough)
+			WHERE agent_id = $1 AND candidate_seq <= $2 AND consumed_at IS NULL`,
+			agentID, consumeThrough)
 		if err != nil {
 			return AttentionInbox{}, fmt.Errorf("consume attention candidates: %w", err)
 		}
 		inbox.Consumed = tag.RowsAffected()
 	}
 
-	if err := s.numberAttentionCandidates(ctx, tx, membership.WorkspaceMemberID); err != nil {
-		return AttentionInbox{}, err
-	}
 	if err := s.supersedeReadAttentionCandidates(ctx, tx); err != nil {
 		return AttentionInbox{}, err
+	}
+	var waiting int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM attention_candidates
+		WHERE workspace_id = $1 AND agent_id = $2 AND consumed_at IS NULL`,
+		s.Scope.WorkspaceID, agentID).Scan(&waiting); err != nil {
+		return AttentionInbox{}, fmt.Errorf("count pending attention candidates: %w", err)
+	}
+	// Allocate only the response's empty slots. Every newly allocated sequence
+	// is therefore returned in this transaction; the per-agent delivery cursor
+	// remains a gap-free acknowledgement boundary even across Workspaces.
+	if waiting < limit {
+		if err := s.numberAttentionCandidates(ctx, tx, membership.WorkspaceMemberID, limit-waiting); err != nil {
+			return AttentionInbox{}, err
+		}
 	}
 
 	rows, err := tx.Query(ctx, `
@@ -164,23 +182,19 @@ func (s *ScopedStore) PollAttentionCandidates(
 	}
 	rows.Close()
 
-	// LatestSeq は consume_through に渡してよい上限であり、その資格は
-	// 「本人に配られたこと」から来る。採番済みでも返していない候補は
-	// 数えない（limit で切った残りは、次の poll で配ってから ack させる）。
-	var acked int64
-	if err := tx.QueryRow(ctx, `
-		SELECT COALESCE(MAX(candidate_seq), 0) FROM attention_candidates
-		WHERE workspace_id = $1 AND agent_id = $2 AND consumed_at IS NOT NULL`,
-		s.Scope.WorkspaceID, agentID).Scan(&acked); err != nil {
-		return AttentionInbox{}, fmt.Errorf("latest attention seq: %w", err)
-	}
-	inbox.LatestSeq = acked
 	if n := len(inbox.Candidates); n > 0 {
-		// ORDER BY candidate_seq なので末尾が返した中の最大。
-		if last := inbox.Candidates[n-1].CandidateSeq; last > inbox.LatestSeq {
-			inbox.LatestSeq = last
+		// ORDER BY candidate_seq なので末尾が返した中の最大。新規採番は
+		// 必ずこの応答へ入るため、ここまでが安全な agent-wide ack cursor。
+		if err := tx.QueryRow(ctx, `
+			UPDATE attention_agent_inboxes
+			SET delivered_through = GREATEST(delivered_through, $2)
+			WHERE agent_id = $1
+			RETURNING delivered_through`, agentID, inbox.Candidates[n-1].CandidateSeq).
+			Scan(&deliveredThrough); err != nil {
+			return AttentionInbox{}, fmt.Errorf("advance attention delivery cursor: %w", err)
 		}
 	}
+	inbox.LatestSeq = deliveredThrough
 	if err := tx.Commit(ctx); err != nil {
 		return AttentionInbox{}, fmt.Errorf("commit attention poll: %w", err)
 	}
@@ -191,8 +205,11 @@ func (s *ScopedStore) PollAttentionCandidates(
 // into numbered candidates, oldest first. 可視性は overview / unread と同じ
 // 条件で引く：もう居ない place の呼びかけで起こされても、開いて読めない。
 func (s *ScopedStore) numberAttentionCandidates(
-	ctx context.Context, tx querier, workspaceMemberID string,
+	ctx context.Context, tx querier, workspaceMemberID string, limit int,
 ) error {
+	if limit <= 0 {
+		return nil
+	}
 	type pending struct {
 		messageID  string
 		placeID    string
@@ -226,7 +243,7 @@ func (s *ScopedStore) numberAttentionCandidates(
 		ORDER BY i.issued_at, m.message_id
 		LIMIT $5`,
 		s.Scope.WorkspaceID, workspaceMemberID,
-		KindPersonalityAgent, s.Scope.Actor.ID, maxAttentionNumberingBatch)
+		KindPersonalityAgent, s.Scope.Actor.ID, limit)
 	if err != nil {
 		return fmt.Errorf("query un-numbered attention intents: %w", err)
 	}
@@ -247,15 +264,15 @@ func (s *ScopedStore) numberAttentionCandidates(
 	if len(waiting) == 0 {
 		return nil
 	}
-	var next int64
-	if err := tx.QueryRow(ctx, `
-		SELECT COALESCE(MAX(candidate_seq), 0) FROM attention_candidates
-		WHERE workspace_id = $1 AND agent_id = $2`,
-		s.Scope.WorkspaceID, s.Scope.Actor.ID).Scan(&next); err != nil {
-		return fmt.Errorf("read attention sequence: %w", err)
-	}
 	for _, item := range waiting {
-		next++
+		var next int64
+		if err := tx.QueryRow(ctx, `
+			UPDATE attention_agent_inboxes
+			SET next_candidate_seq = next_candidate_seq + 1
+			WHERE agent_id = $1
+			RETURNING next_candidate_seq - 1`, s.Scope.Actor.ID).Scan(&next); err != nil {
+			return fmt.Errorf("allocate attention sequence: %w", err)
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO attention_candidates
 			  (candidate_id, workspace_id, agent_id, candidate_seq,
