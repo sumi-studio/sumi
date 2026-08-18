@@ -99,6 +99,7 @@ function unboundMessagingBackend(): MessagingBackend {
 
 let backend: MessagingBackend = unboundMessagingBackend();
 let nextDMStartToken = 0;
+let nextEditSessionToken = 0;
 
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
@@ -148,6 +149,13 @@ export function installMessagingBackend(override: MessagingBackend): void {
 }
 
 export type NotificationWriteResult = "confirmed" | "superseded" | "failed";
+
+interface EditSession {
+  placeKey: PlaceKey;
+  messageId: string;
+  revision: number;
+  token: number;
+}
 
 interface MessagingState {
   capabilities: MessagingCapabilities;
@@ -201,6 +209,8 @@ interface MessagingState {
   editDraft: string;
   /** 編集開始時の版。外部更新との衝突判定の基準。 */
   editBaseRevision: number | null;
+  /** 非同期保存の完了を発行元だけに閉じ込める編集セッション。 */
+  editSession: EditSession | null;
   /** 書きかけを保持したまま保存を止めるための、受信済みの新しい本文。 */
   editConflict: { content: string; revision: number } | null;
   replyTargetId: string | null;
@@ -268,6 +278,40 @@ interface MessagingState {
   loadOlder(key: PlaceKey): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
+}
+
+function isCurrentEditSession(
+  state: MessagingState,
+  session: EditSession,
+): boolean {
+  const current = state.editSession;
+  return (
+    current !== null &&
+    current.placeKey === session.placeKey &&
+    current.messageId === session.messageId &&
+    current.revision === session.revision &&
+    current.token === session.token &&
+    state.activePlaceKey === session.placeKey &&
+    state.editingMessageId === session.messageId &&
+    state.editBaseRevision === session.revision
+  );
+}
+
+function clearedEditSession(): Pick<
+  MessagingState,
+  | "editingMessageId"
+  | "editDraft"
+  | "editBaseRevision"
+  | "editSession"
+  | "editConflict"
+> {
+  return {
+    editingMessageId: null,
+    editDraft: "",
+    editBaseRevision: null,
+    editSession: null,
+    editConflict: null,
+  };
 }
 
 /**
@@ -845,6 +889,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
+        const incomingRevision = event.message.revision ?? 1;
+        if (
+          existing !== undefined &&
+          incomingRevision < (existing.revision ?? 1)
+        ) {
+          return {};
+        }
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           event.message,
@@ -870,7 +921,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
           lastRead,
           state.selfKey,
         );
-        const incomingRevision = event.message.revision ?? 1;
         const editConflict =
           event.type === "message_edited" &&
           state.editingMessageId === event.message.messageId &&
@@ -945,10 +995,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
           ...(editingDeleted
             ? {
-                editingMessageId: null,
-                editDraft: "",
-                editBaseRevision: null,
-                editConflict: null,
+                ...clearedEditSession(),
               }
             : {}),
         };
@@ -1384,6 +1431,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     editingMessageId: null,
     editDraft: "",
     editBaseRevision: null,
+    editSession: null,
     editConflict: null,
     replyTargetId: null,
     connection: "disconnected",
@@ -1482,10 +1530,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (!known) return;
       set((state) => ({
         activePlaceKey: key,
-        editingMessageId: null,
-        editDraft: "",
-        editBaseRevision: null,
-        editConflict: null,
+        ...clearedEditSession(),
         replyTargetId: null,
         unreadLineByPlace: {
           ...state.unreadLineByPlace,
@@ -1506,10 +1551,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
       set({
         activePlaceKey: null,
-        editingMessageId: null,
-        editDraft: "",
-        editBaseRevision: null,
-        editConflict: null,
+        ...clearedEditSession(),
         replyTargetId: null,
       });
     },
@@ -1840,11 +1882,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
             (entry) => entry.messageId === messageId,
           )
         : undefined;
-      if (!message) return;
+      if (!key || !message) return;
+      const revision = message.revision ?? 1;
       set({
         editingMessageId: messageId,
         editDraft: message.content,
-        editBaseRevision: message.revision ?? 1,
+        editBaseRevision: revision,
+        editSession: {
+          placeKey: key,
+          messageId,
+          revision,
+          token: ++nextEditSessionToken,
+        },
         editConflict: null,
         replyTargetId: null,
       });
@@ -1856,44 +1905,50 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     cancelEdit() {
-      set({
-        editingMessageId: null,
-        editDraft: "",
-        editBaseRevision: null,
-        editConflict: null,
-      });
+      set(clearedEditSession());
     },
 
     reloadEditConflict() {
       const state = get();
-      if (!state.editConflict) return;
+      const session = state.editSession;
+      if (!state.editConflict || !session) return;
       set({
         editDraft: state.editConflict.content,
         editBaseRevision: state.editConflict.revision,
+        editSession: {
+          ...session,
+          revision: state.editConflict.revision,
+          token: ++nextEditSessionToken,
+        },
         editConflict: null,
       });
     },
 
     submitEdit() {
       const state = get();
-      const key = state.activePlaceKey;
+      const session = state.editSession;
+      const key = session?.placeKey;
       const place = key ? parsePlaceKey(key) : null;
-      const messageId = state.editingMessageId;
       const trimmed = state.editDraft.trim();
-      const expectedRevision = state.editBaseRevision;
       if (
         !key ||
         !place ||
-        !messageId ||
-        !expectedRevision ||
+        !session ||
+        !isCurrentEditSession(state, session) ||
         state.editConflict ||
         !trimmed
       )
         return;
       void backend
-        .editMessage(place, messageId, trimmed, expectedRevision)
+        .editMessage(place, session.messageId, trimmed, session.revision)
         .then(
-          () => get().cancelEdit(),
+          () => {
+            set((current) =>
+              isCurrentEditSession(current, session)
+                ? clearedEditSession()
+                : {},
+            );
+          },
           (error: unknown) => {
             if (
               !(error instanceof MessagingAPIError) ||
@@ -1904,12 +1959,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
               return;
             const latest = error.currentMessage;
             set((current) => {
-              if (current.editingMessageId !== messageId) return current;
+              if (!isCurrentEditSession(current, session)) return {};
               if (
-                latest.messageId !== messageId ||
+                latest.messageId !== session.messageId ||
                 placeKey(latest.place) !== key
               )
-                return current;
+                return {};
               return {
                 messagesByPlace: {
                   ...current.messagesByPlace,
@@ -1940,10 +1995,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     setReplyTarget(messageId) {
       set({
         replyTargetId: messageId,
-        editingMessageId: null,
-        editDraft: "",
-        editBaseRevision: null,
-        editConflict: null,
+        ...clearedEditSession(),
       });
     },
 
@@ -2090,12 +2142,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
       set((entry) => {
         const existing = entry.messagesByPlace[key] ?? [];
-        const known = new Set(existing.map((m) => m.messageId));
-        const fresh = older.filter((m) => !known.has(m.messageId));
         return {
           messagesByPlace: {
             ...entry.messagesByPlace,
-            [key]: [...fresh, ...existing],
+            [key]: mergeMessages(existing, older),
           },
           hasMoreByPlace: {
             ...entry.hasMoreByPlace,
@@ -2160,12 +2210,7 @@ useMessaging.subscribe((state, previous) => {
     return;
   }
   if (state.editingMessageId !== null && !hasEditingTarget(state)) {
-    useMessaging.setState({
-      editingMessageId: null,
-      editDraft: "",
-      editBaseRevision: null,
-      editConflict: null,
-    });
+    useMessaging.setState(clearedEditSession());
   }
 });
 
@@ -2281,6 +2326,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editingMessageId: null,
     editDraft: "",
     editBaseRevision: null,
+    editSession: null,
     editConflict: null,
     replyTargetId: null,
     connection: "disconnected",

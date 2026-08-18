@@ -448,4 +448,87 @@ describe("編集セッションのタイムライン整合性", () => {
       expect(useMessaging.getState().editingMessageId).toBeNull(),
     );
   });
+
+  it("revision 3の取り込み後にrevision 2のmessage_editedが届いても本文を戻さない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+
+    act(() =>
+      emit({
+        type: "message_edited",
+        message: { ...target, content: "revision 3", revision: 3 },
+      }),
+    );
+    act(() =>
+      emit({
+        type: "message_edited",
+        message: { ...target, content: "revision 2", revision: 2 },
+      }),
+    );
+
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        ),
+    ).toMatchObject({ content: "revision 3", revision: 3 });
+  });
+
+  it("保存中に取消して別の編集を始めても、先の成功は新しいセッションを閉じない", async () => {
+    const backend = await bootStore();
+    const [first, second] = (
+      useMessaging.getState().messagesByPlace["channel:ch-general"] ?? []
+    ).filter(
+      (message) =>
+        message.author.kind === "human" &&
+        message.author.humanId === "h-yohaku",
+    );
+    if (!first || !second) throw new Error("test messages were not loaded");
+
+    let resolveFirstSave: (() => void) | undefined;
+    const firstSave = new Promise<void>((resolve) => {
+      resolveFirstSave = resolve;
+    });
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockImplementationOnce(() => firstSave);
+
+    act(() => useMessaging.getState().startEdit(first.messageId));
+    act(() => useMessaging.getState().setEditDraft("先の保存"));
+    act(() => useMessaging.getState().submitEdit());
+    expect(edit).toHaveBeenCalledWith(
+      first.place,
+      first.messageId,
+      "先の保存",
+      first.revision ?? 1,
+    );
+
+    act(() => useMessaging.getState().cancelEdit());
+    act(() => useMessaging.getState().startEdit(second.messageId));
+    act(() => useMessaging.getState().setEditDraft("新しい書きかけ"));
+
+    await act(async () => {
+      resolveFirstSave?.();
+      await firstSave;
+    });
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: second.messageId,
+      editDraft: "新しい書きかけ",
+      editBaseRevision: second.revision ?? 1,
+    });
+  });
 });
