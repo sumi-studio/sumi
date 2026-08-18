@@ -558,6 +558,43 @@ test("a state root under a writable non-sticky ancestor is refused", async () =>
   }
 });
 
+test("a state root under an ancestor owned by another user is refused", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const script = [
+    launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
+    "stat() {",
+    '  case "$4" in',
+    '    /foreign-owner) printf "755 4242\\n" ;;',
+    '    /) printf "755 0\\n" ;;',
+    '    *) fail "unexpected stat path: $4" ;;',
+    "  esac",
+    "}",
+    "validate_persistent_state_root_ancestors /foreign-owner/real-stack",
+  ].join("\n");
+
+  const refused = await runBash(script, {});
+  assert.equal(refused.code, 3);
+  assert.match(refused.stderr, /ancestor \/foreign-owner.*owner uid 4242/);
+});
+
+test("a root-owned writable sticky ancestor is accepted", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const script = [
+    launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
+    "stat() {",
+    '  case "$4" in',
+    '    /tmp) printf "1777 0\\n" ;;',
+    '    /) printf "755 0\\n" ;;',
+    '    *) fail "unexpected stat path: $4" ;;',
+    "  esac",
+    "}",
+    "validate_persistent_state_root_ancestors /tmp/real-stack",
+  ].join("\n");
+
+  const accepted = await runBash(script, {});
+  assert.equal(accepted.code, 0);
+});
+
 test("a state root under a writable sticky ancestor is accepted", async () => {
   const launcher = await source("scripts/dev/real-stack");
   const scratch = await mkdtemp(join(tmpdir(), "sumi-state-root-test."));

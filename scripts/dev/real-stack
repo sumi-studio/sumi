@@ -107,16 +107,25 @@ require_value() {
 # launcher provision one parent while the API demands another, and would move
 # the store whenever the stack is started from somewhere else.
 validate_persistent_state_root_ancestors() {
-  local root="$1" ancestor metadata mode
+  local root="$1" ancestor metadata mode owner reason
   ancestor="$(dirname -- "${root}")"
   while :; do
-    metadata="$(stat -c '%a' -- "${ancestor}")" ||
+    metadata="$(stat -c '%a %u' -- "${ancestor}")" ||
       fail "cannot inspect an ancestor of the persistent local state root: ${ancestor}"
     mode="${metadata%% *}"
-    if [[ "${mode: -2:1}" =~ [2367] || "${mode: -1}" =~ [2367] ]]; then
-      (( (8#${mode} & 8#1000) != 0 )) ||
-        fail "the persistent local state root is unsafe: ancestor ${ancestor} is writable by group or other and is not sticky"
+    owner="${metadata##* }"
+    reason=""
+    if [[ "${owner}" != "${UID}" && "${owner}" != "0" ]]; then
+      reason="owner uid ${owner} is neither uid ${UID} nor root"
     fi
+    if [[ "${mode: -2:1}" =~ [2367] || "${mode: -1}" =~ [2367] ]]; then
+      if (( (8#${mode} & 8#1000) == 0 )); then
+        [[ -z "${reason}" ]] || reason+="; "
+        reason+="is writable by group or other and is not sticky"
+      fi
+    fi
+    [[ -z "${reason}" ]] ||
+      fail "the persistent local state root is unsafe: ancestor ${ancestor} ${reason}"
     [[ "${ancestor}" == "/" ]] && return 0
     ancestor="$(dirname -- "${ancestor}")"
   done
