@@ -275,6 +275,37 @@ describe("インライン編集", () => {
     expect(onCancelEdit).not.toHaveBeenCalled();
   });
 
+  it("IME変換中に保存ボタンを押しても、compositionendの確定値を保存する", () => {
+    let draft = "編集前";
+    const saved = vi.fn();
+    const onEditDraftChange = vi.fn((next: string) => {
+      draft = next;
+    });
+    renderItem(makeMessage({ content: draft }), {
+      editing: true,
+      editDraft: draft,
+      onEditDraftChange,
+      onSubmitEdit: () => saved(draft),
+    });
+    const textarea = screen.getByLabelText(
+      "メッセージを編集",
+    ) as HTMLTextAreaElement;
+
+    fireEvent.compositionStart(textarea);
+    // Safari/ソフトキーボードではReact stateより先にDOM値だけが確定し得る。
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
+    if (!valueSetter) throw new Error("textarea value setter was not found");
+    valueSetter.call(textarea, "変換を確定した本文");
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    fireEvent.compositionEnd(textarea);
+
+    expect(onEditDraftChange).toHaveBeenCalledWith("変換を確定した本文");
+    expect(saved).toHaveBeenCalledWith("変換を確定した本文");
+  });
+
   it("Shift+Enterと未閉鎖のコードフェンス内では保存しない", () => {
     const onSubmitEdit = vi.fn();
     renderItem(makeMessage({ content: "```ts" }), {

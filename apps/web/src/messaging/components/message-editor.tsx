@@ -6,6 +6,7 @@ import {
   MentionSuggestions,
   useMentionAutocomplete,
 } from "./mention-autocomplete";
+import { useImeCommittedTextarea } from "./use-ime-committed-textarea";
 
 const MAX_HEIGHT_PX = 220;
 
@@ -47,6 +48,7 @@ export function MessageEditor({
     membersByKey,
     selfKey,
   });
+  const ime = useImeCommittedTextarea(textareaRef);
 
   // 開いた瞬間に本文末尾へキャレットを置く（続きを書き足す方が多い）。
   useEffect(() => {
@@ -71,8 +73,12 @@ export function MessageEditor({
 
   const submit = () => {
     if (conflict) return;
+    const text = ime.committedValue(value);
+    // compositionend が controlled state に届くより先でも、実値をsessionへ
+    // 取り込んでから保存する。store更新は同期なので onSubmit はこの値を読む。
+    onChange(text);
     // 空にするのは削除であって編集ではない。取消として扱う。
-    if (!value.trim()) {
+    if (!text.trim()) {
       onCancel();
       return;
     }
@@ -93,6 +99,11 @@ export function MessageEditor({
         onChange={mentionAutocomplete.onInputChange}
         onClick={mentionAutocomplete.onInputClick}
         onKeyUp={mentionAutocomplete.onKeyUp}
+        onCompositionStart={ime.onCompositionStart}
+        onCompositionEnd={(event) => {
+          ime.onCompositionEnd();
+          mentionAutocomplete.onCompositionEnd(event);
+        }}
         onSelect={mentionAutocomplete.onSelectionChange}
         onKeyDown={(event) => {
           // IME変換中のEnter/Escは変換の操作。編集の操作として横取りしない。

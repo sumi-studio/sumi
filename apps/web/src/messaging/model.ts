@@ -399,7 +399,7 @@ export interface MessagingBackend {
     messageId: string,
     content: string,
     expectedRevision: number,
-  ): Promise<void>;
+  ): Promise<Message>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
   /**

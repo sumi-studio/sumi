@@ -184,6 +184,31 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("returns the committed message from a successful edit", async () => {
+    const committed = {
+      ...messageWire(1, "サーバで確定した本文"),
+      edited_at: "2026-08-18T12:00:00Z",
+      revision: 2,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.endsWith("/messages/message-1")) {
+        return json({ message: committed });
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.editMessage(channel, "message-1", "サーバで確定した本文", 1),
+    ).resolves.toMatchObject({
+      messageId: "message-1",
+      content: "サーバで確定した本文",
+      revision: 2,
+    });
+  });
+
   it("requests the scoped bounded search projection", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = expectScopedMessagingPath(input);

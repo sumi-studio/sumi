@@ -666,11 +666,13 @@ export class MockMessagingServer implements MessagingBackend {
     messageId: string,
     content: string,
     expectedRevision: number,
-  ): Promise<void> {
+  ): Promise<Message> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted || !sameParticipant(message.author, SELF)) {
-      return;
+    if (!message) throw new Error("message_not_found");
+    // このmockの非author操作は従来どおりno-op。応答型に合わせて現在値を返す。
+    if (message.deleted || !sameParticipant(message.author, SELF)) {
+      return { ...message };
     }
     if ((message.revision ?? 1) !== expectedRevision) {
       throw new Error("edit_conflict");
@@ -679,7 +681,9 @@ export class MockMessagingServer implements MessagingBackend {
     message.mentions = resolveMentionsAtAdmission(content);
     message.editedAt = Date.now();
     message.revision = (message.revision ?? 1) + 1;
-    this.emit({ type: "message_edited", message: { ...message } });
+    const committed = { ...message };
+    this.emit({ type: "message_edited", message: committed });
+    return committed;
   }
 
   async deleteMessage(place: Place, messageId: string): Promise<void> {
