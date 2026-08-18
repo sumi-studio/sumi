@@ -129,6 +129,8 @@ struct MessagingAttachmentWire {
     size_bytes: u64,
     sha256: String,
     position: u8,
+    spoiler: bool,
+    alt: String,
 }
 
 #[derive(Deserialize)]
@@ -1320,6 +1322,9 @@ fn messaging_attachment_from_wire(
     if wire.position >= 10 {
         bail!("invalid Messaging attachment position");
     }
+    if wire.alt.chars().count() > 1000 || wire.alt.contains('\n') || wire.alt.contains('\0') {
+        bail!("invalid Messaging attachment description");
+    }
     Ok(MessagingAttachmentMetadata {
         attachment_id: wire.attachment_id,
         filename: wire.filename,
@@ -1327,6 +1332,8 @@ fn messaging_attachment_from_wire(
         size_bytes: wire.size_bytes,
         sha256: wire.sha256,
         position: wire.position,
+        spoiler: wire.spoiler,
+        alt: wire.alt,
     })
 }
 
@@ -3868,7 +3875,9 @@ mod tests {
                     "mime": "text/plain",
                     "size_bytes": 13,
                     "sha256": format!("{:x}", Sha256::digest(b"retry payload")),
-                    "position": 0
+                    "position": 0,
+                    "spoiler": false,
+                    "alt": ""
                 },
                 "created": false
             })),
@@ -4632,7 +4641,9 @@ mod tests {
                     "mime": "text/plain",
                     "size_bytes": size_bytes,
                     "sha256": sha256,
-                    "position": position
+                    "position": position,
+                    "spoiler": false,
+                    "alt": ""
                 },
                 "created": created
             }))

@@ -70,6 +70,8 @@ const MESSAGING_APP_ID: &str = "messaging";
 const MAX_CACHED_MESSAGING_VIEWS: usize = 16;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+/// The API's MaxAttachmentAltRunes: the sender's description of a file.
+const MAX_ATTACHMENT_ALT_CHARS: usize = 1000;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MessagingProposal {
@@ -710,7 +712,12 @@ impl Tool for MessagingTool {
                 "react or promise a later reply to a ",
                 "message visible in it. Declare your own availability with status. ",
                 "Opening never publishes presence: what others see about your ",
-                "attention is only what you declare."
+                "attention is only what you declare. ",
+                "A message may carry attachments; each one reports filename, mime, ",
+                "size_bytes, an `alt` description written by the sender, and `spoiler`. ",
+                "A spoilered attachment is one the sender chose to keep covered until ",
+                "the reader opens it — treat it as hidden content: refer to it by its ",
+                "alt description and do not reveal what it shows unless the reader asks."
             )
             .to_owned(),
             parameters: messaging_parameters_schema(),
@@ -2493,6 +2500,11 @@ fn validate_attachment_metadata(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || attachment.position as usize >= MAX_ATTACHMENTS_PER_MESSAGE
         || expected_position.is_some_and(|position| attachment.position as usize != position)
+        // The sender's description is one sentence about the file, bounded by
+        // the same rule the API enforces, and never a second message body.
+        || attachment.alt.chars().count() > MAX_ATTACHMENT_ALT_CHARS
+        || attachment.alt.contains('\n')
+        || attachment.alt.contains('\0')
     {
         return Err(ToolError::Protocol(
             "invalid Messaging attachment metadata".to_owned(),
@@ -2865,6 +2877,8 @@ mod tests {
             size_bytes: bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(bytes)),
             position,
+            spoiler: false,
+            alt: String::new(),
         }
     }
 
@@ -3080,6 +3094,10 @@ mod tests {
                 size_bytes,
                 sha256,
                 position: 0,
+                // The PA's own upload lane declares neither: it has no way to
+                // set them (see the write action's schema).
+                spoiler: false,
+                alt: String::new(),
             };
             by_nonce.insert(client_nonce, attachment.clone());
             Ok(UploadMessagingAttachmentResponse {
@@ -5717,6 +5735,63 @@ mod tests {
         ));
         assert_eq!(*default_state(&tool).await, expected_state);
         assert!(api.reads.lock().await.is_empty());
+    }
+
+    /// AX/UX 同型性: 送り手が添付に付けた「ネタバレ」と説明は、人間の画面と
+    /// 同じくこの view からも見えなければならない。見えなければ agent は、
+    /// 隠されているはずの中身を平然と読み上げてしまう。
+    #[tokio::test]
+    async fn open_carries_the_sender_spoiler_and_alt_on_attachments() {
+        let bytes = b"ending".to_vec();
+        let mut attachment = test_attachment_metadata(30, "ending.png", "image/png", &bytes, 0);
+        attachment.spoiler = true;
+        attachment.alt = "結末の一枚".to_owned();
+        let mut page = test_open_response("general", 1, 0, 1, 1, None);
+        page["messages"][0]["attachments"] =
+            json!([serde_json::to_value(&attachment).expect("attachment wire")]);
+        let api = Arc::new(FakeMessagingApi::default());
+        api.open_responses.lock().await.push_back(page);
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).expect("register Messaging");
+        let registry = builder.build();
+
+        let outcome = execute_bound_action(
+            &registry,
+            "spoilered-open",
+            json!({"action": "open", "place_id": "general"}),
+        )
+        .await
+        .expect("a spoilered attachment is still a valid page");
+        let projected = &outcome.output.details["messages"][0]["attachments"][0];
+        assert_eq!(projected["spoiler"], json!(true));
+        assert_eq!(projected["alt"], json!("結末の一枚"));
+
+        // モデルが読むテキストにも同じことが載る（details だけではない）。
+        let UserContent::Text { text } = &outcome.output.content[0] else {
+            panic!("Messaging open renders text");
+        };
+        assert!(text.contains("\"spoiler\": true"), "rendered: {text}");
+        assert!(text.contains("結末の一枚"), "rendered: {text}");
+
+        // 宣言も他のメタデータと同じ関門を通る: 説明はひと続きの一文で、
+        // 二通目の本文にはならない。
+        let mut oversized = attachment.clone();
+        oversized.alt = "あ".repeat(MAX_ATTACHMENT_ALT_CHARS + 1);
+        let mut multiline = attachment.clone();
+        multiline.alt = "一行目\n二行目".to_owned();
+        for (case, malformed) in [("oversized", oversized), ("multiline", multiline)] {
+            let mut page = test_open_response("general", 1, 0, 1, 1, None);
+            page["messages"][0]["attachments"] =
+                json!([serde_json::to_value(&malformed).expect("attachment wire")]);
+            assert!(
+                matches!(
+                    validate_open_response(&page, "general", None, None),
+                    Err(ToolError::Protocol(_))
+                ),
+                "{case} attachment description must fail closed"
+            );
+        }
     }
 
     #[tokio::test]

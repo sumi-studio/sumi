@@ -160,6 +160,13 @@ pub(crate) struct MessagingAttachmentMetadata {
     pub size_bytes: u64,
     pub sha256: String,
     pub position: u8,
+    /// The sender asked the receiving side to keep this covered until the
+    /// reader opens it. It is carried, never inferred: the agent has to know
+    /// what a human's screen is hiding before it says anything about the file.
+    pub spoiler: bool,
+    /// The sender's description of the content, for whoever cannot or should
+    /// not see it yet. Empty when the sender wrote none.
+    pub alt: String,
 }
 
 /// Metadata proven by the authorized byte response. Position belongs to the
