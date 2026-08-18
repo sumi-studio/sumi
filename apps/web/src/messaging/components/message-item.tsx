@@ -29,6 +29,7 @@ import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 
 const TIME_FORMAT = new Intl.DateTimeFormat("ja-JP", {
   hour: "2-digit",
@@ -230,19 +231,28 @@ export const MessageItem = memo(function MessageItem({
           </span>
         ) : (
           <span className="w-8 shrink-0 pt-0.5">
-            <ParticipantAvatar
+            <ParticipantProfilePopover
               participantKey={authorKey}
-              name={author?.displayName ?? "?"}
-              size={32}
-            />
+              label={`${author?.displayName ?? "参加者"}のプロフィール`}
+              className="rounded-full"
+            >
+              <ParticipantAvatar
+                participantKey={authorKey}
+                name={author?.displayName ?? "?"}
+                size={32}
+              />
+            </ParticipantProfilePopover>
           </span>
         )}
         <div className="min-w-0 flex-1">
           {grouped ? null : (
             <div className="flex items-baseline gap-2">
-              <span className="font-semibold text-[13.5px]">
+              <ParticipantProfilePopover
+                participantKey={authorKey}
+                className="rounded font-semibold text-[13.5px] hover:underline"
+              >
                 {author?.displayName ?? "不明な参加者"}
-              </span>
+              </ParticipantProfilePopover>
               <span
                 className="text-[11px] text-muted-foreground tabular-nums"
                 title={FULL_FORMAT.format(message.createdAt)}

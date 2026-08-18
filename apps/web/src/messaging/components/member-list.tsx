@@ -3,6 +3,7 @@ import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { getMessagingSessionIdentity, useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 
 /**
  * メンバーリスト。人間とagentを同じ「参加者」として一つのリストに並べる。
@@ -34,32 +35,42 @@ export function MemberList() {
         {members.map((member) => {
           const key = participantKey(member.participant);
           const status = statusByKey[key];
-          const content = (
-            <>
+          // アバターはプロフィールカードの開き口、行の残りは従来どおり
+          // DMの開始。役割の違う2つのbuttonを横に並べる（入れ子は作らない）。
+          const avatar = (
+            <ParticipantProfilePopover
+              participantKey={key}
+              label={`${member.displayName}のプロフィール`}
+              side="left"
+              align="start"
+              className="flex shrink-0 rounded-full"
+            >
               <ParticipantAvatar
                 participantKey={key}
                 name={member.displayName}
                 size={28}
                 status={status?.status ?? "available"}
               />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate font-medium text-[13px]">
-                  {member.displayName}
-                  {key === selfKey ? (
-                    <span className="ml-1 text-[10px] text-muted-foreground">
-                      (自分)
-                    </span>
-                  ) : null}
-                </span>
-                <span className="block truncate text-[11px] text-muted-foreground">
-                  {pendingKey === key
-                    ? "DMを開始しています…"
-                    : status?.note
-                      ? status.note
-                      : member.tagline}
-                </span>
+            </ParticipantProfilePopover>
+          );
+          const content = (
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-medium text-[13px]">
+                {member.displayName}
+                {key === selfKey ? (
+                  <span className="ml-1 text-[10px] text-muted-foreground">
+                    (自分)
+                  </span>
+                ) : null}
               </span>
-            </>
+              <span className="block truncate text-[11px] text-muted-foreground">
+                {pendingKey === key
+                  ? "DMを開始しています…"
+                  : status?.note
+                    ? status.note
+                    : member.tagline}
+              </span>
+            </span>
           );
           if (key === selfKey) {
             return (
@@ -67,49 +78,53 @@ export function MemberList() {
                 key={key}
                 className="flex items-center gap-2.5 rounded-md px-2 py-1.5"
               >
+                {avatar}
                 {content}
               </div>
             );
           }
           return (
             <div key={key}>
-              <button
-                type="button"
-                title={`${member.displayName}にDMを送る`}
-                aria-label={`${member.displayName}にDMを送る`}
-                aria-busy={pendingKey === key}
-                disabled={pendingKey !== null}
-                onClick={async () => {
-                  const currentIdentity = getMessagingSessionIdentity();
-                  const expectedSelfKey = selfKey;
-                  setPendingKey(key);
-                  setFailedKey(null);
-                  try {
-                    const place = await startDM([member.participant]);
-                    const sessionChanged =
-                      getMessagingSessionIdentity() !== currentIdentity ||
-                      useMessaging.getState().selfKey !== expectedSelfKey;
-                    if (sessionChanged) {
-                      throw new Error(
-                        "Messaging session changed before DM navigation",
-                      );
+              <div className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/60">
+                {avatar}
+                <button
+                  type="button"
+                  title={`${member.displayName}にDMを送る`}
+                  aria-label={`${member.displayName}にDMを送る`}
+                  aria-busy={pendingKey === key}
+                  disabled={pendingKey !== null}
+                  onClick={async () => {
+                    const currentIdentity = getMessagingSessionIdentity();
+                    const expectedSelfKey = selfKey;
+                    setPendingKey(key);
+                    setFailedKey(null);
+                    try {
+                      const place = await startDM([member.participant]);
+                      const sessionChanged =
+                        getMessagingSessionIdentity() !== currentIdentity ||
+                        useMessaging.getState().selfKey !== expectedSelfKey;
+                      if (sessionChanged) {
+                        throw new Error(
+                          "Messaging session changed before DM navigation",
+                        );
+                      }
+                      placeNavigate(place);
+                    } catch {
+                      if (
+                        getMessagingSessionIdentity() === currentIdentity &&
+                        useMessaging.getState().selfKey === expectedSelfKey
+                      ) {
+                        setFailedKey(key);
+                      }
+                    } finally {
+                      setPendingKey(null);
                     }
-                    placeNavigate(place);
-                  } catch {
-                    if (
-                      getMessagingSessionIdentity() === currentIdentity &&
-                      useMessaging.getState().selfKey === expectedSelfKey
-                    ) {
-                      setFailedKey(key);
-                    }
-                  } finally {
-                    setPendingKey(null);
-                  }
-                }}
-                className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-accent/60 disabled:opacity-60"
-              >
-                {content}
-              </button>
+                  }}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:opacity-60"
+                >
+                  {content}
+                </button>
+              </div>
               {failedKey === key ? (
                 <p
                   role="alert"
