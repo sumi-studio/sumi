@@ -278,7 +278,11 @@ export const MessageItem = memo(function MessageItem({
             />
           </div>
           {message.deleted ? null : (
-            <MessageAttachments attachments={message.attachments} />
+            <MessageAttachments
+              attachments={message.attachments}
+              authorName={author?.displayName}
+              createdAt={message.createdAt}
+            />
           )}
           {allowReactions ? (
             <ReactionChips

@@ -2,11 +2,8 @@ import {
   AtSign,
   Check,
   CornerUpLeft,
-  FileText,
-  Loader2,
   Paperclip,
   Pencil,
-  RotateCw,
   SendHorizontal,
   X,
 } from "lucide-react";
@@ -14,15 +11,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { DraftAttachment } from "../draft-attachments";
-import {
-  attachmentFailureLabel,
-  formatAttachmentSize,
-} from "../draft-attachments";
 import type { MemberProfile, Message, Urgency } from "../model";
 import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import type { ComposerPlusMenuItem } from "./composer-plus-menu";
+import { ComposerAttachments } from "./composer-attachments";
 import { ComposerPlusMenu } from "./composer-plus-menu";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -96,6 +90,9 @@ export function Composer() {
   );
   const retryDraftAttachment = useMessaging(
     (state) => state.retryDraftAttachment,
+  );
+  const editDraftAttachment = useMessaging(
+    (state) => state.editDraftAttachment,
   );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -514,21 +511,14 @@ export function Composer() {
           dragging ? "border-ring/80 bg-accent/30" : "border-border"
         }`}
       >
-        {!editing && draftAttachments.length > 0 ? (
-          <div
-            className="flex flex-wrap gap-1.5 px-3 pt-2.5"
-            data-testid="composer-attachments"
-          >
-            {draftAttachments.map((entry) => (
-              <DraftAttachmentChip
-                key={entry.clientNonce}
-                draft={entry}
-                onRemove={() => removeDraftAttachment(entry.clientNonce)}
-                onRetry={() => retryDraftAttachment(entry.clientNonce)}
-              />
-            ))}
-          </div>
-        ) : null}
+        {editing ? null : (
+          <ComposerAttachments
+            drafts={draftAttachments}
+            onRemove={removeDraftAttachment}
+            onRetry={retryDraftAttachment}
+            onEdit={editDraftAttachment}
+          />
+        )}
         <textarea
           ref={textareaRef}
           value={value}
@@ -628,64 +618,5 @@ export function Composer() {
         </div>
       </div>
     </section>
-  );
-}
-
-function DraftAttachmentChip({
-  draft,
-  onRemove,
-  onRetry,
-}: {
-  draft: DraftAttachment;
-  onRemove: () => void;
-  onRetry: () => void;
-}) {
-  const failed = draft.status === "failed";
-  return (
-    <div
-      className={`flex max-w-full items-center gap-1.5 rounded-md border px-2 py-1 text-[12px] ${
-        failed
-          ? "border-rose-500/40 bg-rose-500/5 text-rose-600"
-          : "border-border bg-muted/50"
-      }`}
-      data-status={draft.status}
-      title={failed ? attachmentFailureLabel(draft.errorCode) : draft.filename}
-    >
-      {draft.status === "uploading" ? (
-        <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-      ) : (
-        <FileText className="size-3.5 shrink-0 text-muted-foreground" />
-      )}
-      <span className="max-w-40 truncate font-medium">{draft.filename}</span>
-      <span className="shrink-0 text-muted-foreground">
-        {formatAttachmentSize(draft.sizeBytes)}
-      </span>
-      {failed ? (
-        <>
-          <span className="shrink-0">
-            {attachmentFailureLabel(draft.errorCode)}
-          </span>
-          {draft.errorCode !== "attachment_too_large" &&
-          draft.errorCode !== "attachment_empty" ? (
-            <button
-              type="button"
-              onClick={onRetry}
-              className="rounded p-0.5 hover:bg-rose-500/10"
-              aria-label={`${draft.filename}を再送`}
-            >
-              <RotateCw className="size-3" />
-            </button>
-          ) : null}
-        </>
-      ) : null}
-      <button
-        type="button"
-        onClick={onRemove}
-        className="rounded p-0.5 hover:bg-accent"
-        aria-label={`${draft.filename}を外す`}
-      >
-        <X className="size-3" />
-      </button>
-    </div>
   );
 }
