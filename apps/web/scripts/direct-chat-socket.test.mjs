@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createConversationStore } from "../src/agent/store.ts";
 import {
   DirectChatSocket,
   isDirectChatCommand,
@@ -988,7 +989,11 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
             event: {
               type: "message_update",
               message_id: "00000000-0000-4000-8000-000000000001",
-              event: { type: "tool_call_end", content_index: 0, tool_call: toolCall },
+              event: {
+                type: "tool_call_end",
+                content_index: 0,
+                tool_call: toolCall,
+              },
             },
           },
         },
@@ -1271,4 +1276,68 @@ test("durable completion supersedes a volatile preview and drops late volatile r
     timeline.items().map((item) => [item.id, item.text]),
     [["message-assistant-2", "durable"]],
   );
+});
+
+test("an upgrade the API rejects reports the agent as unavailable, not a blip", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(binding);
+  const connections = [];
+  const readiness = [];
+  socket.onConnection((state) => connections.push(state));
+  socket.onReady((state) => readiness.push(state));
+  socket.connect();
+
+  // A lazy spawn the API cannot complete answers the upgrade request with HTTP
+  // 503, so the browser socket errors and closes without ever opening.
+  const rejected = FakeWebSocket.instances.at(-1);
+  rejected.onerror?.();
+  rejected.close();
+
+  assert.deepEqual(connections, ["connecting", "closed"]);
+  assert.deepEqual(readiness, ["not_ready"]);
+  socket.close();
+});
+
+test("a dropped established session stays a transport blip", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(binding);
+  const readiness = [];
+  socket.onReady((state) => readiness.push(state));
+  socket.connect();
+  const wire = FakeWebSocket.instances.at(-1);
+  wire.open();
+  wire.receive({ type: "direct_chat_status", status: "ready" });
+  wire.close();
+
+  assert.deepEqual(readiness, ["unknown", "ready", "unknown"]);
+  socket.close();
+});
+
+test("the mounted store surfaces a rejected upgrade and clears it on retry", async () => {
+  FakeWebSocket.instances = [];
+  const transport = new DirectChatSocket();
+  const store = createConversationStore({ transport });
+  const release = store.getState().acquireConnection(binding);
+  await new Promise((resolve) => queueMicrotask(resolve));
+
+  const rejected = FakeWebSocket.instances.at(-1);
+  rejected.onerror?.();
+  rejected.close();
+  assert.equal(store.getState().connection, "closed");
+  assert.equal(store.getState().ready, "not_ready");
+
+  // Exactly what the retry control in the chat screen invokes.
+  store.getState().disconnect();
+  store.getState().resumeMountedConnection();
+  await new Promise((resolve) => queueMicrotask(resolve));
+
+  const retried = FakeWebSocket.instances.at(-1);
+  assert.notEqual(retried, rejected);
+  retried.open();
+  retried.receive({ type: "direct_chat_status", status: "ready" });
+  assert.equal(store.getState().connection, "connected");
+  assert.equal(store.getState().ready, "ready");
+  release();
 });

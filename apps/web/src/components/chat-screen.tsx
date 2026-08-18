@@ -432,10 +432,13 @@ function describeAvailability(
   connection: "connecting" | "connected" | "closed",
   ready: "unknown" | "ready" | "not_ready",
 ) {
+  // A rejected upgrade closes the socket while reporting the agent as not
+  // ready. That is a startup failure the Human can act on, not the transport
+  // blip "再接続中" describes.
+  if (ready === "not_ready") return "エージェント利用不可";
   if (connection === "connecting") return "接続中";
   if (connection === "closed") return "再接続中";
   if (ready === "ready") return "エージェント利用可能";
-  if (ready === "not_ready") return "エージェント利用不可";
   return "エージェント確認中";
 }
 

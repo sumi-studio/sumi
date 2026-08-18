@@ -948,8 +948,14 @@ export class DirectChatSocket {
     });
     const socket = new WebSocket(url);
     this.socket = socket;
+    // A WebSocket that closes without ever opening means the API answered the
+    // upgrade request itself.  Lazy spawn reports a runtime it could not start
+    // as HTTP 503 before the handshake, so this is the readiness answer the
+    // Human actually receives when the agent fails to come up.
+    let upgraded = false;
     socket.onopen = () => {
       if (this.socket !== socket) return;
+      upgraded = true;
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
       this.admissionReady = false;
@@ -997,7 +1003,7 @@ export class DirectChatSocket {
       this.socket = undefined;
       this.admissionReady = false;
       this.setConnectionState("closed");
-      this.setReadyState("unknown");
+      this.setReadyState(upgraded ? "unknown" : "not_ready");
       this.scheduleReconnect();
     };
   }

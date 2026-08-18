@@ -34,16 +34,25 @@ const TEST_APPROVAL_DIGEST_KEY: &str =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
-fn host_run_snapshot() -> Option<(u64, u64, u32, u32, u64)> {
-    std::fs::symlink_metadata("/run/sumi").ok().map(|metadata| {
-        (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.uid(),
-            metadata.gid(),
-            metadata.nlink(),
-        )
-    })
+/// Identity of the live host trust anchors this suite must never touch.  The
+/// deployment tests used to bind the real `/run` into a container and remove
+/// these, which took down the running development stack.
+fn host_run_snapshot() -> Vec<(&'static str, Option<(u64, u64, u32, u32, u64)>)> {
+    ["/run/sumi", "/run/sumi/local-control"]
+        .into_iter()
+        .map(|path| {
+            let identity = std::fs::symlink_metadata(path).ok().map(|metadata| {
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.nlink(),
+                )
+            });
+            (path, identity)
+        })
+        .collect()
 }
 
 fn deploy_dir() -> PathBuf {
@@ -226,8 +235,9 @@ struct HostTrustFixture {
     runtime_secret_root: PathBuf,
     fixture_root: PathBuf,
     supervisor: PathBuf,
-    host_run_before: Option<(u64, u64, u32, u32, u64)>,
+    host_run_before: Vec<(&'static str, Option<(u64, u64, u32, u32, u64)>)>,
     control_gid: u32,
+    cleaned: bool,
     listener: Option<UnixListener>,
     _guard: MutexGuard<'static, ()>,
 }
@@ -267,42 +277,62 @@ impl HostTrustFixture {
         let paid = Uuid::now_v7().to_string();
         let compact = paid.replace('-', "");
         let project = format!("sumi-{compact}");
-        let fixture_root = std::env::temp_dir().join(format!("sumi-deployment-run-{}", Uuid::now_v7()));
+        // The private run root carries the same `local-control/<paid>/control.sock`
+        // tail as production, and that socket still has to fit in `sun_path`, so
+        // the fixture prefix stays short.
+        let unique = Uuid::now_v7().simple().to_string();
+        let fixture_root =
+            std::env::temp_dir().join(format!("sumi-dep-{}", &unique[unique.len() - 12..]));
         let private_run_root = fixture_root.join("run/sumi");
-        std::fs::create_dir_all(&private_run_root).unwrap();
+        // Only the bind source is created here.  The private `/run/sumi` and
+        // its lock root must be provisioned root-owned inside the container,
+        // exactly like the production anchors the supervisor validates.
+        std::fs::create_dir_all(fixture_root.join("run")).unwrap();
         let private_deploy_dir = fixture_root.join("deploy");
-        std::fs::create_dir_all(&private_deploy_dir).unwrap();
-        for entry in std::fs::read_dir(deploy_dir()).unwrap() {
-            let entry = entry.unwrap();
-            let target = private_deploy_dir.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                std::fs::create_dir_all(&target).unwrap();
-                for child in std::fs::read_dir(entry.path()).unwrap() {
-                    let child = child.unwrap();
-                    std::fs::copy(child.path(), target.join(child.file_name())).unwrap();
-                }
-            } else {
-                std::fs::copy(entry.path(), target).unwrap();
-            }
-        }
+        copy_tree(&deploy_dir(), &private_deploy_dir);
         let supervisor = private_deploy_dir.join("supervisor");
         let private_run_root_text = private_run_root.display().to_string();
-        let supervisor_source = std::fs::read_to_string(&supervisor)
-            .unwrap()
-            .replace(
-                "readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks",
-                &format!("readonly SUPERVISOR_LOCK_ROOT={private_run_root_text}/supervisor-locks"),
-            )
-            .replace(
-                "readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control",
-                &format!("readonly LOCAL_CONTROL_HOST_ROOT={private_run_root_text}/local-control"),
-            )
-            .replace("/run/sumi", &private_run_root_text);
+        let published_source = std::fs::read_to_string(&supervisor).unwrap();
+        // A single pass over the published source.  Chained replacements would
+        // rewrite the `/run/sumi` tail of an already-substituted private path
+        // and produce `{fixture_root}/{fixture_root}/run/sumi/...`.
+        let supervisor_source = published_source.replace("/run/sumi", &private_run_root_text);
+        let published_anchors = published_source.matches("/run/sumi").count();
+        assert!(
+            published_anchors > 0,
+            "published supervisor has no host root"
+        );
+        assert_eq!(
+            supervisor_source.matches(&private_run_root_text).count(),
+            published_anchors,
+            "private supervisor root rewrite did not cover every published host root"
+        );
+        assert_eq!(
+            supervisor_source.matches("/run/sumi").count(),
+            published_anchors,
+            "private supervisor root rewrite duplicated or leaked a host root"
+        );
+        assert!(
+            supervisor_source.contains(&format!(
+                "SUPERVISOR_LOCK_ROOT={private_run_root_text}/supervisor-locks"
+            )) && supervisor_source.contains(&format!(
+                "LOCAL_CONTROL_HOST_ROOT={private_run_root_text}/local-control"
+            )),
+            "private supervisor does not root its lock and local-control roots in the fixture"
+        );
         std::fs::write(&supervisor, supervisor_source).unwrap();
         std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
         let lock_path = private_run_root.join(format!("supervisor-locks/{project}.lock"));
         let control_dir = private_run_root.join(format!("local-control/{compact}"));
         let control_socket = control_dir.join("control.sock");
+        // `sun_path` is 108 bytes including the terminator, and the swap test
+        // renames the socket to `control.sock.swapped` beside it.
+        assert!(
+            control_socket.as_os_str().len() + ".swapped".len() < 108,
+            "fixture local-control socket path does not fit in sun_path; \
+             use a shorter TMPDIR: {}",
+            control_socket.display()
+        );
         let runtime_secret_root =
             std::env::temp_dir().join(format!("sumi-runtime-secrets-{compact}"));
         std::fs::create_dir(&runtime_secret_root).unwrap();
@@ -342,12 +372,21 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
                 control_gid.to_string(),
             ],
         );
+        // Docker and the image were already confirmed above, so a failure here
+        // is our own provisioning breaking, not an absent environment.  Skipping
+        // it would report a green run for a fixture that never executed.
         if !setup.status.success() {
-            eprintln!(
-                "HOST_UNAVAILABLE: fixed trust-anchor provisioning failed: {}",
+            purge_private_run_root(&fixture_root);
+            let _ = std::fs::remove_dir_all(&runtime_secret_root);
+            let _ = std::fs::remove_dir_all(&fixture_root);
+            panic!(
+                "fixed trust-anchor provisioning failed under a working Docker host; \
+                 this is a broken fixture, not an unavailable environment: status={:?}\n\
+                 stdout: {}\nstderr: {}",
+                setup.status,
+                String::from_utf8_lossy(&setup.stdout),
                 String::from_utf8_lossy(&setup.stderr)
             );
-            return None;
         }
         assert_eq!(
             host_run_snapshot(),
@@ -357,6 +396,13 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
 
         let listener = UnixListener::bind(&control_socket).unwrap();
         std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o660)).unwrap();
+        eprintln!(
+            "HOST_FIXTURE_ACTIVE: project={project} run_root={private_run_root_text} \
+             supervisor={} lock={} control={}",
+            supervisor.display(),
+            lock_path.display(),
+            control_socket.display()
+        );
 
         Some(Self {
             paid,
@@ -368,6 +414,7 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
             supervisor,
             host_run_before,
             control_gid,
+            cleaned: false,
             listener: Some(listener),
             _guard: guard,
         })
@@ -390,7 +437,22 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
         Command::new(&self.supervisor)
     }
 
+    /// The private deployment copy the fixture supervisor resolves its Compose
+    /// files against.  Lifecycle assertions must expect these paths, not the
+    /// published ones.
+    fn deploy_dir(&self) -> PathBuf {
+        self.supervisor.parent().unwrap().to_path_buf()
+    }
+
     fn cleanup(&mut self) -> Result<(), String> {
+        // Every container below binds `{fixture_root}/run` as its mount source,
+        // and Docker recreates a missing bind source as a root-owned directory.
+        // A second cleanup (the acceptance tests call it, then `Drop` runs) must
+        // therefore not repeat the work it already evidenced.
+        if self.cleaned {
+            return Ok(());
+        }
+        self.cleaned = true;
         self.listener.take();
         let compact = self.paid.replace('-', "");
         let cleanup_script = r#"
@@ -457,6 +519,7 @@ rmdir /host-run/sumi 2>/dev/null || true
                 self.runtime_secret_root.display()
             ));
         }
+        purge_private_run_root(&self.fixture_root);
         make_tree_removable(&self.fixture_root);
         if let Err(error) = std::fs::remove_dir_all(&self.fixture_root)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -466,8 +529,15 @@ rmdir /host-run/sumi 2>/dev/null || true
                 self.fixture_root.display()
             ));
         }
-        if host_run_snapshot() != self.host_run_before {
-            errors.push("private deployment fixture changed host /run/sumi".to_owned());
+        let host_run_after = host_run_snapshot();
+        if host_run_after == self.host_run_before {
+            eprintln!("HOST_ANCHORS_UNCHANGED: {host_run_after:?}");
+        } else {
+            errors.push(format!(
+                "private deployment fixture changed the live host trust anchors: \
+                 before={:?} after={host_run_after:?}",
+                self.host_run_before
+            ));
         }
         if errors.is_empty() {
             Ok(())
@@ -1502,6 +1572,54 @@ fn assert_no_allocator_temps_or_interrupted_handoff(
                 .to_string_lossy()
                 .starts_with(".identity.env.tmp-")
         }));
+    }
+}
+
+/// Remove the root-owned private trust anchors the fixture provisioned inside a
+/// container.  The test uid cannot unlink them, so a leftover tree would stay in
+/// the temporary directory forever.  Best effort: callers already report the
+/// failure that made this necessary.
+fn purge_private_run_root(fixture_root: &std::path::Path) {
+    if !fixture_root.join("run/sumi").exists() {
+        return;
+    }
+    let _ = try_bounded_docker_output(
+        deploy_dir().parent().unwrap().parent().unwrap(),
+        30,
+        &[
+            "run".into(),
+            "--rm".into(),
+            "--network".into(),
+            "none".into(),
+            "-v".into(),
+            format!("{}:/host-run", fixture_root.join("run").display()),
+            "debian:bookworm-slim".into(),
+            "bash".into(),
+            "-c".into(),
+            "set -eu\nrm -rf /host-run/sumi\n".into(),
+        ],
+    );
+}
+
+/// Copy a published deployment tree into a fixture-owned directory.  The
+/// supervisor resolves its Compose files relative to its own location, so the
+/// private copy has to carry every nested artifact, not just the top level.
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let child_target = target.join(entry.file_name());
+        let file_type = entry.file_type().unwrap();
+        assert!(
+            !file_type.is_symlink(),
+            "published deployment artifact must not be a symlink: {}",
+            entry.path().display()
+        );
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &child_target);
+        } else {
+            std::fs::copy(entry.path(), &child_target).unwrap();
+        }
     }
 }
 
@@ -2712,14 +2830,17 @@ fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
         .find(&format!(
             "compose --project-name {} --file {} down",
             fixture.project,
-            deploy_dir().join("compose.lifecycle.yaml").display()
+            fixture
+                .deploy_dir()
+                .join("compose.lifecycle.yaml")
+                .display()
         ))
         .expect("old project must be stopped");
     let up = calls
         .find(&format!(
             "compose --project-name {} --file {} up",
             fixture.project,
-            deploy_dir().join("compose.prepare.yaml").display()
+            fixture.deploy_dir().join("compose.prepare.yaml").display()
         ))
         .expect("new project must be started");
     assert!(
@@ -2839,12 +2960,15 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
             calls.contains(&format!(
                 "--project-name {} --file {} {expected}",
                 fixture.project,
-                deploy_dir().join("compose.lifecycle.yaml").display()
+                fixture
+                    .deploy_dir()
+                    .join("compose.lifecycle.yaml")
+                    .display()
             )),
             "unexpected {action} calls: {calls}"
         );
         assert!(
-            !calls.contains(deploy_dir().join("compose.yaml").to_str().unwrap()),
+            !calls.contains(fixture.deploy_dir().join("compose.yaml").to_str().unwrap()),
             "{action} evaluated the secret-bearing launch descriptor"
         );
     }
