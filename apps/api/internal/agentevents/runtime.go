@@ -189,6 +189,27 @@ type connectionLeaseState struct {
 
 var errBrowserRuntimeUnavailable = errors.New("browser runtime is unavailable")
 
+// directChatReadiness is the browser-facing projection of the durable runtime
+// state. It deliberately distinguishes an automatic rehydration from a
+// terminal shutdown; a bare NotReady state is not enough evidence to claim
+// either condition to the browser.
+type directChatReadiness struct {
+	ready  bool
+	reason string
+}
+
+func (r directChatReadiness) directChatStatusFrame() directChatStatusFrame {
+	status := "unavailable"
+	if r.ready {
+		status = "ready"
+	}
+	return directChatStatusFrame{
+		Type:   "direct_chat_status",
+		Status: status,
+		Reason: r.reason,
+	}
+}
+
 const (
 	connectionLeaseStateVersion  = uint64(1)
 	maxConnectionLeaseStateBytes = 4096
@@ -810,11 +831,32 @@ func verifyRuntimeGeneration(state runtimeState, generation uint64) error {
 // IsPersonalityAgentReady reports the authoritative Ready latch for the one
 // global runtime identity. Tenant is intentionally absent from this key.
 func (g *DurableGateway) IsPersonalityAgentReady(ctx context.Context, personalityAgentID string) (bool, error) {
-	state, err := g.stateWithIntegrityMigration(ctx, personalityAgentID)
+	readiness, err := g.directChatReadiness(ctx, personalityAgentID)
 	if err != nil {
 		return false, err
 	}
-	return state.present && state.HydrationReceiptIdentity != nil, nil
+	return readiness.ready, nil
+}
+
+func (g *DurableGateway) directChatReadiness(ctx context.Context, personalityAgentID string) (directChatReadiness, error) {
+	state, err := g.stateWithIntegrityMigration(ctx, personalityAgentID)
+	if err != nil {
+		return directChatReadiness{}, err
+	}
+	if state.present && state.HydrationReceiptIdentity != nil {
+		return directChatReadiness{ready: true}, nil
+	}
+	if state.LocalControl == nil {
+		return directChatReadiness{reason: directChatUnavailableUnknown}, nil
+	}
+	switch state.LocalControl.Reason {
+	case LocalRuntimeStartup:
+		return directChatReadiness{reason: directChatUnavailableRehydrating}, nil
+	case LocalRuntimeShutdown:
+		return directChatReadiness{reason: directChatUnavailableStopped}, nil
+	default:
+		return directChatReadiness{reason: directChatUnavailableUnknown}, nil
+	}
 }
 
 // Observe observes readiness for exactly one authenticated generation. It

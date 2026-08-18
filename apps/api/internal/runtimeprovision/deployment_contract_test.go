@@ -962,6 +962,76 @@ func TestSupervisorRedactsReapAttestationNonceDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSupervisorPrepareRejectsMissingTimeoutBeforeLifecycle(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	binDir := filepath.Join(testRoot, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"dirname", "readlink", "flock", "install", "mount", "setsid"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatalf("find %s: %v", name, err)
+		}
+		if err := os.Symlink(path, filepath.Join(binDir, name)); err != nil {
+			t.Fatalf("link %s: %v", name, err)
+		}
+	}
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	fakeDocker := filepath.Join(binDir, "docker")
+	if err := os.WriteFile(fakeDocker, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStat := filepath.Join(binDir, "stat")
+	if err := os.WriteFile(fakeStat, []byte(`#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" prepare`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + binDir,
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "GNU timeout is required for bounded cleanup verification") {
+		t.Fatalf("supervisor did not reject missing timeout before lifecycle: err=%v output=%s", err, output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "compose.lifecycle.yaml") {
+		t.Fatalf("supervisor reached lifecycle work before rejecting missing timeout:\n%s", calls)
+	}
+}
+
 func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	prepare := readDeploymentFile(t, "compose.prepare.yaml")
 	for _, service := range []string{"runtime", "executor", "broker"} {

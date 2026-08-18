@@ -83,6 +83,13 @@ require_tracked_compose_support() {
   command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
 }
 
+require_cleanup_verification_support() {
+  command -v timeout >/dev/null 2>&1 ||
+    fail "GNU timeout is required for bounded cleanup verification"
+  timeout --foreground --kill-after=1s 1s true >/dev/null 2>&1 ||
+    fail "timeout must support --foreground and --kill-after for bounded cleanup verification"
+}
+
 configure_apparmor_profile() {
   local enabled=
   if [[ -r /sys/module/apparmor/parameters/enabled ]]; then
@@ -970,6 +977,7 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
+    require_cleanup_verification_support
     configure_apparmor_profile
     validate_prepare_compose_redacted
     # The API installs exact-generation authorization and creates the PAID
@@ -1005,6 +1013,7 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
+    require_cleanup_verification_support
     require_expected_epoch
     set_runtime_secret_host_dir "${EPOCH_GENERATION}"
     require_launch_environment
