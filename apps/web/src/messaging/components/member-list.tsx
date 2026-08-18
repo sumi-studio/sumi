@@ -5,6 +5,12 @@ import { getMessagingSessionIdentity, useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
 
+const MEMBER_LIST = '[data-slot="member-list"]';
+
+/** メンバーリストから開いたカードが覆う面。 */
+const memberListScroller = () =>
+  document.querySelector<HTMLElement>(MEMBER_LIST);
+
 /**
  * メンバーリスト。人間とagentを同じ「参加者」として一つのリストに並べる。
  * bot欄のような区別は作らない。見えるステータスは本人が申告したものだけ。
@@ -37,7 +43,10 @@ export function MemberList() {
       <p className="shrink-0 px-4 pt-3 pb-1 font-medium text-[12px] text-muted-foreground">
         メンバー — {members.length}
       </p>
-      <div className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2">
+      <div
+        data-slot="member-list"
+        className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2"
+      >
         {members.map((member) => {
           const key = participantKey(member.participant);
           const status = statusByKey[key];
@@ -49,6 +58,7 @@ export function MemberList() {
               label={`${member.displayName}のプロフィール`}
               side="left"
               align="start"
+              scrollPassthrough={memberListScroller}
               className="flex shrink-0 rounded-full"
             >
               <ParticipantAvatar

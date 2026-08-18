@@ -19,7 +19,7 @@ import {
   notificationLevelFor,
   useMessaging,
 } from "../store";
-import { fromOwnSubtree, useOverlayPanel } from "./overlay";
+import { ownsEvent, useOverlayPanel } from "./overlay";
 import {
   ParticipantAvatar,
   STATUS_DOT,
@@ -28,6 +28,9 @@ import {
 import { ParticipantProfilePopover } from "./participant-profile";
 
 const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
+
+/** サイドバーのオーバーレイが覆う面。 */
+const sidebarPlaces = () => document.querySelector<HTMLElement>(SIDEBAR_PLACES);
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
@@ -202,12 +205,12 @@ function PlaceRow({
     // 右クリックは行そのものが受ける。leadingへ切り出したアバターの上でも
     // 同じ導線が出る（行の右クリック契約はアバター領域を含む）。行内の
     // buttonへフォーカスしたままのShift+F10もここへ上がってくる。
-    // 行が所有するのはDOM上で行の中にあるターゲットのイベントだけで、
-    // 行から開いたportal（プロフィールカード等）の中は「行の中」ではない。
+    // 行が所有するのは行のイベントだけ。行から開いたportal（プロフィール
+    // カード）も、行がhostしているだけの通知パネルも「行の中」ではない。
     // biome-ignore lint/a11y/noStaticElementInteractions: 右クリックは補助導線で、正規の入口は同じ行の「…」button。
     <div
       onContextMenu={(event) => {
-        if (!canConfigure || !fromOwnSubtree(event)) return;
+        if (!canConfigure || !ownsEvent(event)) return;
         event.preventDefault();
         setMenuOpen(true);
       }}
@@ -612,8 +615,7 @@ export function Sidebar({
   const statusOverlay = useOverlayPanel<HTMLButtonElement>({
     open: statusMenuOpen,
     onOpenChange: setStatusMenuOpen,
-    scrollPassthrough: () =>
-      document.querySelector<HTMLElement>(SIDEBAR_PLACES),
+    scrollPassthrough: sidebarPlaces,
   });
 
   const activePlace = selectedPlaceKey ? parsePlaceKey(selectedPlaceKey) : null;
@@ -749,6 +751,7 @@ export function Sidebar({
                     label={`${firstName}のプロフィール`}
                     side="right"
                     align="start"
+                    scrollPassthrough={sidebarPlaces}
                     className="flex shrink-0 rounded-full"
                   >
                     {avatar}
@@ -815,6 +818,7 @@ export function Sidebar({
             label={`${selfProfile?.displayName ?? "自分"}のプロフィール`}
             side="top"
             align="start"
+            scrollPassthrough={sidebarPlaces}
             className="flex shrink-0 rounded-full"
           >
             <ParticipantAvatar

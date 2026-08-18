@@ -9,6 +9,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -48,14 +49,18 @@ const secondAgent: ParticipantRef = {
   kind: "personality_agent",
   personalityAgentId: "agent-b",
 };
+/** 今の実APIのmemberWireはtaglineを載せないので、これが本番で出る形。 */
+const plain: ParticipantRef = { kind: "human", humanId: "human-b" };
 const humanKey = participantKey(human);
 const agentKey = participantKey(agent);
 const secondAgentKey = participantKey(secondAgent);
+const plainKey = participantKey(plain);
 
 const members: MemberProfile[] = [
   { participant: human, displayName: "余白", tagline: "創業・デザイン" },
   { participant: agent, displayName: "墨", tagline: "秘書" },
   { participant: secondAgent, displayName: "筆", tagline: "編集" },
+  { participant: plain, displayName: "白紙", tagline: "" },
 ];
 
 const startDM = vi.fn<(participants: ParticipantRef[]) => Promise<PlaceKey>>();
@@ -109,11 +114,8 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-/** 会話欄の代わり。jsdomはscrollTopを動かさないので自前で持つ。 */
-function conversationViewportStub() {
-  const element = document.createElement("div");
-  element.setAttribute("data-slot", "conversation-viewport");
-  document.body.append(element);
+/** jsdomはscrollTopを動かさないので、面のスクロール位置を自前で持つ。 */
+function trackScrollTop(element: HTMLElement) {
   let top = 0;
   Object.defineProperty(element, "scrollTop", {
     configurable: true,
@@ -124,6 +126,23 @@ function conversationViewportStub() {
   });
   return () => top;
 }
+
+/** 会話欄の代わり。render前に置いておく。 */
+function conversationViewportStub() {
+  const element = document.createElement("div");
+  element.setAttribute("data-slot", "conversation-viewport");
+  document.body.append(element);
+  return trackScrollTop(element);
+}
+
+function surface(slot: string) {
+  const element = document.querySelector<HTMLElement>(`[data-slot="${slot}"]`);
+  if (!element) throw new Error(`no [data-slot="${slot}"]`);
+  return element;
+}
+
+/** カードの覆う面を問わないテストのための、面のない呼び出し元。 */
+const noSurface = () => null;
 
 function wheelOver(element: HTMLElement) {
   const event = createEvent.wheel(element, { deltaY: 120 });
@@ -138,7 +157,10 @@ function openCard(name: string) {
 describe("ParticipantProfilePopover", () => {
   it("表示名・tagline・自己申告ステータスを出す", async () => {
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -153,7 +175,10 @@ describe("ParticipantProfilePopover", () => {
 
   it("人間と人格agentの別を文字として出さない", async () => {
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -167,7 +192,10 @@ describe("ParticipantProfilePopover", () => {
 
   it("ステータス未申告なら何も推測して出さない", async () => {
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -180,7 +208,10 @@ describe("ParticipantProfilePopover", () => {
 
   it("カードからDMを開始して、そのDMへ遷移する", async () => {
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -197,7 +228,10 @@ describe("ParticipantProfilePopover", () => {
   it("DMを開けなかったら失敗を伝えて閉じない", async () => {
     startDM.mockRejectedValue(new Error("offline"));
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -222,7 +256,10 @@ describe("ParticipantProfilePopover", () => {
       }),
     );
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -237,7 +274,10 @@ describe("ParticipantProfilePopover", () => {
 
   it("identityが切り替わったら開いたままのカードに別人を残さない", async () => {
     render(
-      <ParticipantProfilePopover participantKey={agentKey}>
+      <ParticipantProfilePopover
+        participantKey={agentKey}
+        scrollPassthrough={noSurface}
+      >
         墨
       </ParticipantProfilePopover>,
     );
@@ -260,9 +300,41 @@ describe("ParticipantProfilePopover", () => {
     ).not.toBeInTheDocument();
   });
 
+  // 今のmainの実APIはmemberWireにtaglineを持たない（#229が足す）。
+  // ステータス未申告の相手なら、カードはアバター・表示名・DM導線だけになる。
+  it("taglineもステータスも無い相手でも、カードが開いてDMを始められる", async () => {
+    render(
+      <ParticipantProfilePopover
+        participantKey={plainKey}
+        scrollPassthrough={noSurface}
+      >
+        白紙
+      </ParticipantProfilePopover>,
+    );
+    openCard("白紙");
+
+    const send = await screen.findByRole("button", { name: "DMを送る" });
+    const card = within(screen.getByRole("dialog"));
+    // カードの中身は表示名とDM導線だけ。職務行もステータス行も出ない。
+    expect(card.getByText("白紙")).toBeInTheDocument();
+    for (const label of ["対応可能", "取り込み中", "離席中"]) {
+      expect(card.queryByText(label)).not.toBeInTheDocument();
+    }
+
+    fireEvent.click(send);
+
+    await waitFor(() =>
+      expect(navigation.navigate).toHaveBeenCalledWith("dm:dm-a"),
+    );
+    expect(startDM).toHaveBeenCalledWith([plain]);
+  });
+
   it("自分にはDM導線を出さない", async () => {
     render(
-      <ParticipantProfilePopover participantKey={humanKey}>
+      <ParticipantProfilePopover
+        participantKey={humanKey}
+        scrollPassthrough={noSurface}
+      >
         余白
       </ParticipantProfilePopover>,
     );
@@ -454,6 +526,22 @@ describe("Sidebar のプロフィール導線", () => {
     ).toBeInTheDocument();
   });
 
+  // 通知パネルはportalではなく行の中にinlineで描かれる。DOM上は行の中でも、
+  // 行はhostしているだけで、その中の右クリックは行のものではない。
+  it("行がhostしているだけの通知パネルの中の右クリックを行が奪わない", () => {
+    allowNotifications();
+    renderSidebar();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "通知設定" })[0]);
+    const panel = screen.getByRole("dialog", { name: "この場所の通知設定" });
+    const target = within(panel).getByText("メンションのみ");
+    const event = createEvent.contextMenu(target);
+    fireEvent(target, event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(panel).toBeInTheDocument();
+  });
+
   // Reactの合成イベントはportalの子からもReactの親へ上がる。行が所有するのは
   // DOM上で行の中にあるターゲットだけで、行から開いたカードの中は行の外。
   it("行から開いたプロフィールカードの中の右クリックは行の通知メニューを開かない", async () => {
@@ -492,7 +580,10 @@ describe("カードの束縛と転送先", () => {
     function Harness({ target }: { target: ParticipantKey }) {
       return (
         <>
-          <ParticipantProfilePopover participantKey={target}>
+          <ParticipantProfilePopover
+            participantKey={target}
+            scrollPassthrough={noSurface}
+          >
             対象
           </ParticipantProfilePopover>
           <Probe onCommit={record} />
@@ -512,8 +603,8 @@ describe("カードの束縛と転送先", () => {
     expect(screen.queryByText("編集")).not.toBeInTheDocument();
   });
 
-  it("sidebarから開いたカードのホイールは会話欄を動かさない", async () => {
-    const readTop = conversationViewportStub();
+  it("sidebarから開いたカードのホイールは、カードが覆うplace一覧を動かす", async () => {
+    const readConversation = conversationViewportStub();
     useMessaging.setState({
       capabilities: {
         status: true,
@@ -528,12 +619,27 @@ describe("カードの束縛と転送先", () => {
       mentionCountByPlace: {},
     });
     render(<Sidebar selectedPlaceKey={null} workspaceId="workspace-a" />);
+    const readPlaces = trackScrollTop(surface("sidebar-places"));
 
     fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
     const event = wheelOver(await screen.findByText("秘書"));
 
-    expect(readTop()).toBe(0);
-    expect(event.defaultPrevented).toBe(false);
+    expect(readPlaces()).toBe(120);
+    expect(readConversation()).toBe(0);
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("member listから開いたカードのホイールは、カードが覆うmember listを動かす", async () => {
+    const readConversation = conversationViewportStub();
+    render(<MemberList />);
+    const readMembers = trackScrollTop(surface("member-list"));
+
+    fireEvent.click(screen.getByRole("button", { name: "墨のプロフィール" }));
+    const event = wheelOver(await screen.findByText("秘書"));
+
+    expect(readMembers()).toBe(120);
+    expect(readConversation()).toBe(0);
+    expect(event.defaultPrevented).toBe(true);
   });
 
   it("会話欄から開いたカードのホイールは会話欄を動かす", async () => {

@@ -154,9 +154,6 @@ interface ProfileBinding {
   key: ParticipantKey;
 }
 
-/** 既定の転送先。開いた側が渡さなければ、カードの上のホイールは何も動かさない。 */
-const noPassthrough = () => null;
-
 /**
  * 参加者を指すあらゆる表示（アバター・著者名・メンバーリストの行）を
  * プロフィールカードの開き口にする。Esc・外側クリックで閉じる挙動は
@@ -168,7 +165,7 @@ export function ParticipantProfilePopover({
   className,
   side = "bottom",
   align = "start",
-  scrollPassthrough = noPassthrough,
+  scrollPassthrough,
   children,
 }: {
   participantKey: ParticipantKey;
@@ -178,11 +175,11 @@ export function ParticipantProfilePopover({
   side?: "top" | "bottom" | "left" | "right";
   align?: "start" | "center" | "end";
   /**
-   * カードの上のホイールを渡す先。カードはportalで開くので、下に何がある
-   * かは開いた側しか知らない。既定は転送しない——会話欄から開いたときだけ
-   * 会話欄を渡す。
+   * このカードが覆う面。カードはportalでbody直下に出るので、ブラウザの
+   * スクロール連鎖はDOM祖先しか辿れず、覆った領域の上ではホイールが死ぬ。
+   * どの面を覆うかは開いた側しか知らないので、必須にして呼び出し元に書かせる。
    */
-  scrollPassthrough?: () => HTMLElement | null;
+  scrollPassthrough: () => HTMLElement | null;
   children: ReactNode;
 }) {
   const selfKey = useMessaging((state) => state.selfKey);
