@@ -505,17 +505,16 @@ func (s *Server) RunStatusExpiry(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// sweepExpiredStatuses announces each lapse from inside the transaction that
+// produced it, while that row is still locked. A participant who declares
+// something new in the meantime leaves nothing to lapse, so nothing is said
+// about them; one who declares afterwards is waiting at the same row lock and
+// therefore cannot be overtaken by this announcement.
 func (s *Server) sweepExpiredStatuses(ctx context.Context) {
-	expiries, err := s.Store.ExpireStatuses(ctx)
-	if err != nil {
-		// Best effort: readers still resolve expiry themselves, and the next
-		// tick retries.
-		return
-	}
-	if s.Hub == nil {
-		return
-	}
-	for _, expiry := range expiries {
+	announce := func(ctx context.Context, expiry StatusExpiry) {
+		if s.Hub == nil {
+			return
+		}
 		subject := expiry.Status.Participant
 		wire := statusToWire(expiry.Status)
 		for _, scope := range expiry.Scopes {
@@ -524,6 +523,9 @@ func (s *Server) sweepExpiredStatuses(ctx context.Context) {
 			})
 		}
 	}
+	// Best effort: readers still resolve expiry themselves, and the next tick
+	// retries.
+	_ = s.Store.ExpireStatuses(ctx, announce)
 }
 
 type unreadSummaryWire struct {
