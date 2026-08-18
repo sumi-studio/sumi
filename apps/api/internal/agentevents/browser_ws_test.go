@@ -2772,6 +2772,11 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 			raw:    `{"type":"direct_chat_status","status":"unavailable","reason":"restarting"}`,
 			target: func() any { return &directChatStatusFrame{} },
 		},
+		{
+			name:   "unavailable status omits required reason",
+			raw:    `{"type":"direct_chat_status","status":"unavailable"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -2790,13 +2795,6 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 	}
 	if volatile.Envelope.Seq != nil {
 		t.Fatalf("volatile browser event gained seq: %+v", volatile)
-	}
-	var unavailable directChatStatusFrame
-	if err := json.Unmarshal(
-		[]byte(`{"type":"direct_chat_status","status":"unavailable"}`),
-		&unavailable,
-	); err != nil {
-		t.Fatalf("valid unavailable status rejected: %v", err)
 	}
 	for _, status := range []string{"applied", "superseded", "rejected"} {
 		rejectReason := ""

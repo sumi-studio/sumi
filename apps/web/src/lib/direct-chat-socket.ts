@@ -1,6 +1,7 @@
 import type {
   BrowserEventEnvelope,
   CommandDispositionEvent,
+  DirectChatStatusFrame as APIClientDirectChatStatusFrame,
 } from "@sumi/api-client";
 import { secureRandomUUID } from "./random-uuid";
 
@@ -43,11 +44,9 @@ export type DirectChatEventFrame = {
   type: "event";
   envelope: BrowserEventEnvelope;
 };
-export type DirectChatStatusFrame = {
-  type: "direct_chat_status";
-  status: "ready" | "unavailable";
-  reason?: string;
-};
+// This status frame is generated from the public agent-events contract. In
+// particular, `reason` is prohibited for ready and required for unavailable.
+export type DirectChatStatusFrame = APIClientDirectChatStatusFrame;
 export type DirectChatAcceptedFrame = {
   type: "command_accepted";
   idempotency_key: string;
@@ -144,6 +143,24 @@ const ToolArgumentErrors = new Set([
 const AuditOutcomes = new Set(["allow", "deny"]);
 const RiskLevels = new Set(["low", "medium", "high", "critical"]);
 const UserAuthorizations = new Set(["unknown", "low", "medium", "high"]);
+type DirectChatUnavailableReason = Extract<
+  DirectChatStatusFrame,
+  { status: "unavailable" }
+>["reason"];
+const DirectChatUnavailableReasons = new Set<DirectChatUnavailableReason>([
+  "rehydrating",
+  "stopped",
+  "unavailable",
+]);
+
+function isDirectChatUnavailableReason(
+  value: unknown,
+): value is DirectChatUnavailableReason {
+  return (
+    typeof value === "string" &&
+    DirectChatUnavailableReasons.has(value as DirectChatUnavailableReason)
+  );
+}
 
 function reconnectDelay(attempt: number): number {
   const exponential = InitialReconnectDelay * 2 ** attempt;
@@ -767,16 +784,21 @@ export function parseDirectChatServerFrame(
   lastEventSeq: number,
 ): DirectChatServerFrame | undefined {
   if (!isRecord(value)) return undefined;
-  if (
-    value.type === "direct_chat_status" &&
-    (value.status === "ready" || value.status === "unavailable") &&
-    hasOnlyKeys(value, ["type", "status", "reason"]) &&
-    (value.status === "ready"
-      ? !("reason" in value)
-      : !("reason" in value) ||
-        (typeof value.reason === "string" && value.reason.length <= 64))
-  ) {
-    return value as DirectChatStatusFrame;
+  if (value.type === "direct_chat_status") {
+    if (
+      value.status === "ready" &&
+      hasRequiredAndOnlyKeys(value, ["type", "status"])
+    ) {
+      return value as DirectChatStatusFrame;
+    }
+    if (
+      value.status === "unavailable" &&
+      hasRequiredAndOnlyKeys(value, ["type", "status", "reason"]) &&
+      isDirectChatUnavailableReason(value.reason)
+    ) {
+      return value as DirectChatStatusFrame;
+    }
+    return undefined;
   }
   if (
     value.type === "event" &&

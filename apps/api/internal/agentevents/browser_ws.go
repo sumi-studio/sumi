@@ -309,7 +309,7 @@ func (f *directChatStatusFrame) UnmarshalJSON(data []byte) error {
 	if value.Type != "direct_chat_status" ||
 		(value.Status != "ready" && value.Status != "unavailable") ||
 		(value.Status == "ready" && value.Reason != "") ||
-		(value.Status == "unavailable" && value.Reason != "" &&
+		(value.Status == "unavailable" &&
 			value.Reason != directChatUnavailableRehydrating &&
 			value.Reason != directChatUnavailableStopped &&
 			value.Reason != directChatUnavailableUnknown) {
