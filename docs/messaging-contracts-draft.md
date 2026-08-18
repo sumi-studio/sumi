@@ -218,7 +218,11 @@
   ambientに載るのは参加しているthreadだけで、開けるだけのthreadは読んでも
   参加者にならない。参加していないthreadをURLで開いた閲覧者には、WSの
   `open{place_id}` / `close{place_id}`（ackは `open_ack{place_id}`）で宣言した
-  「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可ではない。Threadのmessageは既存の送信・添付・検索・
+  「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可ではない。
+  cursorを持つ台帳も同じ線で切る。clientがcursorを持つのは参加しているplaceと
+  いま開いているplaceだけで、閉じれば未参加threadのcursorは落とす。serverの
+  catch-upもcursorを購読の根拠にしない: helloでreplayするのは参加しているplace
+  だけで、開いているだけのthreadはその `open` frame のあとにreplayされる。Threadのmessageは既存の送信・添付・検索・
   tombstone・read markerをそのまま使う。通知候補は参加者と新しいmention先だけで、
   mentionされた人は同じtransactionで参加者になる。
 - 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして

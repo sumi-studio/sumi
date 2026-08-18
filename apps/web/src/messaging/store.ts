@@ -1665,8 +1665,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       }));
       // Tell the server which screen is open. A thread the viewer never joined
-      // is delivered live only while it is the open one.
-      backend.openPlace?.(place);
+      // is delivered live only while it is the open one, so the cursor for it
+      // comes from here too: the summary's latest seq is what this client has
+      // already been shown, and a disconnect while the screen stays open must
+      // resume from there rather than replaying the thread from its start.
+      backend.openPlace?.(
+        place,
+        place.kind === "thread"
+          ? (get().threadsById[place.threadId]?.latestSeq ?? 0)
+          : 0,
+      );
       void loadPlace(place);
     },
 

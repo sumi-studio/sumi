@@ -99,6 +99,11 @@ type subscriber struct {
 	// delivery filter, never an authorization: it can only widen delivery to a
 	// participant the event's fenced audience already listed as a watcher.
 	openPlaceID string
+	// deferred holds the handshake cursors for places this connection may read
+	// but does not hold. They are not replayed at hello — that would make a
+	// thread the viewer merely visited ambient again — and are flushed only if
+	// this connection declares that place open.
+	deferred map[string]int64
 }
 
 // markVisible records a known visibility verdict.
@@ -133,6 +138,31 @@ func (s *subscriber) closePlace(placeID string) {
 	if s.openPlaceID == placeID {
 		s.openPlaceID = ""
 	}
+}
+
+// deferCursor remembers a handshake cursor that was not replayed. The map is
+// bounded by maxHelloCursors because it can only ever hold cursors the
+// handshake already carried.
+func (s *subscriber) deferCursor(placeID string, since int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deferred == nil {
+		s.deferred = map[string]int64{}
+	}
+	s.deferred[placeID] = since
+}
+
+// takeDeferredCursor consumes the cursor for one place. It is one-shot: a
+// later close drops the client's own cursor for a place it does not hold, so
+// re-opening in the same connection must not replay the same stretch again.
+func (s *subscriber) takeDeferredCursor(placeID string) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	since, ok := s.deferred[placeID]
+	if ok {
+		delete(s.deferred, placeID)
+	}
+	return since, ok
 }
 
 func (s *subscriber) watching(placeID string) bool {

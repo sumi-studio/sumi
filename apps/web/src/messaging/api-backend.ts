@@ -68,6 +68,8 @@ export class ApiMessagingBackend implements MessagingBackend {
   >();
   private readonly cursors = new Map<string, number>();
   private readonly places = new Map<string, Place>();
+  /** cursorをdurableに持つplace——自分の台帳にあるもの。 */
+  private readonly followed = new Set<string>();
   private openPlaceID: string | null = null;
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
@@ -137,6 +139,7 @@ export class ApiMessagingBackend implements MessagingBackend {
         };
       },
     );
+    this.adoptThreadLedger(unreadSummaries);
     // status_updated は replay されないvolatile eventなので、現在値はここでしか
     // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
     const presence = parsePresence(body);
@@ -461,13 +464,23 @@ export class ApiMessagingBackend implements MessagingBackend {
   /**
    * 開いている画面をserverへ宣言する。参加していないthreadに届くliveはこの
    * 宣言の間だけで、閉じれば止まる。参加しているplaceの配送は宣言に依存しない。
+   *
+   * cursorも同じ線で持つ: 開いている間だけの購読なので、閉じたらそのthreadの
+   * cursorは畳む。残したままにすると、次のhelloがそれを運び、開いてもいない
+   * 背景threadのeventが（未読と通知の効果ごと）replayされてしまう。sinceSeqは
+   * その画面をどこまで見ているかで、台帳の持ち主（store）から渡される。
    */
-  openPlace(place: Place | null): void {
+  openPlace(place: Place | null, sinceSeq = 0): void {
     const previous = this.openPlaceID;
-    this.openPlaceID = place ? placeID(place) : null;
-    // 開いている間は自分のcursorでもある。切断してもその場のdurable eventが
-    // replayされるよう、開いたplaceだけはfollowする。
-    if (place) this.followPlace(place);
+    const next = place ? placeID(place) : null;
+    if (place && next) {
+      this.registerPlace(place);
+      if (!this.cursors.has(next)) this.cursors.set(next, sinceSeq);
+    }
+    this.openPlaceID = next;
+    if (previous !== null && previous !== next && this.watchOnly(previous)) {
+      this.cursors.delete(previous);
+    }
     this.declareOpenPlace(previous);
   }
 
@@ -478,7 +491,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     this.listeners.add(listener);
     for (const [key, seq] of Object.entries(options.sinceByPlace ?? {})) {
       const place = parsePlaceKey(key);
-      if (place) this.cursors.set(placeID(place), seq);
+      if (!place) continue;
+      // storeが渡すcursorは自分の台帳そのものなので、followとして扱う。
+      this.followed.add(placeID(place));
+      this.places.set(placeID(place), place);
+      this.cursors.set(placeID(place), seq);
     }
     this.stopped = false;
     this.connect();
@@ -597,7 +614,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       // message still establishes the routing authority for later partial
       // events, which may arrive before the store finishes hydrating it.
       this.registerPlace(message.place);
-      this.cursors.set(placeID(message.place), message.seq);
+      this.advanceCursor(message.place, message.seq);
       // notifyが無いことは欠損ではなく「呼んでいない」という答え。
       parsed = { type: eventType, message, notify: parseNotify(wire.notify) };
     } else if (
@@ -606,7 +623,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     ) {
       const message = parseMessage(wire.message);
       this.registerPlace(message.place);
-      this.cursors.set(placeID(message.place), message.seq);
+      this.advanceCursor(message.place, message.seq);
       parsed = { type: eventType, message };
     } else if (eventType === "reaction_updated") {
       // A reaction can target a message older than the replay cursor, so it
@@ -735,7 +752,52 @@ export class ApiMessagingBackend implements MessagingBackend {
   private followPlace(place: Place): void {
     const id = placeID(place);
     this.places.set(id, place);
+    this.followed.add(id);
     if (!this.cursors.has(id)) this.cursors.set(id, 0);
+  }
+
+  /**
+   * 見えるだけで自分のものではないplaceか。threadだけがこの状態を持つ:
+   * channelとDMは在籍そのものが台帳で、開いていなくても自分の場所である。
+   */
+  private watchOnly(id: string): boolean {
+    return this.places.get(id)?.kind === "thread" && !this.followed.has(id);
+  }
+
+  /**
+   * bootstrapの未読summaryは「この閲覧者が持っている場所」の正本で、threadに
+   * ついては参加しているものだけを運ぶ。cursorを持つthreadをここで台帳へ
+   * 揃え直す——参加しているthreadと、いま開いているthreadだけが残る。
+   * 参加が終わったthreadのcursorが残り続けない、唯一の合流点でもある。
+   */
+  private adoptThreadLedger(summaries: UnreadSummary[]): void {
+    const participating = new Map<string, number>();
+    for (const summary of summaries) {
+      if (summary.place.kind !== "thread") continue;
+      participating.set(placeID(summary.place), summary.latestSeq);
+    }
+    for (const [id, latestSeq] of participating) {
+      this.followed.add(id);
+      // 新しく参加したthreadは、bootstrapが見た時点から先だけを追えばよい。
+      if (!this.cursors.has(id)) this.cursors.set(id, latestSeq);
+    }
+    for (const id of [...this.cursors.keys()]) {
+      if (this.places.get(id)?.kind !== "thread") continue;
+      if (participating.has(id)) continue;
+      this.followed.delete(id);
+      if (id !== this.openPlaceID) this.cursors.delete(id);
+    }
+  }
+
+  /**
+   * live eventが進めるのは、この接続が既に持っているcursorだけ。参加しても
+   * 開いてもいないthreadのeventでcursorを作ると、閉じたあとの再接続でまた
+   * それを運んでしまう。channelとDMは在籍が台帳なので今までどおり作る。
+   */
+  private advanceCursor(place: Place, seq: number): void {
+    const id = placeID(place);
+    if (place.kind === "thread" && !this.cursors.has(id)) return;
+    this.cursors.set(id, seq);
   }
 
   private stopSocket(): void {

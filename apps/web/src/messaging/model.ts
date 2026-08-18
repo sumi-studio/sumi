@@ -441,8 +441,10 @@ export interface MessagingBackend {
    * いま画面に開いているplaceをserverへ宣言する。参加していないthreadをURLで
    * 開いた閲覧者は、開いている間だけそのplaceのlive eventを受け取る。参加して
    * いるplaceの配送はこの宣言に依存しない（開いていなくても届く）。
+   * sinceSeqはその画面をどこまで見ているか——切断を跨いで開いたままのときに、
+   * その先だけをreplayさせるためのcursorである。閉じれば一緒に捨てられる。
    */
-  openPlace?(place: Place | null): void;
+  openPlace?(place: Place | null, sinceSeq?: number): void;
   /**
    * durable eventの購読。再接続時はplaceごとの消費済みseqをcursorとして渡し、
    * その次からcatch-upする（volatile eventはreplayしない）。

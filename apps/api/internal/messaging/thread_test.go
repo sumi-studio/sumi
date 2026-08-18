@@ -490,3 +490,81 @@ func TestThreadHTTPRejectsNULName(t *testing.T) {
 		t.Fatalf("NUL thread name = %d %v, want 400 invalid_name", resp.StatusCode, body)
 	}
 }
+
+// A cursor says where a client stopped reading, not what it is entitled to
+// read. A thread is visible Workspace-wide, so a viewer who once opened one
+// keeps a working cursor for it; replaying on that alone would push a
+// background conversation back into someone who never joined it. Replay
+// follows the same line as live delivery — participation, or an open
+// declaration on this connection — and the deferred half arrives after the
+// open frame, never before it.
+func TestThreadCatchUpFollowsParticipationNotTheClientsCursor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "背景の枝", "", "thread-catchup-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	for i, content := range []string{"先に置いておく", "二通目"} {
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": fmt.Sprintf("thread-catchup-post-%d", i)})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+
+	expectMessage := func(conn *websocket.Conn, content string) {
+		t.Helper()
+		frame := readFrame(t, conn)
+		event, _ := frame["event"].(map[string]any)
+		message, _ := event["message"].(map[string]any)
+		if frame["type"] != "event" || message["content"] != content {
+			t.Fatalf("expected replayed %q, got %v", content, frame)
+		}
+	}
+	expectCaughtUp := func(conn *websocket.Conn, placeID string) {
+		t.Helper()
+		if frame := readFrame(t, conn); frame["type"] != "caught_up" || frame["place_id"] != placeID {
+			t.Fatalf("expected caught_up for %s, got %v", placeID, frame)
+		}
+	}
+	declareOpen := func(conn *websocket.Conn, placeID string) {
+		t.Helper()
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := conn.WriteJSON(map[string]any{"type": "open", "place_id": placeID}); err != nil {
+			t.Fatalf("declare open place: %v", err)
+		}
+		// Frames reach one subscriber in the order they were queued, so an
+		// acknowledgement arriving first proves nothing preceded it.
+		if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != placeID {
+			t.Fatalf("first frame after open = %v, want open_ack for %s", frame, placeID)
+		}
+	}
+
+	// The participant holds the thread, so the handshake alone replays it.
+	participant := dialWS(t, ts, w.humanA.ID, map[string]int64{thread.Place.PlaceID: 0})
+	expectMessage(participant, "先に置いておく")
+	expectMessage(participant, "二通目")
+	expectCaughtUp(participant, thread.Place.PlaceID)
+
+	// The viewer claims the same cursor without ever having joined. Opening a
+	// different place proves the handshake replayed nothing for the thread:
+	// its acknowledgement is the first frame after hello_ack.
+	viewer := dialWS(t, ts, w.humanB.ID, map[string]int64{thread.Place.PlaceID: 0})
+	declareOpen(viewer, DefaultGeneralChannelID)
+
+	// Declaring the thread open is what finally admits the deferred replay.
+	declareOpen(viewer, thread.Place.PlaceID)
+	expectMessage(viewer, "先に置いておく")
+	expectMessage(viewer, "二通目")
+	expectCaughtUp(viewer, thread.Place.PlaceID)
+
+	// Replay is delivery, not admission: the viewer is still not a participant.
+	viewerStore := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
+	if threads, err := viewerStore.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("catch-up admitted a participant: threads=%+v err=%v", threads, err)
+	}
+}

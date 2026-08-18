@@ -270,25 +270,39 @@ func admitPlaceTenure(ctx context.Context, tx pgx.Tx, placeID string, membership
 }
 
 func (s *ScopedStore) PlaceFor(ctx context.Context, placeID string) (Place, error) {
+	place, _, err := s.PlaceParticipationFor(ctx, placeID)
+	return place, err
+}
+
+// PlaceParticipationFor answers two different questions in one read: may this
+// viewer see the place at all, and do they hold it. For a channel or a thread
+// those answers differ — a Workspace member may open a thread they never
+// joined — and everything that decides whether a place belongs in this
+// viewer's own ledger (rather than merely being readable) needs the second
+// answer, not the first.
+func (s *ScopedStore) PlaceParticipationFor(ctx context.Context, placeID string) (Place, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Place{}, fmt.Errorf("begin scoped place read: %w", err)
+		return Place{}, false, fmt.Errorf("begin scoped place read: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := s.authorizeInTx(ctx, tx); err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
 	if err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
-	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
-		return Place{}, err
+	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor)
+	if err != nil {
+		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Place{}, fmt.Errorf("commit scoped place read: %w", err)
+		return Place{}, false, fmt.Errorf("commit scoped place read: %w", err)
 	}
-	return place, nil
+	// A private place is unreadable without a tenure, so reaching here already
+	// proves participation; a channel or thread reports it explicitly.
+	return place, access.PlaceMemberID != "", nil
 }
 
 func (s *ScopedStore) loadScopedPlace(ctx context.Context, q querier, placeID string) (Place, error) {
