@@ -6,13 +6,14 @@
 
 use std::os::fd::OwnedFd;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::apps::AppInstallationResolver;
+use crate::runtime::contracts::InboundProvenanceV1;
 use crate::tools::executor::TransferredSource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,6 +286,116 @@ pub(crate) struct GetMessagingCallStateRequest<'a> {
     pub place_id: Option<&'a str>,
 }
 
+/// Searching the messages one can already see.  Visibility is the server's to
+/// decide, exactly as it is for the human search box: the query never widens
+/// what this person may read.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchMessagingRequest<'a> {
+    pub query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+/// One place-scoped override of one's own default notification level.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationPlace<'a> {
+    pub place_id: &'a str,
+    pub level: &'a str,
+}
+
+/// Reading or changing one's own notification setting.  Every field is
+/// optional, and a request with none of them is a read: naming one preference
+/// must not silently discard the rest, the way a full replacement would.
+/// Whose setting it is comes from the transport's credential — nobody
+/// configures anyone else's attention.
+#[derive(Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationSettingsRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults_level: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_place: Option<Vec<MessagingNotificationPlace<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<&'a str>>,
+}
+
+/// Taking in one's own AttentionCandidates. `consume_through` may name only
+/// the tail returned in a response this runtime actually received; it
+/// acknowledges everything up to that candidate_seq before the remaining ones
+/// are listed.
+#[derive(Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PollMessagingAttentionRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consume_through: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+/// The provisional local-control route is still an adapter, but its candidate
+/// payload itself is frozen. Deserialize it here before it reaches the tool so
+/// an API shape drift cannot silently become an untyped agent input.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingAttentionResponse {
+    pub candidates: Vec<MessagingAttentionCandidate>,
+    pub consumed: u64,
+    pub latest_seq: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingAttentionCandidate {
+    pub kind: MessagingAttentionCandidateKind,
+    pub candidate_id: String,
+    pub candidate_seq: u64,
+    pub provenance: InboundProvenanceV1,
+    pub unread_range: MessagingUnreadRange,
+    pub arrival_time: String,
+    pub attachments: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MessagingAttentionCandidateKind {
+    AttentionCandidate,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingUnreadRange {
+    pub place_seq_from: u64,
+    pub place_seq_to: u64,
+}
+
+pub(crate) fn validate_attention_response(value: Value) -> Result<Value> {
+    let response: MessagingAttentionResponse = serde_json::from_value(value.clone())
+        .context("decode frozen messaging AttentionCandidate response")?;
+    let mut previous_seq = 0;
+    for candidate in &response.candidates {
+        if candidate.candidate_seq == 0 || candidate.candidate_seq <= previous_seq {
+            anyhow::bail!("invalid messaging AttentionCandidate sequence order");
+        }
+        if candidate.unread_range.place_seq_from == 0
+            || candidate.unread_range.place_seq_from > candidate.unread_range.place_seq_to
+        {
+            anyhow::bail!("invalid messaging AttentionCandidate unread range");
+        }
+        previous_seq = candidate.candidate_seq;
+    }
+    // latest_seq is an acknowledgement cursor, not a global high-water mark:
+    // a smaller retry after a lost response can legitimately end earlier than
+    // an older response. It must still exactly equal this response's tail.
+    if !response.candidates.is_empty() && response.latest_seq != previous_seq {
+        anyhow::bail!("messaging AttentionCandidate latest_seq is not this response's tail");
+    }
+    Ok(value)
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
     async fn overview(&self, scope: &ExactMessagingScope) -> Result<Value>;
@@ -348,11 +459,30 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         scope: &ExactMessagingScope,
         request: GetMessagingCallStateRequest<'_>,
     ) -> Result<Value>;
+
+    async fn search(
+        &self,
+        scope: &ExactMessagingScope,
+        request: SearchMessagingRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn notification_settings(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn attention(
+        &self,
+        scope: &ExactMessagingScope,
+        request: PollMessagingAttentionRequest,
+    ) -> Result<Value>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_attachment_filename;
+    use super::{canonical_attachment_filename, validate_attention_response};
+    use serde_json::json;
 
     #[test]
     fn attachment_filename_canonicalization_matches_the_go_wire_contract() {
@@ -379,5 +509,22 @@ mod tests {
         let bounded = canonical_attachment_filename(&multibyte);
         assert_eq!(bounded.as_bytes().len(), 254);
         assert_eq!(bounded, "é".repeat(127));
+    }
+
+    #[test]
+    fn attention_response_latest_seq_must_be_its_actual_tail() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixtures: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(manifest.join("../../contracts/agent-events-fixtures.json"))
+                .expect("read contract fixtures"),
+        )
+        .expect("parse contract fixtures");
+        let candidate = fixtures["attention_candidate"]["wire"].clone();
+        let valid = json!({"candidates": [candidate], "consumed": 0, "latest_seq": 42});
+        assert!(validate_attention_response(valid.clone()).is_ok());
+
+        let mut stale_high_water = valid;
+        stale_high_water["latest_seq"] = json!(50);
+        assert!(validate_attention_response(stale_high_water).is_err());
     }
 }

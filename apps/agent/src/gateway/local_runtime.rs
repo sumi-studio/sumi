@@ -49,13 +49,13 @@ use crate::apiclient::apps::{
 };
 use crate::apiclient::messaging::{
     CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-    MessagingApi, MessagingApiFailure,
-    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
-    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
-    OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
-    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+    MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+    MessagingNotificationSettingsRequest, MessagingWriteReceipt, OpenMessagingAttachmentMetadata,
+    OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
+    PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+    ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
     UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
-    WriteMessagingMessageRequest, canonical_attachment_filename,
+    WriteMessagingMessageRequest, canonical_attachment_filename, validate_attention_response,
 };
 use crate::apiclient::workspace::{
     WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceInvitationApi,
@@ -1015,6 +1015,47 @@ impl MessagingApi for LocalControlHttpClient {
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
+    }
+
+    async fn search(
+        &self,
+        scope: &ExactMessagingScope,
+        request: SearchMessagingRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        // Up to 50 hits, each carrying a snippet — a result list, not a
+        // timeline, but still wider than the control-plane bound.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:search",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn notification_settings(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:notification-settings",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn attention(
+        &self,
+        scope: &ExactMessagingScope,
+        request: PollMessagingAttentionRequest,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .post_json(
+                "/local-control/v1/messaging:attention",
+                &ScopedMessagingRequest::new(scope, request),
+            )
+            .await?;
+        validate_attention_response(response)
     }
 }
 

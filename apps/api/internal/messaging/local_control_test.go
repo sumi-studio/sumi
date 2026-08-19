@@ -430,3 +430,55 @@ func TestLocalAuthorityEpochWireIsCanonical(t *testing.T) {
 		t.Fatalf("canonical epoch = %d body=%s", response.Code, response.Body.String())
 	}
 }
+
+func TestLocalNotificationSettingsConcurrentPartialUpdatesPreserveBothFields(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+
+	start := make(chan struct{})
+	results := make(chan struct {
+		status int
+		body   map[string]any
+	}, 2)
+	call := func(patch map[string]any) {
+		<-start
+		status, body := callLocalWithoutFixtureInference(t, ctx, server.localNotificationSettings,
+			LocalNotificationSettingsPath, patch, authorization)
+		results <- struct {
+			status int
+			body   map[string]any
+		}{status, body}
+	}
+	base := map[string]any{
+		"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
+		"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10),
+	}
+	defaults := make(map[string]any, len(base)+1)
+	keywords := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		defaults[key], keywords[key] = value, value
+	}
+	defaults["defaults_level"] = NotifyLevelAll
+	keywords["keywords"] = []string{"release"}
+	go call(defaults)
+	go call(keywords)
+	close(start)
+	for range 2 {
+		result := <-results
+		if result.status != http.StatusOK {
+			t.Fatalf("concurrent partial settings update = %d %v", result.status, result.body)
+		}
+	}
+	stored, err := scoped.NotificationSettingFor(ctx)
+	if err != nil {
+		t.Fatalf("read merged setting: %v", err)
+	}
+	if stored.Default() != NotifyLevelAll || len(stored.Keywords) != 1 || stored.Keywords[0] != "release" {
+		t.Fatalf("concurrent partial settings lost a field: %+v", stored)
+	}
+}

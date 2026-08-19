@@ -667,6 +667,44 @@
       "reject_reason": "idempotency_conflict"
     }
   },
+  "attention_candidate": {
+    "kind": "attention_candidate",
+    "wire": {
+      "kind": "attention_candidate",
+      "candidate_id": "018f1e72-6e9a-7c20-8e90-123456789abe",
+      "candidate_seq": 42,
+      "provenance": {
+        "version": 1,
+        "tenant_id": "tenant-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "actor": {
+          "kind": "human",
+          "human_id": "018f1e72-6e9a-7c20-8e90-123456789abd"
+        },
+        "source": {
+          "surface": "messaging",
+          "workspace_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+          "place": { "kind": "channel", "channel_id": "018f1e72-6e9a-7c20-8e90-123456789abc" },
+          "delivery": {
+            "message_id": "018f1e72-6e9a-7c20-8e90-123456789abe",
+            "seq": 123,
+            "addressees": [{
+              "kind": "personality_agent",
+              "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc"
+            }],
+            "trigger_reason": "mention",
+            "urgency": "normal",
+            "correlation_id": null,
+            "causation_id": null
+          }
+        },
+        "authority": { "basis": "place_membership", "decision_id": null }
+      },
+      "unread_range": { "place_seq_from": 100, "place_seq_to": 123 },
+      "arrival_time": "2026-08-01T12:34:56Z",
+      "attachments": {}
+    }
+  },
   "browser_command_rejected_unavailable": {
     "kind": "browser_command_rejected",
     "wire": {

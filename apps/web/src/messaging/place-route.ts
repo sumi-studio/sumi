@@ -1,5 +1,9 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback } from "react";
+// 住所の作り方は public/place-path.js にひとつだけ置いてある。通知のクリック
+// （Service Worker）が同じ規則を通れるようにするためで、ここで書き直すと
+// 「アプリの route」と「通知の行き先」が黙って分かれる。
+import { messagingPlacePath } from "../../public/place-path.js";
 import { type PlaceKey, parsePlaceKey } from "./model";
 import { getMessagingScope } from "./store";
 
@@ -10,10 +14,8 @@ import { getMessagingScope } from "./store";
 export function placePath(workspaceId: string, key: PlaceKey): string {
   const place = parsePlaceKey(key);
   if (!place) return "/";
-  const base = `/w/${encodeURIComponent(workspaceId)}/messaging`;
-  if (place.kind === "channel") return `${base}/c/${place.channelId}`;
-  if (place.kind === "dm") return `${base}/dm/${place.dmId}`;
-  return `${base}/group/${place.dmId}`;
+  const placeId = place.kind === "channel" ? place.channelId : place.dmId;
+  return messagingPlacePath(workspaceId, place.kind, placeId);
 }
 
 export function usePlaceNavigate() {

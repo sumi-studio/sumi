@@ -14,6 +14,11 @@
 /sw.js
   Cache-Control: no-cache, must-revalidate
 
+# sw.js が import する住所の規則。片方だけ古いと、通知の行き先だけが前の
+# route のまま固まるので、sw.js と同じ扱いにする。
+/place-path.js
+  Cache-Control: no-cache, must-revalidate
+
 /theme-bootstrap.js
   Cache-Control: no-cache, must-revalidate
 

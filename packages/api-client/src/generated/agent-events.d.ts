@@ -353,6 +353,32 @@ export type TenantId = string;
 export type PrincipalId = string;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "InboundActorRef".
+ */
+export type InboundActorRef =
+  | {
+      kind: "human";
+      human_id: PersonalityAgentId;
+    }
+  | {
+      kind: "personality_agent";
+      personality_agent_id: PersonalityAgentId;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "InboundPlaceRef".
+ */
+export type InboundPlaceRef =
+  | {
+      kind: "channel";
+      channel_id: TenantId;
+    }
+  | {
+      kind: "dm" | "group_dm";
+      dm_id: TenantId;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "OutboundFrame".
  */
 export type OutboundFrame =
@@ -714,6 +740,58 @@ export interface DirectChatProvenanceV1 {
   source: {
     surface: "direct_chat";
   };
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "InboundDeliveryProvenance".
+ */
+export interface InboundDeliveryProvenance {
+  message_id: TenantId;
+  seq: JsonSafeInteger;
+  /**
+   * @maxItems 64
+   */
+  addressees: InboundActorRef[];
+  trigger_reason: "mention" | "direct_message" | "place_activity";
+  urgency: "urgent" | "normal" | "fyi";
+  correlation_id: TenantId | null;
+  causation_id: TenantId | null;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "InboundProvenanceV1".
+ */
+export interface InboundProvenanceV1 {
+  version: 1;
+  tenant_id: TenantId;
+  personality_agent_id: PersonalityAgentId;
+  actor: InboundActorRef;
+  source: {
+    surface: "messaging";
+    workspace_id: PersonalityAgentId;
+    place: InboundPlaceRef;
+    delivery: InboundDeliveryProvenance;
+  };
+  authority: {
+    basis: "place_membership";
+    decision_id: null;
+  };
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AttentionCandidate".
+ */
+export interface AttentionCandidate {
+  kind: "attention_candidate";
+  candidate_id: PersonalityAgentId;
+  candidate_seq: JsonSafeInteger;
+  provenance: InboundProvenanceV1;
+  unread_range: {
+    place_seq_from: JsonSafeInteger;
+    place_seq_to: JsonSafeInteger;
+  };
+  arrival_time: string;
+  attachments: AnyJSONObject;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

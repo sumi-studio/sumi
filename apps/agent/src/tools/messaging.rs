@@ -23,11 +23,13 @@ use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
         CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-        MessagingApi, MessagingApiFailure,
-        MessagingApiFailureClass, MessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
-        OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
-        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+        MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        MessagingNotificationPlace, MessagingNotificationSettingsRequest,
+        OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
+        PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
         UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
+        validate_attention_response,
     },
     approval::authority::MessagingSourceSigningContinuation,
     provider::types::{ToolDefinition, UserContent},
@@ -63,6 +65,15 @@ const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
 const DEFAULT_OPEN_LIMIT: usize = 20;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
+// The server bounds a search phrase at 200 bytes and one poll at 50 candidates.
+const MAX_SEARCH_QUERY_BYTES: usize = 200;
+const MAX_SEARCH_LIMIT: u16 = 50;
+const MAX_ATTENTION_LIMIT: u16 = 50;
+// A keyword list is a handful of words one wants to be called for, not a
+// search index: the server bounds it at 32 words of 64 characters each.
+const MAX_NOTIFICATION_KEYWORDS: usize = 32;
+const MAX_NOTIFICATION_KEYWORD_CHARS: usize = 64;
+const MAX_NOTIFICATION_PLACES: usize = 200;
 const MESSAGING_APP_ID: &str = "messaging";
 // A single PersonalityAgent is single-threaded and normally inhabits only a
 // handful of Workspace installations at once. Sixteen retains ample locality
@@ -140,6 +151,59 @@ enum MessagingAction {
         #[serde(default)]
         place_id: Option<String>,
     },
+    /// Find messages one can already see.  Like status this is not about a
+    /// place: remembering something said elsewhere should not require having
+    /// guessed the place first.
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    /// Read or change one's own notification setting — the identical resource
+    /// a Human owns and changes from the UI.  With no field set this reads;
+    /// any field present changes only that field, because naming one
+    /// preference must not silently discard the rest.
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+    },
+    /// Take in one's own AttentionCandidates: what arrived while one was not
+    /// looking, and why.  `consume_through` acknowledges everything up to that
+    /// candidate_seq before the rest is listed.
+    ///
+    /// This is a provisional wiring ahead of the wake-trigger design (ADR 0010
+    /// / issue #173).  There, a candidate's arrival wakes the person; here the
+    /// already-awake person comes to look.  What is durable either way is that
+    /// nothing said while the runtime was stopped is lost.
+    Attention {
+        #[serde(default)]
+        consume_through: Option<u64>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+}
+
+/// The three notification levels, identical to the ones a Human chooses in the
+/// UI (契約ドラフト: HumanもAgentも同じ形).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MessagingNotifyLevel {
+    All,
+    Mentions,
+    Mute,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MessagingNotifyPlace {
+    place_id: String,
+    level: MessagingNotifyLevel,
 }
 
 /// Registry-sealed app arguments. Unlike the model-facing schema, every
@@ -195,6 +259,27 @@ enum BoundMessagingAction {
     GetCallState {
         #[serde(default)]
         place_id: Option<String>,
+    },
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+    },
+    Attention {
+        #[serde(default)]
+        consume_through: Option<u64>,
+        #[serde(default)]
+        limit: Option<u16>,
     },
 }
 
@@ -349,6 +434,10 @@ struct MessagingViewState {
     visible_messages: Vec<VisibleMessage>,
     self_participant: Option<ParticipantIdentity>,
     visible_reply_later_markers: Vec<VisibleReplyLaterMarker>,
+    // The only cursor this runtime is allowed to acknowledge next. It is set
+    // from a non-empty response that reached this process, not from a server
+    // delivery high-water or a caller-supplied number.
+    attention_ackable_through: Option<u64>,
 }
 
 struct CachedMessagingView {
@@ -560,9 +649,13 @@ fn messaging_parameters_schema() -> Value {
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id; get_call_state may include place_id. Write, react and reply_later act ",
-            "on the place most recently opened in this tool view; status and get_call_state ",
-            "need no open place; resolve_reply_later needs a marker ",
+            "marker_id; get_call_state may include place_id; search requires query and may ",
+            "include place_id or limit; notification_settings takes any of defaults_level, ",
+            "per_place or keywords and reads the current setting when given none of them; ",
+            "attention may include consume_through or limit. Write, react and reply_later act ",
+            "on the place most recently opened in this tool view; status, get_call_state, ",
+            "search, notification_settings and attention need no open place; ",
+            "resolve_reply_later needs a marker ",
             "already shown or returned in this tool view, but not its place open."
         ),
         "properties": {
@@ -574,7 +667,8 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "open_attachment", "react",
-                    "status", "reply_later", "resolve_reply_later", "get_call_state"
+                    "status", "reply_later", "resolve_reply_later", "get_call_state",
+                    "search", "notification_settings", "attention"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -584,12 +678,19 @@ fn messaging_parameters_schema() -> Value {
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept; ",
-                    "get_call_state reports who is currently in calls you can see."
+                    "get_call_state reports who is currently in calls you can see; ",
+                    "search finds messages you can already see, anywhere; ",
+                    "notification_settings reads or changes what is allowed to interrupt you; ",
+                    "attention lists what arrived while you were not looking, and why."
                 )
             },
             "place_id": {
                 "type": "string",
-                "description": "Required for open, optional for get_call_state, and omitted for other actions. The place to open or whose current call to report."
+                "description": concat!(
+                    "Required for open, optional for get_call_state and search, and omitted ",
+                    "for other actions. The place to open, whose current call to report, or ",
+                    "the one place a search is restricted to."
+                )
             },
             "before_seq": {
                 "type": "integer",
@@ -600,7 +701,10 @@ fn messaging_parameters_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Optional for open and omitted for other actions. Maximum number of messages to return."
+                "description": concat!(
+                    "Optional for open, search and attention, omitted for other actions. ",
+                    "Maximum number of messages, search hits or candidates to return."
+                )
             },
             "content": {
                 "type": "string",
@@ -691,6 +795,57 @@ fn messaging_parameters_schema() -> Value {
                     "marker_id of your unresolved promise already shown or returned in this ",
                     "tool view."
                 )
+            },
+            "query": {
+                "type": "string",
+                "description": concat!(
+                    "Required for search and omitted for other actions. Words to look for. ",
+                    "Matching is case-insensitive substring, so a partial word finds it; the ",
+                    "results only ever come from places you can already see."
+                )
+            },
+            "defaults_level": {
+                "type": "string",
+                "enum": ["all", "mentions", "mute"],
+                "description": concat!(
+                    "Optional for notification_settings and omitted for other actions. What may ",
+                    "interrupt you in a place you have not singled out: all messages, only when ",
+                    "you are called, or nothing."
+                )
+            },
+            "per_place": {
+                "type": "array",
+                "description": concat!(
+                    "Optional for notification_settings and omitted for other actions. Overrides ",
+                    "for individual places. Sending this replaces the whole list of overrides."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "place_id": {"type": "string"},
+                        "level": {"type": "string", "enum": ["all", "mentions", "mute"]}
+                    },
+                    "required": ["place_id", "level"],
+                    "additionalProperties": false
+                }
+            },
+            "keywords": {
+                "type": "array",
+                "description": concat!(
+                    "Optional for notification_settings and omitted for other actions. Words ",
+                    "other than your name that should reach you. Sending this replaces the whole ",
+                    "list; an empty array means you use no keywords."
+                ),
+                "items": {"type": "string"}
+            },
+            "consume_through": {
+                "type": "integer",
+                "minimum": 1,
+                "description": concat!(
+                    "Optional for attention and omitted for other actions. The candidate_seq you ",
+                    "received as latest_seq in this tool view; everything up to and including it stops being offered. ",
+                    "Acknowledging is idempotent and never moves the cursor backwards."
+                )
             }
         },
         "required": ["workspace_id", "action"],
@@ -709,6 +864,9 @@ impl Tool for MessagingTool {
                 "members and unread state. Then write in that currently open place, or ",
                 "react or promise a later reply to a ",
                 "message visible in it. Declare your own availability with status. ",
+                "Use search to find something said elsewhere, attention to see what ",
+                "arrived while you were not looking, and notification_settings to ",
+                "decide what is allowed to interrupt you. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare."
             )
@@ -1058,6 +1216,119 @@ impl BoundToolAdapter for MessagingTool {
                     arguments,
                 )
             }
+            // Search reaches across places rather than into one, so an
+            // unrestricted query declares the place collection. It is a read:
+            // the server never widens what this person may already see.
+            MessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => {
+                let scopes = match &place_id {
+                    Some(place_id) => {
+                        vec![ResourceScope::resource("messaging", "place", place_id)]
+                    }
+                    None => vec![ResourceScope::collection("messaging", "place")],
+                };
+                let mut arguments = object([
+                    ("action", Value::String("search".to_owned())),
+                    ("query", Value::String(query)),
+                ]);
+                insert_optional_string(&mut arguments, "place_id", place_id);
+                insert_optional_u64(&mut arguments, "limit", limit.map(u64::from));
+                messaging_binding(
+                    &scope,
+                    "search",
+                    CapabilityClass::Read,
+                    scopes,
+                    arguments.clone(),
+                    arguments,
+                )
+            }
+            // Reading and changing one's own setting are the same operation
+            // with different fields present, but not the same capability: a
+            // request that names nothing may not be reviewed as a mutation,
+            // and one that names something may not be waved through as a read.
+            MessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let changes = defaults_level.is_some() || per_place.is_some() || keywords.is_some();
+                let mut arguments =
+                    object([("action", Value::String("notification_settings".to_owned()))]);
+                if let Some(level) = defaults_level {
+                    arguments.insert(
+                        "defaults_level".to_owned(),
+                        Value::String(notify_level_text(level).to_owned()),
+                    );
+                }
+                if let Some(entries) = &per_place {
+                    arguments.insert(
+                        "per_place".to_owned(),
+                        Value::Array(
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    Value::Object(object([
+                                        ("place_id", Value::String(entry.place_id.clone())),
+                                        (
+                                            "level",
+                                            Value::String(
+                                                notify_level_text(entry.level).to_owned(),
+                                            ),
+                                        ),
+                                    ]))
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(words) = &keywords {
+                    arguments.insert(
+                        "keywords".to_owned(),
+                        Value::Array(words.iter().cloned().map(Value::String).collect()),
+                    );
+                }
+                let mut review_projection = arguments.clone();
+                review_projection.insert("changes_setting".to_owned(), Value::Bool(changes));
+                let mut scopes = vec![ResourceScope::resource("messaging", "participant", "self")];
+                if let Some(entries) = &per_place {
+                    scopes.extend(entries.iter().map(|entry| {
+                        ResourceScope::resource("messaging", "place", &entry.place_id)
+                    }));
+                }
+                messaging_binding(
+                    &scope,
+                    "notification_settings",
+                    if changes {
+                        CapabilityClass::Mutate
+                    } else {
+                        CapabilityClass::Read
+                    },
+                    scopes,
+                    review_projection,
+                    arguments,
+                )
+            }
+            // Taking candidates in advances one's own cursor, so it is a
+            // mutation even though nothing anyone else can see changes.
+            MessagingAction::Attention {
+                consume_through,
+                limit,
+            } => {
+                let mut arguments = object([("action", Value::String("attention".to_owned()))]);
+                insert_optional_u64(&mut arguments, "consume_through", consume_through);
+                insert_optional_u64(&mut arguments, "limit", limit.map(u64::from));
+                messaging_binding(
+                    &scope,
+                    "attention",
+                    CapabilityClass::Mutate,
+                    vec![ResourceScope::resource("messaging", "participant", "self")],
+                    arguments.clone(),
+                    arguments,
+                )
+            }
         }
     }
 
@@ -1394,6 +1665,79 @@ impl MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            // Search results are not a screen. They stay out of
+            // visible_messages, so a hit cannot be reacted to from the result
+            // list — one opens the place first, exactly as a human does
+            // (ADR 0011 §3: 見えていないものは操作できない).
+            BoundMessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.search(scope, SearchMessagingRequest {
+                    query: &query,
+                    place_id: place_id.as_deref(),
+                    limit,
+                }) => result,
+            }
+            .map_err(map_messaging_api_error)?,
+            BoundMessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let places = per_place.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| MessagingNotificationPlace {
+                            place_id: entry.place_id.as_str(),
+                            level: notify_level_text(entry.level),
+                        })
+                        .collect()
+                });
+                let words = keywords
+                    .as_ref()
+                    .map(|words| words.iter().map(String::as_str).collect());
+                tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.notification_settings(scope, MessagingNotificationSettingsRequest {
+                        defaults_level: defaults_level.map(notify_level_text),
+                        per_place: places,
+                        keywords: words,
+                    }) => result,
+                }
+                .map_err(map_messaging_api_error)?
+            }
+            BoundMessagingAction::Attention {
+                consume_through,
+                limit,
+            } => {
+                // Binding may be resumed from a persisted descriptor, so enforce
+                // the received-tail rule again at the point that could send the
+                // RPC. A caller-supplied sequence never becomes an ack merely
+                // because it passed through a binding cache.
+                if consume_through.is_some() && consume_through != state.attention_ackable_through {
+                    return Err(ToolError::InvalidArguments);
+                }
+                let response = tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.attention(scope, PollMessagingAttentionRequest {
+                        consume_through,
+                        limit,
+                    }) => result,
+                }
+                .map_err(map_messaging_api_error)?;
+                let response = validate_attention_response(response)
+                    .map_err(|error| ToolError::Protocol(error.to_string()))?;
+                state.attention_ackable_through = response
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .filter(|candidates| !candidates.is_empty())
+                    .and_then(|_| response.get("latest_seq"))
+                    .and_then(Value::as_u64);
+                response
+            }
         };
         Ok(ExactMessagingOutcome {
             response: ExactMessagingResponse::Json(response),
@@ -1807,6 +2151,39 @@ fn resolve_raw_action(
         MessagingAction::GetCallState { place_id } => {
             Ok(BoundMessagingAction::GetCallState { place_id })
         }
+        // None of these three need an open place: remembering something said
+        // elsewhere, deciding what may interrupt one, and taking in what
+        // arrived are all about the person, not about a screen.
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => Ok(BoundMessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        }),
+        MessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        } => Ok(BoundMessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        }),
+        MessagingAction::Attention {
+            consume_through,
+            limit,
+        } => {
+            if consume_through.is_some() && consume_through != state.attention_ackable_through {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(BoundMessagingAction::Attention {
+                consume_through,
+                limit,
+            })
+        }
     }
 }
 
@@ -1979,7 +2356,78 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => {
+            // A blank query is not a search. Asking for everything is not a
+            // question, and the server would refuse it anyway.
+            if query.trim().is_empty() || query.len() > MAX_SEARCH_QUERY_BYTES {
+                return Err(ToolError::InvalidArguments);
+            }
+            if place_id
+                .as_deref()
+                .is_some_and(|place| validate_bounded_nonempty(place, MAX_PLACE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_limit(*limit, MAX_SEARCH_LIMIT)
+        }
+        MessagingAction::NotificationSettings {
+            per_place,
+            keywords,
+            ..
+        } => {
+            if per_place
+                .as_ref()
+                .is_some_and(|entries| entries.len() > MAX_NOTIFICATION_PLACES)
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            if let Some(entries) = per_place {
+                for entry in entries {
+                    validate_bounded_nonempty(&entry.place_id, MAX_PLACE_ID_BYTES)?;
+                }
+            }
+            if let Some(words) = keywords {
+                if words.len() > MAX_NOTIFICATION_KEYWORDS {
+                    return Err(ToolError::InvalidArguments);
+                }
+                for word in words {
+                    // 空文字は「呼ばれたい言葉」ではない。サーバー側でも落ちる。
+                    // 長さはサーバーと同じく文字で数える。
+                    if word.trim().is_empty()
+                        || word.chars().count() > MAX_NOTIFICATION_KEYWORD_CHARS
+                        || word.chars().any(char::is_control)
+                    {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                }
+            }
+            Ok(())
+        }
+        MessagingAction::Attention {
+            consume_through,
+            limit,
+        } => {
+            // Zero would mean "acknowledge nothing", which is what omitting the
+            // field already says; a caller writing it means something else.
+            if consume_through == &Some(0) {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_limit(*limit, MAX_ATTENTION_LIMIT)
+        }
     }
+}
+
+/// One bounded page. Zero is not "no limit": it is a request for nothing,
+/// which no caller means.
+fn validate_optional_limit(limit: Option<u16>, max: u16) -> Result<(), ToolError> {
+    if limit.is_some_and(|limit| limit == 0 || limit > max) {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
 }
 
 fn validate_canonical_uuid_v7(value: &str) -> Result<(), ToolError> {
@@ -2096,6 +2544,31 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
                 place_id: place_id.clone(),
             })
         }
+        BoundMessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => validate_action(&MessagingAction::Search {
+            query: query.clone(),
+            place_id: place_id.clone(),
+            limit: *limit,
+        }),
+        BoundMessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        } => validate_action(&MessagingAction::NotificationSettings {
+            defaults_level: *defaults_level,
+            per_place: per_place.clone(),
+            keywords: keywords.clone(),
+        }),
+        BoundMessagingAction::Attention {
+            consume_through,
+            limit,
+        } => validate_action(&MessagingAction::Attention {
+            consume_through: *consume_through,
+            limit: *limit,
+        }),
     }
 }
 
@@ -2557,6 +3030,14 @@ const fn urgency_text(urgency: MessagingUrgency) -> &'static str {
     }
 }
 
+const fn notify_level_text(level: MessagingNotifyLevel) -> &'static str {
+    match level {
+        MessagingNotifyLevel::All => "all",
+        MessagingNotifyLevel::Mentions => "mentions",
+        MessagingNotifyLevel::Mute => "mute",
+    }
+}
+
 const fn status_text(status: MessagingStatus) -> &'static str {
     match status {
         MessagingStatus::Available => "available",
@@ -2892,6 +3373,7 @@ mod tests {
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
+        notification_requests: AsyncMutex<Vec<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -3242,6 +3724,102 @@ mod tests {
                 "started_at": "2026-08-17T00:00:00Z",
                 "participants": []
             }]}))
+        }
+
+        async fn search(
+            &self,
+            scope: &ExactMessagingScope,
+            request: SearchMessagingRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls
+                .lock()
+                .await
+                .push(format!("search:{}", request.query));
+            Ok(json!({"results": [{
+                "message_id": "message-1",
+                "place": {"kind": "channel", "channel_id": request.place_id.unwrap_or("general")},
+                "seq": 7,
+                "author": {"kind": "human", "human_id": "human-1"},
+                "snippet": request.query,
+                "created_at": "2026-08-17T00:00:00Z"
+            }]}))
+        }
+
+        async fn notification_settings(
+            &self,
+            scope: &ExactMessagingScope,
+            request: MessagingNotificationSettingsRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            let changed = request.defaults_level.is_some()
+                || request.per_place.is_some()
+                || request.keywords.is_some();
+            self.calls.lock().await.push(format!(
+                "notification_settings:{}",
+                if changed { "set" } else { "read" }
+            ));
+            self.notification_requests.lock().await.push(json!({
+                "defaults_level": request.defaults_level,
+                "per_place": request.per_place.as_ref().map(|entries| entries
+                    .iter()
+                    .map(|entry| json!({"place_id": entry.place_id, "level": entry.level}))
+                    .collect::<Vec<_>>()),
+                "keywords": request.keywords,
+            }));
+            Ok(json!({"setting": {
+                "owner": {"kind": "personality_agent", "personality_agent_id": "agent-1"},
+                "defaults": {"level": request.defaults_level.unwrap_or("all")},
+                "per_place": [],
+                "keywords": []
+            }}))
+        }
+
+        async fn attention(
+            &self,
+            scope: &ExactMessagingScope,
+            request: PollMessagingAttentionRequest,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls.lock().await.push(format!(
+                "attention:{}",
+                request
+                    .consume_through
+                    .map_or_else(|| "-".to_owned(), |seq| seq.to_string())
+            ));
+            Ok(json!({
+                "candidates": [{
+                    "kind": "attention_candidate",
+                    "candidate_id": "01900000-0000-7000-8000-0000000000c1",
+                    "candidate_seq": 1,
+                    "provenance": {
+                        "version": 1,
+                        "tenant_id": "tenant-1",
+                        "personality_agent_id": "01900000-0000-7000-8000-0000000000a1",
+                        "actor": {"kind": "human", "human_id": "human-1"},
+                        "source": {
+                            "surface": "messaging",
+                            "workspace_id": TEST_WORKSPACE_ID,
+                            "place": {"kind": "channel", "channel_id": "general"},
+                            "delivery": {
+                                "message_id": "message-1",
+                                "seq": 7,
+                                "addressees": [{"kind": "personality_agent", "personality_agent_id": "01900000-0000-7000-8000-0000000000a1"}],
+                                "trigger_reason": "mention",
+                                "urgency": "normal",
+                                "correlation_id": null,
+                                "causation_id": null
+                            }
+                        },
+                        "authority": {"basis": "place_membership", "decision_id": null}
+                    },
+                    "unread_range": {"place_seq_from": 1, "place_seq_to": 7},
+                    "arrival_time": "2026-08-17T00:00:00Z",
+                    "attachments": {}
+                }],
+                "consumed": request.consume_through.unwrap_or(0),
+                "latest_seq": 1
+            }))
         }
     }
 
@@ -3675,7 +4253,10 @@ mod tests {
                 "status",
                 "reply_later",
                 "resolve_reply_later",
-                "get_call_state"
+                "get_call_state",
+                "search",
+                "notification_settings",
+                "attention"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -3710,14 +4291,19 @@ mod tests {
                 "attachment_id",
                 "attachments",
                 "before_seq",
+                "consume_through",
                 "content",
+                "defaults_level",
                 "emoji",
                 "expires_in_minutes",
+                "keywords",
                 "limit",
                 "marker_id",
                 "message_id",
                 "note",
+                "per_place",
                 "place_id",
+                "query",
                 "remind_in_minutes",
                 "reply_to",
                 "seq",
@@ -4394,6 +4980,192 @@ mod tests {
         assert_eq!(
             api.calls.lock().await.last().map(String::as_str),
             Some("call_state:*")
+        );
+    }
+
+    #[tokio::test]
+    async fn search_finds_what_was_said_elsewhere_without_putting_it_on_screen() {
+        let (api, _tool, registry) = binding_fixture().await;
+
+        // 検索は place の中ではなく place を跨いで届くので、範囲を絞らない
+        // 問い合わせは place の collection を名乗る。読みであって変更ではない。
+        let bound = bind_action(
+            &registry,
+            "search",
+            json!({"action": "search", "query": "デプロイ"}),
+        )
+        .await
+        .expect("bind search");
+        assert_eq!(bound.descriptor.operation, "search");
+        assert_eq!(bound.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(
+            bound.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::collection("messaging", "place")])
+        );
+        assert_eq!(
+            Value::Object(bound.execution_arguments.as_object().clone()),
+            scoped_execution(json!({"action": "search", "query": "デプロイ"}))
+        );
+
+        let outcome = execute_bound_action(
+            &registry,
+            "search-run",
+            json!({"action": "search", "query": "デプロイ"}),
+        )
+        .await
+        .expect("run search");
+        assert_eq!(outcome.output.details["results"][0]["seq"], 7);
+        assert_eq!(
+            api.calls.lock().await.last().map(String::as_str),
+            Some("search:デプロイ")
+        );
+
+        // ヒットは「画面」ではない。検索結果からいきなり反応はできず、人間と
+        // 同じく place を開いてからになる（ADR 0011 §3）。
+        let state = default_state(&_tool).await;
+        assert!(
+            state
+                .visible_messages
+                .iter()
+                .all(|message| message.message_id != "message-1")
+        );
+        drop(state);
+
+        // 空の問いは検索ではない。
+        assert!(
+            bind_action(
+                &registry,
+                "blank",
+                json!({"action": "search", "query": "   "})
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_settings_reads_when_it_names_nothing_and_mutates_when_it_names_something()
+    {
+        let (api, _tool, registry) = binding_fixture().await;
+
+        let read = bind_action(
+            &registry,
+            "notify-read",
+            json!({"action": "notification_settings"}),
+        )
+        .await
+        .expect("bind notification read");
+        assert_eq!(read.descriptor.operation, "notification_settings");
+        // 何も名指さない呼びは読みである。変更として審査させると、見るだけの
+        // 行為に変更の重みがつく。
+        assert_eq!(read.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(read.review_projection.as_object()["changes_setting"], false);
+
+        let write = bind_action(
+            &registry,
+            "notify-write",
+            json!({
+                "action": "notification_settings",
+                "defaults_level": "mentions",
+                "per_place": [{"place_id": "place-a", "level": "mute"}]
+            }),
+        )
+        .await
+        .expect("bind notification change");
+        assert_eq!(write.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(write.review_projection.as_object()["changes_setting"], true);
+        assert!(
+            write
+                .descriptor
+                .resource_scopes
+                .contains(&ResourceScope::resource("messaging", "place", "place-a"))
+        );
+
+        execute_bound_action(
+            &registry,
+            "notify-run",
+            json!({"action": "notification_settings", "keywords": ["リリース"]}),
+        )
+        .await
+        .expect("run notification change");
+        // 一つ名指したときに、残りを黙って捨てない。送っていない項目は
+        // wire に現れず、サーバー側の全置換にはならない。
+        let requests = api.notification_requests.lock().await;
+        let last = requests.last().expect("recorded notification request");
+        assert_eq!(last["keywords"], json!(["リリース"]));
+        assert_eq!(last["defaults_level"], Value::Null);
+        assert_eq!(last["per_place"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn attention_takes_candidates_in_and_advances_ones_own_cursor() {
+        let (api, _tool, registry) = binding_fixture().await;
+
+        let first =
+            execute_bound_action(&registry, "attention-first", json!({"action": "attention"}))
+                .await
+                .expect("receive attention");
+        assert_eq!(first.output.details["latest_seq"], 1);
+
+        let bound = bind_action(
+            &registry,
+            "attention",
+            json!({"action": "attention", "consume_through": 1}),
+        )
+        .await
+        .expect("bind attention");
+        assert_eq!(bound.descriptor.operation, "attention");
+        // 他の誰にも見えない変化だが、自分の cursor は前に進む。
+        assert_eq!(bound.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            bound.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "participant",
+                "self"
+            )])
+        );
+
+        let outcome = execute_bound_action(
+            &registry,
+            "attention-run",
+            json!({"action": "attention", "consume_through": 1}),
+        )
+        .await
+        .expect("run attention");
+        let candidate = &outcome.output.details["candidates"][0];
+        assert_eq!(
+            candidate["provenance"]["source"]["delivery"]["trigger_reason"],
+            "mention"
+        );
+        // 候補は message ref であって本文の注入ではない（凍結契約 v1）。
+        assert!(candidate.get("content").is_none());
+        assert_eq!(
+            api.calls.lock().await.last().map(String::as_str),
+            Some("attention:1")
+        );
+
+        // An arbitrary cursor is not an acknowledgement. The only permitted
+        // one is the tail this view actually received in the prior response.
+        assert!(
+            execute_bound_action(
+                &registry,
+                "attention-unreceived-tail",
+                json!({"action": "attention", "consume_through": 2}),
+            )
+            .await
+            .is_err()
+        );
+
+        // 0 は「何も ack しない」で、それは項目を省くことが既に言っている。
+        assert!(
+            bind_action(
+                &registry,
+                "attention-zero",
+                json!({"action": "attention", "consume_through": 0})
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -5287,7 +6059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_and_bound_paths_share_one_exact_executor_for_all_eight_actions() {
+    async fn raw_and_bound_paths_share_one_exact_executor_for_all_eleven_actions() {
         let cases = [
             ("overview", json!({"action": "overview"})),
             (
@@ -5338,6 +6110,19 @@ mod tests {
                 "call-state",
                 json!({"action": "get_call_state", "place_id": "place-a"}),
             ),
+            (
+                "search",
+                json!({"action": "search", "query": "デプロイ", "limit": 10}),
+            ),
+            (
+                "notification-settings",
+                json!({
+                    "action": "notification_settings",
+                    "defaults_level": "mentions",
+                    "keywords": ["リリース"]
+                }),
+            ),
+            ("attention", json!({"action": "attention", "limit": 5})),
         ];
 
         for (id, action) in cases {

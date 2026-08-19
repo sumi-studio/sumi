@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
@@ -25,7 +26,29 @@ func (s *Store) withLiveAudience(
 	requireActor bool,
 	deliver func(map[ParticipantRef]struct{}) error,
 ) error {
-	if s == nil || s.workspaces == nil || s.apps == nil || deliver == nil {
+	if deliver == nil {
+		return ErrInvalidScope
+	}
+	return s.withLiveAudienceInTx(ctx, scope, boundary, requireActor,
+		func(_ pgx.Tx, audience map[ParticipantRef]struct{}) error {
+			return deliver(audience)
+		})
+}
+
+// withLiveAudienceInTx is the lease form for adapters that must take a
+// coherent, currently-authorized snapshot before doing work after the lease.
+// Its callback may read and construct an in-memory delivery plan, but must not
+// perform external I/O: the transaction holds the Workspace and place fences.
+// Live WebSocket fanout is deliberately different: it is process-local enqueue
+// work, so withLiveAudience may perform that enqueue while it has the lease.
+func (s *Store) withLiveAudienceInTx(
+	ctx context.Context,
+	scope Scope,
+	boundary liveBoundary,
+	requireActor bool,
+	prepare func(pgx.Tx, map[ParticipantRef]struct{}) error,
+) error {
+	if s == nil || s.workspaces == nil || s.apps == nil || prepare == nil {
 		return ErrInvalidScope
 	}
 	if requireActor {
@@ -107,7 +130,7 @@ func (s *Store) withLiveAudience(
 			audience[membership.Participant] = struct{}{}
 		}
 	}
-	if err := deliver(audience); err != nil {
+	if err := prepare(tx, audience); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

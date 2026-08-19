@@ -85,6 +85,118 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return NotificationSetting{}, err
 	}
+	if _, err := s.lockNotificationSettingInTx(ctx, tx); err != nil {
+		return NotificationSetting{}, err
+	}
+	stored, err := s.replaceNotificationSettingInTx(ctx, tx, defaultLevel, perPlace, cleanKeywords)
+	if err != nil {
+		return NotificationSetting{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return NotificationSetting{}, fmt.Errorf("commit scoped notification setting: %w", err)
+	}
+	return stored, nil
+}
+
+// UpdateNotificationSetting applies only the supplied fields. The setting row
+// is locked before its current values are read, so a local-control patch never
+// loses another request's simultaneous change to an unnamed field.
+func (s *ScopedStore) UpdateNotificationSetting(
+	ctx context.Context, defaultLevel *string, perPlace *[]PlaceNotifyLevel, keywords *[]string,
+) (NotificationSetting, error) {
+	if defaultLevel == nil && perPlace == nil && keywords == nil {
+		return s.NotificationSettingFor(ctx)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return NotificationSetting{}, fmt.Errorf("begin update scoped notification setting: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+		return NotificationSetting{}, err
+	}
+	current, err := s.lockNotificationSettingInTx(ctx, tx)
+	if err != nil {
+		return NotificationSetting{}, err
+	}
+	if defaultLevel != nil {
+		current.DefaultLevel = *defaultLevel
+	}
+	if perPlace != nil {
+		current.PerPlace = *perPlace
+	}
+	if keywords != nil {
+		current.Keywords = *keywords
+	}
+	if current.DefaultLevel == "" {
+		current.DefaultLevel = DefaultNotifyLevel
+	}
+	if err := ValidateNotifyLevel(current.DefaultLevel); err != nil {
+		return NotificationSetting{}, err
+	}
+	cleanKeywords, err := normalizeKeywords(current.Keywords)
+	if err != nil {
+		return NotificationSetting{}, err
+	}
+	stored, err := s.replaceNotificationSettingInTx(
+		ctx, tx, current.DefaultLevel, current.PerPlace, cleanKeywords)
+	if err != nil {
+		return NotificationSetting{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return NotificationSetting{}, fmt.Errorf("commit update scoped notification setting: %w", err)
+	}
+	return stored, nil
+}
+
+// lockNotificationSettingInTx establishes a parent row for this actor and
+// locks it before either a full replacement or a partial update touches the
+// child per-place rows. The no-op conflict update is the row-lock primitive;
+// rollback removes a newly inserted default row when later validation fails.
+func (s *ScopedStore) lockNotificationSettingInTx(ctx context.Context, tx pgx.Tx) (NotificationSetting, error) {
+	setting := NotificationSetting{Owner: s.Scope.Actor, Keywords: []string{}}
+	var keywords []string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO notification_settings
+			(workspace_id, member_kind, member_id, defaults_level, keywords)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (workspace_id, member_kind, member_id)
+		DO UPDATE SET defaults_level = notification_settings.defaults_level
+		RETURNING defaults_level, keywords`,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, DefaultNotifyLevel, []string{}).
+		Scan(&setting.DefaultLevel, &keywords)
+	if err != nil {
+		return NotificationSetting{}, fmt.Errorf("lock scoped notification setting: %w", err)
+	}
+	if keywords != nil {
+		setting.Keywords = keywords
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT nsp.place_id, p.kind, nsp.level
+		FROM notification_setting_places nsp
+		JOIN places p ON p.workspace_id = nsp.workspace_id AND p.place_id = nsp.place_id
+		WHERE nsp.workspace_id = $1 AND nsp.member_kind = $2 AND nsp.member_id = $3
+		ORDER BY nsp.place_id`, s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID)
+	if err != nil {
+		return NotificationSetting{}, fmt.Errorf("query locked notification places: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var entry PlaceNotifyLevel
+		if err := rows.Scan(&entry.PlaceID, &entry.PlaceKind, &entry.Level); err != nil {
+			return NotificationSetting{}, fmt.Errorf("scan locked notification place: %w", err)
+		}
+		setting.PerPlace = append(setting.PerPlace, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return NotificationSetting{}, fmt.Errorf("iterate locked notification places: %w", err)
+	}
+	return setting, nil
+}
+
+func (s *ScopedStore) replaceNotificationSettingInTx(
+	ctx context.Context, tx pgx.Tx, defaultLevel string, perPlace []PlaceNotifyLevel, cleanKeywords []string,
+) (NotificationSetting, error) {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO notification_settings
 			(workspace_id, member_kind, member_id, defaults_level, keywords)
@@ -126,9 +238,6 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 			return NotificationSetting{}, fmt.Errorf("insert scoped notification place: %w", err)
 		}
 		stored.PerPlace = append(stored.PerPlace, PlaceNotifyLevel{PlaceID: entry.PlaceID, PlaceKind: place.Kind, Level: entry.Level})
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return NotificationSetting{}, fmt.Errorf("commit scoped notification setting: %w", err)
 	}
 	return stored, nil
 }

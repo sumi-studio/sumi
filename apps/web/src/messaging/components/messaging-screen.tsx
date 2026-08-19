@@ -23,6 +23,7 @@ import {
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
+import { enablePushSubscription } from "../push";
 import {
   getMessagingScope,
   setNotificationNavigator,
@@ -36,6 +37,7 @@ import { MessageList, type MessageListHandle } from "./message-list";
 import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
+import { PushSubscriptionBridge } from "./push-bridge";
 import { Sidebar } from "./sidebar";
 
 interface PendingJump {
@@ -198,7 +200,12 @@ function NotificationPermissionBanner() {
       <button
         type="button"
         onClick={() => {
-          void requestNotificationPermission().then(setPermission);
+          void requestNotificationPermission().then((next) => {
+            setPermission(next);
+            // 許可されたその場で端末を購読済みにする。ここで待たせると、
+            // 「許可したのに閉じている間は届かない」時間が生まれる。
+            if (next === "granted") void enablePushSubscription();
+          });
         }}
         className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
       >
@@ -571,6 +578,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
           開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
       <div className="flex min-w-0 flex-1 flex-col">
+        <PushSubscriptionBridge />
         <NotificationPermissionBanner />
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
           {display?.kind === "channel" ? (

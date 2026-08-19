@@ -274,6 +274,90 @@ pub enum DirectChatSurface {
     DirectChat,
 }
 
+/// Frozen, surface-neutral admission metadata carried by an AttentionCandidate.
+/// This is intentionally separate from the still-direct-chat-only command
+/// envelope while the provisional attention control route is in use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundProvenanceV1 {
+    pub version: u8,
+    pub tenant_id: String,
+    pub personality_agent_id: PersonalityAgentId,
+    pub actor: InboundActorRef,
+    pub source: InboundSource,
+    pub authority: InboundAuthority,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InboundActorRef {
+    Human {
+        human_id: String,
+    },
+    PersonalityAgent {
+        personality_agent_id: PersonalityAgentId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "surface", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InboundSource {
+    Messaging {
+        workspace_id: String,
+        place: InboundPlaceRef,
+        delivery: InboundDeliveryProvenance,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InboundPlaceRef {
+    Channel { channel_id: String },
+    Dm { dm_id: String },
+    GroupDm { dm_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundDeliveryProvenance {
+    pub message_id: String,
+    pub seq: u64,
+    pub addressees: Vec<InboundActorRef>,
+    pub trigger_reason: InboundTriggerReason,
+    pub urgency: InboundUrgency,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundTriggerReason {
+    Mention,
+    DirectMessage,
+    PlaceActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundUrgency {
+    Urgent,
+    Normal,
+    Fyi,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundAuthority {
+    pub basis: InboundAuthorityBasis,
+    pub decision_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundAuthorityBasis {
+    PlaceMembership,
+}
+
 fn validate_provenance_identity(
     value: String,
     kind: &'static str,
@@ -581,6 +665,21 @@ mod tests {
     use super::*;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+
+    #[test]
+    fn frozen_attention_candidate_fixture_carries_inbound_provenance() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let raw =
+            std::fs::read_to_string(manifest.join("../../contracts/agent-events-fixtures.json"))
+                .expect("read contract fixtures");
+        let fixtures: serde_json::Value = serde_json::from_str(&raw).expect("parse fixtures");
+        let candidate = &fixtures["attention_candidate"]["wire"];
+        let provenance: InboundProvenanceV1 =
+            serde_json::from_value(candidate["provenance"].clone())
+                .expect("decode frozen inbound provenance");
+        assert_eq!(provenance.version, 1);
+        assert!(matches!(provenance.source, InboundSource::Messaging { .. }));
+    }
 
     #[test]
     fn personality_agent_id_accepts_only_exact_canonical_rfc_uuid_v7() {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +30,13 @@ const (
 	// uses for a Human. This adapter route does not itself define which agent
 	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
+	// LocalSearchPath is the agent's copy of the human search box, through the
+	// identical store path. 探すことが UI にしか無いと、agent は「見えている
+	// ものしか思い出せない」人になる。
+	LocalSearchPath = "/local-control/v1/messaging:search"
+	// LocalAttentionPath hands the agent its own unconsumed AttentionCandidates
+	// and, in the same call, lets it ack what it has already taken in.
+	LocalAttentionPath = "/local-control/v1/messaging:attention"
 	// LocalUploadAttachmentPattern is the PAID-local raw-body upload route. The
 	// exact Messaging scope travels in headers because the body is the file.
 	LocalUploadAttachmentPattern = "/local-control/v1/messaging/places/{place_id}/attachments"
@@ -76,6 +84,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
+		{"POST " + LocalSearchPath, s.localSearch},
+		{"POST " + LocalAttentionPath, s.localAttention},
 		{"POST " + LocalAttachmentPath, s.localAttachment},
 	}
 	if s.Calls != nil {
@@ -516,37 +526,31 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	current, err := store.NotificationSettingFor(r.Context())
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	if request.DefaultsLevel == nil && request.PerPlace == nil && request.Keywords == nil {
+		current, err := store.NotificationSettingFor(r.Context())
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, struct {
 			Setting notificationSettingWire `json:"setting"`
 		}{notificationSettingToWire(current)})
 		return
 	}
-	defaultLevel := current.Default()
-	if request.DefaultsLevel != nil {
-		defaultLevel = *request.DefaultsLevel
-	}
-	perPlace := current.PerPlace
+	var perPlace *[]PlaceNotifyLevel
 	if request.PerPlace != nil {
-		perPlace = make([]PlaceNotifyLevel, 0, len(*request.PerPlace))
+		converted := make([]PlaceNotifyLevel, 0, len(*request.PerPlace))
 		for _, entry := range *request.PerPlace {
 			if entry.PlaceID == "" {
 				writeError(w, http.StatusBadRequest, "invalid_request")
 				return
 			}
-			perPlace = append(perPlace, PlaceNotifyLevel{PlaceID: entry.PlaceID, Level: entry.Level})
+			converted = append(converted, PlaceNotifyLevel{PlaceID: entry.PlaceID, Level: entry.Level})
 		}
+		perPlace = &converted
 	}
-	keywords := current.Keywords
-	if request.Keywords != nil {
-		keywords = *request.Keywords
-	}
-	stored, err := store.SetNotificationSetting(r.Context(), defaultLevel, perPlace, keywords)
+	stored, err := store.UpdateNotificationSetting(
+		r.Context(), request.DefaultsLevel, perPlace, request.Keywords)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -554,6 +558,202 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
+}
+
+// localSearch is the agent's copy of the human search box, through the
+// identical store path (SearchMessages)。可視性は store が決めるので、agent が
+// 見られない place の発言は結果に現れず、見られない place を名指しした検索は
+// 「無い」と答える——人間の UI と同じ答え方である。
+func (s *Server) localSearch(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Query   string `json:"query"`
+		PlaceID string `json:"place_id,omitempty"`
+		Limit   int    `json:"limit,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	query := strings.TrimSpace(request.Query)
+	if query == "" || len(query) > MaxSearchQueryBytes || request.Limit < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	results, err := store.SearchMessages(r.Context(), query,
+		SearchOptions{PlaceID: request.PlaceID, Limit: request.Limit})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]searchResultWire, len(results))
+	for i, result := range results {
+		wires[i] = searchResultWire{
+			MessageID: result.Message.MessageID,
+			Place:     placeToWire(result.Place),
+			Seq:       result.Message.Seq,
+			Author:    participantToWire(result.Message.Author),
+			Snippet:   result.Snippet,
+			CreatedAt: result.Message.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []searchResultWire `json:"results"`
+	}{wires})
+}
+
+// attentionCandidateWire is one queued「呼ばれた」. The frozen contract keeps
+// actor, place, message reference, reason, urgency, and authority together in
+// provenance; it only keeps the message body behind the later place-open
+// authorization boundary. Candidate-local fields must not duplicate provenance.
+type attentionCandidateWire struct {
+	Kind         string                          `json:"kind"`
+	CandidateID  string                          `json:"candidate_id"`
+	CandidateSeq int64                           `json:"candidate_seq"`
+	Provenance   agentevents.InboundProvenanceV1 `json:"provenance"`
+	UnreadRange  attentionUnreadRangeWire        `json:"unread_range"`
+	ArrivalTime  time.Time                       `json:"arrival_time"`
+	Attachments  map[string]any                  `json:"attachments"`
+}
+
+type attentionUnreadRangeWire struct {
+	PlaceSeqFrom int64 `json:"place_seq_from"`
+	PlaceSeqTo   int64 `json:"place_seq_to"`
+}
+
+func attentionCandidateToWire(candidate AttentionCandidate, tenantID, workspaceID, agentID string) (attentionCandidateWire, error) {
+	// The PAID-local authorization normally supplies the tenant. Messaging is a
+	// Workspace-owned surface, so older local-control leases without that claim
+	// still have one canonical tenancy boundary to record.
+	if tenantID == "" {
+		tenantID = workspaceID
+	}
+	actor := inboundActor(candidate.MessageAuthor)
+	addressee := inboundActor(PersonalityAgent(agentID))
+	workspace := workspaceID
+	provenance := agentevents.InboundProvenanceV1{
+		Version:            1,
+		TenantID:           tenantID,
+		PersonalityAgentID: agentID,
+		Actor:              actor,
+		Source: agentevents.InboundSource{
+			Surface:     "messaging",
+			WorkspaceID: &workspace,
+			Place:       inboundPlace(candidate.PlaceID, candidate.PlaceKind),
+			Delivery: &agentevents.InboundDeliveryProvenance{
+				MessageID:     candidate.MessageID,
+				Seq:           candidate.MessageSeq,
+				Addressees:    []agentevents.InboundActorRef{addressee},
+				TriggerReason: attentionTriggerReason(candidate.Reason),
+				Urgency:       candidate.MessageUrgency,
+				CorrelationID: nil,
+				CausationID:   nil,
+			},
+		},
+		Authority: agentevents.AdmissionAuthority{Basis: "place_membership", DecisionID: nil},
+	}
+	if err := provenance.Validate(); err != nil {
+		return attentionCandidateWire{}, err
+	}
+	return attentionCandidateWire{
+		Kind:         "attention_candidate",
+		CandidateID:  candidate.CandidateID,
+		CandidateSeq: candidate.CandidateSeq,
+		Provenance:   provenance,
+		UnreadRange: attentionUnreadRangeWire{
+			PlaceSeqFrom: candidate.UnreadFrom,
+			PlaceSeqTo:   candidate.MessageSeq,
+		},
+		ArrivalTime: candidate.CreatedAt,
+		Attachments: map[string]any{},
+	}, nil
+}
+
+func inboundActor(participant ParticipantRef) agentevents.InboundActorRef {
+	if participant.Kind == KindHuman {
+		return agentevents.InboundActorRef{Kind: string(KindHuman), HumanID: participant.ID}
+	}
+	return agentevents.InboundActorRef{Kind: string(KindPersonalityAgent), PersonalityAgentID: participant.ID}
+}
+
+func inboundPlace(placeID, kind string) *agentevents.InboundPlaceRef {
+	if kind == PlaceChannel {
+		return &agentevents.InboundPlaceRef{Kind: kind, ChannelID: placeID}
+	}
+	return &agentevents.InboundPlaceRef{Kind: kind, DMID: placeID}
+}
+
+func attentionTriggerReason(reason string) string {
+	switch reason {
+	case NotifyReasonDM:
+		return "direct_message"
+	case NotifyReasonMention:
+		return "mention"
+	default:
+		// keyword and all are delivery-eligibility facts, but neither asserts a
+		// resolved address in this candidate; both are place activity.
+		return "place_activity"
+	}
+}
+
+// localAttention hands the agent its own unconsumed AttentionCandidates and, in
+// the same call, acks what a previous call already took in.
+//
+// **暫定配線である（ADR 0010 覚醒トリガ / issue #173）。** 本設計では候補の
+// 到着そのものが本人を起こす。ここには自動覚醒が無く、起きている本人が自分で
+// 取りに来る形にしてある。それでも「runtime が止まっていた間に呼ばれたこと」は
+// message と同じ transaction で shared 側に確定しているので、次に動いたときに
+// 必ず見つかる。
+//
+// consume_through は先に適用する：本人が「ここまで取り込んだ」と言ってから
+// 「次は何か」を聞く順である。
+//
+// candidates が非空なら latest_seq は**この応答に実際に載せた末尾**であり、それ
+// だけを次の consume_through に渡せる。過去の poll の高水位、limit で切れた残り、
+// 別 Workspace の配布は含まない。空なら latest_seq は既に consumed / superseded
+// の境界であって、未配布候補の高水位ではない。agent は自分が受け取った非空応答の
+// 末尾以外を consume_through に送らない。server は大き過ぎる cursor をこの
+// Workspace の直前応答の境界へ clamp するが、これは client の受領証明を代替しない。
+func (s *Server) localAttention(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		ConsumeThrough int64 `json:"consume_through,omitempty"`
+		Limit          int   `json:"limit,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.ConsumeThrough < 0 || request.Limit < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	inbox, err := store.PollAttentionCandidates(r.Context(), request.ConsumeThrough, request.Limit)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]attentionCandidateWire, len(inbox.Candidates))
+	for i, candidate := range inbox.Candidates {
+		wire, err := attentionCandidateToWire(candidate, authorization.TenantID,
+			store.Scope.WorkspaceID, store.Scope.Actor.ID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		wires[i] = wire
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Candidates []attentionCandidateWire `json:"candidates"`
+		Consumed   int64                    `json:"consumed"`
+		LatestSeq  int64                    `json:"latest_seq"`
+	}{wires, inbox.Consumed, inbox.LatestSeq})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

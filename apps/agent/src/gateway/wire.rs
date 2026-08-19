@@ -3210,6 +3210,9 @@ mod tests {
                 "api_hello" => round_trip_value::<ApiHello>(name, &wire),
                 "agent_event" => round_trip_value::<WireAgentEvent>(name, &wire),
                 "public_message" => round_trip_value::<WirePublicMessage>(name, &wire),
+                "attention_candidate" => round_trip_value::<
+                    crate::apiclient::messaging::MessagingAttentionCandidate,
+                >(name, &wire),
                 // These frames terminate at the API/browser boundary and are
                 // validated by the Go gateway and generated TypeScript client.
                 // The Rust agent never sends or receives them, so naming each
