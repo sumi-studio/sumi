@@ -2912,6 +2912,135 @@ fn supervisor_rejects_noncanonical_paid_before_touching_docker() {
 }
 
 #[test]
+fn reconcile_keeps_active_epoch_when_prepare_one_shots_remain() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("reconcile-orphan-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    let script = r#"#!/bin/bash
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version")
+    exit 0
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'cccccccccccc\tbroker\trunning\n'
+    printf 'dddddddddddd\tallocator\texited\n'
+    printf 'eeeeeeeeeeee\tprepare\texited\n'
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml down --remove-orphans"*)
+    touch "$SUMI_FAKE_REAPED"
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    exit 0
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    exit 0
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+"#;
+    std::fs::write(&fake_docker, script).unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = root.join("docker.log");
+    let reaped = root.join("reaped");
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut command = fixture.supervisor_command();
+    command
+        .arg("reconcile")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_DOCKER_LOG", &log)
+        .env("SUMI_FAKE_REAPED", &reaped);
+    launch_runtime_env(&mut command, &fixture);
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "reconcile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !reaped.exists(),
+        "reconcile reaped a healthy active epoch because completed setup roles remained: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(r#""phase":"active","generation":7"#),
+        "reconcile did not preserve the active epoch: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !calls.contains("compose.lifecycle.yaml down --remove-orphans"),
+        "active epoch unexpectedly entered destructive reconciliation: {calls}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn inspect_epoch_returns_recovery_when_any_long_lived_role_is_missing() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("inspect-missing-role-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    let script = r#"#!/bin/bash
+case "$*" in
+  "compose version")
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'dddddddddddd\tallocator\texited\n'
+    printf 'eeeeeeeeeeee\tprepare\texited\n'
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+"#;
+    std::fs::write(&fake_docker, script).unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut command = fixture.supervisor_command();
+    command
+        .arg("inspect-epoch")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()));
+    launch_runtime_env(&mut command, &fixture);
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(r#""phase":"recovery","generation":7"#),
+        "a missing long-lived role was reported as active: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;
@@ -2922,7 +3051,7 @@ fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3023,7 +3152,7 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3420,6 +3549,14 @@ case "$*" in
     fi
     exit 88
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'aaaaaaaaaaaa\t%s\texited\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.lifecycle.yaml ps --all --quiet")
     printf '%s %s\n' "$SUMI_CLEANUP_SENTINEL" "$SUMI_PROVIDER_API_KEY" >&2
     for role in allocator prepare runtime executor broker; do
@@ -3513,10 +3650,10 @@ esac
         assert_eq!(
             calls
                 .lines()
-                .filter(|line| line.contains("compose.lifecycle.yaml ps --all --quiet"))
+                .filter(|line| line.contains("ps --all --filter label=com.docker.compose.project="))
                 .count(),
             cleanup_attempts,
-            "unexpected {mode} verification attempts: {calls}"
+            "unexpected {mode} long-lived epoch checks: {calls}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4363,6 +4500,28 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
         let output = activate
             .output()
             .expect("activate owned Docker/AppArmor acceptance");
+        let mut inspect = Command::new("timeout");
+        inspect
+            .args(["--preserve-status", "60s"])
+            .arg(&supervisor)
+            .arg("inspect-epoch");
+        launch_owned_acceptance_env(&mut inspect, &fixture);
+        let inspect = inspect
+            .output()
+            .expect("inspect activated Docker/AppArmor epoch");
+        let setup_container_ids = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "ps".into(),
+                "--all".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("label=com.docker.compose.project={}", fixture.project),
+                "--filter".into(),
+                "label=com.docker.compose.service=allocator".into(),
+            ],
+        );
         let runtime_id = bounded_docker_output(
             deploy_dir().parent().unwrap().parent().unwrap(),
             30,
@@ -4429,6 +4588,24 @@ done
             output.status.success(),
             "real deployment failed: {}",
             supervisor_failure(&output)
+        );
+        assert!(
+            inspect.status.success(),
+            "inspect after real prepare -> activate failed: {}",
+            supervisor_failure(&inspect)
+        );
+        let inspected_epoch: JsonValue =
+            serde_json::from_slice(&inspect.stdout).expect("active epoch JSON");
+        assert_eq!(inspected_epoch["phase"].as_str(), Some("active"));
+        assert_eq!(inspected_epoch["generation"].as_u64(), Some(generation));
+        assert_eq!(inspected_epoch["rpc_boot_nonce"].as_str(), Some(nonce));
+        assert!(
+            setup_container_ids.status.success()
+                && !String::from_utf8_lossy(&setup_container_ids.stdout)
+                    .trim()
+                    .is_empty(),
+            "prepare's completed allocator container did not remain for the active-epoch assertion: {}",
+            String::from_utf8_lossy(&setup_container_ids.stderr)
         );
         assert!(
             runtime_id.status.success() && !runtime_id_text.is_empty(),

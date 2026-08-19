@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 		"prepare":       `{"personality_agent_id":"` + testPAID + `","phase":"prepared","generation":7,"rpc_boot_nonce":"boot-7"}`,
 		"inspect-epoch": `{"personality_agent_id":"` + testPAID + `","phase":"prepared","generation":7,"rpc_boot_nonce":"boot-7"}`,
 		"reconcile":     `{"personality_agent_id":"` + testPAID + `","phase":"active","generation":7,"rpc_boot_nonce":"boot-7"}`,
+		"stop-epoch":    `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":7}`,
 	}}
 	backend := &DockerBackend{supervisor: "/fake/supervisor", baseEnvironment: []string{"PATH=/usr/bin"}, runner: runner}
 	epoch, err := backend.Prepare(context.Background(), PrepareRequest{PersonalityAgentID: testPAID})
@@ -51,15 +53,22 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 	if err != nil || inspection.Epoch == nil || inspection.Epoch.OpaquePreparedHandle != epoch.OpaquePreparedHandle {
 		t.Fatalf("inspect did not reconstruct the coherent handle: %#v %v", inspection, err)
 	}
+	activation := testActivationConfig()
+	activation.ReapAttestation = &ReapAttestation{
+		PersonalityAgentID:      testPAID,
+		EpochGeneration:         7,
+		RPCBootNonce:            "boot-7",
+		ReapedThroughGeneration: 6,
+	}
 	activate := ActivateRequest{
 		Version:       ProtocolVersion,
 		PreparedEpoch: epoch,
-		Activation:    testActivationConfig(),
+		Activation:    activation,
 	}
 	if err := backend.Activate(context.Background(), activate); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Stop(context.Background(), epoch); err != nil {
+	if _, err := backend.Stop(context.Background(), epoch); err != nil {
 		t.Fatal(err)
 	}
 	if len(runner.actions) != 4 || runner.actions[0] != "prepare" || runner.actions[1] != "inspect-epoch" || runner.actions[2] != "activate" || runner.actions[3] != "stop-epoch" {
@@ -77,6 +86,10 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 		"SUMI_ESCALATION_REVIEWER_API_KEY=escalation-reviewer-key",
 		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET=glm-5.2",
 		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV=SUMI_ESCALATION_REVIEWER_API_KEY",
+		"SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_REAP_ATTESTATION_EPOCH_GENERATION=7",
+		"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE=boot-7",
+		"SUMI_REAPED_THROUGH_GENERATION=6",
 	} {
 		if !strings.Contains(joinedEnvironment, expected) {
 			t.Fatalf("activation environment omitted %s: %s", expected, joinedEnvironment)
@@ -86,6 +99,52 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 	for _, expected := range []string{"SUMI_EXPECTED_RPC_GENERATION=7", "SUMI_EXPECTED_RPC_NONCE=boot-7"} {
 		if !strings.Contains(stopEnvironment, expected) {
 			t.Fatalf("exact stop environment omitted %s: %s", expected, stopEnvironment)
+		}
+	}
+}
+
+func TestDockerBackendRejectsTeardownWithoutExactObservedEmptyReceipt(t *testing.T) {
+	epoch := PreparedEpoch{PersonalityAgentID: testPAID, Generation: 7, RPCBootNonce: "boot-7", OpaquePreparedHandle: "handle"}
+	for name, output := range map[string]string{
+		"missing": `{"personality_agent_id":"` + testPAID + `","phase":"unknown"}`,
+		"lower":   `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":6}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &recordingRunner{outputs: map[string]string{"stop-epoch": output}}
+			backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}
+			if _, err := backend.Stop(context.Background(), epoch); err == nil || !strings.Contains(err.Error(), "exact observed-empty") {
+				t.Fatalf("invalid teardown output accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDockerBackendReconcileReturnsObservedEmptyReceipt(t *testing.T) {
+	runner := &recordingRunner{outputs: map[string]string{
+		"reconcile": `{"personality_agent_id":"` + testPAID + `","phase":"unknown","reaped_through_generation":7}`,
+	}}
+	backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}
+	fenced := PreparedEpoch{
+		PersonalityAgentID:   testPAID,
+		Generation:           7,
+		RPCBootNonce:         "boot-7",
+		OpaquePreparedHandle: dockerPreparedHandle(testPAID, 7, "boot-7"),
+	}
+	inspection, err := backend.Reconcile(context.Background(), ReconcileRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, FencedEpoch: &fenced,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.ReapedThroughGeneration == nil || *inspection.ReapedThroughGeneration != 7 {
+		t.Fatalf("reconcile lost the supervisor's observed-empty receipt: %#v", inspection)
+	}
+	for _, expected := range []string{
+		"SUMI_EXPECTED_RPC_GENERATION=7",
+		"SUMI_EXPECTED_RPC_NONCE=boot-7",
+	} {
+		if !strings.Contains(strings.Join(runner.envs[0], "\n"), expected) {
+			t.Fatalf("fenced reconcile did not pin %q: %#v", expected, runner.envs[0])
 		}
 	}
 }
@@ -122,6 +181,20 @@ func TestDockerBackendRejectsAuthorityEnvironmentOverridesAndRedactsFailure(t *t
 	}
 }
 
+func TestSanitizeSupervisorErrorRedactsReapAttestationNonce(t *testing.T) {
+	const nonce = "reap-attestation-rpc-boot-nonce"
+	diagnostic := sanitizeSupervisorError(
+		"compose activation failed with SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE="+nonce,
+		[]string{"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE=" + nonce},
+	)
+	if strings.Contains(diagnostic, nonce) {
+		t.Fatalf("reap attestation nonce leaked in diagnostic: %s", diagnostic)
+	}
+	if !strings.Contains(diagnostic, "<redacted:SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE>") {
+		t.Fatalf("reap attestation nonce was not marked redacted: %s", diagnostic)
+	}
+}
+
 func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 	_, err := parseSupervisorInspection([]byte(`{"personality_agent_id":"`+testPAID+`","phase":"unknown"} trailing`), testPAID)
 	if err == nil {
@@ -130,16 +203,30 @@ func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 }
 
 func TestExecCommandRunnerCancelsThroughSupervisorTermTrap(t *testing.T) {
+	// The runner signals the whole process group, so anything this script waits
+	// on in that same group receives SIGTERM at the same moment the shell does.
+	// A same-group `sleep` therefore races the shell's own trap and makes the
+	// assertion below intermittent. Park the blocker in its own session so only
+	// the shell is signalled and the trap is the one thing under test; the trap
+	// reaps it so no detached process outlives the case.
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Fatalf("setsid is required to isolate the blocker from the signalled group: %v", err)
+	}
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
 	termPath := filepath.Join(dir, "term")
+	script := `trap 'printf term >"$TERM_PATH"; kill "$blocker" 2>/dev/null; exit 143' TERM
+setsid sleep 30 &
+blocker=$!
+printf ready >"$READY_PATH"
+wait "$blocker"`
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
 		_, err := (execCommandRunner{terminationGrace: time.Second, pipeWait: 100 * time.Millisecond}).Run(
 			ctx,
 			"/bin/sh",
-			[]string{"-c", `trap 'printf term >"$TERM_PATH"; exit 143' TERM; printf ready >"$READY_PATH"; while :; do sleep 1; done`},
+			[]string{"-c", script},
 			[]string{"PATH=/usr/bin:/bin", "READY_PATH=" + readyPath, "TERM_PATH=" + termPath},
 		)
 		result <- err

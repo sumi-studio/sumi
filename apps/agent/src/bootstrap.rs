@@ -65,7 +65,8 @@ use crate::{
     runtime::{allocator::SupervisorAllocation, authority::RuntimeEpochAuthority},
     store::{
         AgentScope, EnvironmentKeyProvider, HydratedRunState, HydrationOutcome,
-        LogicalRecoveryExecutor as StoreLogicalRecoveryExecutor, RecoveryStep, Redactor, Store,
+        LogicalRecoveryExecutor as StoreLogicalRecoveryExecutor, PhysicalReapAttestation,
+        RecoveryStep, Redactor, Store, SuffixRecovery,
     },
     tools::{
         Tool, WorkspacePaths,
@@ -94,6 +95,7 @@ struct BootstrapContext {
     local_control_bearer: Zeroizing<String>,
     local_control_bearer_expires_at: SystemTime,
     wrapping_key_id: String,
+    reap_attestation: Option<PhysicalReapAttestation>,
     executor_call_authority_private_key: Option<Zeroizing<[u8; 32]>>,
 }
 
@@ -124,6 +126,13 @@ impl BootstrapContext {
             lease_id,
             fence_id,
         )?;
+        let authority = allocation.into_authority();
+        let reap_attestation = optional_reap_attestation(&mut get)?;
+        if let Some(attestation) = &reap_attestation {
+            attestation
+                .validate_for(&authority)
+                .context("activation reap attestation binding is invalid")?;
+        }
 
         let state_dir = required_absolute_path(&mut get, "SUMI_STATE_DIR")?;
         let executor_socket = required_absolute_path(&mut get, "SUMI_EXECUTOR_SOCKET")?;
@@ -161,7 +170,7 @@ impl BootstrapContext {
         }
 
         Ok(Self {
-            authority: allocation.into_authority(),
+            authority,
             state_dir,
             executor_socket,
             executor_server_uid,
@@ -171,8 +180,47 @@ impl BootstrapContext {
             local_control_bearer: Zeroizing::new(local_control_bearer),
             local_control_bearer_expires_at,
             wrapping_key_id,
+            reap_attestation,
             executor_call_authority_private_key: Some(executor_call_authority_private_key),
         })
+    }
+}
+
+fn optional_reap_attestation(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<PhysicalReapAttestation>> {
+    let personality_agent_id = optional_value(get, "SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID")?;
+    let epoch_generation = optional_value(get, "SUMI_REAP_ATTESTATION_EPOCH_GENERATION")?;
+    let rpc_boot_nonce = optional_value(get, "SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE")?;
+    let reaped_through_generation = optional_value(get, "SUMI_REAPED_THROUGH_GENERATION")?;
+    match (
+        personality_agent_id,
+        epoch_generation,
+        rpc_boot_nonce,
+        reaped_through_generation,
+    ) {
+        (None, None, None, None) => Ok(None),
+        (
+            Some(personality_agent_id),
+            Some(epoch_generation),
+            Some(rpc_boot_nonce),
+            Some(reaped),
+        ) => {
+            let epoch_generation = epoch_generation
+                .parse::<u64>()
+                .context("SUMI_REAP_ATTESTATION_EPOCH_GENERATION must be a base-10 integer")?;
+            let reaped = reaped
+                .parse::<u64>()
+                .context("SUMI_REAPED_THROUGH_GENERATION must be a base-10 integer")?;
+            PhysicalReapAttestation::from_wire(
+                &personality_agent_id,
+                epoch_generation,
+                rpc_boot_nonce,
+                reaped,
+            )
+            .map(Some)
+        }
+        _ => bail!("activation reap attestation must provide all four bound fields or none"),
     }
 }
 
@@ -347,9 +395,11 @@ impl LogicalRecoveryExecutor for LogicalRecoveryExecutorUnavailable {
 async fn hydrate_to_fixed_point(
     store: &Store,
     authority: &RuntimeEpochAuthority,
+    reap_attestation: Option<&PhysicalReapAttestation>,
     recovery: &dyn LogicalRecoveryExecutor,
 ) -> Result<HydratedRunState> {
     let mut previous_plan = None;
+    let mut previous_physical_intents = None;
     loop {
         match store
             .hydrate(authority.lease(), authority.fence())
@@ -358,10 +408,48 @@ async fn hydrate_to_fixed_point(
         {
             HydrationOutcome::Complete(hydrated) => return Ok(hydrated),
             HydrationOutcome::PhysicalRecoveryRequired(intents) => {
-                bail!(
-                    "physical recovery is required for {} execution(s); runtime remains NotReady",
-                    intents.len()
+                if intents.is_empty() {
+                    bail!("hydration returned an empty PhysicalRecoveryRequired intent set");
+                }
+                if previous_physical_intents.as_ref() == Some(&intents) {
+                    bail!(
+                        "boot physical recovery returned success without advancing the authenticated intent set"
+                    );
+                }
+                let Some(reap_attestation) = reap_attestation else {
+                    bail!(
+                        "physical recovery is required for {} execution(s); runtime remains NotReady",
+                        intents.len()
+                    );
+                };
+                reap_attestation
+                    .validate_for(authority)
+                    .context("reject mismatched boot reap attestation")?;
+                if intents
+                    .iter()
+                    .any(|intent| !reap_attestation.covers(intent.executor_generation))
+                {
+                    bail!(
+                        "physical recovery is required for {} execution(s); runtime remains NotReady",
+                        intents.len()
+                    );
+                }
+
+                // The authenticated activation claim records the control
+                // plane's host-observed empty-project teardown. That proves
+                // only that execution cannot still be live; it cannot prove
+                // whether the external effect happened, so every terminal is
+                // `indeterminate`, never success or failure.
+                previous_physical_intents = Some(intents.clone());
+                SuffixRecovery::apply_boot_physical_receipt(
+                    store,
+                    authority.lease(),
+                    authority.fence(),
+                    reap_attestation,
+                    &intents,
                 )
+                .await
+                .context("apply fenced boot physical recovery receipt")?;
             }
             HydrationOutcome::LogicalRecoveryRequired { steps } => {
                 if steps.is_empty() {
@@ -380,6 +468,21 @@ async fn hydrate_to_fixed_point(
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn hydrate_store_to_fixed_point_for_test(
+    store: &Store,
+    authority: &RuntimeEpochAuthority,
+    reap_attestation: Option<&PhysicalReapAttestation>,
+) -> Result<HydratedRunState> {
+    hydrate_to_fixed_point(
+        store,
+        authority,
+        reap_attestation,
+        &StoreLogicalRecoveryExecutor,
+    )
+    .await
 }
 
 const EXECUTOR_STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1062,6 +1165,7 @@ async fn run_after_not_ready(
         let hydrated = hydrate_to_fixed_point(
             store.as_ref(),
             &context.authority,
+            context.reap_attestation.as_ref(),
             &StoreLogicalRecoveryExecutor,
         )
         .await?;
@@ -2155,7 +2259,11 @@ mod tests {
     use crate::gateway::stdio::InjectedStdioGateway;
     use crate::provider::ModelSpec;
     use crate::runtime::contracts::RpcIdentity;
-    use crate::store::HydrationReceiptIdentity;
+    use crate::store::{
+        ApplyReceiptOutcome, EventBatch, HydrationReceiptIdentity, assert_indeterminate_surface,
+        open_boot_running_tools_store, setup_boot_running_tools,
+        setup_boot_running_tools_on_disk, setup_boot_running_tools_with_rowless_tail,
+    };
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
 
@@ -2262,6 +2370,40 @@ mod tests {
 
     fn parse(map: &HashMap<String, OsString>) -> Result<BootstrapContext> {
         BootstrapContext::from_source(|name| map.get(name).cloned())
+    }
+
+    fn authority_for_generation(generation: u64) -> RuntimeEpochAuthority {
+        let mut env = valid_env();
+        env.insert(
+            "SUMI_RPC_GENERATION".to_owned(),
+            generation.to_string().into(),
+        );
+        env.insert(
+            "SUMI_RPC_NONCE".to_owned(),
+            format!("boot-{generation}").into(),
+        );
+        env.insert(
+            "SUMI_PROCESS_GENERATION_LEASE_ID".to_owned(),
+            format!("lease-{generation}").into(),
+        );
+        env.insert(
+            "SUMI_GENERATION_RECOVERY_FENCE_ID".to_owned(),
+            format!("fence-{generation}").into(),
+        );
+        parse(&env).expect("boot generation authority").authority
+    }
+
+    fn reap_attestation_for(
+        authority: &RuntimeEpochAuthority,
+        reaped_through_generation: u64,
+    ) -> PhysicalReapAttestation {
+        PhysicalReapAttestation::from_wire(
+            authority.personality_agent_id().as_str(),
+            authority.generation().as_u64(),
+            authority.nonce().as_str().to_owned(),
+            reaped_through_generation,
+        )
+        .expect("test reap attestation")
     }
 
     fn startup_probe_worker(identity: RpcIdentity) -> Arc<dyn RunWorker> {
@@ -2628,6 +2770,65 @@ mod tests {
         assert_eq!(context.authority.generation().as_u64(), 7);
         assert_eq!(context.authority.nonce().as_str(), "boot-a");
         assert!(!context.allow_insecure_loopback_gateway);
+        assert!(context.reap_attestation.is_none());
+    }
+
+    #[test]
+    fn activation_reap_attestation_is_all_or_none_and_epoch_bound() {
+        let mut matching = valid_env();
+        matching.extend([
+            (
+                "SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID".to_owned(),
+                PAID.into(),
+            ),
+            (
+                "SUMI_REAP_ATTESTATION_EPOCH_GENERATION".to_owned(),
+                "7".into(),
+            ),
+            (
+                "SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE".to_owned(),
+                "boot-a".into(),
+            ),
+            ("SUMI_REAPED_THROUGH_GENERATION".to_owned(), "6".into()),
+        ]);
+        let context = parse(&matching).expect("matching activation reap attestation");
+        assert_eq!(
+            context
+                .reap_attestation
+                .expect("parsed reap attestation")
+                .reaped_through_generation
+                .as_u64(),
+            6
+        );
+
+        let mut partial = valid_env();
+        partial.insert("SUMI_REAPED_THROUGH_GENERATION".to_owned(), "6".into());
+        assert!(
+            format!(
+                "{:#}",
+                parse(&partial).err().expect("partial claim must fail")
+            )
+            .contains("all four bound fields")
+        );
+
+        for (name, value) in [
+            (
+                "SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID",
+                "0198f0f4-9b72-7000-8000-000000000002",
+            ),
+            ("SUMI_REAP_ATTESTATION_EPOCH_GENERATION", "8"),
+            ("SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE", "other-boot"),
+        ] {
+            let mut mismatched = matching.clone();
+            mismatched.insert(name.to_owned(), value.into());
+            let error = parse(&mismatched)
+                .err()
+                .expect("mismatched claim must fail");
+            assert!(
+                format!("{error:#}").contains("not bound to this PersonalityAgent runtime epoch"),
+                "{name}: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -2888,6 +3089,380 @@ mod tests {
             .expect_err("bootstrap must not invent approval cancellation events");
         assert!(error.to_string().contains("LogicalRecoveryExecutor"));
         assert!(error.to_string().contains("1 ordered step"));
+    }
+
+    #[tokio::test]
+    async fn boot_reaps_older_running_execution_only_with_matching_attestation() {
+        let (store, _writer) = setup_boot_running_tools(&[("tool-boot-old", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+
+        let hydrated =
+            hydrate_store_to_fixed_point_for_test(&store, &authority, Some(&attestation))
+                .await
+                .expect("older physical intent reaches a hydrated fixed point");
+        assert_eq!(
+            hydrated.resume,
+            crate::store::ResumeDirective::AdmitCommands
+        );
+        assert_indeterminate_surface(&store, "tool-boot-old").await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count physical receipts"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM physical_recovery_receipt_intents",)
+                .fetch_one(store.pool())
+                .await
+                .expect("count physical receipt intents"),
+            1
+        );
+        let stored: (String, i64, String, i64) = sqlx::query_as(
+            "SELECT personality_agent_id, epoch_generation, rpc_boot_nonce,
+                    reaped_through_generation
+             FROM physical_recovery_receipt_reap_attestations",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load durable reap attestation");
+        assert_eq!(stored, (PAID.to_owned(), 8, "boot-8".to_owned(), 7));
+    }
+
+    #[tokio::test]
+    async fn boot_without_reap_attestation_stays_not_ready() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-unattested", "read_file", 0)]).await;
+        let error =
+            hydrate_store_to_fixed_point_for_test(&store, &authority_for_generation(8), None)
+                .await
+                .expect_err("unattested physical intent must remain NotReady");
+        assert!(format!("{error:#}").contains("physical recovery is required for 1 execution"));
+    }
+
+    #[tokio::test]
+    async fn boot_attestation_below_intent_generation_stays_not_ready() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-too-new", "read_file", 0)]).await;
+        let authority = authority_for_generation(9);
+        let attestation = reap_attestation_for(&authority, 6);
+        let error = hydrate_store_to_fixed_point_for_test(&store, &authority, Some(&attestation))
+            .await
+            .expect_err("lower reap bound must remain NotReady");
+        assert!(format!("{error:#}").contains("physical recovery is required for 1 execution"));
+    }
+
+    #[tokio::test]
+    async fn boot_rejects_reap_attestation_bound_to_another_paid_or_epoch() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-wrong-binding", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+        let other_paid = PhysicalReapAttestation::from_wire(
+            "0198f0f4-9b72-7000-8000-000000000002",
+            8,
+            "boot-8".to_owned(),
+            7,
+        )
+        .expect("other-PAID attestation");
+        let error = hydrate_store_to_fixed_point_for_test(&store, &authority, Some(&other_paid))
+            .await
+            .expect_err("other PAID attestation must be rejected");
+        assert!(format!("{error:#}").contains("not bound to this PersonalityAgent runtime epoch"));
+
+        let other_epoch = PhysicalReapAttestation::from_wire(PAID, 9, "boot-9".to_owned(), 7)
+            .expect("other-epoch attestation");
+        let error = hydrate_store_to_fixed_point_for_test(&store, &authority, Some(&other_epoch))
+            .await
+            .expect_err("other epoch attestation must be rejected");
+        assert!(format!("{error:#}").contains("not bound to this PersonalityAgent runtime epoch"));
+    }
+
+    #[tokio::test]
+    async fn boot_covers_two_older_executions_with_one_receipt() {
+        let (store, _writer) = setup_boot_running_tools(&[
+            ("tool-boot-one", "read_file", 0),
+            ("tool-boot-two", "write_file", 1),
+        ])
+        .await;
+
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+        hydrate_store_to_fixed_point_for_test(&store, &authority, Some(&attestation))
+            .await
+            .expect("two older physical intents reach one hydrated fixed point");
+        assert_indeterminate_surface(&store, "tool-boot-one").await;
+        assert_indeterminate_surface(&store, "tool-boot-two").await;
+        let (receipts, intents): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT COUNT(*) FROM physical_recovery_receipt_intents)",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count grouped physical recovery ledger");
+        assert_eq!((receipts, intents), (1, 2));
+    }
+
+    /// The T17 contract is "全件なし／全件あり" across the receipt boundary
+    /// (`docs/agent/implementation-plan.md`). Applying the receipt therefore has
+    /// to carry the whole recovery its intent resolution makes necessary; the
+    /// `hydrate_to_fixed_point` loop may re-verify afterwards, but it must not
+    /// be where state required for correctness is created.
+    #[tokio::test]
+    async fn one_receipt_transaction_commits_the_logical_suffix_it_makes_necessary() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-atomic", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+        let intents = match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate the running boot fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("fixture must require physical recovery: {other:?}"),
+        };
+
+        // Stop here, exactly where a crash right after the receipt commit
+        // would: one transaction, and nothing from the fixed-point loop after
+        // it.
+        let (outcome, _receipt) = SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("apply the boot physical receipt");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+
+        assert_indeterminate_surface(&store, "tool-boot-atomic").await;
+        let observed: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'turn_end'),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'agent_end'),
+                (SELECT COUNT(*) FROM inbound_commands
+                 WHERE status = 'applied' AND run_phase = 'finished')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read the state one receipt transaction leaves behind");
+        assert_eq!(
+            observed,
+            (1, 1, 1, 1),
+            "the receipt transaction must carry the ledger, the terminal and the whole suffix"
+        );
+
+        match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("re-hydrate after the single receipt transaction")
+        {
+            HydrationOutcome::Complete(_) => {}
+            other => panic!("the suffix must already be durable, not planned again: {other:?}"),
+        }
+    }
+
+    /// A ToolCall that never reached policy preparation has no execution row, so
+    /// resolving the physical intents alone leaves the turn open. Its
+    /// pre-execution result belongs to the same receipt transaction.
+    #[tokio::test]
+    async fn one_receipt_transaction_also_closes_a_call_that_never_reached_the_executor() {
+        let (store, _writer) = setup_boot_running_tools_with_rowless_tail(
+            &[
+                ("tool-boot-ran", "read_file", 0),
+                ("tool-boot-rowless", "write_file", 1),
+            ],
+            1,
+        )
+        .await;
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+        let intents = match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate the partially prepared boot fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("fixture must require physical recovery: {other:?}"),
+        };
+        assert_eq!(intents.len(), 1);
+
+        let (outcome, _receipt) = SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("apply the boot physical receipt beside a rowless ToolCall");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+
+        assert_indeterminate_surface(&store, "tool-boot-ran").await;
+        let rowless: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'tool-boot-rowless'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("the co-committed suffix must close the rowless ToolCall");
+        assert_eq!(
+            (rowless.0.as_str(), rowless.1.as_deref()),
+            ("not_started", Some("process_restarted"))
+        );
+
+        match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("re-hydrate after the single receipt transaction")
+        {
+            HydrationOutcome::Complete(_) => {}
+            other => panic!("the suffix must already be durable, not planned again: {other:?}"),
+        }
+    }
+
+    /// The same property observed the way a restart observes it: the process
+    /// that applied the receipt is gone, and a freshly opened Store sees the
+    /// ledger, the `indeterminate` terminal and the whole suffix together.
+    #[tokio::test]
+    async fn a_restart_right_after_the_receipt_transaction_sees_the_whole_suffix() {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t27-receipt-suffix-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create the on-disk fixture root");
+        let database_path = root.join("agent.db");
+
+        {
+            let (store, _writer) = setup_boot_running_tools_on_disk(
+                &database_path,
+                &[("tool-boot-restart", "read_file", 0)],
+            )
+            .await;
+            let authority = authority_for_generation(8);
+            let attestation = reap_attestation_for(&authority, 7);
+            let intents = match store
+                .hydrate(authority.lease(), authority.fence())
+                .await
+                .expect("hydrate the on-disk boot fixture")
+            {
+                HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+                other => panic!("fixture must require physical recovery: {other:?}"),
+            };
+            SuffixRecovery::apply_boot_physical_receipt(
+                &store,
+                authority.lease(),
+                authority.fence(),
+                &attestation,
+                &intents,
+            )
+            .await
+            .expect("apply the boot physical receipt");
+        }
+
+        let reopened = open_boot_running_tools_store(&database_path).await;
+        assert_indeterminate_surface(&reopened, "tool-boot-restart").await;
+        let observed: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'turn_end'),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type = 'agent_end'),
+                (SELECT COUNT(*) FROM inbound_commands
+                 WHERE status = 'applied' AND run_phase = 'finished')",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .expect("read the restarted state");
+        assert_eq!(observed, (1, 1, 1, 1), "the restart must not observe a torn suffix");
+
+        let next = authority_for_generation(9);
+        match reopened
+            .hydrate(next.lease(), next.fence())
+            .await
+            .expect("hydrate the restarted Store")
+        {
+            HydrationOutcome::Complete(_) => {}
+            other => panic!("the restart must not have to rebuild the suffix: {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn boot_attestation_cannot_cover_current_generation() {
+        let (store, _writer) =
+            setup_boot_running_tools(&[("tool-boot-live", "read_file", 0)]).await;
+
+        let authority = authority_for_generation(7);
+        let attestation = reap_attestation_for(&authority, 6);
+        let error = hydrate_store_to_fixed_point_for_test(&store, &authority, Some(&attestation))
+            .await
+            .expect_err("current-generation execution must remain live and fail closed");
+        assert!(format!("{error:#}").contains("physical recovery is required for 1 execution"));
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM tool_executions WHERE tool_call_id = 'tool-boot-live'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load refused live tool");
+        assert_eq!(state, "running");
+    }
+
+    #[tokio::test]
+    async fn physical_receipt_replay_after_committed_apply_is_idempotent_and_next_boot_completes() {
+        let (store, writer) =
+            setup_boot_running_tools(&[("tool-boot-replay", "read_file", 0)]).await;
+        let authority = authority_for_generation(8);
+        let attestation = reap_attestation_for(&authority, 7);
+        let intents = match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate running replay fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("replay fixture must require physical recovery: {other:?}"),
+        };
+        let (outcome, receipt) = SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("apply physical receipt before simulated crash");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+
+        let replay = SuffixRecovery::apply_physical_receipt(
+            &writer,
+            authority.lease(),
+            authority.fence(),
+            receipt,
+            EventBatch::default(),
+        )
+        .await
+        .expect("replay exact committed receipt after simulated crash");
+        assert_eq!(replay.0, ApplyReceiptOutcome::AlreadyApplied);
+        assert!(replay.1.is_empty());
+
+        hydrate_store_to_fixed_point_for_test(&store, &authority_for_generation(9), None)
+            .await
+            .expect("next boot converges after committed receipt replay");
+        assert_indeterminate_surface(&store, "tool-boot-replay").await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count replayed receipt"),
+            1
+        );
     }
 
     #[tokio::test]

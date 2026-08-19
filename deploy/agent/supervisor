@@ -467,6 +467,10 @@ readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
 readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
 readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
+# An epoch's live process set is deliberately limited to the roles that outlive
+# allocation. Allocator and prepare are successful one-shot setup evidence, not
+# runtime processes: Compose retains their exited containers after activation.
+readonly LONG_LIVED_ROLES=(runtime executor broker)
 # One explicit bound covers termination of the active detached Compose session,
 # every cleanup retry at the configured Compose timeout, verification calls,
 # retry delays, and a small scheduling margin. The provisioner receives this
@@ -661,6 +665,7 @@ redact_activation_diagnostic_stream() {
     SUMI_EXECUTION_REVIEWER_API_KEY
     SUMI_ESCALATION_REVIEWER_API_KEY
     SUMI_EXPECTED_RPC_NONCE
+    SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE
   )
   while IFS= read -r line || [[ -n "${line}" ]]; do
     for name in "${names[@]}"; do
@@ -687,7 +692,12 @@ epoch_identity() {
   local output line key value
   local paid= generation= nonce=
   declare -A seen=()
-  output="$(prepare_compose run --rm --no-deps --entrypoint /bin/bash allocator \
+  # --pull never keeps epoch identity readable when the registry is unreachable.
+  # A project with containers always has the allocator image locally; an empty
+  # project has no image and fails here, which is the correct `unknown` outcome.
+  # The service default `pull_policy: always` would otherwise turn a transient
+  # DNS/registry gap into a failed identity read and fence a healthy runtime.
+  output="$(prepare_compose run --rm --no-deps --pull never --entrypoint /bin/bash allocator \
     -c 'cat /var/lib/sumi-allocator-root/identity-output/broker/identity.env' 2>/dev/null)" ||
     return 1
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -710,13 +720,83 @@ epoch_identity() {
   EPOCH_NONCE="${nonce}"
 }
 
-running_role_count() {
-  local role id count=0
-  for role in runtime executor broker; do
-    id="$(lifecycle_compose ps --status running --quiet "${role}" 2>/dev/null)" || return 1
-    [[ -z "${id//[[:space:]]/}" ]] || count=$((count + 1))
+# This is the definition of the container collection that represents a running
+# epoch. Active inspection deliberately ignores one-shot roles and unrelated
+# project-labelled containers: those containers do not make this generation
+# live.
+long_lived_role_states() {
+  docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}' 2>/dev/null
+}
+
+is_long_lived_role() {
+  local candidate="$1" role
+  for role in "${LONG_LIVED_ROLES[@]}"; do
+    [[ "${candidate}" == "${role}" ]] && return 0
   done
-  printf '%s\n' "${count}"
+  return 1
+}
+
+long_lived_roles_match_expected_state() {
+  local expected_state="$1"
+  local output line container_id service
+  local -A observed=()
+  local state role
+
+  output="$(long_lived_role_states)" || return 1
+  [[ -n "${output}" ]] || return 1
+  while IFS=$'\t' read -r container_id service state; do
+    is_long_lived_role "${service}" || continue
+    [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ && \
+      "${state}" == "${expected_state}" && -z "${observed[${service}]+set}" ]] || return 1
+    observed["${service}"]=1
+  done <<< "${output}"
+
+  (( ${#observed[@]} == ${#LONG_LIVED_ROLES[@]} )) || return 1
+  for role in "${LONG_LIVED_ROLES[@]}"; do
+    [[ -n "${observed[${role}]+set}" ]] || return 1
+  done
+}
+
+long_lived_containers_exist() {
+  local output line container_id service state
+  # Presence/absence of a long-lived role is an observation, not a guess. A
+  # failed `docker ps` must not read as "no long-lived container exists": that
+  # would route a running project into the prepared/recovery branch on a
+  # transient observation gap. Fail closed, mirroring project_is_empty's posture.
+  output="$(long_lived_role_states)" ||
+    fail "cannot observe long-lived role states for presence proof"
+  while IFS=$'\t' read -r container_id service state; do
+    is_long_lived_role "${service}" || continue
+    [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+    return 0
+  done <<< "${output}"
+  return 1
+}
+
+# A prepared epoch is intentionally a separate, one-shot-only shape. Unlike a
+# running epoch, it must still have exactly allocator and prepare before it can
+# be reused for activation.
+prepared_project_containers_match_expected_roles() {
+  local output line container_id service
+  local -A expected=([allocator]=1 [prepare]=1)
+  local -A observed=()
+  local role
+
+  output="$(docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}' 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r container_id service; do
+    [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ && -n "${service}" && \
+      -n "${expected[${service}]+set}" && -z "${observed[${service}]+set}" ]] || return 1
+    observed["${service}"]=1
+  done <<< "${output}"
+
+  (( ${#observed[@]} == ${#expected[@]} )) || return 1
+  for role in "${!expected[@]}"; do
+    [[ -n "${observed[${role}]+set}" ]] || return 1
+  done
 }
 
 prepared_containers_exist() {
@@ -724,15 +804,6 @@ prepared_containers_exist() {
   allocator_id="$(lifecycle_compose ps --all --quiet allocator 2>/dev/null)" || return 1
   prepare_id="$(lifecycle_compose ps --all --quiet prepare 2>/dev/null)" || return 1
   [[ -n "${allocator_id//[[:space:]]/}" && -n "${prepare_id//[[:space:]]/}" ]]
-}
-
-long_lived_containers_exist() {
-  local role id
-  for role in runtime executor broker; do
-    id="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || return 1
-    [[ -z "${id//[[:space:]]/}" ]] || return 0
-  done
-  return 1
 }
 
 print_epoch_json() {
@@ -745,20 +816,29 @@ print_unknown_json() {
   printf '{"personality_agent_id":"%s","phase":"unknown"}\n' "${SUMI_PERSONALITY_AGENT_ID}"
 }
 
+print_reaped_json() {
+  local generation="$1"
+  printf '{"personality_agent_id":"%s","phase":"unknown","reaped_through_generation":%s}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${generation}"
+}
+
 inspect_epoch() {
-  local running
-  running="$(running_role_count)" || fail "cannot inspect Compose role state"
-  if [[ "${running}" == 3 ]]; then
+  if long_lived_roles_match_expected_state running; then
     epoch_identity || fail "active project has no coherent prepared epoch"
     print_epoch_json active
     return
   fi
-  [[ "${running}" == 0 ]] || fail "project contains a partial active generation"
-  ! long_lived_containers_exist ||
-    fail "project contains a failed active generation; reconcile before reuse"
-  if prepared_containers_exist; then
+  if ! long_lived_containers_exist && prepared_containers_exist &&
+    prepared_project_containers_match_expected_roles; then
     epoch_identity || fail "prepared project has no coherent epoch"
     print_epoch_json prepared
+    return
+  fi
+  # A partial, failed, or orphaned project is not reusable, but allocator
+  # identity remains the authority needed by the API to fence local control
+  # before its subsequent destructive reconcile.
+  if epoch_identity; then
+    print_epoch_json recovery
   else
     print_unknown_json
   fi
@@ -773,10 +853,17 @@ require_expected_epoch() {
     fail "prepared epoch does not match requested activation handle"
 }
 
-cleanup_project_is_empty() {
-  local containers
-  containers="$(lifecycle_compose ps --all --quiet 2>/dev/null)" || return 1
-  [[ -z "${containers//[[:space:]]/}" ]]
+project_is_empty() {
+  # A reap receipt is an absence proof, unlike the long-lived-role liveness
+  # check above. It must therefore enumerate every container labelled with this
+  # Compose project, including old service names and one-shot/orphan remnants.
+  # Treat an inspection failure as non-empty so a failed `down` cannot turn an
+  # unobserved project into a physical-recovery receipt.
+  local output
+  output="$(docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}' 2>/dev/null)" || return 1
+  [[ -z "${output//[[:space:]]/}" ]]
 }
 
 cleanup_partial_generation() {
@@ -796,7 +883,7 @@ cleanup_partial_generation() {
     for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
       lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1
-      if cleanup_project_is_empty; then
+      if project_is_empty; then
         cleanup_complete=1
         break
       fi
@@ -912,20 +999,25 @@ case "${action}" in
   abort)
     acquire_supervisor_lock
     require_docker
-    if prepared_containers_exist; then
-      require_expected_epoch
-    fi
+    require_expected_epoch
+    reaped_generation="${EPOCH_GENERATION}"
     lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-      >/dev/null 2>&1
+      >/dev/null 2>&1 || true
+    project_is_empty || fail "abort did not remove every project container"
     remove_runtime_secret_tree
+    print_reaped_json "${reaped_generation}"
     ;;
   stop-epoch)
     acquire_supervisor_lock
     require_docker
     require_expected_epoch
     set_runtime_secret_host_dir "${EPOCH_GENERATION}"
-    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    reaped_generation="${EPOCH_GENERATION}"
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+      >/dev/null 2>&1 || true
+    project_is_empty || fail "stop did not remove every project container"
     remove_runtime_secret_tree
+    print_reaped_json "${reaped_generation}"
     ;;
   stop|down)
     acquire_supervisor_lock
@@ -949,15 +1041,37 @@ case "${action}" in
   reconcile)
     acquire_supervisor_lock
     require_docker
-    running="$(running_role_count)" || fail "cannot inspect Compose role state"
-    if [[ "${running}" != 0 && "${running}" != 3 ]] ||
-      { [[ "${running}" == 0 ]] && long_lived_containers_exist; }; then
-      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-        >/dev/null 2>&1
-      remove_runtime_secret_tree
-      print_unknown_json
-    else
+    if long_lived_roles_match_expected_state running ||
+      { ! long_lived_containers_exist && prepared_containers_exist &&
+        prepared_project_containers_match_expected_roles; }; then
       inspect_epoch
+    else
+      # This branch also covers a provisioner crash after a verified stop or
+      # abort: Compose can already be empty, but the daemon had no chance to
+      # publish its local receipt. `down` is a no-op in that case; always run
+      # it so every other leftover container shape is removed before the
+      # project-wide empty check and any durable re-attestation.
+      # If a durable epoch remains, the API must bind this destructive action
+      # to the exact epoch whose local-control authority it already fenced.
+      # Without an epoch there is no issued local-control authority; a
+      # long-lived role in that state is ambiguous and must not be reaped.
+      if epoch_identity; then
+        require_expected_epoch
+      elif long_lived_containers_exist; then
+        fail "reconcile found long-lived roles without a fenceable epoch"
+      fi
+      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1 || true
+      project_is_empty || fail "reconcile did not remove every project container"
+      if epoch_identity; then
+        reaped_generation="${EPOCH_GENERATION}"
+        remove_runtime_secret_tree
+        print_reaped_json "${reaped_generation}"
+      else
+        # A never-provisioned PAID has no durable epoch to attest. Preserve
+        # unknown rather than manufacturing a recovery proof.
+        print_unknown_json
+      fi
     fi
     ;;
   *)

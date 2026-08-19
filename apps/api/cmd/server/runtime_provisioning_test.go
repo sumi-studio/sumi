@@ -51,9 +51,15 @@ type fakeRuntimeProvisioner struct {
 	aborts          map[string]int
 	stops           map[string]int
 	activations     map[string]runtimeprovision.ActivationConfig
+	reapedThrough   map[string]uint64
 	activationErr   error
 	mismatchActive  bool
 	dropBeforeReady bool
+	recovery        map[string]bool
+	reconcileReaps  map[string]bool
+	omitReapReceipt bool
+	inspectErr      error
+	inspectErrLimit int
 }
 
 func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvisioner {
@@ -64,6 +70,9 @@ func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvi
 		aborts:         make(map[string]int),
 		stops:          make(map[string]int),
 		activations:    make(map[string]runtimeprovision.ActivationConfig),
+		reapedThrough:  make(map[string]uint64),
+		recovery:       make(map[string]bool),
+		reconcileReaps: make(map[string]bool),
 	}
 }
 
@@ -112,7 +121,7 @@ func (p *fakeRuntimeProvisioner) Abort(_ context.Context, request runtimeprovisi
 	}
 	p.aborts[request.PersonalityAgentID]++
 	delete(p.epochs, request.PersonalityAgentID)
-	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	return p.reapInspection(request.PreparedEpoch), nil
 }
 
 func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovision.StopRequest) (runtimeprovision.Inspection, error) {
@@ -123,9 +132,27 @@ func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovisio
 	if !exists || current != request.PreparedEpoch {
 		return runtimeprovision.Inspection{}, runtimeprovision.ErrConflict
 	}
+	if p.recovery[request.PersonalityAgentID] {
+		return runtimeprovision.Inspection{}, runtimeprovision.ErrConflict
+	}
 	p.stops[request.PersonalityAgentID]++
 	delete(p.epochs, request.PersonalityAgentID)
-	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	return p.reapInspection(request.PreparedEpoch), nil
+}
+
+func (p *fakeRuntimeProvisioner) reapInspection(epoch runtimeprovision.PreparedEpoch) runtimeprovision.Inspection {
+	inspection := runtimeprovision.Inspection{
+		PersonalityAgentID: epoch.PersonalityAgentID,
+		Phase:              runtimeprovision.PhaseUnknown,
+	}
+	if !p.omitReapReceipt {
+		reaped := epoch.Generation
+		inspection.ReapedThroughGeneration = &reaped
+		if previous, ok := p.reapedThrough[epoch.PersonalityAgentID]; !ok || reaped > previous {
+			p.reapedThrough[epoch.PersonalityAgentID] = reaped
+		}
+	}
+	return inspection
 }
 
 func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
@@ -134,7 +161,18 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 	defer p.mu.Unlock()
 	epoch, exists := p.epochs[request.PersonalityAgentID]
 	if !exists {
-		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+		inspection := runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}
+		if reaped, ok := p.reapedThrough[request.PersonalityAgentID]; ok {
+			inspection.ReapedThroughGeneration = &reaped
+		}
+		return inspection, nil
+	}
+	if p.reconcileReaps[request.PersonalityAgentID] {
+		p.recorder.add("reap:" + request.PersonalityAgentID)
+		delete(p.epochs, request.PersonalityAgentID)
+		delete(p.recovery, request.PersonalityAgentID)
+		delete(p.reconcileReaps, request.PersonalityAgentID)
+		return p.reapInspection(epoch), nil
 	}
 	if p.dropBeforeReady {
 		delete(p.epochs, request.PersonalityAgentID)
@@ -145,6 +183,36 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 		Phase:              runtimeprovision.PhaseActive,
 		Epoch:              &epoch,
 	}, nil
+}
+
+func (p *fakeRuntimeProvisioner) Inspect(_ context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
+	p.recorder.add("inspect:" + request.PersonalityAgentID)
+	p.mu.Lock()
+	if p.inspectErr != nil {
+		err := p.inspectErr
+		if p.inspectErrLimit > 0 {
+			p.inspectErrLimit--
+			if p.inspectErrLimit == 0 {
+				p.inspectErr = nil
+			}
+		}
+		p.mu.Unlock()
+		return runtimeprovision.Inspection{}, err
+	}
+	defer p.mu.Unlock()
+	epoch, exists := p.epochs[request.PersonalityAgentID]
+	if !exists {
+		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	}
+	if p.dropBeforeReady {
+		delete(p.epochs, request.PersonalityAgentID)
+		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	}
+	phase := runtimeprovision.PhaseActive
+	if p.recovery[request.PersonalityAgentID] {
+		phase = runtimeprovision.PhaseRecovery
+	}
+	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: phase, Epoch: &epoch}, nil
 }
 
 type fakeAuthorizationController struct {
@@ -297,6 +365,9 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 			activation.AgentWrappingKey != provisionedTestWrappingMaterial.Bytes {
 			t.Fatalf("activation split the stored wrapping key pair for %s", paid)
 		}
+		if activation.ReapAttestation != nil {
+			t.Fatalf("initial spawn fabricated a reap attestation for %s: %#v", paid, activation.ReapAttestation)
+		}
 	}
 	for _, paid := range provisionedTestPAIDs {
 		want := []string{"prepare:" + paid, "authorize:" + paid, "listen:" + paid, "activate:" + paid}
@@ -325,6 +396,9 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 	}
 	if got := provisioner.epochs[first].Generation; got != 1 {
 		t.Fatalf("restart generation=%d, want 1", got)
+	}
+	if attestation := provisioner.activations[first].ReapAttestation; attestation == nil || attestation.ReapedThroughGeneration != 0 {
+		t.Fatalf("restart after verified Stop did not consume retained reap receipt: %#v", attestation)
 	}
 	_ = restarted.Stop()
 	for _, paid := range provisionedTestPAIDs[1:] {
@@ -435,6 +509,160 @@ func TestProvisionedProcessStaleStopCannotCloseReplacementListener(t *testing.T)
 	}
 }
 
+func TestProvisionedProcessStopReconcilesRecoveryInsteadOfLeavingPartialRuntime(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+
+	if err := process.Stop(); err != nil {
+		t.Fatalf("recovery Stop = %v, want fenced reconciliation", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("recovery Stop left the partial runtime behind")
+	}
+	if reaped, ok := provisioner.reapedThrough[paid]; !ok || reaped != 0 {
+		t.Fatalf("recovery Stop did not return an exact observed-empty receipt: reaped=%d present=%t", reaped, ok)
+	}
+	if authorizations.fences[paid] != 2 || listeners.active[paid] {
+		t.Fatalf("recovery Stop retained local authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"fence:" + paid,
+		"stop:" + paid,
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("recovery Stop did not fence and reconcile before returning: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedProcessMonitorFencesAndReconcilesRecoveryBeforeReturning(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	provisioned := process.(*provisionedProcess)
+	provisioned.monitorInterval = time.Millisecond
+
+	if err := provisioned.Wait(); err == nil || !strings.Contains(err.Error(), "left its active epoch") {
+		t.Fatalf("monitor error = %v, want non-active epoch failure", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatalf("monitor retained local runtime authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("monitor returned before fenced recovery reconcile: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedProcessMonitorFencesAndReconcilesAfterInspectError(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	provisioner.inspectErr = errors.New("inspect unavailable")
+	provisioned := process.(*provisionedProcess)
+	provisioned.monitorInterval = time.Millisecond
+
+	inspectBaseline := 0
+	for _, call := range recorder.calls {
+		if call == "inspect:"+paid {
+			inspectBaseline++
+		}
+	}
+	if err := provisioned.Wait(); err == nil || !strings.Contains(err.Error(), "inspect unavailable") {
+		t.Fatalf("monitor error = %v, want inspect failure", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatalf("monitor retained local runtime authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	inspectCount := 0
+	for _, call := range recorder.calls {
+		if call == "inspect:"+paid {
+			inspectCount++
+		}
+	}
+	if got := inspectCount - inspectBaseline; got != 3 {
+		t.Fatalf("monitor retired after %d inspect errors, want the 3-error threshold", got)
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("monitor inspect failure returned before fenced reconcile: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedProcessMonitorToleratesInspectErrorsBelowThreshold(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.inspectErr = errors.New("transient inspect gap")
+	provisioner.inspectErrLimit = 2 // one below the 3-error retire threshold
+	provisioner.mu.Unlock()
+	provisioned := process.(*provisionedProcess)
+	provisioned.monitorInterval = time.Millisecond
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- provisioned.Wait() }()
+
+	// Two consecutive errors are ridden through; the third observation succeeds
+	// and the monitor must keep the healthy runtime alive.
+	select {
+	case err := <-waitErr:
+		t.Fatalf("monitor retired below the inspect-error threshold: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if authorizations.fences[paid] != 0 || !listeners.active[paid] {
+		t.Fatalf("sub-threshold inspect errors fenced the runtime: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if err := process.Stop(); err != nil {
+		t.Fatalf("stop after transient inspect errors = %v", err)
+	}
+}
+
 func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t *testing.T) {
 	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
 	paid := provisionedTestPAIDs[0]
@@ -469,11 +697,20 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	if provisioner.stops[paid] != 1 || freshAuthorizations.fences[paid] != 1 {
 		t.Fatalf("surviving active epoch was not fenced/stopped: stops=%d fences=%d", provisioner.stops[paid], freshAuthorizations.fences[paid])
 	}
+	activation := provisioner.activations[paid]
+	if activation.ReapAttestation == nil ||
+		activation.ReapAttestation.PersonalityAgentID != paid ||
+		activation.ReapAttestation.EpochGeneration != 1 ||
+		activation.ReapAttestation.RPCBootNonce != provisioner.epochs[paid].RPCBootNonce ||
+		activation.ReapAttestation.ReapedThroughGeneration != 0 {
+		t.Fatalf("replacement activation omitted or misbound verified reap attestation: %#v", activation.ReapAttestation)
+	}
 	want := []string{
-		"reconcile:" + paid,
+		"inspect:" + paid,
 		"fence:" + paid,
-		"stop:" + paid,
 		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"stop:" + paid,
 		"prepare:" + paid,
 	}
 	// Match the second lifecycle suffix rather than the initial reconciliation.
@@ -486,6 +723,95 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	}
 	if !containsOrdered(recorder.calls[secondStart:], want) {
 		t.Fatalf("reconcile ordering mismatch: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerFencesBeforeReconcileReapsActiveProjectWithOrphan(t *testing.T) {
+	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+		"prepare:" + paid,
+	}) {
+		t.Fatalf("active orphan reconcile reaped before local authority was fenced: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerFencesBeforeReconcileReapsPartialProject(t *testing.T) {
+	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	provisioner.mu.Unlock()
+	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+		"prepare:" + paid,
+	}) {
+		t.Fatalf("partial reconcile reaped before local authority was fenced: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerRejectsTeardownWithoutObservedEmptyReceipt(t *testing.T) {
+	first, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	if _, err := first.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provisioner.omitReapReceipt = true
+	freshAuthorizations := &fakeAuthorizationController{recorder: recorder, current: make(map[string]agentevents.LocalRuntimeAuthorization), fences: make(map[string]int)}
+	freshListeners := &fakeListenerController{recorder: recorder, active: make(map[string]bool)}
+	restarted, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
+		Provisioner: provisioner, Authorizations: freshAuthorizations, Listeners: freshListeners,
+		Readiness: &fakeRuntimeReadiness{ready: true}, TenantID: "tenant-context",
+		Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
+		TeardownTimeout: time.Second,
+		Activation:      runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = restarted.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "observed-empty reap receipt") {
+		t.Fatalf("unattested teardown was accepted: %v", err)
+	}
+	if containsOrdered(recorder.calls, []string{"stop:" + paid, "prepare:" + paid}) {
+		t.Fatalf("replacement prepare ran after teardown omitted its proof: %v", recorder.calls)
 	}
 }
 
@@ -710,6 +1036,48 @@ func TestProvisionedRuntimeSpawnerRejectsReadyThenExit(t *testing.T) {
 	}
 	if authorizations.fences[paid] != 1 || listeners.active[paid] {
 		t.Fatal("Ready-then-exit runtime retained authority")
+	}
+}
+
+func TestProvisionedRuntimeSpawnerPreReadyRecoveryReconcilesExactEpochBeforeFailing(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	readiness := &fakeRuntimeReadiness{terminal: true}
+	readiness.onObserve = func() {
+		provisioner.mu.Lock()
+		defer provisioner.mu.Unlock()
+		provisioner.recovery[paid] = true
+		provisioner.reconcileReaps[paid] = true
+	}
+	spawner.config.Readiness = readiness
+
+	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
+		GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "terminal NotReady") {
+		t.Fatalf("pre-Ready recovery spawn error = %v, want terminal readiness failure", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("pre-Ready recovery left the partial runtime behind")
+	}
+	if reaped, ok := provisioner.reapedThrough[paid]; !ok || reaped != 0 {
+		t.Fatalf("pre-Ready recovery did not produce the exact observed-empty receipt: reaped=%d present=%t", reaped, ok)
+	}
+	if authorizations.fences[paid] != 2 || listeners.active[paid] {
+		t.Fatalf("pre-Ready recovery retained local authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if !containsOrdered(recorder.calls, []string{
+		"fence:" + paid,
+		"stop:" + paid,
+		"unlisten:" + paid,
+		"inspect:" + paid,
+		"fence:" + paid,
+		"unlisten:" + paid,
+		"reconcile:" + paid,
+		"reap:" + paid,
+	}) {
+		t.Fatalf("pre-Ready recovery did not fence and reconcile before returning: %v", recorder.calls)
 	}
 }
 

@@ -307,7 +307,7 @@ func sanitizeSupervisorError(message string, environment []string) string {
 		case "SUMI_LOCAL_CONTROL_BEARER", "SUMI_AGENT_WRAPPING_KEY",
 			"SUMI_APPROVAL_SECRET_DIGEST_KEY", "SUMI_PROVIDER_API_KEY",
 			"SUMI_EXECUTION_REVIEWER_API_KEY", "SUMI_ESCALATION_REVIEWER_API_KEY",
-			"SUMI_EXPECTED_RPC_NONCE":
+			"SUMI_EXPECTED_RPC_NONCE", "SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE":
 			message = strings.ReplaceAll(message, value, "<redacted:"+name+">")
 		}
 	}
@@ -347,10 +347,11 @@ func NewDockerBackend(config DockerBackendConfig) (*DockerBackend, error) {
 }
 
 type supervisorInspection struct {
-	PersonalityAgentID string `json:"personality_agent_id"`
-	Phase              Phase  `json:"phase"`
-	Generation         uint64 `json:"generation,omitempty"`
-	RPCBootNonce       string `json:"rpc_boot_nonce,omitempty"`
+	PersonalityAgentID      string  `json:"personality_agent_id"`
+	Phase                   Phase   `json:"phase"`
+	Generation              uint64  `json:"generation,omitempty"`
+	RPCBootNonce            string  `json:"rpc_boot_nonce,omitempty"`
+	ReapedThroughGeneration *uint64 `json:"reaped_through_generation,omitempty"`
 }
 
 func (backend *DockerBackend) Prepare(ctx context.Context, request PrepareRequest) (PreparedEpoch, error) {
@@ -419,16 +420,25 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 	if config.LogFilter != "" {
 		values["SUMI_LOG"] = config.LogFilter
 	}
+	if attestation := config.ReapAttestation; attestation != nil {
+		values["SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID"] = attestation.PersonalityAgentID
+		values["SUMI_REAP_ATTESTATION_EPOCH_GENERATION"] = fmt.Sprint(attestation.EpochGeneration)
+		values["SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE"] = attestation.RPCBootNonce
+		values["SUMI_REAPED_THROUGH_GENERATION"] = fmt.Sprint(attestation.ReapedThroughGeneration)
+	}
 	return values
 }
 
-func (backend *DockerBackend) Abort(ctx context.Context, epoch PreparedEpoch) error {
+func (backend *DockerBackend) Abort(ctx context.Context, epoch PreparedEpoch) (Inspection, error) {
 	expected := map[string]string{
 		"SUMI_EXPECTED_RPC_GENERATION": fmt.Sprint(epoch.Generation),
 		"SUMI_EXPECTED_RPC_NONCE":      epoch.RPCBootNonce,
 	}
-	_, err := backend.run(ctx, "abort", epoch.PersonalityAgentID, nil, expected)
-	return err
+	output, err := backend.run(ctx, "abort", epoch.PersonalityAgentID, nil, expected)
+	if err != nil {
+		return Inspection{}, err
+	}
+	return parseExactSupervisorReap(output, epoch)
 }
 
 func (backend *DockerBackend) Inspect(ctx context.Context, personalityAgentID string) (Inspection, error) {
@@ -439,21 +449,34 @@ func (backend *DockerBackend) Inspect(ctx context.Context, personalityAgentID st
 	return parseSupervisorInspection(output, personalityAgentID)
 }
 
-func (backend *DockerBackend) Stop(ctx context.Context, epoch PreparedEpoch) error {
+func (backend *DockerBackend) Stop(ctx context.Context, epoch PreparedEpoch) (Inspection, error) {
 	expected := map[string]string{
 		"SUMI_EXPECTED_RPC_GENERATION": fmt.Sprint(epoch.Generation),
 		"SUMI_EXPECTED_RPC_NONCE":      epoch.RPCBootNonce,
 	}
-	_, err := backend.run(ctx, "stop-epoch", epoch.PersonalityAgentID, nil, expected)
-	return err
-}
-
-func (backend *DockerBackend) Reconcile(ctx context.Context, personalityAgentID string) (Inspection, error) {
-	output, err := backend.run(ctx, "reconcile", personalityAgentID, nil, nil)
+	output, err := backend.run(ctx, "stop-epoch", epoch.PersonalityAgentID, nil, expected)
 	if err != nil {
 		return Inspection{}, err
 	}
-	return parseSupervisorInspection(output, personalityAgentID)
+	return parseExactSupervisorReap(output, epoch)
+}
+
+func (backend *DockerBackend) Reconcile(ctx context.Context, request ReconcileRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	var expected map[string]string
+	if request.FencedEpoch != nil {
+		expected = map[string]string{
+			"SUMI_EXPECTED_RPC_GENERATION": fmt.Sprint(request.FencedEpoch.Generation),
+			"SUMI_EXPECTED_RPC_NONCE":      request.FencedEpoch.RPCBootNonce,
+		}
+	}
+	output, err := backend.run(ctx, "reconcile", request.PersonalityAgentID, nil, expected)
+	if err != nil {
+		return Inspection{}, err
+	}
+	return parseSupervisorInspection(output, request.PersonalityAgentID)
 }
 
 func (backend *DockerBackend) run(ctx context.Context, action, personalityAgentID string, supplied, forced map[string]string) ([]byte, error) {
@@ -518,6 +541,10 @@ var allowedActivationEnvironment = map[string]bool{
 	"SUMI_MODEL_ID":                                true,
 	"SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY":         true,
 	"SUMI_LOG":                                     true,
+	"SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID":   true,
+	"SUMI_REAP_ATTESTATION_EPOCH_GENERATION":       true,
+	"SUMI_REAP_ATTESTATION_RPC_BOOT_NONCE":         true,
+	"SUMI_REAPED_THROUGH_GENERATION":               true,
 }
 
 func mergeEnvironment(base []string, supplied, forced map[string]string, personalityAgentID string) ([]string, error) {
@@ -584,8 +611,12 @@ func parseSupervisorInspection(output []byte, expectedPersonalityAgentID string)
 	if wire.PersonalityAgentID != expectedPersonalityAgentID {
 		return Inspection{}, errors.New("docker supervisor returned a different personality agent")
 	}
-	inspection := Inspection{PersonalityAgentID: wire.PersonalityAgentID, Phase: wire.Phase}
-	if wire.Phase == PhasePrepared || wire.Phase == PhaseActive {
+	inspection := Inspection{
+		PersonalityAgentID:      wire.PersonalityAgentID,
+		Phase:                   wire.Phase,
+		ReapedThroughGeneration: wire.ReapedThroughGeneration,
+	}
+	if wire.Phase == PhasePrepared || wire.Phase == PhaseActive || wire.Phase == PhaseRecovery {
 		epoch := PreparedEpoch{
 			PersonalityAgentID:   wire.PersonalityAgentID,
 			Generation:           wire.Generation,
@@ -596,6 +627,18 @@ func parseSupervisorInspection(output []byte, expectedPersonalityAgentID string)
 	}
 	if err := inspection.Validate(); err != nil {
 		return Inspection{}, fmt.Errorf("docker supervisor returned invalid epoch: %w", err)
+	}
+	return inspection, nil
+}
+
+func parseExactSupervisorReap(output []byte, epoch PreparedEpoch) (Inspection, error) {
+	inspection, err := parseSupervisorInspection(output, epoch.PersonalityAgentID)
+	if err != nil {
+		return Inspection{}, err
+	}
+	if inspection.Phase != PhaseUnknown || inspection.ReapedThroughGeneration == nil ||
+		*inspection.ReapedThroughGeneration != epoch.Generation {
+		return Inspection{}, errors.New("docker supervisor teardown did not return the exact observed-empty reap receipt")
 	}
 	return inspection, nil
 }

@@ -21,7 +21,9 @@ use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease}
 
 use super::{
     ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
-    PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter, RunPhase, Store,
+    HydrationReceiptIdentity, PhysicalReapAttestation, PhysicalRecoveryIntent,
+    PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter,
+    RunPhase, Store, ToolExecutionMutation,
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
@@ -38,6 +40,7 @@ const PROCESS_RESTARTED_TOOL_RESULT: &str = "process restarted before tool execu
 const APPROVAL_CANCELLED_ERROR_CODE: &str = "approval_cancelled";
 const APPROVAL_CANCELLED_TOOL_RESULT: &str =
     "approval was cancelled after process restart before tool execution";
+const PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT: &str = "ツールの実行中にプロセスが停止したため、実行結果は不明です。処理が完了している可能性と、完了していない可能性があります。";
 
 /// Typed identity for one durably pending approval whose prepared tool must be
 /// closed during logical suffix recovery.
@@ -161,6 +164,20 @@ enum MissingToolDisposition {
     ApprovalCancelled(CancelledPendingApproval),
 }
 
+/// A `running` tool execution that the physical recovery batch currently under
+/// construction is about to terminate as `indeterminate`, together with the
+/// ToolResult that batch writes for it.
+///
+/// The logical suffix has to be planned against these pending resolutions
+/// rather than against the database, because both halves commit in the same
+/// transaction and therefore neither can observe the other through durable
+/// rows.
+#[derive(Clone)]
+struct PendingPhysicalResolution {
+    message_id: String,
+    result: ToolResultMessage,
+}
+
 struct ToolUseRecoverySnapshot {
     command_id: String,
     command_seq: u64,
@@ -179,6 +196,38 @@ impl LogicalRecoveryExecutor {
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
     ) -> Result<()> {
+        // The guard authenticates the current lifecycle checkpoint and keeps
+        // this recovery writer exclusive through the final atomic batch.
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
+        let batch = Self::plan_batch(
+            store,
+            &recovery,
+            steps,
+            lease.generation(),
+            &HashMap::new(),
+        )
+        .await?;
+        recovery
+            .apply_recovery_batch(batch)
+            .await
+            .context("failed to atomically close ToolUse restart seam")?;
+        Ok(())
+    }
+
+    /// Build the logical suffix batch without committing it.
+    ///
+    /// `pending_physical` names the `running` executions whose
+    /// `indeterminate` terminals and ToolResults are already staged in the
+    /// caller's batch. Boot physical recovery supplies them so that the ledger,
+    /// the terminals, and this suffix reach SQLite as one transaction.
+    async fn plan_batch(
+        store: &Store,
+        recovery: &super::event_writer::BootstrapRecoveryGuard<'_>,
+        steps: &[RecoveryStep],
+        executor_generation: crate::runtime::contracts::ProcessGeneration,
+        pending_physical: &HashMap<String, PendingPhysicalResolution>,
+    ) -> Result<EventBatch> {
         let [step] = steps else {
             bail!(
                 "Store LogicalRecoveryExecutor only supports one assistant logical-recovery step; received {} ordered step(s)",
@@ -221,10 +270,6 @@ impl LogicalRecoveryExecutor {
                 ),
             };
 
-        // The guard authenticates the current lifecycle checkpoint and keeps
-        // this recovery writer exclusive through the final atomic batch.
-        let writer = EventWriter::new(Arc::new(store.clone()));
-        let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
         let active_turn_id = recovery.authenticated_open_turn(run_id)?.to_owned();
         if planned_active_turn_id.is_some_and(|planned| planned != active_turn_id) {
             bail!("pending approval recovery turn does not match the authenticated open turn");
@@ -249,6 +294,7 @@ impl LogicalRecoveryExecutor {
             expected_owner_turn_id,
             &active_turn_id,
             expected_pending.as_ref(),
+            pending_physical,
         )
         .await?;
         transaction
@@ -256,11 +302,7 @@ impl LogicalRecoveryExecutor {
             .await
             .context("failed to commit logical-recovery inspection")?;
 
-        recovery
-            .apply_recovery_batch(snapshot.into_batch(lease.generation())?)
-            .await
-            .context("failed to atomically close ToolUse restart seam")?;
-        Ok(())
+        snapshot.into_batch(executor_generation)
     }
 }
 
@@ -273,6 +315,7 @@ impl ToolUseRecoverySnapshot {
         expected_owner_turn_id: Option<&str>,
         active_turn_id: &str,
         expected_pending: Option<&PendingApprovalRecovery>,
+        pending_physical: &HashMap<String, PendingPhysicalResolution>,
     ) -> Result<Self> {
         let command = sqlx::query(
             "SELECT seq, command_kind, status, application_kind, run_id, turn_id, run_phase
@@ -526,6 +569,34 @@ impl ToolUseRecoverySnapshot {
                     let state: String = row.try_get("state")?;
                     if owner_command != command_id || owner_run != run_id {
                         bail!("ToolCall {} belongs to another durable owner", call.id);
+                    }
+                    if state == "running"
+                        && let Some(pending) = pending_physical.get(call.id.as_str())
+                    {
+                        // The caller's batch turns this execution into an
+                        // `indeterminate` terminal plus its ToolResult in the
+                        // same transaction that will commit this suffix, so the
+                        // durable row cannot show the resolution yet. Plan
+                        // against the staged result and check it exactly as the
+                        // durable branch below checks a persisted one.
+                        if pending.message_id != expected_message_id
+                            || pending.result.tool_call_id != call.id
+                            || pending.result.tool_name != call.name
+                            || !pending.result.is_error
+                        {
+                            bail!(
+                                "physically recovered ToolCall {} disagrees with its staged indeterminate ToolResult",
+                                call.id
+                            );
+                        }
+                        if persisted_results.contains_key(call.id.as_str()) {
+                            bail!(
+                                "physically recovered ToolCall {} already has a durable result",
+                                call.id
+                            );
+                        }
+                        tool_results.push(pending.result.clone());
+                        continue;
                     }
                     if matches!(state.as_str(), "prepared" | "running") {
                         bail!(
@@ -787,10 +858,6 @@ pub(crate) enum ResumeDirective {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HydrationOutcome {
-    #[allow(
-        dead_code,
-        reason = "T26 bootstrap composition will pass these immutable physical attestations to T27; T17 must keep this variant fail-closed until then"
-    )]
     PhysicalRecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
     LogicalRecoveryRequired {
         // T26 owns applying this suffix. Until then this variant deliberately
@@ -821,11 +888,251 @@ struct PendingCommand {
 pub(crate) struct SuffixRecovery;
 
 impl SuffixRecovery {
+    /// Consume an authenticated control-plane reap attestation for boot-only
+    /// physical intents, then durably record the honest unknown outcome. The
+    /// attestation proves only that execution cannot still be live; it cannot
+    /// prove whether the external effect happened, so every terminal is
+    /// `indeterminate`, never success or failure.
+    pub(crate) async fn apply_boot_physical_receipt(
+        store: &Store,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        reap_attestation: &PhysicalReapAttestation,
+        requests: &[PhysicalRecoveryIntentRequest],
+    ) -> Result<(ApplyReceiptOutcome, PhysicalRecoveryReceipt)> {
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
+        let (receipt, batch) = Self::plan_boot_physical_receipt(
+            store,
+            &recovery,
+            lease,
+            fence,
+            reap_attestation,
+            requests,
+        )
+        .await?;
+        let (outcome, _) = recovery
+            .apply_physical_recovery_batch(lease, fence, receipt.clone(), batch)
+            .await?;
+        Ok((outcome, receipt))
+    }
+
+    /// Build the single transaction the receipt contract requires: the T17
+    /// application ledger, every `running -> indeterminate` terminal with its
+    /// ToolResult, and the whole logical suffix that resolving those intents
+    /// makes necessary.
+    ///
+    /// The suffix is deliberately not left to the next `hydrate` iteration.
+    /// That loop stays as an idempotent re-verification, but it must never be
+    /// where state required for correctness is created: a crash between two
+    /// commits would leave the ledger and the `indeterminate` terminals durable
+    /// with the rest of the suffix missing, which is precisely the torn state
+    /// `docs/agent/implementation-plan.md` forbids ("全件なし／全件あり").
+    async fn plan_boot_physical_receipt(
+        store: &Store,
+        recovery: &super::event_writer::BootstrapRecoveryGuard<'_>,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        reap_attestation: &PhysicalReapAttestation,
+        requests: &[PhysicalRecoveryIntentRequest],
+    ) -> Result<(PhysicalRecoveryReceipt, EventBatch)> {
+        if requests.is_empty() {
+            bail!("boot physical recovery requires at least one intent");
+        }
+
+        // Boot is still NotReady, the epoch fence has removed all older
+        // containers, and the caller holds the single writer gate through the
+        // commit, so no producer can advance this Store between this head read
+        // and the EventWriter transaction. EventWriter revalidates the exact
+        // contiguous suffix and receipt binding before commit.
+        let head: Option<i64> = sqlx::query_scalar("SELECT last_seq FROM event_log_heads")
+            .fetch_optional(store.pool())
+            .await
+            .context("read event-log head for boot physical recovery")?;
+        let first_seq = u64::try_from(head.unwrap_or(0))
+            .context("event-log head is outside the physical recovery sequence range")?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("physical recovery first sequence overflow"))?;
+        let physical_event_count = requests
+            .len()
+            .checked_mul(3)
+            .ok_or_else(|| anyhow::anyhow!("physical recovery event count overflow"))?;
+
+        let mut writes = Vec::with_capacity(physical_event_count);
+        let mut intents = Vec::with_capacity(requests.len());
+        let mut pending_physical = HashMap::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            let terminal_seq = first_seq
+                .checked_add(
+                    u64::try_from(index)
+                        .context("physical recovery intent index exceeds u64")?
+                        .checked_mul(3)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("physical recovery terminal sequence overflow")
+                        })?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("physical recovery terminal sequence overflow"))?;
+            let result = ToolResultMessage {
+                tool_call_id: request.tool_call_id.clone(),
+                tool_name: request.tool_name.clone(),
+                content: vec![UserContent::Text {
+                    text: PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT.to_owned(),
+                }],
+                details: json!({
+                    "error": "indeterminate",
+                    "outcome": "indeterminate",
+                    "message": PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT,
+                }),
+                is_error: true,
+                timestamp: Utc::now(),
+            };
+            let message = PublicMessage::ToolResult(result.clone());
+            let message_id =
+                tool_result_message_id(&request.assistant_message_id, &request.tool_call_id);
+            writes.extend([
+                EventWrite {
+                    event: Some(super::DurableEvent::tool_execution_end(
+                        request.tool_call_id.clone(),
+                        serde_json::to_value(&result)?,
+                        true,
+                        "indeterminate".to_owned(),
+                        Some("indeterminate".to_owned()),
+                    )?),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: request.tool_call_id.clone(),
+                        expected: "running",
+                        state: "indeterminate",
+                        error_code: Some("indeterminate"),
+                    })],
+                },
+                EventWrite {
+                    event: Some(super::DurableEvent::message(
+                        "message_start",
+                        &message_id,
+                        &message,
+                    )?),
+                    projections: Vec::new(),
+                },
+                EventWrite {
+                    event: Some(super::DurableEvent::message(
+                        "message_end",
+                        &message_id,
+                        &message,
+                    )?),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.clone(),
+                        role: "tool_result",
+                        message,
+                        append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
+                    }],
+                },
+            ]);
+            if pending_physical
+                .insert(
+                    request.tool_call_id.clone(),
+                    PendingPhysicalResolution { message_id, result },
+                )
+                .is_some()
+            {
+                bail!(
+                    "boot physical recovery received duplicate intents for ToolCall {}",
+                    request.tool_call_id
+                );
+            }
+            intents.push(PhysicalRecoveryIntent {
+                tool_call_id: request.tool_call_id.clone(),
+                command_id: request.command_id.clone(),
+                run_id: request.run_id.clone(),
+                executor_generation: request.executor_generation,
+                indeterminate_terminal_seq: terminal_seq,
+            });
+        }
+
+        // Plan the rest of the suffix against the state this batch is about to
+        // create. `plan_one_command` classifies from the durable command phase
+        // and event evidence, and the physical terminals change neither, so this
+        // is the same plan the next hydration would produce - it just reaches
+        // SQLite in the same transaction instead of a later one.
+        let steps = Self::plan_full_suffix(store, recovery).await?;
+        if !steps.is_empty() {
+            let suffix = LogicalRecoveryExecutor::plan_batch(
+                store,
+                recovery,
+                &steps,
+                lease.generation(),
+                &pending_physical,
+            )
+            .await
+            .context("plan the logical suffix this physical recovery makes necessary")?;
+            if !suffix.injected_commands.is_empty() {
+                bail!("physical recovery suffix must not inject commands");
+            }
+            writes.extend(suffix.writes);
+        }
+
+        let batch = EventBatch {
+            writes,
+            injected_commands: Vec::new(),
+        };
+        // EventWriter materializes one `command_disposition` event per terminal
+        // command projection, so the range this receipt must name is longer than
+        // the writes planned above.
+        let event_count = super::event_writer::materialized_event_count(&batch);
+        if event_count < physical_event_count {
+            bail!("physical recovery batch lost a terminal event while planning its suffix");
+        }
+        let last_seq = first_seq
+            .checked_add(
+                u64::try_from(event_count - 1)
+                    .context("physical recovery event count exceeds u64")?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("physical recovery last sequence overflow"))?;
+
+        let identity = HydrationReceiptIdentity {
+            personality_agent_id: lease.personality_agent_id().clone(),
+            lease_id: lease.lease_id().to_owned(),
+            generation: lease.generation(),
+            fence_id: fence.fence_id().to_owned(),
+            intent_count: intents.len(),
+        };
+        let mut receipt = PhysicalRecoveryReceipt {
+            receipt_id: format!("physical-recovery-{}", identity.stable_id()),
+            lease: lease.clone(),
+            fence: fence.clone(),
+            reap_attestation: reap_attestation.clone(),
+            intents,
+            logical_suffix_first_seq: first_seq,
+            logical_suffix_last_seq: last_seq,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.canonical_digest();
+
+        Ok((receipt, batch))
+    }
+
+    /// Test-only seam for the crash-boundary fixtures: build exactly the batch
+    /// `apply_boot_physical_receipt` would commit, and hand it back unapplied so
+    /// the caller can drive it through an abrupt transaction failpoint.
+    #[cfg(test)]
+    pub(crate) async fn plan_boot_physical_receipt_for_test(
+        store: &Store,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        reap_attestation: &PhysicalReapAttestation,
+        requests: &[PhysicalRecoveryIntentRequest],
+    ) -> Result<(PhysicalRecoveryReceipt, EventBatch)> {
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
+        Self::plan_boot_physical_receipt(store, &recovery, lease, fence, reap_attestation, requests)
+            .await
+    }
+
     /// Complete a T17 hydration suffix after T27 has supplied an authenticated
     /// physical recovery receipt.  EventWriter owns the transaction boundary;
     /// this wrapper intentionally does not kill/reap processes or persist the
     /// T27 proof store.
-    #[allow(dead_code, reason = "T26 hydration composes this T17 boundary")]
     pub(crate) async fn apply_physical_receipt(
         writer: &EventWriter,
         lease: &ProcessGenerationLease,
@@ -1818,7 +2125,7 @@ async fn durable_event_evidence(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use anyhow::{Result, bail};
@@ -1962,12 +2269,11 @@ mod tests {
         })
     }
 
-    async fn persist_terminal_tool(
+    async fn persist_running_tool(
         writer: &EventWriter,
         tool_call_id: &str,
         tool_name: &str,
         slot: u32,
-        is_error: bool,
     ) {
         let generation = test_generation();
         writer
@@ -2010,7 +2316,17 @@ mod tests {
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("prepare and start terminal ToolCall fixture");
+            .expect("prepare and start ToolCall fixture");
+    }
+
+    async fn persist_terminal_tool(
+        writer: &EventWriter,
+        tool_call_id: &str,
+        tool_name: &str,
+        slot: u32,
+        is_error: bool,
+    ) {
+        persist_running_tool(writer, tool_call_id, tool_name, slot).await;
 
         let result = ToolResultMessage {
             tool_call_id: tool_call_id.to_owned(),
@@ -2342,6 +2658,318 @@ mod tests {
         for (tool_call_id, tool_name, slot, is_error) in terminal_tools {
             persist_terminal_tool(writer, tool_call_id, tool_name, *slot, *is_error).await;
         }
+    }
+
+    /// Replacement-epoch authority for the boot fixture: the fixture's running
+    /// executions belong to generation 7, so generation 8 is the first epoch
+    /// whose attestation can cover them.
+    fn boot_recovery_authority(
+        store: &Store,
+    ) -> (
+        ProcessGenerationLease,
+        GenerationRecoveryFence,
+        PhysicalReapAttestation,
+    ) {
+        let personality_agent_id = store.scope().personality_agent_id.clone();
+        let lease = ProcessGenerationLease::new(
+            personality_agent_id.clone(),
+            ProcessGeneration::from_wire(8).expect("boot epoch generation"),
+            "boot-physical-recovery-lease",
+        )
+        .expect("boot physical recovery lease");
+        let fence = GenerationRecoveryFence::new(&lease, "boot-physical-recovery-fence")
+            .expect("boot physical recovery fence");
+        let attestation = PhysicalReapAttestation::from_wire(
+            personality_agent_id.as_str(),
+            8,
+            "boot-physical-recovery-nonce".to_owned(),
+            7,
+        )
+        .expect("boot physical reap attestation");
+        (lease, fence, attestation)
+    }
+
+    async fn seed_boot_running_tools(writer: &EventWriter, calls: &[(&str, &str, u32)]) {
+        seed_tool_use_restart_seam_with_assistant(
+            writer,
+            false,
+            tool_use_recovery_assistant_with_calls(calls),
+            &[],
+        )
+        .await;
+        for (tool_call_id, tool_name, slot) in calls {
+            persist_running_tool(writer, tool_call_id, tool_name, *slot).await;
+        }
+    }
+
+    pub(crate) async fn setup_boot_running_tools(
+        calls: &[(&str, &str, u32)],
+    ) -> (Arc<Store>, EventWriter) {
+        let (store, writer) = setup().await;
+        seed_boot_running_tools(&writer, calls).await;
+        (store, writer)
+    }
+
+    /// The same fixture on disk, so a test can drop the Store and reopen it the
+    /// way a restarted process would.
+    pub(crate) async fn setup_boot_running_tools_on_disk(
+        database_path: &std::path::Path,
+        calls: &[(&str, &str, u32)],
+    ) -> (Arc<Store>, EventWriter) {
+        let store = open_boot_running_tools_store(database_path).await;
+        let writer = EventWriter::new(store.clone());
+        seed_boot_running_tools(&writer, calls).await;
+        (store, writer)
+    }
+
+    /// Admitting the co-committed suffix widened what may sit inside a
+    /// receipt's sequence range, so the widening has to stay bound to the
+    /// receipt's own owner. A receipt that claims a different owning command no
+    /// longer authenticates the suffix's other ToolCalls, and is refused before
+    /// anything commits.
+    #[tokio::test]
+    async fn a_receipt_range_admits_the_co_committed_suffix_only_for_its_own_owner() {
+        let (store, writer) = setup_boot_running_tools_with_rowless_tail(
+            &[
+                ("tool-boot-owned", "read_file", 0),
+                ("tool-boot-rowless", "write_file", 1),
+            ],
+            1,
+        )
+        .await;
+        let (lease, fence, attestation) = boot_recovery_authority(&store);
+        let intents = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate the owner-binding fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("fixture must require physical recovery: {other:?}"),
+        };
+        let (mut receipt, batch) = SuffixRecovery::plan_boot_physical_receipt_for_test(
+            &store,
+            &lease,
+            &fence,
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("plan the boot physical recovery batch");
+
+        // Same events, same range - only the claimed owning command changes.
+        for intent in &mut receipt.intents {
+            intent.command_id = "00000000-0000-4000-8000-0000000000ff".to_owned();
+        }
+        receipt.digest = receipt.canonical_digest();
+
+        let error = SuffixRecovery::apply_physical_receipt(&writer, &lease, &fence, receipt, batch)
+            .await
+            .expect_err("a receipt must not authenticate another owner's suffix");
+        assert!(
+            format!("{error:#}")
+                .contains("recovery suffix contains a result for an unrelated tool"),
+            "{error:#}"
+        );
+        let (ledger, state): (i64, String) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'tool-boot-owned')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read the refused state");
+        assert_eq!((ledger, state.as_str()), (0, "running"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for the boot physical-recovery suffix atomicity test"]
+    async fn boot_physical_receipt_suffix_child() {
+        let boundary = std::env::var("SUMI_T27_BOUNDARY").expect("child boundary environment");
+        let database_path = std::path::PathBuf::from(
+            std::env::var("SUMI_T27_DATABASE").expect("child database environment"),
+        );
+        let readiness_path = std::path::PathBuf::from(
+            std::env::var("SUMI_T27_READY").expect("child readiness environment"),
+        );
+        let (store, writer) = setup_boot_running_tools_on_disk(
+            &database_path,
+            &[("tool-boot-kill", "read_file", 0)],
+        )
+        .await;
+        let (lease, fence, attestation) = boot_recovery_authority(&store);
+        let intents = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate the hard-kill fixture")
+        {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => intents,
+            other => panic!("hard-kill fixture must require physical recovery: {other:?}"),
+        };
+        let (receipt, batch) = SuffixRecovery::plan_boot_physical_receipt_for_test(
+            &store,
+            &lease,
+            &fence,
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("plan the boot physical recovery batch");
+        writer
+            .apply_boot_physical_recovery_with_abrupt_failpoint(
+                &lease,
+                &fence,
+                &receipt,
+                batch,
+                "boot_physical_receipt_suffix",
+                boundary == "after_commit",
+                &readiness_path,
+            )
+            .await
+            .expect("abrupt failpoint must not return");
+        panic!("abrupt failpoint returned");
+    }
+
+    /// The receipt transaction now carries the ledger, the `indeterminate`
+    /// terminal and the whole logical suffix, so a hard kill on either side of
+    /// its commit must leave all of them or none of them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_physical_receipt_and_its_suffix_are_all_or_none_across_a_hard_kill() {
+        for boundary in ["before_commit", "after_commit"] {
+            let root = std::env::temp_dir().join(format!(
+                "sumi-t27-boot-suffix-{boundary}-{}",
+                Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&root).expect("create the hard-kill fixture root");
+            let database_path = root.join("agent.db");
+            let readiness_path = root.join("ready");
+
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current unit test executable"),
+            )
+            .arg("--exact")
+            .arg("store::recovery::tests::boot_physical_receipt_suffix_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("SUMI_T27_BOUNDARY", boundary)
+            .env("SUMI_T27_DATABASE", &database_path)
+            .env("SUMI_T27_READY", &readiness_path)
+            .output()
+            .expect("run the boot physical recovery hard-kill child");
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{boundary} child did not exit at the failpoint:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+                format!("boot_physical_receipt_suffix.{boundary}\n")
+            );
+
+            let reopened = open_boot_running_tools_store(&database_path).await;
+            let observed: (i64, String, i64, i64, i64) = sqlx::query_as(
+                "SELECT
+                    (SELECT COUNT(*) FROM physical_recovery_receipt_applications),
+                    (SELECT state FROM tool_executions WHERE tool_call_id = 'tool-boot-kill'),
+                    (SELECT COUNT(*) FROM agent_events WHERE event_type = 'turn_end'),
+                    (SELECT COUNT(*) FROM agent_events WHERE event_type = 'agent_end'),
+                    (SELECT COUNT(*) FROM inbound_commands
+                     WHERE status = 'applied' AND run_phase = 'finished')",
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("read the restarted state after the hard kill");
+            let expected = if boundary == "after_commit" {
+                (1, "indeterminate".to_owned(), 1, 1, 1)
+            } else {
+                (0, "running".to_owned(), 0, 0, 0)
+            };
+            assert_eq!(
+                observed, expected,
+                "{boundary} left a torn ledger/terminal/suffix"
+            );
+            drop(reopened);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    pub(crate) async fn open_boot_running_tools_store(
+        database_path: &std::path::Path,
+    ) -> Arc<Store> {
+        Store::open(
+            database_path,
+            AgentScope {
+                personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
+            },
+            Arc::new(TestKeyProvider(WrappingKey::new(
+                "test",
+                [0x61; DATA_KEY_BYTES],
+            ))),
+        )
+        .await
+        .expect("open the on-disk boot fixture store")
+        .into()
+    }
+
+    /// The same ToolUse restart seam, but only the first `running_prefix` calls
+    /// ever reached the executor. The rest have no `tool_executions` row at all,
+    /// so resolving the physical intents is not enough to close the turn: the
+    /// logical suffix must also give those calls their pre-execution result.
+    pub(crate) async fn setup_boot_running_tools_with_rowless_tail(
+        calls: &[(&str, &str, u32)],
+        running_prefix: usize,
+    ) -> (Arc<Store>, EventWriter) {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam_with_assistant(
+            &writer,
+            false,
+            tool_use_recovery_assistant_with_calls(calls),
+            &[],
+        )
+        .await;
+        for (tool_call_id, tool_name, slot) in &calls[..running_prefix] {
+            persist_running_tool(&writer, tool_call_id, tool_name, *slot).await;
+        }
+        (store, writer)
+    }
+
+    pub(crate) async fn assert_indeterminate_surface(store: &Store, tool_call_id: &str) {
+        let (state, error_code): (String, Option<String>) =
+            sqlx::query_as("SELECT state, error_code FROM tool_executions WHERE tool_call_id = ?")
+                .bind(tool_call_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load physically recovered tool state");
+        assert_eq!(state, "indeterminate");
+        assert_eq!(error_code.as_deref(), Some("indeterminate"));
+
+        let envelope: String = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events
+             WHERE event_type = 'message_end'
+               AND json_extract(envelope, '$.message.role') = 'tool_result'
+               AND json_extract(envelope, '$.message.tool_call_id') = ?",
+        )
+        .bind(tool_call_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("load physical recovery ToolResult");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&envelope).expect("decode ToolResult event");
+        assert_eq!(
+            envelope
+                .pointer("/message/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some(PHYSICAL_RECOVERY_INDETERMINATE_TOOL_RESULT)
+        );
+        assert_eq!(
+            envelope
+                .pointer("/message/details/error")
+                .and_then(|v| v.as_str()),
+            Some("indeterminate")
+        );
     }
 
     async fn seed_pending_messaging_approval(writer: &EventWriter, turn_id: &str) {
