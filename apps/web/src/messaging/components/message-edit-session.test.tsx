@@ -184,11 +184,22 @@ function row(messageId: string): HTMLElement | null {
   );
 }
 
+/** 添付の開閉は画面側の状態。編集セッションの試験では常に閉じたまま。 */
+function renderList() {
+  return render(
+    <MessageList
+      revealedAttachmentIds={new Set()}
+      onRevealAttachment={() => undefined}
+      onOpenImage={() => undefined}
+    />,
+  );
+}
+
 describe("編集セッションは仮想リストの行より長生きする", () => {
   it("描画窓の外のメッセージでも編集を始めれば編集欄が現れる", async () => {
     const messages = makeMessages(MESSAGE_COUNT);
     seedStore(messages);
-    render(<MessageList />);
+    renderList();
 
     const target = messages[OFFSCREEN_INDEX].messageId;
     // 最初の描画窓は最新側。対象の行はまだ存在しない。
@@ -212,7 +223,7 @@ describe("編集セッションは仮想リストの行より長生きする", (
   it("編集中に行が描画窓から外れても書きかけは残る", async () => {
     const messages = makeMessages(MESSAGE_COUNT);
     seedStore(messages);
-    render(<MessageList />);
+    renderList();
 
     const target = messages[OFFSCREEN_INDEX].messageId;
     act(() => useMessaging.getState().startEdit(target));
@@ -247,7 +258,7 @@ describe("編集セッションは仮想リストの行より長生きする", (
   it("インライン編集中の @ 補完は候補を選ぶと表示名を挿入する", async () => {
     const messages = makeMessages(MESSAGE_COUNT);
     seedStore(messages);
-    render(<MessageList />);
+    renderList();
 
     act(() =>
       useMessaging.getState().startEdit(messages[OFFSCREEN_INDEX].messageId),
@@ -269,7 +280,7 @@ describe("編集セッションは仮想リストの行より長生きする", (
   it("候補表示後にキャレットを@から外してTabしても古い範囲を置換しない", async () => {
     const messages = makeMessages(MESSAGE_COUNT);
     seedStore(messages);
-    render(<MessageList />);
+    renderList();
 
     act(() =>
       useMessaging.getState().startEdit(messages[OFFSCREEN_INDEX].messageId),

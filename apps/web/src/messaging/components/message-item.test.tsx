@@ -99,6 +99,9 @@ function renderItem(
       onSubmitEdit={noop}
       onCancelEdit={noop}
       onReloadEditConflict={noop}
+      revealedAttachmentIds={new Set()}
+      onRevealAttachment={noop}
+      onOpenImage={noop}
       {...props}
     />,
   );
