@@ -550,7 +550,7 @@ func TestDurableReapStateRejectsOversizeBeforePublishing(t *testing.T) {
 	}
 }
 
-func TestDurableReapStateKeepsPublishedEntryAfterDirectorySyncFailure(t *testing.T) {
+func TestDurableReapStateConfirmsPublishedEntryOnDirectorySyncRetry(t *testing.T) {
 	stateDirectory := filepath.Join(t.TempDir(), "state")
 	state, err := newDurableReapState(stateDirectory)
 	if err != nil {
@@ -561,12 +561,19 @@ func TestDurableReapStateKeepsPublishedEntryAfterDirectorySyncFailure(t *testing
 	}
 
 	syncFailure := errors.New("injected directory sync failure")
-	state.syncDirectory = func(*os.File) error { return syncFailure }
+	syncAttempts := 0
+	state.syncDirectory = func(*os.File) error {
+		syncAttempts++
+		if syncAttempts == 1 {
+			return syncFailure
+		}
+		return nil
+	}
 	if err := state.record(testPAID2, 5); !errors.Is(err, syncFailure) {
 		t.Fatalf("post-rename directory sync failure was not returned: %v", err)
 	}
-	if generation, ok := state.lookup(testPAID2); !ok || generation != 5 {
-		t.Fatalf("post-rename entry was rolled back in memory: generation=%d ok=%t", generation, ok)
+	if generation, ok := state.lookup(testPAID2); ok || generation != 0 {
+		t.Fatalf("post-rename entry became durable in memory: generation=%d ok=%t", generation, ok)
 	}
 
 	restarted, err := newDurableReapState(stateDirectory)
@@ -577,7 +584,16 @@ func TestDurableReapStateKeepsPublishedEntryAfterDirectorySyncFailure(t *testing
 		t.Fatalf("post-rename entry was not present in the published document: generation=%d ok=%t", generation, ok)
 	}
 
-	state.syncDirectory = func(directory *os.File) error { return directory.Sync() }
+	if err := state.record(testPAID2, 5); err != nil {
+		t.Fatalf("retry directory sync for published reap attestation: %v", err)
+	}
+	if syncAttempts != 2 {
+		t.Fatalf("directory sync attempts = %d, want retry after failure", syncAttempts)
+	}
+	if generation, ok := state.lookup(testPAID2); !ok || generation != 5 {
+		t.Fatalf("retried post-rename entry did not become durable: generation=%d ok=%t", generation, ok)
+	}
+
 	thirdPAID := "0198f0f4-9b72-7000-8000-000000000003"
 	if err := state.record(thirdPAID, 7); err != nil {
 		t.Fatalf("later reap attestation discarded published entry: %v", err)

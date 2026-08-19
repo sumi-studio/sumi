@@ -715,10 +715,10 @@ epoch_identity() {
   EPOCH_NONCE="${nonce}"
 }
 
-# This is the one definition of the container collection that represents a
-# running epoch. All active inspection, teardown observation, and durable reap
-# receipt decisions consume it. It intentionally ignores every one-shot role
-# and any unrelated project-labelled container.
+# This is the definition of the container collection that represents a running
+# epoch. Active inspection deliberately ignores one-shot roles and unrelated
+# project-labelled containers: those containers do not make this generation
+# live.
 long_lived_role_states() {
   docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
@@ -844,10 +844,17 @@ require_expected_epoch() {
     fail "prepared epoch does not match requested activation handle"
 }
 
-long_lived_epoch_is_empty() {
-  # A reap receipt attests that runtime processes are gone. One-shot setup
-  # containers are not members of the epoch process set and cannot block it.
-  ! long_lived_containers_exist
+project_is_empty() {
+  # A reap receipt is an absence proof, unlike the long-lived-role liveness
+  # check above. It must therefore enumerate every container labelled with this
+  # Compose project, including old service names and one-shot/orphan remnants.
+  # Treat an inspection failure as non-empty so a failed `down` cannot turn an
+  # unobserved project into a physical-recovery receipt.
+  local output
+  output="$(docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}' 2>/dev/null)" || return 1
+  [[ -z "${output//[[:space:]]/}" ]]
 }
 
 cleanup_partial_generation() {
@@ -867,7 +874,7 @@ cleanup_partial_generation() {
     for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
       lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1
-      if long_lived_epoch_is_empty; then
+      if project_is_empty; then
         cleanup_complete=1
         break
       fi
@@ -987,7 +994,7 @@ case "${action}" in
     reaped_generation="${EPOCH_GENERATION}"
     lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
       >/dev/null 2>&1 || true
-    long_lived_epoch_is_empty || fail "abort did not remove every long-lived epoch role"
+    project_is_empty || fail "abort did not remove every project container"
     remove_runtime_secret_tree
     print_reaped_json "${reaped_generation}"
     ;;
@@ -999,7 +1006,7 @@ case "${action}" in
     reaped_generation="${EPOCH_GENERATION}"
     lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
       >/dev/null 2>&1 || true
-    long_lived_epoch_is_empty || fail "stop did not remove every long-lived epoch role"
+    project_is_empty || fail "stop did not remove every project container"
     remove_runtime_secret_tree
     print_reaped_json "${reaped_generation}"
     ;;
@@ -1034,7 +1041,7 @@ case "${action}" in
       # abort: Compose can already be empty, but the daemon had no chance to
       # publish its local receipt. `down` is a no-op in that case; always run
       # it so every other leftover container shape is removed before the
-      # long-lived epoch check and any durable re-attestation.
+      # project-wide empty check and any durable re-attestation.
       # If a durable epoch remains, the API must bind this destructive action
       # to the exact epoch whose local-control authority it already fenced.
       # Without an epoch there is no issued local-control authority; a
@@ -1046,7 +1053,7 @@ case "${action}" in
       fi
       lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1 || true
-      long_lived_epoch_is_empty || fail "reconcile did not remove every long-lived epoch role"
+      project_is_empty || fail "reconcile did not remove every project container"
       if epoch_identity; then
         reaped_generation="${EPOCH_GENERATION}"
         remove_runtime_secret_tree

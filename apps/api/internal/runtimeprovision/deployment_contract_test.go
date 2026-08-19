@@ -262,6 +262,90 @@ exec /usr/bin/stat "$@"
 	}
 }
 
+func TestSupervisorReconcileDoesNotAttestWhenPartialDownLeavesRenamedContainer(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "ps --all --filter label=com.docker.compose.project="*"--format {{.ID}}")
+    printf '0123456789ab\n'
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    # The old service name is not a long-lived role in the current manifest,
+    # but it still belongs to this Compose project and remains running after
+    # the partially failed down.
+    printf '0123456789ab\tretired-executor\trunning\n'
+    ;;
+  *"compose.lifecycle.yaml down"*)
+    exit 17
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=renamed-remnant-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" reconcile`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+		"SUMI_EXPECTED_RPC_GENERATION=7",
+		"SUMI_EXPECTED_RPC_NONCE=renamed-remnant-nonce",
+	}
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("reconcile attested a project with a renamed container remnant: %s", output)
+	}
+	if strings.Contains(string(output), `"reaped_through_generation"`) {
+		t.Fatalf("reconcile emitted a reap receipt despite the renamed remnant: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := strings.Index(string(calls), "compose.lifecycle.yaml down")
+	projectObservation := strings.LastIndex(string(calls), "--format {{.ID}}")
+	if down < 0 || projectObservation <= down {
+		t.Fatalf("reconcile did not verify every project container after partial down:\n%s", calls)
+	}
+}
+
 func TestSupervisorReconcileReattestsAlreadyEmptyProjectAfterProvisionerCrash(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
@@ -605,7 +689,7 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 	}
 	reconcile := supervisor[reconcileStart:]
 	for _, required := range []string{
-		"long_lived_epoch_is_empty || fail",
+		"project_is_empty || fail",
 		"if epoch_identity; then",
 		`print_reaped_json "${reaped_generation}"`,
 		"print_unknown_json",
@@ -615,7 +699,7 @@ func TestSupervisorReconcileAttestationContractPreservesUnknownWithoutDurableEpo
 		}
 	}
 	if strings.Index(reconcile, "require_expected_epoch") > strings.Index(reconcile, "lifecycle_compose down") ||
-		strings.Index(reconcile, "long_lived_epoch_is_empty") > strings.LastIndex(reconcile, "if epoch_identity; then") ||
+		strings.Index(reconcile, "project_is_empty") > strings.LastIndex(reconcile, "if epoch_identity; then") ||
 		strings.LastIndex(reconcile, "epoch_identity") > strings.Index(reconcile, "print_reaped_json") {
 		t.Fatalf("reconcile can attest before observed-empty verification and durable generation recovery:\n%s", reconcile)
 	}

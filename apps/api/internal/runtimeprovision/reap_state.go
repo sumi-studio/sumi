@@ -22,6 +22,10 @@ type durableReapState struct {
 	directory string
 	path      string
 	entries   map[string]uint64
+	// pending contains records that rename made visible but whose directory
+	// fsync has not yet succeeded. They deliberately do not appear in entries:
+	// callers may consume only a receipt whose durable ordering is confirmed.
+	pending map[string]uint64
 	// Kept on the state so tests can deterministically exercise the boundary
 	// after os.Rename has made a new document visible.
 	syncDirectory func(*os.File) error
@@ -70,6 +74,7 @@ func newDurableReapState(directory string) (*durableReapState, error) {
 		directory: directory,
 		path:      filepath.Join(directory, reapStateFileName),
 		entries:   make(map[string]uint64),
+		pending:   make(map[string]uint64),
 		syncDirectory: func(directory *os.File) error {
 			return directory.Sync()
 		},
@@ -95,6 +100,18 @@ func (state *durableReapState) load() error {
 	}
 	if info.Size() > maxReapStateBytes {
 		return errors.New("durable reap state exceeds the maximum allowed size")
+	}
+	// A previous provisioner can have renamed this document and then failed its
+	// directory fsync before it exited. Synchronize the directory before loading
+	// any generation into this process, so a restart cannot turn that uncertain
+	// publication into a durable receipt without completing the missing step.
+	directory, err := os.Open(state.directory)
+	if err != nil {
+		return fmt.Errorf("open reap state directory: %w", err)
+	}
+	defer directory.Close()
+	if err := state.syncDirectory(directory); err != nil {
+		return fmt.Errorf("sync reap state directory: %w", err)
 	}
 	file, err := os.Open(state.path)
 	if err != nil {
@@ -144,38 +161,67 @@ func (state *durableReapState) record(personalityAgentID string, generation uint
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if err := state.confirmPending(); err != nil {
+		return err
+	}
 	previous, existed := state.entries[personalityAgentID]
 	if existed && previous >= generation {
 		return nil
 	}
-	state.entries[personalityAgentID] = generation
-	published, err := state.persist()
+	candidate := make(map[string]uint64, len(state.entries)+1)
+	for id, reaped := range state.entries {
+		candidate[id] = reaped
+	}
+	candidate[personalityAgentID] = generation
+	published, err := state.persistEntries(candidate)
 	if err != nil {
-		// A failed write before rename leaves the old document authoritative, so
-		// restore the in-memory view. Once rename succeeds, the new document is
-		// already visible even if directory fsync reports an uncertain durability
-		// result; keeping the entry prevents a later write from deleting it.
-		if !published {
-			if existed {
-				state.entries[personalityAgentID] = previous
-			} else {
-				delete(state.entries, personalityAgentID)
-			}
+		// A failed write before rename leaves the previous durable state
+		// authoritative. After rename, retain only a pending marker: a retry must
+		// fsync the directory before this receipt becomes visible in memory.
+		if published {
+			state.pending[personalityAgentID] = generation
 		}
 		return err
 	}
+	state.entries[personalityAgentID] = generation
+	return nil
+}
+
+// confirmPending retries the directory fsync for a document that was already
+// renamed into place. A successful sync makes all of its pending receipts
+// durable and only then advances the in-memory generations used by callers.
+func (state *durableReapState) confirmPending() error {
+	if len(state.pending) == 0 {
+		return nil
+	}
+	directory, err := os.Open(state.directory)
+	if err != nil {
+		return fmt.Errorf("open reap state directory: %w", err)
+	}
+	defer directory.Close()
+	if err := state.syncDirectory(directory); err != nil {
+		return fmt.Errorf("sync reap state directory: %w", err)
+	}
+	for personalityAgentID, generation := range state.pending {
+		state.entries[personalityAgentID] = generation
+	}
+	clear(state.pending)
 	return nil
 }
 
 // persist reports whether the document was published with os.Rename before an
-// error. A post-rename error means durable ordering is uncertain, not that the
-// old document is still current.
+// error. A post-rename error means durable ordering is uncertain, and callers
+// must retry its directory fsync before treating the records as durable.
 func (state *durableReapState) persist() (published bool, result error) {
+	return state.persistEntries(state.entries)
+}
+
+func (state *durableReapState) persistEntries(entries map[string]uint64) (published bool, result error) {
 	document := reapStateDocument{
 		Version:           reapStateVersion,
-		PersonalityAgents: make(map[string]reapStateAgentRecord, len(state.entries)),
+		PersonalityAgents: make(map[string]reapStateAgentRecord, len(entries)),
 	}
-	for personalityAgentID, generation := range state.entries {
+	for personalityAgentID, generation := range entries {
 		reapedThroughGeneration := generation
 		document.PersonalityAgents[personalityAgentID] = reapStateAgentRecord{
 			ReapedThroughGeneration: &reapedThroughGeneration,
