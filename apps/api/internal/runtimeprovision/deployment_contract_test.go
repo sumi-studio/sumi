@@ -1133,8 +1133,8 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 		}
 	}
 	for _, row := range []string{
-		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance Docker process group (all descendants)",
-		"ps --all --quiet none CLEANUP_VERIFICATION_TIMEOUT_SECONDS Docker process group (all descendants)",
+		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance + TERM grace Docker process group (all descendants)",
+		"ps --all --quiet none verification timeout + TERM grace Docker process group (all descendants)",
 	} {
 		if !strings.Contains(compactSupervisor, row) {
 			t.Fatalf("supervisor cleanup group-deadline table omits %q:\n%s", row, compactSupervisor)
@@ -1146,11 +1146,22 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	if !strings.Contains(compactSupervisor, "containers=\"$(cleanup_verification_lifecycle_compose ps --all --quiet 2>/dev/null)\"") {
 		t.Fatalf("cleanup emptiness verification is not subject to the advertised timeout: %s", compactSupervisor)
 	}
+	for _, required := range []string{
+		"deadline_milliseconds=$(( $(monotonic_time_milliseconds) + (timeout_seconds + kill_grace_seconds) * MILLISECONDS_PER_SECOND ))",
+		"milliseconds_until_cleanup_term \"${deadline_milliseconds}\" \"${kill_grace_seconds}\"",
+	} {
+		if !strings.Contains(compactSupervisor, required) {
+			t.Fatalf("supervisor cleanup deadline does not reserve TERM grace from one clock %q:\n%s", required, compactSupervisor)
+		}
+	}
 }
 
 func TestSupervisorCleanupKillsForkedDockerChildAfterLeaderExit(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is required to hold a cleanup process group outside a new session")
 	}
 	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
 		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
@@ -1160,6 +1171,7 @@ func TestSupervisorCleanupKillsForkedDockerChildAfterLeaderExit(t *testing.T) {
 	dockerLog := filepath.Join(testRoot, "docker.log")
 	prepareReady := filepath.Join(testRoot, "prepare-ready")
 	hangCleanupDown := filepath.Join(testRoot, "hang-cleanup-down")
+	forceUnisolatedCleanup := filepath.Join(testRoot, "force-unisolated-cleanup")
 	cleanupDownStarted := filepath.Join(testRoot, "cleanup-down-started")
 	cleanupChildPID := filepath.Join(testRoot, "cleanup-child-pid")
 	fakeDocker := filepath.Join(testRoot, "docker")
@@ -1181,6 +1193,24 @@ case "$*" in
 esac
 `
 	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeSetsid := filepath.Join(testRoot, "setsid")
+	fakeSetsidScript := `#!/bin/sh
+set -eu
+case "$*" in
+  *"compose.lifecycle.yaml"*)
+    if [ -e "$SUMI_FORCE_UNISOLATED_CLEANUP" ]; then
+      # Keep the child process group alive but outside a new session. This
+      # makes the supervisor's /proc isolation probe consume its full normal
+      # budget before the process-group cleanup path takes over.
+      exec /usr/bin/perl -MPOSIX -e 'POSIX::setpgid(0, 0) or die "$!\n"; exec @ARGV' "$@"
+    fi
+    ;;
+esac
+exec /usr/bin/setsid "$@"
+`
+	if err := os.WriteFile(fakeSetsid, []byte(fakeSetsidScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	fakeStat := filepath.Join(testRoot, "stat")
@@ -1218,6 +1248,7 @@ exec /usr/bin/stat "$@"
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
 		"SUMI_PREPARE_READY=" + prepareReady,
 		"SUMI_HANG_CLEANUP_DOWN=" + hangCleanupDown,
+		"SUMI_FORCE_UNISOLATED_CLEANUP=" + forceUnisolatedCleanup,
 		"SUMI_CLEANUP_DOWN_STARTED=" + cleanupDownStarted,
 		"SUMI_CLEANUP_CHILD_PID=" + cleanupChildPID,
 		"SUMI_SUPERVISOR_CONTROL_FD=3",
@@ -1236,6 +1267,9 @@ exec /usr/bin/stat "$@"
 	}
 	waitForSupervisorFile(t, prepareReady, 5*time.Second)
 	if err := os.WriteFile(hangCleanupDown, []byte("hang"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(forceUnisolatedCleanup, []byte("force"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
