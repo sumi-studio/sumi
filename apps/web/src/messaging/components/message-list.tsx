@@ -84,6 +84,9 @@ export function MessageList({
   const editDraft = useMessaging((state) => state.editDraft);
   const editConflict = useMessaging((state) => state.editConflict);
   const editFailure = useMessaging((state) => state.editFailure);
+  const editSavedWithPendingChanges = useMessaging(
+    (state) => state.editSavedWithPendingChanges,
+  );
   const setEditDraft = useMessaging((state) => state.setEditDraft);
   const reloadEditConflict = useMessaging((state) => state.reloadEditConflict);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
@@ -410,6 +413,7 @@ export function MessageList({
             editDraft={editDraft}
             editConflict={editConflict}
             editFailure={editFailure}
+            editSavedWithPendingChanges={editSavedWithPendingChanges}
             onEditDraftChange={setEditDraft}
             onSubmitEdit={submitEdit}
             onCancelEdit={cancelEdit}
@@ -424,6 +428,7 @@ export function MessageList({
       editDraft,
       editConflict,
       editFailure,
+      editSavedWithPendingChanges,
       setEditDraft,
       reloadEditConflict,
       submitEdit,

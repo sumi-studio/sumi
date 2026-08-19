@@ -28,6 +28,7 @@ export function MessageEditor({
   onCancel,
   conflict,
   failure,
+  savedWithPendingChanges,
   onReloadConflict,
   membersByKey,
   selfKey,
@@ -38,6 +39,7 @@ export function MessageEditor({
   onCancel: () => void;
   conflict: { content: string; revision: number } | null;
   failure?: string | null;
+  savedWithPendingChanges?: boolean;
   onReloadConflict: () => void;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   selfKey: ParticipantKey;
@@ -140,6 +142,8 @@ export function MessageEditor({
           </>
         ) : failure ? (
           <span role="alert">{failure}</span>
+        ) : savedWithPendingChanges ? (
+          <span role="status">保存済み。さらに未保存の変更があります。</span>
         ) : (
           <span>Escでキャンセル・Enterで保存</span>
         )}

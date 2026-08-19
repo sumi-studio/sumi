@@ -750,6 +750,69 @@ describe("編集セッションのタイムライン整合性", () => {
     );
   });
 
+  it("保存中の追記は成功応答後も残し、次の保存は確定revisionを基準にする", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const submitted = "送った版";
+    const appended = "送った版の追記";
+    const committed = {
+      ...target,
+      content: submitted,
+      editedAt: Date.UTC(2026, 7, 19, 12, 30, 0),
+      revision: (target.revision ?? 1) + 1,
+    };
+    let resolveSave: ((message: Message) => void) | undefined;
+    const save = new Promise<Message>((resolve) => {
+      resolveSave = resolve;
+    });
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockImplementationOnce(() => save);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft(submitted));
+    act(() => useMessaging.getState().submitEdit());
+    act(() => useMessaging.getState().setEditDraft(appended));
+
+    await act(async () => {
+      resolveSave?.(committed);
+      await save;
+    });
+
+    await waitFor(() => {
+      expect(useMessaging.getState()).toMatchObject({
+        editingMessageId: target.messageId,
+        editDraft: appended,
+        editBaseRevision: committed.revision,
+        editSavedWithPendingChanges: true,
+      });
+      expect(
+        useMessaging
+          .getState()
+          .messagesByPlace["channel:ch-general"]?.find(
+            (message) => message.messageId === target.messageId,
+          ),
+      ).toMatchObject({ content: submitted, revision: committed.revision });
+    });
+
+    act(() => useMessaging.getState().submitEdit());
+    await waitFor(() =>
+      expect(edit).toHaveBeenLastCalledWith(
+        target.place,
+        target.messageId,
+        appended,
+        committed.revision,
+      ),
+    );
+  });
+
   it("保存中に取消して別の編集を始めても、先の成功は新しいセッションを閉じない", async () => {
     const backend = await bootStore();
     const [first, second] = (
