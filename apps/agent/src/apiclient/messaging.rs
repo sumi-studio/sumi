@@ -295,6 +295,11 @@ pub(crate) struct MessagingParticipant {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartMessagingDMRequest<'a> {
     pub participants: &'a [MessagingParticipant],
+    /// Group DMs create a new place, so an indeterminate retry must identify
+    /// the original creation. A one-to-one DM already has a canonical pair
+    /// key on the server and consequently needs no nonce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_nonce: Option<&'a str>,
 }
 
 /// Opening a channel.  There is no workspace field: the sealed scope already
@@ -306,6 +311,7 @@ pub(crate) struct CreateMessagingChannelRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<&'a str>,
     pub voice: bool,
+    pub client_nonce: &'a str,
 }
 
 /// Editing a channel's mutable identity.  An omitted field is left alone, so a
@@ -328,6 +334,7 @@ pub(crate) struct DuplicateMessagingChannelRequest<'a> {
     pub place_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<&'a str>,
+    pub client_nonce: &'a str,
 }
 
 #[derive(Debug, Serialize)]

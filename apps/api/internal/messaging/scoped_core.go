@@ -1,7 +1,10 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -69,26 +72,141 @@ func validChannelName(name string) bool {
 	return name != "" && utf8.RuneCountInString(name) <= MaxChannelNameChars
 }
 
-func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string, voice bool) (Place, error) {
-	if !validChannelName(name) {
-		return Place{}, ErrInvalidChannelName
+const (
+	placeCreationChannel   = "create_channel"
+	placeCreationDuplicate = "duplicate_channel"
+	placeCreationGroupDM   = "create_group_dm"
+)
+
+// A place creation can commit before an HTTP peer receives its response. Keep
+// a receipt under the authenticated scoped actor, just as message sends keep
+// their client nonce, so retrying that exact operation returns the first
+// place rather than minting another one.
+func (s *ScopedStore) replayPlaceCreation(
+	ctx context.Context,
+	tx pgx.Tx,
+	operation, nonce string,
+	digest []byte,
+) (Place, bool, error) {
+	if nonce == "" {
+		return Place{}, false, nil
 	}
+	if len(nonce) > 128 {
+		return Place{}, false, ErrIdempotencyConflict
+	}
+	// PostgreSQL text rejects NUL, while a client nonce may contain arbitrary
+	// valid text. %q escapes control bytes, and this advisory key only needs to
+	// serialize contenders for the same durable receipt (a collision merely
+	// serializes otherwise independent creations).
+	key := fmt.Sprintf("place-creation/%s/%s/%s/%q", s.Scope.WorkspaceID, s.Scope.Actor.Key(), operation, nonce)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+		return Place{}, false, fmt.Errorf("lock place creation nonce: %w", err)
+	}
+	var storedDigest []byte
+	var placeID string
+	err := tx.QueryRow(ctx, `
+		SELECT request_digest, place_id
+		FROM messaging_place_creation_receipts
+		WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3
+		  AND operation = $4 AND client_nonce = $5`,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, nonce,
+	).Scan(&storedDigest, &placeID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Place{}, false, nil
+	}
+	if err != nil {
+		return Place{}, false, fmt.Errorf("load place creation receipt: %w", err)
+	}
+	if !bytes.Equal(storedDigest, digest) {
+		return Place{}, false, ErrIdempotencyConflict
+	}
+	place, err := s.loadScopedPlace(ctx, tx, placeID)
+	if err != nil {
+		return Place{}, false, fmt.Errorf("load idempotent place creation: %w", err)
+	}
+	return place, true, nil
+}
+
+func (s *ScopedStore) recordPlaceCreation(
+	ctx context.Context,
+	tx pgx.Tx,
+	operation, nonce string,
+	digest []byte,
+	placeID string,
+) error {
+	if nonce == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO messaging_place_creation_receipts
+			(workspace_id, member_kind, member_id, operation, client_nonce, request_digest, place_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, nonce, digest, placeID,
+	)
+	if err != nil {
+		return fmt.Errorf("record place creation receipt: %w", err)
+	}
+	return nil
+}
+
+func placeCreationDigest(operation string, request any) []byte {
+	encoded, err := json.Marshal(struct {
+		Operation string `json:"operation"`
+		Request   any    `json:"request"`
+	}{operation, request})
+	if err != nil {
+		panic("place creation request must be JSON serializable")
+	}
+	sum := sha256.Sum256(encoded)
+	return sum[:]
+}
+
+func (s *ScopedStore) CreateChannel(ctx context.Context, name, topic string, voice bool) (Place, error) {
+	place, _, err := s.createChannel(ctx, name, topic, voice, "")
+	return place, err
+}
+
+func (s *ScopedStore) CreateChannelOnce(ctx context.Context, name, topic string, voice bool, nonce string) (Place, bool, error) {
+	return s.createChannel(ctx, name, topic, voice, nonce)
+}
+
+func (s *ScopedStore) createChannel(ctx context.Context, name, topic string, voice bool, nonce string) (Place, bool, error) {
+	if !validChannelName(name) {
+		return Place{}, false, ErrInvalidChannelName
+	}
+	digest := placeCreationDigest(placeCreationChannel, struct {
+		Name  string `json:"name"`
+		Topic string `json:"topic"`
+		Voice bool   `json:"voice"`
+	}{name, topic, voice})
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Place{}, fmt.Errorf("begin create channel: %w", err)
+		return Place{}, false, fmt.Errorf("begin create channel: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := s.authorizeManageChannelsInTx(ctx, tx); err != nil {
-		return Place{}, err
+		return Place{}, false, err
+	}
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationChannel, nonce, digest); err != nil || replayed {
+		if err != nil {
+			return Place{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Place{}, false, fmt.Errorf("commit replay create channel: %w", err)
+		}
+		return place, false, nil
 	}
 	place, err := s.insertChannelInTx(ctx, tx, name, topic, voice)
 	if err != nil {
-		return Place{}, fmt.Errorf("insert channel: %w", err)
+		return Place{}, false, fmt.Errorf("insert channel: %w", err)
+	}
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationChannel, nonce, digest, place.PlaceID); err != nil {
+		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Place{}, fmt.Errorf("commit create channel: %w", err)
+		return Place{}, false, fmt.Errorf("commit create channel: %w", err)
 	}
-	return place, nil
+	return place, true, nil
 }
 
 // insertChannelInTx writes the new channel and reads back the row the database
@@ -184,38 +302,63 @@ func (s *ScopedStore) UpdateChannel(ctx context.Context, placeID string, name, t
 // empty. An empty name takes the derived default, so the human menu and the
 // agent tool cannot disagree about what a copy is called.
 func (s *ScopedStore) DuplicateChannel(ctx context.Context, placeID, name string) (Place, error) {
+	place, _, err := s.duplicateChannel(ctx, placeID, name, "")
+	return place, err
+}
+
+func (s *ScopedStore) DuplicateChannelOnce(ctx context.Context, placeID, name, nonce string) (Place, bool, error) {
+	return s.duplicateChannel(ctx, placeID, name, nonce)
+}
+
+func (s *ScopedStore) duplicateChannel(ctx context.Context, placeID, name, nonce string) (Place, bool, error) {
 	if name != "" && !validChannelName(name) {
-		return Place{}, ErrInvalidChannelName
+		return Place{}, false, ErrInvalidChannelName
 	}
+	digest := placeCreationDigest(placeCreationDuplicate, struct {
+		PlaceID string `json:"place_id"`
+		Name    string `json:"name"`
+	}{placeID, name})
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Place{}, fmt.Errorf("begin duplicate channel: %w", err)
+		return Place{}, false, fmt.Errorf("begin duplicate channel: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	if _, err := s.authorizeManageChannelsInTx(ctx, tx); err != nil {
-		return Place{}, err
+		return Place{}, false, err
+	}
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationDuplicate, nonce, digest); err != nil || replayed {
+		if err != nil {
+			return Place{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Place{}, false, fmt.Errorf("commit replay duplicate channel: %w", err)
+		}
+		return place, false, nil
 	}
 	source, err := s.loadScopedPlace(ctx, tx, placeID)
 	if err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
 	if _, err := s.placeAccessAfterAuthorization(ctx, tx, source, s.Scope.Actor); err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
 	if source.Kind != PlaceChannel {
-		return Place{}, ErrNotAChannel
+		return Place{}, false, ErrNotAChannel
 	}
 	if name == "" {
 		name = copyChannelName(source.Name)
 	}
 	place, err := s.insertChannelInTx(ctx, tx, name, source.Topic, source.Voice)
 	if err != nil {
-		return Place{}, fmt.Errorf("insert duplicated channel: %w", err)
+		return Place{}, false, fmt.Errorf("insert duplicated channel: %w", err)
+	}
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationDuplicate, nonce, digest, place.PlaceID); err != nil {
+		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Place{}, fmt.Errorf("commit duplicate channel: %w", err)
+		return Place{}, false, fmt.Errorf("commit duplicate channel: %w", err)
 	}
-	return place, nil
+	return place, true, nil
 }
 
 // copyChannelName derives the default name of a copy. The server owns it so
@@ -318,28 +461,49 @@ func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place
 }
 
 func (s *ScopedStore) CreateGroupDM(ctx context.Context, others []ParticipantRef) (Place, error) {
+	place, _, err := s.createGroupDM(ctx, others, "")
+	return place, err
+}
+
+func (s *ScopedStore) CreateGroupDMOnce(ctx context.Context, others []ParticipantRef, nonce string) (Place, bool, error) {
+	return s.createGroupDM(ctx, others, nonce)
+}
+
+func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef, nonce string) (Place, bool, error) {
 	others, err := normalizeDMOthers(s.Scope.Actor, others)
 	if err != nil {
-		return Place{}, err
+		return Place{}, false, err
 	}
 	members := append([]ParticipantRef{s.Scope.Actor}, others...)
 	if len(members) < 3 {
-		return Place{}, errors.New("a group dm needs at least three distinct participants")
+		return Place{}, false, errors.New("a group dm needs at least three distinct participants")
 	}
+	digest := placeCreationDigest(placeCreationGroupDM, struct {
+		Participants []ParticipantRef `json:"participants"`
+	}{others})
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Place{}, fmt.Errorf("begin create group dm: %w", err)
+		return Place{}, false, fmt.Errorf("begin create group dm: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
 	if err != nil {
-		return Place{}, err
+		return Place{}, false, err
+	}
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest); err != nil || replayed {
+		if err != nil {
+			return Place{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Place{}, false, fmt.Errorf("commit replay create group dm: %w", err)
+		}
+		return place, false, nil
 	}
 	memberships := []workspacecontrol.Membership{actorMembership}
 	for _, ref := range members[1:] {
 		membership, err := s.workspaces.ActiveMembershipInTx(ctx, tx, s.Scope.WorkspaceID, ref)
 		if err != nil {
-			return Place{}, ErrNotReachable
+			return Place{}, false, ErrNotReachable
 		}
 		memberships = append(memberships, membership)
 	}
@@ -347,17 +511,20 @@ func (s *ScopedStore) CreateGroupDM(ctx context.Context, others []ParticipantRef
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO places (place_id, kind, workspace_id)
 		VALUES ($1, 'group_dm', $2)`, place.PlaceID, place.WorkspaceID); err != nil {
-		return Place{}, fmt.Errorf("insert group dm: %w", err)
+		return Place{}, false, fmt.Errorf("insert group dm: %w", err)
 	}
 	for _, membership := range memberships {
 		if err := admitPlaceTenure(ctx, tx, place.PlaceID, membership, 1); err != nil {
-			return Place{}, err
+			return Place{}, false, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return Place{}, fmt.Errorf("commit create group dm: %w", err)
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest, place.PlaceID); err != nil {
+		return Place{}, false, err
 	}
-	return place, nil
+	if err := tx.Commit(ctx); err != nil {
+		return Place{}, false, fmt.Errorf("commit create group dm: %w", err)
+	}
+	return place, true, nil
 }
 
 func admitPlaceTenure(ctx context.Context, tx pgx.Tx, placeID string, membership workspacecontrol.Membership, visibleFrom int64) error {
