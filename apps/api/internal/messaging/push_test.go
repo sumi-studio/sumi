@@ -18,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // 使い捨てのブラウザ購読鍵。対応する秘密鍵はどこにも無いので、暗号化された
@@ -745,5 +747,205 @@ func TestPushTopicCollapsesOnlyACanonicalPlaceID(t *testing.T) {
 	}
 	if got := pushTopic("not-a-uuid"); got != "" {
 		t.Fatalf("unexpected topic for a malformed place id: %q", got)
+	}
+}
+
+// ownerGenerationFor reads one endpoint's owner_generation straight from the
+// row. The delivery fence turns on this value, so the test reads it directly
+// rather than going through the subscription loader's projection.
+func (w world) ownerGenerationFor(t *testing.T, ctx context.Context, endpoint string) int64 {
+	t.Helper()
+	var gen int64
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT owner_generation FROM push_subscriptions WHERE endpoint = $1",
+		endpoint).Scan(&gen); err != nil {
+		t.Fatalf("read owner_generation for %s: %v", endpoint, err)
+	}
+	return gen
+}
+
+// ownerOfEndpoint returns the Human who currently owns the endpoint, or empty.
+func (w world) ownerOfEndpoint(t *testing.T, ctx context.Context, endpoint string) ParticipantRef {
+	t.Helper()
+	var humanID string
+	err := w.store.pool.QueryRow(ctx,
+		"SELECT human_id FROM push_subscriptions WHERE endpoint = $1",
+		endpoint).Scan(&humanID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ParticipantRef{}
+	}
+	if err != nil {
+		t.Fatalf("read owner for %s: %v", endpoint, err)
+	}
+	return Human(humanID)
+}
+
+// TestPushSubscriptionOwnerGenerationAdvancesOnlyOnCrossOwnerTransfer
+// captures the generation invariant the delivery fence relies on: 同一所有者
+// の再購読は世代を進めず、別の Human への移管（同一鍵素材による引き継ぎ）
+// だけが世代を進める。
+func TestPushSubscriptionOwnerGenerationAdvancesOnlyOnCrossOwnerTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+	const endpoint = "https://push.example.test/gen"
+
+	// A が初めて購読。世代は 1。
+	w.subscribe(t, ctx, w.humanA, endpoint)
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 1 {
+		t.Fatalf("initial generation = %d, want 1", gen)
+	}
+
+	// 同一所有者 A の再購読（同じ鍵素材）。世代は進まない——所有者は変わっていない。
+	w.subscribe(t, ctx, w.humanA, endpoint)
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 1 {
+		t.Fatalf("same-owner reregister generation = %d, want 1", gen)
+	}
+
+	// 同一所有者でも鍵素材が変わる再購読。p256dh/auth は更新されるが、所有者は
+	// A のままなので世代は進まない。
+	if _, err := w.store.mustScopeForActor(t, ctx, w.humanA).SavePushSubscription(ctx,
+		endpoint, "BDCBECfmPtnXzdwJgF_TdPNsC6ZfDnFm31D8x6HqxOJ7zq3tJamfSlIVx2cDwsSUKwGiiuucupkLMDwJFObrclA-2",
+		"lRvaLEgVKoLGOxRND8ZCTA-2"); err != nil {
+		t.Fatalf("same-owner rekey: %v", err)
+	}
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 1 {
+		t.Fatalf("same-owner rekey generation = %d, want 1", gen)
+	}
+	if owner := w.ownerOfEndpoint(t, ctx, endpoint); owner != w.humanA {
+		t.Fatalf("same-owner rekey moved ownership to %v", owner)
+	}
+
+	// 同一ブラウザ（同一鍵素材）で B へログインし直す。endpoint は B に移り、
+	// 世代が進む。これが配信 fence の対象となる移管である。ブラウザが今持って
+	// いる鍵素材（rekey 後の ...-2）を B が提示して引き継ぐ。
+	if _, err := w.store.mustScopeForActor(t, ctx, w.humanB).SavePushSubscription(ctx,
+		endpoint,
+		"BDCBECfmPtnXzdwJgF_TdPNsC6ZfDnFm31D8x6HqxOJ7zq3tJamfSlIVx2cDwsSUKwGiiuucupkLMDwJFObrclA-2",
+		"lRvaLEgVKoLGOxRND8ZCTA-2"); err != nil {
+		t.Fatalf("cross-owner transfer: %v", err)
+	}
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 2 {
+		t.Fatalf("cross-owner transfer generation = %d, want 2", gen)
+	}
+	if owner := w.ownerOfEndpoint(t, ctx, endpoint); owner != w.humanB {
+		t.Fatalf("cross-owner transfer owner = %v, want %v", owner, w.humanB)
+	}
+
+	// 移管後の B の再購読はまた世代を進めない。
+	w.subscribe(t, ctx, w.humanB, endpoint)
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 2 {
+		t.Fatalf("post-transfer same-owner reregister generation = %d, want 2", gen)
+	}
+}
+
+// TestPushSendSkipsWhenEndpointTransferredToAnotherHumanAfterPlan is the core
+// fence: 配信計画が A の membership で認可した本文を、計画後に endpoint が B に
+// 移管されたとしても B のブラウザへ送ってはならない。送信の直前に endpoint の
+// 世代を読み直し、計画時と一致しなければ取り止める。
+func TestPushSendSkipsWhenEndpointTransferredToAnotherHumanAfterPlan(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+	const endpoint = "https://push.example.test/fence"
+
+	// A が購読。この時点の世代（=1）が配信計画の世代になる。
+	w.subscribe(t, ctx, w.humanA, endpoint)
+	planned := w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()][0]
+	if planned.OwnerGeneration != 1 {
+		t.Fatalf("planned generation = %d, want 1", planned.OwnerGeneration)
+	}
+
+	// 計画確定と送信のあいだに、同じブラウザで B へログインし直す。
+	// endpoint は B に移り、世代が 2 に進む。
+	w.subscribe(t, ctx, w.humanB, endpoint)
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 2 {
+		t.Fatalf("post-transfer generation = %d, want 2", gen)
+	}
+
+	// 配信は計画時の世代（1）を持ったまま送信に入る。送信直前の確認で世代が
+	// 一致しないので、HTTPS への一バイトも出ない。
+	client := &recordingPushClient{}
+	dispatcher := w.dispatcher(t, ctx, client)
+	dispatcher.send(ctx, planned, []byte(`{"title":"Aの秘密の本文"}`), "", planned.OwnerGeneration)
+
+	if sent := client.endpoints(); len(sent) != 0 {
+		t.Fatalf("push sent to transferred endpoint: %v", sent)
+	}
+}
+
+// TestPushSendHoldsEndpointLeaseSoTransferWaitsForInFlightSend は逆方向の
+// 境界: 送信が先に endpoint lease を取ったなら、その送信が終わるまで移管は
+// 待たされる。fake endpoint に sleep させて、送信中の移管が完了しないことと、
+// 送信完了後に移管が進んで世代が進むことを見る。
+func TestPushSendHoldsEndpointLeaseSoTransferWaitsForInFlightSend(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+	const endpoint = "https://push.example.test/inflight"
+
+	w.subscribe(t, ctx, w.humanA, endpoint)
+	planned := w.subscriptionsFor(t, ctx, w.humanA)[w.humanA.Key()][0]
+
+	client := &blockingPushClient{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	dispatcher := w.dispatcher(t, ctx, client)
+
+	delivered := make(chan struct{})
+	go func() {
+		defer close(delivered)
+		dispatcher.send(ctx, planned, []byte(`{"title":"送信中"}`), "", planned.OwnerGeneration)
+	}()
+
+	// 送信が endpoint lease を取り、世代を確認し、HTTPS Do に入った。
+	select {
+	case <-client.started:
+	case <-ctx.Done():
+		t.Fatal("push never reached the blocked endpoint")
+	}
+
+	// 送信が lease を持っている間、別アカウントへの移管は完了しない。
+	transferDone := make(chan error, 1)
+	go func() {
+		_, err := w.store.mustScopeForActor(t, ctx, w.humanB).
+			SavePushSubscription(ctx, endpoint, testPushP256dh, testPushAuth)
+		transferDone <- err
+	}()
+	select {
+	case err := <-transferDone:
+		close(client.release)
+		<-delivered
+		t.Fatalf("transfer completed while push send held the endpoint lease: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		// 期待通り: 移管は送信の完了を待っている。
+	}
+
+	// 送信を完了させると lease が放たれ、移管が進む。
+	close(client.release)
+	select {
+	case <-delivered:
+	case <-ctx.Done():
+		t.Fatal("push delivery did not finish after release")
+	}
+	select {
+	case err := <-transferDone:
+		if err != nil {
+			t.Fatalf("transfer after release: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("transfer did not complete after push send finished")
+	}
+
+	// 移管が完了し、endpoint は B に移り世代が進んでいる。
+	if owner := w.ownerOfEndpoint(t, ctx, endpoint); owner != w.humanB {
+		t.Fatalf("post-release owner = %v, want %v", owner, w.humanB)
+	}
+	if gen := w.ownerGenerationFor(t, ctx, endpoint); gen != 2 {
+		t.Fatalf("post-release generation = %d, want 2", gen)
 	}
 }

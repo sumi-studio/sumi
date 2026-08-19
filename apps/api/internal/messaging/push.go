@@ -61,7 +61,12 @@ type PushSubscription struct {
 	Endpoint       string
 	P256dh         string
 	Auth           string
-	CreatedAt      time.Time
+	// OwnerGeneration is the endpoint's owner epoch. 所有者が同じブラウザの
+	// ログインし直しで別の Human に移るたびに進む。配信計画はこの値を持ち、
+	// 送信の直前に読み直して一致を確認する——計画時の所有者で認可された本文が、
+	// 移管後の所有者のブラウザへ届くのを防ぐ。
+	OwnerGeneration int64
+	CreatedAt       time.Time
 }
 
 var (
@@ -158,6 +163,15 @@ func (s *ScopedStore) SavePushSubscription(
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", owner.ID); err != nil {
 		return PushSubscription{}, fmt.Errorf("lock push subscriptions: %w", err)
 	}
+	// endpoint 単位の lease。配信 (deliver) は送信の直前に同じ鍵を取り、世代を
+	// 読み直してから HTTP に出る。ここで取ると、配信中の送信が終わるまで移管は
+	// 待たされ、送信は移管後の世代を見て取り止まる。これは一つの endpoint の
+	// 一回の送信を束ねるだけの lease であって、r7 が禁じた「Workspace の共有
+	// ロックの中で外部 I/O をする」ものではない——Workspace/place のロックは
+	// 配信計画を確定した時点で既に手放している。
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint); err != nil {
+		return PushSubscription{}, fmt.Errorf("lock push endpoint: %w", err)
+	}
 	var otherEndpoints int
 	if err := tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM push_subscriptions
@@ -174,19 +188,27 @@ func (s *ScopedStore) SavePushSubscription(
 		P256dh:         p256dh,
 		Auth:           auth,
 	}
+	// ON CONFLICT の移管経路で所有者が変わるときだけ owner_generation を進める。
+	// 同一所有者の再購読は世代を進めない（所有者は変わっていない）。世代が
+	// 進むと、進む前の世代で作った配信計画は送信直前の確認で弾かれる。
 	err = tx.QueryRow(ctx,
 		`INSERT INTO push_subscriptions (subscription_id, human_id, endpoint, p256dh, auth)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (endpoint) DO UPDATE
 		   SET human_id = EXCLUDED.human_id,
 		       p256dh = EXCLUDED.p256dh,
-		       auth = EXCLUDED.auth
+		       auth = EXCLUDED.auth,
+		       owner_generation = CASE
+		         WHEN push_subscriptions.human_id = EXCLUDED.human_id
+		           THEN push_subscriptions.owner_generation
+		         ELSE push_subscriptions.owner_generation + 1
+		       END
 		   WHERE push_subscriptions.human_id = EXCLUDED.human_id
 		      OR (push_subscriptions.p256dh = EXCLUDED.p256dh
 		          AND push_subscriptions.auth = EXCLUDED.auth)
-		 RETURNING subscription_id, created_at`,
+		 RETURNING subscription_id, owner_generation, created_at`,
 		subscription.SubscriptionID, owner.ID, endpoint, p256dh, auth).
-		Scan(&subscription.SubscriptionID, &subscription.CreatedAt)
+		Scan(&subscription.SubscriptionID, &subscription.OwnerGeneration, &subscription.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return PushSubscription{}, ErrPushSubscriptionOwned
 	}
@@ -249,7 +271,7 @@ func (s *Store) pushSubscriptionsForWith(
 		return out, nil
 	}
 	rows, err := q.Query(ctx,
-		`SELECT subscription_id, human_id, endpoint, p256dh, auth, created_at
+		`SELECT subscription_id, human_id, endpoint, p256dh, auth, owner_generation, created_at
 		 FROM push_subscriptions WHERE human_id = ANY($1)
 		 ORDER BY created_at`, humanIDs)
 	if err != nil {
@@ -262,7 +284,8 @@ func (s *Store) pushSubscriptionsForWith(
 			humanID      string
 		)
 		if err := rows.Scan(&subscription.SubscriptionID, &humanID, &subscription.Endpoint,
-			&subscription.P256dh, &subscription.Auth, &subscription.CreatedAt); err != nil {
+			&subscription.P256dh, &subscription.Auth, &subscription.OwnerGeneration,
+			&subscription.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan push subscription: %w", err)
 		}
 		subscription.Human = Human(humanID)
@@ -466,7 +489,7 @@ func (d *PushDispatcher) deliver(
 		return
 	}
 	for _, delivery := range deliveries {
-		d.send(ctx, delivery.subscription, delivery.payload, delivery.topic)
+		d.send(ctx, delivery.subscription, delivery.payload, delivery.topic, delivery.ownerGeneration)
 	}
 }
 
@@ -474,6 +497,11 @@ type pushDelivery struct {
 	subscription PushSubscription
 	payload      []byte
 	topic        string
+	// ownerGeneration is the endpoint's owner epoch captured in the delivery
+	// plan. send rechecks it under the endpoint lease before any HTTPS byte
+	// leaves the process: if the endpoint was transferred to another Human in
+	// the meantime, the generation no longer matches and the send is dropped.
+	ownerGeneration int64
 }
 
 // deliveryPlanInTx only reads durable state and builds bytes. In particular,
@@ -553,16 +581,41 @@ func (d *PushDispatcher) deliveryPlanInTx(
 		}
 		for _, subscription := range endpoints {
 			out = append(out, pushDelivery{
-				subscription: subscription,
-				payload:      payload,
-				topic:        pushTopic(currentPlace.PlaceID),
+				subscription:    subscription,
+				payload:         payload,
+				topic:           pushTopic(currentPlace.PlaceID),
+				ownerGeneration: subscription.OwnerGeneration,
 			})
 		}
 	}
 	return out, nil
 }
 
-func (d *PushDispatcher) send(ctx context.Context, subscription PushSubscription, payload []byte, topic string) {
+// send delivers one planned push to one endpoint. 「この endpoint に送ってよいのは
+// 所有者 X の分」という判断は、送信の瞬間まで有効でなければならない。配信計画は
+// 計画時の owner_generation を持っているが、計画確定（audience lease の commit）
+// からこの HTTP 送信のあいだに、同じブラウザで別の Human へログインし直すと
+// endpoint 行は移管され世代が進む。
+//
+// だから送信の直前に endpoint 単位の短い lease を取り、世代が計画時と一致する
+// ことを確認してから HTTPS に出る。移管 (SavePushSubscription の ON CONFLICT
+// 経路) は同じ lease を取るので、送信中の移管は送信の完了を待ち、送信は移管後の
+// 世代を見て取り止まる。この lease は一つの endpoint の一回の送信の間だけ
+// （最大 push timeout）なので、r7 が禁じた「Workspace の共有ロックの中で外部 I/O」
+// には当たらない——Workspace/place のロックは配信計画を確定した時点で手放して
+// あり、ここで持つのは一つの endpoint の advisory lock だけである。
+func (d *PushDispatcher) send(ctx context.Context, subscription PushSubscription, payload []byte, topic string, planGeneration int64) {
+	lease, ok, err := d.acquireEndpointSendLease(ctx, subscription.Endpoint, planGeneration)
+	if err != nil {
+		log.Printf("messaging push: acquire endpoint lease: %v", err)
+		return
+	}
+	if !ok {
+		// 世代が進んだ＝endpoint は別の Human に移った。計画時の所有者で認可
+		// された本文を、移管後のブラウザへ届けてはいけない。
+		return
+	}
+	defer lease.release()
 	response, err := webpush.SendNotificationWithContext(ctx, payload, &webpush.Subscription{
 		Endpoint: subscription.Endpoint,
 		Keys:     webpush.Keys{P256dh: subscription.P256dh, Auth: subscription.Auth},
@@ -598,6 +651,60 @@ func (d *PushDispatcher) send(ctx context.Context, subscription PushSubscription
 		// rate limit・payload rejection の区別には十分である。
 		log.Printf("messaging push: unexpected response status %d", response.StatusCode)
 	}
+}
+
+// pushEndpointSendLease is the one-endpoint lease held across a single HTTPS
+// send. release drops the advisory lock by ending the backing transaction.
+type pushEndpointSendLease struct {
+	tx pgx.Tx
+}
+
+func (l pushEndpointSendLease) release() {
+	// rollback releases the transaction-scoped advisory lock. The HTTP send is
+	// best-effort and writes nothing through this transaction, so rollback is
+	// the correct end regardless of the response.
+	_ = l.tx.Rollback(context.Background())
+}
+
+// acquireEndpointSendLease takes the endpoint advisory lock and reports whether
+// the endpoint's current owner_generation still matches the plan. ok is false
+// (with no error) when the endpoint was transferred or vanished since the plan
+// was made — the caller drops that send. The returned lease, when ok, must be
+// released after the HTTPS send so that a waiting transfer can proceed.
+func (d *PushDispatcher) acquireEndpointSendLease(
+	ctx context.Context, endpoint string, planGeneration int64,
+) (pushEndpointSendLease, bool, error) {
+	tx, err := d.store.pool.Begin(ctx)
+	if err != nil {
+		return pushEndpointSendLease{}, false, fmt.Errorf("begin endpoint lease: %w", err)
+	}
+	lease := pushEndpointSendLease{tx: tx}
+	// SavePushSubscription の移管経路が取るのと同じ鍵。送信が先なら移管はこれを
+	// 待ち、移管が先ならここで待たされた後に世代が変わって見える。
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint); err != nil {
+		_ = tx.Rollback(context.Background())
+		return pushEndpointSendLease{}, false, fmt.Errorf("lock push endpoint: %w", err)
+	}
+	var currentGeneration int64
+	err = tx.QueryRow(ctx,
+		"SELECT owner_generation FROM push_subscriptions WHERE endpoint = $1",
+		endpoint).Scan(&currentGeneration)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// endpoint はもう無い（410 清掃か人間の解除が先に効いた）。送る相手が無い。
+		_ = tx.Rollback(context.Background())
+		return pushEndpointSendLease{}, false, nil
+	}
+	if err != nil {
+		_ = tx.Rollback(context.Background())
+		return pushEndpointSendLease{}, false, fmt.Errorf("read endpoint generation: %w", err)
+	}
+	if currentGeneration != planGeneration {
+		// 計画時から所有者が変わった。A の membership で認可された本文を、
+		// 移管後のブラウザへ届けてはいけない。
+		_ = tx.Rollback(context.Background())
+		return pushEndpointSendLease{}, false, nil
+	}
+	return lease, true, nil
 }
 
 // pushTopic collapses a place's queued pushes into the latest one. RFC 8030 の

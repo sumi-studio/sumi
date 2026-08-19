@@ -27,6 +27,13 @@ CREATE TABLE push_subscriptions (
     endpoint        text        NOT NULL UNIQUE CHECK (length(endpoint) BETWEEN 1 AND 2000),
     p256dh          text        NOT NULL CHECK (length(p256dh) BETWEEN 1 AND 200),
     auth            text        NOT NULL CHECK (length(auth) BETWEEN 1 AND 100),
+    -- owner_generation は endpoint の所有者世代。同じブラウザ（同一鍵素材）で
+    -- Human A → Human B へログインし直すと endpoint 行は B に移るが、そのとき
+    -- 世代を進める。配信計画は (endpoint, owner, owner_generation) を持ち、
+    -- 送信の直前に世代が計画時と一致することを確認する。一致しなければ送信を
+    -- 取り止める——A の membership で認可された本文が B のブラウザへ届くのを
+    -- 防ぐ。同一所有者の再購読は世代を進めない（所有者は変わっていない）。
+    owner_generation bigint     NOT NULL DEFAULT 1 CHECK (owner_generation > 0),
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 

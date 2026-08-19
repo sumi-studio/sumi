@@ -55,6 +55,7 @@ import {
 } from "./email-link-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
+import { disablePushSubscription } from "../messaging/push";
 import {
   AuthAPIError,
   canonicalizeSumiDisplayName,
@@ -835,6 +836,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // cleanup then closes its upgraded socket before this request clears the
     // cookie that authorized it.
     flushSync(() => setSessionState("checking"));
+    // ログアウト時にブラウザの push 購読を外す。防御の一層であって、サーバー側
+    // の endpoint 世代 fence の代わりにはしない——同じブラウザで別アカウントへ
+    // ログインし直したとき、届き先が同じ物理端末であることはここでは変えられな
+    // い。それでも、購読を unsubscribe しておけば、古い endpoint への到達を端末
+    // 側で受け取る窓を閉じる。サーバーへの DELETE は cookie が生きているうちに
+    // best-effort で出す。失敗してもサーバー側の fence と 410 清掃が効く。
+    await disablePushSubscription().catch(() => undefined);
     try {
       await serializeSessionMutation(async () => {
         await logoutSumiSession();
