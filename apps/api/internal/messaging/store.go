@@ -106,6 +106,10 @@ type MemberProfile struct {
 	Revision int64
 }
 
+// ParticipantProfile is the public name for the canonical participant profile
+// returned by shared write boundaries used outside the messaging package.
+type ParticipantProfile = MemberProfile
+
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple
 // Secretaries canonically named Sumi. The composite is presentation only: the
 // agent registry continues to store "Sumi", while its stable Human relation

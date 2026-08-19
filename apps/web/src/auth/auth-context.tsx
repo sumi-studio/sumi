@@ -23,6 +23,7 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import { applyConfirmedMessagingProfile } from "../messaging/store";
 import {
   clearPendingConfirmation,
   loadPendingConfirmation,
@@ -742,7 +743,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           throw new AuthAPIError("Authentication is unavailable.", 401);
         }
         const requestedDisplayName = canonicalizeSumiDisplayName(displayName);
-        let updatedUser: { id: string; displayName: string };
+        let updatedUser: Awaited<ReturnType<typeof updateSumiProfile>>;
         try {
           updatedUser = await updateSumiProfile(requestedDisplayName);
         } catch (error) {
@@ -816,6 +817,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (updatedUser.id !== current.user.id) {
           throw new AuthAPIError("Profile identity changed.", 409);
         }
+        // `/auth/profile` is a confirmed profile arrival, just like a
+        // Messaging save ACK, live profile_updated frame, or bootstrap.
+        // Project it through the shared revision gate before exposing it.
+        applyConfirmedMessagingProfile(updatedUser.profile);
         const nextSession: SumiSessionStatus = {
           ...current,
           user: updatedUser,

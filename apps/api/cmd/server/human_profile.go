@@ -68,11 +68,11 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 	}
 
 	called := false
-	var displayName string
+	var profile messaging.ParticipantProfile
 	err = s.sessions.AuthorizeSession(r.Context(), claims, func() error {
 		called = true
-		profile, updateErr := s.messaging.SetHumanProfile(r.Context(), claims.UserID, request.DisplayName)
-		displayName = profile.DisplayName
+		var updateErr error
+		profile, updateErr = s.messaging.SetHumanProfile(r.Context(), claims.UserID, request.DisplayName)
 		return updateErr
 	})
 	if !called {
@@ -97,10 +97,30 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
 		} `json:"user"`
+		Profile struct {
+			Participant struct {
+				Kind    string `json:"kind"`
+				HumanID string `json:"human_id"`
+			} `json:"participant"`
+			DisplayName string `json:"display_name"`
+			Tagline     string `json:"tagline"`
+			Revision    int64  `json:"revision"`
+		} `json:"profile"`
 	}{User: struct {
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
-	}{ID: claims.UserID, DisplayName: displayName}})
+	}{ID: claims.UserID, DisplayName: profile.DisplayName}, Profile: struct {
+		Participant struct {
+			Kind    string `json:"kind"`
+			HumanID string `json:"human_id"`
+		} `json:"participant"`
+		DisplayName string `json:"display_name"`
+		Tagline     string `json:"tagline"`
+		Revision    int64  `json:"revision"`
+	}{Participant: struct {
+		Kind    string `json:"kind"`
+		HumanID string `json:"human_id"`
+	}{Kind: string(profile.Participant.Kind), HumanID: profile.Participant.ID}, DisplayName: profile.ProjectedDisplayName(), Tagline: profile.Tagline, Revision: profile.Revision}})
 }
 
 func writeHumanProfileError(w http.ResponseWriter, status int, code string) {

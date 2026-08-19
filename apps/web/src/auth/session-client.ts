@@ -9,6 +9,19 @@ export interface SumiSessionUser {
   displayName: string | null;
 }
 
+export interface ConfirmedSumiProfile {
+  participant: { kind: "human"; humanId: string };
+  displayName: string;
+  tagline: string;
+  revision: number;
+}
+
+export interface SumiProfileUpdate {
+  id: string;
+  displayName: string;
+  profile: ConfirmedSumiProfile;
+}
+
 export type SumiSessionStatus =
   | { authenticated: false }
   | {
@@ -178,7 +191,7 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
 
 export async function updateSumiProfile(
   displayName: string,
-): Promise<{ id: string; displayName: string }> {
+): Promise<SumiProfileUpdate> {
   const trimmedDisplayName = canonicalizeSumiDisplayName(displayName);
   if (
     !trimmedDisplayName ||
@@ -197,11 +210,33 @@ export async function updateSumiProfile(
     body.user.id.length > 256 ||
     typeof body.user.display_name !== "string" ||
     body.user.display_name.length === 0 ||
-    Array.from(body.user.display_name).length > maxDisplayNameCodePoints
+    Array.from(body.user.display_name).length > maxDisplayNameCodePoints ||
+    !isObject(body.profile) ||
+    !isObject(body.profile.participant) ||
+    body.profile.participant.kind !== "human" ||
+    typeof body.profile.participant.human_id !== "string" ||
+    body.profile.participant.human_id !== body.user.id ||
+    body.profile.display_name !== body.user.display_name ||
+    typeof body.profile.tagline !== "string" ||
+    typeof body.profile.revision !== "number" ||
+    !Number.isSafeInteger(body.profile.revision) ||
+    body.profile.revision < 1
   ) {
     throw new AuthAPIError("Invalid authentication response.", 200);
   }
-  return { id: body.user.id, displayName: body.user.display_name };
+  return {
+    id: body.user.id,
+    displayName: body.user.display_name,
+    profile: {
+      participant: {
+        kind: "human",
+        humanId: body.profile.participant.human_id,
+      },
+      displayName: body.profile.display_name,
+      tagline: body.profile.tagline,
+      revision: Number(body.profile.revision),
+    },
+  };
 }
 
 export function canonicalizeSumiDisplayName(displayName: string): string {

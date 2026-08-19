@@ -67,7 +67,7 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
 	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
-	request := profileRequest(`{"display_name":"  かずい\nさん  "}`)
+	request := profileRequest(`{"display_name":"  かずい さん  "}`)
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, request)
 	if response.Code != http.StatusOK {
@@ -81,12 +81,24 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
 		} `json:"user"`
+		Profile struct {
+			Participant struct {
+				Kind    string `json:"kind"`
+				HumanID string `json:"human_id"`
+			} `json:"participant"`
+			DisplayName string `json:"display_name"`
+			Tagline     string `json:"tagline"`
+			Revision    int64  `json:"revision"`
+		} `json:"profile"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
 	if result.User.ID != profileTestHumanID || result.User.DisplayName != "かずい さん" || sessions.operationRun != 1 {
 		t.Fatalf("result=%+v operationRun=%d", result, sessions.operationRun)
+	}
+	if result.Profile.Participant.Kind != "human" || result.Profile.Participant.HumanID != profileTestHumanID || result.Profile.DisplayName != "かずい さん" || result.Profile.Tagline != "" || result.Profile.Revision != 1 {
+		t.Fatalf("profile=%+v", result.Profile)
 	}
 	var stored string
 	var customized bool
@@ -143,6 +155,7 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 		}, want: http.StatusUnsupportedMediaType},
 		{name: "duplicate key", req: func() *http.Request { return profileRequest(`{"display_name":"A","display_name":"B"}`) }, want: http.StatusBadRequest},
 		{name: "control", req: func() *http.Request { return profileRequest(`{"display_name":"safe\u202edanger"}`) }, want: http.StatusBadRequest},
+		{name: "line break", req: func() *http.Request { return profileRequest(`{"display_name":"かずい\nさん"}`) }, want: http.StatusBadRequest},
 		{name: "overlong", req: func() *http.Request {
 			return profileRequest(`{"display_name":"` + strings.Repeat("名", koseki.MaxHumanDisplayNameRunes+1) + `"}`)
 		}, want: http.StatusBadRequest},

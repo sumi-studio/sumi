@@ -144,6 +144,12 @@ describe("Sumi browser session client", () => {
         new Response(
           JSON.stringify({
             user: { id: "user-1", display_name: "かずい" },
+            profile: {
+              participant: { kind: "human", human_id: "user-1" },
+              display_name: "かずい",
+              tagline: "",
+              revision: 1,
+            },
           }),
           { status: 200 },
         ),
@@ -153,6 +159,12 @@ describe("Sumi browser session client", () => {
     await expect(updateSumiProfile("かずい")).resolves.toEqual({
       id: "user-1",
       displayName: "かずい",
+      profile: {
+        participant: { kind: "human", humanId: "user-1" },
+        displayName: "かずい",
+        tagline: "",
+        revision: 1,
+      },
     });
     expect(fetchMock.mock.calls[1]).toEqual([
       "/auth/profile",

@@ -148,6 +148,23 @@ function applyConfirmedProfiles(
   return merged;
 }
 
+/**
+ * Projects a confirmed profile received outside a bound Messaging scope.
+ * Account settings uses this for the `/auth/profile` save ACK: the profile is
+ * still participant-global, even while no Workspace transport is active.
+ */
+export function applyConfirmedMessagingProfile(profile: MemberProfile): void {
+  useMessaging.setState((current) => {
+    const selfKey = current.selfKey || participantKey(profile.participant);
+    return {
+      membersByKey: applyConfirmedProfiles(current.membersByKey, [profile], {
+        knownOnly: true,
+        selfKey,
+      }),
+    };
+  });
+}
+
 function unboundMessagingBackend(): MessagingBackend {
   const target = {
     capabilities: UNBOUND_CAPABILITIES,

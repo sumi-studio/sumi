@@ -26,6 +26,15 @@ import { AuthAPIError, SumiSessionCompensatedError } from "./session-client";
 const authorityBindingA = "A".repeat(43);
 const authorityBindingB = `${"B".repeat(42)}E`;
 
+function confirmedProfile(id: string, displayName: string, revision = 1) {
+  return {
+    participant: { kind: "human" as const, humanId: id },
+    displayName,
+    tagline: "",
+    revision,
+  };
+}
+
 const authMocks = vi.hoisted(() => ({
   getSumiSession: vi.fn(),
   logoutSumiSession: vi.fn(),
@@ -159,6 +168,7 @@ beforeEach(() => {
   authMocks.updateSumiProfile.mockResolvedValue({
     id: "user-a",
     displayName: "After",
+    profile: confirmedProfile("user-a", "After"),
   });
   authMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
   authMocks.beginSameEmailCredentialRecovery.mockResolvedValue(undefined);
@@ -239,6 +249,7 @@ describe("canonical Human profile", () => {
     authMocks.updateSumiProfile.mockResolvedValue({
       id: "user-a",
       displayName: "After",
+      profile: confirmedProfile("user-a", "After"),
     });
 
     render(
@@ -317,6 +328,53 @@ describe("canonical Human profile", () => {
     expect(screen.getByTestId("display-name")).toHaveTextContent(
       "別タブの確定名",
     );
+  });
+
+  it("projects the /auth/profile ACK while Messaging is unbound and keeps it after rebind", async () => {
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "h-yohaku", displayName: "session fallback" },
+    });
+    authMocks.updateSumiProfile.mockResolvedValue({
+      id: "h-yohaku",
+      displayName: "After",
+      profile: confirmedProfile("h-yohaku", "After"),
+    });
+    const server = new MockMessagingServer();
+    bindMessagingSessionIdentity("h-yohaku");
+    installMessagingBackend(server);
+    useMessaging.getState().init();
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+    await waitFor(() =>
+      expect(screen.getByTestId("display-name")).toHaveTextContent("yohaku"),
+    );
+
+    setActiveMessagingScope({
+      workspaceId: "ws-sumi",
+      installationId: "installation-sumi",
+      authorityEpoch: "1",
+    });
+    bindMessagingScope(null);
+    expect(useMessaging.getState().ready).toBe(false);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("display-name")).toHaveTextContent("After"),
+    );
+
+    installMessagingBackend(server);
+    useMessaging.getState().init();
+    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+    expect(screen.getByTestId("display-name")).toHaveTextContent("After");
   });
 
   it("reconciles a committed profile update whose response was lost", async () => {
@@ -495,12 +553,15 @@ describe("canonical Human profile", () => {
     let resolveFirstUpdate!: (value: {
       id: string;
       displayName: string;
+      profile: ReturnType<typeof confirmedProfile>;
     }) => void;
-    const firstUpdate = new Promise<{ id: string; displayName: string }>(
-      (resolve) => {
-        resolveFirstUpdate = resolve;
-      },
-    );
+    const firstUpdate = new Promise<{
+      id: string;
+      displayName: string;
+      profile: ReturnType<typeof confirmedProfile>;
+    }>((resolve) => {
+      resolveFirstUpdate = resolve;
+    });
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
       authorityBindingId: authorityBindingA,
@@ -529,7 +590,11 @@ describe("canonical Human profile", () => {
       screen.getByRole("button", { name: "update display name" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
-    resolveFirstUpdate({ id: "user-a", displayName: "After" });
+    resolveFirstUpdate({
+      id: "user-a",
+      displayName: "After",
+      profile: confirmedProfile("user-a", "After"),
+    });
 
     await waitFor(() => {
       expect(screen.getByTestId("session-state")).toHaveTextContent(
