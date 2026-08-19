@@ -17,6 +17,7 @@ const bootstrap = {
     {
       channel_id: "channel-1",
       workspace_id: "workspace-1",
+      revision: 1,
       name: "general",
       topic: "",
       visibility: "public",
@@ -367,6 +368,12 @@ describe("ApiMessagingBackend", () => {
         ) {
           return json(channelSummaryWire("新しいトピック"));
         }
+        if (
+          path === "/messaging/places/channel-2/duplicate" &&
+          init?.method === "POST"
+        ) {
+          return json(channelSummaryWire("開発の相談"), 201);
+        }
         throw new Error(`unexpected request ${path}`);
       },
     );
@@ -379,6 +386,7 @@ describe("ApiMessagingBackend", () => {
     ).resolves.toEqual({
       channelId: "channel-2",
       workspaceId: "workspace-1",
+      revision: 1,
       name: "dev",
       topic: "開発の相談",
       visibility: "public",
@@ -417,9 +425,26 @@ describe("ApiMessagingBackend", () => {
       ]),
     ).resolves.toMatchObject({ dmId: "group-dm-1", kind: "group_dm" });
 
+    // 省いた項目はwireにも載せない。トピックだけの編集で名前を巻き込まない。
     await expect(
-      backend.updateChannelTopic("channel-2", "新しいトピック"),
+      backend.updateChannel("channel-2", { topic: "新しいトピック" }),
     ).resolves.toMatchObject({ topic: "新しいトピック" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/places/channel-2"),
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ topic: "新しいトピック" }),
+      }),
+    );
+
+    // 複製の名前はサーバーが決める。クライアントは「〜 のコピー」を組み立てない。
+    await expect(backend.duplicateChannel("channel-2")).resolves.toMatchObject({
+      channelId: "channel-2",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/places/channel-2/duplicate"),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({}) }),
+    );
   });
 
   it("projects place_created and place_updated from the socket", async () => {
@@ -528,6 +553,7 @@ describe("ApiMessagingBackend", () => {
       statuses: [
         {
           participant: { kind: "human", human_id: "human-2" },
+          revision: 5,
           status: "busy",
           note: "取り込み中",
           expires_at: null,
@@ -545,9 +571,12 @@ describe("ApiMessagingBackend", () => {
         if (path === "/messaging/status" && init?.method === "PUT") {
           return json({
             participant: { kind: "human", human_id: "human-1" },
+            revision: 6,
             status: "busy",
             note: "取り込み中",
-            expires_at: null,
+            expires_at: "2026-08-01T11:00:00Z",
+            base_status: "available",
+            base_note: "",
           });
         }
         if (path.endsWith("/reply-later") && init?.method === "POST") {
@@ -582,9 +611,12 @@ describe("ApiMessagingBackend", () => {
     expect(snapshot.statuses).toEqual([
       {
         participant: { kind: "human", humanId: "human-2" },
+        revision: 5,
         status: "busy",
         note: "取り込み中",
         expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
       },
     ]);
     expect(snapshot.replyLaterMarkers.map((marker) => marker.remindAt)).toEqual(
@@ -594,21 +626,33 @@ describe("ApiMessagingBackend", () => {
     // 再接続後の再同期は、bootstrapと同じ現在値をもう一度読み直す。
     await expect(backend.fetchPresence()).resolves.toEqual({
       statuses: snapshot.statuses,
+      clearedStatuses: [],
       replyLaterMarkers: snapshot.replyLaterMarkers,
     });
 
     // mutationはserverが確定した値を返す。呼び出し側はecho待ちにならない。
-    await expect(backend.setStatus("busy", "取り込み中")).resolves.toEqual({
+    // 期限付きの申告は、戻る先までserverが確定して返す。
+    const until = Date.parse("2026-08-01T11:00:00Z");
+    await expect(
+      backend.setStatus("busy", "取り込み中", until),
+    ).resolves.toEqual({
       participant: { kind: "human", humanId: "human-1" },
+      revision: 6,
       status: "busy",
       note: "取り込み中",
-      expiresAt: null,
+      expiresAt: until,
+      baseStatus: "available",
+      baseNote: "",
     });
     expect(fetchMock).toHaveBeenCalledWith(
       scopedMessagingTestPath("/messaging/status"),
       expect.objectContaining({
         method: "PUT",
-        body: JSON.stringify({ status: "busy", note: "取り込み中" }),
+        body: JSON.stringify({
+          status: "busy",
+          note: "取り込み中",
+          expires_at: "2026-08-01T11:00:00.000Z",
+        }),
       }),
     );
 
@@ -648,6 +692,7 @@ describe("ApiMessagingBackend", () => {
         type: "status_updated",
         status: {
           participant: { kind: "human", human_id: "human-2" },
+          revision: 7,
           status: "away",
           note: "",
           expires_at: "2026-08-01T12:00:00Z",
@@ -805,6 +850,7 @@ function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
     workspace_id: "workspace-1",
+    revision: 1,
     name: "dev",
     topic,
     visibility: "public",

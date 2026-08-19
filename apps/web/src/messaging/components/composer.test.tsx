@@ -35,6 +35,7 @@ const members: MemberProfile[] = [
 const channel: ChannelSummary = {
   channelId: "c1",
   workspaceId: "w1",
+  revision: 1,
   name: "general",
   topic: "",
   visibility: "public",

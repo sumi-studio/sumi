@@ -27,6 +27,8 @@ vi.mock("../place-route", () => ({
 
 const SELF = { kind: "human", humanId: "human-a" } as const;
 const realCreateChannel = useMessaging.getState().createChannel;
+const realUpdateChannel = useMessaging.getState().updateChannel;
+const realDuplicateChannel = useMessaging.getState().duplicateChannel;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -55,6 +57,7 @@ function setTwoWorkspaceState(
       {
         channelId: "channel-a",
         workspaceId: "workspace-a",
+        revision: 1,
         name: "alpha",
         topic: "",
         visibility: "public",
@@ -63,6 +66,7 @@ function setTwoWorkspaceState(
       {
         channelId: "channel-b",
         workspaceId: "workspace-b",
+        revision: 1,
         name: "beta",
         topic: "",
         visibility: "public",
@@ -298,9 +302,12 @@ describe("Sidebar overlay and IME behavior", () => {
       statusByKey: {
         "human:human-a": {
           participant: SELF,
+          revision: 1,
           status: "available",
           note: "",
           expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
         },
       },
       unreadCountByPlace: {},
@@ -324,7 +331,7 @@ describe("Sidebar overlay and IME behavior", () => {
     useMessaging.setState({ createChannel: realCreateChannel });
   });
 
-  it("shows the selected place notification level as a radio and closes after selection", () => {
+  it("shows the selected place notification level inside the place menu and closes after selection", () => {
     render(
       <Sidebar
         selectedPlaceKey="channel:channel-a"
@@ -332,15 +339,22 @@ describe("Sidebar overlay and IME behavior", () => {
       />,
     );
 
-    fireEvent.click(screen.getAllByRole("button", { name: "通知設定" })[0]);
-    expect(screen.getByRole("radio", { name: /すべて通知/ })).toBeChecked();
-    fireEvent.click(screen.getByRole("radio", { name: /ミュート/ }));
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: /通知設定/ }));
+    expect(
+      screen.getByRole("menuitemradio", { name: /すべて通知/ }),
+    ).toBeChecked();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /ミュート/ }));
 
     expect(setPlaceNotificationLevel).toHaveBeenCalledWith(
       "channel:channel-a",
       "mute",
     );
-    expect(screen.queryByRole("radio", { name: /ミュート/ })).toBeNull();
+    expect(
+      screen.queryByRole("menuitemradio", { name: /ミュート/ }),
+    ).toBeNull();
   });
 
   it("closes the status menu on an outside pointerdown", () => {
@@ -351,11 +365,11 @@ describe("Sidebar overlay and IME behavior", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /Alice 対応可能/ }));
-    expect(screen.getByRole("radio", { name: "取り込み中" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /取り込み中/ })).toBeVisible();
 
     fireEvent.pointerDown(screen.getByRole("navigation"));
 
-    expect(screen.queryByRole("radio", { name: "取り込み中" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /取り込み中/ })).toBeNull();
   });
 
   it("does not implicitly submit channel creation on an IME Enter", () => {
@@ -374,5 +388,152 @@ describe("Sidebar overlay and IME behavior", () => {
     fireEvent.keyDown(name, { key: "Enter", keyCode: 229 });
 
     expect(createChannel).not.toHaveBeenCalled();
+  });
+});
+
+describe("place menu channel actions", () => {
+  const updateChannel = vi.fn(async () => undefined);
+  const duplicateChannel = vi.fn(
+    async (): Promise<PlaceKey> => "channel:alpha-copy",
+  );
+  const createChannel = vi.fn(async (): Promise<PlaceKey> => "channel:created");
+
+  beforeEach(() => {
+    bindMessagingSessionIdentity(null);
+    bindMessagingSessionIdentity("human-a");
+    navigation.navigate.mockReset();
+    setTwoWorkspaceState(createChannel);
+    useMessaging.setState({
+      capabilities: {
+        status: true,
+        replyLater: true,
+        reactions: true,
+        notifications: true,
+      },
+      updateChannel,
+      duplicateChannel,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    useMessaging.setState({
+      createChannel: realCreateChannel,
+      updateChannel: realUpdateChannel,
+      duplicateChannel: realDuplicateChannel,
+    });
+    bindMessagingSessionIdentity(null);
+  });
+
+  function openAlphaMenu() {
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+  }
+
+  it("refuses to save an edit that names no change, then sends only what changed", async () => {
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
+    expect(within(dialog).getByRole("textbox", { name: "名前" })).toHaveValue(
+      "alpha",
+    );
+    expect(within(dialog).getByRole("button", { name: "保存" })).toBeDisabled();
+
+    fireEvent.change(
+      within(dialog).getByRole("textbox", { name: "トピック" }),
+      { target: { value: "設計の話" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    // 名前は触っていないので送らない——空文字で上書きしてトピックを消さない。
+    await waitFor(() =>
+      expect(updateChannel).toHaveBeenCalledWith("channel-a", {
+        topic: "設計の話",
+      }),
+    );
+  });
+
+  it("keeps the opening snapshot when a place update arrives before a topic-only save", async () => {
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+
+    // 自分の編集とは別の更新が、ダイアログを開いた後に届く。
+    useMessaging.setState((state) => ({
+      channels: state.channels.map((channel) =>
+        channel.channelId === "channel-a"
+          ? { ...channel, name: "別の名前", topic: "別の話題" }
+          : channel,
+      ),
+    }));
+
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
+    fireEvent.change(
+      within(dialog).getByRole("textbox", { name: "トピック" }),
+      {
+        target: { value: "自分の話題" },
+      },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateChannel).toHaveBeenCalledWith("channel-a", {
+        topic: "自分の話題",
+      }),
+    );
+  });
+
+  it("duplicates without asking for a name and moves to the copy", async () => {
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "複製" }));
+
+    await waitFor(() =>
+      expect(duplicateChannel).toHaveBeenCalledWith("channel-a"),
+    );
+    expect(navigation.navigate).toHaveBeenCalledWith("channel:alpha-copy");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("offers no channel-only actions on a direct message", () => {
+    useMessaging.setState({
+      dms: [
+        {
+          kind: "dm",
+          dmId: "dm-1",
+          participants: [SELF, { kind: "human", humanId: "human-b" }],
+        },
+      ],
+      membersByKey: {
+        ...useMessaging.getState().membersByKey,
+        "human:human-b": {
+          participant: { kind: "human", humanId: "human-b" },
+          displayName: "Bob",
+          tagline: "",
+        },
+      },
+    });
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+
+    const menus = screen.getAllByRole("button", { name: "この場所のメニュー" });
+    fireEvent.click(menus[menus.length - 1]);
+
+    expect(
+      screen.queryByRole("menuitem", { name: "チャンネルを編集" }),
+    ).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "複製" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: /通知設定/ })).toBeVisible();
   });
 });

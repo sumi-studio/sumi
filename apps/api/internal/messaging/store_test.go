@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
@@ -66,6 +67,33 @@ func newWorldWithMaxConns(t *testing.T, ctx context.Context, maxConns int32) wor
 	return world{
 		store: store, workspaces: workspaces, apps: apps,
 		humanA: Human(humanA), humanB: Human(humanB), agent: PersonalityAgent(agent),
+	}
+}
+
+// waitForWaitingBackend blocks until another connection to this test's database
+// is waiting on a lock. Tests about what one statement sees of another's
+// uncommitted work have to know the second statement actually reached the
+// point where it waits; a sleep would be either flaky or slow, and the wait is
+// the thing under test.
+func waitForWaitingBackend(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatalf("read waiting backends: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no backend ever waited on a lock")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

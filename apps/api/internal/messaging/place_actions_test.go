@@ -1,0 +1,479 @@
+package messaging
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+)
+
+func TestChannelWireCarriesPlaceRevision(t *testing.T) {
+	wire := channelToWire(Place{PlaceID: "place-a", WorkspaceID: "workspace-a", Revision: 7})
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal channel wire: %v", err)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(encoded, &projected); err != nil {
+		t.Fatalf("unmarshal channel wire: %v", err)
+	}
+	if projected["revision"] != float64(7) {
+		t.Fatalf("channel wire revision = %#v, want 7", projected["revision"])
+	}
+}
+
+// A channel's name and its topic are the same one answer to「このチャンネルは
+// 何か」. Editing one must not silently answer the other, and an edit that
+// names nothing has to be refused rather than reported as done — a caller that
+// reads a no-op as success believes a rename happened that did not.
+func TestUpdateChannelChangesOnlyWhatWasNamed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	renamed := "設計"
+	place, err := scoped.UpdateChannel(ctx, channel.PlaceID, &renamed, nil)
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if place.Name != "設計" || place.Topic != "日々のこと" {
+		t.Fatalf("renamed place = %+v, want the topic left alone", place)
+	}
+	if place.Revision != 2 {
+		t.Fatalf("renamed place revision = %d, want 2", place.Revision)
+	}
+
+	retopic := ""
+	place, err = scoped.UpdateChannel(ctx, channel.PlaceID, nil, &retopic)
+	if err != nil {
+		t.Fatalf("clear topic: %v", err)
+	}
+	// Clearing a topic is a thing someone can mean; it is not the same as
+	// omitting it, which is why the arguments are pointers.
+	if place.Name != "設計" || place.Topic != "" {
+		t.Fatalf("retopiced place = %+v", place)
+	}
+	if place.Revision != 3 {
+		t.Fatalf("retopiced place revision = %d, want 3", place.Revision)
+	}
+
+	if _, err := scoped.UpdateChannel(ctx, channel.PlaceID, nil, nil); !errors.Is(err, ErrEmptyChannelUpdate) {
+		t.Fatalf("empty edit error = %v, want ErrEmptyChannelUpdate", err)
+	}
+
+	empty := ""
+	if _, err := scoped.UpdateChannel(ctx, channel.PlaceID, &empty, nil); !errors.Is(err, ErrInvalidChannelName) {
+		t.Fatalf("empty name error = %v, want ErrInvalidChannelName", err)
+	}
+	overlong := strings.Repeat("あ", MaxChannelNameChars+1)
+	if _, err := scoped.UpdateChannel(ctx, channel.PlaceID, &overlong, nil); !errors.Is(err, ErrInvalidChannelName) {
+		t.Fatalf("overlong name error = %v, want ErrInvalidChannelName", err)
+	}
+}
+
+// Two people editing the same channel at once are each editing a different
+// field of one answer to「このチャンネルは何か」. The reply — and the
+// place_updated built from it (http.go serveUpdatePlace) — has to be what the
+// channel now is. An answer assembled from what this request happened to read
+// on its way in would carry the other person's field as it was before their
+// edit, and every open screen would take that as the current name.
+func TestAConcurrentEditIsAnsweredWithWhatTheChannelNowIs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	// Someone else's topic change, written but not yet committed. The rename
+	// below reads the place before this lands and writes after it.
+	other, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the other edit: %v", err)
+	}
+	defer func() { _ = other.Rollback(context.Background()) }()
+	if _, err := other.Exec(ctx, `
+		UPDATE places SET topic = $1 WHERE workspace_id = $2 AND place_id = $3`,
+		"設計の話", workspace.WorkspaceID, channel.PlaceID); err != nil {
+		t.Fatalf("other edit: %v", err)
+	}
+
+	type renameResult struct {
+		place Place
+		err   error
+	}
+	renamed := "設計"
+	done := make(chan renameResult, 1)
+	go func() {
+		place, err := scoped.UpdateChannel(ctx, channel.PlaceID, &renamed, nil)
+		done <- renameResult{place: place, err: err}
+	}()
+	waitForWaitingBackend(t, ctx, w.store.pool)
+	if err := other.Commit(ctx); err != nil {
+		t.Fatalf("commit the other edit: %v", err)
+	}
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("rename: %v", got.err)
+	}
+	if got.place.Name != "設計" || got.place.Topic != "設計の話" {
+		t.Fatalf("renamed place = %+v, want both edits", got.place)
+	}
+	var name, topic string
+	if err := w.store.pool.QueryRow(ctx, `
+		SELECT name, topic FROM places WHERE place_id = $1`,
+		channel.PlaceID).Scan(&name, &topic); err != nil {
+		t.Fatalf("read back the place: %v", err)
+	}
+	if name != got.place.Name || topic != got.place.Topic {
+		t.Fatalf("stored place = %q/%q, answer said %+v", name, topic, got.place)
+	}
+}
+
+// Duplicating carries the shape and nothing else. Messages, read state, and
+// notification settings belong to the channel they were made in; a copy that
+// dragged them along would be claiming things about the new place that nobody
+// there ever did.
+func TestDuplicateChannelCarriesTheShapeAndNotTheContents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	w.send(t, ctx, channel.PlaceID, w.humanA, "元のチャンネルの発言")
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	copied, err := scoped.DuplicateChannel(ctx, channel.PlaceID, "")
+	if err != nil {
+		t.Fatalf("duplicate: %v", err)
+	}
+	if copied.PlaceID == channel.PlaceID {
+		t.Fatal("duplicate returned the original place")
+	}
+	if copied.Name != "general のコピー" || copied.Topic != channel.Topic {
+		t.Fatalf("copy = %+v, want the derived name and the same topic", copied)
+	}
+	history, err := scoped.History(ctx, copied.PlaceID, HistoryOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("read copy: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("copy has %d messages, want an empty place", len(history))
+	}
+
+	// Copying the copy does not stack suffixes forever.
+	second, err := scoped.DuplicateChannel(ctx, copied.PlaceID, "")
+	if err != nil {
+		t.Fatalf("duplicate the copy: %v", err)
+	}
+	if second.Name != "general のコピー" {
+		t.Fatalf("second copy = %q, want the suffix not to accumulate", second.Name)
+	}
+
+	// An explicit name wins over the derived one.
+	named, err := scoped.DuplicateChannel(ctx, channel.PlaceID, "general-2")
+	if err != nil {
+		t.Fatalf("duplicate with a name: %v", err)
+	}
+	if named.Name != "general-2" {
+		t.Fatalf("named copy = %q", named.Name)
+	}
+}
+
+func TestPlaceCreationNonceReplaysTheCommittedPlace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, source := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	channel, created, err := scoped.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || !created {
+		t.Fatalf("first channel create = (%+v, %v, %v), want created", channel, created, err)
+	}
+	replayed, created, err := scoped.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || created || replayed.PlaceID != channel.PlaceID {
+		t.Fatalf("channel replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
+	}
+	if _, _, err := scoped.CreateChannelOnce(ctx, "different", "coordination", false, "create-once"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed channel request under nonce = %v, want ErrIdempotencyConflict", err)
+	}
+
+	copy, created, err := scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "duplicate-once")
+	if err != nil || !created {
+		t.Fatalf("first duplicate = (%+v, %v, %v), want created", copy, created, err)
+	}
+	replayed, created, err = scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "duplicate-once")
+	if err != nil || created || replayed.PlaceID != copy.PlaceID {
+		t.Fatalf("duplicate replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
+	}
+
+	group, created, err := scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.humanB, w.agent}, "group-once")
+	if err != nil || !created {
+		t.Fatalf("first group dm = (%+v, %v, %v), want created", group, created, err)
+	}
+	replayed, created, err = scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.humanB, w.agent}, "group-once")
+	if err != nil || created || replayed.PlaceID != group.PlaceID {
+		t.Fatalf("group DM replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
+	}
+}
+
+func TestPlaceEditsOverHTTPRefuseANoOpAndAnnounceTheCopy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	_, channel := w.workspaceWithChannel(t, ctx)
+
+	conn := dialWS(t, ts, w.humanB.ID, nil)
+
+	resp, body := call(t, ts, http.MethodPatch, "/messaging/places/"+channel.PlaceID, w.humanA.ID,
+		map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty edit: status %d body %v", resp.StatusCode, body)
+	}
+
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channel.PlaceID, w.humanA.ID,
+		map[string]any{"name": "設計"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rename: status %d body %v", resp.StatusCode, body)
+	}
+	if body["name"] != "設計" || body["topic"] != "日々のこと" {
+		t.Fatalf("renamed wire = %v", body)
+	}
+
+	resp, body = call(t, ts, http.MethodPost, "/messaging/places/"+channel.PlaceID+"/duplicate", w.humanA.ID,
+		map[string]any{})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("duplicate: status %d body %v", resp.StatusCode, body)
+	}
+	copyID, _ := body["channel_id"].(string)
+	if copyID == "" || copyID == channel.PlaceID {
+		t.Fatalf("duplicate wire = %v", body)
+	}
+
+	// Someone else in the Workspace learns about both, in order.
+	sawUpdated, sawCreated := false, false
+	for range 6 {
+		frame := readFrame(t, conn)
+		event, ok := frame["event"].(map[string]any)
+		if !ok {
+			continue
+		}
+		switch event["type"] {
+		case EventPlaceUpdated:
+			sawUpdated = true
+		case EventPlaceCreated:
+			if event["place_id"] == copyID {
+				sawCreated = true
+			}
+		}
+		if sawUpdated && sawCreated {
+			break
+		}
+	}
+	if !sawUpdated || !sawCreated {
+		t.Fatalf("place edits were not announced (updated=%v created=%v)", sawUpdated, sawCreated)
+	}
+}
+
+// The agent reaches the same operations through the same Store, and is refused
+// in the same places. It gains no reach a person in that Workspace lacks: a
+// plain member is refused channel management whichever lane it arrives on, and
+// the sealed scope means there is no Workspace field to be talked into naming.
+func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	hub := NewHub(w.store.core)
+	server.Hub = hub
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+
+	// A member without the channel-management capability is refused, exactly as
+	// the Human REST route refuses one.
+	status, body := callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
+		"name": "設計", "client_nonce": "unprivileged-create-channel",
+	}, authorization)
+	if status != http.StatusForbidden {
+		t.Fatalf("unprivileged create: status %d body %v", status, body)
+	}
+
+	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
+
+	status, body = callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
+		"name": "設計", "topic": "構造の話", "voice": true, "client_nonce": "local-create-channel",
+	}, authorization)
+	if status != http.StatusCreated {
+		t.Fatalf("create channel: status %d body %v", status, body)
+	}
+	created := body["channel"].(map[string]any)
+	if created["name"] != "設計" || created["topic"] != "構造の話" || created["voice"] != true {
+		t.Fatalf("created channel = %v", created)
+	}
+
+	status, body = callLocal(t, ctx, server.localUpdateChannel, LocalUpdateChannelPath, map[string]any{
+		"place_id": created["channel_id"], "topic": "構造と実装の話",
+	}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("update channel: status %d body %v", status, body)
+	}
+	updated := body["channel"].(map[string]any)
+	if updated["name"] != "設計" || updated["topic"] != "構造と実装の話" {
+		t.Fatalf("updated channel = %v", updated)
+	}
+
+	// Naming nothing is refused here too: the model must not be able to report
+	// an edit it did not make.
+	status, _ = callLocal(t, ctx, server.localUpdateChannel, LocalUpdateChannelPath, map[string]any{
+		"place_id": created["channel_id"],
+	}, authorization)
+	if status != http.StatusBadRequest {
+		t.Fatalf("empty local edit: status %d, want 400", status)
+	}
+
+	status, body = callLocal(t, ctx, server.localDuplicateChannel, LocalDuplicateChannelPath, map[string]any{
+		"place_id": channel.PlaceID, "client_nonce": "local-duplicate-channel",
+	}, authorization)
+	if status != http.StatusCreated {
+		t.Fatalf("duplicate channel: status %d body %v", status, body)
+	}
+	if body["channel"].(map[string]any)["name"] != "general のコピー" {
+		t.Fatalf("duplicated channel = %v", body)
+	}
+
+	// The actor can appear in an agent request, but it is not an "other": with
+	// one actual other this remains a 1:1 DM, and both the response and event
+	// describe each real member exactly once.
+	observer := hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA))
+	defer hub.unsubscribe(observer)
+	status, body = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
+		"participants": []any{
+			map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
+			map[string]any{"kind": "human", "human_id": w.humanA.ID},
+		},
+	}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("start dm: status %d body %v", status, body)
+	}
+	dm := body["dm"].(map[string]any)
+	if dm["kind"] != "dm" || body["created"] != true {
+		t.Fatalf("start dm = %v", body)
+	}
+	assertDMParticipantsOnce(t, dm["participants"], w.agent, w.humanA)
+	select {
+	case frame := <-observer.send:
+		var eventFrame struct {
+			Event struct {
+				Type string `json:"type"`
+				DM   struct {
+					Participants any `json:"participants"`
+				} `json:"dm"`
+			} `json:"event"`
+		}
+		if err := json.Unmarshal(frame.payload, &eventFrame); err != nil {
+			t.Fatalf("decode place-created event: %v", err)
+		}
+		if eventFrame.Event.Type != EventPlaceCreated {
+			t.Fatalf("event type = %q, want %q", eventFrame.Event.Type, EventPlaceCreated)
+		}
+		assertDMParticipantsOnce(t, eventFrame.Event.DM.Participants, w.agent, w.humanA)
+	case <-ctx.Done():
+		t.Fatal("did not receive place_created for normalized DM")
+	}
+	status, again := callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
+		"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}},
+	}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("start dm again: status %d body %v", status, again)
+	}
+	if again["dm"].(map[string]any)["dm_id"] != dm["dm_id"] || again["created"] != false {
+		t.Fatalf("second start dm = %v, want the same conversation and created=false", again)
+	}
+
+	// Several participants make a group conversation instead.
+	status, body = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
+		"client_nonce": "local-start-group-dm",
+		"participants": []any{
+			map[string]any{"kind": "human", "human_id": w.humanA.ID},
+			map[string]any{"kind": "human", "human_id": w.humanB.ID},
+		},
+	}, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("start group dm: status %d body %v", status, body)
+	}
+	if body["dm"].(map[string]any)["kind"] != "group_dm" {
+		t.Fatalf("group dm = %v", body)
+	}
+
+	// Naming no one is refused rather than opening a conversation with nobody.
+	status, _ = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
+		"participants": []any{},
+	}, authorization)
+	if status != http.StatusBadRequest {
+		t.Fatalf("empty participants: status %d, want 400", status)
+	}
+}
+
+func assertDMParticipantsOnce(t *testing.T, raw any, actor, other ParticipantRef) {
+	t.Helper()
+	participants, ok := raw.([]any)
+	if !ok || len(participants) != 2 {
+		t.Fatalf("dm participants = %v, want exactly two", raw)
+	}
+	seen := map[string]int{}
+	for _, rawParticipant := range participants {
+		participant, ok := rawParticipant.(map[string]any)
+		if !ok {
+			t.Fatalf("dm participant = %T, want object", rawParticipant)
+		}
+		kind, _ := participant["kind"].(string)
+		id, _ := participant["human_id"].(string)
+		if kind == string(KindPersonalityAgent) {
+			id, _ = participant["personality_agent_id"].(string)
+		}
+		seen[kind+":"+id]++
+	}
+	if seen[actor.Key()] != 1 || seen[other.Key()] != 1 {
+		t.Fatalf("dm participants = %v, want %s and %s once", raw, actor.Key(), other.Key())
+	}
+}
+
+// grantManageChannels gives a member a role carrying the app-owned channel
+// management capability, the same grant a Workspace owner would make.
+func grantManageChannels(
+	t *testing.T,
+	ctx context.Context,
+	w world,
+	workspaceID string,
+	member ParticipantRef,
+) {
+	t.Helper()
+	role, err := w.workspaces.CreateRole(ctx, workspaceID, w.humanA,
+		"チャンネル管理", "", map[string]bool{ManageChannelsCapability: true})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	memberships, err := w.workspaces.Members(ctx, workspaceID, w.humanA)
+	if err != nil {
+		t.Fatalf("list members: %v", err)
+	}
+	for _, membership := range memberships {
+		if membership.Participant.Kind != member.Kind || membership.Participant.ID != member.ID {
+			continue
+		}
+		if _, err := w.workspaces.SetMembershipRoles(
+			ctx, workspaceID, membership.WorkspaceMemberID, w.humanA, []string{role.RoleID},
+		); err != nil {
+			t.Fatalf("assign role: %v", err)
+		}
+		return
+	}
+	t.Fatalf("member %s is not in workspace %s", member.Key(), workspaceID)
+}

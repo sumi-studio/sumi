@@ -172,6 +172,7 @@ pub(crate) enum ProviderReviewIdentity {
     MessagingV1,
     MessagingV2,
     MessagingV3,
+    MessagingV4,
     WorkspaceReadFileV1,
     WorkspaceListDirV1,
     WorkspaceGlobV1,
@@ -200,7 +201,7 @@ impl ProviderReviewIdentity {
             ("workspace_invitation_accept", "sumi.workspace.invitation.accept", 1) => {
                 Self::WorkspaceInvitationAcceptV1
             }
-            ("messaging", "sumi.messaging", 3) => Self::MessagingV3,
+            ("messaging", "sumi.messaging", 4) => Self::MessagingV4,
             ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
             ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
             ("glob", "sumi.foundation.workspace", 1) => Self::WorkspaceGlobV1,
@@ -242,6 +243,10 @@ pub(crate) enum ProviderReviewOperation {
     ReplyLater,
     ResolveReplyLater,
     GetCallState,
+    StartDm,
+    CreateChannel,
+    UpdateChannel,
+    DuplicateChannel,
     ReadFile,
     ListDir,
     Glob,
@@ -382,42 +387,76 @@ fn provider_review_operation(
             Operation::AcceptInvitation
         }
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "overview",
             Read,
         ) => Operation::Overview,
-        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "open", Read) => {
-            Operation::Open
-        }
-        (Identity::MessagingV3, "open_attachment", Read) => Operation::OpenAttachment,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
+            "open",
+            Read,
+        ) => Operation::Open,
+        (Identity::MessagingV3 | Identity::MessagingV4, "open_attachment", Read) => {
+            Operation::OpenAttachment
+        }
+        (
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "write",
             Mutate,
         ) => Operation::Write,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "react",
             Mutate,
         ) => Operation::React,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "status",
             Mutate,
         ) => Operation::Status,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "reply_later",
             Mutate,
         ) => Operation::ReplyLater,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "resolve_reply_later",
             Mutate,
         ) => Operation::ResolveReplyLater,
-        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "get_call_state", Read) => {
-            Operation::GetCallState
-        }
+        (
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
+            "get_call_state",
+            Read,
+        ) => Operation::GetCallState,
+        (Identity::MessagingV4, "start_dm", Mutate) => Operation::StartDm,
+        (Identity::MessagingV4, "create_channel", Mutate) => Operation::CreateChannel,
+        (Identity::MessagingV4, "update_channel", Mutate) => Operation::UpdateChannel,
+        (Identity::MessagingV4, "duplicate_channel", Mutate) => Operation::DuplicateChannel,
         (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
         (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
         (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
@@ -479,47 +518,68 @@ fn provider_review_scope(
             (Resource, Namespace::Workspace, Kind::Membership)
         }
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "workspace",
             "workspace",
         ) => (Resource, Namespace::Workspace, Kind::Workspace),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Collection,
             "messaging",
             "place",
         ) => (Collection, Namespace::Messaging, Kind::Place),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "place",
         ) => (Resource, Namespace::Messaging, Kind::Place),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "message",
         ) => (Resource, Namespace::Messaging, Kind::Message),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "participant",
         ) => (Resource, Namespace::Messaging, Kind::Participant),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "reply_later_marker",
         ) => (Resource, Namespace::Messaging, Kind::ReplyLaterMarker),
-        (Identity::MessagingV3, Resource, "messaging", "attachment") => {
+        (Identity::MessagingV3 | Identity::MessagingV4, Resource, "messaging", "attachment") => {
             (Resource, Namespace::Messaging, Kind::Attachment)
         }
-        (Identity::MessagingV3, Resource, "sumi.foundation.workspace", "path") => {
-            (Resource, Namespace::FoundationWorkspace, Kind::Path)
-        }
+        (
+            Identity::MessagingV3 | Identity::MessagingV4,
+            Resource,
+            "sumi.foundation.workspace",
+            "path",
+        ) => (Resource, Namespace::FoundationWorkspace, Kind::Path),
         (
             Identity::WorkspaceReadFileV1
             | Identity::WorkspaceListDirV1
@@ -1568,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn messaging_v1_and_v2_recover_but_only_v3_can_be_newly_bound() {
+    fn earlier_messaging_identities_recover_but_only_v4_can_be_newly_bound() {
         assert_eq!(
             serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v1\"").unwrap(),
             ProviderReviewIdentity::MessagingV1,
@@ -1579,20 +1639,26 @@ mod tests {
             ProviderReviewIdentity::MessagingV2,
             "durable v2 evidence must remain decodable during recovery"
         );
-        let v3 = AdapterIdentity::new("sumi.messaging", 3).unwrap();
         assert_eq!(
-            ProviderReviewIdentity::from_local("messaging", &v3).unwrap(),
-            ProviderReviewIdentity::MessagingV3
+            serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v3\"").unwrap(),
+            ProviderReviewIdentity::MessagingV3,
+            "durable v3 evidence must remain decodable during recovery"
         );
-        let v1 = AdapterIdentity::new("sumi.messaging", 1).unwrap();
-        assert!(ProviderReviewIdentity::from_local("messaging", &v1).is_err());
-        let v2 = AdapterIdentity::new("sumi.messaging", 2).unwrap();
-        assert!(ProviderReviewIdentity::from_local("messaging", &v2).is_err());
+        let v4 = AdapterIdentity::new("sumi.messaging", 4).unwrap();
+        assert_eq!(
+            ProviderReviewIdentity::from_local("messaging", &v4).unwrap(),
+            ProviderReviewIdentity::MessagingV4
+        );
+        for retired in [1, 2, 3] {
+            let identity = AdapterIdentity::new("sumi.messaging", retired).unwrap();
+            assert!(ProviderReviewIdentity::from_local("messaging", &identity).is_err());
+        }
 
         for identity in [
             ProviderReviewIdentity::MessagingV1,
             ProviderReviewIdentity::MessagingV2,
             ProviderReviewIdentity::MessagingV3,
+            ProviderReviewIdentity::MessagingV4,
         ] {
             assert!(
                 provider_review_operation(
@@ -1614,6 +1680,24 @@ mod tests {
             )
             .is_ok()
         );
+        // Opening and editing a place arrived with V4. An older seal carrying
+        // one of these operations was never issued and must not be honored.
+        for operation in [
+            "start_dm",
+            "create_channel",
+            "update_channel",
+            "duplicate_channel",
+        ] {
+            let descriptor =
+                AppActionDescriptor::new(operation, CapabilityClass::Mutate, vec![]).unwrap();
+            assert!(
+                provider_review_operation(ProviderReviewIdentity::MessagingV4, &descriptor).is_ok()
+            );
+            assert!(
+                provider_review_operation(ProviderReviewIdentity::MessagingV3, &descriptor)
+                    .is_err()
+            );
+        }
         assert!(
             provider_review_scope(
                 ProviderReviewIdentity::MessagingV3,

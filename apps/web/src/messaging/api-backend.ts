@@ -23,6 +23,7 @@ import type {
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusCleared,
   StatusKind,
   UnreadSummary,
   UploadAttachmentInput,
@@ -137,6 +138,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       dms,
       members,
       statuses: presence.statuses,
+      clearedStatuses: presence.clearedStatuses,
       readMarkers,
       unreadSummaries,
       replyLaterMarkers: presence.replyLaterMarkers,
@@ -211,13 +213,32 @@ export class ApiMessagingBackend implements MessagingBackend {
     return this.registerDm(body);
   }
 
-  async updateChannelTopic(
+  async updateChannel(
     channelId: string,
-    topic: string,
+    input: { name?: string; topic?: string },
   ): Promise<ChannelSummary> {
+    // 省いた項目はbodyに載せない。載せると「その値にして」の意味になる。
     const body = await this.request(
       `/messaging/places/${encodeURIComponent(channelId)}`,
-      { method: "PATCH", body: { topic } },
+      {
+        method: "PATCH",
+        body: {
+          ...(input.name === undefined ? {} : { name: input.name }),
+          ...(input.topic === undefined ? {} : { topic: input.topic }),
+        },
+      },
+    );
+    return this.registerChannel(body);
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(channelId)}/duplicate`,
+      // 名前を言わないなら送らない。サーバーが「〜 のコピー」を決める。
+      { method: "POST", body: name === undefined ? {} : { name } },
     );
     return this.registerChannel(body);
   }
@@ -331,11 +352,17 @@ export class ApiMessagingBackend implements MessagingBackend {
   async setStatus(
     status: StatusKind,
     note: string,
+    expiresAt: number | null,
   ): Promise<ParticipantStatus> {
     return parseStatus(
       await this.request("/messaging/status", {
         method: "PUT",
-        body: { status, note },
+        body: {
+          status,
+          note,
+          expires_at:
+            expiresAt === null ? null : new Date(expiresAt).toISOString(),
+        },
       }),
     );
   }
@@ -540,7 +567,17 @@ export class ApiMessagingBackend implements MessagingBackend {
       };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
-      parsed = { type: eventType, status: parseStatus(wire.status) };
+      // 空のstatusは欠損ではなく「宣言が終わった」という答え——期限切れで
+      // 戻る先が無かった場合に届く。
+      const status = asRecord(wire.status);
+      parsed =
+        status.status === ""
+          ? {
+              type: "status_cleared",
+              participant: parseParticipant(status.participant),
+              revision: asRevision(status.revision),
+            }
+          : { type: eventType, status: parseStatus(status) };
     } else if (eventType === "reply_later_created") {
       parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
     } else if (eventType === "reply_later_resolved") {
@@ -585,6 +622,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     const channel: ChannelSummary = {
       channelId: asString(wire.channel_id),
       workspaceId: asString(wire.workspace_id),
+      revision: asSeq(wire.revision),
       name: asString(wire.name),
       topic: asString(wire.topic),
       visibility: asVisibility(wire.visibility),
@@ -743,10 +781,25 @@ function parseReaction(value: unknown): ReactionSummary {
 
 function parsePresence(body: Record<string, unknown>): {
   statuses: ParticipantStatus[];
+  clearedStatuses: StatusCleared[];
   replyLaterMarkers: ReplyLaterMarker[];
 } {
+  const statuses: ParticipantStatus[] = [];
+  const clearedStatuses: StatusCleared[] = [];
+  for (const value of asArray(body.statuses)) {
+    const status = asRecord(value);
+    if (status.status === "") {
+      clearedStatuses.push({
+        participant: parseParticipant(status.participant),
+        revision: asRevision(status.revision),
+      });
+    } else {
+      statuses.push(parseStatus(status));
+    }
+  }
   return {
-    statuses: asArray(body.statuses).map(parseStatus),
+    statuses,
+    clearedStatuses,
     replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
   };
 }
@@ -755,10 +808,25 @@ function parseStatus(value: unknown): ParticipantStatus {
   const wire = asRecord(value);
   return {
     participant: parseParticipant(wire.participant),
+    revision: asRevision(wire.revision),
     status: asStatusKind(wire.status),
     note: asString(wire.note),
     expiresAt: wire.expires_at == null ? null : asTimestamp(wire.expires_at),
+    // 期限切れで戻る先。無ければ期限で宣言そのものが終わる。
+    baseStatus:
+      wire.base_status === undefined ||
+      wire.base_status === null ||
+      wire.base_status === ""
+        ? null
+        : asStatusKind(wire.base_status),
+    baseNote: typeof wire.base_note === "string" ? wire.base_note : "",
   };
+}
+
+function asRevision(value: unknown): number {
+  const revision = asSeq(value);
+  if (revision < 1) throw new Error("invalid status revision");
+  return revision;
 }
 
 function parseReplyLater(value: unknown): ReplyLaterMarker {
