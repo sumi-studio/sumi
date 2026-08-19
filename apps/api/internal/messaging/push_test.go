@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +37,12 @@ type recordingPushClient struct {
 	authorizations []string
 	status         map[string]int
 	err            error
+}
+
+type pushHTTPClientFunc func(*http.Request) (*http.Response, error)
+
+func (f pushHTTPClientFunc) Do(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 // blockingPushClient makes the boundary between the lease and HTTPS observable:
@@ -144,6 +151,86 @@ func (w world) subscriptionsFor(
 		t.Fatalf("load subscriptions: %v", err)
 	}
 	return loaded
+}
+
+func TestHublessServerDeliversPushAndKeepsAgentAttentionInbox(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	for _, participant := range []ParticipantRef{w.humanA, w.humanB, w.agent} {
+		if err := w.store.seedDefaultWorkspaceFixture(ctx, participant); err != nil {
+			t.Fatalf("prepare default test Workspace: %v", err)
+		}
+	}
+	_, channel := w.workspaceWithChannel(t, ctx)
+
+	// Push subscriptions must be HTTPS. The TLS server is still a fake HTTP
+	// endpoint, and its own client trusts this test certificate only.
+	pushRequests := make(chan *http.Request, 1)
+	pushEndpoint := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
+		pushRequests <- request
+		rw.WriteHeader(http.StatusCreated)
+	}))
+	defer pushEndpoint.Close()
+	endpointURL, err := url.Parse(pushEndpoint.URL)
+	if err != nil {
+		t.Fatalf("parse fake push endpoint: %v", err)
+	}
+	// Keep the registered endpoint publicly routable under the real egress
+	// policy, then use the push HTTP seam to deliver it to this test server.
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/hubless")
+	dispatcher := w.dispatcher(t, ctx, pushHTTPClientFunc(func(request *http.Request) (*http.Response, error) {
+		forwarded := request.Clone(request.Context())
+		forwarded.URL = endpointURL
+		forwarded.Host = ""
+		return pushEndpoint.Client().Do(forwarded)
+	}))
+	w.store.core.UsePush(dispatcher)
+
+	server := NewServer(w.store.core, stubSessions{})
+	server.AllowedOrigins = []string{testOrigin}
+	server.Push = dispatcher
+	if server.Hub != nil {
+		t.Fatal("test server unexpectedly has a live hub")
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	api := httptest.NewServer(mux)
+	t.Cleanup(api.Close)
+	testStoresByServer.Store(api.URL, w.store)
+
+	response, receipt := call(t, api, http.MethodPost,
+		"/messaging/places/"+channel.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "@Kuro（Yohaku） 確認をお願いします", "client_nonce": "hubless-delivery"})
+	if response.StatusCode != http.StatusCreated || receipt["created"] != true {
+		t.Fatalf("create through hubless server: status=%d receipt=%v", response.StatusCode, receipt)
+	}
+	messageID, _ := receipt["message_id"].(string)
+	if messageID == "" {
+		t.Fatalf("create receipt has no message id: %v", receipt)
+	}
+
+	select {
+	case request := <-pushRequests:
+		if request.Method != http.MethodPost {
+			t.Fatalf("push method = %s, want POST", request.Method)
+		}
+	case <-ctx.Done():
+		t.Fatal("hubless server never delivered the Push endpoint")
+	}
+
+	// The very same committed intent also remains available to the agent's
+	// durable inbox; it does not depend on the absent live WS transport.
+	candidates := candidateList(t, w.poll(t, ctx, server, map[string]any{}))
+	if len(candidates) != 1 {
+		t.Fatalf("hubless attention candidates = %v, want one", candidates)
+	}
+	provenance, _ := candidates[0]["provenance"].(map[string]any)
+	source, _ := provenance["source"].(map[string]any)
+	delivery, _ := source["delivery"].(map[string]any)
+	if delivery["message_id"] != messageID {
+		t.Fatalf("attention delivery = %v, want message %s", delivery, messageID)
+	}
 }
 
 func TestVAPIDKeysAreMintedOnceAndNeverRotatedUnderneathSubscribers(t *testing.T) {

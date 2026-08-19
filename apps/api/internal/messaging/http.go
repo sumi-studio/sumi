@@ -431,9 +431,6 @@ func notificationSettingToWire(setting NotificationSetting) notificationSettingW
 // durable truth, so a delivery read failure still fans out the message without
 // claiming that anyone was called.
 func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, place Place, msg Message) {
-	if hub == nil {
-		return
-	}
 	wire := messageToWire(place, msg)
 	decisions, err := store.NotificationIntentsForMessage(ctx, msg.MessageID)
 	if err != nil {
@@ -454,7 +451,9 @@ func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, pl
 		Type: EventMessageCreated, PlaceID: place.PlaceID,
 		Message: &wire, ExceptFor: notified,
 	})
-	_ = hub.PublishVariantsScoped(ctx, store, events)
+	if hub != nil {
+		_ = hub.PublishVariantsScoped(ctx, store, events)
+	}
 	// 同じひとつの intent から、開いていない身体へ分かれる二本。人間には
 	// 登録済みブラウザへ Push、agent には attention inbox（凍結契約 v1
 	// 「Push 通知レイヤーとの対応」）。開いている窓を除外したりはしない——
