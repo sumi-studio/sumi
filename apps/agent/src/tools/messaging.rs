@@ -269,6 +269,28 @@ enum BoundMessagingAction {
     },
 }
 
+impl BoundMessagingAction {
+    /// Remote mutations need a committed-effect receipt: once their request is
+    /// dispatched, cancelling its future would turn a potentially committed
+    /// Workspace change into a false "cancelled" result. Reads only observe
+    /// server state, and this tool has no other local mutation, so they remain
+    /// local effects and may observe cancellation while waiting for a reply.
+    fn is_remote_persistent_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Write { .. }
+                | Self::React { .. }
+                | Self::Status { .. }
+                | Self::ReplyLater { .. }
+                | Self::ResolveReplyLater { .. }
+                | Self::StartDm { .. }
+                | Self::CreateChannel { .. }
+                | Self::UpdateChannel { .. }
+                | Self::DuplicateChannel { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct BoundMessagingInvocation {
     workspace_id: String,
@@ -1349,6 +1371,29 @@ impl BoundToolAdapter for MessagingTool {
                     })
                     .await?
             }
+            action if action.is_remote_persistent_mutation() => {
+                // This covers every non-attachment remote mutation. The
+                // executor effect deliberately survives cancellation after
+                // dispatch; a lost response is surfaced as Indeterminate,
+                // never as a locally abandoned effect.
+                committed_effect_permit
+                    .begin_executor_effect()
+                    .complete(|_| {
+                        self.execute_exact_action(
+                            &scope,
+                            view.clone(),
+                            &mut state,
+                            action,
+                            ExactMessagingExecutionContext {
+                                flow_id,
+                                call_id,
+                                cancel: &cancel,
+                                post_commit_mode: PostCommitMode::ReturnLiveHook,
+                            },
+                        )
+                    })
+                    .await?
+            }
             action => {
                 committed_effect_permit
                     .begin_local_effect()
@@ -1434,6 +1479,12 @@ impl MessagingTool {
         action: BoundMessagingAction,
         execution: ExactMessagingExecutionContext<'_>,
     ) -> Result<ExactMessagingOutcome, ToolError> {
+        // A mutation may be cancelled before its request is dispatched. Once
+        // this gate has passed, each mutation below awaits its RPC directly:
+        // dropping it on cancellation could hide a server commit.
+        if action.is_remote_persistent_mutation() && execution.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         if let BoundMessagingAction::OpenAttachment {
             place_id,
             message_id,
@@ -1523,18 +1574,21 @@ impl MessagingTool {
                     ));
                 }
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.write(scope, WriteMessagingMessageRequest {
-                        place_id: &place_id,
-                        content: &content,
-                        urgency: urgency_text(urgency),
-                        reply_to: reply_to.as_deref(),
-                        client_nonce: &nonce,
-                        attachments: &[],
-                    }) => result,
-                }
-                .map_err(map_messaging_api_error)?;
+                let response = self
+                    .api
+                    .write(
+                        scope,
+                        WriteMessagingMessageRequest {
+                            place_id: &place_id,
+                            content: &content,
+                            urgency: urgency_text(urgency),
+                            reply_to: reply_to.as_deref(),
+                            client_nonce: &nonce,
+                            attachments: &[],
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
                     upsert_visible_message(
                         state,
@@ -1554,46 +1608,54 @@ impl MessagingTool {
                 emoji,
             } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.react(scope, ReactMessagingReactionRequest {
-                        place_id: &place_id,
-                        message_id: &message_id,
-                        emoji: &emoji,
-                        client_nonce: &nonce,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?
+                self.api
+                    .react(
+                        scope,
+                        ReactMessagingReactionRequest {
+                            place_id: &place_id,
+                            message_id: &message_id,
+                            emoji: &emoji,
+                            client_nonce: &nonce,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?
             }
             BoundMessagingAction::Status {
                 status,
                 note,
                 expires_in_minutes,
-            } => tokio::select! {
-                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                result = self.api.set_status(scope, SetMessagingStatusRequest {
-                    status: status_text(status),
-                    note: note.as_deref(),
-                    expires_in_minutes,
-                }) => result,
-            }
-            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            } => self
+                .api
+                .set_status(
+                    scope,
+                    SetMessagingStatusRequest {
+                        status: status_text(status),
+                        note: note.as_deref(),
+                        expires_in_minutes,
+                    },
+                )
+                .await
+                .map_err(map_messaging_api_error)?,
             BoundMessagingAction::ReplyLater {
                 place_id,
                 message_id,
                 note,
                 remind_in_minutes,
             } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.reply_later(scope, CreateMessagingReplyLaterRequest {
-                        place_id: &place_id,
-                        message_id: &message_id,
-                        note: note.as_deref(),
-                        remind_in_minutes,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let response = self
+                    .api
+                    .reply_later(
+                        scope,
+                        CreateMessagingReplyLaterRequest {
+                            place_id: &place_id,
+                            message_id: &message_id,
+                            note: note.as_deref(),
+                            remind_in_minutes,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 if let Some(marker) = reply_later_marker_from_response(&response) {
                     if state.self_participant.is_none() {
                         // The authenticated create endpoint can only return
@@ -1606,13 +1668,16 @@ impl MessagingTool {
                 response
             }
             BoundMessagingAction::ResolveReplyLater { marker_id } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.resolve_reply_later(scope, ResolveMessagingReplyLaterRequest {
-                        marker_id: &marker_id,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let response = self
+                    .api
+                    .resolve_reply_later(
+                        scope,
+                        ResolveMessagingReplyLaterRequest {
+                            marker_id: &marker_id,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 state
                     .visible_reply_later_markers
                     .retain(|marker| marker.marker_id != marker_id);
@@ -1629,26 +1694,36 @@ impl MessagingTool {
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
             BoundMessagingAction::StartDm { participants } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.start_dm(scope, StartMessagingDMRequest {
-                        participants: &participants,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = self
+                    .api
+                    .start_dm(
+                        scope,
+                        StartMessagingDMRequest {
+                            participants: &participants,
+                            client_nonce: (participants.len() > 1).then_some(nonce.as_str()),
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 focus_opened_place(&mut *state, &response, "dm", "dm_id");
                 response
             }
             BoundMessagingAction::CreateChannel { name, topic, voice } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.create_channel(scope, CreateMessagingChannelRequest {
-                        name: &name,
-                        topic: topic.as_deref(),
-                        voice,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = self
+                    .api
+                    .create_channel(
+                        scope,
+                        CreateMessagingChannelRequest {
+                            name: &name,
+                            topic: topic.as_deref(),
+                            voice,
+                            client_nonce: &nonce,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 focus_opened_place(&mut *state, &response, "channel", "channel_id");
                 response
             }
@@ -1656,24 +1731,32 @@ impl MessagingTool {
                 place_id,
                 name,
                 topic,
-            } => tokio::select! {
-                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                result = self.api.update_channel(scope, UpdateMessagingChannelRequest {
-                    place_id: &place_id,
-                    name: name.as_deref(),
-                    topic: topic.as_deref(),
-                }) => result,
-            }
-            .map_err(|error| ToolError::Rpc(error.to_string()))?,
-            BoundMessagingAction::DuplicateChannel { place_id, name } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.duplicate_channel(scope, DuplicateMessagingChannelRequest {
+            } => self
+                .api
+                .update_channel(
+                    scope,
+                    UpdateMessagingChannelRequest {
                         place_id: &place_id,
                         name: name.as_deref(),
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                        topic: topic.as_deref(),
+                    },
+                )
+                .await
+                .map_err(map_messaging_api_error)?,
+            BoundMessagingAction::DuplicateChannel { place_id, name } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = self
+                    .api
+                    .duplicate_channel(
+                        scope,
+                        DuplicateMessagingChannelRequest {
+                            place_id: &place_id,
+                            name: name.as_deref(),
+                            client_nonce: &nonce,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 focus_opened_place(&mut *state, &response, "channel", "channel_id");
                 response
             }
@@ -3332,6 +3415,8 @@ mod tests {
         open_responses: AsyncMutex<VecDeque<Value>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
         created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
+        created_channels_by_nonce: AsyncMutex<BTreeMap<String, Value>>,
+        lose_create_channel_response_once: AsyncMutex<bool>,
         updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
         duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
@@ -3622,18 +3707,35 @@ mod tests {
         ) -> Result<Value> {
             self.record_scope(scope).await;
             self.calls.lock().await.push("create_channel".to_owned());
-            self.created_channels.lock().await.push((
-                request.name.to_owned(),
-                request.topic.map(str::to_owned),
-                request.voice,
-            ));
-            Ok(json!({
-                "channel": {
-                    "channel_id": "channel-new",
-                    "name": request.name,
-                    "topic": request.topic.unwrap_or("")
+            let response = {
+                let mut created = self.created_channels_by_nonce.lock().await;
+                if let Some(existing) = created.get(request.client_nonce) {
+                    existing.clone()
+                } else {
+                    self.created_channels.lock().await.push((
+                        request.name.to_owned(),
+                        request.topic.map(str::to_owned),
+                        request.voice,
+                    ));
+                    let response = json!({
+                        "channel": {
+                            "channel_id": "channel-new",
+                            "name": request.name,
+                            "topic": request.topic.unwrap_or("")
+                        }
+                    });
+                    created.insert(request.client_nonce.to_owned(), response.clone());
+                    response
                 }
-            }))
+            };
+            if std::mem::take(&mut *self.lose_create_channel_response_once.lock().await) {
+                return Err(MessagingApiFailure::indeterminate(
+                    "test create channel",
+                    "place committed but the response was lost",
+                )
+                .into());
+            }
+            Ok(response)
         }
 
         async fn update_channel(
@@ -5973,6 +6075,39 @@ mod tests {
         ));
         assert!(api.calls.lock().await.is_empty());
         assert!(api.writes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn indeterminate_channel_creation_retries_the_same_call_without_a_second_place() {
+        let (api, _tool, registry) = binding_fixture().await;
+        *api.lose_create_channel_response_once.lock().await = true;
+        let action = json!({
+            "action": "create_channel",
+            "name": "incident-room",
+            "topic": "coordination"
+        });
+
+        let first =
+            match execute_bound_action(&registry, "create-channel-retry", action.clone()).await {
+                Err(error) => error,
+                Ok(_) => panic!("lost response after a committed creation is indeterminate"),
+            };
+        assert!(matches!(
+            first,
+            BoundExecutionError::Tool(ToolError::RpcIndeterminate(_))
+        ));
+        assert_eq!(api.created_channels.lock().await.len(), 1);
+
+        let retry = execute_bound_action(&registry, "create-channel-retry", action)
+            .await
+            .expect("the same flow/call nonce replays the committed place");
+        assert_eq!(retry.output.details["channel"]["channel_id"], "channel-new");
+        assert_eq!(api.created_channels.lock().await.len(), 1);
+        assert_eq!(
+            api.created_channels_by_nonce.lock().await.len(),
+            1,
+            "the fake server persisted one creation receipt"
+        );
     }
 
     #[tokio::test]

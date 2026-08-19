@@ -399,6 +399,117 @@ impl LocalControlHttpClient {
         serde_json::from_slice(body.as_slice()).context("decode strict local control response")
     }
 
+    /// Replay one nonce-bearing Messaging mutation after a transport or reply
+    /// loss. The server records place creations by nonce, so both attempts can
+    /// safely name the same committed place. A terminal rejection is not
+    /// replayed; a 5xx cannot prove that the server did not commit first.
+    async fn post_idempotent_messaging_json<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        let mut first_indeterminate = None;
+        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
+            let result = async {
+                let (status, response) = self
+                    .post_json_bounded_raw(path, body, max_response_bytes)
+                    .await
+                    .map_err(|error| {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging idempotent mutation",
+                            format!("transport or response framing failed: {error}"),
+                        )
+                    })?;
+                if !status.is_success() {
+                    let failure = if status.is_server_error() {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging idempotent mutation",
+                            format!("server returned {status} after a possibly committed request"),
+                        )
+                    } else {
+                        MessagingApiFailure::terminal(
+                            "Messaging idempotent mutation",
+                            format!("local control request was rejected with status {status}"),
+                        )
+                    };
+                    return Err(anyhow::Error::new(failure));
+                }
+                serde_json::from_slice(response.as_slice()).map_err(|error| {
+                    anyhow::Error::new(MessagingApiFailure::indeterminate(
+                        "Messaging idempotent mutation",
+                        format!("decode strict local control response: {error}"),
+                    ))
+                })
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
+                        && is_indeterminate_messaging_failure(&error) =>
+                {
+                    first_indeterminate = Some(error);
+                }
+                Err(_replay_error) if first_indeterminate.is_some() => {
+                    return Err(first_indeterminate
+                        .take()
+                        .expect("only a replay has an initial indeterminate result"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded Messaging retry loop always returns")
+    }
+
+    /// A nonce-less remote mutation still must not be reported as a plain RPC
+    /// failure after dispatch: a response loss cannot prove that the server
+    /// did not commit. It deliberately does not replay automatically because
+    /// those endpoints have no operation receipt to make that safe.
+    async fn post_mutating_messaging_json<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        let (status, response) = self
+            .post_json_bounded_raw(path, body, MAX_LOCAL_CONTROL_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                MessagingApiFailure::indeterminate(
+                    "Messaging mutation",
+                    format!("transport or response framing failed: {error}"),
+                )
+            })?;
+        if !status.is_success() {
+            let failure = if status.is_server_error() {
+                MessagingApiFailure::indeterminate(
+                    "Messaging mutation",
+                    format!("server returned {status} after a possibly committed request"),
+                )
+            } else {
+                MessagingApiFailure::terminal(
+                    "Messaging mutation",
+                    format!("local control request was rejected with status {status}"),
+                )
+            };
+            return Err(anyhow::Error::new(failure));
+        }
+        serde_json::from_slice(response.as_slice()).map_err(|error| {
+            anyhow::Error::new(MessagingApiFailure::indeterminate(
+                "Messaging mutation",
+                format!("decode strict local control response: {error}"),
+            ))
+        })
+    }
+
     async fn post_json_bounded_raw<Request>(
         &self,
         path: &str,
@@ -948,7 +1059,7 @@ impl MessagingApi for LocalControlHttpClient {
         // The response echoes the full message (content up to 64 KiB plus its
         // reaction state), so it shares the messaging screen bound rather than
         // the tighter control-plane bound.
-        self.post_json_bounded(
+        self.post_idempotent_messaging_json(
             "/local-control/v1/messaging:react",
             &ScopedMessagingRequest::new(scope, request),
             MAX_MESSAGING_RESPONSE_BYTES,
@@ -961,7 +1072,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:status",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -973,11 +1084,18 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: StartMessagingDMRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
-            "/local-control/v1/messaging:start-dm",
-            &ScopedMessagingRequest::new(scope, request),
-        )
-        .await
+        let request = ScopedMessagingRequest::new(scope, request);
+        if request.operation.client_nonce.is_some() {
+            self.post_idempotent_messaging_json(
+                "/local-control/v1/messaging:start-dm",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+            )
+            .await
+        } else {
+            self.post_mutating_messaging_json("/local-control/v1/messaging:start-dm", &request)
+                .await
+        }
     }
 
     async fn create_channel(
@@ -985,9 +1103,10 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: CreateMessagingChannelRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_idempotent_messaging_json(
             "/local-control/v1/messaging:create-channel",
             &ScopedMessagingRequest::new(scope, request),
+            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
         )
         .await
     }
@@ -997,7 +1116,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: UpdateMessagingChannelRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:update-channel",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -1009,9 +1128,10 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: DuplicateMessagingChannelRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_idempotent_messaging_json(
             "/local-control/v1/messaging:duplicate-channel",
             &ScopedMessagingRequest::new(scope, request),
+            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
         )
         .await
     }
@@ -1021,7 +1141,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: CreateMessagingReplyLaterRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:reply-later",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -1033,7 +1153,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: ResolveMessagingReplyLaterRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:reply-later-resolve",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -1045,7 +1165,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: ReadMessagingThroughRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:read-through",
             &ScopedMessagingRequest::new(scope, request),
         )
