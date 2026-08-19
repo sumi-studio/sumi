@@ -487,6 +487,56 @@ export const useMessaging = create<MessagingState>((set, get) => {
     if (seq > (knownLatestSeq.get(key) ?? 0)) knownLatestSeq.set(key, seq);
   };
   /**
+   * 履歴とは独立した、このsessionで既に見たmessage idとplace内seq。履歴を
+   * 手放しても、replayとliveの重複やmessage_editedを新着として数えないために
+   * 残す。lastRead以下は未読に寄与しないので即時に捨て、残りはseq昇順（同seqは
+   * id昇順）で古い方から上限までにする。
+   */
+  const KNOWN_MESSAGE_IDS_PER_PLACE_LIMIT = 512;
+  const knownMessageIDsByPlace = new Map<PlaceKey, Map<string, number>>();
+  const pruneKnownMessageIDs = (key: PlaceKey, cursor: number) => {
+    const known = knownMessageIDsByPlace.get(key);
+    if (!known) return;
+    for (const [messageId, seq] of known) {
+      if (seq <= cursor) known.delete(messageId);
+    }
+    if (known.size > KNOWN_MESSAGE_IDS_PER_PLACE_LIMIT) {
+      const evictionOrder = [...known.entries()].sort(
+        ([leftID, leftSeq], [rightID, rightSeq]) =>
+          leftSeq - rightSeq || leftID.localeCompare(rightID),
+      );
+      for (const [messageId] of evictionOrder.slice(
+        0,
+        known.size - KNOWN_MESSAGE_IDS_PER_PLACE_LIMIT,
+      )) {
+        known.delete(messageId);
+      }
+    }
+    if (known.size === 0) knownMessageIDsByPlace.delete(key);
+  };
+  const rememberKnownMessage = (
+    key: PlaceKey,
+    message: Pick<Message, "messageId" | "seq">,
+    cursor: number,
+  ): boolean => {
+    let known = knownMessageIDsByPlace.get(key);
+    if (!known) {
+      known = new Map();
+      knownMessageIDsByPlace.set(key, known);
+    }
+    const alreadyKnown = known.has(message.messageId);
+    known.set(message.messageId, message.seq);
+    pruneKnownMessageIDs(key, cursor);
+    return alreadyKnown;
+  };
+  const rememberKnownMessages = (
+    key: PlaceKey,
+    messages: readonly Message[],
+    cursor: number,
+  ) => {
+    for (const message of messages) rememberKnownMessage(key, message, cursor);
+  };
+  /**
    * 一度に履歴を抱える場所の上限。serverのmaxHelloCursorsより十分小さく取り、
    * 「開き続けたら握手が拒否される」状態に構造的に到達しないようにする。
    */
@@ -1036,6 +1086,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const key = placeKey(event.message.place);
       noteLatestSeq(key, event.message.seq);
       set((state) => {
+        const priorLastRead = state.lastReadByPlace[key] ?? 0;
+        const alreadyKnown = rememberKnownMessage(
+          key,
+          event.message,
+          priorLastRead,
+        );
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
@@ -1056,16 +1112,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
         delete typing[authorKey];
         const lastRead =
           authorKey === state.selfKey
-            ? Math.max(state.lastReadByPlace[key] ?? 0, event.message.seq)
-            : (state.lastReadByPlace[key] ?? 0);
+            ? Math.max(priorLastRead, event.message.seq)
+            : priorLastRead;
+        pruneKnownMessageIDs(key, lastRead);
         const previousContribution = existing
           ? unreadContribution(existing, lastRead, state.selfKey)
           : { unread: 0, mentions: 0 };
-        const nextContribution = unreadContribution(
-          event.message,
-          lastRead,
-          state.selfKey,
-        );
+        // Only a previously unknown message_created may add unread state.
+        // An edit can change visible content but never becomes a new unread
+        // or mention, and replay/live duplicates have already contributed.
+        const nextContribution =
+          event.type === "message_created" && !alreadyKnown
+            ? unreadContribution(event.message, lastRead, state.selfKey)
+            : previousContribution;
         return {
           messagesByPlace: messages
             ? { ...state.messagesByPlace, [key]: messages }
@@ -1110,6 +1169,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     if (event.type === "message_deleted") {
       const key = placeKey(event.message.place);
       noteLatestSeq(key, event.message.seq);
+      // A late pre-delete create frame is not new news. Keep the identity even
+      // when the tombstone itself is not retained with unheld history.
+      rememberKnownMessage(key, event.message, get().lastReadByPlace[key] ?? 0);
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
@@ -1450,6 +1512,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     ) {
       return;
     }
+    rememberKnownMessages(key, messages, get().lastReadByPlace[key] ?? 0);
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
@@ -1537,6 +1600,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
             (message) => message.messageId === receipt.messageId,
           );
           if (committed) {
+            rememberKnownMessage(
+              key,
+              committed,
+              get().lastReadByPlace[key] ?? 0,
+            );
             set((state) => ({
               messagesByPlace: {
                 ...state.messagesByPlace,
@@ -1751,6 +1819,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       heldPlaces.clear();
       placeHoldGenerations.clear();
       knownLatestSeq.clear();
+      knownMessageIDsByPlace.clear();
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
       const threadVersions = new Map(threadProjectionVersions);
@@ -2180,6 +2249,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return false;
       }
+      rememberKnownMessages(key, messages, get().lastReadByPlace[key] ?? 0);
       set((state) => ({
         messagesByPlace: {
           ...state.messagesByPlace,
@@ -2390,6 +2460,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (seq <= current) return;
       const place = parsePlaceKey(key);
       if (!place) return;
+      pruneKnownMessageIDs(key, seq);
       set((entry) => ({
         lastReadByPlace: { ...entry.lastReadByPlace, [key]: seq },
         unreadCountByPlace: {
@@ -2540,6 +2611,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return;
       }
+      rememberKnownMessages(key, older, get().lastReadByPlace[key] ?? 0);
       set((entry) => {
         const existing = entry.messagesByPlace[key] ?? [];
         const known = new Set(existing.map((m) => m.messageId));

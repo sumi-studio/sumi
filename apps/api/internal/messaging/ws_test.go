@@ -505,6 +505,19 @@ func TestWSCatchUpReplaysFromCursor(t *testing.T) {
 	}
 }
 
+func TestWSCatchUpEmptyPlaceStillAnnouncesCaughtUp(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+
+	conn := dialWS(t, ts, w.humanA.ID, map[string]int64{ch.PlaceID: 0})
+	frame := readFrame(t, conn)
+	if frame["type"] != "caught_up" || frame["place_id"] != ch.PlaceID || frame["latest_seq"] != float64(0) {
+		t.Fatalf("empty-place catch-up = %v, want caught_up at seq 0", frame)
+	}
+}
+
 func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

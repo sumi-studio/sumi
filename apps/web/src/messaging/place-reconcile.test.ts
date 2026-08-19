@@ -413,6 +413,29 @@ describe("place lifecycleの再接続突き合わせ", () => {
     );
   });
 
+  it("履歴を保持していないplaceでもcreated・edited・replay重複を一度だけ未読にする", () => {
+    const created: Message = {
+      ...threadMessage("unused", 6),
+      place: { kind: "channel", channelId: "channel-1" },
+      messageId: "message-unheld-dedupe",
+      mentions: [SELF],
+    };
+
+    backend.emit({ type: "message_created", message: created, notify: null });
+    expect(useMessaging.getState().messagesByPlace[CHANNEL_1]).toBeUndefined();
+    expect(useMessaging.getState().unreadCountByPlace[CHANNEL_1]).toBe(4);
+    expect(useMessaging.getState().mentionCountByPlace[CHANNEL_1]).toBe(2);
+
+    backend.emit({
+      type: "message_edited",
+      message: { ...created, content: "編集後の本文", editedAt: 7 },
+    });
+    backend.emit({ type: "message_created", message: created, notify: null });
+
+    expect(useMessaging.getState().unreadCountByPlace[CHANNEL_1]).toBe(4);
+    expect(useMessaging.getState().mentionCountByPlace[CHANNEL_1]).toBe(2);
+  });
+
   it("順不同のthread作成イベントでもserver aggregateの件数と参加者を採用する", async () => {
     const known = thread("thread-authoritative");
     const mentioned = { kind: "human", humanId: "human-c" } as const;

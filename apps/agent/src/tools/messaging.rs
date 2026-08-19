@@ -1380,15 +1380,19 @@ impl MessagingTool {
             }.map_err(map_messaging_api_error)?,
             BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let mut response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.create_thread(scope, CreateMessagingThreadRequest {
+                // This is a mutation boundary. Once its HTTP future exists we
+                // must retain it until it produces either the durable receipt
+                // or the transport's indeterminate failure. Dropping it on a
+                // cancellation would lose a committed thread_id and invite a
+                // second create with another call id.
+                let mut response = self.api.create_thread(scope, CreateMessagingThreadRequest {
                         parent_place_id: &parent_place_id,
                         name: &name,
                         parent_message_id: parent_message_id.as_deref(),
                         client_nonce: &nonce,
-                    }) => result,
-                }.map_err(map_messaging_api_error)?;
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 let thread_id = response.get("thread_id").and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?
@@ -1472,18 +1476,18 @@ impl MessagingTool {
                     ));
                 }
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.write(scope, WriteMessagingMessageRequest {
+                // The write has been emitted: settle it to its receipt or an
+                // indeterminate API error before observing cancellation again.
+                let response = self.api.write(scope, WriteMessagingMessageRequest {
                         place_id: &place_id,
                         content: &content,
                         urgency: urgency_text(urgency),
                         reply_to: reply_to.as_deref(),
                         client_nonce: &nonce,
                         attachments: &[],
-                    }) => result,
-                }
-                .map_err(map_messaging_api_error)?;
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
                     upsert_visible_message(
                         state,
@@ -1503,46 +1507,40 @@ impl MessagingTool {
                 emoji,
             } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.react(scope, ReactMessagingReactionRequest {
+                self.api.react(scope, ReactMessagingReactionRequest {
                         place_id: &place_id,
                         message_id: &message_id,
                         emoji: &emoji,
                         client_nonce: &nonce,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?
             }
             BoundMessagingAction::Status {
                 status,
                 note,
                 expires_in_minutes,
-            } => tokio::select! {
-                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                result = self.api.set_status(scope, SetMessagingStatusRequest {
+            } => self.api.set_status(scope, SetMessagingStatusRequest {
                     status: status_text(status),
                     note: note.as_deref(),
                     expires_in_minutes,
-                }) => result,
-            }
-            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+                })
+                .await
+                .map_err(map_messaging_api_error)?,
             BoundMessagingAction::ReplyLater {
                 place_id,
                 message_id,
                 note,
                 remind_in_minutes,
             } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.reply_later(scope, CreateMessagingReplyLaterRequest {
+                let response = self.api.reply_later(scope, CreateMessagingReplyLaterRequest {
                         place_id: &place_id,
                         message_id: &message_id,
                         note: note.as_deref(),
                         remind_in_minutes,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 if let Some(marker) = reply_later_marker_from_response(&response) {
                     if state.self_participant.is_none() {
                         // The authenticated create endpoint can only return
@@ -1555,13 +1553,11 @@ impl MessagingTool {
                 response
             }
             BoundMessagingAction::ResolveReplyLater { marker_id } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.resolve_reply_later(scope, ResolveMessagingReplyLaterRequest {
+                let response = self.api.resolve_reply_later(scope, ResolveMessagingReplyLaterRequest {
                         marker_id: &marker_id,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 state
                     .visible_reply_later_markers
                     .retain(|marker| marker.marker_id != marker_id);
@@ -3131,6 +3127,7 @@ mod tests {
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         threads: AsyncMutex<Vec<(String, String, Option<String>, String)>>,
+        create_thread_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
@@ -3513,6 +3510,12 @@ mod tests {
                 .lock()
                 .await
                 .push(format!("create_thread:{}", request.parent_place_id));
+            if let Some(gate) = self.create_thread_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("test create-thread gate remains open")
+                    .forget();
+            }
             self.threads.lock().await.push((
                 request.parent_place_id.to_owned(),
                 request.name.to_owned(),
@@ -3535,6 +3538,15 @@ mod tests {
         action: Value,
         call_id: &str,
     ) -> Result<ToolOutput, ToolError> {
+        execute_with_cancel(tool, action, call_id, CancellationToken::new()).await
+    }
+
+    async fn execute_with_cancel(
+        tool: &MessagingTool,
+        action: Value,
+        call_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
         let args: ValidatedToolArguments =
             serde_json::from_value(with_default_workspace(action)).unwrap();
         let workspace = WorkspacePaths::new("/workspace").unwrap();
@@ -3544,7 +3556,7 @@ mod tests {
                 flow_id: "flow",
                 call_id,
                 args: &args,
-                cancel: CancellationToken::new(),
+                cancel,
                 on_update: Arc::new(|_| {}),
                 workspace: &workspace,
             },
@@ -4880,6 +4892,67 @@ mod tests {
         )
         .await
         .expect("resume opening the committed thread");
+        assert_eq!(api.threads.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_after_create_request_waits_for_and_returns_the_thread_receipt() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let gate = Arc::new(Semaphore::new(0));
+        *api.create_thread_gate.lock().await = Some(gate.clone());
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-parent",
+        )
+        .await
+        .expect("open parent");
+        default_state(&tool).await.pending_read_through.clear();
+
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let tool = tool.clone();
+            let cancel = cancel.clone();
+            async move {
+                execute_with_cancel(
+                    &tool,
+                    json!({"action": "create_thread", "name": "取消し中の枝"}),
+                    "create-cancelled-after-send",
+                    cancel,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|call| call == "create_thread:general")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake server received create request");
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !execution.is_finished(),
+            "cancellation after request emission must retain the receipt future"
+        );
+
+        gate.add_permits(1);
+        let created = execution
+            .await
+            .expect("execution joins")
+            .expect("the committed response remains a success");
+        assert_eq!(created.details["thread_id"], "th-1");
         assert_eq!(api.threads.lock().await.len(), 1);
     }
 

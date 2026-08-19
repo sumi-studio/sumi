@@ -204,7 +204,10 @@ func (s *subscriber) markReplayed(placeID string, seq int64) {
 func (s *subscriber) markCaughtUp(placeID string, latestSeq int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if latestSeq <= s.caughtUp[placeID] {
+	// The zero sequence is a valid durable head for an empty place. A missing
+	// map entry is not an already-announced zero boundary: the first replay
+	// still owes caught_up{latest_seq:0} to its completion waiter.
+	if announced, ok := s.caughtUp[placeID]; ok && latestSeq <= announced {
 		return false
 	}
 	s.caughtUp[placeID] = latestSeq
