@@ -29,6 +29,7 @@ export function MessageEditor({
   conflict,
   failure,
   savedWithPendingChanges,
+  saving,
   onReloadConflict,
   membersByKey,
   selfKey,
@@ -40,6 +41,7 @@ export function MessageEditor({
   conflict: { content: string; revision: number } | null;
   failure?: string | null;
   savedWithPendingChanges?: boolean;
+  saving: boolean;
   onReloadConflict: () => void;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   selfKey: ParticipantKey;
@@ -76,7 +78,7 @@ export function MessageEditor({
   }, [value]);
 
   const submit = () => {
-    if (conflict) return;
+    if (conflict || saving) return;
     const text = ime.committedValue(value);
     // compositionend が controlled state に届くより先でも、実値をsessionへ
     // 取り込んでから保存する。store更新は同期なので onSubmit はこの値を読む。
@@ -140,6 +142,8 @@ export function MessageEditor({
               新しい本文を読み込む
             </button>
           </>
+        ) : saving ? (
+          <span role="status">保存中…</span>
         ) : failure ? (
           <span role="alert">{failure}</span>
         ) : savedWithPendingChanges ? (
@@ -157,7 +161,7 @@ export function MessageEditor({
         <button
           type="button"
           onClick={submit}
-          disabled={conflict !== null}
+          disabled={conflict !== null || saving}
           className="rounded bg-primary px-1.5 py-0.5 font-medium text-primary-foreground transition-opacity hover:opacity-90"
         >
           保存

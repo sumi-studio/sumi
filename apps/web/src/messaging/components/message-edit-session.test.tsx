@@ -813,6 +813,140 @@ describe("編集セッションのタイムライン整合性", () => {
     );
   });
 
+  it("追記中に自分のmessage_editedが先に届いても、ACKで競合を残さず確定revisionへ進める", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const submitted = "先に送った本文";
+    const appended = "先に送った本文と追記";
+    const committed = {
+      ...target,
+      content: submitted,
+      revision: (target.revision ?? 1) + 1,
+    };
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+    let resolveSave: ((message: Message) => void) | undefined;
+    const save = new Promise<Message>((resolve) => {
+      resolveSave = resolve;
+    });
+    vi.spyOn(backend, "editMessage").mockImplementationOnce(() => save);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft(submitted));
+    act(() => useMessaging.getState().submitEdit());
+    act(() => useMessaging.getState().setEditDraft(appended));
+    act(() => emit({ type: "message_edited", message: committed }));
+
+    expect(useMessaging.getState().editConflict).toBeNull();
+
+    await act(async () => {
+      resolveSave?.(committed);
+      await save;
+    });
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: appended,
+      editBaseRevision: committed.revision,
+      editConflict: null,
+      editSavedWithPendingChanges: true,
+    });
+  });
+
+  it("保存中の二度目のsubmitはPATCHを送らない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    let resolveSave: ((message: Message) => void) | undefined;
+    const save = new Promise<Message>((resolve) => {
+      resolveSave = resolve;
+    });
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockImplementationOnce(() => save);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("一度だけ送る"));
+    act(() => useMessaging.getState().submitEdit());
+    act(() => useMessaging.getState().submitEdit());
+
+    expect(edit).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      resolveSave?.({
+        ...target,
+        content: "一度だけ送る",
+        revision: (target.revision ?? 1) + 1,
+      });
+      await save;
+    });
+  });
+
+  it("保存中の他者編集と409は従来どおり競合として残す", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const otherEdit = {
+      ...target,
+      content: "他者の本文",
+      revision: (target.revision ?? 1) + 1,
+    };
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+    let rejectSave: ((error: unknown) => void) | undefined;
+    const save = new Promise<Message>((_resolve, reject) => {
+      rejectSave = reject;
+    });
+    vi.spyOn(backend, "editMessage").mockImplementationOnce(() => save);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("自分の本文"));
+    act(() => useMessaging.getState().submitEdit());
+    act(() => emit({ type: "message_edited", message: otherEdit }));
+    await act(async () => {
+      rejectSave?.(
+        new MessagingAPIError("edit_conflict", 409, {
+          message: conflictWire(otherEdit),
+        }),
+      );
+      await save.catch(() => undefined);
+    });
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: "自分の本文",
+      editConflict: {
+        content: otherEdit.content,
+        revision: otherEdit.revision,
+      },
+    });
+  });
+
   it("保存中に取消して別の編集を始めても、先の成功は新しいセッションを閉じない", async () => {
     const backend = await bootStore();
     const [first, second] = (
