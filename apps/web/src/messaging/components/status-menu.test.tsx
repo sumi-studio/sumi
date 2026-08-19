@@ -42,12 +42,13 @@ afterEach(() => {
 });
 
 describe("StatusMenu", () => {
-  it("申告が無い人を対応可能とは表示しない", () => {
+  it("申告が無い人を対応可能とは表示せず、対応可能ドットも付けない", () => {
     setSelfStatus(undefined);
-    render(<StatusMenu />);
+    const { container } = render(<StatusMenu />);
 
     expect(screen.getByText("未設定")).toBeVisible();
     expect(screen.queryByText("対応可能")).not.toBeInTheDocument();
+    expect(container.querySelector(".bg-emerald-500")).not.toBeInTheDocument();
   });
 
   it("期限を選ぶ前に、その期限が切れたときどこへ戻るかを見せる", () => {

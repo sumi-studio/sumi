@@ -259,7 +259,7 @@ export function StatusMenu() {
             participantKey={selfKey}
             name={selfProfile?.displayName ?? "?"}
             size={26}
-            status={selfStatus?.status ?? "available"}
+            status={selfStatus?.status}
           />
         </ParticipantProfilePopover>
         <button
