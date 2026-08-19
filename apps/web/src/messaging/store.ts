@@ -380,6 +380,48 @@ function latestEditConflict(
 }
 
 /**
+ * この編集セッションにおける「競合」の唯一の定義。
+ *
+ * base より新しい revision の `message_edited` のうち、このセッションが送信した
+ * 本文ではないものだけが競合である。送信済み本文と一致する event は自分の echo
+ * として扱う。Message には編集者が載らないため、ここで確実に照合できるのは本文と
+ * 送信中の session だけである。
+ */
+function conflictFromMessageEditedEvent(
+  state: MessagingState,
+  existing: Message | undefined,
+  message: Message,
+): EditConflict | null {
+  const session = state.editSession;
+  const revision = message.revision ?? 1;
+  if (
+    !session ||
+    state.editingMessageId !== message.messageId ||
+    state.editBaseRevision === null ||
+    revision <= state.editBaseRevision ||
+    (session.submittedDraft !== null &&
+      message.content === session.submittedDraft.trim())
+  )
+    return state.editConflict;
+  return (
+    latestEditConflict(existing, state.editConflict, message) ??
+    state.editConflict
+  );
+}
+
+/**
+ * サーバーは PATCH の base revision を検査してから revision を進める。成功 ACK が
+ * R を返した時点で base..R に他者の編集は無かったことが確定するので、その範囲の
+ * 競合は自分の echo か古い観測であり、追記を残す場合にも表示し続けてはならない。
+ */
+function clearConflictsThroughSuccessfulEditAck(
+  conflict: EditConflict | null,
+  acknowledgedRevision: number,
+): EditConflict | null {
+  return conflict && conflict.revision > acknowledgedRevision ? conflict : null;
+}
+
+/**
  * 進行中のDM開始。participantsはUIが「誰にDMを始めているか」を表示するための値で、
  * tokenは開始を一意に識別して、古い開始のfinallyが新しい保留を解放しないための値。
  */
@@ -1141,15 +1183,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           state.selfKey,
         );
         const editConflict =
-          event.type === "message_edited" &&
-          state.editingMessageId === event.message.messageId &&
-          state.editBaseRevision !== null &&
-          (event.message.revision ?? 1) !== state.editBaseRevision
-            ? (latestEditConflict(
-                existing,
-                state.editConflict,
-                event.message,
-              ) ?? state.editConflict)
+          event.type === "message_edited"
+            ? conflictFromMessageEditedEvent(state, existing, event.message)
             : state.editConflict;
         return {
           messagesByPlace: { ...state.messagesByPlace, [key]: messages },
@@ -2169,6 +2204,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         !place ||
         !session ||
         !isCurrentEditSession(state, session) ||
+        session.submittedDraft !== null ||
         state.editConflict ||
         !trimmed
       )
@@ -2206,6 +2242,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 (message) => message.messageId === committed.messageId,
               );
               const base = latestMessageContent(currentMessage, committed);
+              const acknowledgedRevision =
+                committed.revision ?? submittedSession.revision;
               return {
                 messagesByPlace: {
                   ...current.messagesByPlace,
@@ -2227,6 +2265,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
                           submittedDraft: null,
                           token: ++nextEditSessionToken,
                         },
+                        editConflict: clearConflictsThroughSuccessfulEditAck(
+                          current.editConflict,
+                          acknowledgedRevision,
+                        ),
                         editFailure: null,
                         editSavedWithPendingChanges: true,
                       }
@@ -2255,6 +2297,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
               set((current) =>
                 isCurrentEditSession(current, submittedSession)
                   ? {
+                      editSession: {
+                        ...submittedSession,
+                        submittedDraft: null,
+                        token: ++nextEditSessionToken,
+                      },
                       editFailure:
                         "保存できませんでした。もう一度お試しください。",
                       editSavedWithPendingChanges: false,

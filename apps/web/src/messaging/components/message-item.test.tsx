@@ -220,6 +220,17 @@ describe("インライン編集", () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  it("保存中は保存操作を無効化する", () => {
+    renderItem(makeMessage({ content: "編集前" }), {
+      editing: true,
+      editDraft: "保存中の本文",
+      editSaving: true,
+    });
+
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("保存中");
+  });
+
   it("競合でも対象消滅でもない保存失敗を表示する", () => {
     renderItem(makeMessage(), {
       editing: true,
