@@ -1,11 +1,14 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
 import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
 import { hasDisplayMention } from "./mention";
 import type {
+  Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -29,6 +32,7 @@ import type {
   WorkspaceSummary,
 } from "./model";
 import {
+  isInlineImageMime,
   MAX_ATTACHMENT_BYTES,
   MAX_ATTACHMENTS_PER_MESSAGE,
   parsePlaceKey,
@@ -102,17 +106,32 @@ let nextDMStartToken = 0;
  */
 const draftFiles = new Map<
   string,
-  { file: File; controller: AbortController | null }
+  { file: File; controller: AbortController | null; previewUrl: string | null }
 >();
 
-function rememberDraftFile(clientNonce: string, file: File): void {
-  draftFiles.set(clientNonce, { file, controller: null });
+/**
+ * サムネイルのobject URLはbytesと同じ持ち主が管理する。作った側が解放まで
+ * 責任を持たないと、composerの再描画やplace切替のたびに取り逃す。
+ */
+function createPreviewUrl(file: File): string | null {
+  if (!isInlineImageMime(file.type)) return null;
+  if (typeof URL.createObjectURL !== "function") return null;
+  return URL.createObjectURL(file);
+}
+
+function rememberDraftFile(
+  clientNonce: string,
+  file: File,
+  previewUrl: string | null,
+): void {
+  draftFiles.set(clientNonce, { file, controller: null, previewUrl });
 }
 
 function releaseDraftFile(clientNonce: string): void {
   const entry = draftFiles.get(clientNonce);
   if (!entry) return;
   entry.controller?.abort();
+  if (entry.previewUrl) URL.revokeObjectURL(entry.previewUrl);
   draftFiles.delete(clientNonce);
 }
 
@@ -204,6 +223,11 @@ interface MessagingState {
   addDraftAttachments(files: File[]): void;
   removeDraftAttachment(clientNonce: string): void;
   retryDraftAttachment(clientNonce: string): void;
+  /**
+   * 送信前の添付に付ける宣言（名前・説明・ネタバレ）を変える。反映中は送信
+   * ゲートを閉じ、束ねたあとの添付へ編集が落ちるのを防ぐ。
+   */
+  editDraftAttachment(clientNonce: string, patch: AttachmentDraftPatch): void;
   /** 添付付き送信の可否: 本文か添付があり、uploadが全部終わっているとき。 */
   send(content: string, urgency: Urgency): void;
   retrySend(clientNonce: string): void;
@@ -1113,6 +1137,61 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
   };
 
+  /**
+   * 送信前の宣言（名前・説明・ネタバレ）の反映。uploadと同じ関門を通す:
+   * backend世代・session世代・そのdraftがまだ積まれていることを確かめてから
+   * 反映し、そうでなければ黙って捨てる。戻ってきた受領は別のWorkspaceの
+   * 添付かもしれない。
+   */
+  const dispatchDraftEdit = (
+    key: PlaceKey,
+    draft: DraftAttachment,
+    attachment: Attachment,
+    patch: AttachmentDraftPatch,
+  ) => {
+    const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const stillLive = () =>
+      backend === currentBackend &&
+      messagingSessionGeneration === sessionGeneration &&
+      (get().draftAttachmentsByPlace[key] ?? []).some(
+        (candidate) => candidate.clientNonce === draft.clientNonce,
+      );
+    const apply = (next: Partial<DraftAttachment>) =>
+      set((current) => ({
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: (current.draftAttachmentsByPlace[key] ?? []).map(
+            (candidate) =>
+              candidate.clientNonce === draft.clientNonce
+                ? { ...candidate, ...next }
+                : candidate,
+          ),
+        },
+      }));
+    currentBackend
+      .updateDraftAttachment(attachment.attachmentId, patch)
+      .then((updated) => {
+        if (!stillLive()) return;
+        apply({
+          status: "ready",
+          attachment: updated,
+          filename: updated.filename,
+          errorCode: undefined,
+          editPatch: undefined,
+        });
+      })
+      .catch((error: unknown) => {
+        if (!stillLive()) return;
+        // bytesは預けたままだが、古い宣言で送れてしまうと保存済みと誤認する。
+        // 直前のPATCHと理由を残し、再試行か破棄が済むまで送信を閉じる。
+        apply({
+          status: "edit_failed",
+          errorCode: attachmentUploadFailureCode(error),
+        });
+      });
+  };
+
   // upload結果はscope/session/backend世代とdraftの存在を全部確かめてから反映する。
   // 別のWorkspaceに切り替わったあとに戻ってきた受領は、前のplaceの添付として
   // 別のメッセージへ載る危険があるので捨てる。
@@ -1159,6 +1238,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         patch({
           status: "ready",
           attachment: receipt.attachment,
+          filename: receipt.attachment.filename,
           errorCode: undefined,
         });
       })
@@ -1554,7 +1634,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const clientNonce = secureRandomUUID();
         const draft: DraftAttachment = {
           clientNonce,
-          filename: file.name || "file",
+          filename: sanitizeAttachmentFilenameForDisplay(file.name),
           sizeBytes: file.size,
           contentType: file.type,
           status: "uploading",
@@ -1569,8 +1649,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
             errorCode: "attachment_too_large",
           };
         }
-        rememberDraftFile(clientNonce, file);
-        return draft;
+        // サムネイルは手元のFileから作る。uploadの完了を待たずに中身が見える
+        // ことが、送る前に確かめるという操作の全部なので。
+        const previewUrl = createPreviewUrl(file);
+        rememberDraftFile(clientNonce, file, previewUrl);
+        return previewUrl ? { ...draft, previewUrl } : draft;
       });
       set((current) => ({
         draftAttachmentsByPlace: {
@@ -1608,7 +1691,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const draft = (get().draftAttachmentsByPlace[key] ?? []).find(
         (entry) => entry.clientNonce === clientNonce,
       );
-      if (draft?.status !== "failed" || !draftFiles.has(clientNonce)) {
+      if (!draft) return;
+      if (
+        draft.status === "edit_failed" &&
+        draft.attachment &&
+        draft.editPatch
+      ) {
+        const retried: DraftAttachment = {
+          ...draft,
+          status: "editing",
+          errorCode: undefined,
+        };
+        set((current) => ({
+          draftAttachmentsByPlace: {
+            ...current.draftAttachmentsByPlace,
+            [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+              entry.clientNonce === clientNonce ? retried : entry,
+            ),
+          },
+        }));
+        dispatchDraftEdit(key, retried, draft.attachment, draft.editPatch);
+        return;
+      }
+      if (draft.status !== "failed" || !draftFiles.has(clientNonce)) {
         return;
       }
       const retried: DraftAttachment = {
@@ -1625,6 +1730,41 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       }));
       dispatchUpload(key, place, retried);
+    },
+
+    editDraftAttachment(clientNonce, patch) {
+      const key = get().activePlaceKey;
+      if (!key) return;
+      const draft = (get().draftAttachmentsByPlace[key] ?? []).find(
+        (entry) => entry.clientNonce === clientNonce,
+      );
+      const attachment = draft?.attachment;
+      // 預かりが済んでいない添付には宣言を付けられない。"editing" を先に置く
+      // ことが二重送信の関門でもある（zustandのsetは同期的なので、次の呼び
+      // 出しはもう ready ではない）。編集失敗後は、同じ入口から宣言を直して
+      // 新しいpatchへ置き換えられる。
+      if (
+        !draft ||
+        !attachment ||
+        (draft.status !== "ready" && draft.status !== "edit_failed")
+      )
+        return;
+      set((current) => ({
+        draftAttachmentsByPlace: {
+          ...current.draftAttachmentsByPlace,
+          [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+            entry.clientNonce === clientNonce
+              ? {
+                  ...entry,
+                  status: "editing" as const,
+                  errorCode: undefined,
+                  editPatch: patch,
+                }
+              : entry,
+          ),
+        },
+      }));
+      dispatchDraftEdit(key, draft, attachment, patch);
     },
 
     attachmentURL(attachmentId) {

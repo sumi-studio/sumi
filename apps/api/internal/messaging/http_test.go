@@ -151,6 +151,92 @@ func TestMessagingRoutesFailClosedOnOriginAndSession(t *testing.T) {
 	}
 }
 
+func TestMessagingJSONUnknownFieldsReturnInvalidJSON(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+
+	// JSON request bodies share decodeJSON. Verify representative creation,
+	// send, edit, and reaction endpoints use its strict unknown-field result
+	// instead of introducing endpoint-specific input-error classifications.
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   map[string]any
+	}{
+		{
+			name:   "create channel",
+			method: http.MethodPost,
+			path:   "/messaging/channels",
+			body:   map[string]any{"name": "design", "unknown": true},
+		},
+		{
+			name:   "send",
+			method: http.MethodPost,
+			path:   "/messaging/places/" + ch.PlaceID + "/messages",
+			body:   map[string]any{"content": "hello", "client_nonce": "unknown-send", "unknown": true},
+		},
+		{
+			name:   "edit",
+			method: http.MethodPatch,
+			path:   "/messaging/places/" + ch.PlaceID + "/messages/" + newUUIDv7(),
+			body:   map[string]any{"content": "hello", "unknown": true},
+		},
+		{
+			name:   "reaction",
+			method: http.MethodPost,
+			path:   "/messaging/places/" + ch.PlaceID + "/messages/" + newUUIDv7() + "/reactions",
+			body:   map[string]any{"emoji": "👍", "client_nonce": "unknown-reaction", "unknown": true},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resp, body := call(t, ts, test.method, test.path, w.humanA.ID, test.body)
+			if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_json" {
+				t.Fatalf("unknown field: status %d body %v", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+func TestMessagingJSONTrailingGarbageReturnsInvalidJSONBeforeMutation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	path := scopedPath(t, ts, w.humanA.ID, "/messaging/places/"+ch.PlaceID+"/messages")
+
+	// This is one valid object plus an invalid top-level suffix. It must not
+	// reach the send mutation (and therefore must not allocate a sequence).
+	req, err := http.NewRequest(http.MethodPost, ts.URL+path,
+		strings.NewReader(`{"content":"must not send","client_nonce":"trailing-json"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Origin", testOrigin)
+	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: w.humanA.ID})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_json" {
+		t.Fatalf("trailing JSON: status %d body %v", resp.StatusCode, body)
+	}
+	history, err := w.store.History(ctx, ch.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("trailing JSON reached mutation: %+v", history)
+	}
+}
+
 func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

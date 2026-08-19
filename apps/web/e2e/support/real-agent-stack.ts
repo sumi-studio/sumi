@@ -2022,7 +2022,9 @@ function exactHumanMessagingAttachment(
     attachment.mime !== "text/plain" ||
     attachment.sizeBytes !==
       Buffer.byteLength(humanMessagingAttachmentContents) ||
-    attachment.position !== 0
+    attachment.position !== 0 ||
+    attachment.spoiler !== false ||
+    attachment.alt !== ""
   ) {
     return undefined;
   }
@@ -2048,7 +2050,9 @@ function exactAgentMessagingAttachment(
     attachment.mime !== "text/plain" ||
     attachment.sizeBytes !==
       Buffer.byteLength(executorAuthorityProbeContents) ||
-    attachment.position !== 0
+    attachment.position !== 0 ||
+    attachment.spoiler !== false ||
+    attachment.alt !== ""
   ) {
     return undefined;
   }
@@ -2066,6 +2070,7 @@ function exactMessagingWriteReceipt(
     value.client_nonce.length === 0 ||
     value.created !== true ||
     !isCanonicalUUIDv7(value.message_id) ||
+    typeof value.seq !== "number" ||
     !Number.isSafeInteger(value.seq) ||
     value.seq <= 0
   ) {
@@ -2080,11 +2085,13 @@ function exactOpenMessages(value: unknown): Array<{
   author: { kind: string; id: string };
   attachments: Array<{
     attachmentID: string;
+    alt: string;
     filename: string;
     mime: string;
     sizeBytes: number;
     position: number;
     sha256: string;
+    spoiler: boolean;
   }>;
 }> {
   if (
@@ -2121,27 +2128,33 @@ function exactOpenMessages(value: unknown): Array<{
       if (
         !isRecord(attachment) ||
         Object.keys(attachment).sort().join("\0") !==
-          "attachment_id\0filename\0mime\0position\0sha256\0size_bytes" ||
+          "alt\0attachment_id\0filename\0mime\0position\0sha256\0size_bytes\0spoiler" ||
         !isCanonicalUUIDv7(attachment.attachment_id) ||
+        typeof attachment.alt !== "string" ||
         typeof attachment.filename !== "string" ||
         typeof attachment.mime !== "string" ||
+        typeof attachment.size_bytes !== "number" ||
         !Number.isSafeInteger(attachment.size_bytes) ||
         attachment.size_bytes < 1 ||
+        typeof attachment.position !== "number" ||
         !Number.isSafeInteger(attachment.position) ||
         attachment.position < 0 ||
         typeof attachment.sha256 !== "string" ||
-        !/^[a-f0-9]{64}$/.test(attachment.sha256)
+        !/^[a-f0-9]{64}$/.test(attachment.sha256) ||
+        typeof attachment.spoiler !== "boolean"
       ) {
         return [];
       }
       return [
         {
           attachmentID: attachment.attachment_id,
+          alt: attachment.alt,
           filename: attachment.filename,
           mime: attachment.mime,
           sizeBytes: attachment.size_bytes,
           position: attachment.position,
           sha256: attachment.sha256,
+          spoiler: attachment.spoiler,
         },
       ];
     });

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -28,6 +29,11 @@ const MaxUnboundDraftBytes = int64(MaxAttachmentsPerMessage) * MaxAttachmentByte
 
 // MaxAttachmentFilenameBytes matches the schema CHECK on filename.
 const MaxAttachmentFilenameBytes = 255
+
+// MaxAttachmentAltRunes bounds the sender's description of a file. It is a
+// sentence about the attachment, not a second message. The schema fences the
+// same column in bytes; this is the limit a person is held to.
+const MaxAttachmentAltRunes = 1000
 
 // DefaultAttachmentReservationTTL is how long an upload may stay reserved
 // without finalizing. The upload route allows 130 seconds for a 20 MiB body;
@@ -69,6 +75,10 @@ var (
 	ErrAttachmentUploadInProgress = errors.New("attachment upload is already staging")
 	ErrAttachmentSizeMismatch     = errors.New("attachment body size differs from the declared size")
 	ErrAttachmentsUnavailable     = errors.New("attachments are not configured")
+	// AlreadySent is a draft edit that arrived after the attachment became
+	// part of a message. What the recipients saw is what was sent, so the
+	// edit is refused instead of rewriting history under them.
+	ErrAttachmentAlreadySent = errors.New("attachment is already part of a message")
 )
 
 // AttachmentPolicy is the operator-owned attachment configuration. Every
@@ -157,8 +167,28 @@ type Attachment struct {
 	SHA256       []byte
 	Position     int
 	BlobState    string
-	CreatedAt    time.Time
-	BoundAt      *time.Time
+	// Spoiler asks the receiving side to keep the content covered until the
+	// reader opens it. It is the sender's declaration about the file, so it
+	// travels with the file rather than with the message text.
+	Spoiler bool
+	// Alt describes the content for someone who cannot or should not see it
+	// yet — a screen reader, or a PersonalityAgent reading a timeline.
+	Alt       string
+	CreatedAt time.Time
+	BoundAt   *time.Time
+}
+
+// AttachmentDraftPatch edits an attachment that has not been sent yet. A nil
+// field is「触らない」; a non-nil one is the new value.
+type AttachmentDraftPatch struct {
+	Filename *string
+	Alt      *string
+	Spoiler  *bool
+}
+
+// empty reports a patch that names nothing at all, which is never an edit.
+func (p AttachmentDraftPatch) empty() bool {
+	return p.Filename == nil && p.Alt == nil && p.Spoiler == nil
 }
 
 // SHA256Hex renders the digest for wire projection.
@@ -540,7 +570,8 @@ func (s *ScopedStore) outstandingDraftsInTx(ctx context.Context, tx pgx.Tx, plac
 }
 
 const attachmentColumns = `attachment_id, workspace_id, place_id, message_id, uploader_kind, uploader_id,
-	client_nonce, filename, mime, size_bytes, sha256, position, blob_state, created_at, bound_at`
+	client_nonce, filename, mime, size_bytes, sha256, position, blob_state, spoiler, alt,
+	created_at, bound_at`
 
 func scanAttachment(row pgx.Row) (Attachment, error) {
 	var (
@@ -550,7 +581,7 @@ func scanAttachment(row pgx.Row) (Attachment, error) {
 	)
 	if err := row.Scan(&att.AttachmentID, &att.WorkspaceID, &att.PlaceID, &messageID, &kind, &att.Uploader.ID,
 		&att.ClientNonce, &att.Filename, &att.MIME, &att.SizeBytes, &att.SHA256, &att.Position,
-		&att.BlobState, &att.CreatedAt, &att.BoundAt); err != nil {
+		&att.BlobState, &att.Spoiler, &att.Alt, &att.CreatedAt, &att.BoundAt); err != nil {
 		return Attachment{}, err
 	}
 	att.Uploader.Kind = ParticipantKind(kind)
@@ -864,6 +895,99 @@ func (s *ScopedStore) attachmentForViewerInTx(ctx context.Context, q querier, at
 	}
 	if deleted || seq < access.VisibleFromSeq {
 		return Attachment{}, ErrAttachmentNotFound
+	}
+	return att, nil
+}
+
+// UpdateDraftAttachment edits an upload that has not been sent yet: its
+// display name, its description, and whether it arrives covered. The window is
+// deliberately narrow — the uploader's own attachment, still unbound — because
+// these are things one decides *before* pressing send. Once the attachment is
+// part of a message, what the recipients saw is what was sent, so the edit is
+// refused rather than silently rewriting history.
+//
+// Authorization is AttachmentForViewer's: an attachment belonging to someone
+// else, or outside this exact scope, is reported as missing and never as
+// forbidden, so existence never leaks. Only the uploader's own already-sent
+// file is told apart, because that person deserves to know why their edit did
+// not land.
+func (s *ScopedStore) UpdateDraftAttachment(ctx context.Context, attachmentID string, patch AttachmentDraftPatch) (Attachment, error) {
+	if err := s.requireAttachments(); err != nil {
+		return Attachment{}, err
+	}
+	if !validAttachmentID(attachmentID) {
+		return Attachment{}, ErrAttachmentNotFound
+	}
+	if patch.empty() {
+		return Attachment{}, errors.New("attachment edit must name at least one field")
+	}
+	if patch.Filename != nil {
+		name := strings.TrimSpace(*patch.Filename)
+		if name == "" || len(name) > MaxAttachmentFilenameBytes {
+			return Attachment{}, fmt.Errorf("filename must be 1..%d bytes", MaxAttachmentFilenameBytes)
+		}
+		patch.Filename = &name
+	}
+	if patch.Alt != nil && utf8.RuneCountInString(*patch.Alt) > MaxAttachmentAltRunes {
+		return Attachment{}, fmt.Errorf("alt must be at most %d characters", MaxAttachmentAltRunes)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Attachment{}, fmt.Errorf("begin attachment edit: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
+		return Attachment{}, err
+	}
+	current, err := s.attachmentForViewerInTx(ctx, tx, attachmentID)
+	if err != nil {
+		return Attachment{}, err
+	}
+	if current.Uploader != s.Scope.Actor {
+		return Attachment{}, ErrAttachmentNotFound
+	}
+	if current.MessageID != "" {
+		return Attachment{}, ErrAttachmentAlreadySent
+	}
+	// COALESCE keeps「触らない」honest: an unnamed field reads its stored value
+	// back in the same statement that writes the named ones. The WHERE clause
+	// repeats the unbound rule so a send committing between the read above and
+	// this write loses the race instead of overwriting a sent attachment.
+	att, err := scanAttachment(tx.QueryRow(ctx, `
+		UPDATE message_attachments
+		SET filename = COALESCE($3, filename),
+		    alt      = COALESCE($4, alt),
+		    spoiler  = COALESCE($5, spoiler)
+		WHERE attachment_id = $1 AND workspace_id = $2
+		  AND uploader_kind = $6 AND uploader_id = $7
+		  AND message_id IS NULL AND blob_state = 'stored'
+		RETURNING `+attachmentColumns,
+		attachmentID, s.Scope.WorkspaceID, patch.Filename, patch.Alt, patch.Spoiler,
+		s.Scope.Actor.Kind, s.Scope.Actor.ID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Only a concurrent bind deserves the special 409. A reconciler can
+		// move an orphan to deleting in the same window; that attachment is
+		// unavailable, not already sent.
+		var messageID *string
+		recheckErr := tx.QueryRow(ctx, `
+			SELECT message_id FROM message_attachments
+			WHERE attachment_id = $1 AND workspace_id = $2
+			  AND uploader_kind = $3 AND uploader_id = $4`,
+			attachmentID, s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID,
+		).Scan(&messageID)
+		if recheckErr == nil && messageID != nil {
+			return Attachment{}, ErrAttachmentAlreadySent
+		}
+		if recheckErr != nil && !errors.Is(recheckErr, pgx.ErrNoRows) {
+			return Attachment{}, fmt.Errorf("recheck attachment edit: %w", recheckErr)
+		}
+		return Attachment{}, ErrAttachmentNotFound
+	}
+	if err != nil {
+		return Attachment{}, fmt.Errorf("update attachment: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Attachment{}, fmt.Errorf("commit attachment edit: %w", err)
 	}
 	return att, nil
 }

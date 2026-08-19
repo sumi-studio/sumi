@@ -19,6 +19,7 @@ import {
   notificationLevelFor,
   useMessaging,
 } from "../store";
+import { ModalDialog } from "./modal-dialog";
 import { ownsEvent, useOverlayPanel } from "./overlay";
 import {
   ParticipantAvatar,
@@ -263,21 +264,13 @@ function DialogShell({
   onClose: () => void;
   children: React.ReactNode;
 }) {
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        className="w-80 rounded-xl border border-border bg-background p-4 shadow-lg"
-      >
+    <ModalDialog
+      label={title}
+      onClose={onClose}
+      className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
+    >
+      <div className="w-80 rounded-xl border border-border bg-background p-4 shadow-lg">
         <div className="flex items-center justify-between">
           <p className="font-semibold text-[14px]">{title}</p>
           <button
@@ -291,7 +284,7 @@ function DialogShell({
         </div>
         {children}
       </div>
-    </div>
+    </ModalDialog>
   );
 }
 

@@ -140,13 +140,18 @@
   "mime": "サーバーがバイト先頭を sniff して決めた型",
   "size_bytes": 12345,
   "sha256": "<hex>",
-  "position": 0
+  "position": 0,
+  "spoiler": false,
+  "alt": "中身を見なくても何のファイルか分かる説明"
 }
 ```
 
 - `Message.attachments` は送信者が選んだ順序で最大 10 件。1 ファイルは最大 20 MiB。
   `content` が空でも attachments が 1 件以上あれば有効なメッセージである
   （DB の deferred trigger が同じ規則を commit 時に強制する）。
+- `spoiler` は受信側が開くまで inline 画像を覆う送信者の宣言であり、必ず boolean として
+  wire に載せる。`alt` は中身を見ずに分かる説明で、空文字を「説明なし」とし、最大
+  1,000 code point（DB 上は最大 4,000 UTF-8 bytes）を必ず string として wire に載せる。
 - upload は message より先に行い、`POST /messaging/places/{place_id}/attachments`
   に生バイトを送る。メタデータは header で運ぶ: `Idempotency-Key`（ファイルごとに
   安定な nonce）、`Content-Length`（宣言サイズ・必須）、`Content-Type`（ヒント）、
@@ -165,6 +170,12 @@
   削除確認後だけに行う。
   tombstone 済みの nonce は historical logical-upload identity として retired になり、
   ready receipt に化けず `410 attachment_upload_retired` を返す。
+- 送信前の宣言は `PATCH /messaging/attachments/{attachment_id}`（exact scope query 付き）で
+  編集する。body は `filename` / `alt` / `spoiler` の任意の非空サブセットで、空 patch は
+  `400 invalid_request`。省略した field は不変である。編集できるのは
+  upload した本人の未 bind attachment だけで、送信済みの本人の attachment は
+  `409 attachment_already_sent`、それ以外（見えない・削除中・他人のものを含む）は
+  `404 not_found` になる。
 - 送信 `POST /messaging/places/{place_id}/messages` の body に
   `attachments: [attachment_id, ...]` を順序付きで載せる。bind は message insert・
   mention・seq 割当・notification intent と同じ transaction で行われ、1 件でも
@@ -196,6 +207,10 @@
 
 ## API / event（人間UI側）
 
+- JSON request body は messaging REST 全体で strict に decode する。malformed JSON、複数の
+  JSON value、未知 field は endpoint を問わず `400 invalid_json` とする。decode 後の
+  endpoint 固有の内容検証だけが、それぞれの `invalid_*`（この PATCH の空 body などは
+  `invalid_request`）を返す。
 - REST: place一覧、履歴取得（seqベースのpagination）、read marker更新、
   connection申請/承認、通知設定CRUD、channel作成。
 - 送信とlive配信は既存方針どおりWS経由（TTFT < 500ms、[screen-composition.md](screen-composition.md) の設計制約）。

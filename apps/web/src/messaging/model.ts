@@ -89,6 +89,23 @@ export interface Attachment {
   sizeBytes: number;
   sha256: string;
   position: number;
+  /**
+   * 送り手が「開くまで中身を見せない」と宣言した添付。受け手の画面では覆って
+   * おき、開示は受け手の操作に任せる。メッセージ本文ではなく添付の性質。
+   */
+  spoiler: boolean;
+  /** 中身を見なくても何のファイルか分かる説明。無ければ空。 */
+  alt: string;
+}
+
+/** 添付の説明の上限。サーバーのMaxAttachmentAltRunesと同値。 */
+export const MAX_ATTACHMENT_ALT_LENGTH = 1000;
+
+/** 送信前の添付への編集。省略した項目は「触らない」。 */
+export interface AttachmentDraftPatch {
+  filename?: string;
+  alt?: string;
+  spoiler?: boolean;
 }
 
 export function isInlineImageMime(mime: string): boolean {
@@ -362,6 +379,14 @@ export interface MessagingBackend {
   uploadAttachment(
     input: UploadAttachmentInput,
   ): Promise<UploadAttachmentReceipt>;
+  /**
+   * 送信前の添付を編集する（名前・説明・ネタバレ）。送ってしまった添付は
+   * 受け手が見たものが正なので、サーバーが編集を拒む。
+   */
+  updateDraftAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment>;
   /**
    * 現在のexact scopeで再認可されるbytes取得URL。<img src>と<a download>が
    * そのまま使う。scopeが変われば別のURLになる。

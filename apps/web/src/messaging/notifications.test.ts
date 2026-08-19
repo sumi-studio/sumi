@@ -111,9 +111,25 @@ describe("notification text", () => {
           sizeBytes: 1,
           sha256: "00",
           position: 0,
+          spoiler: false,
+          alt: "",
         },
       ]),
     ).toBe("📎 plan.pdf");
+    expect(
+      notificationBody("", [
+        {
+          attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaac",
+          filename: "ending_dies.png",
+          mime: "image/png",
+          sizeBytes: 1,
+          sha256: "00",
+          position: 0,
+          spoiler: true,
+          alt: "",
+        },
+      ]),
+    ).toBe("📎 添付（ネタバレ）");
     expect(
       notificationBody("", [
         {
@@ -123,6 +139,8 @@ describe("notification text", () => {
           sizeBytes: 1,
           sha256: "00",
           position: 0,
+          spoiler: false,
+          alt: "",
         },
         {
           attachmentId: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaab",
@@ -131,6 +149,8 @@ describe("notification text", () => {
           sizeBytes: 1,
           sha256: "00",
           position: 1,
+          spoiler: false,
+          alt: "",
         },
       ]),
     ).toBe("📎 2件のファイル");

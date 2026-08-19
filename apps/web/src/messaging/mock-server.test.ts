@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { MessagingAPIError } from "./api-backend";
 import { MockMessagingServer } from "./mock-server";
 import type { Message } from "./model";
 
@@ -12,6 +13,18 @@ afterEach(() => {
 });
 
 describe("MockMessagingServer admission", () => {
+  it("returns the API-shaped already-sent edit rejection", async () => {
+    const server = new MockMessagingServer();
+    await expect(
+      server.updateDraftAttachment("missing", { spoiler: true }),
+    ).rejects.toEqual(
+      expect.objectContaining<Partial<MessagingAPIError>>({
+        code: "attachment_already_sent",
+        status: 409,
+      }),
+    );
+  });
+
   it("client文字列の部分一致ではmentionを解決しない", async () => {
     vi.useFakeTimers();
     const server = new MockMessagingServer();

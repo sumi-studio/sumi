@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -74,6 +75,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
 	mux.HandleFunc("POST /messaging/places/{place_id}/attachments", s.serveUploadAttachment)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
+	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 }
 
 // --- wire shapes (snake_case, ActorRef/PlaceRef-compatible) ---
@@ -1405,7 +1407,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, into any) bool {
 		writeError(w, http.StatusBadRequest, "invalid_json")
 		return false
 	}
-	if dec.More() {
+	// Decoder.More only answers whether another value is available *inside* an
+	// array or object. A second Decode is the only strict top-level check: a
+	// JSON request has exactly one value followed by EOF.
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid_json")
 		return false
 	}
@@ -1461,6 +1467,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusGone, "attachment_upload_expired")
 	case errors.Is(err, ErrAttachmentUploadRetired):
 		writeError(w, http.StatusGone, "attachment_upload_retired")
+	case errors.Is(err, ErrAttachmentAlreadySent):
+		writeError(w, http.StatusConflict, "attachment_already_sent")
 	case errors.Is(err, ErrTooManyAttachments):
 		writeError(w, http.StatusBadRequest, "too_many_attachments")
 	case errors.Is(err, ErrAttachmentsUnavailable):

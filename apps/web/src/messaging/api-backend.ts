@@ -1,6 +1,7 @@
 import { parseCallState } from "./call/call-api";
 import type {
   Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -293,6 +294,23 @@ export class ApiMessagingBackend implements MessagingBackend {
       attachment: parseAttachment(body.attachment),
       created: asBoolean(body.created),
     };
+  }
+
+  /** 送信前の添付の編集。省略した項目はサーバー側でも「触らない」。 */
+  async updateDraftAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment> {
+    const body: Record<string, unknown> = {};
+    if (patch.filename !== undefined) body.filename = patch.filename;
+    if (patch.alt !== undefined) body.alt = patch.alt;
+    if (patch.spoiler !== undefined) body.spoiler = patch.spoiler;
+    return parseAttachment(
+      await this.request(
+        `/messaging/attachments/${encodeURIComponent(attachmentId)}`,
+        { method: "PATCH", body },
+      ),
+    );
   }
 
   attachmentURL(attachmentId: string): string {
@@ -823,6 +841,11 @@ function parseAttachment(value: unknown): Attachment {
     sizeBytes,
     sha256: asString(wire.sha256),
     position,
+    // These declarations are mandatory on every attachment wire. In
+    // particular, inventing `false` for a missing spoiler would reveal an
+    // image the sender asked to keep covered.
+    spoiler: asBoolean(wire.spoiler),
+    alt: asString(wire.alt),
   };
 }
 

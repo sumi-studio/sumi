@@ -60,6 +60,36 @@ afterEach(() => {
 });
 
 describe("ApiMessagingBackend", () => {
+  it("rejects attachment wires that omit required spoiler or alt declarations", async () => {
+    for (const missing of ["spoiler", "alt"] as const) {
+      const attachment: Record<string, unknown> = {
+        attachment_id: "0190aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+        filename: "shot.png",
+        mime: "image/png",
+        size_bytes: 3,
+        sha256: "ab",
+        position: 0,
+        spoiler: false,
+        alt: "",
+      };
+      delete attachment[missing];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => json({ attachment, created: true }, 201)),
+      );
+      const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+      await expect(
+        backend.uploadAttachment({
+          place: channel,
+          clientNonce: `missing-${missing}`,
+          filename: "shot.png",
+          contentType: "image/png",
+          body: new Blob(["png"]),
+        }),
+      ).rejects.toThrow("invalid messaging response");
+    }
+  });
+
   it("uses the browser session REST surface for bootstrap, history, send, and read", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
