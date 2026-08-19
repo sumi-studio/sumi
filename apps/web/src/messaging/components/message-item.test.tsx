@@ -9,6 +9,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetEditFocus } from "../edit-focus";
 import {
   lockedMessageId,
   lockMessageActions,
@@ -99,6 +100,7 @@ function renderItem(
       onSubmitEdit={noop}
       onCancelEdit={noop}
       onReloadEditConflict={noop}
+      editOpenedToken={1}
       revealedAttachmentIds={new Set()}
       onRevealAttachment={noop}
       onOpenImage={noop}
@@ -111,6 +113,7 @@ function renderItem(
 beforeEach(() => {
   resetRecentEmojis();
   resetMessageActionLock();
+  resetEditFocus();
 });
 
 afterEach(() => {

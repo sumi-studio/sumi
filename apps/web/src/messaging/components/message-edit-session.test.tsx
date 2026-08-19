@@ -10,6 +10,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { memo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MessagingAPIError } from "../api-backend";
 import { MockMessagingServer } from "../mock-server";
@@ -34,6 +35,26 @@ import { MessageList } from "./message-list";
 vi.mock("../place-route", () => ({
   placePath: (workspaceId: string, key: string) => `/w/${workspaceId}/${key}`,
 }));
+
+/**
+ * 行の描画回数。MessageItem は memo なので、この外側の memo が描き直された
+ * 回数＝「その行に渡る props が変わった回数」。編集欄の1キーストロークで
+ * 可視行すべてを描き直していないことを、ここで数える。
+ */
+const rowRenders = new Map<string, number>();
+vi.mock("./message-item", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./message-item")>();
+  const Counted = memo(function CountedMessageItem(
+    props: React.ComponentProps<typeof actual.MessageItem>,
+  ) {
+    rowRenders.set(
+      props.message.messageId,
+      (rowRenders.get(props.message.messageId) ?? 0) + 1,
+    );
+    return <actual.MessageItem {...props} />;
+  });
+  return { ...actual, MessageItem: Counted };
+});
 
 const VIEWPORT_HEIGHT = 240;
 const MESSAGE_COUNT = 200;
@@ -176,6 +197,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   useMessaging.getState().cancelEdit();
+  rowRenders.clear();
 });
 
 function row(messageId: string): HTMLElement | null {
@@ -253,6 +275,80 @@ describe("編集セッションは仮想リストの行より長生きする", (
     fireEvent.scroll(viewport);
     const again = await screen.findByLabelText("メッセージを編集");
     expect(again).toHaveValue("書きかけの続き");
+  });
+
+  it("編集欄は開いた回に一度だけフォーカスし、行の再マウントでは奪わない", async () => {
+    const messages = makeMessages(MESSAGE_COUNT);
+    seedStore(messages);
+    renderList();
+    // 編集欄が focus() を呼んだ回数を数える。仮想リストは自分の都合で
+    // viewport へフォーカスを移すことがあるので、activeElement ではなく
+    // 「編集欄が奪いにいったか」を見る。
+    const focusedTextareas: HTMLElement[] = [];
+    const originalFocus = HTMLElement.prototype.focus;
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(function (
+      this: HTMLElement,
+      options?: FocusOptions,
+    ) {
+      if (this instanceof HTMLTextAreaElement) focusedTextareas.push(this);
+      originalFocus.call(this, options);
+    });
+
+    const target = messages[OFFSCREEN_INDEX].messageId;
+    act(() => useMessaging.getState().startEdit(target));
+    const textarea = await screen.findByLabelText("メッセージを編集");
+    expect(focusedTextareas).toEqual([textarea]);
+
+    // 最新側へ飛ばして行を捨て、戻して再マウントさせる。
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="conversation-viewport"]',
+    );
+    if (!viewport) throw new Error("viewport not rendered");
+    fireEvent.wheel(viewport, { deltaY: 4_000 });
+    viewport.scrollTop = 9_000;
+    fireEvent.scroll(viewport);
+    await waitFor(() => {
+      expect(screen.queryByLabelText("メッセージを編集")).toBeNull();
+    });
+    viewport.scrollTop = 0;
+    fireEvent.scroll(viewport);
+    const remounted = await screen.findByLabelText("メッセージを編集");
+    // 同じ編集の回。別の場所（composer など）に居る caret を奪い返さない。
+    expect(remounted).not.toBe(textarea);
+    expect(focusedTextareas).toEqual([textarea]);
+    expect(remounted).not.toHaveFocus();
+
+    // 取り消して開き直せば、新しい回として再びフォーカスする。
+    act(() => useMessaging.getState().cancelEdit());
+    await waitFor(() => {
+      expect(screen.queryByLabelText("メッセージを編集")).toBeNull();
+    });
+    act(() => useMessaging.getState().startEdit(target));
+    const reopened = await screen.findByLabelText("メッセージを編集");
+    expect(focusedTextareas).toEqual([textarea, reopened]);
+  });
+
+  it("編集欄の1キーストロークで描き直すのは編集行だけ", async () => {
+    const messages = makeMessages(MESSAGE_COUNT);
+    seedStore(messages);
+    renderList();
+    // 最新側の描画窓にある行を編集する（可視行が複数ある状態で数える）。
+    const target = messages[MESSAGE_COUNT - 2].messageId;
+    await waitFor(() => {
+      expect(row(target)).toBeInTheDocument();
+    });
+    act(() => useMessaging.getState().startEdit(target));
+    const textarea = await screen.findByLabelText("メッセージを編集");
+    const before = new Map(rowRenders);
+    expect(before.size).toBeGreaterThan(1);
+
+    fireEvent.change(textarea, { target: { value: "一文字足す" } });
+    expect(useMessaging.getState().editDraft).toBe("一文字足す");
+
+    const rerendered = [...rowRenders].filter(
+      ([id, count]) => count !== before.get(id),
+    );
+    expect(rerendered.map(([id]) => id)).toEqual([target]);
   });
 
   it("インライン編集中の @ 補完は候補を選ぶと表示名を挿入する", async () => {
@@ -393,6 +489,49 @@ describe("編集セッションのタイムライン整合性", () => {
       editConflict: {
         content: "別の場所の本文",
         revision: 2,
+      },
+    });
+    const edit = vi.spyOn(backend, "editMessage");
+    act(() => useMessaging.getState().submitEdit());
+    expect(edit).not.toHaveBeenCalled();
+  });
+
+  it("catch-up が message_created で運ぶ他所の新しい版も、submit を待たず競合として止める", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_created"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("切断中の書きかけ"));
+    // 再接続の catch-up は現在版を message_created として再生する。
+    act(() =>
+      emit({
+        type: "message_created",
+        message: {
+          ...target,
+          content: "別のタブで保存された本文",
+          revision: (target.revision ?? 1) + 1,
+        },
+      }),
+    );
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: "切断中の書きかけ",
+      editConflict: {
+        content: "別のタブで保存された本文",
+        revision: (target.revision ?? 1) + 1,
       },
     });
     const edit = vi.spyOn(backend, "editMessage");
@@ -1004,6 +1143,190 @@ describe("編集セッションのタイムライン整合性", () => {
       editingMessageId: second.messageId,
       editDraft: "新しい書きかけ",
       editBaseRevision: second.revision ?? 1,
+    });
+  });
+
+  it("DELETE の失敗は無音にせず、その行に出して再試行できる", async () => {
+    const backend = await bootStore();
+    // 未読ライン付近（入室時の位置決めの先）にある自分の最後の発言を使う。
+    const target = (
+      useMessaging.getState().messagesByPlace["channel:ch-general"] ?? []
+    )
+      .filter(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      )
+      .at(-1);
+    if (!target) throw new Error("target message was not loaded");
+    renderList();
+    await waitFor(() => expect(row(target.messageId)).toBeInTheDocument());
+
+    const remove = vi
+      .spyOn(backend, "deleteMessage")
+      .mockRejectedValueOnce(new MessagingAPIError("forbidden", 403));
+    act(() => useMessaging.getState().deleteMessage(target.messageId));
+    await waitFor(() =>
+      expect(
+        useMessaging.getState().deleteFailedMessageIds.has(target.messageId),
+      ).toBe(true),
+    );
+    const notice = await waitFor(() => {
+      const element = row(target.messageId);
+      if (!element) throw new Error("target row is not rendered");
+      return within(element).getByRole("alert");
+    });
+    expect(notice).toHaveTextContent("削除できませんでした");
+    // 本文は残ったまま（削除は起きていない）。
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        )?.deleted,
+    ).toBe(false);
+
+    // 再試行で失敗表示は消え、成功すれば tombstone になる。
+    fireEvent.click(within(notice).getByRole("button", { name: "もう一度" }));
+    expect(remove).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(
+        useMessaging
+          .getState()
+          .messagesByPlace["channel:ch-general"]?.find(
+            (message) => message.messageId === target.messageId,
+          )?.deleted,
+      ).toBe(true),
+    );
+    expect(
+      useMessaging.getState().deleteFailedMessageIds.has(target.messageId),
+    ).toBe(false);
+    // tombstone は行にならない。失敗表示ごと消える。
+    await waitFor(() => expect(row(target.messageId)).toBeNull());
+  });
+
+  it("保存中に取消して同じメッセージを開き直すと、先の成功ACKは開き直した編集の base だけ進める", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const committedRevision = (target.revision ?? 1) + 1;
+
+    let resolveFirstSave: ((message: Message) => void) | undefined;
+    const firstSave = new Promise<Message>((resolve) => {
+      resolveFirstSave = resolve;
+    });
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      .mockImplementationOnce(() => firstSave)
+      .mockImplementationOnce(
+        async (_place, _messageId, content, revision) => ({
+          ...target,
+          content,
+          revision: revision + 1,
+        }),
+      );
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("先の保存"));
+    act(() => useMessaging.getState().submitEdit());
+    // 「保存中…」の間に取り消して、同じメッセージをもう一度開く。
+    // ACK 前なので編集欄は旧本文・旧 revision で開く。
+    act(() => useMessaging.getState().cancelEdit());
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    expect(useMessaging.getState()).toMatchObject({
+      editDraft: target.content,
+      editBaseRevision: target.revision ?? 1,
+    });
+    act(() => useMessaging.getState().setEditDraft("開き直して直した本文"));
+
+    await act(async () => {
+      resolveFirstSave?.({
+        ...target,
+        content: "先の保存",
+        revision: committedRevision,
+      });
+      await firstSave;
+    });
+
+    // 書きかけは残し、base だけが確定 revision へ進む。競合にはならない。
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: "開き直して直した本文",
+      editBaseRevision: committedRevision,
+      editConflict: null,
+    });
+    act(() => useMessaging.getState().submitEdit());
+    await waitFor(() =>
+      expect(edit).toHaveBeenLastCalledWith(
+        target.place,
+        target.messageId,
+        "開き直して直した本文",
+        committedRevision,
+      ),
+    );
+    await waitFor(() =>
+      expect(useMessaging.getState().editingMessageId).toBeNull(),
+    );
+  });
+
+  it("開き直した編集に自分の echo が先に届いて競合になっても、ACK が畳んで base を進める", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const committed = {
+      ...target,
+      content: "先の保存",
+      revision: (target.revision ?? 1) + 1,
+    };
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+    let resolveFirstSave: ((message: Message) => void) | undefined;
+    const firstSave = new Promise<Message>((resolve) => {
+      resolveFirstSave = resolve;
+    });
+    vi.spyOn(backend, "editMessage").mockImplementationOnce(() => firstSave);
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("先の保存"));
+    act(() => useMessaging.getState().submitEdit());
+    act(() => useMessaging.getState().cancelEdit());
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft("開き直しの書きかけ"));
+
+    // 開き直した session は送信中ではないので、自分の echo を echo と見分けられず
+    // いったん競合になる（本文と送信中 session でしか照合できない）。
+    act(() => emit({ type: "message_edited", message: committed }));
+    expect(useMessaging.getState().editConflict).toEqual({
+      content: committed.content,
+      revision: committed.revision,
+    });
+
+    await act(async () => {
+      resolveFirstSave?.(committed);
+      await firstSave;
+    });
+
+    // 成功 ACK R は base..R に他者の編集が無いことの確定。R 以下の競合は畳む。
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: "開き直しの書きかけ",
+      editBaseRevision: committed.revision,
+      editConflict: null,
     });
   });
 });

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
+import { claimEditFocus } from "../edit-focus";
 import type { MemberProfile, ParticipantKey } from "../model";
 import {
   MentionSuggestions,
@@ -30,6 +31,7 @@ export function MessageEditor({
   failure,
   savedWithPendingChanges,
   saving,
+  openedToken,
   onReloadConflict,
   membersByKey,
   selfKey,
@@ -42,6 +44,11 @@ export function MessageEditor({
   failure?: string | null;
   savedWithPendingChanges?: boolean;
   saving: boolean;
+  /**
+   * 編集欄を開いた回（store の editSession.openedToken）。同じ回で行が
+   * 再マウントされてもフォーカスを取り直さない。null なら自動フォーカスしない。
+   */
+  openedToken: number | null;
   onReloadConflict: () => void;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   selfKey: ParticipantKey;
@@ -57,13 +64,17 @@ export function MessageEditor({
   const ime = useImeCommittedTextarea(textareaRef);
 
   // 開いた瞬間に本文末尾へキャレットを置く（続きを書き足す方が多い）。
+  // 「開いた瞬間」だけ。行は編集中でも仮想リストから外れて再マウントされるので、
+  // マウントごとに focus() すると composer に打っている最中の caret を奪う。
   useEffect(() => {
     const textarea = textareaRef.current;
-    if (!textarea) return;
+    if (!textarea || openedToken === null || !claimEditFocus(openedToken)) {
+      return;
+    }
     textarea.focus();
     const end = textarea.value.length;
     textarea.setSelectionRange(end, end);
-  }, []);
+  }, [openedToken]);
 
   // autogrow: composerと同じ挙動。上限を超えたらこの枠の中でスクロールする。
   // biome-ignore lint/correctness/useExhaustiveDependencies: 入力値の変化を高さ再計算のトリガーにする

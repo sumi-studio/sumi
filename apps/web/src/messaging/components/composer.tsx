@@ -237,9 +237,14 @@ export function Composer() {
       }
       // 空欄で↑ = 自分の直前のメッセージをその場で編集し始める。
       if (event.key === "ArrowUp" && !editingMessageId && value === "") {
+        // messages は tombstone を含む。削除済みは編集できないので、
+        // 「まだ本文のある自分の直前の発言」を拾う。
         const own = [...messages]
           .reverse()
-          .find((entry) => participantKey(entry.author) === selfKey);
+          .find(
+            (entry) =>
+              !entry.deleted && participantKey(entry.author) === selfKey,
+          );
         if (own) {
           event.preventDefault();
           startEdit(own.messageId);
