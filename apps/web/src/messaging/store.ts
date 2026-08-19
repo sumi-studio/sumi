@@ -154,6 +154,8 @@ interface EditSession {
   placeKey: PlaceKey;
   messageId: string;
   revision: number;
+  /** 送信中なら、そのPATCHへ切り出した編集欄のスナップショット。 */
+  submittedDraft: string | null;
   token: number;
 }
 
@@ -164,12 +166,13 @@ type EditResponseDisposition = "conflict" | "terminal" | "failure";
 /**
  * PATCH /messages/{message_id} の失敗応答を、保存を続けられるかで分類する。
  *
- * | HTTP | code | 処理 |
- * | --- | --- | --- |
- * | 409 | edit_conflict | 現在メッセージを競合として提示 |
- * | 409 | message_deleted | tombstone を投影して編集を終了 |
- * | 404 | not_found | 対象seqを再取得して反映し、編集を終了 |
- * | その他 | 任意 | 編集欄に失敗を表示 |
+ * | 応答 | 処理 |
+ * | --- | --- |
+ * | 2xx | 送信時のdraftと現在のdraftが同じ時だけ閉じる。違えば新revisionを基準に、追記を残す |
+ * | 409 `edit_conflict` | 現在のdraftを残して競合本文を提示 |
+ * | 409 `message_deleted` | tombstoneを投影して終了（対象自体がもう編集不能） |
+ * | 404 `not_found` | 対象seqを再取得して反映し、編集を終了（対象自体がもう編集不能） |
+ * | その他 | 現在のdraftを残して失敗を表示 |
  *
  * API が新しいコードを足しても無言で無視しないよう、既知の終端・競合以外は
  * 必ず failure に落とす。
@@ -245,6 +248,8 @@ interface MessagingState {
   editConflict: EditConflict | null;
   /** 競合でも対象消滅でもない保存失敗。無言で失敗を捨てない。 */
   editFailure: string | null;
+  /** 保存応答後も、その後の追記を編集欄に残していることを示す。 */
+  editSavedWithPendingChanges: boolean;
   replyTargetId: string | null;
   connection: ConnectionState;
   /**
@@ -322,6 +327,7 @@ function isCurrentEditSession(
     current.placeKey === session.placeKey &&
     current.messageId === session.messageId &&
     current.revision === session.revision &&
+    current.submittedDraft === session.submittedDraft &&
     current.token === session.token &&
     state.activePlaceKey === session.placeKey &&
     state.editingMessageId === session.messageId &&
@@ -337,6 +343,7 @@ function clearedEditSession(): Pick<
   | "editSession"
   | "editConflict"
   | "editFailure"
+  | "editSavedWithPendingChanges"
 > {
   return {
     editingMessageId: null,
@@ -345,6 +352,7 @@ function clearedEditSession(): Pick<
     editSession: null,
     editConflict: null,
     editFailure: null,
+    editSavedWithPendingChanges: false,
   };
 }
 
@@ -1627,6 +1635,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     editSession: null,
     editConflict: null,
     editFailure: null,
+    editSavedWithPendingChanges: false,
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
@@ -2106,10 +2115,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           placeKey: key,
           messageId,
           revision,
+          submittedDraft: null,
           token: ++nextEditSessionToken,
         },
         editConflict: null,
         editFailure: null,
+        editSavedWithPendingChanges: false,
         replyTargetId: null,
       });
     },
@@ -2138,10 +2149,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
         editSession: {
           ...session,
           revision: base.revision ?? 1,
+          submittedDraft: null,
           token: ++nextEditSessionToken,
         },
         editConflict: null,
         editFailure: null,
+        editSavedWithPendingChanges: false,
       });
     },
 
@@ -2160,15 +2173,24 @@ export const useMessaging = create<MessagingState>((set, get) => {
         !trimmed
       )
         return;
-      set({ editFailure: null });
+      const submittedSession: EditSession = {
+        ...session,
+        submittedDraft: state.editDraft,
+        token: ++nextEditSessionToken,
+      };
+      set({
+        editSession: submittedSession,
+        editFailure: null,
+        editSavedWithPendingChanges: false,
+      });
       const request = beginMessagingBackendRequest();
       void request
         .wait((backend) =>
           backend.editMessage(
             place,
-            session.messageId,
+            submittedSession.messageId,
             trimmed,
-            session.revision,
+            submittedSession.revision,
           ),
         )
         .then(
@@ -2176,10 +2198,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
             if (!committed || !request.isCurrent()) return;
             set((current) => {
               if (
-                committed.messageId !== session.messageId ||
+                committed.messageId !== submittedSession.messageId ||
                 placeKey(committed.place) !== key
               )
                 return {};
+              const currentMessage = (current.messagesByPlace[key] ?? []).find(
+                (message) => message.messageId === committed.messageId,
+              );
+              const base = latestMessageContent(currentMessage, committed);
               return {
                 messagesByPlace: {
                   ...current.messagesByPlace,
@@ -2189,8 +2215,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
                     "revision",
                   ),
                 },
-                ...(isCurrentEditSession(current, session)
-                  ? clearedEditSession()
+                ...(isCurrentEditSession(current, submittedSession)
+                  ? current.editDraft === submittedSession.submittedDraft
+                    ? clearedEditSession()
+                    : {
+                        editBaseRevision:
+                          base?.revision ?? submittedSession.revision,
+                        editSession: {
+                          ...submittedSession,
+                          revision: base?.revision ?? submittedSession.revision,
+                          submittedDraft: null,
+                          token: ++nextEditSessionToken,
+                        },
+                        editFailure: null,
+                        editSavedWithPendingChanges: true,
+                      }
                   : {}),
               };
             });
@@ -2200,7 +2239,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             const disposition = editResponseDisposition(error);
             if (disposition === "terminal") {
               reconcileTerminalEditResponse(
-                session,
+                submittedSession,
                 request,
                 error instanceof MessagingAPIError
                   ? error.responseMessage
@@ -2214,10 +2253,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
               !error.currentMessage
             ) {
               set((current) =>
-                isCurrentEditSession(current, session)
+                isCurrentEditSession(current, submittedSession)
                   ? {
                       editFailure:
                         "保存できませんでした。もう一度お試しください。",
+                      editSavedWithPendingChanges: false,
                     }
                   : {},
               );
@@ -2226,7 +2266,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             const latest = error.currentMessage;
             set((current) => {
               if (
-                latest.messageId !== session.messageId ||
+                latest.messageId !== submittedSession.messageId ||
                 placeKey(latest.place) !== key
               )
                 return {};
@@ -2238,7 +2278,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                   "revision",
                 ),
               };
-              if (!isCurrentEditSession(current, session)) {
+              if (!isCurrentEditSession(current, submittedSession)) {
                 return { messagesByPlace };
               }
               const currentMessage = (current.messagesByPlace[key] ?? []).find(
@@ -2254,6 +2294,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 messagesByPlace,
                 editConflict: conflict,
                 editFailure: null,
+                editSavedWithPendingChanges: false,
               };
             });
           },
@@ -2617,6 +2658,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editSession: null,
     editConflict: null,
     editFailure: null,
+    editSavedWithPendingChanges: false,
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,

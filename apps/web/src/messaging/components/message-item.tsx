@@ -201,6 +201,7 @@ export interface MessageItemProps {
   editDraft: string;
   editConflict: { content: string; revision: number } | null;
   editFailure?: string | null;
+  editSavedWithPendingChanges?: boolean;
   onEditDraftChange: (content: string) => void;
   onSubmitEdit: () => void;
   onCancelEdit: () => void;
@@ -233,6 +234,7 @@ export const MessageItem = memo(function MessageItem({
   editDraft,
   editConflict,
   editFailure,
+  editSavedWithPendingChanges,
   onEditDraftChange,
   onSubmitEdit,
   onCancelEdit,
@@ -414,6 +416,7 @@ export const MessageItem = memo(function MessageItem({
                 onCancel={onCancelEdit}
                 conflict={editConflict}
                 failure={editFailure}
+                savedWithPendingChanges={editSavedWithPendingChanges}
                 onReloadConflict={onReloadEditConflict}
                 membersByKey={membersByKey}
                 selfKey={selfKey}
