@@ -433,6 +433,7 @@ func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorizat
 	var request struct {
 		localScopeWire
 		Participants []participantWire `json:"participants"`
+		ClientNonce  string            `json:"client_nonce,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -467,8 +468,11 @@ func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorizat
 	if len(others) == 1 {
 		place, created, err = store.EnsureDM(r.Context(), others[0])
 	} else {
-		place, err = store.CreateGroupDM(r.Context(), others)
-		created = true
+		if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+			writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+			return
+		}
+		place, created, err = store.CreateGroupDMOnce(r.Context(), others, request.ClientNonce)
 	}
 	if err != nil {
 		writeStoreError(w, err)
@@ -500,14 +504,15 @@ func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorizat
 func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		localScopeWire
-		Name  string `json:"name"`
-		Topic string `json:"topic,omitempty"`
-		Voice bool   `json:"voice"`
+		Name        string `json:"name"`
+		Topic       string `json:"topic,omitempty"`
+		Voice       bool   `json:"voice"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.Name == "" || utf8.RuneCountInString(request.Name) > MaxChannelNameChars ||
+	if request.Name == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || utf8.RuneCountInString(request.Name) > MaxChannelNameChars ||
 		len(request.Topic) > maxTopicBytes {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
@@ -516,16 +521,22 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 	if !ok {
 		return
 	}
-	place, err := store.CreateChannel(r.Context(), request.Name, request.Topic, request.Voice)
+	place, created, err := store.CreateChannelOnce(r.Context(), request.Name, request.Topic, request.Voice, request.ClientNonce)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	wire := channelToWire(place)
-	_ = s.Hub.PublishScoped(r.Context(), store, Event{
-		Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
-	})
-	writeJSON(w, http.StatusCreated, struct {
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
 		Channel channelWire `json:"channel"`
 	}{wire})
 }
@@ -580,13 +591,14 @@ func (s *Server) localUpdateChannel(w http.ResponseWriter, r *http.Request, auth
 func (s *Server) localDuplicateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		localScopeWire
-		PlaceID string `json:"place_id"`
-		Name    string `json:"name,omitempty"`
+		PlaceID     string `json:"place_id"`
+		Name        string `json:"name,omitempty"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.PlaceID == "" || utf8.RuneCountInString(request.Name) > MaxChannelNameChars {
+	if request.PlaceID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || utf8.RuneCountInString(request.Name) > MaxChannelNameChars {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -594,16 +606,22 @@ func (s *Server) localDuplicateChannel(w http.ResponseWriter, r *http.Request, a
 	if !ok {
 		return
 	}
-	place, err := store.DuplicateChannel(r.Context(), request.PlaceID, request.Name)
+	place, created, err := store.DuplicateChannelOnce(r.Context(), request.PlaceID, request.Name, request.ClientNonce)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	wire := channelToWire(place)
-	_ = s.Hub.PublishScoped(r.Context(), store, Event{
-		Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
-	})
-	writeJSON(w, http.StatusCreated, struct {
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
 		Channel channelWire `json:"channel"`
 	}{wire})
 }

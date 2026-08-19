@@ -186,6 +186,44 @@ func TestDuplicateChannelCarriesTheShapeAndNotTheContents(t *testing.T) {
 	}
 }
 
+func TestPlaceCreationNonceReplaysTheCommittedPlace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, source := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+
+	channel, created, err := scoped.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || !created {
+		t.Fatalf("first channel create = (%+v, %v, %v), want created", channel, created, err)
+	}
+	replayed, created, err := scoped.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || created || replayed.PlaceID != channel.PlaceID {
+		t.Fatalf("channel replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
+	}
+	if _, _, err := scoped.CreateChannelOnce(ctx, "different", "coordination", false, "create-once"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed channel request under nonce = %v, want ErrIdempotencyConflict", err)
+	}
+
+	copy, created, err := scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "duplicate-once")
+	if err != nil || !created {
+		t.Fatalf("first duplicate = (%+v, %v, %v), want created", copy, created, err)
+	}
+	replayed, created, err = scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "duplicate-once")
+	if err != nil || created || replayed.PlaceID != copy.PlaceID {
+		t.Fatalf("duplicate replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
+	}
+
+	group, created, err := scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.humanB, w.agent}, "group-once")
+	if err != nil || !created {
+		t.Fatalf("first group dm = (%+v, %v, %v), want created", group, created, err)
+	}
+	replayed, created, err = scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.humanB, w.agent}, "group-once")
+	if err != nil || created || replayed.PlaceID != group.PlaceID {
+		t.Fatalf("group DM replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
+	}
+}
+
 func TestPlaceEditsOverHTTPRefuseANoOpAndAnnounceTheCopy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -261,7 +299,7 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	// A member without the channel-management capability is refused, exactly as
 	// the Human REST route refuses one.
 	status, body := callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
-		"name": "設計",
+		"name": "設計", "client_nonce": "unprivileged-create-channel",
 	}, authorization)
 	if status != http.StatusForbidden {
 		t.Fatalf("unprivileged create: status %d body %v", status, body)
@@ -270,7 +308,7 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
 
 	status, body = callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
-		"name": "設計", "topic": "構造の話", "voice": true,
+		"name": "設計", "topic": "構造の話", "voice": true, "client_nonce": "local-create-channel",
 	}, authorization)
 	if status != http.StatusCreated {
 		t.Fatalf("create channel: status %d body %v", status, body)
@@ -301,7 +339,7 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 	}
 
 	status, body = callLocal(t, ctx, server.localDuplicateChannel, LocalDuplicateChannelPath, map[string]any{
-		"place_id": channel.PlaceID,
+		"place_id": channel.PlaceID, "client_nonce": "local-duplicate-channel",
 	}, authorization)
 	if status != http.StatusCreated {
 		t.Fatalf("duplicate channel: status %d body %v", status, body)
@@ -361,6 +399,7 @@ func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
 
 	// Several participants make a group conversation instead.
 	status, body = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
+		"client_nonce": "local-start-group-dm",
 		"participants": []any{
 			map[string]any{"kind": "human", "human_id": w.humanA.ID},
 			map[string]any{"kind": "human", "human_id": w.humanB.ID},

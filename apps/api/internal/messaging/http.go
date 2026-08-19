@@ -764,6 +764,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Name        string `json:"name"`
 		Topic       string `json:"topic"`
 		Voice       bool   `json:"voice"`
+		ClientNonce string `json:"client_nonce,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -776,13 +777,22 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_topic")
 		return
 	}
+	if len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	var place Place
+	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
 		if req.WorkspaceID != "" && req.WorkspaceID != scopedStoreForRequest(r).Scope.WorkspaceID {
 			return ErrInvalidScope
 		}
-		place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic, req.Voice)
+		if req.ClientNonce == "" {
+			place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic, req.Voice)
+		} else {
+			place, created, opErr = scopedStoreForRequest(r).CreateChannelOnce(r.Context(), req.Name, req.Topic, req.Voice, req.ClientNonce)
+		}
 		return opErr
 	})
 	if !done {
@@ -793,8 +803,14 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := channelToWire(place)
-	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 // serveUpdatePlace edits a channel's mutable identity: name, topic, or both.
@@ -851,7 +867,8 @@ func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name string `json:"name"`
+		Name        string `json:"name"`
+		ClientNonce string `json:"client_nonce,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -860,10 +877,19 @@ func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
+	if len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	var place Place
+	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = scopedStoreForRequest(r).DuplicateChannel(r.Context(), r.PathValue("place_id"), req.Name)
+		if req.ClientNonce == "" {
+			place, opErr = scopedStoreForRequest(r).DuplicateChannel(r.Context(), r.PathValue("place_id"), req.Name)
+		} else {
+			place, created, opErr = scopedStoreForRequest(r).DuplicateChannelOnce(r.Context(), r.PathValue("place_id"), req.Name, req.ClientNonce)
+		}
 		return opErr
 	})
 	if !done {
@@ -874,8 +900,14 @@ func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := channelToWire(place)
-	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
@@ -937,6 +969,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Participants []participantWire `json:"participants"`
+		ClientNonce  string            `json:"client_nonce,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -959,10 +992,19 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	if len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	var place Place
+	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = scopedStoreForRequest(r).CreateGroupDM(r.Context(), others)
+		if req.ClientNonce == "" {
+			place, opErr = scopedStoreForRequest(r).CreateGroupDM(r.Context(), others)
+		} else {
+			place, created, opErr = scopedStoreForRequest(r).CreateGroupDMOnce(r.Context(), others, req.ClientNonce)
+		}
 		return opErr
 	})
 	if !done {
@@ -976,8 +1018,14 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		DMID: place.PlaceID, Kind: place.Kind,
 		Participants: append([]participantWire{participantToWire(viewer)}, participantsToWire(others)...),
 	}
-	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
