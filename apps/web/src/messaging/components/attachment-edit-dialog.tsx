@@ -1,7 +1,10 @@
 import { EyeOff, X } from "lucide-react";
 import { useRef, useState } from "react";
 import { codePointLength } from "../../lib/text-length";
-import { sanitizeAttachmentDisplayText } from "../attachment-display";
+import {
+  sanitizeAttachmentDisplayText,
+  sanitizeAttachmentFilename,
+} from "../attachment-display";
 import type { AttachmentDraftPatch } from "../model";
 import { MAX_ATTACHMENT_ALT_LENGTH } from "../model";
 import { ModalDialog } from "./modal-dialog";
@@ -36,7 +39,7 @@ export function AttachmentEditDialog({
 
   const apply = () => {
     const patch: AttachmentDraftPatch = {};
-    const trimmed = sanitizeAttachmentDisplayText(nextFilename).trim();
+    const trimmed = sanitizeAttachmentFilename(nextFilename);
     const sanitizedAlt = sanitizeAttachmentDisplayText(nextAlt);
     if (!trimmed) {
       setValidationError("ファイル名を入力してください");

@@ -88,13 +88,18 @@ function statusLine(draft: DraftAttachment): string {
   return formatAttachmentSize(draft.sizeBytes);
 }
 
-/** 再送しても同じ結果にしかならない失敗には再送を出さない。 */
+/** 再送しても同じ結果にしかならない失敗には、状態にかかわらず再送を出さない。 */
+const NON_RETRYABLE_ATTACHMENT_ERROR_CODES = new Set([
+  "attachment_too_large",
+  "attachment_empty",
+  "attachment_already_sent",
+  "not_found",
+]);
+
 function retryable(draft: DraftAttachment): boolean {
-  if (draft.status === "edit_failed") return true;
   return (
-    draft.status === "failed" &&
-    draft.errorCode !== "attachment_too_large" &&
-    draft.errorCode !== "attachment_empty"
+    (draft.status === "failed" || draft.status === "edit_failed") &&
+    !NON_RETRYABLE_ATTACHMENT_ERROR_CODES.has(draft.errorCode ?? "")
   );
 }
 
@@ -121,8 +126,8 @@ export function ComposerAttachments({
         const spoiler =
           draft.editPatch?.spoiler ?? draft.attachment?.spoiler ?? false;
         const alt = draft.editPatch?.alt ?? draft.attachment?.alt;
-        // 受領済みなら常に操作をDOMに置く。保存中だけdisabledにして、失敗時は
-        // 同じ入口から宣言を直せるようにする。
+        // 受領済みなら常に操作をDOMに置く。保存中も焦点復帰先として残し、
+        // aria-disabled と no-op で二重操作だけを防ぐ。
         const declarable =
           draft.attachment !== undefined && draft.status !== "failed";
         const busy = draft.status === "uploading" || draft.status === "editing";
@@ -173,9 +178,11 @@ export function ComposerAttachments({
                       spoiler ? "ネタバレを解除" : "ネタバレをマーク"
                     }`}
                     aria-pressed={spoiler}
+                    aria-disabled={busy}
                     title={spoiler ? "ネタバレを解除" : "ネタバレとしてマーク"}
-                    disabled={busy}
-                    onClick={() => requestEdit(draft, { spoiler: !spoiler })}
+                    onClick={() => {
+                      if (!busy) requestEdit(draft, { spoiler: !spoiler });
+                    }}
                     className={`bg-background/80 opacity-60 focus-visible:opacity-100 group-hover/attachment:opacity-100 ${
                       spoiler ? "opacity-100" : ""
                     }`}
@@ -186,9 +193,11 @@ export function ComposerAttachments({
                 {declarable ? (
                   <AttachmentAction
                     aria-label={`${filename}を編集`}
+                    aria-disabled={busy}
                     title="名前と説明を編集"
-                    disabled={busy}
-                    onClick={() => setEditingNonce(draft.clientNonce)}
+                    onClick={() => {
+                      if (!busy) setEditingNonce(draft.clientNonce);
+                    }}
                     className="bg-background/80 opacity-60 focus-visible:opacity-100 group-hover/attachment:opacity-100"
                   >
                     <Pencil />

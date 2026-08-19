@@ -71,7 +71,10 @@ export function ModalDialog({
       const current = document.activeElement;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (event.shiftKey && (current === first || !dialog.contains(current))) {
+      if (
+        event.shiftKey &&
+        (current === first || current === dialog || !dialog.contains(current))
+      ) {
         event.preventDefault();
         last.focus();
       } else if (

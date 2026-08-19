@@ -689,9 +689,6 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
                   revealedAttachmentIds={revealedAttachmentIds}
                   onRevealAttachment={revealAttachment}
                   onOpenImage={openImage}
-                  followNewMessages={
-                    viewingImage?.placeKey !== selectedPlaceKey
-                  }
                 />
                 <TypingIndicator />
                 <Composer />

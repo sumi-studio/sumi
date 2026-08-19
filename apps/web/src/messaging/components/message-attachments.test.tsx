@@ -11,9 +11,10 @@ import {
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  hasForbiddenAttachmentDisplayCharacter,
   sanitizeAttachmentDisplayText,
+  sanitizeAttachmentFilenameForDisplay,
 } from "../attachment-display";
+import type { DraftAttachment } from "../draft-attachments";
 import { MockMessagingServer } from "../mock-server";
 import type { Attachment, AttachmentDraftPatch } from "../model";
 import { MAX_ATTACHMENT_ALT_LENGTH } from "../model";
@@ -30,6 +31,7 @@ import {
   type ImageViewerRequest,
   MessageAttachments,
 } from "./message-attachments";
+import { ModalDialog } from "./modal-dialog";
 
 function AttachmentHost({
   attachments,
@@ -113,7 +115,12 @@ describe("attachment display text", () => {
       "\u202e",
       "\u200b",
     ]) {
-      expect(hasForbiddenAttachmentDisplayCharacter(character)).toBe(true);
+      expect(sanitizeAttachmentDisplayText(`before${character}after`)).toBe(
+        "before after",
+      );
+      expect(
+        sanitizeAttachmentFilenameForDisplay(`before${character}after.txt`),
+      ).toBe("beforeafter.txt");
     }
     expect(sanitizeAttachmentDisplayText("before\u202eafter\u200bend")).toBe(
       "before after end",
@@ -294,6 +301,26 @@ describe("Attachment spoiler and viewer", () => {
     displayControls[1].focus();
     fireEvent.keyDown(document, { key: "Tab" });
     expect(displayControls[0]).toHaveFocus();
+  });
+
+  it("traps Shift+Tab when initial focus is the dialog itself", () => {
+    render(
+      <ModalDialog
+        label="初期フォーカスなしのダイアログ"
+        onClose={vi.fn()}
+        className="fixed inset-0"
+      >
+        <button type="button">最初</button>
+        <button type="button">最後</button>
+      </ModalDialog>,
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "初期フォーカスなしのダイアログ",
+    });
+    const last = screen.getByRole("button", { name: "最後" });
+    expect(dialog).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(last).toHaveFocus();
   });
 });
 
@@ -496,10 +523,10 @@ describe("Composer attachment cards", () => {
     );
     expect(
       screen.getByRole("button", { name: "shot.pngのネタバレをマーク" }),
-    ).toBeDisabled();
+    ).toHaveAttribute("aria-disabled", "true");
     expect(
       screen.getByRole("button", { name: "shot.pngを編集" }),
-    ).toBeDisabled();
+    ).toHaveAttribute("aria-disabled", "true");
     rerender(
       <ComposerAttachments
         drafts={[
@@ -522,5 +549,74 @@ describe("Composer attachment cards", () => {
     expect(
       screen.getByRole("dialog", { name: "添付ファイルを編集" }),
     ).toBeVisible();
+  });
+
+  it("keeps focus on the edit trigger after saving while the edit is busy", () => {
+    function FocusHost() {
+      const [draft, setDraft] = useState<DraftAttachment>({
+        clientNonce: "focus-edit",
+        filename: "shot.png",
+        sizeBytes: 3,
+        contentType: "image/png",
+        status: "ready",
+        attachment: IMAGE,
+      });
+      return (
+        <ComposerAttachments
+          drafts={[draft]}
+          onEdit={(_clientNonce, editPatch) =>
+            setDraft((current) => ({
+              ...current,
+              status: "editing",
+              editPatch,
+            }))
+          }
+          onRemove={vi.fn()}
+          onRetry={vi.fn()}
+        />
+      );
+    }
+
+    render(<FocusHost />);
+    const edit = screen.getByRole("button", { name: "shot.pngを編集" });
+    edit.focus();
+    fireEvent.click(edit);
+    fireEvent.change(screen.getByRole("textbox", { name: "ファイル名" }), {
+      target: { value: "renamed.png" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(edit).toHaveFocus();
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).not.toBeDisabled();
+  });
+
+  it.each([
+    "attachment_already_sent",
+    "not_found",
+  ])("does not offer a retry for a permanently rejected edit (%s)", (errorCode) => {
+    render(
+      <ComposerAttachments
+        drafts={[
+          {
+            clientNonce: errorCode,
+            filename: "gone.txt",
+            sizeBytes: 3,
+            contentType: "text/plain",
+            status: "edit_failed",
+            errorCode,
+            attachment: { ...DOCUMENT, attachmentId: errorCode },
+          },
+        ]}
+        onEdit={vi.fn()}
+        onRemove={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "gone.txtを再送" })).toBeNull();
+    if (errorCode === "not_found") {
+      expect(screen.getByTestId("composer-attachments")).toHaveTextContent(
+        "この添付はもうありません。外してください",
+      );
+    }
   });
 });

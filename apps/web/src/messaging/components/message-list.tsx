@@ -50,13 +50,11 @@ export function MessageList({
   revealedAttachmentIds,
   onRevealAttachment,
   onOpenImage,
-  followNewMessages = true,
 }: {
   handleRef?: Ref<MessageListHandle>;
   revealedAttachmentIds: ReadonlySet<string>;
   onRevealAttachment: (attachmentId: string) => void;
   onOpenImage: (request: ImageViewerRequest) => void;
-  followNewMessages?: boolean;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const messages = useMessaging((state) =>
@@ -248,10 +246,10 @@ export function MessageList({
   const lastRowId = rows.length > 0 ? rows[rows.length - 1].id : null;
   useEffect(() => {
     if (lastRowId === null) return;
-    if (followNewMessages && atEndRef.current) {
+    if (atEndRef.current) {
       virtualizerRef.current?.scrollToEnd({ behavior: "auto" });
     }
-  }, [lastRowId, followNewMessages]);
+  }, [lastRowId]);
 
   const advanceRead = useCallback(
     (ids: string[]) => {

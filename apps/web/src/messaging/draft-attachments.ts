@@ -60,6 +60,7 @@ const FAILURE_LABELS: Record<string, string> = {
     "同じファイルをアップロード中です。少し待ってから再試行してください",
   attachments_unavailable: "このサーバーでは添付を受け付けていません",
   attachment_already_sent: "送信済みの添付は編集できません",
+  not_found: "この添付はもうありません。外してください",
   invalid_request: "この内容では保存できません",
   invalid_session: "サインインし直してください",
   app_disabled: "Messagingが無効化されています",

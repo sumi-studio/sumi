@@ -11,11 +11,10 @@ export function sanitizeAttachmentDisplayText(value: string): string {
   return value.replace(FORBIDDEN_ATTACHMENT_DISPLAY_CHARACTERS, " ");
 }
 
-export function sanitizeAttachmentFilenameForDisplay(value: string): string {
-  return sanitizeAttachmentDisplayText(value).trim() || "file";
+export function sanitizeAttachmentFilename(value: string): string {
+  return value.replace(FORBIDDEN_ATTACHMENT_DISPLAY_CHARACTERS, "").trim();
 }
 
-export function hasForbiddenAttachmentDisplayCharacter(value: string): boolean {
-  FORBIDDEN_ATTACHMENT_DISPLAY_CHARACTERS.lastIndex = 0;
-  return FORBIDDEN_ATTACHMENT_DISPLAY_CHARACTERS.test(value);
+export function sanitizeAttachmentFilenameForDisplay(value: string): string {
+  return sanitizeAttachmentFilename(value) || "file";
 }
