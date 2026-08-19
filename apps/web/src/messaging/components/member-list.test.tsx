@@ -95,6 +95,12 @@ describe("MemberList DM action", () => {
     vi.restoreAllMocks();
   });
 
+  it("ステータス未申告のメンバーを対応可能ドットで補わない", () => {
+    const { container } = render(<MemberList />);
+
+    expect(container.querySelector(".bg-emerald-500")).not.toBeInTheDocument();
+  });
+
   it("starts a DM from a non-self member and navigates to its place", async () => {
     const startDM = vi.fn(async (): Promise<PlaceKey> => "dm:dm-bob");
     useMessaging.setState({ startDM });
