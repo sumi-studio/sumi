@@ -692,7 +692,12 @@ epoch_identity() {
   local output line key value
   local paid= generation= nonce=
   declare -A seen=()
-  output="$(prepare_compose run --rm --no-deps --entrypoint /bin/bash allocator \
+  # --pull never keeps epoch identity readable when the registry is unreachable.
+  # A project with containers always has the allocator image locally; an empty
+  # project has no image and fails here, which is the correct `unknown` outcome.
+  # The service default `pull_policy: always` would otherwise turn a transient
+  # DNS/registry gap into a failed identity read and fence a healthy runtime.
+  output="$(prepare_compose run --rm --no-deps --pull never --entrypoint /bin/bash allocator \
     -c 'cat /var/lib/sumi-allocator-root/identity-output/broker/identity.env' 2>/dev/null)" ||
     return 1
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -756,7 +761,12 @@ long_lived_roles_match_expected_state() {
 
 long_lived_containers_exist() {
   local output line container_id service state
-  output="$(long_lived_role_states)" || return 1
+  # Presence/absence of a long-lived role is an observation, not a guess. A
+  # failed `docker ps` must not read as "no long-lived container exists": that
+  # would route a running project into the prepared/recovery branch on a
+  # transient observation gap. Fail closed, mirroring project_is_empty's posture.
+  output="$(long_lived_role_states)" ||
+    fail "cannot observe long-lived role states for presence proof"
   while IFS=$'\t' read -r container_id service state; do
     is_long_lived_role "${service}" || continue
     [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
@@ -818,9 +828,8 @@ inspect_epoch() {
     print_epoch_json active
     return
   fi
-  if ! long_lived_containers_exist && prepared_containers_exist; then
-    prepared_project_containers_match_expected_roles ||
-      fail "prepared project contains containers outside the expected role set; reconcile before reuse"
+  if ! long_lived_containers_exist && prepared_containers_exist &&
+    prepared_project_containers_match_expected_roles; then
     epoch_identity || fail "prepared project has no coherent epoch"
     print_epoch_json prepared
     return

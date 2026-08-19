@@ -2941,7 +2941,7 @@ case "$*" in
   *"compose.lifecycle.yaml ps --all --quiet")
     exit 0
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     exit 0
     ;;
@@ -3008,7 +3008,7 @@ case "$*" in
     printf 'dddddddddddd\tallocator\texited\n'
     printf 'eeeeeeeeeeee\tprepare\texited\n'
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
   *)
@@ -3051,7 +3051,7 @@ fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3152,7 +3152,7 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();

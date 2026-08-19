@@ -453,6 +453,15 @@ func (p *provisionedProcess) Wait() error {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
+	// A single Inspect error is an observation gap (registry/DNS/docker blip),
+	// not a death observation. Fence→reap on one error would kill a healthy PA
+	// for a seconds-long network gap and leave its in-flight tools indeterminate.
+	// Ride through up to monitorInspectErrorThreshold consecutive errors before
+	// treating the host as unobservable; a not-active observation is a positive
+	// death signal and retires immediately. Sustained unobservability still
+	// fences and reaps so no unowned runtime survives the gap.
+	const monitorInspectErrorThreshold = 3
+	inspectFailures := 0
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -467,8 +476,13 @@ func (p *provisionedProcess) Wait() error {
 			})
 			cancel()
 			if err != nil {
+				inspectFailures++
+				if inspectFailures < monitorInspectErrorThreshold {
+					continue
+				}
 				return p.retireAfterMonitorFailure(fmt.Errorf("monitor provisioned runtime: %w", err))
 			}
+			inspectFailures = 0
 			if inspection.Phase != runtimeprovision.PhaseActive ||
 				inspection.Epoch == nil || *inspection.Epoch != p.epoch {
 				return p.retireAfterMonitorFailure(errors.New("provisioned runtime left its active epoch"))

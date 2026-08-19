@@ -59,6 +59,7 @@ type fakeRuntimeProvisioner struct {
 	reconcileReaps  map[string]bool
 	omitReapReceipt bool
 	inspectErr      error
+	inspectErrLimit int
 }
 
 func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvisioner {
@@ -186,10 +187,18 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 
 func (p *fakeRuntimeProvisioner) Inspect(_ context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
 	p.recorder.add("inspect:" + request.PersonalityAgentID)
-	if p.inspectErr != nil {
-		return runtimeprovision.Inspection{}, p.inspectErr
-	}
 	p.mu.Lock()
+	if p.inspectErr != nil {
+		err := p.inspectErr
+		if p.inspectErrLimit > 0 {
+			p.inspectErrLimit--
+			if p.inspectErrLimit == 0 {
+				p.inspectErr = nil
+			}
+		}
+		p.mu.Unlock()
+		return runtimeprovision.Inspection{}, err
+	}
 	defer p.mu.Unlock()
 	epoch, exists := p.epochs[request.PersonalityAgentID]
 	if !exists {
@@ -588,11 +597,26 @@ func TestProvisionedProcessMonitorFencesAndReconcilesAfterInspectError(t *testin
 	provisioned := process.(*provisionedProcess)
 	provisioned.monitorInterval = time.Millisecond
 
+	inspectBaseline := 0
+	for _, call := range recorder.calls {
+		if call == "inspect:"+paid {
+			inspectBaseline++
+		}
+	}
 	if err := provisioned.Wait(); err == nil || !strings.Contains(err.Error(), "inspect unavailable") {
 		t.Fatalf("monitor error = %v, want inspect failure", err)
 	}
 	if authorizations.fences[paid] != 1 || listeners.active[paid] {
 		t.Fatalf("monitor retained local runtime authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	inspectCount := 0
+	for _, call := range recorder.calls {
+		if call == "inspect:"+paid {
+			inspectCount++
+		}
+	}
+	if got := inspectCount - inspectBaseline; got != 3 {
+		t.Fatalf("monitor retired after %d inspect errors, want the 3-error threshold", got)
 	}
 	if !containsOrdered(recorder.calls, []string{
 		"inspect:" + paid,
@@ -602,6 +626,40 @@ func TestProvisionedProcessMonitorFencesAndReconcilesAfterInspectError(t *testin
 		"reap:" + paid,
 	}) {
 		t.Fatalf("monitor inspect failure returned before fenced reconcile: %v", recorder.calls)
+	}
+}
+
+func TestProvisionedProcessMonitorToleratesInspectErrorsBelowThreshold(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.mu.Lock()
+	provisioner.inspectErr = errors.New("transient inspect gap")
+	provisioner.inspectErrLimit = 2 // one below the 3-error retire threshold
+	provisioner.mu.Unlock()
+	provisioned := process.(*provisionedProcess)
+	provisioned.monitorInterval = time.Millisecond
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- provisioned.Wait() }()
+
+	// Two consecutive errors are ridden through; the third observation succeeds
+	// and the monitor must keep the healthy runtime alive.
+	select {
+	case err := <-waitErr:
+		t.Fatalf("monitor retired below the inspect-error threshold: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if authorizations.fences[paid] != 0 || !listeners.active[paid] {
+		t.Fatalf("sub-threshold inspect errors fenced the runtime: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
+	}
+	if err := process.Stop(); err != nil {
+		t.Fatalf("stop after transient inspect errors = %v", err)
 	}
 }
 

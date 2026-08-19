@@ -27,12 +27,12 @@ set -eu
 case "$*" in
   "compose version")
     ;;
-  *"compose.lifecycle.yaml ps --status running --quiet runtime"*|*"compose.lifecycle.yaml ps --all --quiet runtime"*)
-    printf '0123456789ab\n'
+  "ps --all --filter label=com.docker.compose.project="*)
+    # Only runtime remains; executor and broker are missing. This is the
+    # partial-project shape that must flow to recovery, not a hard fail.
+    printf '0123456789ab\truntime\trunning\n'
     ;;
-  *"compose.lifecycle.yaml ps --status running --quiet executor"*|*"compose.lifecycle.yaml ps --status running --quiet broker"*|*"compose.lifecycle.yaml ps --all --quiet executor"*|*"compose.lifecycle.yaml ps --all --quiet broker"*)
-    ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=recovery-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
   *)
@@ -106,6 +106,86 @@ exec /usr/bin/stat "$@"
 	}
 }
 
+func TestSupervisorInspectEpochReturnsActiveWithoutPullingAllocatorImage(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version")
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'cccccccccccc\tbroker\trunning\n'
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=active-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" inspect-epoch`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real supervisor active inspection failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"phase":"active","generation":7,"rpc_boot_nonce":"active-nonce"`) {
+		t.Fatalf("active inspection did not confirm the running epoch: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// --pull never is the registry-unreachable resilience: epoch identity must
+	// not attempt a pull that a DNS/registry gap would turn into a false death.
+	if !strings.Contains(string(calls), "compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator") {
+		t.Fatalf("epoch identity did not use --pull never:\n%s", calls)
+	}
+}
+
 func TestSupervisorPrepareDoesNotRequireActivationEnvironment(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
@@ -122,7 +202,7 @@ func TestSupervisorPrepareDoesNotRequireActivationEnvironment(t *testing.T) {
 set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=prepare-phase-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
 esac
@@ -204,7 +284,7 @@ case "$*" in
     : > "$SUMI_FAKE_DOCKER_STATE"
     exit 17
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=reconciled-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
 esac
@@ -290,7 +370,7 @@ case "$*" in
   *"compose.lifecycle.yaml down"*)
     exit 17
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=renamed-remnant-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
 esac
@@ -362,7 +442,7 @@ func TestSupervisorReconcileReattestsAlreadyEmptyProjectAfterProvisionerCrash(t 
 set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=recovered-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
 esac
@@ -451,7 +531,7 @@ case "$*" in
     : > "$SUMI_FAKE_DOCKER_STATE"
     exit 17
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=allocator-only-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
 esac
@@ -535,7 +615,7 @@ case "$*" in
     printf 'cccccccccccc\tbroker\trunning\n'
     printf 'dddddddddddd\torphan-one-off\texited\n'
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=orphan-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
   *)
@@ -623,7 +703,7 @@ case "$*" in
     printf 'bbbbbbbbbbbb\texecutor\trunning\n'
     printf 'cccccccccccc\tbroker\trunning\n'
     ;;
-  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
     printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=active-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
     ;;
   *)
