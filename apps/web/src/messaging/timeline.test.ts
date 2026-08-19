@@ -38,25 +38,131 @@ function message(overrides: Partial<Message> & { seq: number }): Message {
 describe("upsertMessage", () => {
   it("seq順を保って挿入する", () => {
     const list = [message({ seq: 1 }), message({ seq: 3 })];
-    const next = upsertMessage(list, message({ seq: 2 }));
+    const next = upsertMessage(list, message({ seq: 2 }), "revision");
     expect(next.map((entry) => entry.seq)).toEqual([1, 2, 3]);
   });
 
   it("同じmessageIdは置換する（編集反映）", () => {
     const list = [message({ seq: 1 }), message({ seq: 2 })];
-    const next = upsertMessage(list, message({ seq: 2, content: "edited" }));
+    const next = upsertMessage(
+      list,
+      message({ seq: 2, content: "edited" }),
+      "revision",
+    );
     expect(next).toHaveLength(2);
     expect(next[1].content).toBe("edited");
   });
 
+  it("同じmessageIdへ遅れて届いた古いrevisionは捨てる", () => {
+    const current = message({
+      seq: 1,
+      content: "revision 3",
+      revision: 3,
+    });
+
+    const next = upsertMessage(
+      [current],
+      message({ seq: 1, content: "revision 2", revision: 2 }),
+      "revision",
+    );
+
+    expect(next).toEqual([current]);
+  });
+
+  it("tombstoneを同じrevision以下の通常メッセージで復活させない", () => {
+    const tombstone = message({
+      seq: 1,
+      content: "",
+      deleted: true,
+      revision: 3,
+    });
+
+    const next = upsertMessage(
+      [tombstone],
+      message({ seq: 1, content: "遅着した本文", revision: 3 }),
+      "revision",
+    );
+
+    expect(next).toEqual([tombstone]);
+  });
+
   it("同じseqの別IDは受け入れない", () => {
     const list = [message({ seq: 1 })];
-    const next = upsertMessage(list, {
-      ...message({ seq: 1 }),
-      messageId: "duplicate",
-    });
+    const next = upsertMessage(
+      list,
+      {
+        ...message({ seq: 1 }),
+        messageId: "duplicate",
+      },
+      "revision",
+    );
     expect(next).toHaveLength(1);
     expect(next[0].messageId).toBe("m1");
+  });
+
+  it("revision部分更新ではreaction_updatedが確定したreactionsを保つ", () => {
+    const current = message({
+      seq: 1,
+      revision: 1,
+      reactions: [{ emoji: "👍", participants: [SELF] }],
+    });
+
+    const next = upsertMessage(
+      [current],
+      message({ seq: 1, content: "編集後", revision: 2, reactions: [] }),
+      "revision",
+    );
+
+    expect(next[0]).toMatchObject({
+      content: "編集後",
+      revision: 2,
+      reactions: [{ emoji: "👍", participants: [SELF] }],
+    });
+  });
+
+  it("削除tombstoneの部分更新でもreactionsは独立同期の値を保つ", () => {
+    const current = message({
+      seq: 1,
+      revision: 1,
+      reactions: [{ emoji: "👍", participants: [SELF] }],
+    });
+
+    const next = upsertMessage(
+      [current],
+      message({
+        seq: 1,
+        content: "",
+        deleted: true,
+        revision: 2,
+        reactions: [],
+      }),
+      "revision",
+    );
+
+    expect(next[0]).toMatchObject({
+      content: "",
+      deleted: true,
+      revision: 2,
+      reactions: [{ emoji: "👍", participants: [SELF] }],
+    });
+  });
+
+  it("履歴snapshotではreactionsも置き換える", () => {
+    const current = message({
+      seq: 1,
+      content: "新しい本文",
+      revision: 2,
+      reactions: [{ emoji: "👍", participants: [SELF] }],
+    });
+
+    const next = upsertMessage(
+      [current],
+      message({ seq: 1, content: "古い本文", revision: 1, reactions: [] }),
+      "snapshot",
+    );
+
+    expect(next[0]?.content).toBe("新しい本文");
+    expect(next[0]?.reactions).toEqual([]);
   });
 });
 

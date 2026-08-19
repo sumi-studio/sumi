@@ -78,7 +78,12 @@ describe("MockMessagingServer admission", () => {
       (message) => message.author.kind === "personality_agent",
     ) as Message;
 
-    await server.editMessage(DEV, other.messageId, "改ざん");
+    await server.editMessage(
+      DEV,
+      other.messageId,
+      "改ざん",
+      other.revision ?? 1,
+    );
     await server.deleteMessage(DEV, other.messageId);
     const after = await server.fetchMessages(DEV);
     const unchanged = after.find(

@@ -665,31 +665,47 @@ export class MockMessagingServer implements MessagingBackend {
     place: Place,
     messageId: string,
     content: string,
-  ): Promise<void> {
+    expectedRevision: number,
+  ): Promise<Message> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted || !sameParticipant(message.author, SELF)) {
-      return;
+    if (!message) throw new Error("message_not_found");
+    // このmockの非author操作は従来どおりno-op。応答型に合わせて現在値を返す。
+    if (message.deleted || !sameParticipant(message.author, SELF)) {
+      return { ...message };
+    }
+    if ((message.revision ?? 1) !== expectedRevision) {
+      throw new Error("edit_conflict");
     }
     message.content = content;
     message.mentions = resolveMentionsAtAdmission(content);
     message.editedAt = Date.now();
-    this.emit({ type: "message_edited", message: { ...message } });
+    message.revision = (message.revision ?? 1) + 1;
+    const committed = { ...message };
+    this.emit({ type: "message_edited", message: committed });
+    return committed;
   }
 
-  async deleteMessage(place: Place, messageId: string): Promise<void> {
+  async deleteMessage(place: Place, messageId: string): Promise<Message> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
     if (!message || message.deleted || !sameParticipant(message.author, SELF)) {
-      return;
+      if (message) return { ...message };
+      throw new Error("message_not_found");
     }
     // tombstone化: contentは残さず、消えた事実とseqだけが残る。
     message.deleted = true;
     message.content = "";
+    message.mentions = [];
+    message.reactions = [];
+    message.attachments = [];
+    message.revision = (message.revision ?? 1) + 1;
+    const deleted = { ...message };
     this.emit({
       type: "message_deleted",
-      message: { ...message },
+      message: deleted,
     });
+    return deleted;
   }
 
   async markRead(place: Place, lastReadSeq: number): Promise<void> {

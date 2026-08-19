@@ -83,7 +83,8 @@
   "urgency": "urgent | normal | fyi",
   "reply_to": "<message_id> | null",
   "created_at": "...",
-  "edited_at": null
+  "edited_at": null,
+  "revision": 1
 }
 ```
 
@@ -98,6 +99,10 @@
 - `mentions` は入力テキストの `@表示名` をadmission時にmembership lookupで**解決済みParticipantRef**として束縛する。
   raw文字列の一致を認可やmention判定に使わない（ADR 0008: scope-local addressは交換可能な参照）。
 - authorはサーバー側が認証済みactorから構成する。client-assertedのauthor名を信用しない（ADR 0008 §6）。
+- `revision` は作成時に `1`。編集PATCHは現在の `revision` を必須で送り、サーバーは
+  compare-and-swap で一致したときだけ本文・mentions・`edited_at` とともに増分する。
+  古い版は `409 edit_conflict` と現在の完全な `message` を受け取る。clientはローカルの
+  推測やWS到達を使わず、この本文とrevisionを衝突表示・再読込の正本にする。
 
 ### ReadMarker と NotificationSetting — HumanもAgentも同じ形
 

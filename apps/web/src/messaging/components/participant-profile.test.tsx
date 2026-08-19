@@ -677,7 +677,7 @@ describe("カードの束縛と転送先", () => {
         onReply={vi.fn()}
         onReplyLater={vi.fn()}
         onToggleReaction={vi.fn()}
-        onCopyLink={vi.fn()}
+        onCopyLink={vi.fn().mockResolvedValue(true)}
         onEdit={vi.fn()}
         onDelete={vi.fn()}
         onJumpTo={vi.fn()}
@@ -685,6 +685,13 @@ describe("カードの束縛と転送先", () => {
         revealedAttachmentIds={new Set()}
         onRevealAttachment={vi.fn()}
         onOpenImage={vi.fn()}
+        editing={false}
+        editDraft=""
+        editConflict={null}
+        onEditDraftChange={vi.fn()}
+        onSubmitEdit={vi.fn()}
+        onCancelEdit={vi.fn()}
+        onReloadEditConflict={vi.fn()}
       />,
     );
 
