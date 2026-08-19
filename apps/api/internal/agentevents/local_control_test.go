@@ -1698,6 +1698,36 @@ func TestDurableStateFromAnEarlierRunDoesNotKeepTheAPIDown(t *testing.T) {
 		3,
 		"boot-debris",
 	)
+	currentAuthorization := localControlAuthorization(
+		localControlOtherBearer,
+		localControlOtherPAID,
+		4,
+		"boot-current",
+	)
+
+	// This is a legitimate current-key state that dynamic provisioning does
+	// not list as an authorization. It must survive the same startup sweep that
+	// quarantines the older debris below.
+	_, currentGateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
+	currentControl, err := NewLocalControlServer(
+		currentGateway,
+		currentSecret,
+		[]LocalRuntimeAuthorization{currentAuthorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := currentControl.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-current", localControlOtherPAID, 4, "boot-current"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	signedByCurrentKey, err := os.ReadFile(currentGateway.statePath(localControlOtherPAID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	oldControl, err := NewLocalControlServer(oldGateway, oldSecret, []LocalRuntimeAuthorization{authorization})
 	if err != nil {
 		t.Fatal(err)
@@ -1711,6 +1741,10 @@ func TestDurableStateFromAnEarlierRunDoesNotKeepTheAPIDown(t *testing.T) {
 	statePath := oldGateway.statePath(localControlTestPAID)
 	signedByOldKey, err := os.ReadFile(statePath)
 	if err != nil {
+		t.Fatal(err)
+	}
+	currentStatePath := oldGateway.statePath(localControlOtherPAID)
+	if err := os.WriteFile(currentStatePath, signedByCurrentKey, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1739,6 +1773,9 @@ func TestDurableStateFromAnEarlierRunDoesNotKeepTheAPIDown(t *testing.T) {
 	}
 	if _, err := os.Stat(statePath); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("unverifiable debris was left in the scanned name space: %v", err)
+	}
+	if survived, readErr := os.ReadFile(currentStatePath); readErr != nil || !bytes.Equal(survived, signedByCurrentKey) {
+		t.Fatalf("dynamic startup changed a legitimate current-key state: err=%v", readErr)
 	}
 	quarantined := quarantinedDurableStateFiles(t, runtimeDir)
 	if len(quarantined) != 1 {

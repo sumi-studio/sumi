@@ -463,18 +463,125 @@ declare SUMI_RUNTIME_SECRET_HOST_DIR="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT
 export SUMI_RUNTIME_SECRET_HOST_DIR
 declare CLEANUP_ARMED=0
 declare ACTIVE_COMPOSE_PID=
+readonly MILLISECONDS_PER_SECOND=1000
 readonly CLEANUP_MAX_ATTEMPTS=3
-readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
-readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
-readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
-# One explicit bound covers termination of the active detached Compose session,
-# every cleanup retry at the configured Compose timeout, verification calls,
-# retry delays, and a small scheduling margin. The provisioner receives this
-# exact contract over its private control descriptor before lifecycle work.
-readonly SUPERVISOR_CLEANUP_BOUND_SECONDS=$((
-  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT + 10
+readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
+# Every cleanup-path Docker CLI call has a wall-clock cap:
+#
+# Docker call                         Inner operation                 One total group budget                         Signal target
+# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop grace + post-stop allowance + TERM grace Docker process group (all descendants)
+# ps --all --quiet                    none                             verification timeout + TERM grace              Docker process group (all descendants)
+#
+# `down --timeout` is Docker's container-stop grace, not a cap on the CLI or
+# daemon response. After that grace expires, Compose still has to observe the
+# exits and remove containers, networks, and orphans. Five seconds (the same
+# bounded allowance used for the follow-up `ps`) reserves that local teardown
+# work, so the outer budget does not TERM Compose at the stop-grace boundary.
+readonly COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS=5
+readonly CLEANUP_DOWN_TIMEOUT_SECONDS=$((
+  SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS
 ))
-publish_supervisor_control "cleanup-bound-ms $((SUPERVISOR_CLEANUP_BOUND_SECONDS * 1000))"
+readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
+# `cleanup_project_is_empty` runs once after each cleanup `down`. Bound both
+# its query and the time allowed for a TERM-resistant Docker process group to
+# exit before its KILL fallback.
+readonly CLEANUP_VERIFICATION_TIMEOUT_SECONDS=5
+readonly CLEANUP_VERIFICATION_KILL_GRACE_SECONDS=1
+# Keep the post-TERM grace on the same 15s ceiling as initial session/group
+# isolation below: both bounds protect the same tracked Compose child, and a
+# slower host must not classify it as untrackable before its group can be
+# recovered.
+readonly COMPOSE_CHILD_TERM_ATTEMPTS=150
+readonly COMPOSE_CHILD_TERM_DELAY_MILLISECONDS=100
+readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
+# The cancellation cleanup can first wait for the tracked Compose child to
+# honour TERM, then run each bounded `down`, verify each attempt, and wait
+# between unsuccessful attempts. `flock -n` has no wait to add: cleanup is
+# armed only after that lock has already been acquired. Keep this in the same
+# constants that drive those waits, rather than a hand-maintained total. The
+# outer `down` cap includes its inner stop grace plus post-stop allowance.
+#
+# Each process-group KILL grace and the final scheduling margin cover joining
+# its leader plus local secret removal after the bounded Docker calls.
+readonly SUPERVISOR_CLEANUP_BOUND_MILLISECONDS=$((
+  COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS +
+  CLEANUP_MAX_ATTEMPTS * (
+    CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS
+  ) * MILLISECONDS_PER_SECOND +
+  CLEANUP_MAX_ATTEMPTS * (
+    CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS
+  ) * MILLISECONDS_PER_SECOND +
+  (CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS +
+  SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS * MILLISECONDS_PER_SECOND
+))
+publish_supervisor_control "cleanup-bound-ms ${SUPERVISOR_CLEANUP_BOUND_MILLISECONDS}"
+
+sleep_milliseconds() {
+  local milliseconds="$1"
+  local duration
+  printf -v duration '%d.%03d' \
+    "$((milliseconds / MILLISECONDS_PER_SECOND))" \
+    "$((milliseconds % MILLISECONDS_PER_SECOND))"
+  sleep "${duration}"
+}
+
+monotonic_time_milliseconds() {
+  local uptime seconds fractional_milliseconds
+  read -r uptime _ < /proc/uptime
+  seconds="${uptime%.*}"
+  fractional_milliseconds="${uptime#*.}000"
+  printf '%d\n' "$((10#${seconds} * MILLISECONDS_PER_SECOND + 10#${fractional_milliseconds:0:3}))"
+}
+
+milliseconds_until_cleanup_deadline() {
+  local deadline_milliseconds="$1"
+  local now_milliseconds
+  now_milliseconds="$(monotonic_time_milliseconds)"
+  if (( now_milliseconds >= deadline_milliseconds )); then
+    printf '0\n'
+  else
+    printf '%d\n' "$((deadline_milliseconds - now_milliseconds))"
+  fi
+}
+
+# The normal Docker phase must leave the advertised TERM grace in the same
+# absolute deadline. No probe, wait, or fallback may create a new budget.
+milliseconds_until_cleanup_term() {
+  local deadline_milliseconds="$1"
+  local kill_grace_seconds="$2"
+  local remaining_milliseconds
+  remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
+  if (( remaining_milliseconds <= kill_grace_seconds * MILLISECONDS_PER_SECOND )); then
+    printf '0\n'
+  else
+    printf '%d\n' "$((remaining_milliseconds - kill_grace_seconds * MILLISECONDS_PER_SECOND))"
+  fi
+}
+
+sleep_cleanup_milliseconds() {
+  local requested_milliseconds="$1"
+  local deadline_milliseconds="$2"
+  local remaining_milliseconds
+  remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
+  (( remaining_milliseconds > 0 )) || return 1
+  if (( requested_milliseconds > remaining_milliseconds )); then
+    requested_milliseconds="${remaining_milliseconds}"
+  fi
+  sleep_milliseconds "${requested_milliseconds}"
+}
+
+sleep_cleanup_normal_milliseconds() {
+  local requested_milliseconds="$1"
+  local deadline_milliseconds="$2"
+  local kill_grace_seconds="$3"
+  local remaining_milliseconds
+  remaining_milliseconds="$(milliseconds_until_cleanup_term "${deadline_milliseconds}" "${kill_grace_seconds}")"
+  (( remaining_milliseconds > 0 )) || return 1
+  if (( requested_milliseconds > remaining_milliseconds )); then
+    requested_milliseconds="${remaining_milliseconds}"
+  fi
+  sleep_milliseconds "${requested_milliseconds}"
+}
 
 launch_compose() {
   docker compose \
@@ -487,6 +594,20 @@ lifecycle_compose() {
   docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${LIFECYCLE_COMPOSE_FILE}" \
+    "$@"
+}
+
+cleanup_down_lifecycle_compose() {
+  run_bounded_cleanup_lifecycle_compose \
+    "${CLEANUP_DOWN_TIMEOUT_SECONDS}" \
+    "${CLEANUP_DOWN_KILL_GRACE_SECONDS}" \
+    "$@"
+}
+
+cleanup_verification_lifecycle_compose() {
+  run_bounded_cleanup_lifecycle_compose \
+    "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}" \
+    "${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}" \
     "$@"
 }
 
@@ -550,10 +671,11 @@ tracked_compose_child_isolated() {
   [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
 }
 
-# `setsid` makes the child its own session and group within microseconds on an
-# idle host, but this suite starts thirteen Docker fixtures while Cargo builds.
-# A 500ms ceiling lost that race and turned load into a launch failure, so the
-# bound is generous while still bounded.
+# `setsid` normally makes the child its own session and group within
+# microseconds. Under the recorded test load (thirteen Docker fixtures plus
+# Cargo builds), the old 500ms ceiling lost that scheduling race; 20/20 runs
+# with six busy loops completed at the 15s ceiling. Match the TERM grace above
+# so initial tracking and later group recovery use one bounded host-load budget.
 readonly TRACKED_COMPOSE_ISOLATION_ATTEMPTS=1500
 
 wait_for_tracked_compose_child_isolation() {
@@ -590,6 +712,134 @@ tracked_compose_group_isolated() {
   [[ "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
 }
 
+wait_for_cleanup_compose_group_isolation() {
+  local pid="$1"
+  local deadline_milliseconds="$2"
+  local kill_grace_seconds="$3"
+  while :; do
+    # Unlike the launch path, a cleanup Docker leader may finish before this
+    # probe. Its session/group still identifies any helper it left behind.
+    if tracked_compose_group_isolated "${pid}"; then
+      return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 1
+    fi
+    sleep_cleanup_normal_milliseconds 10 "${deadline_milliseconds}" "${kill_grace_seconds}" || return 1
+  done
+}
+
+cleanup_compose_group_alive() {
+  local pid="$1"
+  kill -0 -- "-${pid}" 2>/dev/null
+}
+
+reap_cleanup_compose_leader() {
+  local pid="$1"
+  local status_name="$2"
+  local reaped_name="$3"
+  local leader_status
+  if [[ "${!reaped_name}" == 0 ]] && tracked_compose_child_is_zombie "${pid}"; then
+    if wait "${pid}"; then
+      leader_status=0
+    else
+      leader_status=$?
+    fi
+    printf -v "${status_name}" '%s' "${leader_status}"
+    printf -v "${reaped_name}" '%s' 1
+  fi
+}
+
+run_bounded_cleanup_lifecycle_compose() {
+  local timeout_seconds="$1"
+  local kill_grace_seconds="$2"
+  shift 2
+  local pid status=0 leader_reaped=0 deadline_milliseconds remaining_milliseconds
+
+  # A cleanup call has one clock from launch through its probe, normal wait,
+  # TERM grace, and KILL. Reserve the advertised TERM grace from the normal
+  # phase, but never reset this absolute deadline after a probe race.
+  deadline_milliseconds=$(( $(monotonic_time_milliseconds) +
+    (timeout_seconds + kill_grace_seconds) * MILLISECONDS_PER_SECOND
+  ))
+
+  # Keep every Docker helper in a dedicated session/process group. Waiting for
+  # the group, rather than just Docker's leader, makes the cleanup deadline
+  # cover Compose plugins and helpers even if the CLI exits first.
+  setsid docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${LIFECYCLE_COMPOSE_FILE}" \
+    "$@" 3>&- 4>&- &
+  pid=$!
+
+  # The isolation probe spends from the same total deadline as Docker itself.
+  # Its centisecond resolution leaves the ordinary scheduling margin in the
+  # advertised cleanup bound to absorb wakeup jitter.
+  if ! wait_for_cleanup_compose_group_isolation \
+    "${pid}" "${deadline_milliseconds}" "${kill_grace_seconds}"; then
+    # `setsid` has already made this PID the group identifier. The leader can
+    # disappear before /proc is sampled while a Compose helper remains in that
+    # group, so keep policing the group instead of treating the leader's exit
+    # as successful cleanup.
+    if cleanup_compose_group_alive "${pid}"; then
+      :
+    elif tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
+      if wait "${pid}"; then
+        return 0
+      else
+        return $?
+      fi
+    else
+      log "ERROR: cleanup Docker child did not become its own session and process group"
+      kill -TERM "${pid}" 2>/dev/null || true
+      while sleep_cleanup_milliseconds 100 "${deadline_milliseconds}"; do
+        if tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
+          break
+        fi
+      done
+      kill -KILL "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+      return 125
+    fi
+  fi
+
+  while :; do
+    reap_cleanup_compose_leader "${pid}" status leader_reaped
+    if ! cleanup_compose_group_alive "${pid}"; then
+      if (( ! leader_reaped )); then
+        if wait "${pid}"; then
+          status=0
+        else
+          status=$?
+        fi
+      fi
+      return "${status}"
+    fi
+    remaining_milliseconds="$(milliseconds_until_cleanup_term "${deadline_milliseconds}" "${kill_grace_seconds}")"
+    (( remaining_milliseconds > 0 )) || break
+    sleep_cleanup_normal_milliseconds 100 "${deadline_milliseconds}" "${kill_grace_seconds}" || break
+  done
+
+  kill -TERM -- "-${pid}" 2>/dev/null || true
+  while :; do
+    reap_cleanup_compose_leader "${pid}" status leader_reaped
+    if ! cleanup_compose_group_alive "${pid}"; then
+      if (( ! leader_reaped )); then
+        wait "${pid}" 2>/dev/null || true
+      fi
+      return 124
+    fi
+    remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
+    (( remaining_milliseconds > 0 )) || break
+    sleep_cleanup_milliseconds 100 "${deadline_milliseconds}" || break
+  done
+  kill -KILL -- "-${pid}" 2>/dev/null || true
+  if (( ! leader_reaped )); then
+    wait "${pid}" 2>/dev/null || true
+  fi
+  return 124
+}
+
 terminate_active_compose() {
   local pid="${ACTIVE_COMPOSE_PID:-}"
   local attempt
@@ -604,7 +854,7 @@ terminate_active_compose() {
     fi
     for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
       kill -0 "${pid}" 2>/dev/null || break
-      sleep "${COMPOSE_CHILD_TERM_DELAY_SECONDS}"
+      sleep_milliseconds "${COMPOSE_CHILD_TERM_DELAY_MILLISECONDS}"
     done
     if kill -0 "${pid}" 2>/dev/null; then
       if tracked_compose_group_isolated "${pid}"; then
@@ -775,7 +1025,7 @@ require_expected_epoch() {
 
 cleanup_project_is_empty() {
   local containers
-  containers="$(lifecycle_compose ps --all --quiet 2>/dev/null)" || return 1
+  containers="$(cleanup_verification_lifecycle_compose ps --all --quiet 2>/dev/null)" || return 1
   [[ -z "${containers//[[:space:]]/}" ]]
 }
 
@@ -794,14 +1044,14 @@ cleanup_partial_generation() {
     # A nonzero `down` can still leave an empty project, while a zero status is
     # not the cleanup contract by itself. Bound retries on observed emptiness.
     for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
-      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+      cleanup_down_lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1
       if cleanup_project_is_empty; then
         cleanup_complete=1
         break
       fi
       if (( attempt < CLEANUP_MAX_ATTEMPTS )); then
-        sleep "${CLEANUP_RETRY_DELAY_SECONDS}"
+        sleep_milliseconds "${CLEANUP_RETRY_DELAY_MILLISECONDS}"
       fi
     done
     if (( ! cleanup_complete )); then
