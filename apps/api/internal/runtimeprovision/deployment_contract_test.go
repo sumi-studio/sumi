@@ -3,6 +3,7 @@ package runtimeprovision
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -966,7 +967,7 @@ func TestSupervisorRedactsReapAttestationNonceDiagnostics(t *testing.T) {
 	}
 }
 
-func TestSupervisorPrepareRejectsMissingTimeoutBeforeLifecycle(t *testing.T) {
+func TestSupervisorPrepareRejectsMissingSetsidBeforeLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
 	}
@@ -979,7 +980,7 @@ func TestSupervisorPrepareRejectsMissingTimeoutBeforeLifecycle(t *testing.T) {
 	if err := os.Mkdir(binDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"dirname", "readlink", "flock", "install", "mount", "setsid"} {
+	for _, name := range []string{"dirname", "readlink", "flock", "install", "mount"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			t.Fatalf("find %s: %v", name, err)
@@ -1024,15 +1025,15 @@ exec /usr/bin/stat "$@"
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
 	}
 	output, err := command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "GNU timeout is required for bounded cleanup Docker calls") {
-		t.Fatalf("supervisor did not reject missing timeout before lifecycle: err=%v output=%s", err, output)
+	if err == nil || !strings.Contains(string(output), "setsid is required for supervised Compose launch") {
+		t.Fatalf("supervisor did not reject missing setsid before lifecycle: err=%v output=%s", err, output)
 	}
 	calls, err := os.ReadFile(dockerLog)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(calls), "compose.lifecycle.yaml") {
-		t.Fatalf("supervisor reached lifecycle work before rejecting missing timeout:\n%s", calls)
+		t.Fatalf("supervisor reached lifecycle work before rejecting missing setsid:\n%s", calls)
 	}
 }
 
@@ -1132,11 +1133,11 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 		}
 	}
 	for _, row := range []string{
-		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance",
-		"ps --all --quiet none CLEANUP_VERIFICATION_TIMEOUT_SECONDS",
+		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance Docker process group (all descendants)",
+		"ps --all --quiet none CLEANUP_VERIFICATION_TIMEOUT_SECONDS Docker process group (all descendants)",
 	} {
 		if !strings.Contains(compactSupervisor, row) {
-			t.Fatalf("supervisor cleanup timeout table omits %q:\n%s", row, compactSupervisor)
+			t.Fatalf("supervisor cleanup group-deadline table omits %q:\n%s", row, compactSupervisor)
 		}
 	}
 	if !strings.Contains(compactSupervisor, "cleanup_down_lifecycle_compose down --remove-orphans --timeout \"${SUMI_COMPOSE_TIMEOUT}\"") {
@@ -1147,7 +1148,7 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	}
 }
 
-func TestSupervisorCleanupBoundsHungDockerDown(t *testing.T) {
+func TestSupervisorCleanupKillsForkedDockerChildAfterLeaderExit(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
 	}
@@ -1160,6 +1161,7 @@ func TestSupervisorCleanupBoundsHungDockerDown(t *testing.T) {
 	prepareReady := filepath.Join(testRoot, "prepare-ready")
 	hangCleanupDown := filepath.Join(testRoot, "hang-cleanup-down")
 	cleanupDownStarted := filepath.Join(testRoot, "cleanup-down-started")
+	cleanupChildPID := filepath.Join(testRoot, "cleanup-child-pid")
 	fakeDocker := filepath.Join(testRoot, "docker")
 	fakeDockerScript := `#!/bin/sh
 set -eu
@@ -1167,9 +1169,8 @@ printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
   *"compose.lifecycle.yaml down"*)
     if [ -e "$SUMI_HANG_CLEANUP_DOWN" ]; then
-      printf started > "$SUMI_CLEANUP_DOWN_STARTED"
-      trap '' TERM
-      while :; do :; done
+      /bin/sh -c 'trap "" TERM; printf "$$" > "$SUMI_CLEANUP_CHILD_PID"; printf started > "$SUMI_CLEANUP_DOWN_STARTED"; while :; do :; done' &
+      exit 0
     fi
     ;;
   *"compose.prepare.yaml up --detach --wait"*)
@@ -1218,6 +1219,7 @@ exec /usr/bin/stat "$@"
 		"SUMI_PREPARE_READY=" + prepareReady,
 		"SUMI_HANG_CLEANUP_DOWN=" + hangCleanupDown,
 		"SUMI_CLEANUP_DOWN_STARTED=" + cleanupDownStarted,
+		"SUMI_CLEANUP_CHILD_PID=" + cleanupChildPID,
 		"SUMI_SUPERVISOR_CONTROL_FD=3",
 		"SUMI_COMPOSE_TIMEOUT=1",
 	}
@@ -1256,6 +1258,8 @@ exec /usr/bin/stat "$@"
 		t.Fatal("supervisor prepare unexpectedly succeeded after TERM")
 	}
 	waitForSupervisorFile(t, cleanupDownStarted, time.Second)
+	childPID := readSupervisorPID(t, cleanupChildPID)
+	waitForSupervisorProcessGone(t, childPID, 2*time.Second)
 	controlOutput, err := io.ReadAll(controlRead)
 	if err != nil {
 		t.Fatal(err)
@@ -1275,7 +1279,7 @@ exec /usr/bin/stat "$@"
 	// This tighter assertion makes the fake daemon hang observable. The
 	// advertised bound also includes three retries and conservative host margin.
 	if elapsed > 8*time.Second {
-		t.Fatalf("hung cleanup down escaped its timeout wrapper: cleanup took %s", elapsed)
+		t.Fatalf("forked cleanup child escaped its process-group deadline: cleanup took %s", elapsed)
 	}
 }
 
@@ -1387,6 +1391,31 @@ func waitForSupervisorFile(t *testing.T, path string, limit time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", path)
+}
+
+func readSupervisorPID(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("read PID from %s: value=%q err=%v", path, raw, err)
+	}
+	return pid
+}
+
+func waitForSupervisorProcessGone(t *testing.T, pid int, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("cleanup Docker child %d survived its process-group deadline", pid)
 }
 
 func TestDeploymentActivateCannotRerunAllocatorOrExposeDockerSocket(t *testing.T) {

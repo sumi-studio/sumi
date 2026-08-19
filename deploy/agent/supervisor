@@ -83,13 +83,6 @@ require_tracked_compose_support() {
   command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
 }
 
-require_cleanup_timeout_support() {
-  command -v timeout >/dev/null 2>&1 ||
-    fail "GNU timeout is required for bounded cleanup Docker calls"
-  timeout --foreground --kill-after=1s 1s true >/dev/null 2>&1 ||
-    fail "timeout must support --foreground and --kill-after for bounded cleanup Docker calls"
-}
-
 configure_apparmor_profile() {
   local enabled=
   if [[ -r /sys/module/apparmor/parameters/enabled ]]; then
@@ -475,23 +468,23 @@ readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
 # Every cleanup-path Docker CLI call has a wall-clock cap:
 #
-# Docker call                         Inner operation                 Outer CLI deadline
-# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop grace + post-stop allowance
-# ps --all --quiet                    none                             CLEANUP_VERIFICATION_TIMEOUT_SECONDS
+# Docker call                         Inner operation                 Outer group deadline               Signal target
+# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop grace + post-stop allowance  Docker process group (all descendants)
+# ps --all --quiet                    none                             CLEANUP_VERIFICATION_TIMEOUT_SECONDS Docker process group (all descendants)
 #
 # `down --timeout` is Docker's container-stop grace, not a cap on the CLI or
 # daemon response. After that grace expires, Compose still has to observe the
 # exits and remove containers, networks, and orphans. Five seconds (the same
 # bounded allowance used for the follow-up `ps`) reserves that local teardown
-# work, so the outer timeout does not TERM Compose at the stop-grace boundary.
+# work, so the outer deadline does not TERM Compose at the stop-grace boundary.
 readonly COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS=5
 readonly CLEANUP_DOWN_TIMEOUT_SECONDS=$((
   SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS
 ))
 readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
 # `cleanup_project_is_empty` runs once after each cleanup `down`. Bound both
-# its query and the time allowed for timeout(1) to join a TERM-resistant
-# Docker CLI before its KILL fallback.
+# its query and the time allowed for a TERM-resistant Docker process group to
+# exit before its KILL fallback.
 readonly CLEANUP_VERIFICATION_TIMEOUT_SECONDS=5
 readonly CLEANUP_VERIFICATION_KILL_GRACE_SECONDS=1
 # Keep the post-TERM grace on the same 15s ceiling as initial session/group
@@ -512,8 +505,8 @@ readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
 # constants that drive those waits, rather than a hand-maintained total. The
 # outer `down` cap includes its inner stop grace plus post-stop allowance.
 #
-# Each timeout(1) KILL grace and the final scheduling margin cover joining its
-# process plus local secret removal after the bounded Docker calls.
+# Each process-group KILL grace and the final scheduling margin cover joining
+# its leader plus local secret removal after the bounded Docker calls.
 readonly SUPERVISOR_CLEANUP_BOUND_MILLISECONDS=$((
   COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS +
   CLEANUP_MAX_ATTEMPTS * (
@@ -551,23 +544,17 @@ lifecycle_compose() {
 }
 
 cleanup_down_lifecycle_compose() {
-  timeout --foreground \
-    --kill-after="${CLEANUP_DOWN_KILL_GRACE_SECONDS}s" \
-    "${CLEANUP_DOWN_TIMEOUT_SECONDS}s" \
-    docker compose \
-      --project-name "${SUMI_COMPOSE_PROJECT}" \
-      --file "${LIFECYCLE_COMPOSE_FILE}" \
-      "$@"
+  run_bounded_cleanup_lifecycle_compose \
+    "${CLEANUP_DOWN_TIMEOUT_SECONDS}" \
+    "${CLEANUP_DOWN_KILL_GRACE_SECONDS}" \
+    "$@"
 }
 
 cleanup_verification_lifecycle_compose() {
-  timeout --foreground \
-    --kill-after="${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}s" \
-    "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}s" \
-    docker compose \
-      --project-name "${SUMI_COMPOSE_PROJECT}" \
-      --file "${LIFECYCLE_COMPOSE_FILE}" \
-      "$@"
+  run_bounded_cleanup_lifecycle_compose \
+    "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}" \
+    "${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}" \
+    "$@"
 }
 
 prepare_compose() {
@@ -669,6 +656,127 @@ tracked_compose_group_isolated() {
   [[ "${remainder}" != "${stat}" ]] || return 1
   read -r state ppid pgid sid _ <<< "${remainder}"
   [[ "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+}
+
+wait_for_cleanup_compose_group_isolation() {
+  local pid="$1"
+  local max_attempts="$2"
+  local attempts_name="$3"
+  local attempt
+  for ((attempt = 0; attempt < max_attempts; attempt++)); do
+    # Unlike the launch path, a cleanup Docker leader may finish before this
+    # probe. Its session/group still identifies any helper it left behind.
+    if tracked_compose_group_isolated "${pid}"; then
+      printf -v "${attempts_name}" '%s' "${attempt}"
+      return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      printf -v "${attempts_name}" '%s' "${attempt}"
+      return 1
+    fi
+    sleep 0.01
+  done
+  printf -v "${attempts_name}" '%s' "${max_attempts}"
+  return 1
+}
+
+cleanup_compose_group_alive() {
+  local pid="$1"
+  kill -0 -- "-${pid}" 2>/dev/null
+}
+
+reap_cleanup_compose_leader() {
+  local pid="$1"
+  local status_name="$2"
+  local reaped_name="$3"
+  local leader_status
+  if [[ "${!reaped_name}" == 0 ]] && tracked_compose_child_is_zombie "${pid}"; then
+    if wait "${pid}"; then
+      leader_status=0
+    else
+      leader_status=$?
+    fi
+    printf -v "${status_name}" '%s' "${leader_status}"
+    printf -v "${reaped_name}" '%s' 1
+  fi
+}
+
+run_bounded_cleanup_lifecycle_compose() {
+  local timeout_seconds="$1"
+  local kill_grace_seconds="$2"
+  shift 2
+  local pid status=0 leader_reaped=0 isolation_attempts=0 remaining_attempts attempt
+
+  # Keep every Docker helper in a dedicated session/process group. Waiting for
+  # the group, rather than just Docker's leader, makes the cleanup deadline
+  # cover Compose plugins and helpers even if the CLI exits first.
+  setsid docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${LIFECYCLE_COMPOSE_FILE}" \
+    "$@" 3>&- 4>&- &
+  pid=$!
+
+  # The isolation probe spends from the same deadline as Docker itself. Its
+  # centisecond resolution leaves the ordinary scheduling margin in the
+  # advertised cleanup bound to absorb wakeup jitter.
+  if ! wait_for_cleanup_compose_group_isolation \
+    "${pid}" "$((timeout_seconds * 100))" isolation_attempts; then
+    # `setsid` has already made this PID the group identifier. The leader can
+    # disappear before /proc is sampled while a Compose helper remains in that
+    # group, so keep policing the group instead of treating the leader's exit
+    # as successful cleanup.
+    if cleanup_compose_group_alive "${pid}"; then
+      isolation_attempts=0
+    elif tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
+      if wait "${pid}"; then
+        return 0
+      else
+        return $?
+      fi
+    else
+      log "ERROR: cleanup Docker child did not become its own session and process group"
+      kill -TERM "${pid}" 2>/dev/null || true
+      sleep_milliseconds "${COMPOSE_CHILD_TERM_DELAY_MILLISECONDS}"
+      kill -KILL "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+      return 125
+    fi
+  fi
+
+  remaining_attempts=$((
+    timeout_seconds * 10 - (isolation_attempts + 9) / 10
+  ))
+  for ((attempt = 0; attempt < remaining_attempts; attempt++)); do
+    reap_cleanup_compose_leader "${pid}" status leader_reaped
+    if ! cleanup_compose_group_alive "${pid}"; then
+      if (( ! leader_reaped )); then
+        if wait "${pid}"; then
+          status=0
+        else
+          status=$?
+        fi
+      fi
+      return "${status}"
+    fi
+    sleep_milliseconds 100
+  done
+
+  kill -TERM -- "-${pid}" 2>/dev/null || true
+  for ((attempt = 0; attempt < kill_grace_seconds * 10; attempt++)); do
+    reap_cleanup_compose_leader "${pid}" status leader_reaped
+    if ! cleanup_compose_group_alive "${pid}"; then
+      if (( ! leader_reaped )); then
+        wait "${pid}" 2>/dev/null || true
+      fi
+      return 124
+    fi
+    sleep_milliseconds 100
+  done
+  kill -KILL -- "-${pid}" 2>/dev/null || true
+  if (( ! leader_reaped )); then
+    wait "${pid}" 2>/dev/null || true
+  fi
+  return 124
 }
 
 terminate_active_compose() {
@@ -1006,7 +1114,6 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
-    require_cleanup_timeout_support
     configure_apparmor_profile
     validate_prepare_compose_redacted
     # The API installs exact-generation authorization and creates the PAID
@@ -1042,7 +1149,6 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
-    require_cleanup_timeout_support
     require_expected_epoch
     set_runtime_secret_host_dir "${EPOCH_GENERATION}"
     require_launch_environment
