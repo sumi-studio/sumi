@@ -88,7 +88,14 @@ export function MessageList({
     (state) => state.editSavedWithPendingChanges,
   );
   const editSaving = useMessaging(
-    (state) => state.editSession?.submittedDraft !== null,
+    (state) =>
+      state.editSession !== null && state.editSession.submittedDraft !== null,
+  );
+  const editOpenedToken = useMessaging(
+    (state) => state.editSession?.openedToken ?? null,
+  );
+  const deleteFailedMessageIds = useMessaging(
+    (state) => state.deleteFailedMessageIds,
   );
   const setEditDraft = useMessaging((state) => state.setEditDraft);
   const reloadEditConflict = useMessaging((state) => state.reloadEditConflict);
@@ -327,6 +334,32 @@ export function MessageList({
     [deleteMessage],
   );
 
+  // 行に渡す関数は identity を固定する。MessageItem は memo なので、渡す値が
+  // 変わらない行は再描画されない。編集欄の1キーストロークで可視行すべてを
+  // 描き直さないための前提（編集中の値は編集行にだけ渡す）。
+  const retryMessage = useCallback(
+    (message: Message) => {
+      if (message.clientNonce) retrySend(message.clientNonce);
+    },
+    [retrySend],
+  );
+  const findMessage = useCallback(
+    (id: string) => messagesById.get(id),
+    [messagesById],
+  );
+  const replyTo = useCallback(
+    (message: Message) => setReplyTarget(message.messageId),
+    [setReplyTarget],
+  );
+  const replyLater = useCallback(
+    (message: Message, delayMs?: number) => createReplyLater(message, delayMs),
+    [createReplyLater],
+  );
+  const editMessage = useCallback(
+    (message: Message) => startEdit(message.messageId),
+    [startEdit],
+  );
+
   const loadOlderAnchored = useCallback(async () => {
     if (!activePlaceKey || !messages || messages.length === 0) return;
     const anchorId = messages[0].messageId;
@@ -374,12 +407,13 @@ export function MessageList({
           </div>
         );
       }
+      const editing = editingMessageId === row.message.messageId;
       return (
         <div
           className={
             highlightedId === row.message.messageId
               ? "rounded-md bg-primary/8 ring-1 ring-primary/25 transition-colors"
-              : editingMessageId === row.message.messageId
+              : editing
                 ? "rounded-md ring-1 ring-primary/40"
                 : undefined
           }
@@ -394,34 +428,36 @@ export function MessageList({
             }
             allowReactions={allowReactions}
             allowReplyLater={allowReplyLater}
-            onRetry={(message) => {
-              if (message.clientNonce) retrySend(message.clientNonce);
-            }}
+            onRetry={retryMessage}
             selfKey={selfKey}
             membersByKey={membersByKey}
-            findMessage={(id) => messagesById.get(id)}
-            onReply={(message) => setReplyTarget(message.messageId)}
-            onReplyLater={(message, delayMs) =>
-              createReplyLater(message, delayMs)
-            }
+            findMessage={findMessage}
+            onReply={replyTo}
+            onReplyLater={replyLater}
             onToggleReaction={toggleReaction}
             onCopyLink={copyLink}
-            onEdit={(message) => startEdit(message.messageId)}
+            onEdit={editMessage}
             onDelete={deleteMessage2}
             onJumpTo={flashMessage}
             revealedAttachmentIds={revealedAttachmentIds}
             onRevealAttachment={onRevealAttachment}
             onOpenImage={onOpenImage}
-            editing={editingMessageId === row.message.messageId}
-            editDraft={editDraft}
-            editConflict={editConflict}
-            editFailure={editFailure}
-            editSavedWithPendingChanges={editSavedWithPendingChanges}
-            editSaving={editSaving}
+            editing={editing}
+            // 編集セッションの値は編集行にだけ渡す。他の行の props は
+            // キーストロークで変わらないので、memo が効いて描き直されない。
+            editDraft={editing ? editDraft : ""}
+            editConflict={editing ? editConflict : null}
+            editFailure={editing ? editFailure : null}
+            editSavedWithPendingChanges={
+              editing ? editSavedWithPendingChanges : false
+            }
+            editSaving={editing ? editSaving : false}
+            editOpenedToken={editing ? editOpenedToken : null}
             onEditDraftChange={setEditDraft}
             onSubmitEdit={submitEdit}
             onCancelEdit={cancelEdit}
             onReloadEditConflict={reloadEditConflict}
+            deleteFailed={deleteFailedMessageIds.has(row.message.messageId)}
           />
         </div>
       );
@@ -434,22 +470,24 @@ export function MessageList({
       editFailure,
       editSavedWithPendingChanges,
       editSaving,
+      editOpenedToken,
+      deleteFailedMessageIds,
       setEditDraft,
       reloadEditConflict,
       submitEdit,
       cancelEdit,
       selfKey,
       membersByKey,
-      messagesById,
+      findMessage,
       replyLaterByMessage,
-      setReplyTarget,
-      createReplyLater,
+      replyTo,
+      replyLater,
       toggleReaction,
       allowReactions,
       allowReplyLater,
-      retrySend,
+      retryMessage,
       copyLink,
-      startEdit,
+      editMessage,
       deleteMessage2,
       flashMessage,
       loadOlderAnchored,

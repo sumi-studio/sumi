@@ -157,6 +157,12 @@ interface EditSession {
   /** 送信中なら、そのPATCHへ切り出した編集欄のスナップショット。 */
   submittedDraft: string | null;
   token: number;
+  /**
+   * 編集欄を開いた（開き直した）回。startEdit と reloadEditConflict だけが
+   * 更新し、保存の送受で派生する session は引き継ぐ。編集欄の初回フォーカスは
+   * この単位で一度だけ——仮想リストの行が再マウントされても caret を奪わない。
+   */
+  openedToken: number;
 }
 
 type EditConflict = Required<MessageContentRevision>;
@@ -250,6 +256,11 @@ interface MessagingState {
   editFailure: string | null;
   /** 保存応答後も、その後の追記を編集欄に残していることを示す。 */
   editSavedWithPendingChanges: boolean;
+  /**
+   * DELETE が失敗したメッセージ。行に「削除できませんでした」を出す。
+   * 再試行の要求で外し、tombstone が届けば（誰の削除でも）外す。
+   */
+  deleteFailedMessageIds: ReadonlySet<string>;
   replyTargetId: string | null;
   connection: ConnectionState;
   /**
@@ -356,6 +367,17 @@ function clearedEditSession(): Pick<
   };
 }
 
+function setWith(ids: ReadonlySet<string>, id: string): ReadonlySet<string> {
+  return ids.has(id) ? ids : new Set(ids).add(id);
+}
+
+function setWithout(ids: ReadonlySet<string>, id: string): ReadonlySet<string> {
+  if (!ids.has(id)) return ids;
+  const next = new Set(ids);
+  next.delete(id);
+  return next;
+}
+
 /**
  * 画面上の本文、競合本文、今回の応答を一つのrevision規則で畳み込む。
  * 呼び出し元は「どの場所に書き戻すか」だけを決め、版の優劣を別実装しない。
@@ -382,12 +404,16 @@ function latestEditConflict(
 /**
  * この編集セッションにおける「競合」の唯一の定義。
  *
- * base より新しい revision の `message_edited` のうち、このセッションが送信した
+ * base より新しい revision を運ぶ message event のうち、このセッションが送信した
  * 本文ではないものだけが競合である。送信済み本文と一致する event は自分の echo
  * として扱う。Message には編集者が載らないため、ここで確実に照合できるのは本文と
  * 送信中の session だけである。
+ *
+ * 入口は live の `message_edited` に限らない。再接続の catch-up は現在版を
+ * `message_created` として再生するので、切断中に別の場所で進んだ revision も
+ * ここを通す。submit の 409 まで競合を知らずにいる窓を作らない。
  */
-function conflictFromMessageEditedEvent(
+function conflictFromMessageEvent(
   state: MessagingState,
   existing: Message | undefined,
   message: Message,
@@ -419,6 +445,42 @@ function clearConflictsThroughSuccessfulEditAck(
   acknowledgedRevision: number,
 ): EditConflict | null {
   return conflict && conflict.revision > acknowledgedRevision ? conflict : null;
+}
+
+/**
+ * 保存中に取り消して同じメッセージを開き直した未送信セッションは、送った版の
+ * ACK を知らないまま古い base（≤ R）を持つ。そのまま保存すると自分の確定版に
+ * 409 で弾かれ、「別の場所で編集されました」が自分の保存に対して出る。
+ *
+ * 成功 ACK R は base..R に他者の編集が無かったことの確定なので、その base だけ
+ * R へ進め、R 以下の競合表示を畳む。書きかけには触らない——開き直した欄に
+ * 見えている本文がそのまま次の保存の対象で、送った版のセッションはもう無い。
+ * 送信中（submittedDraft あり）のセッションは自分の ACK で決着するので対象外。
+ */
+function advanceUnsentEditSessionThroughAck(
+  state: MessagingState,
+  acknowledged: EditSession,
+  acknowledgedRevision: number,
+): Partial<MessagingState> {
+  const session = state.editSession;
+  if (
+    !session ||
+    session.submittedDraft !== null ||
+    session.placeKey !== acknowledged.placeKey ||
+    session.messageId !== acknowledged.messageId ||
+    state.editingMessageId !== session.messageId ||
+    state.editBaseRevision === null ||
+    state.editBaseRevision > acknowledgedRevision
+  )
+    return {};
+  return {
+    editBaseRevision: acknowledgedRevision,
+    editSession: { ...session, revision: acknowledgedRevision },
+    editConflict: clearConflictsThroughSuccessfulEditAck(
+      state.editConflict,
+      acknowledgedRevision,
+    ),
+  };
 }
 
 /**
@@ -1040,6 +1102,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
             "revision",
           ),
         },
+        ...(state.deleteFailedMessageIds.has(message.messageId)
+          ? {
+              deleteFailedMessageIds: setWithout(
+                state.deleteFailedMessageIds,
+                message.messageId,
+              ),
+            }
+          : {}),
         unreadCountByPlace: {
           ...state.unreadCountByPlace,
           [key]: Math.max(
@@ -1182,10 +1252,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           lastRead,
           state.selfKey,
         );
-        const editConflict =
-          event.type === "message_edited"
-            ? conflictFromMessageEditedEvent(state, existing, event.message)
-            : state.editConflict;
+        const editConflict = conflictFromMessageEvent(
+          state,
+          existing,
+          event.message,
+        );
         return {
           messagesByPlace: { ...state.messagesByPlace, [key]: messages },
           pendingByPlace: { ...state.pendingByPlace, [key]: pending },
@@ -1671,6 +1742,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     editConflict: null,
     editFailure: null,
     editSavedWithPendingChanges: false,
+    deleteFailedMessageIds: new Set(),
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
@@ -2142,6 +2214,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         : undefined;
       if (!key || !message) return;
       const revision = message.revision ?? 1;
+      const token = ++nextEditSessionToken;
       set({
         editingMessageId: messageId,
         editDraft: message.content,
@@ -2151,7 +2224,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           messageId,
           revision,
           submittedDraft: null,
-          token: ++nextEditSessionToken,
+          token,
+          openedToken: token,
         },
         editConflict: null,
         editFailure: null,
@@ -2178,6 +2252,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       );
       const base = latestMessageContent(current, state.editConflict);
       if (!base) return;
+      const token = ++nextEditSessionToken;
       set({
         editDraft: base.content,
         editBaseRevision: base.revision ?? 1,
@@ -2185,7 +2260,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ...session,
           revision: base.revision ?? 1,
           submittedDraft: null,
-          token: ++nextEditSessionToken,
+          token,
+          openedToken: token,
         },
         editConflict: null,
         editFailure: null,
@@ -2272,7 +2348,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
                         editFailure: null,
                         editSavedWithPendingChanges: true,
                       }
-                  : {}),
+                  : advanceUnsentEditSessionThroughAck(
+                      current,
+                      submittedSession,
+                      acknowledgedRevision,
+                    )),
               };
             });
           },
@@ -2353,18 +2433,39 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       if (!key || !place) return;
+      if (state.deleteFailedMessageIds.has(messageId)) {
+        set((current) => ({
+          deleteFailedMessageIds: setWithout(
+            current.deleteFailedMessageIds,
+            messageId,
+          ),
+        }));
+      }
       const request = beginMessagingBackendRequest();
       void request
         .wait((backend) => backend.deleteMessage(place, messageId))
-        .then((committed) => {
-          if (!committed || !request.isCurrent()) return;
-          if (
-            committed.messageId !== messageId ||
-            placeKey(committed.place) !== key
-          )
-            return;
-          applyMessageDeleted(committed);
-        });
+        .then(
+          (committed) => {
+            if (!committed || !request.isCurrent()) return;
+            if (
+              committed.messageId !== messageId ||
+              placeKey(committed.place) !== key
+            )
+              return;
+            applyMessageDeleted(committed);
+          },
+          // 403/404/ネットワーク断。無言で捨てると行は残ったまま何も起きない。
+          // 送信失敗と同じく、その行に失敗を出して再試行の口を残す。
+          () => {
+            if (!request.isCurrent()) return;
+            set((current) => ({
+              deleteFailedMessageIds: setWith(
+                current.deleteFailedMessageIds,
+                messageId,
+              ),
+            }));
+          },
+        );
     },
 
     setReplyTarget(messageId) {
@@ -2706,6 +2807,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editConflict: null,
     editFailure: null,
     editSavedWithPendingChanges: false,
+    deleteFailedMessageIds: new Set(),
     replyTargetId: null,
     connection: "disconnected",
     everConnected: false,

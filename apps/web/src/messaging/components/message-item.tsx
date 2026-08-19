@@ -203,10 +203,14 @@ export interface MessageItemProps {
   editFailure?: string | null;
   editSavedWithPendingChanges?: boolean;
   editSaving?: boolean;
+  /** 編集欄を開いた回（editSession.openedToken）。行の再マウントで caret を奪わないための鍵。 */
+  editOpenedToken?: number | null;
   onEditDraftChange: (content: string) => void;
   onSubmitEdit: () => void;
   onCancelEdit: () => void;
   onReloadEditConflict: () => void;
+  /** このメッセージの削除要求が失敗した。送信失敗と同じく行に出す。 */
+  deleteFailed?: boolean;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -237,10 +241,12 @@ export const MessageItem = memo(function MessageItem({
   editFailure,
   editSavedWithPendingChanges,
   editSaving = false,
+  editOpenedToken = null,
   onEditDraftChange,
   onSubmitEdit,
   onCancelEdit,
   onReloadEditConflict,
+  deleteFailed = false,
 }: MessageItemProps) {
   // パレット類はportalで一覧の外に出る。その上でのホイールは一覧へ渡す。
   const passthroughRef = useWheelPassthrough<HTMLDivElement>();
@@ -420,6 +426,7 @@ export const MessageItem = memo(function MessageItem({
                 failure={editFailure}
                 savedWithPendingChanges={editSavedWithPendingChanges}
                 saving={editSaving}
+                openedToken={editOpenedToken}
                 onReloadConflict={onReloadEditConflict}
                 membersByKey={membersByKey}
                 selfKey={selfKey}
@@ -473,6 +480,21 @@ export const MessageItem = memo(function MessageItem({
                 className="rounded border border-rose-500/40 px-1.5 py-px font-medium hover:bg-rose-500/10"
               >
                 再送
+              </button>
+            </div>
+          ) : null}
+          {deleteFailed ? (
+            <div
+              role="alert"
+              className="mt-0.5 flex items-center gap-2 text-[11px] text-rose-500"
+            >
+              削除できませんでした
+              <button
+                type="button"
+                onClick={() => onDelete(message)}
+                className="rounded border border-rose-500/40 px-1.5 py-px font-medium hover:bg-rose-500/10"
+              >
+                もう一度
               </button>
             </div>
           ) : null}

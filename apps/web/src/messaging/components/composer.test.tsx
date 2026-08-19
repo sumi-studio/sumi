@@ -274,6 +274,26 @@ describe("Composer 送信ボタン", () => {
     expect(mocks.send).not.toHaveBeenCalled();
   });
 
+  it("空欄の↑は削除済みを飛ばして、本文の残る自分の直前の発言を編集する", () => {
+    const startEdit = vi.fn();
+    const older = { ...ownMessage("まだ残っている発言"), messageId: "m0" };
+    const tombstone: Message = {
+      ...ownMessage(""),
+      messageId: "m1",
+      seq: 2,
+      deleted: true,
+    };
+    useMessaging.setState({
+      messagesByPlace: { [placeKey]: [older, tombstone] },
+      startEdit,
+    });
+    render(<Composer />);
+
+    fireEvent.keyDown(composer(), { key: "ArrowUp" });
+
+    expect(startEdit).toHaveBeenCalledWith("m0");
+  });
+
   it("行内編集中でもcomposerは下書きの送信経路を保つ", () => {
     useMessaging.setState({
       editingMessageId: "m1",
