@@ -4,12 +4,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagingAPIError } from "./api-backend";
 import { MockMessagingServer } from "./mock-server";
 import type { Message } from "./model";
+import {
+  bindMessagingSessionIdentity,
+  installMessagingBackend,
+  useMessaging,
+} from "./store";
 
 const GENERAL = { kind: "channel", channelId: "ch-general" } as const;
 const DEV = { kind: "channel", channelId: "ch-dev" } as const;
 
 afterEach(() => {
   vi.useRealTimers();
+  bindMessagingSessionIdentity(null);
 });
 
 describe("MockMessagingServer admission", () => {
@@ -99,5 +105,44 @@ describe("MockMessagingServer admission", () => {
     );
 
     expect(dev).toMatchObject({ unreadCount: 6, mentionCount: 1 });
+  });
+
+  it("名乗りの書き換えは他のモックへ漏れない", async () => {
+    const server = new MockMessagingServer();
+    const saved = await server.updateProfile({
+      displayName: "余白",
+      tagline: "開発",
+    });
+    expect(saved).toMatchObject({ displayName: "余白", tagline: "開発" });
+
+    const own = await server.bootstrap();
+    expect(own.members[0]).toMatchObject({
+      displayName: "余白",
+      tagline: "開発",
+    });
+
+    // 後から作った別のモックは初期状態のまま。開発用の別sessionや別テストが
+    // 一方の保存に汚されない。
+    const fresh = await new MockMessagingServer().bootstrap();
+    expect(fresh.members[0]).toMatchObject({
+      displayName: "yohaku",
+      tagline: "Founder / デザイン",
+    });
+  });
+
+  it("保存した名乗りをrevision付きで画面のstoreへ反映する", async () => {
+    bindMessagingSessionIdentity("h-yohaku");
+    installMessagingBackend(new MockMessagingServer());
+    useMessaging.getState().init();
+    await vi.waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+
+    await useMessaging.getState().updateProfile({ displayName: "余白" });
+
+    expect(
+      useMessaging.getState().membersByKey["human:h-yohaku"],
+    ).toMatchObject({
+      displayName: "余白",
+      revision: 1,
+    });
   });
 });

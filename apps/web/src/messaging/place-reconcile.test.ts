@@ -46,6 +46,7 @@ function snapshot(options: {
   dms: DmSummary[];
   unread: Record<PlaceKey, { latest: number; unread: number; mention: number }>;
   lastRead?: Record<PlaceKey, number>;
+  members?: BootstrapSnapshot["members"];
 }): BootstrapSnapshot {
   const keys = Object.keys(options.unread) as PlaceKey[];
   return {
@@ -53,9 +54,9 @@ function snapshot(options: {
     workspaces: [{ workspaceId: "workspace-1", name: "Sumi" }],
     channels: options.channels,
     dms: options.dms,
-    members: [
-      { participant: SELF, displayName: "Yohaku", tagline: "" },
-      { participant: OTHER, displayName: "Aoi", tagline: "" },
+    members: options.members ?? [
+      { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
+      { participant: OTHER, displayName: "Aoi", tagline: "", revision: 1 },
     ],
     statuses: [],
     readMarkers: keys.map((key) => ({
@@ -147,6 +148,9 @@ class FakeBackend implements MessagingBackend {
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
   }
+  async updateProfile(): ReturnType<MessagingBackend["updateProfile"]> {
+    throw new Error("unused");
+  }
   async createReplyLater(): ReturnType<MessagingBackend["createReplyLater"]> {
     throw new Error("unused");
   }
@@ -223,9 +227,45 @@ describe("place lifecycleの再接続突き合わせ", () => {
 
   afterEach(() => bindMessagingSessionIdentity(null));
 
-  it("最初のconnectedではbootstrapを読み直さない", () => {
-    expect(backend.bootstrapCalls).toBe(1);
+  // bootstrapはsubscribeより前に読むので、その隙間に起きた変更はどのevent
+  // にも乗らない。初回のconnectedでも再接続と同じ読み直しを走らせる。
+  it("最初のconnectedでもbootstrapを読み直して隙間を閉じる", () => {
+    expect(backend.bootstrapCalls).toBe(2);
     expect(useMessaging.getState().ready).toBe(true);
+  });
+
+  it("bootstrapとsubscribeの隙間で変わった名乗りを初回接続で取り込む", async () => {
+    bindMessagingSessionIdentity(null);
+    bindMessagingSessionIdentity("human-a");
+    const gap = new FakeBackend(FIRST);
+    installMessagingBackend(gap);
+    useMessaging.getState().init();
+    await settle();
+    // ここまでがbootstrapの読取り。subscriberが登録される前に相手が名乗りを
+    // 変えると、そのprofile_updatedはこのクライアントには届かない。
+    gap.next = snapshot({
+      channels: [channel("channel-1", "旧トピック")],
+      dms: [],
+      unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
+      members: [
+        { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
+        {
+          participant: OTHER,
+          displayName: "葵",
+          tagline: "デザイン",
+          revision: 2,
+        },
+      ],
+    });
+    gap.emitConnection("connected");
+    await settle();
+
+    expect(useMessaging.getState().membersByKey["human:human-b"]).toMatchObject(
+      {
+        displayName: "葵",
+        tagline: "デザイン",
+      },
+    );
   });
 
   it("切断中に作られたplaceとtopic編集を再接続で取り込む", async () => {
@@ -249,7 +289,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     await settle();
 
     const state = useMessaging.getState();
-    expect(backend.bootstrapCalls).toBe(2);
+    expect(backend.bootstrapCalls).toBe(3);
     expect(state.channels.map((entry) => entry.channelId)).toEqual([
       "channel-1",
       "channel-2",
@@ -330,7 +370,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     await settle();
 
     const state = useMessaging.getState();
-    expect(backend.bootstrapCalls).toBe(2);
+    expect(backend.bootstrapCalls).toBe(3);
     expect(state.channels.map((entry) => entry.channelId)).toEqual([
       "channel-1",
     ]);

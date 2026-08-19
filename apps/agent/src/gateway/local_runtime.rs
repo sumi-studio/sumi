@@ -50,7 +50,8 @@ use crate::apiclient::apps::{
 use crate::apiclient::messaging::{
     CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
     MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
-    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    MessagingProfileRequest, MessagingWriteReceipt, OpenMessagingAttachmentMetadata,
+    OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
     UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
@@ -965,6 +966,18 @@ impl MessagingApi for LocalControlHttpClient {
     ) -> Result<serde_json::Value> {
         self.post_json(
             "/local-control/v1/messaging:status",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn profile(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingProfileRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:profile",
             &ScopedMessagingRequest::new(scope, request),
         )
         .await

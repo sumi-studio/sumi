@@ -178,6 +178,19 @@ export interface MemberProfile {
   participant: ParticipantRef;
   displayName: string;
   tagline: string;
+  /** Monotonic server revision used to discard stale profile projections. */
+  revision?: number;
+  /**
+   * 顔写真のbytes取得URL。まだ誰も出していない段階では常にundefinedで、
+   * 受け手はイニシャルへ落ちる。読み込みに失敗したときも同じ落とし方をする。
+   */
+  avatarUrl?: string;
+}
+
+/** 自分の名乗りの部分更新。省いたfieldはサーバー側でそのまま残る。 */
+export interface ProfileInput {
+  displayName?: string;
+  tagline?: string;
 }
 
 export type StatusKind = "available" | "busy" | "away";
@@ -265,6 +278,11 @@ export type ServerEvent =
   | { type: "message_deleted"; message: Message }
   | { type: "typing"; place: Place; participant: ParticipantRef }
   | { type: "status_updated"; status: ParticipantStatus }
+  /**
+   * 名乗りの変更。statusと同じ参加者スコープで届くが、statusと違って正本は
+   * durableなので、取りこぼしはbootstrapの再読み込みで直る。
+   */
+  | { type: "profile_updated"; profile: MemberProfile }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   /**
@@ -409,6 +427,12 @@ export interface MessagingBackend {
    * 収束できるよう、呼び出し側はこの戻り値を状態に反映する。
    */
   setStatus(status: StatusKind, note: string): Promise<ParticipantStatus>;
+  /**
+   * 自分の名乗りを置き換える。対象は認証されたsession本人で、bodyに参加者を
+   * 載せる余地はない（statusと同じ自己申告の規則）。返すのはサーバーが
+   * 正規化した確定値。
+   */
+  updateProfile(input: ProfileInput): Promise<MemberProfile>;
   createReplyLater(
     place: Place,
     messageId: string,

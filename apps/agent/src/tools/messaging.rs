@@ -24,8 +24,8 @@ use crate::{
     apiclient::messaging::{
         CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
         MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
-        OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
-        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        MessagingProfileRequest, OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse,
+        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
         ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
         UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
     },
@@ -44,7 +44,7 @@ use crate::{
 
 const TOOL_NAME: &str = "messaging";
 const BINDING_ADAPTER_ID: &str = "sumi.messaging";
-const BINDING_ADAPTER_VERSION: u32 = 3;
+const BINDING_ADAPTER_VERSION: u32 = 4;
 const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const ATTACHMENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-attachment-upload-v1";
 const SOURCE_EXECUTION_ID_DOMAIN: &[u8] = b"sumi-messaging-source-execution-v1";
@@ -60,6 +60,9 @@ const MAX_EMOJI_BYTES: usize = 128;
 // character ASCII note is well under any byte budget and still a 400.
 const MAX_STATUS_NOTE_CHARS: usize = 200;
 const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
+// Comfortably above the server's 80-rune name and 100-character tagline in any
+// script, so this transport bound never pre-empts the server's own decision.
+const MAX_PROFILE_FIELD_BYTES: usize = 1024;
 const DEFAULT_OPEN_LIMIT: usize = 20;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
@@ -123,6 +126,15 @@ enum MessagingAction {
         #[serde(default)]
         expires_in_minutes: Option<u32>,
     },
+    /// Read or change one's own 名乗り — the display name others see and the
+    /// one line under it.  Like status it is about the person, not a place.
+    /// Naming neither field reads; a named field changes only itself.
+    Profile {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        tagline: Option<String>,
+    },
     /// Promise a later reply to a message visible in the open place.
     ReplyLater {
         #[serde(default)]
@@ -182,6 +194,12 @@ enum BoundMessagingAction {
         note: Option<String>,
         #[serde(default)]
         expires_in_minutes: Option<u32>,
+    },
+    Profile {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        tagline: Option<String>,
     },
     ReplyLater {
         place_id: String,
@@ -561,10 +579,11 @@ fn messaging_parameters_schema() -> Value {
             "open page; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
-            "status and may include note or expires_in_minutes; resolve_reply_later requires ",
+            "status and may include note or expires_in_minutes; profile takes display_name, ",
+            "tagline, both, or neither; resolve_reply_later requires ",
             "marker_id; get_call_state may include place_id. Write, react and reply_later act ",
-            "on the place most recently opened in this tool view; status and get_call_state ",
-            "need no open place; resolve_reply_later needs a marker ",
+            "on the place most recently opened in this tool view; status, profile and ",
+            "get_call_state need no open place; resolve_reply_later needs a marker ",
             "already shown or returned in this tool view, but not its place open."
         ),
         "properties": {
@@ -576,7 +595,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "open_attachment", "react",
-                    "status", "reply_later", "resolve_reply_later", "get_call_state"
+                    "status", "profile", "reply_later", "resolve_reply_later", "get_call_state"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -585,7 +604,8 @@ fn messaging_parameters_schema() -> Value {
                     "visible there; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
-                    "own availability; resolve_reply_later marks one of your promises as kept; ",
+                    "own availability; profile reads or changes your own display name and ",
+                    "tagline; resolve_reply_later marks one of your promises as kept; ",
                     "get_call_state reports who is currently in calls you can see."
                 )
             },
@@ -658,6 +678,26 @@ fn messaging_parameters_schema() -> Value {
                     "which you declare; nothing about you is published automatically."
                 )
             },
+            "display_name": {
+                "type": "string",
+                "maxLength": 80,
+                "description": concat!(
+                    "Optional for profile and omitted for other actions. The name others see ",
+                    "for you everywhere in the workspace. Omit it to leave the current name ",
+                    "unchanged; the server, which owns the registry of names, decides whether ",
+                    "a given name is usable."
+                )
+            },
+            "tagline": {
+                "type": "string",
+                "maxLength": 100,
+                "description": concat!(
+                    "Optional for profile and omitted for other actions. One line about what ",
+                    "you do, shown under your name. Omit it to leave the current tagline ",
+                    "unchanged; an empty string clears it. A profile action naming neither ",
+                    "field simply reads your current profile."
+                )
+            },
             "note": {
                 "type": "string",
                 "maxLength": 500,
@@ -710,7 +750,8 @@ impl Tool for MessagingTool {
                 "available places, or open an explicitly known place to see its timeline, ",
                 "members and unread state. Then write in that currently open place, or ",
                 "react or promise a later reply to a ",
-                "message visible in it. Declare your own availability with status. ",
+                "message visible in it. Declare your own availability with status and your ",
+                "own name and tagline with profile. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare. ",
                 "A message may carry attachments; each one reports filename, mime, ",
@@ -951,6 +992,50 @@ impl BoundToolAdapter for MessagingTool {
                     &scope,
                     "status",
                     CapabilityClass::Mutate,
+                    vec![ResourceScope::resource("messaging", "participant", "self")],
+                    review_projection,
+                    arguments,
+                )
+            }
+            MessagingAction::Profile {
+                display_name,
+                tagline,
+            } => {
+                // Naming nothing is a read of one's own 名乗り; naming a field
+                // changes that field alone. The reviewer sees which of the two
+                // this is rather than having to infer it from the payload.
+                let changes = display_name.is_some() || tagline.is_some();
+                let mut review_projection = object([
+                    ("action", Value::String("profile".to_owned())),
+                    ("changes", Value::Bool(changes)),
+                ]);
+                if let Some(display_name) = &display_name {
+                    review_projection
+                        .insert("display_name".to_owned(), Value::String(display_name.clone()));
+                    review_projection.insert(
+                        "display_name_characters".to_owned(),
+                        Value::from(display_name.chars().count() as u64),
+                    );
+                }
+                if let Some(tagline) = &tagline {
+                    review_projection.insert("tagline".to_owned(), Value::String(tagline.clone()));
+                    review_projection.insert(
+                        "tagline_characters".to_owned(),
+                        Value::from(tagline.chars().count() as u64),
+                    );
+                }
+                let mut arguments =
+                    object([("action", Value::String("profile".to_owned()))]);
+                insert_optional_string(&mut arguments, "display_name", display_name);
+                insert_optional_string(&mut arguments, "tagline", tagline);
+                messaging_binding(
+                    &scope,
+                    "profile",
+                    if changes {
+                        CapabilityClass::Mutate
+                    } else {
+                        CapabilityClass::Read
+                    },
                     vec![ResourceScope::resource("messaging", "participant", "self")],
                     review_projection,
                     arguments,
@@ -1348,6 +1433,17 @@ impl MessagingTool {
                     status: status_text(status),
                     note: note.as_deref(),
                     expires_in_minutes,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            BoundMessagingAction::Profile {
+                display_name,
+                tagline,
+            } => tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.profile(scope, MessagingProfileRequest {
+                    display_name: display_name.as_deref(),
+                    tagline: tagline.as_deref(),
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
@@ -1782,6 +1878,13 @@ fn resolve_raw_action(
             note,
             expires_in_minutes,
         }),
+        MessagingAction::Profile {
+            display_name,
+            tagline,
+        } => Ok(BoundMessagingAction::Profile {
+            display_name,
+            tagline,
+        }),
         MessagingAction::ReplyLater {
             message_id,
             seq,
@@ -1964,6 +2067,13 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             validate_optional_note(note, MAX_STATUS_NOTE_CHARS)?;
             validate_relative_minutes(expires_in_minutes)
         }
+        MessagingAction::Profile {
+            display_name,
+            tagline,
+        } => {
+            validate_profile_field(display_name)?;
+            validate_profile_field(tagline)
+        }
         MessagingAction::ReplyLater {
             message_id,
             seq,
@@ -2079,6 +2189,13 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
             note: note.clone(),
             expires_in_minutes: *expires_in_minutes,
         }),
+        BoundMessagingAction::Profile {
+            display_name,
+            tagline,
+        } => validate_action(&MessagingAction::Profile {
+            display_name: display_name.clone(),
+            tagline: tagline.clone(),
+        }),
         BoundMessagingAction::ReplyLater {
             place_id,
             message_id,
@@ -2119,6 +2236,21 @@ fn validate_visible_selector(
     if message_id
         .as_deref()
         .is_some_and(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_err())
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// What a name and a tagline may be is decided in exactly one place — the
+/// server's ScopedStore.SetProfile, which both the human settings screen and
+/// this tool reach. The schema states those bounds to the model; this check
+/// only keeps an unusable payload off the transport and deliberately does not
+/// re-decide the rule, so the two lanes cannot drift apart.
+fn validate_profile_field(value: &Option<String>) -> Result<(), ToolError> {
+    if value
+        .as_deref()
+        .is_some_and(|value| value.len() > MAX_PROFILE_FIELD_BYTES || value.contains('\0'))
     {
         return Err(ToolError::InvalidArguments);
     }
@@ -2739,6 +2871,9 @@ mod tests {
     }
 
     type RecordedStatus = (String, Option<String>, Option<u32>);
+    /// (display_name, tagline) exactly as the tool handed them to the transport:
+    /// None means "leave this alone", which is what the server preserves.
+    type RecordedProfile = (Option<String>, Option<String>);
     type RecordedReplyLater = (String, String, Option<String>, Option<u32>);
     type RecordedWrite = (String, String, String, Vec<String>);
 
@@ -2904,6 +3039,7 @@ mod tests {
         open_attachment_response: AsyncMutex<Option<(OpenMessagingAttachmentMetadata, Vec<u8>)>>,
         reacts: AsyncMutex<Vec<(String, String, String)>>,
         statuses: AsyncMutex<Vec<RecordedStatus>>,
+        profiles: AsyncMutex<Vec<RecordedProfile>>,
         promises: AsyncMutex<Vec<RecordedReplyLater>>,
         resolutions: AsyncMutex<Vec<String>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
@@ -3169,6 +3305,29 @@ mod tests {
                 request.expires_in_minutes,
             ));
             Ok(json!({"status": {"status": request.status, "note": request.note.unwrap_or("")}}))
+        }
+
+        async fn profile(
+            &self,
+            scope: &ExactMessagingScope,
+            request: MessagingProfileRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls.lock().await.push(format!(
+                "profile:{}:{}",
+                request.display_name.unwrap_or("-"),
+                request.tagline.unwrap_or("-")
+            ));
+            self.profiles.lock().await.push((
+                request.display_name.map(str::to_owned),
+                request.tagline.map(str::to_owned),
+            ));
+            Ok(json!({"profile": {
+                "participant": {"kind": "personality_agent",
+                                "personality_agent_id": "01900000-0000-7000-8000-0000000000aa"},
+                "display_name": request.display_name.unwrap_or("Kuro"),
+                "tagline": request.tagline.unwrap_or(""),
+            }}))
         }
 
         async fn reply_later(
@@ -3693,6 +3852,7 @@ mod tests {
                 "open_attachment",
                 "react",
                 "status",
+                "profile",
                 "reply_later",
                 "resolve_reply_later",
                 "get_call_state"
@@ -3731,6 +3891,7 @@ mod tests {
                 "attachments",
                 "before_seq",
                 "content",
+                "display_name",
                 "emoji",
                 "expires_in_minutes",
                 "limit",
@@ -3742,6 +3903,7 @@ mod tests {
                 "reply_to",
                 "seq",
                 "status",
+                "tagline",
                 "urgency",
                 "workspace_id",
             ])
@@ -4596,6 +4758,48 @@ mod tests {
             }))
         );
 
+        // 名乗り: naming a field is a change to oneself; naming none is a read.
+        // The reviewer sees which of the two it is without decoding the payload.
+        let profile = bind_action(
+            &registry,
+            "profile",
+            json!({"action": "profile", "tagline": "調べもの"}),
+        )
+        .await
+        .expect("bind profile");
+        assert_eq!(profile.descriptor.operation, "profile");
+        assert_eq!(profile.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(profile.review_projection.as_object()["changes"], true);
+        assert_eq!(profile.review_projection.as_object()["tagline"], "調べもの");
+        assert_eq!(
+            profile.review_projection.as_object()["tagline_characters"],
+            4
+        );
+        assert!(
+            !profile
+                .review_projection
+                .as_object()
+                .contains_key("display_name")
+        );
+        assert_eq!(
+            profile.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "participant",
+                "self",
+            )])
+        );
+        assert_eq!(
+            Value::Object(profile.execution_arguments.as_object().clone()),
+            scoped_execution(json!({"action": "profile", "tagline": "調べもの"}))
+        );
+
+        let profile_read = bind_action(&registry, "profile-read", json!({"action": "profile"}))
+            .await
+            .expect("bind profile read");
+        assert_eq!(profile_read.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(profile_read.review_projection.as_object()["changes"], false);
+
         let reply_later = bind_action(
             &registry,
             "reply-later",
@@ -5307,7 +5511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_and_bound_paths_share_one_exact_executor_for_all_eight_actions() {
+    async fn raw_and_bound_paths_share_one_exact_executor_for_all_nine_actions() {
         let cases = [
             ("overview", json!({"action": "overview"})),
             (
@@ -5337,6 +5541,10 @@ mod tests {
                     "note": "deep work",
                     "expires_in_minutes": 30
                 }),
+            ),
+            (
+                "profile",
+                json!({"action": "profile", "display_name": "クロ", "tagline": "調べもの"}),
             ),
             (
                 "reply-later",
@@ -6301,6 +6509,58 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.statuses.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_names_oneself_and_leaves_the_unnamed_field_alone() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // 名乗り is about the person, so like status it needs no place in view.
+        execute(
+            &tool,
+            json!({"action": "profile", "display_name": "クロ", "tagline": "調べもの"}),
+            "profile",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.profiles.lock().await.as_slice(),
+            &[(Some("クロ".to_owned()), Some("調べもの".to_owned()))]
+        );
+
+        // An unnamed field stays off the wire, so the server preserves it
+        // instead of receiving a null it would have to interpret.
+        execute(
+            &tool,
+            json!({"action": "profile", "tagline": "散歩中"}),
+            "profile-2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.profiles.lock().await[1],
+            (None, Some("散歩中".to_owned()))
+        );
+
+        // Naming neither field reads the current 名乗り rather than clearing it.
+        execute(&tool, json!({"action": "profile"}), "profile-3")
+            .await
+            .unwrap();
+        assert_eq!(api.profiles.lock().await[2], (None, None));
+
+        // Whether a name or a tagline is usable is decided in one place, on the
+        // server. Only a payload this transport cannot carry is stopped here.
+        for arguments in [
+            json!({"action": "profile", "tagline": "a\u{0000}b"}),
+            json!({"action": "profile", "display_name": "あ".repeat(MAX_PROFILE_FIELD_BYTES)}),
+        ] {
+            let error = execute(&tool, arguments, "invalid-profile")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.profiles.lock().await.len(), 3);
     }
 
     /// The server counts characters. Checking bytes here would both reject

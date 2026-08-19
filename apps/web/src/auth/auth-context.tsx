@@ -13,6 +13,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -22,6 +23,7 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import { applyConfirmedMessagingProfile } from "../messaging/store";
 import {
   clearPendingConfirmation,
   loadPendingConfirmation,
@@ -55,6 +57,7 @@ import {
 } from "./email-link-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
+import { seedSelfProfileFromSession, useSelfProfile } from "./self-profile";
 import {
   AuthAPIError,
   canonicalizeSumiDisplayName,
@@ -740,7 +743,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           throw new AuthAPIError("Authentication is unavailable.", 401);
         }
         const requestedDisplayName = canonicalizeSumiDisplayName(displayName);
-        let updatedUser: { id: string; displayName: string };
+        let updatedUser: Awaited<ReturnType<typeof updateSumiProfile>>;
         try {
           updatedUser = await updateSumiProfile(requestedDisplayName);
         } catch (error) {
@@ -814,6 +817,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (updatedUser.id !== current.user.id) {
           throw new AuthAPIError("Profile identity changed.", 409);
         }
+        // `/auth/profile` is a confirmed profile arrival, just like a
+        // Messaging save ACK, live profile_updated frame, or bootstrap.
+        // Project it through the shared revision gate before exposing it.
+        applyConfirmedMessagingProfile(updatedUser.profile);
         const nextSession: SumiSessionStatus = {
           ...current,
           user: updatedUser,
@@ -866,6 +873,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
 
+  const selfProfilesByKey = useSelfProfile((state) => state.profilesByKey);
+
+  // The auth response supplies only the initial presentation value. The
+  // application-level self projection survives Messaging scope replacement and
+  // is later overwritten only by a revisioned confirmed profile.
+  useLayoutEffect(() => {
+    seedSelfProfileFromSession(
+      session.authenticated ? session.user.id : null,
+      session.authenticated ? session.user.displayName : null,
+    );
+  }, [session]);
+
   const user = useMemo<AuthUser | null>(() => {
     if (sessionState === "preissued" && preissuedUserID) {
       return {
@@ -878,13 +897,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!session.authenticated) {
       return null;
     }
+    const profileDisplayName =
+      selfProfilesByKey[`human:${session.user.id}`]?.displayName ?? null;
     return {
       id: session.user.id,
-      displayName: session.user.displayName,
+      displayName: profileDisplayName,
       email: null,
       photoURL: null,
     };
-  }, [session, sessionState]);
+  }, [selfProfilesByKey, session, sessionState]);
 
   const authorityBindingId =
     sessionState === "authenticated" && session.authenticated

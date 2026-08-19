@@ -96,7 +96,19 @@ type MemberProfile struct {
 	DisplayName             string
 	SecretaryForDisplayName string
 	Role                    string // workspace role; empty for dm/group_dm members
+	// Tagline is the one line the participant said about what they do. It
+	// belongs to the Participant, not to a Workspace membership: 人格・本人性は
+	// Workspace をまたいで続くので、肩書きが Workspace ごとに要るようになっても
+	// global tagline を上書きせず membership 側に別に持たせる。
+	Tagline string
+	// Revision is assigned by participant_profiles on every profile update.
+	// Receivers use it to reject an older live event or bootstrap snapshot.
+	Revision int64
 }
+
+// ParticipantProfile is the public name for the canonical participant profile
+// returned by shared write boundaries used outside the messaging package.
+type ParticipantProfile = MemberProfile
 
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple
 // Secretaries canonically named Sumi. The composite is presentation only: the

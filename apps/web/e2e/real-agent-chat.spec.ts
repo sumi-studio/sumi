@@ -550,7 +550,7 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     const messagingReviewerWire = JSON.stringify(
       stack.executionReviewRequests[1],
     );
-    expect(messagingReviewerWire).toContain("messaging_v3");
+    expect(messagingReviewerWire).toContain("messaging_v4");
     expect(messagingReviewerWire).toContain("write");
     expect(messagingReviewerWire).toContain("foundation_workspace");
     for (const forbidden of [

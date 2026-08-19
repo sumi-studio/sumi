@@ -13,7 +13,8 @@ import (
 // replayed because reconnecting clients re-read the durable places table via
 // bootstrap. Volatile events (typing, status_updated) are never replayed.
 // Place events scope delivery by PlaceID; participant-scoped events
-// (status_updated) leave PlaceID empty and set Subject instead.
+// (status_updated, profile_updated) leave PlaceID empty and set Subject
+// instead.
 type Event struct {
 	Type     string              `json:"type"`
 	PlaceID  string              `json:"place_id,omitempty"`
@@ -23,6 +24,7 @@ type Event struct {
 	Channel  *channelWire        `json:"channel,omitempty"`
 	DM       *dmWire             `json:"dm,omitempty"`
 	Status   *statusWire         `json:"status,omitempty"`
+	Profile  *memberWire         `json:"profile,omitempty"`
 	Marker   *replyLaterWire     `json:"marker,omitempty"`
 	Call     *callStateWire      `json:"call,omitempty"`
 	// Notify rides only on the copy addressed to a recipient the server decided
@@ -72,6 +74,7 @@ const (
 	EventReactionUpdated    = "reaction_updated"
 	EventTyping             = "typing"
 	EventStatusUpdated      = "status_updated"
+	EventProfileUpdated     = "profile_updated"
 	EventReplyLaterCreated  = "reply_later_created"
 	EventReplyLaterResolved = "reply_later_resolved"
 	EventPlaceCreated       = "place_created"

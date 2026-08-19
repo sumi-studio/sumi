@@ -142,6 +142,9 @@ class StubBackend implements MessagingBackend {
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
   }
+  async updateProfile(): ReturnType<MessagingBackend["updateProfile"]> {
+    throw new Error("unused");
+  }
   async createReplyLater(): ReturnType<MessagingBackend["createReplyLater"]> {
     throw new Error("unused");
   }

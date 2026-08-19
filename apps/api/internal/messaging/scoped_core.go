@@ -393,7 +393,9 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 	}
 	rows, err := q.Query(ctx, `
 		SELECT wm.member_kind, wm.member_id,
-		       COALESCE(h.display_name, a.display_name, '') AS display_name
+		       COALESCE(h.display_name, a.display_name, '') AS display_name,
+		       COALESCE(pp.tagline, '') AS tagline,
+		       COALESCE(pp.revision, 0) AS revision
 		FROM workspace_members wm
 		-- Bound to the exact place: without pm.place_id the join multiplies a
 		-- member by every other place they are in, which for a channel (whose
@@ -406,6 +408,10 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 		LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
 		LEFT JOIN agents a ON wm.member_kind = 'personality_agent'
 		                  AND a.personality_agent_id = wm.member_id
+		-- The profile is Participant-global, so it joins on the participant
+		-- identity alone: the same tagline follows the member into every place.
+		LEFT JOIN participant_profiles pp ON pp.member_kind = wm.member_kind
+		                                AND pp.member_id = wm.member_id
 		WHERE `+condition+`
 		ORDER BY wm.workspace_member_id`, args...)
 	if err != nil {
@@ -415,7 +421,8 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 	var members []MemberProfile
 	for rows.Next() {
 		var member MemberProfile
-		if err := rows.Scan(&member.Participant.Kind, &member.Participant.ID, &member.DisplayName); err != nil {
+		if err := rows.Scan(&member.Participant.Kind, &member.Participant.ID,
+			&member.DisplayName, &member.Tagline, &member.Revision); err != nil {
 			return nil, fmt.Errorf("scan scoped active member: %w", err)
 		}
 		members = append(members, member)

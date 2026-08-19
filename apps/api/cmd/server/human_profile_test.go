@@ -14,6 +14,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -65,8 +66,8 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
-	request := profileRequest(`{"display_name":"  かずい\nさん  "}`)
+	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
+	request := profileRequest(`{"display_name":"  かずい さん  "}`)
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, request)
 	if response.Code != http.StatusOK {
@@ -80,12 +81,24 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
 		} `json:"user"`
+		Profile struct {
+			Participant struct {
+				Kind    string `json:"kind"`
+				HumanID string `json:"human_id"`
+			} `json:"participant"`
+			DisplayName string `json:"display_name"`
+			Tagline     string `json:"tagline"`
+			Revision    int64  `json:"revision"`
+		} `json:"profile"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
 	if result.User.ID != profileTestHumanID || result.User.DisplayName != "かずい さん" || sessions.operationRun != 1 {
 		t.Fatalf("result=%+v operationRun=%d", result, sessions.operationRun)
+	}
+	if result.Profile.Participant.Kind != "human" || result.Profile.Participant.HumanID != profileTestHumanID || result.Profile.DisplayName != "かずい さん" || result.Profile.Tagline != "" || result.Profile.Revision != 1 {
+		t.Fatalf("profile=%+v", result.Profile)
 	}
 	var stored string
 	var customized bool
@@ -94,6 +107,15 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 	}
 	if stored != "かずい さん" || !customized {
 		t.Fatalf("stored name=%q customized=%v", stored, customized)
+	}
+	var revision int64
+	if err := pool.QueryRow(ctx, `
+		SELECT revision FROM participant_profiles
+		WHERE member_kind = 'human' AND member_id = $1`, profileTestHumanID).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 {
+		t.Fatalf("profile revision = %d, want 1", revision)
 	}
 
 	// A client-nominated identity is never accepted; the signed session is the
@@ -110,7 +132,7 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(koseki.New(nil), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(messaging.NewServer(messaging.New(nil, nil, nil), nil), sessions, []string{testBrowserOrigin})
 	tests := []struct {
 		name string
 		req  func() *http.Request
@@ -133,6 +155,7 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 		}, want: http.StatusUnsupportedMediaType},
 		{name: "duplicate key", req: func() *http.Request { return profileRequest(`{"display_name":"A","display_name":"B"}`) }, want: http.StatusBadRequest},
 		{name: "control", req: func() *http.Request { return profileRequest(`{"display_name":"safe\u202edanger"}`) }, want: http.StatusBadRequest},
+		{name: "line break", req: func() *http.Request { return profileRequest(`{"display_name":"かずい\nさん"}`) }, want: http.StatusBadRequest},
 		{name: "overlong", req: func() *http.Request {
 			return profileRequest(`{"display_name":"` + strings.Repeat("名", koseki.MaxHumanDisplayNameRunes+1) + `"}`)
 		}, want: http.StatusBadRequest},
@@ -170,7 +193,7 @@ func TestHumanProfileDatabaseFailureIsUnavailable(t *testing.T) {
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, profileRequest(`{"display_name":"Human"}`))
 	if response.Code != http.StatusServiceUnavailable {

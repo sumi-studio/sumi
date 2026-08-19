@@ -275,6 +275,20 @@ pub(crate) struct SetMessagingStatusRequest<'a> {
     pub expires_in_minutes: Option<u32>,
 }
 
+/// Declaring one's own 名乗り: the display name others see and the one line
+/// under it.  As with status there is no field for whose profile it is — the
+/// transport's credential decides — and an absent field is preserved rather
+/// than cleared, so naming only a tagline cannot silently drop the name.
+/// Naming neither field reads the current profile without changing it.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingProfileRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tagline: Option<&'a str>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateMessagingReplyLaterRequest<'a> {
@@ -348,6 +362,12 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         &self,
         scope: &ExactMessagingScope,
         request: SetMessagingStatusRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn profile(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingProfileRequest<'_>,
     ) -> Result<Value>;
 
     async fn reply_later(

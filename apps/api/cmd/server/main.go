@@ -361,9 +361,6 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	if authEnabled {
 		authServer.RegisterRoutes(mux)
-		if database != nil {
-			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
-		}
 	}
 	// The /messaging surface requires the control-plane database. Without a
 	// session verifier the routes stay mounted but fail closed (401), matching
@@ -395,6 +392,9 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
 		messagingServer.RegisterRoutes(mux)
+		if authEnabled {
+			newHumanProfileServer(messagingServer, sv, browserOrigins).RegisterRoutes(mux)
+		}
 		livekit, callsEnabled, configErr := liveKitConfigFromEnv()
 		if configErr != nil {
 			closeOnError()

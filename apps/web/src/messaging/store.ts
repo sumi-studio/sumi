@@ -1,4 +1,8 @@
 import { create } from "zustand";
+import {
+  applyConfirmedSelfProfile,
+  seedSelfProfileFromSession,
+} from "../auth/self-profile";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
 import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
@@ -24,6 +28,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ProfileInput,
   ReactionSummary,
   ReplyLaterMarker,
   ServerEvent,
@@ -81,6 +86,84 @@ const UNBOUND_CAPABILITIES: MessagingCapabilities = {
   reactions: false,
   notifications: false,
 };
+
+const profileRevision = (profile: MemberProfile): number =>
+  profile.revision ?? 0;
+
+/** profileを更新する唯一の書き込み口。revisionが同じか古ければ残す。 */
+function applyProfile(
+  membersByKey: Record<ParticipantKey, MemberProfile>,
+  profile: MemberProfile,
+  allowUnknown = true,
+): Record<ParticipantKey, MemberProfile> {
+  const key = participantKey(profile.participant);
+  const current = membersByKey[key];
+  if (!current && !allowUnknown) return membersByKey;
+  if (current && profileRevision(profile) <= profileRevision(current)) {
+    return membersByKey;
+  }
+  return { ...membersByKey, [key]: profile };
+}
+
+/**
+ * サーバーが確定したprofileを一つの規則で投影する。
+ *
+ * profile_updatedとREST ACKは既知のmembershipだけを更新する。一方bootstrap
+ * snapshotはmembershipの全体像なので、snapshotにあるprofileだけで一覧を作り
+ * 直す。ただし、どちらもrevisionが新しい確定値だけを採用する。
+ */
+function applyConfirmedProfiles(
+  current: Record<ParticipantKey, MemberProfile>,
+  profiles: readonly MemberProfile[],
+  options: {
+    knownOnly?: boolean;
+    snapshot?: boolean;
+    selfKey?: ParticipantKey;
+  } = {},
+): Record<ParticipantKey, MemberProfile> {
+  const projected = profiles.map((profile) => {
+    if (participantKey(profile.participant) !== options.selfKey) return profile;
+    // The self profile is participant-global. Messaging only takes a scoped
+    // copy of the independently maintained projection.
+    return applyConfirmedSelfProfile(profile);
+  });
+  if (!options.snapshot) {
+    let next = current;
+    for (const profile of projected) {
+      next = applyProfile(next, profile, !options.knownOnly);
+    }
+    return next;
+  }
+
+  let merged: Record<ParticipantKey, MemberProfile> = {};
+  for (const profile of projected) {
+    const currentProfile = current[participantKey(profile.participant)];
+    const winner =
+      currentProfile &&
+      profileRevision(currentProfile) >= profileRevision(profile)
+        ? currentProfile
+        : profile;
+    merged = applyProfile(merged, winner);
+  }
+  return merged;
+}
+
+/**
+ * Projects a confirmed profile received outside a bound Messaging scope.
+ * Account settings uses this for the `/auth/profile` save ACK: the profile is
+ * still participant-global, even while no Workspace transport is active.
+ */
+export function applyConfirmedMessagingProfile(profile: MemberProfile): void {
+  useMessaging.setState((current) => {
+    const selfKey = current.selfKey || participantKey(profile.participant);
+    return {
+      membersByKey: applyConfirmedProfiles(current.membersByKey, [profile], {
+        knownOnly: true,
+        selfKey,
+      }),
+    };
+  });
+}
 
 function unboundMessagingBackend(): MessagingBackend {
   const target = {
@@ -239,6 +322,11 @@ interface MessagingState {
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
   setStatus(status: StatusKind, note: string): void;
+  /**
+   * 自分の名乗りを置き換える。サーバーが正規化した確定値をそのまま取り込むので、
+   * 失敗した保存が手元にだけ残ることはない。
+   */
+  updateProfile(input: ProfileInput): Promise<MemberProfile>;
   setPlaceNotificationLevel(
     key: PlaceKey,
     level: NotificationLevel,
@@ -538,6 +626,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         },
       };
+    });
+  };
+
+  /**
+   * 名乗りの確定値を一覧へ取り込む。REST ACK・WS event・bootstrap・再接続
+   * snapshot・明示refreshはapplyConfirmedProfilesだけを通るので、到着順が
+   * commit順と異なっても古い値に戻らない。認証側の表示名もこのself profile
+   * から導出されるため、ここが更新されれば同じ確定値へ追従する。
+   */
+  const applyProfileEvent = (profile: MemberProfile) => {
+    set((state) => {
+      const membersByKey = applyConfirmedProfiles(
+        state.membersByKey,
+        [profile],
+        { knownOnly: true, selfKey: state.selfKey },
+      );
+      return membersByKey === state.membersByKey ? {} : { membersByKey };
     });
   };
 
@@ -942,6 +1047,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       applyPresenceProjection({ type: "status", status: event.status });
       return;
     }
+    if (event.type === "profile_updated") {
+      applyProfileEvent(event.profile);
+      return;
+    }
     if (event.type === "reply_later_created") {
       applyPresenceProjection({ type: "reply_later", marker: event.marker });
       return;
@@ -1017,10 +1126,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
         placeKey({ kind: entry.kind, dmId: entry.dmId }),
       ),
     ]);
-    const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-    for (const member of snapshot.members) {
-      membersByKey[participantKey(member.participant)] = member;
-    }
+    const membersByKey = applyConfirmedProfiles(
+      state.membersByKey,
+      snapshot.members,
+      { snapshot: true, selfKey: state.selfKey },
+    );
     const lastReadByPlace = { ...state.lastReadByPlace };
     for (const marker of snapshot.readMarkers) {
       const key = placeKey(marker.place);
@@ -1361,10 +1471,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend
         .bootstrap()
         .then((snapshot) => {
-          const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-          for (const member of snapshot.members) {
-            membersByKey[participantKey(member.participant)] = member;
-          }
+          const membersByKey = applyConfirmedProfiles(
+            get().membersByKey,
+            snapshot.members,
+            { snapshot: true, selfKey: participantKey(snapshot.self) },
+          );
           const statusByKey = applyStatuses(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
           for (const marker of snapshot.readMarkers) {
@@ -1407,10 +1518,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           });
           scheduleStatusExpiry();
           backend.subscribe(applyEvent, { sinceByPlace });
-          // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
-          // 再接続なので、replayされないplace lifecycleを読み直す。presenceは
-          // bootstrap-to-subscribe gapも閉じるため初回を含む毎回で取り直す。
-          let connectedOnce = false;
+          // 上のbootstrapはsubscribeより前に読んでいるので、その間に起きた変更は
+          // どのeventにも乗らない。再接続と同じ読み直しを初回のconnectedでも走ら
+          // せてこの隙間を閉じる。places・members（名乗りを含む）・presenceは
+          // どれもreplayされないsnapshotなので、扱いを揃える。
           backend.subscribeConnection((connection) => {
             set((state) => ({
               connection,
@@ -1418,11 +1529,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             }));
             if (connection !== "connected") return;
             void useCall.getState().hydrate();
-            if (connectedOnce) {
-              void reconcilePlaces().catch(() => undefined);
-            } else {
-              connectedOnce = true;
-            }
+            void reconcilePlaces().catch(() => undefined);
             void resyncPresence().catch(() => undefined);
           });
         })
@@ -1851,6 +1958,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
+    async updateProfile(input) {
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      const canonical = await currentBackend.updateProfile(input);
+      if (
+        backend !== currentBackend ||
+        messagingSessionGeneration !== sessionGeneration
+      ) {
+        // 別のsessionのbackendが答えた値を今の一覧へ混ぜない。
+        throw new Error("Messaging session changed during profile update");
+      }
+      applyProfileEvent(canonical);
+      return (
+        get().membersByKey[participantKey(canonical.participant)] ?? canonical
+      );
+    },
     setStatus(status, note) {
       const currentBackend = backend;
       const sessionGeneration = messagingSessionGeneration;
@@ -2039,16 +2162,19 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
     throw new Error("Messaging session changed during profile refresh");
   }
 
-  const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-  for (const member of snapshot.members) {
-    membersByKey[participantKey(member.participant)] = member;
-  }
-  useMessaging.setState({ membersByKey });
+  useMessaging.setState((current) => ({
+    membersByKey: applyConfirmedProfiles(
+      current.membersByKey,
+      snapshot.members,
+      { snapshot: true, selfKey: current.selfKey },
+    ),
+  }));
 }
 
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  seedSelfProfileFromSession(identity);
   setActiveMessagingScope(null);
   resetMessagingRuntime(unboundMessagingBackend());
 }

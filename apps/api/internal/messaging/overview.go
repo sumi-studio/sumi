@@ -31,7 +31,7 @@ func (s *Server) buildOverview(ctx context.Context, store *ScopedStore) (overvie
 			if _, seen := memberSet[key]; seen {
 				continue
 			}
-			memberSet[key] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
+			memberSet[key] = memberToWire(p)
 			memberOrder = append(memberOrder, key)
 		}
 	}

@@ -168,10 +168,13 @@ pub(crate) enum ProviderReviewIdentity {
     WorkspaceInvitationListV1,
     WorkspaceInvitationAcceptV1,
     /// Durable recovery identity for seals emitted before authority epochs.
-    /// It is deliberately absent from `from_local`: new bindings are V2 only.
+    /// It and the versions below it are deliberately absent from `from_local`:
+    /// only the current adapter surface can be newly bound.
     MessagingV1,
     MessagingV2,
     MessagingV3,
+    /// V4 adds the self-declared 名乗り (`profile`), which V3 seals cannot carry.
+    MessagingV4,
     WorkspaceReadFileV1,
     WorkspaceListDirV1,
     WorkspaceGlobV1,
@@ -200,7 +203,7 @@ impl ProviderReviewIdentity {
             ("workspace_invitation_accept", "sumi.workspace.invitation.accept", 1) => {
                 Self::WorkspaceInvitationAcceptV1
             }
-            ("messaging", "sumi.messaging", 3) => Self::MessagingV3,
+            ("messaging", "sumi.messaging", 4) => Self::MessagingV4,
             ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
             ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
             ("glob", "sumi.foundation.workspace", 1) => Self::WorkspaceGlobV1,
@@ -239,6 +242,7 @@ pub(crate) enum ProviderReviewOperation {
     Write,
     React,
     Status,
+    Profile,
     ReplyLater,
     ResolveReplyLater,
     GetCallState,
@@ -382,42 +386,75 @@ fn provider_review_operation(
             Operation::AcceptInvitation
         }
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "overview",
             Read,
         ) => Operation::Overview,
-        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "open", Read) => {
-            Operation::Open
-        }
-        (Identity::MessagingV3, "open_attachment", Read) => Operation::OpenAttachment,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
+            "open",
+            Read,
+        ) => Operation::Open,
+        (Identity::MessagingV3 | Identity::MessagingV4, "open_attachment", Read) => {
+            Operation::OpenAttachment
+        }
+        (
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "write",
             Mutate,
         ) => Operation::Write,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "react",
             Mutate,
         ) => Operation::React,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "status",
             Mutate,
         ) => Operation::Status,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "reply_later",
             Mutate,
         ) => Operation::ReplyLater,
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             "resolve_reply_later",
             Mutate,
         ) => Operation::ResolveReplyLater,
-        (Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3, "get_call_state", Read) => {
-            Operation::GetCallState
-        }
+        (
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
+            "get_call_state",
+            Read,
+        ) => Operation::GetCallState,
+        // Reading one's own 名乗り and changing it are the same operation on the
+        // same participant; the capability class is what separates them.
+        (Identity::MessagingV4, "profile", Read | Mutate) => Operation::Profile,
         (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
         (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
         (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
@@ -479,45 +516,68 @@ fn provider_review_scope(
             (Resource, Namespace::Workspace, Kind::Membership)
         }
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "workspace",
             "workspace",
         ) => (Resource, Namespace::Workspace, Kind::Workspace),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Collection,
             "messaging",
             "place",
         ) => (Collection, Namespace::Messaging, Kind::Place),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "place",
         ) => (Resource, Namespace::Messaging, Kind::Place),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "message",
         ) => (Resource, Namespace::Messaging, Kind::Message),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "participant",
         ) => (Resource, Namespace::Messaging, Kind::Participant),
         (
-            Identity::MessagingV1 | Identity::MessagingV2 | Identity::MessagingV3,
+            Identity::MessagingV1
+            | Identity::MessagingV2
+            | Identity::MessagingV3
+            | Identity::MessagingV4,
             Resource,
             "messaging",
             "reply_later_marker",
         ) => (Resource, Namespace::Messaging, Kind::ReplyLaterMarker),
-        (Identity::MessagingV3, Resource, "messaging", "attachment") => {
+        (Identity::MessagingV3 | Identity::MessagingV4, Resource, "messaging", "attachment") => {
             (Resource, Namespace::Messaging, Kind::Attachment)
         }
-        (Identity::MessagingV3, Resource, "sumi.foundation.workspace", "path") => {
+        (
+            Identity::MessagingV3 | Identity::MessagingV4,
+            Resource,
+            "sumi.foundation.workspace",
+            "path",
+        ) => {
             (Resource, Namespace::FoundationWorkspace, Kind::Path)
         }
         (
@@ -1568,31 +1628,52 @@ mod tests {
     }
 
     #[test]
-    fn messaging_v1_and_v2_recover_but_only_v3_can_be_newly_bound() {
+    fn superseded_messaging_versions_recover_but_only_v4_can_be_newly_bound() {
+        for (wire, identity) in [
+            ("\"messaging_v1\"", ProviderReviewIdentity::MessagingV1),
+            ("\"messaging_v2\"", ProviderReviewIdentity::MessagingV2),
+            ("\"messaging_v3\"", ProviderReviewIdentity::MessagingV3),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ProviderReviewIdentity>(wire).unwrap(),
+                identity,
+                "durable evidence must remain decodable during recovery"
+            );
+        }
+        let v4 = AdapterIdentity::new("sumi.messaging", 4).unwrap();
         assert_eq!(
-            serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v1\"").unwrap(),
-            ProviderReviewIdentity::MessagingV1,
-            "durable v1 evidence must remain decodable during recovery"
+            ProviderReviewIdentity::from_local("messaging", &v4).unwrap(),
+            ProviderReviewIdentity::MessagingV4
         );
-        assert_eq!(
-            serde_json::from_str::<ProviderReviewIdentity>("\"messaging_v2\"").unwrap(),
-            ProviderReviewIdentity::MessagingV2,
-            "durable v2 evidence must remain decodable during recovery"
-        );
-        let v3 = AdapterIdentity::new("sumi.messaging", 3).unwrap();
-        assert_eq!(
-            ProviderReviewIdentity::from_local("messaging", &v3).unwrap(),
-            ProviderReviewIdentity::MessagingV3
-        );
-        let v1 = AdapterIdentity::new("sumi.messaging", 1).unwrap();
-        assert!(ProviderReviewIdentity::from_local("messaging", &v1).is_err());
-        let v2 = AdapterIdentity::new("sumi.messaging", 2).unwrap();
-        assert!(ProviderReviewIdentity::from_local("messaging", &v2).is_err());
+        for superseded in 1..=3 {
+            let adapter = AdapterIdentity::new("sumi.messaging", superseded).unwrap();
+            assert!(ProviderReviewIdentity::from_local("messaging", &adapter).is_err());
+        }
+
+        // 名乗り arrived with V4, so a V3 seal cannot carry it however it is
+        // classified, while everything V3 already had keeps working.
+        for capability in [CapabilityClass::Read, CapabilityClass::Mutate] {
+            assert!(
+                provider_review_operation(
+                    ProviderReviewIdentity::MessagingV4,
+                    &AppActionDescriptor::new("profile", capability.clone(), vec![]).unwrap(),
+                )
+                .is_ok()
+            );
+            assert!(
+                provider_review_operation(
+                    ProviderReviewIdentity::MessagingV3,
+                    &AppActionDescriptor::new("profile", capability, vec![]).unwrap(),
+                )
+                .is_err()
+            );
+        }
 
         for identity in [
             ProviderReviewIdentity::MessagingV1,
             ProviderReviewIdentity::MessagingV2,
             ProviderReviewIdentity::MessagingV3,
+            ProviderReviewIdentity::MessagingV4,
         ] {
             assert!(
                 provider_review_operation(
@@ -1606,21 +1687,26 @@ mod tests {
                     .is_ok()
             );
         }
-        assert!(
-            provider_review_operation(
-                ProviderReviewIdentity::MessagingV3,
-                &AppActionDescriptor::new("open_attachment", CapabilityClass::Read, vec![],)
-                    .unwrap(),
-            )
-            .is_ok()
-        );
-        assert!(
-            provider_review_scope(
-                ProviderReviewIdentity::MessagingV3,
-                &ResourceScope::resource("sumi.foundation.workspace", "path", "secret.txt"),
-            )
-            .is_ok()
-        );
+        for identity in [
+            ProviderReviewIdentity::MessagingV3,
+            ProviderReviewIdentity::MessagingV4,
+        ] {
+            assert!(
+                provider_review_operation(
+                    identity,
+                    &AppActionDescriptor::new("open_attachment", CapabilityClass::Read, vec![],)
+                        .unwrap(),
+                )
+                .is_ok()
+            );
+            assert!(
+                provider_review_scope(
+                    identity,
+                    &ResourceScope::resource("sumi.foundation.workspace", "path", "secret.txt"),
+                )
+                .is_ok()
+            );
+        }
         assert!(
             provider_review_scope(
                 ProviderReviewIdentity::MessagingV2,

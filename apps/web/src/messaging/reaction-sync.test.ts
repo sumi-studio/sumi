@@ -713,6 +713,9 @@ class StubBackend implements MessagingBackend {
   setStatus = vi.fn(async () => {
     throw new Error("unused");
   });
+  updateProfile = vi.fn(async () => {
+    throw new Error("unused");
+  });
   createReplyLater = vi.fn(async () => {
     throw new Error("unused");
   });

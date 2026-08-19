@@ -68,6 +68,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
+	mux.HandleFunc("GET /messaging/profile", s.serveProfile)
+	mux.HandleFunc("PUT /messaging/profile", s.serveSetProfile)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
@@ -277,9 +279,23 @@ type dmWire struct {
 	Participants []participantWire `json:"participants"`
 }
 
+// memberWire is the presentation of one participant. The tagline rides with
+// every member list rather than needing a second round trip: it is what the
+// member list, the profile card and the composer all show next to the name.
 type memberWire struct {
 	Participant participantWire `json:"participant"`
 	DisplayName string          `json:"display_name"`
+	Tagline     string          `json:"tagline"`
+	Revision    int64           `json:"revision"`
+}
+
+func memberToWire(profile MemberProfile) memberWire {
+	return memberWire{
+		Participant: participantToWire(profile.Participant),
+		DisplayName: profile.ProjectedDisplayName(),
+		Tagline:     profile.Tagline,
+		Revision:    profile.Revision,
+	}
 }
 
 type readMarkerWire struct {
@@ -464,6 +480,35 @@ func (s *Server) publishStatus(ctx context.Context, store *ScopedStore, status P
 	_ = s.Hub.PublishScoped(ctx, store, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
 }
 
+// publishProfile fans a replaced profile out to every Workspace where its
+// participant is presently visible. Unlike status it is durable: bootstrap
+// already carries the current value, so a missed frame is repaired by
+// reconnecting rather than by a replay.
+func (s *Server) publishProfile(ctx context.Context, scopes []Scope, profile MemberProfile) {
+	if s.Hub == nil {
+		return
+	}
+	subject := profile.Participant
+	wire := memberToWire(profile)
+	for _, scope := range scopes {
+		_ = s.Hub.PublishSystemScoped(ctx, scope, Event{Type: EventProfileUpdated, Subject: &subject, Profile: &wire})
+	}
+}
+
+// setProfile is the scoped transport adapter for Store.setProfile. Receivers
+// resolve any delivery reordering through the profile revision.
+func (s *Server) setProfile(ctx context.Context, store *ScopedStore, displayName, tagline *string) (MemberProfile, error) {
+	return store.SetProfile(ctx, displayName, tagline, s.publishProfile)
+}
+
+// SetHumanProfile lets the account settings surface use the exact same
+// profile write boundary as Messaging. Session authorization belongs to that
+// outer transport; this method owns the durable name/revision write and the
+// post-commit fan-out to every Workspace where the Human is visible.
+func (s *Server) SetHumanProfile(ctx context.Context, humanID string, displayName string) (MemberProfile, error) {
+	return s.Store.setProfile(ctx, ParticipantRef{Kind: KindHuman, ID: humanID}, &displayName, nil, nil, s.publishProfile)
+}
+
 type unreadSummaryWire struct {
 	Place        placeWire `json:"place"`
 	LatestSeq    int64     `json:"latest_seq"`
@@ -586,10 +631,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			if _, seen := memberSet[key]; seen {
 				continue
 			}
-			memberSet[key] = memberWire{
-				Participant: participantToWire(p.Participant),
-				DisplayName: p.ProjectedDisplayName(),
-			}
+			memberSet[key] = memberToWire(p)
 			memberOrder = append(memberOrder, key)
 		}
 	}
@@ -869,7 +911,7 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	members := make([]memberWire, len(profiles))
 	for i, p := range profiles {
-		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
+		members[i] = memberToWire(p)
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`
@@ -1166,6 +1208,53 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		Message messageWire `json:"message"`
 		Reacted bool        `json:"reacted"`
 	}{Message: messageToWire(place, msg), Reacted: reacted})
+}
+
+// serveProfile returns the viewer's own canonical profile. Everyone else's is
+// already in the member list, so this route exists for the settings screen
+// rather than for looking people up.
+func (s *Server) serveProfile(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := s.viewer(w, r); !ok {
+		return
+	}
+	profile, err := scopedStoreForRequest(r).Profile(r.Context())
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberToWire(profile))
+}
+
+// serveSetProfile replaces the viewer's own profile. Like status there is no
+// route for setting anyone else's: the participant is the authenticated
+// session, never a request field. An absent JSON field is preserved, so a
+// client that only edits the tagline cannot clear the display name.
+func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
+	_, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		DisplayName *string `json:"display_name"`
+		Tagline     *string `json:"tagline"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var profile MemberProfile
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		profile, opErr = s.setProfile(r.Context(), scopedStoreForRequest(r), req.DisplayName, req.Tagline)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberToWire(profile))
 }
 
 // serveSetStatus replaces the viewer's own status. There is no route for
@@ -1479,6 +1568,10 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+	case errors.Is(err, ErrInvalidDisplayName):
+		writeError(w, http.StatusBadRequest, "invalid_display_name")
+	case errors.Is(err, ErrInvalidTagline):
+		writeError(w, http.StatusBadRequest, "invalid_tagline")
 	case errors.Is(err, ErrInvalidScope):
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 	case errors.Is(err, applicationapps.ErrInstallationNotFound):
