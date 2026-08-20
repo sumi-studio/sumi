@@ -18,6 +18,7 @@ export function ThreadPanel({
   const navigate = usePlaceNavigate();
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const creatingRef = useRef(false);
   const createNonceRef = useRef<string | null>(null);
   const threads = Object.values(threadsById)
@@ -29,6 +30,7 @@ export function ThreadPanel({
     if (!trimmed) return;
     creatingRef.current = true;
     setCreating(true);
+    setError(null);
     try {
       const nonce = createNonceRef.current ?? secureRandomUUID();
       createNonceRef.current = nonce;
@@ -37,6 +39,8 @@ export function ThreadPanel({
       setName("");
       navigate(key);
       onClose();
+    } catch {
+      setError("スレッドを作成できませんでした。再試行してください。");
     } finally {
       creatingRef.current = false;
       setCreating(false);
@@ -63,6 +67,7 @@ export function ThreadPanel({
           value={name}
           onChange={(event) => {
             createNonceRef.current = null;
+            setError(null);
             setName(event.target.value);
           }}
           placeholder="スレッド名"
@@ -78,6 +83,11 @@ export function ThreadPanel({
           <Plus className="size-4" />
         </button>
       </div>
+      {error ? (
+        <p role="alert" className="px-3 pb-2 text-xs text-destructive">
+          {error}
+        </p>
+      ) : null}
       <div className="min-h-0 flex-1 overflow-y-auto p-1">
         {threads.map((thread) => (
           <button

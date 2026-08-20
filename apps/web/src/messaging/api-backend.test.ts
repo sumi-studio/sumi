@@ -60,6 +60,33 @@ afterEach(() => {
 });
 
 describe("ApiMessagingBackend", () => {
+  it("returns the existing thread carried by a thread_exists conflict", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (
+          path === "/messaging/places/channel-1/threads" &&
+          init?.method === "POST"
+        ) {
+          return json(
+            { error: "thread_exists", thread: threadSummaryWire("thread-1") },
+            409,
+          );
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.createThread(channel, "すでにある枝", "message-1", "new-nonce"),
+    ).resolves.toMatchObject({
+      threadId: "thread-1",
+      parentPlace: channel,
+    });
+  });
+
   it("uses the browser session REST surface for bootstrap, history, send, and read", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {

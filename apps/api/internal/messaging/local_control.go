@@ -143,6 +143,9 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 	}
 	thread, created, err := store.CreateThread(r.Context(), request.ParentPlaceID, request.Name, request.ParentMessageID, request.ClientNonce)
 	if err != nil {
+		if writeThreadCreateError(w, err) {
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}

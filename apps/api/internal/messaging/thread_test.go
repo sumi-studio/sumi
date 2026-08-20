@@ -26,8 +26,9 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	if !created {
 		t.Fatal("first thread creation was replayed")
 	}
-	if _, _, err := a.CreateThread(ctx, channel.PlaceID, "duplicate", origin.MessageID, "thread-origin-2"); !errors.Is(err, ErrThreadExists) {
-		t.Fatalf("duplicate origin error = %v", err)
+	duplicate, created, err := a.CreateThread(ctx, channel.PlaceID, "duplicate", origin.MessageID, "thread-origin-2")
+	if !errors.Is(err, ErrThreadExists) || created || duplicate.Place.PlaceID != thread.Place.PlaceID {
+		t.Fatalf("duplicate origin = %+v created=%v err=%v, want existing thread conflict", duplicate, created, err)
 	}
 	b := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	if _, err := b.ThreadFor(ctx, thread.Place.PlaceID); err != nil {
@@ -490,18 +491,25 @@ func TestThreadHTTPRoutesReturnParentRelation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w, server := newTestServer(t, ctx)
+	origin := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "HTTP origin")
 	resp, body := call(t, server, http.MethodPost,
 		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
-		map[string]any{"name": "HTTP thread", "parent_message_id": "", "client_nonce": "thread-http-1"})
+		map[string]any{"name": "HTTP thread", "parent_message_id": origin.MessageID, "client_nonce": "thread-http-1"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status %d body %v", resp.StatusCode, body)
 	}
 	threadID, _ := body["thread_id"].(string)
 	replayed, replayBody := call(t, server, http.MethodPost,
 		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
-		map[string]any{"name": "HTTP thread", "parent_message_id": "", "client_nonce": "thread-http-1"})
+		map[string]any{"name": "HTTP thread", "parent_message_id": origin.MessageID, "client_nonce": "thread-http-1"})
 	if replayed.StatusCode != http.StatusOK || replayBody["thread_id"] != threadID {
 		t.Fatalf("replayed create status %d body %v, want existing %q", replayed.StatusCode, replayBody, threadID)
+	}
+	conflict, conflictBody := call(t, server, http.MethodPost,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
+		map[string]any{"name": "different retry", "parent_message_id": origin.MessageID, "client_nonce": "thread-http-conflict-1"})
+	if conflict.StatusCode != http.StatusConflict || conflictBody["error"] != "thread_exists" || conflictBody["thread"].(map[string]any)["thread_id"] != threadID {
+		t.Fatalf("existing thread conflict status %d body %v, want thread %q", conflict.StatusCode, conflictBody, threadID)
 	}
 	resp, body = call(t, server, http.MethodGet, "/messaging/places/"+threadID, w.humanB.ID, nil)
 	if resp.StatusCode != http.StatusOK {

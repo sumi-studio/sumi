@@ -46,6 +46,14 @@ type Thread struct {
 	Participants       []ParticipantRef
 }
 
+// ThreadExistsError keeps the existing thread on a conflict so transport
+// callers can navigate to the resource that won the one-thread-per-message
+// race. It still unwraps to ErrThreadExists for store callers.
+type ThreadExistsError struct{ Thread Thread }
+
+func (e *ThreadExistsError) Error() string { return ErrThreadExists.Error() }
+func (e *ThreadExistsError) Unwrap() error { return ErrThreadExists }
+
 func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, originMessageID, clientNonce string) (Thread, bool, error) {
 	name = strings.TrimSpace(name)
 	if !threadNameValid(name) {
@@ -108,6 +116,23 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 			return Thread{}, false, ErrMessageNotFound
 		}
 		origin = &originMessageID
+		// The origin row lock above serializes all normal creators for this
+		// message. Check after taking it, so a retried request with a new nonce
+		// can be told which durable thread already owns this origin.
+		existing, err := s.threadsWhere(ctx, tx, membership.WorkspaceMemberID,
+			"t.parent_place_id = $3 AND t.parent_message_id = $4", parentPlaceID, originMessageID)
+		if err != nil {
+			return Thread{}, false, err
+		}
+		if len(existing) > 1 {
+			return Thread{}, false, fmt.Errorf("message %q has multiple threads", originMessageID)
+		}
+		if len(existing) == 1 {
+			if err := tx.Commit(ctx); err != nil {
+				return Thread{}, false, fmt.Errorf("commit existing thread lookup: %w", err)
+			}
+			return existing[0], false, &ThreadExistsError{Thread: existing[0]}
+		}
 	}
 	thread := Thread{
 		Place: Place{PlaceID: newUUIDv7(), Kind: PlaceThread, WorkspaceID: s.Scope.WorkspaceID,

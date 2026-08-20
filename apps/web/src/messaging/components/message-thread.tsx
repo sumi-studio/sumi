@@ -39,6 +39,8 @@ export function MessageThreadAction({ message }: { message: Message }) {
   const navigate = usePlaceNavigate();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const createNonceRef = useRef<string | null>(null);
   if (
     !canUseThreads ||
@@ -48,13 +50,26 @@ export function MessageThreadAction({ message }: { message: Message }) {
   )
     return null;
   const submit = async () => {
-    if (!name.trim()) return;
+    if (creating || !name.trim()) return;
     const nonce = createNonceRef.current ?? secureRandomUUID();
     createNonceRef.current = nonce;
-    navigate(
-      await createThread(activePlaceKey, name.trim(), message.messageId, nonce),
-    );
-    createNonceRef.current = null;
+    setCreating(true);
+    setError(null);
+    try {
+      navigate(
+        await createThread(
+          activePlaceKey,
+          name.trim(),
+          message.messageId,
+          nonce,
+        ),
+      );
+      createNonceRef.current = null;
+    } catch {
+      setError("スレッドを作成できませんでした。再試行してください。");
+    } finally {
+      setCreating(false);
+    }
   };
   return (
     <span className="relative">
@@ -75,8 +90,10 @@ export function MessageThreadAction({ message }: { message: Message }) {
           <input
             maxLength={100}
             value={name}
+            disabled={creating}
             onChange={(event) => {
               createNonceRef.current = null;
+              setError(null);
               setName(event.target.value);
             }}
             className="min-w-0 flex-1 rounded border px-2 text-xs"
@@ -84,10 +101,19 @@ export function MessageThreadAction({ message }: { message: Message }) {
           <button
             type="button"
             onClick={() => void submit()}
+            disabled={creating}
             className="rounded bg-primary px-2 text-xs text-primary-foreground"
           >
-            作成
+            {creating ? "作成中…" : "作成"}
           </button>
+          {error ? (
+            <span
+              role="alert"
+              className="absolute top-full right-0 mt-1 w-64 text-xs text-destructive"
+            >
+              {error}
+            </span>
+          ) : null}
         </span>
       ) : null}
     </span>

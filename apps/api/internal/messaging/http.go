@@ -956,6 +956,9 @@ func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		if writeThreadCreateError(w, err) {
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
@@ -1553,6 +1556,18 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
+}
+
+func writeThreadCreateError(w http.ResponseWriter, err error) bool {
+	var exists *ThreadExistsError
+	if !errors.As(err, &exists) {
+		return false
+	}
+	writeJSON(w, http.StatusConflict, struct {
+		Error  string     `json:"error"`
+		Thread threadWire `json:"thread"`
+	}{Error: "thread_exists", Thread: threadToWire(exists.Thread)})
+	return true
 }
 
 // writeStoreError maps store sentinels to transport codes. Unknown errors are

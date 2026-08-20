@@ -349,6 +349,30 @@ describe("place lifecycleの再接続突き合わせ", () => {
     );
   });
 
+  it("direct thread load failure remains visible until a retry recovers", async () => {
+    const unopened = thread("thread-retry-after-failure");
+    backend.fetchThread
+      .mockRejectedValueOnce(new Error("temporary network failure"))
+      .mockResolvedValueOnce(unopened);
+
+    await expect(
+      useMessaging.getState().loadThread(unopened.threadId),
+    ).resolves.toBe(false);
+    expect(
+      useMessaging.getState().threadLoadErrorsById[unopened.threadId],
+    ).toBe("failed");
+
+    await expect(
+      useMessaging.getState().loadThread(unopened.threadId),
+    ).resolves.toBe(true);
+    expect(
+      useMessaging.getState().threadLoadErrorsById[unopened.threadId],
+    ).toBeUndefined();
+    expect(useMessaging.getState().threadsById[unopened.threadId]).toEqual(
+      unopened,
+    );
+  });
+
   it("未知threadのhydrate中の新活動で古いGET summaryを戻さない", async () => {
     const stale = thread("thread-hydration-race");
     let resolveFetch!: (summary: ThreadSummary) => void;

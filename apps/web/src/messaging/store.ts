@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
-import { ApiMessagingBackend } from "./api-backend";
+import { ApiMessagingBackend, MessagingAPIError } from "./api-backend";
 import { useCall } from "./call/call-store";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
@@ -150,6 +150,8 @@ interface MessagingState {
   dms: DmSummary[];
   threadsById: Record<string, ThreadSummary>;
   threadsLoadedForPlace: Record<PlaceKey, boolean>;
+  /** Direct thread URL hydration failures, retained until the user retries. */
+  threadLoadErrorsById: Record<string, "not_found" | "failed">;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -1783,6 +1785,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     dms: [],
     threadsById: {},
     threadsLoadedForPlace: {},
+    threadLoadErrorsById: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -1864,6 +1867,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             channels: snapshot.channels,
             dms: snapshot.dms,
             threadsLoadedForPlace: {},
+            threadLoadErrorsById: {},
             membersByKey,
             statusByKey,
             lastReadByPlace,
@@ -2144,6 +2148,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return existing.request;
       }
+      set((state) => {
+        if (state.threadLoadErrorsById[threadId] === undefined) return {};
+        const { [threadId]: _discarded, ...threadLoadErrorsById } =
+          state.threadLoadErrorsById;
+        return { threadLoadErrorsById };
+      });
       const hydration = {
         backend: currentBackend,
         sessionGeneration,
@@ -2163,7 +2173,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
             return false;
           }
           return true;
-        } catch {
+        } catch (error) {
+          if (
+            isCurrentMessagingSession(currentBackend, sessionGeneration) &&
+            threadHydrations.get(threadId) === hydration
+          ) {
+            set((state) => ({
+              threadLoadErrorsById: {
+                ...state.threadLoadErrorsById,
+                [threadId]:
+                  error instanceof MessagingAPIError && error.status === 404
+                    ? "not_found"
+                    : "failed",
+              },
+            }));
+          }
           return false;
         } finally {
           if (threadHydrations.get(threadId) === hydration) {
@@ -2745,6 +2769,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     dms: [],
     threadsById: {},
     threadsLoadedForPlace: {},
+    threadLoadErrorsById: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},

@@ -439,6 +439,9 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
   const threadsById = useMessaging((state) => state.threadsById);
+  const threadLoadErrorsById = useMessaging(
+    (state) => state.threadLoadErrorsById,
+  );
   const loadThreads = useMessaging((state) => state.loadThreads);
   const loadThread = useMessaging((state) => state.loadThread);
   const workspaces = useMessaging((state) => state.workspaces);
@@ -453,6 +456,9 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const requestedThreadId = placeKey?.startsWith("thread:")
     ? placeKey.slice("thread:".length)
     : null;
+  const threadLoadError = requestedThreadId
+    ? threadLoadErrorsById[requestedThreadId]
+    : undefined;
   const display = usePlaceDisplay(selectedPlaceKey);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
   const listRef = useRef<MessageListHandle>(null);
@@ -488,11 +494,12 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     if (
       ready &&
       requestedThreadId &&
-      threadsById[requestedThreadId] === undefined
+      threadsById[requestedThreadId] === undefined &&
+      threadLoadError === undefined
     ) {
       void loadThread(requestedThreadId);
     }
-  }, [ready, requestedThreadId, threadsById, loadThread]);
+  }, [ready, requestedThreadId, threadsById, threadLoadError, loadThread]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
@@ -685,6 +692,28 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
                 <TypingIndicator />
                 <Composer />
               </>
+            ) : threadLoadError && requestedThreadId ? (
+              <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+                <div className="max-w-sm">
+                  <h2 className="font-medium text-[15px] text-foreground">
+                    {threadLoadError === "not_found"
+                      ? "スレッドが見つかりません"
+                      : "スレッドを開けませんでした"}
+                  </h2>
+                  <p className="mt-1.5 text-[13px] text-muted-foreground leading-5">
+                    {threadLoadError === "not_found"
+                      ? "このスレッドは存在しないか、アクセスできません。"
+                      : "読み込みに失敗しました。接続を確認して、もう一度お試しください。"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void loadThread(requestedThreadId)}
+                    className="mt-3 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+                  >
+                    再試行
+                  </button>
+                </div>
+              </section>
             ) : (
               <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
                 <div className="max-w-sm">

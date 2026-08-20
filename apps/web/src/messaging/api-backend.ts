@@ -44,12 +44,19 @@ const UPLOAD_TIMEOUT_MS = 120_000;
 export class MessagingAPIError extends Error {
   readonly code: string;
   readonly status: number;
+  /** Error responses may carry the authoritative resource that caused a conflict. */
+  readonly body: Record<string, unknown> | null;
 
-  constructor(code: string, status: number) {
+  constructor(
+    code: string,
+    status: number,
+    body: Record<string, unknown> | null = null,
+  ) {
     super(code);
     this.name = "MessagingAPIError";
     this.code = code;
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -258,18 +265,32 @@ export class ApiMessagingBackend implements MessagingBackend {
     originMessageId: string | null,
     clientNonce: string,
   ): Promise<ThreadSummary> {
-    const body = await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
-      {
-        method: "POST",
-        body: {
-          name,
-          parent_message_id: originMessageId ?? "",
-          client_nonce: clientNonce,
+    try {
+      const body = await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+        {
+          method: "POST",
+          body: {
+            name,
+            parent_message_id: originMessageId ?? "",
+            client_nonce: clientNonce,
+          },
         },
-      },
-    );
-    return this.registerThread(body);
+      );
+      return this.registerThread(body);
+    } catch (error) {
+      // A new nonce can race a creation whose response was lost. The server
+      // returns that already-created thread with its 409 so this remains an
+      // ordinary navigation, not a dead-end error state.
+      if (
+        error instanceof MessagingAPIError &&
+        error.code === "thread_exists" &&
+        error.body?.thread !== undefined
+      ) {
+        return this.registerThread(error.body.thread);
+      }
+      throw error;
+    }
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -844,13 +865,14 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
     if (!response.ok) {
       let code = "messaging_request_failed";
+      let errorBody: Record<string, unknown> | null = null;
       try {
-        const body = asRecord(await response.json());
-        if (typeof body.error === "string") code = body.error;
+        errorBody = asRecord(await response.json());
+        if (typeof errorBody.error === "string") code = errorBody.error;
       } catch {
         // Status remains the authoritative non-sensitive signal.
       }
-      throw new MessagingAPIError(code, response.status);
+      throw new MessagingAPIError(code, response.status, errorBody);
     }
     if (response.status === 204) return null;
     return response.json() as Promise<unknown>;

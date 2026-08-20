@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlaceKey } from "../model";
 import { bindMessagingSessionIdentity, useMessaging } from "../store";
@@ -52,6 +58,7 @@ const CHANNEL_B: PlaceKey = "channel:channel-b";
 const realInit = useMessaging.getState().init;
 const realSelectPlace = useMessaging.getState().selectPlace;
 const realLoadPlaceAround = useMessaging.getState().loadPlaceAround;
+const realLoadThread = useMessaging.getState().loadThread;
 
 function seedCurrentPlace() {
   useMessaging.setState({
@@ -122,6 +129,7 @@ describe("MessagingScreen route-owned current place", () => {
       init: realInit,
       selectPlace: realSelectPlace,
       loadPlaceAround: realLoadPlaceAround,
+      loadThread: realLoadThread,
     });
     bindMessagingSessionIdentity(null);
   });
@@ -208,6 +216,63 @@ describe("MessagingScreen route-owned current place", () => {
     expect(screen.getByText("認証リダイレクト")).toBeInTheDocument();
     expect(screen.getByText("親: #alpha")).toBeInTheDocument();
     expect(useMessaging.getState().activePlaceKey).toBe("thread:thread-a");
+  });
+
+  it("shows a direct thread load failure and retries it into the existing thread", async () => {
+    const recovered = {
+      threadId: "thread-retry",
+      parentPlace: { kind: "channel", channelId: "channel-a" } as const,
+      parentMessageId: "message-a",
+      workspaceId: "workspace-a",
+      name: "回復したスレッド",
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [SELF],
+      latestSeq: 0,
+    };
+    let attempts = 0;
+    const loadThread = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        useMessaging.setState({
+          threadLoadErrorsById: { "thread-retry": "failed" },
+        });
+        return false;
+      }
+      useMessaging.setState({
+        threadsById: { "thread-retry": recovered },
+        threadLoadErrorsById: {},
+      });
+      return true;
+    });
+    useMessaging.setState({
+      capabilities: {
+        status: false,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+        threads: true,
+      },
+      loadThread,
+    });
+
+    render(<MessagingScreen placeKey="thread:thread-retry" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("スレッドを開けませんでした"),
+      ).toBeInTheDocument(),
+    );
+    expect(loadThread).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+
+    await waitFor(() =>
+      expect(screen.getByText("回復したスレッド")).toBeInTheDocument(),
+    );
+    expect(loadThread).toHaveBeenCalledTimes(2);
+    expect(useMessaging.getState().activePlaceKey).toBe("thread:thread-retry");
   });
 
   it("hides thread controls when the backend does not support threads", () => {
