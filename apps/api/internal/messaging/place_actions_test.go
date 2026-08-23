@@ -222,6 +222,102 @@ func TestPlaceCreationNonceReplaysTheCommittedPlace(t *testing.T) {
 	if err != nil || created || replayed.PlaceID != group.PlaceID {
 		t.Fatalf("group DM replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
 	}
+	if _, _, err := scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.agent, w.humanB}, "group-once"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed group DM request under nonce = %v, want ErrIdempotencyConflict", err)
+	}
+
+	// Receipt identity is scoped by actor as well as Workspace. The same nonce
+	// from another authenticated member is a different creation, not a replay.
+	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.humanB)
+	otherActor := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	otherChannel, created, err := otherActor.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || !created || otherChannel.PlaceID == channel.PlaceID {
+		t.Fatalf("other actor create = (%+v, %v, %v), want an independent place", otherChannel, created, err)
+	}
+
+	// A new installation authority epoch is a new exact session scope. A nonce
+	// retained by an old caller cannot reconcile a new-session mutation to the
+	// stale session's place.
+	if _, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, false); err != nil {
+		t.Fatalf("disable Messaging installation: %v", err)
+	}
+	if _, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, true); err != nil {
+		t.Fatalf("re-enable Messaging installation: %v", err)
+	}
+	newSession := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	newSessionChannel, created, err := newSession.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || !created || newSessionChannel.PlaceID == channel.PlaceID {
+		t.Fatalf("new session create = (%+v, %v, %v), want an independent place", newSessionChannel, created, err)
+	}
+
+	// Workspace is also part of the durable identity.
+	otherWorkspace, _ := w.workspaceWithChannel(t, ctx)
+	otherWorkspaceStore := w.store.mustScope(t, ctx, otherWorkspace.WorkspaceID, w.humanA)
+	otherWorkspaceChannel, created, err := otherWorkspaceStore.CreateChannelOnce(ctx, "incident", "coordination", false, "create-once")
+	if err != nil || !created || otherWorkspaceChannel.PlaceID == channel.PlaceID {
+		t.Fatalf("other Workspace create = (%+v, %v, %v), want an independent place", otherWorkspaceChannel, created, err)
+	}
+}
+
+// The first handler response is intentionally discarded, as when the peer
+// loses the response after commit. A normal second local-control request must
+// recover the canonical place without a PA-only manual retry API.
+func TestLocalPlaceCreationRoutesRecoverACommittedLostResponse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, source := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	server.Hub = NewHub(w.store.core)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
+
+	retry := func(
+		name, path string,
+		handler func(http.ResponseWriter, *http.Request, agentevents.LocalRuntimeAuthorization),
+		request map[string]any,
+		identity func(map[string]any) string,
+	) {
+		t.Helper()
+		firstStatus, first := callLocal(t, ctx, handler, path, request, authorization)
+		if firstStatus != http.StatusCreated && firstStatus != http.StatusOK {
+			t.Fatalf("%s committed attempt: status %d body %v", name, firstStatus, first)
+		}
+		// Drop first/firstStatus here: the retry has no receipt supplied by the
+		// caller, only the same ordinary route request and nonce.
+		secondStatus, second := callLocal(t, ctx, handler, path, request, authorization)
+		if secondStatus != http.StatusOK || identity(first) == "" || identity(second) != identity(first) {
+			t.Fatalf("%s retry: first=%v second status=%d body=%v", name, first, secondStatus, second)
+		}
+		if created, ok := second["created"]; ok && created != false {
+			t.Fatalf("%s retry created=%v, want false", name, created)
+		}
+	}
+
+	retry("create channel", LocalCreateChannelPath, server.localCreateChannel,
+		map[string]any{"name": "lost-create", "client_nonce": "lost-create-nonce"},
+		func(body map[string]any) string { return body["channel"].(map[string]any)["channel_id"].(string) })
+	retry("duplicate channel", LocalDuplicateChannelPath, server.localDuplicateChannel,
+		map[string]any{"place_id": source.PlaceID, "client_nonce": "lost-duplicate-nonce"},
+		func(body map[string]any) string { return body["channel"].(map[string]any)["channel_id"].(string) })
+	retry("one-to-one DM", LocalStartDMPath, server.localStartDM,
+		map[string]any{"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}}},
+		func(body map[string]any) string { return body["dm"].(map[string]any)["dm_id"].(string) })
+	retry("group DM", LocalStartDMPath, server.localStartDM,
+		map[string]any{
+			"client_nonce": "lost-group-nonce",
+			"participants": []any{
+				map[string]any{"kind": "human", "human_id": w.humanA.ID},
+				map[string]any{"kind": "human", "human_id": w.humanB.ID},
+			},
+		},
+		func(body map[string]any) string { return body["dm"].(map[string]any)["dm_id"].(string) })
+
+	status, body := callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath,
+		map[string]any{"name": "changed-after-commit", "client_nonce": "lost-create-nonce"}, authorization)
+	if status != http.StatusConflict || body["error"] != "idempotency_conflict" {
+		t.Fatalf("changed request under committed nonce: status %d body %v", status, body)
+	}
 }
 
 func TestPlaceEditsOverHTTPRefuseANoOpAndAnnounceTheCopy(t *testing.T) {

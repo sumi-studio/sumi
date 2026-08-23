@@ -94,11 +94,8 @@ func (s *ScopedStore) replayPlaceCreation(
 	if len(nonce) > 128 {
 		return Place{}, false, ErrIdempotencyConflict
 	}
-	// PostgreSQL text rejects NUL, while a client nonce may contain arbitrary
-	// valid text. %q escapes control bytes, and this advisory key only needs to
-	// serialize contenders for the same durable receipt (a collision merely
-	// serializes otherwise independent creations).
-	key := fmt.Sprintf("place-creation/%s/%s/%s/%q", s.Scope.WorkspaceID, s.Scope.Actor.Key(), operation, nonce)
+	receiptNonce := s.placeCreationReceiptNonce(nonce)
+	key := fmt.Sprintf("place-creation/%s/%s/%s/%s", s.Scope.WorkspaceID, s.Scope.Actor.Key(), operation, receiptNonce)
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
 		return Place{}, false, fmt.Errorf("lock place creation nonce: %w", err)
 	}
@@ -109,7 +106,7 @@ func (s *ScopedStore) replayPlaceCreation(
 		FROM messaging_place_creation_receipts
 		WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3
 		  AND operation = $4 AND client_nonce = $5`,
-		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, nonce,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, receiptNonce,
 	).Scan(&storedDigest, &placeID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Place{}, false, nil
@@ -141,12 +138,28 @@ func (s *ScopedStore) recordPlaceCreation(
 		INSERT INTO messaging_place_creation_receipts
 			(workspace_id, member_kind, member_id, operation, client_nonce, request_digest, place_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, nonce, digest, placeID,
+		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation,
+		s.placeCreationReceiptNonce(nonce), digest, placeID,
 	)
 	if err != nil {
 		return fmt.Errorf("record place creation receipt: %w", err)
 	}
 	return nil
+}
+
+// A client nonce is only a receipt identity inside one exact installation
+// lifecycle. Hashing that sealed address into the stored key keeps a later
+// disable/re-enable session, or another installation, from reconciling with a
+// creation committed under stale authority. Workspace and actor remain
+// explicit relational key columns for auditability and isolation.
+func (s *ScopedStore) placeCreationReceiptNonce(nonce string) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("sumi.messaging.place-creation-receipt/v1\x00"))
+	for _, value := range []string{s.Scope.InstallationID, fmt.Sprint(s.Scope.AuthorityEpoch), nonce} {
+		_, _ = hash.Write([]byte(fmt.Sprintf("%d:", len(value))))
+		_, _ = hash.Write([]byte(value))
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func placeCreationDigest(operation string, request any) []byte {

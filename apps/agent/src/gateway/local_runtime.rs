@@ -1087,18 +1087,15 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: StartMessagingDMRequest<'_>,
     ) -> Result<serde_json::Value> {
-        let request = ScopedMessagingRequest::new(scope, request);
-        if request.operation.client_nonce.is_some() {
-            self.post_idempotent_messaging_json(
-                "/local-control/v1/messaging:start-dm",
-                &request,
-                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
-            )
-            .await
-        } else {
-            self.post_mutating_messaging_json("/local-control/v1/messaging:start-dm", &request)
-                .await
-        }
+        // Group creation is nonce-idempotent. A one-to-one DM has no nonce,
+        // but the server reconciles the canonical actor/participant pair, so
+        // the same bounded replay is safe after a lost committed response.
+        self.post_idempotent_messaging_json(
+            "/local-control/v1/messaging:start-dm",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+        )
+        .await
     }
 
     async fn create_channel(
@@ -4083,6 +4080,50 @@ mod tests {
             .into_response()
     }
 
+    async fn place_response_loss_then_replay_fixture(
+        State(state): State<MessagingReplayFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("strict place JSON");
+        let nonce = request["client_nonce"]
+            .as_str()
+            .unwrap_or("canonical-dm")
+            .to_owned();
+        let mut requests = state.requests.lock().unwrap();
+        requests.push((nonce, "place".to_owned(), body.to_vec()));
+        if requests.len() % 2 == 1 {
+            return committed_response_loss();
+        }
+        drop(requests);
+        if request.get("participants").is_some() {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "dm": {
+                        "dm_id": "0198f0f4-9b72-7000-8000-000000000701",
+                        "kind": "group_dm",
+                        "participants": []
+                    },
+                    "created": false
+                })),
+            )
+                .into_response();
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "channel": {
+                    "channel_id": "0198f0f4-9b72-7000-8000-000000000702",
+                    "kind": "channel",
+                    "name": "reconciled",
+                    "topic": "",
+                    "voice": false
+                }
+            })),
+        )
+            .into_response()
+    }
+
     #[derive(Clone)]
     struct CountedMutationFixture {
         status: StatusCode,
@@ -4483,6 +4524,108 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1], "replay must be wire-identical");
         assert_eq!(requests[0].0, "message-nonce-2");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_place_actions_retry_committed_response_loss_with_the_same_scoped_request() {
+        let state = MessagingReplayFixtureState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-channel",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .route(
+                "/local-control/v1/messaging:duplicate-channel",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .route(
+                "/local-control/v1/messaging:start-dm",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let scope = messaging_scope();
+
+        client
+            .create_channel(
+                &scope,
+                CreateMessagingChannelRequest {
+                    name: "reconciled",
+                    topic: None,
+                    voice: false,
+                    client_nonce: "lost-create",
+                },
+            )
+            .await
+            .expect("create response loss reconciles");
+        client
+            .duplicate_channel(
+                &scope,
+                DuplicateMessagingChannelRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    name: None,
+                    client_nonce: "lost-duplicate",
+                },
+            )
+            .await
+            .expect("duplicate response loss reconciles");
+        let participants = vec![
+            crate::apiclient::messaging::MessagingParticipant {
+                kind: "human".to_owned(),
+                human_id: Some("01900000-0000-7000-8000-000000000009".to_owned()),
+                personality_agent_id: None,
+            },
+            crate::apiclient::messaging::MessagingParticipant {
+                kind: "human".to_owned(),
+                human_id: Some("01900000-0000-7000-8000-000000000010".to_owned()),
+                personality_agent_id: None,
+            },
+        ];
+        client
+            .start_dm(
+                &scope,
+                StartMessagingDMRequest {
+                    participants: &participants[..1],
+                    client_nonce: None,
+                },
+            )
+            .await
+            .expect("canonical one-to-one DM response loss reconciles");
+        client
+            .start_dm(
+                &scope,
+                StartMessagingDMRequest {
+                    participants: &participants,
+                    client_nonce: Some("lost-group"),
+                },
+            )
+            .await
+            .expect("group DM response loss reconciles");
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        for pair in requests.chunks_exact(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "retry must preserve exact scope, digest inputs, and nonce"
+            );
+        }
         server.abort();
     }
 
