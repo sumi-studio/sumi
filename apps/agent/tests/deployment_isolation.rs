@@ -1976,12 +1976,13 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
 
 #[test]
 fn exact_runtime_secret_loader_rejects_invalid_files_without_exposing_values() {
+    const UID_NAMESPACE_CHILD_ENV: &str = "SUMI_TEST_RUNTIME_SECRET_UID_NAMESPACE";
+
     struct LoaderCase {
         label: &'static str,
         path: PathBuf,
         expected_diagnostic: &'static str,
         secret_fragments: Vec<&'static [u8]>,
-        run_as_runtime: bool,
     }
 
     fn loader_harness() -> String {
@@ -2010,18 +2011,8 @@ exit 99
         )
     }
 
-    fn chown_runtime(path: &std::path::Path) -> bool {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        unsafe { libc::chown(path.as_ptr(), 10001, 10001) == 0 }
-    }
-
-    fn write_exact_runtime_file(path: &std::path::Path, bytes: &[u8], mode: u32, euid: u32) {
+    fn write_exact_runtime_file(path: &std::path::Path, bytes: &[u8], mode: u32) {
         std::fs::write(path, bytes).unwrap();
-        if euid == 0 {
-            assert!(chown_runtime(path), "cannot chown exact runtime secret");
-        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
@@ -2032,10 +2023,65 @@ exit 99
             .arg(&case.path)
             .env_clear()
             .env("PATH", "/usr/bin:/bin");
-        if case.run_as_runtime {
-            command.gid(10001).uid(10001);
-        }
         command.output().unwrap()
+    }
+
+    fn run_uid_namespace_child(marker: &str, uid: u32) {
+        let mut child = Command::new("/usr/bin/timeout");
+        child
+            .args([
+                "--preserve-status",
+                "--kill-after=5s",
+                "30s",
+                "/usr/bin/unshare",
+                "--user",
+            ])
+            .arg(format!("--map-user={uid}"))
+            .arg(format!("--map-group={uid}"))
+            .arg("--kill-child")
+            .arg(std::env::current_exe().expect("resolve exact deployment test binary"))
+            .args([
+                "--exact",
+                "exact_runtime_secret_loader_rejects_invalid_files_without_exposing_values",
+                "--nocapture",
+            ])
+            .env(UID_NAMESPACE_CHILD_ENV, marker)
+            .env_remove(FIXTURE_OPTIONAL_ENV)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = child.spawn().expect(
+            "/usr/bin/timeout is required to bound exact runtime-secret isolation coverage",
+        );
+        let output = child
+            .wait_with_output()
+            .expect("wait for exact runtime-secret namespace child");
+        let stdout = &output.stdout[..output.stdout.len().min(4096)];
+        let stderr = &output.stderr[..output.stderr.len().min(4096)];
+        assert!(
+            output.status.success(),
+            "runtime-secret namespace child {marker:?} failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr)
+        );
+    }
+
+    let namespace_mode = std::env::var(UID_NAMESPACE_CHILD_ENV).ok();
+    let exact_owner_child = namespace_mode.as_deref() == Some("runtime-owner");
+    let wrong_owner_child = namespace_mode.as_deref() == Some("wrong-owner");
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    match namespace_mode.as_deref() {
+        Some("runtime-owner") => {
+            assert_eq!(euid, 10001, "runtime-secret namespace child euid");
+            assert_eq!(egid, 10001, "runtime-secret namespace child egid");
+        }
+        Some("wrong-owner") => {
+            assert_eq!(euid, 10002, "wrong-owner namespace child euid");
+            assert_eq!(egid, 10002, "wrong-owner namespace child egid");
+        }
+        Some(other) => panic!("unknown private runtime-secret child marker {other:?}"),
+        None => {}
     }
 
     let root = std::env::temp_dir().join(format!("secret-loader-{}", Uuid::now_v7().simple()));
@@ -2047,30 +2093,27 @@ exit 99
 
     let mut cases = Vec::new();
 
-    let symlink_target = root.join("symlink-target");
-    std::fs::write(&symlink_target, b"symlink-secret-must-not-escape").unwrap();
-    let symlink = root.join("symlink-secret");
-    std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
-    cases.push(LoaderCase {
-        label: "symlink",
-        path: symlink,
-        expected_diagnostic: "runtime secret must be a regular non-symlink",
-        secret_fragments: vec![b"symlink-secret-must-not-escape"],
-        run_as_runtime: false,
-    });
+    if wrong_owner_child || (namespace_mode.is_none() && euid != 10001) {
+        let symlink_target = root.join("symlink-target");
+        std::fs::write(&symlink_target, b"symlink-secret-must-not-escape").unwrap();
+        let symlink = root.join("symlink-secret");
+        std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
+        cases.push(LoaderCase {
+            label: "symlink",
+            path: symlink,
+            expected_diagnostic: "runtime secret must be a regular non-symlink",
+            secret_fragments: vec![b"symlink-secret-must-not-escape"],
+        });
 
-    let nonregular = root.join("nonregular-secret");
-    std::fs::create_dir(&nonregular).unwrap();
-    cases.push(LoaderCase {
-        label: "nonregular",
-        path: nonregular,
-        expected_diagnostic: "runtime secret must be a regular non-symlink",
-        secret_fragments: vec![],
-        run_as_runtime: false,
-    });
+        let nonregular = root.join("nonregular-secret");
+        std::fs::create_dir(&nonregular).unwrap();
+        cases.push(LoaderCase {
+            label: "nonregular",
+            path: nonregular,
+            expected_diagnostic: "runtime secret must be a regular non-symlink",
+            secret_fragments: vec![],
+        });
 
-    let euid = unsafe { libc::geteuid() };
-    if euid != 10001 {
         let wrong_owner = root.join("wrong-owner-secret");
         std::fs::write(&wrong_owner, b"owner-secret-must-not-escape").unwrap();
         std::fs::set_permissions(&wrong_owner, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -2079,67 +2122,43 @@ exit 99
             path: wrong_owner,
             expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
             secret_fragments: vec![b"owner-secret-must-not-escape"],
-            run_as_runtime: false,
         });
-    } else {
-        unavailable_host(
-            "owner-mismatch secret case requires chown authority when tests already run as uid 10001",
-        );
-    }
-
-    let exact_runtime_owner_available = if euid == 10001 {
-        true
-    } else if euid == 0 {
-        let probe = root.join("chown-probe");
-        std::fs::write(&probe, b"probe").unwrap();
-        let available = chown_runtime(&probe);
-        let _ = std::fs::remove_file(probe);
-        available
-    } else {
-        false
-    };
-    if exact_runtime_owner_available {
-        let run_as_runtime = euid == 0;
-
+    } else if exact_owner_child {
         let wrong_mode = root.join("wrong-mode-secret");
-        write_exact_runtime_file(&wrong_mode, b"mode-secret-must-not-escape", 0o600, euid);
+        write_exact_runtime_file(&wrong_mode, b"mode-secret-must-not-escape", 0o600);
         cases.push(LoaderCase {
             label: "mode",
             path: wrong_mode,
             expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
             secret_fragments: vec![b"mode-secret-must-not-escape"],
-            run_as_runtime,
         });
 
         let linked = root.join("linked-secret");
-        write_exact_runtime_file(&linked, b"linked-secret-must-not-escape", 0o400, euid);
+        write_exact_runtime_file(&linked, b"linked-secret-must-not-escape", 0o400);
         std::fs::hard_link(&linked, root.join("linked-secret-alias")).unwrap();
         cases.push(LoaderCase {
             label: "link-count",
             path: linked,
             expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
             secret_fragments: vec![b"linked-secret-must-not-escape"],
-            run_as_runtime,
         });
 
         let empty = root.join("empty-secret");
-        write_exact_runtime_file(&empty, b"", 0o400, euid);
+        write_exact_runtime_file(&empty, b"", 0o400);
         cases.push(LoaderCase {
             label: "empty",
             path: empty,
             expected_diagnostic: "runtime secret must not be empty",
             secret_fragments: vec![],
-            run_as_runtime,
         });
 
         let nul = root.join("nul-secret");
-        write_exact_runtime_file(&nul, b"nul-secret-prefix\0nul-secret-suffix", 0o400, euid);
+        write_exact_runtime_file(&nul, b"nul-secret-prefix\0nul-secret-suffix", 0o400);
         cases.push(LoaderCase {
             label: "NUL",
             path: nul,
             expected_diagnostic: "runtime secret byte length changed during parsing",
             secret_fragments: vec![b"nul-secret-prefix", b"nul-secret-suffix"],
-            run_as_runtime,
         });
 
         let carriage_return = root.join("cr-secret");
@@ -2147,34 +2166,22 @@ exit 99
             &carriage_return,
             b"cr-secret-prefix\rcr-secret-suffix",
             0o400,
-            euid,
         );
         cases.push(LoaderCase {
             label: "CR",
             path: carriage_return,
             expected_diagnostic: "runtime secret must not contain newline or carriage return",
             secret_fragments: vec![b"cr-secret-prefix", b"cr-secret-suffix"],
-            run_as_runtime,
         });
 
         let line_feed = root.join("lf-secret");
-        write_exact_runtime_file(
-            &line_feed,
-            b"lf-secret-prefix\nlf-secret-suffix",
-            0o400,
-            euid,
-        );
+        write_exact_runtime_file(&line_feed, b"lf-secret-prefix\nlf-secret-suffix", 0o400);
         cases.push(LoaderCase {
             label: "LF",
             path: line_feed,
             expected_diagnostic: "runtime secret must not contain newline or carriage return",
             secret_fragments: vec![b"lf-secret-prefix", b"lf-secret-suffix"],
-            run_as_runtime,
         });
-    } else {
-        unavailable_host(
-            "mode/link-count/empty/NUL/CR/LF cases require uid 10001 or root chown/setuid authority; symlink/nonregular/owner cases still ran",
-        );
     }
 
     let results = cases
@@ -2216,6 +2223,13 @@ exit 99
         }
     }
     assert!(cleanup.is_ok(), "secret-loader fixture survived cleanup");
+
+    if namespace_mode.is_none() {
+        if euid == 10001 {
+            run_uid_namespace_child("wrong-owner", 10002);
+        }
+        run_uid_namespace_child("runtime-owner", 10001);
+    }
 }
 
 #[test]
@@ -3388,6 +3402,10 @@ esac
     }
     if stop_status.is_none() {
         stop_status = wait_for_child_exit(&mut stop, Duration::from_secs(5));
+    } else {
+        // `try_wait` reaps the child; `wait` is idempotent and makes that
+        // ownership settlement explicit on every control-flow path.
+        let _ = stop.wait();
     }
     if stop_status.is_none() {
         let _ = stop.kill();

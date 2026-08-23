@@ -353,6 +353,10 @@ pub(crate) struct ArtifactKeyAnchor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "derived deletion authorities are exercised by retention-erasure tests"
+)]
 pub(crate) enum DerivedRetentionEraseAuthority {
     ProviderContextInvalidation,
     MemorySummaryDeletion,
@@ -4894,7 +4898,6 @@ mod tests {
         drop(store);
         let wrong_scope = AgentScope {
             personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ..scope()
         };
         let error = match Store::finish_open(pool, wrong_scope, provider()).await {
             Ok(_) => panic!("scope mismatch must fail closed"),
@@ -4936,7 +4939,6 @@ mod tests {
 
         let wrong_scope = AgentScope {
             personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ..scope()
         };
         let error = match Store::finish_open(pool.clone(), wrong_scope, provider()).await {
             Ok(_) => panic!("wrong scope must fail before projection initialization"),

@@ -1422,6 +1422,10 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
 /// Health plus workspace-dirfd read and discovery operations. The broader
 /// stdio fixture service remains separate and cannot be reached through
 /// production bootstrap.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the critical endpoint keeps every authenticated authority and capability explicit"
+)]
 async fn run_critical_executor_service(
     first_line: Vec<u8>,
     (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
@@ -1482,6 +1486,10 @@ pub(super) async fn run_critical_executor_test_service(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exchange validates each authenticated authority and capability before dispatch"
+)]
 async fn run_critical_executor_exchange(
     first_line: Vec<u8>,
     writer: &ExecutorWriter,
@@ -3323,6 +3331,10 @@ mod tests {
         RpcIdentity::from_wire(PAID, 7, "blocking-fs-test").expect("test RPC identity")
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the test helper mirrors the exact executor identity and capability boundary"
+    )]
     fn start_prefetched_test_session(
         identity: RpcIdentity,
         workspace: PathBuf,

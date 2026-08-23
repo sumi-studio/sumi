@@ -12,6 +12,10 @@ use crate::runtime::contracts::{
 };
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "the Mismatch suffix is the stable error taxonomy at this authority boundary"
+)]
 pub(crate) enum RuntimeEpochAuthorityError {
     #[error("runtime RPC identity is not bound to the supplied process-generation lease")]
     LeaseMismatch,

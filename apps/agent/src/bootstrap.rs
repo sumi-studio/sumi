@@ -2017,6 +2017,10 @@ async fn teardown_failed_session_start(
     finish_runtime(primary, post_commit, supervisor, true).await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ready supervision retains explicit ownership of every required runtime and shutdown authority"
+)]
 async fn supervise_ready_session(
     authority: &RuntimeEpochAuthority,
     publisher: &LocalRuntimePublisher,
@@ -2031,6 +2035,10 @@ async fn supervise_ready_session(
     let session_run = session.run_until_cancelled(shutdown.clone());
     tokio::pin!(session_run);
 
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "the select boundary preserves SessionResult ownership without allocation"
+    )]
     enum Exit {
         Session(SessionResult),
         Runtime(PreReadyRuntimeExit),
@@ -2261,8 +2269,8 @@ mod tests {
     use crate::runtime::contracts::RpcIdentity;
     use crate::store::{
         ApplyReceiptOutcome, EventBatch, HydrationReceiptIdentity, assert_indeterminate_surface,
-        open_boot_running_tools_store, setup_boot_running_tools,
-        setup_boot_running_tools_on_disk, setup_boot_running_tools_with_rowless_tail,
+        open_boot_running_tools_store, setup_boot_running_tools, setup_boot_running_tools_on_disk,
+        setup_boot_running_tools_with_rowless_tail,
     };
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
@@ -3332,10 +3340,8 @@ mod tests {
     /// ledger, the `indeterminate` terminal and the whole suffix together.
     #[tokio::test]
     async fn a_restart_right_after_the_receipt_transaction_sees_the_whole_suffix() {
-        let root = std::env::temp_dir().join(format!(
-            "sumi-t27-receipt-suffix-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("sumi-t27-receipt-suffix-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).expect("create the on-disk fixture root");
         let database_path = root.join("agent.db");
 
@@ -3379,7 +3385,11 @@ mod tests {
         .fetch_one(reopened.pool())
         .await
         .expect("read the restarted state");
-        assert_eq!(observed, (1, 1, 1, 1), "the restart must not observe a torn suffix");
+        assert_eq!(
+            observed,
+            (1, 1, 1, 1),
+            "the restart must not observe a torn suffix"
+        );
 
         let next = authority_for_generation(9);
         match reopened

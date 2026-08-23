@@ -200,6 +200,10 @@ pub enum InboundCommand {
 }
 
 impl InboundCommand {
+    #[allow(
+        dead_code,
+        reason = "the normalized sequence accessor is retained for gateway consumers"
+    )]
     pub fn seq(&self) -> u64 {
         match self {
             Self::Valid(envelope) => envelope.seq,
