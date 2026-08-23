@@ -529,7 +529,7 @@ describe("Sidebar のプロフィール導線", () => {
     );
 
     expect(
-      screen.getByRole("menu", { name: "この場所のメニュー" }),
+      screen.getByRole("group", { name: "この場所のメニュー" }),
     ).toBeInTheDocument();
   });
 
@@ -542,8 +542,8 @@ describe("Sidebar のプロフィール導線", () => {
     fireEvent.click(
       screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
     );
-    fireEvent.click(screen.getByRole("menuitem", { name: /通知設定/ }));
-    const panel = screen.getByRole("menu", { name: "通知設定" });
+    fireEvent.click(screen.getByRole("button", { name: /通知設定/ }));
+    const panel = screen.getByRole("group", { name: "通知設定" });
     const target = within(panel).getByText("メンションのみ");
     const event = createEvent.contextMenu(target);
     fireEvent(target, event);
