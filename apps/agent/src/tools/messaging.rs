@@ -4380,6 +4380,7 @@ mod tests {
                 "status",
                 "topic",
                 "urgency",
+                "voice",
                 "workspace_id",
             ])
         );
