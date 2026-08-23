@@ -94,9 +94,9 @@ test("the API image and runbook bind the offline schema-30 rollback operator", a
     /COPY --from=build \/usr\/local\/bin\/sumi-schema30-rollback \/usr\/local\/bin\/sumi-schema30-rollback/,
   );
 
-  const commandBlocks = [...rollbackRunbook.matchAll(/```bash\n([\s\S]*?)```/g)].map(
-    (match) => match[1],
-  );
+  const commandBlocks = [
+    ...rollbackRunbook.matchAll(/```bash\n([\s\S]*?)```/g),
+  ].map((match) => match[1]);
   assert.equal(commandBlocks.length, 2);
   for (const command of commandBlocks) {
     assert.match(command, /^set \+x\nset -euo pipefail$/m);
@@ -106,7 +106,9 @@ test("the API image and runbook bind the offline schema-30 rollback operator", a
     assert.doesNotMatch(command, /\$\{SUMI_DB_URL/);
     assert.match(command, /docker image inspect --format/);
     assert.match(command, /docker network inspect/);
-    assert.ok(command.indexOf("docker image inspect") < command.indexOf("docker run"));
+    assert.ok(
+      command.indexOf("docker image inspect") < command.indexOf("docker run"),
+    );
   }
 });
 
