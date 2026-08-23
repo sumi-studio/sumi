@@ -298,7 +298,11 @@ function CreateChannelDialog({
           />
         </label>
         {failed ? (
-          <p className="text-[11px] text-rose-500">
+          <p
+            role="alert"
+            aria-live="assertive"
+            className="text-[11px] text-rose-500"
+          >
             チャンネルを作成できませんでした
           </p>
         ) : null}
@@ -428,7 +432,11 @@ function EditChannelDialog({
           />
         </label>
         {failed ? (
-          <p className="text-[11px] text-rose-500">
+          <p
+            role="alert"
+            aria-live="assertive"
+            className="text-[11px] text-rose-500"
+          >
             チャンネルを更新できませんでした
           </p>
         ) : null}
@@ -607,7 +615,11 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
         </p>
       ) : null}
       {failed ? (
-        <p className="mt-2 text-[11px] text-rose-500">
+        <p
+          role="alert"
+          aria-live="assertive"
+          className="mt-2 text-[11px] text-rose-500"
+        >
           会話を開始できませんでした
         </p>
       ) : null}

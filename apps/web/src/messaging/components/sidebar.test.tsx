@@ -29,6 +29,7 @@ const SELF = { kind: "human", humanId: "human-a" } as const;
 const realCreateChannel = useMessaging.getState().createChannel;
 const realUpdateChannel = useMessaging.getState().updateChannel;
 const realDuplicateChannel = useMessaging.getState().duplicateChannel;
+const realStartDM = useMessaging.getState().startDM;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -330,7 +331,10 @@ describe("Sidebar overlay and IME behavior", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
-    useMessaging.setState({ createChannel: realCreateChannel });
+    useMessaging.setState({
+      createChannel: realCreateChannel,
+      startDM: realStartDM,
+    });
   });
 
   it("shows the selected place notification level inside the place menu and closes after selection", () => {
@@ -390,6 +394,63 @@ describe("Sidebar overlay and IME behavior", () => {
     fireEvent.keyDown(name, { key: "Enter", keyCode: 229 });
 
     expect(createChannel).not.toHaveBeenCalled();
+  });
+
+  it("announces a channel creation failure as an assertive alert", async () => {
+    const rejectedCreate = vi.fn(async (): Promise<PlaceKey> => {
+      throw new Error("permission denied");
+    });
+    useMessaging.setState({ createChannel: rejectedCreate });
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+    fireEvent.click(screen.getByTitle("チャンネルを作成"));
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "名前" }), {
+      target: { value: "拒否される場所" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(alert).toHaveTextContent("チャンネルを作成できませんでした");
+  });
+
+  it("announces a DM start failure as an assertive alert", async () => {
+    const bob = { kind: "human", humanId: "human-b" } as const;
+    const rejectedStart = vi.fn(async (): Promise<PlaceKey> => {
+      throw new Error("stale participant tenure");
+    });
+    useMessaging.setState({
+      membersByKey: {
+        ...useMessaging.getState().membersByKey,
+        "human:human-b": {
+          participant: bob,
+          displayName: "Bob",
+          tagline: "",
+        },
+      },
+      startDM: rejectedStart,
+    });
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+    fireEvent.click(screen.getByTitle("ダイレクトメッセージを開始"));
+    const dialog = screen.getByRole("dialog", {
+      name: "ダイレクトメッセージを開始",
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Bob/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "DMを開始" }));
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(alert).toHaveTextContent("会話を開始できませんでした");
   });
 });
 
@@ -462,6 +523,32 @@ describe("place menu channel actions", () => {
         topic: "設計の話",
       }),
     );
+  });
+
+  it("announces a channel edit failure as an assertive alert", async () => {
+    updateChannel.mockRejectedValueOnce(new Error("revision conflict"));
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
+    fireEvent.change(
+      within(dialog).getByRole("textbox", { name: "トピック" }),
+      { target: { value: "競合する話題" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(alert).toHaveTextContent("チャンネルを更新できませんでした");
+  });
+
+  it("keeps the place overflow action visible for keyboard focus", () => {
+    openAlphaMenu();
+    const trigger = screen.getAllByRole("button", {
+      name: "この場所のメニュー",
+    })[0];
+
+    expect(trigger).toHaveClass("focus-visible:opacity-100");
+    expect(trigger).toHaveClass("group-focus-within:opacity-100");
   });
 
   it("keeps the opening snapshot when a place update arrives before a topic-only save", async () => {

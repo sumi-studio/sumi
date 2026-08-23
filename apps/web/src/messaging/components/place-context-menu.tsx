@@ -90,7 +90,7 @@ export function PlaceContextMenu({
           event.stopPropagation();
           overlay.toggle();
         }}
-        className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
+        className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-focus-within:opacity-100 ${
           open ? "opacity-100" : "opacity-0 group-hover:opacity-100"
         }`}
       >
