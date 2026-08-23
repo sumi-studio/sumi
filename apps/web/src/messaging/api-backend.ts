@@ -865,12 +865,6 @@ function parseStatus(value: unknown): ParticipantStatus {
   };
 }
 
-function asRevision(value: unknown): number {
-  const revision = asSeq(value);
-  if (revision < 1) throw new Error("invalid status revision");
-  return revision;
-}
-
 function parseReplyLater(value: unknown): ReplyLaterMarker {
   const wire = asRecord(value);
   return {

@@ -1598,7 +1598,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 既読進行が正本で、bootstrapのスナップショットで塗り直すと読んだはずの
    * メッセージが未読へ巻き戻る。未読を採用するのはこのクライアントがまだ
    * 知らなかったplaceだけにする。
-  */
+   */
   const reconcilePlaces = async () => {
     const request = beginMessagingBackendRequest();
     const currentIdentity = getMessagingSessionIdentity();

@@ -12,15 +12,11 @@ import {
   useMessaging,
 } from "../store";
 import { ModalDialog } from "./modal-dialog";
-import { ownsEvent, useOverlayPanel } from "./overlay";
-import {
-  ParticipantAvatar,
-  STATUS_DOT,
-  STATUS_LABEL,
-} from "./participant-avatar";
+import { ownsEvent } from "./overlay";
+import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 import { PlaceContextMenu } from "./place-context-menu";
 import { StatusMenu } from "./status-menu";
-import { ParticipantProfilePopover } from "./participant-profile";
 
 const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 

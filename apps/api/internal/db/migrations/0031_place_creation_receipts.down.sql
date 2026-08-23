@@ -1,1 +1,0 @@
-DROP TABLE messaging_place_creation_receipts;

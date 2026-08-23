@@ -216,6 +216,7 @@ describe("Composer attachments", () => {
         {
           channelId: "ch-general",
           workspaceId: "ws",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",
@@ -462,6 +463,7 @@ describe("Composer attachment cards", () => {
           {
             channelId: "ch-general",
             workspaceId: "ws",
+            revision: 1,
             name: "general",
             topic: "",
             visibility: "public",
