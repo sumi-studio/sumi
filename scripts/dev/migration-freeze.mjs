@@ -23,17 +23,27 @@ async function manifest() {
   return `${lines.join("\n")}\n`;
 }
 
-const migrationName = /^(\d+)_([^.]+)\.(up|down)\.sql$/;
+const migrationName = /^(\d{4})_([a-z0-9_]+)\.(up|down)\.sql$/;
 
 function entries(text) {
-  return text.trimEnd().split("\n").filter(Boolean).map((line) => {
-    const [digest, name, ...extra] = line.trim().split(/\s+/);
+  if (!text.endsWith("\n") || text.length === 1) {
+    throw new Error("migration freeze manifest must be non-empty and end with a newline");
+  }
+  const parsed = text.slice(0, -1).split("\n").map((line) => {
+    const [digest, name, ...extra] = line.split("  ");
     const match = migrationName.exec(name ?? "");
-    if (extra.length !== 0 || !/^[0-9a-f]{64}$/.test(digest ?? "") || !match) {
+    if (extra.length !== 0 || line !== `${digest}  ${name}` ||
+        !/^[0-9a-f]{64}$/.test(digest ?? "") || !match) {
       throw new Error(`invalid migration freeze entry: ${line}`);
     }
     return { line, digest, name, version: Number(match[1]), stem: match[2], direction: match[3] };
   });
+  for (let index = 1; index < parsed.length; index++) {
+    if (parsed[index - 1].name >= parsed[index].name) {
+      throw new Error("migration freeze entries must use canonical filename order");
+    }
+  }
+  return parsed;
 }
 
 export function validateSeal(actualText) {
@@ -52,24 +62,24 @@ export function validateSeal(actualText) {
 }
 
 export function validateExtension(expectedText, actualText) {
+  validateSeal(expectedText);
+  validateSeal(actualText);
   const expected = entries(expectedText);
   const actual = entries(actualText);
-  const actualLines = new Set(actual.map((entry) => entry.line));
-  for (const entry of expected) {
-    if (!actualLines.has(entry.line)) {
-      throw new Error(`sealed migration changed or disappeared: ${entry.line}`);
+  for (let index = 0; index < expected.length; index++) {
+    if (actual[index]?.line !== expected[index].line) {
+      throw new Error(`sealed migration changed, disappeared, or moved: ${expected[index].line}`);
     }
   }
-  const expectedLines = new Set(expected.map((entry) => entry.line));
-  const added = actual.filter((entry) => !expectedLines.has(entry.line));
+  const added = actual.slice(expected.length);
   const sealedMaximum = Math.max(...expected.map((entry) => entry.version));
   const addedVersions = new Set(added.map((entry) => entry.version));
   if (addedVersions.size !== 1) {
     throw new Error("extend must seal exactly one new migration version");
   }
   const [newVersion] = addedVersions;
-  if (newVersion <= sealedMaximum) {
-    throw new Error(`new migration version ${newVersion} must exceed sealed maximum ${sealedMaximum}`);
+  if (newVersion !== sealedMaximum + 1) {
+    throw new Error(`new migration version ${newVersion} must immediately follow sealed maximum ${sealedMaximum}`);
   }
   const pair = added.filter((entry) => entry.version === newVersion);
   if (pair.length !== 2 || new Set(pair.map((entry) => entry.direction)).size !== 2 ||

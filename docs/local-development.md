@@ -174,11 +174,12 @@ first message. From that commit onward, every migration file named in the
 manifest is immutable and all schema changes use a new forward migration. The
 ordinary database test suite validates the seal; `node
 scripts/dev/migration-freeze.mjs check` provides the same explicit operator
-check. A later forward migration must be added to the manifest with
+check. A later forward migration must use the next numeric version and be added to the manifest with
 `node scripts/dev/migration-freeze.mjs extend`; that command refuses to extend
 over any changed or deleted sealed entry, a numeric gap at or below the sealed
-maximum, or anything other than one matching `up`/`down` pair at a new higher
-version. Resetting or replacing an applied migration is no longer an available
+maximum, or anything other than one matching `up`/`down` pair at the immediately
+following version. Manifest lines are in canonical filename order and append-only.
+Resetting or replacing an applied migration is no longer an available
 operation after this point.
 
 First validate configuration, then start:
