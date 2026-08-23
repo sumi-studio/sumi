@@ -1217,11 +1217,25 @@ func TestPlaceStatusRevisionReceiptsMigrationDownAndReupgrade(t *testing.T) {
 
 	assertShape := func(want bool) {
 		t.Helper()
-		var receipts, placeRevision, placeFunction, statusFunction, statusIndex bool
+		var receipts, receiptTenure, receiptTenureFK bool
+		var placeRevision, placeFunction, statusFunction, statusIndex bool
 		var statusColumns int
 		if err := pool.QueryRow(ctx, `
 			SELECT
 				to_regclass('messaging_place_creation_receipts') IS NOT NULL,
+				EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name = 'messaging_place_creation_receipts'
+					  AND column_name = 'workspace_member_id'
+				),
+				EXISTS (
+					SELECT 1 FROM pg_constraint
+					WHERE conname = 'messaging_place_creation_receipts_workspace_member_identity'
+					  AND conrelid = to_regclass('messaging_place_creation_receipts')
+					  AND confrelid = to_regclass('workspace_members')
+					  AND contype = 'f'
+				),
 				EXISTS (
 					SELECT 1 FROM information_schema.columns
 					WHERE table_schema = current_schema()
@@ -1237,15 +1251,18 @@ func TestPlaceStatusRevisionReceiptsMigrationDownAndReupgrade(t *testing.T) {
 					  AND column_name IN ('base_status', 'base_note', 'revision')
 				)
 		`).Scan(
-			&receipts, &placeRevision, &placeFunction, &statusFunction,
+			&receipts, &receiptTenure, &receiptTenureFK,
+			&placeRevision, &placeFunction, &statusFunction,
 			&statusIndex, &statusColumns,
 		); err != nil {
 			t.Fatal(err)
 		}
-		if receipts != want || placeRevision != want || placeFunction != want ||
+		if receipts != want || receiptTenure != want || receiptTenureFK != want ||
+			placeRevision != want || placeFunction != want ||
 			statusFunction != want || statusIndex != want || (statusColumns == 3) != want {
-			t.Fatalf("0031 shape = receipts:%t place-column:%t place-function:%t status-function:%t status-index:%t status-columns:%d, want present=%t",
-				receipts, placeRevision, placeFunction, statusFunction, statusIndex, statusColumns, want)
+			t.Fatalf("0031 shape = receipts:%t receipt-tenure:%t receipt-tenure-fk:%t place-column:%t place-function:%t status-function:%t status-index:%t status-columns:%d, want present=%t",
+				receipts, receiptTenure, receiptTenureFK, placeRevision, placeFunction,
+				statusFunction, statusIndex, statusColumns, want)
 		}
 	}
 	assertShape(true)

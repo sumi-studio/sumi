@@ -62,20 +62,26 @@ BEFORE UPDATE ON places
 FOR EACH ROW EXECUTE FUNCTION messaging_increment_place_revision();
 
 -- A response can be lost after a channel, copy, or group DM commits. The
--- authenticated actor's nonce records the exact creation result so a bounded
--- retry returns that place rather than creating a second one.
+-- authenticated actor's exact Workspace membership tenure and nonce record
+-- the creation result so a bounded retry returns that place without exposing
+-- it to the same participant after they leave and rejoin under a new tenure.
 CREATE TABLE messaging_place_creation_receipts (
-    workspace_id   uuidv7 NOT NULL,
-    member_kind    text   NOT NULL
+    workspace_id        uuidv7 NOT NULL,
+    workspace_member_id uuidv7 NOT NULL,
+    member_kind         text   NOT NULL
         CHECK (member_kind IN ('human', 'personality_agent')),
-    member_id      uuidv7 NOT NULL,
-    operation      text   NOT NULL
+    member_id           uuidv7 NOT NULL,
+    operation           text   NOT NULL
         CHECK (operation IN ('create_channel', 'duplicate_channel', 'create_group_dm')),
-    client_nonce   text   NOT NULL CHECK (length(client_nonce) BETWEEN 1 AND 128),
-    request_digest bytea  NOT NULL CHECK (octet_length(request_digest) = 32),
-    place_id       uuidv7 NOT NULL,
-    created_at     timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (workspace_id, member_kind, member_id, operation, client_nonce),
+    client_nonce        text   NOT NULL CHECK (length(client_nonce) BETWEEN 1 AND 128),
+    request_digest      bytea  NOT NULL CHECK (octet_length(request_digest) = 32),
+    place_id            uuidv7 NOT NULL,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, workspace_member_id, operation, client_nonce),
+    CONSTRAINT messaging_place_creation_receipts_workspace_member_identity
+        FOREIGN KEY (workspace_id, workspace_member_id, member_kind, member_id)
+        REFERENCES workspace_members
+            (workspace_id, workspace_member_id, member_kind, member_id),
     FOREIGN KEY (workspace_id, place_id)
         REFERENCES places (workspace_id, place_id)
 );

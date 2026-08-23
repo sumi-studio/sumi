@@ -87,6 +87,7 @@ func (s *ScopedStore) replayPlaceCreation(
 	tx pgx.Tx,
 	operation, nonce string,
 	digest []byte,
+	workspaceMemberID string,
 ) (Place, bool, error) {
 	if nonce == "" {
 		return Place{}, false, nil
@@ -96,18 +97,25 @@ func (s *ScopedStore) replayPlaceCreation(
 	}
 	receiptNonce := s.placeCreationReceiptNonce(nonce)
 	key := fmt.Sprintf("place-creation/%s/%s/%s/%s", s.Scope.WorkspaceID, s.Scope.Actor.Key(), operation, receiptNonce)
+	if workspaceMemberID != "" {
+		key += "/" + workspaceMemberID
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
 		return Place{}, false, fmt.Errorf("lock place creation nonce: %w", err)
 	}
 	var storedDigest []byte
 	var placeID string
-	err := tx.QueryRow(ctx, `
+	receiptQuery := `
 		SELECT request_digest, place_id
 		FROM messaging_place_creation_receipts
 		WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3
-		  AND operation = $4 AND client_nonce = $5`,
-		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, receiptNonce,
-	).Scan(&storedDigest, &placeID)
+		  AND operation = $4 AND client_nonce = $5`
+	args := []any{s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation, receiptNonce}
+	if workspaceMemberID != "" {
+		receiptQuery += ` AND workspace_member_id = $6`
+		args = append(args, workspaceMemberID)
+	}
+	err := tx.QueryRow(ctx, receiptQuery, args...).Scan(&storedDigest, &placeID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Place{}, false, nil
 	}
@@ -130,16 +138,18 @@ func (s *ScopedStore) recordPlaceCreation(
 	operation, nonce string,
 	digest []byte,
 	placeID string,
+	workspaceMemberID string,
 ) error {
 	if nonce == "" {
 		return nil
 	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO messaging_place_creation_receipts
-			(workspace_id, member_kind, member_id, operation, client_nonce, request_digest, place_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, operation,
-		s.placeCreationReceiptNonce(nonce), digest, placeID,
+			(workspace_id, workspace_member_id, member_kind, member_id,
+			 operation, client_nonce, request_digest, place_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		s.Scope.WorkspaceID, workspaceMemberID, s.Scope.Actor.Kind, s.Scope.Actor.ID,
+		operation, s.placeCreationReceiptNonce(nonce), digest, placeID,
 	)
 	if err != nil {
 		return fmt.Errorf("record place creation receipt: %w", err)
@@ -197,10 +207,11 @@ func (s *ScopedStore) createChannel(ctx context.Context, name, topic string, voi
 		return Place{}, false, fmt.Errorf("begin create channel: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeManageChannelsInTx(ctx, tx); err != nil {
+	membership, err := s.authorizeManageChannelsInTx(ctx, tx)
+	if err != nil {
 		return Place{}, false, err
 	}
-	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationChannel, nonce, digest); err != nil || replayed {
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationChannel, nonce, digest, membership.WorkspaceMemberID); err != nil || replayed {
 		if err != nil {
 			return Place{}, false, err
 		}
@@ -213,7 +224,7 @@ func (s *ScopedStore) createChannel(ctx context.Context, name, topic string, voi
 	if err != nil {
 		return Place{}, false, fmt.Errorf("insert channel: %w", err)
 	}
-	if err := s.recordPlaceCreation(ctx, tx, placeCreationChannel, nonce, digest, place.PlaceID); err != nil {
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationChannel, nonce, digest, place.PlaceID, membership.WorkspaceMemberID); err != nil {
 		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -336,10 +347,11 @@ func (s *ScopedStore) duplicateChannel(ctx context.Context, placeID, name, nonce
 		return Place{}, false, fmt.Errorf("begin duplicate channel: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := s.authorizeManageChannelsInTx(ctx, tx); err != nil {
+	membership, err := s.authorizeManageChannelsInTx(ctx, tx)
+	if err != nil {
 		return Place{}, false, err
 	}
-	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationDuplicate, nonce, digest); err != nil || replayed {
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationDuplicate, nonce, digest, membership.WorkspaceMemberID); err != nil || replayed {
 		if err != nil {
 			return Place{}, false, err
 		}
@@ -365,7 +377,7 @@ func (s *ScopedStore) duplicateChannel(ctx context.Context, placeID, name, nonce
 	if err != nil {
 		return Place{}, false, fmt.Errorf("insert duplicated channel: %w", err)
 	}
-	if err := s.recordPlaceCreation(ctx, tx, placeCreationDuplicate, nonce, digest, place.PlaceID); err != nil {
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationDuplicate, nonce, digest, place.PlaceID, membership.WorkspaceMemberID); err != nil {
 		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -503,7 +515,7 @@ func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef
 	if err != nil {
 		return Place{}, false, err
 	}
-	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest); err != nil || replayed {
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest, ""); err != nil || replayed {
 		if err != nil {
 			return Place{}, false, err
 		}
@@ -534,7 +546,7 @@ func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef
 			return Place{}, false, err
 		}
 	}
-	if err := s.recordPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest, place.PlaceID); err != nil {
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest, place.PlaceID, actorMembership.WorkspaceMemberID); err != nil {
 		return Place{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {

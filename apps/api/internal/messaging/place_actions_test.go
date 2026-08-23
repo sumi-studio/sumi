@@ -260,6 +260,76 @@ func TestPlaceCreationNonceReplaysTheCommittedPlace(t *testing.T) {
 	}
 }
 
+func TestChannelCreationReceiptsDoNotReplayAcrossWorkspaceTenures(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, source := w.workspaceWithChannel(t, ctx)
+	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	membershipM1 := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+	var manageChannelsRoleID string
+	if err := w.store.pool.QueryRow(ctx, `
+		SELECT role_id FROM workspace_role_assignments
+		WHERE workspace_id = $1 AND workspace_member_id = $2`,
+		workspace.WorkspaceID, membershipM1,
+	).Scan(&manageChannelsRoleID); err != nil {
+		t.Fatalf("load M1 channel-management role: %v", err)
+	}
+
+	createdM1, fresh, err := scoped.CreateChannelOnce(ctx, "tenure-create", "", false, "tenure-create-nonce")
+	if err != nil || !fresh {
+		t.Fatalf("M1 create = (%+v, %v, %v), want fresh", createdM1, fresh, err)
+	}
+	duplicatedM1, fresh, err := scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "tenure-duplicate-nonce")
+	if err != nil || !fresh {
+		t.Fatalf("M1 duplicate = (%+v, %v, %v), want fresh", duplicatedM1, fresh, err)
+	}
+
+	if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("remove M1: %v", err)
+	}
+	if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("join M2: %v", err)
+	}
+	membershipM2 := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+	if membershipM2 == membershipM1 {
+		t.Fatalf("rejoin reused Workspace membership %s", membershipM2)
+	}
+	if _, err := w.workspaces.SetMembershipRoles(
+		ctx, workspace.WorkspaceID, membershipM2, w.humanA, []string{manageChannelsRoleID},
+	); err != nil {
+		t.Fatalf("grant M2 channel-management role: %v", err)
+	}
+
+	createdM2, fresh, err := scoped.CreateChannelOnce(ctx, "tenure-create", "", false, "tenure-create-nonce")
+	if err != nil || !fresh || createdM2.PlaceID == createdM1.PlaceID {
+		t.Fatalf("M2 create = (%+v, %v, %v), want independent fresh place from M1 %s", createdM2, fresh, err, createdM1.PlaceID)
+	}
+	duplicatedM2, fresh, err := scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "tenure-duplicate-nonce")
+	if err != nil || !fresh || duplicatedM2.PlaceID == duplicatedM1.PlaceID {
+		t.Fatalf("M2 duplicate = (%+v, %v, %v), want independent fresh place from M1 %s", duplicatedM2, fresh, err, duplicatedM1.PlaceID)
+	}
+
+	for name, replay := range map[string]func() (Place, bool, error){
+		"create": func() (Place, bool, error) {
+			return scoped.CreateChannelOnce(ctx, "tenure-create", "", false, "tenure-create-nonce")
+		},
+		"duplicate": func() (Place, bool, error) {
+			return scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "tenure-duplicate-nonce")
+		},
+	} {
+		got, replayFresh, replayErr := replay()
+		wantPlaceID := createdM2.PlaceID
+		if name == "duplicate" {
+			wantPlaceID = duplicatedM2.PlaceID
+		}
+		if replayErr != nil || replayFresh || got.PlaceID != wantPlaceID {
+			t.Fatalf("M2 %s replay = (%+v, %v, %v), want M2 place %s", name, got, replayFresh, replayErr, wantPlaceID)
+		}
+	}
+}
+
 func TestPlaceCreationReplayRevalidatesCurrentAuthorityAndPrivateTenure(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
