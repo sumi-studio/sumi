@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { validateExtension, validateSeal } from "./migration-freeze.mjs";
+import {
+  validateCandidateAgainstBase,
+  validateExactSeal,
+  validateExtension,
+  validateSeal,
+  verifyAgainstBase,
+} from "./migration-freeze.mjs";
 
 const line = (version, stem, direction, digest) =>
   `${digest.repeat(64)}  ${String(version).padStart(4, "0")}_${stem}.${direction}.sql`;
@@ -13,9 +19,11 @@ const sealed = [
   line(16, "identity", "up", "c"),
 ].join("\n") + "\n";
 
+const nextPair = line(17, "workspace", "down", "f") + "\n" +
+  line(17, "workspace", "up", "e") + "\n";
+
 test("accepts one matching pair at the next version", () => {
-  const actual = sealed + line(17, "workspace", "down", "f") + "\n" +
-    line(17, "workspace", "up", "e") + "\n";
+  const actual = sealed + nextPair;
   assert.doesNotThrow(() => validateExtension(sealed, actual));
 });
 
@@ -65,4 +73,111 @@ test("rejects reordering sealed entries", () => {
 test("rejects non-canonical formatting", () => {
   assert.throws(() => validateSeal(sealed.trimEnd()), /end with a newline/);
   assert.throws(() => validateSeal(sealed.replace("  0015", " 0015")), /invalid migration freeze entry/);
+});
+
+test("exact check validates malformed matching inputs before comparing bytes", () => {
+  const malformed = sealed.trimEnd();
+  assert.throws(() => validateExactSeal(malformed, malformed), /end with a newline/);
+});
+
+test("base comparison allows an unchanged valid seal", () => {
+  assert.equal(validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: sealed,
+    candidateManifest: sealed,
+    candidateActual: sealed,
+  }), "unchanged seal");
+});
+
+test("base comparison allows one exact next migration pair", () => {
+  const extended = sealed + nextPair;
+  assert.equal(validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: sealed,
+    candidateManifest: extended,
+    candidateActual: extended,
+  }), "one-version extension");
+});
+
+test("base comparison rejects a synchronized sealed SQL and digest rewrite", () => {
+  const rewritten = sealed.replace("a".repeat(64), "9".repeat(64));
+  assert.throws(() => validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: sealed,
+    candidateManifest: rewritten,
+    candidateActual: rewritten,
+  }), /changed, disappeared, or moved/);
+});
+
+test("base comparison rejects malformed candidate and base history", () => {
+  const malformed = sealed.trimEnd();
+  assert.throws(() => validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: sealed,
+    candidateManifest: malformed,
+    candidateActual: malformed,
+  }), /end with a newline/);
+  assert.throws(() => validateCandidateAgainstBase({
+    baseManifest: malformed,
+    baseActual: sealed,
+    candidateManifest: sealed,
+    candidateActual: sealed,
+  }), /end with a newline/);
+  const inconsistentBase = sealed.replace("a".repeat(64), "9".repeat(64));
+  assert.throws(() => validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: inconsistentBase,
+    candidateManifest: sealed,
+    candidateActual: sealed,
+  }), /differs from FROZEN/);
+});
+
+test("base comparison rejects two versions and a forward gap", () => {
+  const twoVersions = sealed + nextPair +
+    line(18, "profiles", "down", "8") + "\n" +
+    line(18, "profiles", "up", "7") + "\n";
+  assert.throws(() => validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: sealed,
+    candidateManifest: twoVersions,
+    candidateActual: twoVersions,
+  }), /exactly one new migration version/);
+
+  const gap = sealed +
+    line(18, "profiles", "down", "8") + "\n" +
+    line(18, "profiles", "up", "7") + "\n";
+  assert.throws(() => validateCandidateAgainstBase({
+    baseManifest: sealed,
+    baseActual: sealed,
+    candidateManifest: gap,
+    candidateActual: gap,
+  }), /immediately follow sealed maximum/);
+});
+
+test("initial seal requires candidate SQL to exactly match the unsealed base", () => {
+  assert.equal(validateCandidateAgainstBase({
+    baseManifest: undefined,
+    baseActual: sealed,
+    candidateManifest: sealed,
+    candidateActual: sealed,
+  }), "initial seal");
+
+  const changedCandidates = [
+    sealed.replace("a".repeat(64), "9".repeat(64)),
+    sealed + nextPair,
+    sealed.split("\n").filter((entry) => !entry.includes("0016_")).join("\n"),
+    sealed.replaceAll("identity", "profile"),
+  ];
+  for (const changed of changedCandidates) {
+    assert.throws(() => validateCandidateAgainstBase({
+      baseManifest: undefined,
+      baseActual: sealed,
+      candidateManifest: changed,
+      candidateActual: changed,
+    }), /preserve and exactly seal the base migration SQL assets/);
+  }
+});
+
+test("Git base verification rejects ambiguous or injectable refs before lookup", async () => {
+  await assert.rejects(() => verifyAgainstBase("main; touch /tmp/not-allowed"), /exact lowercase 40-hex/);
 });
