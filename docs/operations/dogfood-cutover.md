@@ -41,6 +41,22 @@ until it has been pushed; an empty `repo_digests` array is explicit, not a
 registry attestation. On any partial build or inspection mismatch there is no
 `COMPLETE` manifest.
 
+The script exports the pinned commit into one owner-only temporary context,
+re-hashes that exported tree, and uses the same context for all four builds.
+Ignored and untracked files—including local credentials, `.tfvars`, and native
+build products—never enter the context, and an edit to the live checkout after
+export cannot change a later image. The context is removed on success and on
+failure. The repository currently uses neither submodules nor Git LFS; the
+script fails closed if either policy appears because a plain tracked-tree
+export would otherwise omit submodule content or preserve LFS pointers instead
+of proving the intended bytes.
+
+Each build writes an isolated Docker `--iidfile`. Inspection addresses that
+canonical image ID, not its mutable tag, and consumes one bounded JSON evidence
+object. Immediately before publishing `COMPLETE`, the script resolves every
+intended tag again and requires it to equal the captured ID. A missing or
+retagged reference leaves no completion manifest.
+
 The current Dockerfiles contain upstream image/package selectors that are not
 content-digest pinned. The source SHA and labels therefore prove which Sumi
 tree was built, but they do not make independent rebuilds byte-for-byte
@@ -87,6 +103,30 @@ This path uses the four locally inspected images and makes registry access
 irrelevant to image selection. Keep the launcher-required owner-only Docker
 configuration file in place even when pulls are disabled; that file mount is a
 separate provisioner boundary.
+
+Local Docker tags remain mutable after the manifest is written. Immediately
+before the reviewed cutover, the operator must re-resolve all four references
+and compare their image IDs with the manifest. Treat any elapsed handoff where
+that comparison was not performed, or any mismatch, as a failed image gate;
+the manifest is point-in-time evidence, not a lock on the Docker daemon.
+
+```sh
+MANIFEST=".dogfood-manifests/images-${SHA}.json"
+node - "${MANIFEST}" <<'NODE'
+const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (manifest.status !== "COMPLETE" || manifest.images.length !== 4) process.exit(1);
+for (const image of manifest.images) {
+  const actual = execFileSync(
+    "docker",
+    ["image", "inspect", "--format", "{{.Id}}", image.reference],
+    { encoding: "utf8" },
+  ).trim();
+  if (actual !== image.id) throw new Error(`local tag mismatch: ${image.reference}`);
+}
+NODE
+```
 
 ```sh
 export SUMI_AGENT_IMAGE_PULL_POLICY=never
