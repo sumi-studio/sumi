@@ -14,7 +14,7 @@ export class PlaceCreationAttemptLedger {
   private readonly attempts = new Map<string, string>();
   private ownerKey: string | null = null;
   private persistent = false;
-  private readonly storage: Storage | null;
+  private storage: Storage | null;
   private readonly capacity: number;
   private readonly nonceFactory: () => string;
 
@@ -36,15 +36,21 @@ export class PlaceCreationAttemptLedger {
     if (!persistent || !this.storage) return;
 
     const storageKey = this.storageKey(ownerKey);
-    // sessionStorage is tab-scoped. Any other exact authority is obsolete in
-    // this tab and must not retain capability-like reconciliation state.
-    for (let index = this.storage.length - 1; index >= 0; index -= 1) {
-      const key = this.storage.key(index);
-      if (key?.startsWith(STORAGE_PREFIX) && key !== storageKey) {
-        this.storage.removeItem(key);
+    let encoded: string | null;
+    try {
+      // sessionStorage is tab-scoped. Any other exact authority is obsolete in
+      // this tab and must not retain capability-like reconciliation state.
+      for (let index = this.storage.length - 1; index >= 0; index -= 1) {
+        const key = this.storage.key(index);
+        if (key?.startsWith(STORAGE_PREFIX) && key !== storageKey) {
+          this.storage.removeItem(key);
+        }
       }
+      encoded = this.storage.getItem(storageKey);
+    } catch {
+      this.degradeStorage();
+      return;
     }
-    const encoded = this.storage.getItem(storageKey);
     if (encoded === null) return;
     const entries: unknown = JSON.parse(encoded);
     if (!Array.isArray(entries) || entries.length > this.capacity) {
@@ -68,12 +74,14 @@ export class PlaceCreationAttemptLedger {
   }
 
   authorityReplaced(): void {
-    if (this.persistent && this.ownerKey && this.storage) {
-      this.storage.removeItem(this.storageKey(this.ownerKey));
-    }
+    const storageKey =
+      this.persistent && this.ownerKey && this.storage
+        ? this.storageKey(this.ownerKey)
+        : null;
     this.attempts.clear();
     this.ownerKey = null;
     this.persistent = false;
+    if (storageKey) this.removeItem(storageKey);
   }
 
   nonceFor(declaration: string): string {
@@ -90,28 +98,38 @@ export class PlaceCreationAttemptLedger {
 
   complete(declaration: string, nonce: string): void {
     if (this.attempts.get(declaration) !== nonce) return;
-    if (this.persistent && this.ownerKey && this.storage) {
-      const remaining = [...this.attempts].filter(
-        ([candidate]) => candidate !== declaration,
-      );
-      const key = this.storageKey(this.ownerKey);
-      if (remaining.length === 0) {
-        this.storage.removeItem(key);
-      } else {
-        this.storage.setItem(key, JSON.stringify(remaining));
-      }
-    }
     this.attempts.delete(declaration);
+    this.persist();
   }
 
   private persist(): void {
     if (!this.persistent || !this.ownerKey || !this.storage) return;
     const key = this.storageKey(this.ownerKey);
     if (this.attempts.size === 0) {
-      this.storage.removeItem(key);
+      this.removeItem(key);
       return;
     }
-    this.storage.setItem(key, JSON.stringify([...this.attempts]));
+    const encoded = JSON.stringify([...this.attempts]);
+    try {
+      this.storage.setItem(key, encoded);
+    } catch {
+      this.degradeStorage();
+    }
+  }
+
+  private removeItem(key: string): void {
+    if (!this.storage) return;
+    try {
+      this.storage.removeItem(key);
+    } catch {
+      this.degradeStorage();
+    }
+  }
+
+  private degradeStorage(): void {
+    // Storage is an optional reload aid. Once the browser denies or loses it,
+    // this ledger remains authoritative in memory for the rest of the tab.
+    this.storage = null;
   }
 
   private storageKey(ownerKey: string): string {

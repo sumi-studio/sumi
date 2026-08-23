@@ -18,6 +18,38 @@ const SELF: ParticipantRef = { kind: "human", humanId: "human-a" };
 const BOB: ParticipantRef = { kind: "human", humanId: "human-b" };
 const CAROL: ParticipantRef = { kind: "human", humanId: "human-c" };
 
+class ThrowingStorage implements Storage {
+  readonly values = new Map<string, string>();
+  throwOnRemove = false;
+  throwOnSet = false;
+
+  get length(): number {
+    return this.values.size;
+  }
+
+  clear(): void {
+    this.values.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return [...this.values.keys()][index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    if (this.throwOnRemove) throw new Error("Storage remove denied");
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    if (this.throwOnSet) throw new Error("Storage quota denied");
+    this.values.set(key, value);
+  }
+}
+
 function signIn(): MockMessagingServer {
   bindMessagingSessionIdentity(null);
   bindMessagingSessionIdentity("human-a");
@@ -305,6 +337,119 @@ describe("place creation logical-attempt nonces", () => {
     expect(afterAcknowledgement.nonceFor(declaration)).not.toBe(
       committedButAmbiguous,
     );
+  });
+
+  it("retains an ambiguous attempt in memory when Storage setItem fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `set-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    storage.throwOnSet = true;
+
+    const retained = ledger.nonceFor("create-a");
+    expect(ledger.nonceFor("create-a")).toBe(retained);
+    expect(storage.values.size).toBe(0);
+
+    // Degradation is sticky: later Storage recovery cannot silently replace
+    // the in-memory ambiguous attempt or give it a second nonce.
+    storage.throwOnSet = false;
+    expect(ledger.nonceFor("create-a")).toBe(retained);
+    expect(storage.values.size).toBe(0);
+  });
+
+  it("completes in memory when removing the final persisted attempt fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `remove-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    const acknowledged = ledger.nonceFor("create-a");
+    storage.throwOnRemove = true;
+
+    expect(() => ledger.complete("create-a", acknowledged)).not.toThrow();
+    expect(ledger.nonceFor("create-a")).not.toBe(acknowledged);
+  });
+
+  it("completes one attempt in memory when persisting the remainder fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `remaining-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    const completed = ledger.nonceFor("create-a");
+    const unresolved = ledger.nonceFor("create-b");
+    storage.throwOnSet = true;
+
+    expect(() => ledger.complete("create-a", completed)).not.toThrow();
+    expect(ledger.nonceFor("create-a")).not.toBe(completed);
+    expect(ledger.nonceFor("create-b")).toBe(unresolved);
+  });
+
+  it("resets authority in memory when persisted-state removal fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `authority-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    const obsolete = ledger.nonceFor("duplicate-a");
+    storage.throwOnRemove = true;
+
+    expect(() => ledger.authorityReplaced()).not.toThrow();
+    ledger.activate("owner-b", true);
+    expect(ledger.nonceFor("duplicate-a")).not.toBe(obsolete);
+  });
+
+  it("does not report canonical success as failure and renews manual gestures after Storage failure", async () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `success-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+
+    const gesture = async () => {
+      const nonce = ledger.nonceFor("create-a");
+      const canonicalResult = await Promise.resolve("channel:created");
+      ledger.complete("create-a", nonce);
+      return { canonicalResult, nonce };
+    };
+    storage.throwOnRemove = true;
+    const first = await gesture();
+    expect(first).toMatchObject({
+      canonicalResult: "channel:created",
+    });
+    const retry = await gesture();
+    expect(retry).toMatchObject({
+      canonicalResult: "channel:created",
+    });
+
+    expect(retry.nonce).not.toBe(first.nonce);
+  });
+
+  it("still rejects malformed persisted ledger state instead of swallowing logic errors", () => {
+    const storage = new ThrowingStorage();
+    storage.values.set(
+      "sumi.messaging.place-creation-attempts/v1/owner-a",
+      "not-json",
+    );
+    const ledger = new PlaceCreationAttemptLedger(storage);
+
+    expect(() => ledger.activate("owner-a", true)).toThrow(SyntaxError);
   });
 
   it("does not carry persisted reconciliation state across authority replacement", () => {
