@@ -337,7 +337,7 @@ describe("Sidebar overlay and IME behavior", () => {
     });
   });
 
-  it("shows the selected place notification level inside the place menu and closes after selection", () => {
+  it("exposes place actions as native buttons and restores focus when closed", () => {
     render(
       <Sidebar
         selectedPlaceKey="channel:channel-a"
@@ -345,22 +345,65 @@ describe("Sidebar overlay and IME behavior", () => {
       />,
     );
 
-    fireEvent.click(
-      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
-    );
-    fireEvent.click(screen.getByRole("menuitem", { name: /通知設定/ }));
+    const trigger = screen.getAllByRole("button", {
+      name: "この場所のメニュー",
+    })[0];
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    expect(screen.queryByRole("menu")).toBeNull();
+    const actionGroup = screen.getByRole("group", {
+      name: "この場所のメニュー",
+    });
+    expect(actionGroup).toBeVisible();
     expect(
-      screen.getByRole("menuitemradio", { name: /すべて通知/ }),
-    ).toBeChecked();
-    fireEvent.click(screen.getByRole("menuitemradio", { name: /ミュート/ }));
+      within(actionGroup)
+        .getAllByRole("button")
+        .every((button) => button.tabIndex === 0),
+    ).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "チャンネルを編集" }),
+    ).toHaveFocus();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(
+      screen.queryByRole("group", { name: "この場所のメニュー" }),
+    ).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("exposes notification choices as pressed buttons and closes after selection", () => {
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+
+    const trigger = screen.getAllByRole("button", {
+      name: "この場所のメニュー",
+    })[0];
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("button", { name: /通知設定/ }));
+    const notificationGroup = screen.getByRole("group", {
+      name: "通知設定",
+    });
+    const allNotifications = within(notificationGroup).getByRole("button", {
+      name: /すべて通知/,
+    });
+    expect(allNotifications).toHaveAttribute("aria-pressed", "true");
+    expect(allNotifications).toHaveFocus();
+    expect(notificationGroup).toBeVisible();
+    fireEvent.click(
+      within(notificationGroup).getByRole("button", { name: /ミュート/ }),
+    );
 
     expect(setPlaceNotificationLevel).toHaveBeenCalledWith(
       "channel:channel-a",
       "mute",
     );
-    expect(
-      screen.queryByRole("menuitemradio", { name: /ミュート/ }),
-    ).toBeNull();
+    expect(screen.queryByRole("group", { name: "通知設定" })).toBeNull();
+    expect(trigger).toHaveFocus();
   });
 
   it("closes the status menu on an outside pointerdown", () => {
@@ -503,7 +546,7 @@ describe("place menu channel actions", () => {
 
   it("refuses to save an edit that names no change, then sends only what changed", async () => {
     openAlphaMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+    fireEvent.click(screen.getByRole("button", { name: "チャンネルを編集" }));
 
     const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
     expect(within(dialog).getByRole("textbox", { name: "名前" })).toHaveValue(
@@ -528,7 +571,7 @@ describe("place menu channel actions", () => {
   it("announces a channel edit failure as an assertive alert", async () => {
     updateChannel.mockRejectedValueOnce(new Error("revision conflict"));
     openAlphaMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+    fireEvent.click(screen.getByRole("button", { name: "チャンネルを編集" }));
     const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
     fireEvent.change(
       within(dialog).getByRole("textbox", { name: "トピック" }),
@@ -553,7 +596,7 @@ describe("place menu channel actions", () => {
 
   it("keeps the opening snapshot when a place update arrives before a topic-only save", async () => {
     openAlphaMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "チャンネルを編集" }));
+    fireEvent.click(screen.getByRole("button", { name: "チャンネルを編集" }));
 
     // 自分の編集とは別の更新が、ダイアログを開いた後に届く。
     useMessaging.setState((state) => ({
@@ -582,7 +625,7 @@ describe("place menu channel actions", () => {
 
   it("duplicates without asking for a name and moves to the copy", async () => {
     openAlphaMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "複製" }));
+    fireEvent.click(screen.getByRole("button", { name: "複製" }));
 
     await waitFor(() =>
       expect(duplicateChannel).toHaveBeenCalledWith("channel-a"),
@@ -597,7 +640,7 @@ describe("place menu channel actions", () => {
       .mockRejectedValueOnce(new Error("ambiguous reconciliation exhausted"))
       .mockResolvedValueOnce("channel:alpha-copy");
     openAlphaMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "複製" }));
+    fireEvent.click(screen.getByRole("button", { name: "複製" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "チャンネルを複製できませんでした",
@@ -620,14 +663,14 @@ describe("place menu channel actions", () => {
     const pending = deferred<PlaceKey>();
     duplicateChannel.mockReturnValueOnce(pending.promise);
     openAlphaMenu();
-    const duplicate = screen.getByRole("menuitem", { name: "複製" });
+    const duplicate = screen.getByRole("button", { name: "複製" });
     fireEvent.click(duplicate);
 
     // Re-open while the request is pending: its action is visibly disabled.
     fireEvent.click(
       screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
     );
-    const pendingAction = screen.getByRole("menuitem", { name: "複製中…" });
+    const pendingAction = screen.getByRole("button", { name: "複製中…" });
     expect(pendingAction).toBeDisabled();
     fireEvent.click(pendingAction);
     expect(duplicateChannel).toHaveBeenCalledTimes(1);
@@ -643,7 +686,7 @@ describe("place menu channel actions", () => {
     const pending = deferred<PlaceKey>();
     duplicateChannel.mockReturnValueOnce(pending.promise);
     openAlphaMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "複製" }));
+    fireEvent.click(screen.getByRole("button", { name: "複製" }));
 
     useMessaging.setState((state) => ({
       transportGeneration: state.transportGeneration + 1,
@@ -658,7 +701,7 @@ describe("place menu channel actions", () => {
     fireEvent.click(
       screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
     );
-    expect(screen.getByRole("menuitem", { name: "複製" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "複製" })).toBeEnabled();
   });
 
   it("offers no channel-only actions on a direct message", () => {
@@ -690,9 +733,9 @@ describe("place menu channel actions", () => {
     fireEvent.click(menus[menus.length - 1]);
 
     expect(
-      screen.queryByRole("menuitem", { name: "チャンネルを編集" }),
+      screen.queryByRole("button", { name: "チャンネルを編集" }),
     ).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "複製" })).toBeNull();
-    expect(screen.getByRole("menuitem", { name: /通知設定/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "複製" })).toBeNull();
+    expect(screen.getByRole("button", { name: /通知設定/ })).toBeVisible();
   });
 });

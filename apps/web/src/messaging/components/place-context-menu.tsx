@@ -6,7 +6,7 @@ import {
   Pencil,
   Plus,
 } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { NotificationLevel, PlaceKey } from "../model";
 import { notificationLevelFor, useMessaging } from "../store";
 import { useOverlayPanel } from "./overlay";
@@ -62,7 +62,9 @@ export function PlaceContextMenu({
   const setPlaceNotificationLevel = useMessaging(
     (state) => state.setPlaceNotificationLevel,
   );
+  const panelId = useId();
   const submenuId = useId();
+  const focusSubmenuRef = useRef(false);
   const overlay = useOverlayPanel<HTMLButtonElement>({
     open,
     onOpenChange,
@@ -74,6 +76,21 @@ export function PlaceContextMenu({
     if (!open) setSubmenuOpen(false);
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    overlay.panelRef.current
+      ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+  }, [open, overlay.panelRef]);
+
+  useEffect(() => {
+    if (!submenuOpen || !focusSubmenuRef.current) return;
+    focusSubmenuRef.current = false;
+    overlay.panelRef.current
+      ?.querySelector<HTMLButtonElement>('button[aria-pressed="true"]')
+      ?.focus();
+  }, [submenuOpen, overlay.panelRef]);
+
   const close = () => {
     setSubmenuOpen(false);
     onOpenChange(false);
@@ -84,7 +101,7 @@ export function PlaceContextMenu({
       <button
         type="button"
         aria-label="この場所のメニュー"
-        aria-haspopup="menu"
+        aria-controls={panelId}
         {...overlay.triggerProps}
         onClick={(event) => {
           event.stopPropagation();
@@ -97,9 +114,11 @@ export function PlaceContextMenu({
         <MoreVertical className="size-3.5" />
       </button>
       {open ? (
+        // biome-ignore lint/a11y/useSemanticElements: This non-form action popover is a labeled group, not a fieldset.
         <div
           {...overlay.panelProps}
-          role="menu"
+          id={panelId}
+          role="group"
           aria-label="この場所のメニュー"
           className="absolute top-full right-0 z-30 mt-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
         >
@@ -107,7 +126,6 @@ export function PlaceContextMenu({
             <>
               <button
                 type="button"
-                role="menuitem"
                 className={ITEM_CLASS}
                 onClick={() => {
                   close();
@@ -119,7 +137,6 @@ export function PlaceContextMenu({
               </button>
               <button
                 type="button"
-                role="menuitem"
                 disabled={duplicatePending}
                 className={ITEM_CLASS}
                 onClick={() => {
@@ -132,7 +149,6 @@ export function PlaceContextMenu({
               </button>
               <button
                 type="button"
-                role="menuitem"
                 className={ITEM_CLASS}
                 onClick={() => {
                   close();
@@ -157,11 +173,12 @@ export function PlaceContextMenu({
               >
                 <button
                   type="button"
-                  role="menuitem"
-                  aria-haspopup="menu"
                   aria-expanded={submenuOpen}
                   aria-controls={submenuId}
-                  onClick={() => setSubmenuOpen((value) => !value)}
+                  onClick={() => {
+                    focusSubmenuRef.current = !submenuOpen;
+                    setSubmenuOpen((value) => !value);
+                  }}
                   className={`${ITEM_CLASS} ${submenuOpen ? "bg-accent" : ""}`}
                 >
                   通知設定
@@ -171,9 +188,8 @@ export function PlaceContextMenu({
                   <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
                 </button>
                 {submenuOpen ? (
-                  <div
+                  <fieldset
                     id={submenuId}
-                    role="menu"
                     aria-label="通知設定"
                     className="absolute top-0 right-full z-40 mr-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
                   >
@@ -185,8 +201,7 @@ export function PlaceContextMenu({
                       <button
                         key={candidate}
                         type="button"
-                        role="menuitemradio"
-                        aria-checked={level === candidate}
+                        aria-pressed={level === candidate}
                         onClick={() => {
                           setPlaceNotificationLevel(key, candidate);
                           close();
@@ -216,7 +231,7 @@ export function PlaceContextMenu({
                         </span>
                       </button>
                     ))}
-                  </div>
+                  </fieldset>
                 ) : null}
               </div>
             </>
