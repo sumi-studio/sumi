@@ -51,11 +51,12 @@ use crate::apiclient::messaging::{
     CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
     DuplicateMessagingChannelRequest, ExactMessagingScope, GetMessagingCallStateRequest,
     MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
-    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
-    OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
-    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
-    StartMessagingDMRequest, UpdateMessagingChannelRequest, UploadMessagingAttachmentRequest,
-    UploadMessagingAttachmentResponse, WriteMessagingMessageRequest, canonical_attachment_filename,
+    MessagingParticipant, MessagingWriteReceipt, OpenMessagingAttachmentMetadata,
+    OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
+    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
+    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+    UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
+    WriteMessagingMessageRequest, canonical_attachment_filename,
     forbidden_attachment_display_character,
 };
 use crate::apiclient::workspace::{
@@ -114,6 +115,53 @@ impl<'a, T> ScopedMessagingRequest<'a, T> {
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyMessagingOperation {}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingPlaceResponseScope {
+    workspace_id: String,
+    installation_id: String,
+    authority_epoch: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingChannelWire {
+    channel_id: String,
+    workspace_id: String,
+    revision: u64,
+    name: String,
+    topic: String,
+    visibility: String,
+    voice: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingChannelMutationResponse {
+    channel: MessagingChannelWire,
+    created: bool,
+    kind: String,
+    #[serde(flatten)]
+    scope: MessagingPlaceResponseScope,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingDMWire {
+    dm_id: String,
+    kind: String,
+    participants: Vec<MessagingParticipant>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingDMMutationResponse {
+    dm: MessagingDMWire,
+    created: bool,
+    #[serde(flatten)]
+    scope: MessagingPlaceResponseScope,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -402,10 +450,11 @@ impl LocalControlHttpClient {
         serde_json::from_slice(body.as_slice()).context("decode strict local control response")
     }
 
-    /// Replay one nonce-bearing Messaging mutation after a transport or reply
-    /// loss. The server records place creations by nonce, so both attempts can
-    /// safely name the same committed place. A terminal rejection is not
-    /// replayed; a 5xx cannot prove that the server did not commit first.
+    /// Replay one server-reconcilable Messaging mutation after a transport or
+    /// reply loss. Creation receipts cover nonce-bearing operations; the
+    /// nonce-less one-to-one DM route resolves one canonical actor/participant
+    /// pair. A terminal rejection is not replayed; a 5xx cannot prove that the
+    /// server did not commit first.
     async fn post_idempotent_messaging_json<Request, Response>(
         &self,
         path: &str,
@@ -415,6 +464,27 @@ impl LocalControlHttpClient {
     where
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
+    {
+        self.post_idempotent_messaging_json_validated(
+            path,
+            body,
+            max_response_bytes,
+            |_, _: &Response| Ok(()),
+        )
+        .await
+    }
+
+    async fn post_idempotent_messaging_json_validated<Request, Response, Validate>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+        validate: Validate,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+        Validate: Fn(reqwest::StatusCode, &Response) -> Result<()>,
     {
         let mut first_indeterminate = None;
         for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
@@ -442,12 +512,19 @@ impl LocalControlHttpClient {
                     };
                     return Err(anyhow::Error::new(failure));
                 }
-                serde_json::from_slice(response.as_slice()).map_err(|error| {
+                let decoded = serde_json::from_slice(response.as_slice()).map_err(|error| {
                     anyhow::Error::new(MessagingApiFailure::indeterminate(
                         "Messaging idempotent mutation",
                         format!("decode strict local control response: {error}"),
                     ))
-                })
+                })?;
+                validate(status, &decoded).map_err(|error| {
+                    anyhow::Error::new(MessagingApiFailure::indeterminate(
+                        "Messaging idempotent mutation",
+                        format!("validate exact local control response: {error}"),
+                    ))
+                })?;
+                Ok(decoded)
             }
             .await;
             match result {
@@ -803,6 +880,131 @@ fn is_canonical_authority_epoch(value: &str) -> bool {
     value.parse::<i64>().is_ok_and(|epoch| epoch > 0)
 }
 
+fn validate_place_response_scope(
+    response: &MessagingPlaceResponseScope,
+    expected: &ExactMessagingScope,
+) -> Result<()> {
+    if response.workspace_id != expected.workspace_id
+        || response.installation_id != expected.installation_id
+        || response.authority_epoch != expected.authority_epoch
+        || !is_canonical_uuid_v7(&response.workspace_id)
+        || !is_canonical_uuid_v7(&response.installation_id)
+        || !is_canonical_authority_epoch(&response.authority_epoch)
+    {
+        bail!("Messaging place response scope mismatch");
+    }
+    Ok(())
+}
+
+fn validate_channel_mutation_response(
+    status: reqwest::StatusCode,
+    response: &MessagingChannelMutationResponse,
+    scope: &ExactMessagingScope,
+    expected_name: Option<&str>,
+    expected_topic: Option<&str>,
+    expected_voice: Option<bool>,
+    different_from_place_id: Option<&str>,
+) -> Result<()> {
+    validate_place_response_scope(&response.scope, scope)?;
+    if response.kind != "channel" {
+        bail!("Messaging channel response kind mismatch");
+    }
+    if !is_canonical_uuid_v7(&response.channel.channel_id)
+        || different_from_place_id.is_some_and(|source| response.channel.channel_id == source)
+    {
+        bail!("Messaging channel response identity mismatch");
+    }
+    if response.channel.workspace_id != scope.workspace_id {
+        bail!("Messaging channel response Workspace mismatch");
+    }
+    if response.channel.revision == 0 || response.channel.revision > i64::MAX as u64 {
+        bail!("Messaging channel response revision is invalid");
+    }
+    if response.channel.name.is_empty()
+        || response.channel.name.len() > 800
+        || response.channel.name.chars().count() > 200
+        || expected_name.is_some_and(|name| response.channel.name != name)
+    {
+        bail!("Messaging channel response name mismatch");
+    }
+    if response.channel.topic.len() > 1000
+        || expected_topic.is_some_and(|topic| response.channel.topic != topic)
+    {
+        bail!("Messaging channel response topic mismatch");
+    }
+    if response.channel.visibility != "workspace"
+        || expected_voice.is_some_and(|voice| response.channel.voice != voice)
+    {
+        bail!("Messaging channel response shape mismatch");
+    }
+    let expected_status = if response.created {
+        reqwest::StatusCode::CREATED
+    } else {
+        reqwest::StatusCode::OK
+    };
+    if status != expected_status {
+        bail!("Messaging channel response created/status mismatch");
+    }
+    Ok(())
+}
+
+fn messaging_participant_key(participant: &MessagingParticipant) -> Result<String> {
+    let id = match participant.kind.as_str() {
+        "human" if participant.personality_agent_id.is_none() => participant.human_id.as_deref(),
+        "personality_agent" if participant.human_id.is_none() => {
+            participant.personality_agent_id.as_deref()
+        }
+        _ => None,
+    }
+    .filter(|id| is_canonical_uuid_v7(id))
+    .context("invalid Messaging participant identity")?;
+    Ok(format!("{}:{id}", participant.kind))
+}
+
+fn validate_dm_mutation_response(
+    status: reqwest::StatusCode,
+    response: &MessagingDMMutationResponse,
+    scope: &ExactMessagingScope,
+    actor_id: &str,
+    requested: &[MessagingParticipant],
+    client_nonce: Option<&str>,
+) -> Result<()> {
+    validate_place_response_scope(&response.scope, scope)?;
+    let actor_key = format!("personality_agent:{actor_id}");
+    if !is_canonical_uuid_v7(actor_id) || status != reqwest::StatusCode::OK {
+        bail!("Messaging DM mutation response has invalid actor or status");
+    }
+    let mut expected = std::collections::BTreeSet::from([actor_key.clone()]);
+    for participant in requested {
+        expected.insert(messaging_participant_key(participant)?);
+    }
+    expected.remove(&actor_key);
+    let expected_kind = match expected.len() {
+        // The server normalizes an explicitly listed actor away. The raw
+        // request can therefore carry a nonce while still naming one actual
+        // other participant and resolving to the canonical 1:1 DM.
+        1 => "dm",
+        count if count >= 2 && client_nonce.is_some() => "group_dm",
+        _ => bail!("Messaging DM request kind and nonce disagree"),
+    };
+    expected.insert(actor_key);
+
+    let mut actual = std::collections::BTreeSet::new();
+    for participant in &response.dm.participants {
+        if !actual.insert(messaging_participant_key(participant)?) {
+            bail!("Messaging DM response repeats a participant");
+        }
+    }
+    if !is_canonical_uuid_v7(&response.dm.dm_id)
+        || response.dm.kind != expected_kind
+        || response.dm.participants.len() > 33
+        || actual != expected
+    {
+        bail!("Messaging DM mutation response does not match its canonical participant set");
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl MessagingApi for LocalControlHttpClient {
     async fn overview(&self, scope: &ExactMessagingScope) -> Result<serde_json::Value> {
@@ -1090,12 +1292,25 @@ impl MessagingApi for LocalControlHttpClient {
         // Group creation is nonce-idempotent. A one-to-one DM has no nonce,
         // but the server reconciles the canonical actor/participant pair, so
         // the same bounded replay is safe after a lost committed response.
-        self.post_idempotent_messaging_json(
-            "/local-control/v1/messaging:start-dm",
-            &ScopedMessagingRequest::new(scope, request),
-            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
-        )
-        .await
+        let request = ScopedMessagingRequest::new(scope, request);
+        let response: MessagingDMMutationResponse = self
+            .post_idempotent_messaging_json_validated(
+                "/local-control/v1/messaging:start-dm",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                |status, response| {
+                    validate_dm_mutation_response(
+                        status,
+                        response,
+                        scope,
+                        self.authority.personality_agent_id().as_str(),
+                        request.operation.participants,
+                        request.operation.client_nonce,
+                    )
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({"dm": response.dm, "created": response.created}))
     }
 
     async fn create_channel(
@@ -1103,12 +1318,29 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: CreateMessagingChannelRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_idempotent_messaging_json(
-            "/local-control/v1/messaging:create-channel",
-            &ScopedMessagingRequest::new(scope, request),
-            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
-        )
-        .await
+        let request = ScopedMessagingRequest::new(scope, request);
+        let response: MessagingChannelMutationResponse = self
+            .post_idempotent_messaging_json_validated(
+                "/local-control/v1/messaging:create-channel",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                |status, response| {
+                    validate_channel_mutation_response(
+                        status,
+                        response,
+                        scope,
+                        Some(request.operation.name),
+                        Some(request.operation.topic.unwrap_or("")),
+                        Some(request.operation.voice),
+                        None,
+                    )
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({
+            "channel": response.channel,
+            "created": response.created
+        }))
     }
 
     async fn update_channel(
@@ -1128,12 +1360,29 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: DuplicateMessagingChannelRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_idempotent_messaging_json(
-            "/local-control/v1/messaging:duplicate-channel",
-            &ScopedMessagingRequest::new(scope, request),
-            MAX_LOCAL_CONTROL_RESPONSE_BYTES,
-        )
-        .await
+        let request = ScopedMessagingRequest::new(scope, request);
+        let response: MessagingChannelMutationResponse = self
+            .post_idempotent_messaging_json_validated(
+                "/local-control/v1/messaging:duplicate-channel",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                |status, response| {
+                    validate_channel_mutation_response(
+                        status,
+                        response,
+                        scope,
+                        request.operation.name,
+                        None,
+                        None,
+                        Some(request.operation.place_id),
+                    )
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({
+            "channel": response.channel,
+            "created": response.created
+        }))
     }
 
     async fn reply_later(
@@ -4095,33 +4344,107 @@ mod tests {
             return committed_response_loss();
         }
         drop(requests);
+        let (status, response) = canonical_place_mutation_fixture_response(&request);
+        (status, Json(response)).into_response()
+    }
+
+    fn canonical_place_mutation_fixture_response(
+        request: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         if request.get("participants").is_some() {
+            let actor = serde_json::json!({
+                "kind": "personality_agent",
+                "personality_agent_id": PAID
+            });
+            let mut participants = vec![actor.clone()];
+            let mut seen = std::collections::BTreeSet::from([actor.to_string()]);
+            for participant in request["participants"]
+                .as_array()
+                .expect("participant array")
+            {
+                if seen.insert(participant.to_string()) {
+                    participants.push(participant.clone());
+                }
+            }
+            let kind = if participants.len() == 2 {
+                "dm"
+            } else {
+                "group_dm"
+            };
             return (
                 StatusCode::OK,
-                Json(serde_json::json!({
+                serde_json::json!({
                     "dm": {
                         "dm_id": "0198f0f4-9b72-7000-8000-000000000701",
-                        "kind": "group_dm",
-                        "participants": []
+                        "kind": kind,
+                        "participants": participants
                     },
-                    "created": false
-                })),
-            )
-                .into_response();
+                    "created": false,
+                    "workspace_id": request["workspace_id"],
+                    "installation_id": request["installation_id"],
+                    "authority_epoch": request["authority_epoch"]
+                }),
+            );
         }
         (
             StatusCode::OK,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "channel": {
                     "channel_id": "0198f0f4-9b72-7000-8000-000000000702",
-                    "kind": "channel",
-                    "name": "reconciled",
-                    "topic": "",
-                    "voice": false
-                }
-            })),
+                    "workspace_id": request["workspace_id"],
+                    "revision": 1,
+                    "name": request.get("name").and_then(serde_json::Value::as_str).unwrap_or("reconciled"),
+                    "topic": request.get("topic").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    "visibility": "workspace",
+                    "voice": request.get("voice").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                },
+                "created": false,
+                "kind": "channel",
+                "workspace_id": request["workspace_id"],
+                "installation_id": request["installation_id"],
+                "authority_epoch": request["authority_epoch"]
+            }),
         )
-            .into_response()
+    }
+
+    #[derive(Clone, Copy)]
+    enum PlaceMutationFixtureStep {
+        Canonical,
+        Malformed,
+        TimeoutBeforeEffect,
+    }
+
+    #[derive(Clone)]
+    struct PlaceMutationValidationFixtureState {
+        steps: Arc<StdMutex<VecDeque<PlaceMutationFixtureStep>>>,
+        requests: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    async fn place_mutation_validation_fixture(
+        State(state): State<PlaceMutationValidationFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        state.requests.lock().unwrap().push(body.to_vec());
+        let step = state
+            .steps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("one fixture step per request");
+        if matches!(step, PlaceMutationFixtureStep::TimeoutBeforeEffect) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("strict place JSON");
+        let (status, mut response) = canonical_place_mutation_fixture_response(&request);
+        if matches!(step, PlaceMutationFixtureStep::Malformed) {
+            if response.get("dm").is_some() {
+                response["dm"]["kind"] = serde_json::json!("channel");
+            } else {
+                response["channel"]["workspace_id"] =
+                    serde_json::json!("0198f0f4-9b72-7000-8000-000000000299");
+            }
+        }
+        (status, Json(response)).into_response()
     }
 
     #[derive(Clone)]
@@ -4627,6 +4950,326 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PlaceFixtureOperation {
+        CreateChannel,
+        DuplicateChannel,
+        DirectMessage,
+        DirectMessageWithActor,
+        GroupMessage,
+    }
+
+    async fn invoke_place_fixture_operation(
+        client: &LocalControlHttpClient,
+        operation: PlaceFixtureOperation,
+    ) -> Result<serde_json::Value> {
+        let scope = messaging_scope();
+        match operation {
+            PlaceFixtureOperation::CreateChannel => {
+                client
+                    .create_channel(
+                        &scope,
+                        CreateMessagingChannelRequest {
+                            name: "reconciled",
+                            topic: Some("exact topic"),
+                            voice: true,
+                            client_nonce: "typed-create",
+                        },
+                    )
+                    .await
+            }
+            PlaceFixtureOperation::DuplicateChannel => {
+                client
+                    .duplicate_channel(
+                        &scope,
+                        DuplicateMessagingChannelRequest {
+                            place_id: "01900000-0000-7000-8000-000000000002",
+                            name: Some("reconciled"),
+                            client_nonce: "typed-duplicate",
+                        },
+                    )
+                    .await
+            }
+            PlaceFixtureOperation::DirectMessage
+            | PlaceFixtureOperation::DirectMessageWithActor
+            | PlaceFixtureOperation::GroupMessage => {
+                let participants = [
+                    MessagingParticipant {
+                        kind: "human".to_owned(),
+                        human_id: Some("01900000-0000-7000-8000-000000000009".to_owned()),
+                        personality_agent_id: None,
+                    },
+                    MessagingParticipant {
+                        kind: "human".to_owned(),
+                        human_id: Some("01900000-0000-7000-8000-000000000010".to_owned()),
+                        personality_agent_id: None,
+                    },
+                ];
+                let group = matches!(operation, PlaceFixtureOperation::GroupMessage);
+                let includes_actor =
+                    matches!(operation, PlaceFixtureOperation::DirectMessageWithActor);
+                let actor = MessagingParticipant {
+                    kind: "personality_agent".to_owned(),
+                    human_id: None,
+                    personality_agent_id: Some(PAID.to_owned()),
+                };
+                let direct_with_actor = [actor, participants[0].clone()];
+                client
+                    .start_dm(
+                        &scope,
+                        StartMessagingDMRequest {
+                            participants: if group {
+                                &participants
+                            } else if includes_actor {
+                                &direct_with_actor
+                            } else {
+                                &participants[..1]
+                            },
+                            client_nonce: if group {
+                                Some("typed-group")
+                            } else if includes_actor {
+                                Some("typed-direct-with-actor")
+                            } else {
+                                None
+                            },
+                        },
+                    )
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_place_response_validation_replays_once_and_remains_bounded() {
+        for operation in [
+            PlaceFixtureOperation::CreateChannel,
+            PlaceFixtureOperation::DuplicateChannel,
+            PlaceFixtureOperation::DirectMessage,
+            PlaceFixtureOperation::DirectMessageWithActor,
+            PlaceFixtureOperation::GroupMessage,
+        ] {
+            for (label, steps, succeeds) in [
+                (
+                    "malformed then canonical",
+                    VecDeque::from([
+                        PlaceMutationFixtureStep::Malformed,
+                        PlaceMutationFixtureStep::Canonical,
+                    ]),
+                    true,
+                ),
+                (
+                    "persistently malformed",
+                    VecDeque::from([
+                        PlaceMutationFixtureStep::Malformed,
+                        PlaceMutationFixtureStep::Malformed,
+                    ]),
+                    false,
+                ),
+                (
+                    "timeout before effect then canonical",
+                    VecDeque::from([
+                        PlaceMutationFixtureStep::TimeoutBeforeEffect,
+                        PlaceMutationFixtureStep::Canonical,
+                    ]),
+                    true,
+                ),
+            ] {
+                let state = PlaceMutationValidationFixtureState {
+                    steps: Arc::new(StdMutex::new(steps)),
+                    requests: Arc::new(StdMutex::new(Vec::new())),
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new()
+                    .route(
+                        "/local-control/v1/messaging:create-channel",
+                        post(place_mutation_validation_fixture),
+                    )
+                    .route(
+                        "/local-control/v1/messaging:duplicate-channel",
+                        post(place_mutation_validation_fixture),
+                    )
+                    .route(
+                        "/local-control/v1/messaging:start-dm",
+                        post(place_mutation_validation_fixture),
+                    )
+                    .with_state(state.clone());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let expected = authority();
+                let credential = LocalControlCredential::new(
+                    "control-secret",
+                    expected.rpc_identity().clone(),
+                    SystemTime::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+                let client = LocalControlHttpClient::new_loopback_with_timeouts(
+                    format!("http://{address}/"),
+                    expected,
+                    credential,
+                    Duration::from_millis(100),
+                    Duration::from_millis(100),
+                )
+                .unwrap();
+
+                let result = invoke_place_fixture_operation(&client, operation).await;
+                if succeeds {
+                    let output = result.unwrap_or_else(|error| {
+                        panic!("{operation:?} {label} must reconcile: {error:#}")
+                    });
+                    assert!(output.get("workspace_id").is_none());
+                    assert!(output.get("installation_id").is_none());
+                    assert!(output.get("authority_epoch").is_none());
+                } else {
+                    let error = result.expect_err("two semantic failures must remain uncertain");
+                    assert_eq!(
+                        error
+                            .downcast_ref::<MessagingApiFailure>()
+                            .expect("typed indeterminate failure")
+                            .class(),
+                        MessagingApiFailureClass::Indeterminate,
+                        "{operation:?} {label}"
+                    );
+                }
+                let requests = state.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2, "{operation:?} {label}");
+                assert_eq!(requests[0], requests[1], "{operation:?} {label}");
+                server.abort();
+            }
+        }
+    }
+
+    #[test]
+    fn messaging_place_response_validators_require_exact_action_scope_and_participants() {
+        let scope = messaging_scope();
+        let channel_request = serde_json::json!({
+            "workspace_id": &scope.workspace_id,
+            "installation_id": &scope.installation_id,
+            "authority_epoch": &scope.authority_epoch,
+            "name": "reconciled",
+            "topic": "exact topic",
+            "voice": true,
+            "client_nonce": "typed-create"
+        });
+        let (_, channel_value) = canonical_place_mutation_fixture_response(&channel_request);
+        let channel: MessagingChannelMutationResponse =
+            serde_json::from_value(channel_value.clone()).unwrap();
+        validate_channel_mutation_response(
+            StatusCode::OK,
+            &channel,
+            &scope,
+            Some("reconciled"),
+            Some("exact topic"),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        let mut fresh_channel_value = channel_value.clone();
+        fresh_channel_value["created"] = serde_json::json!(true);
+        let fresh_channel: MessagingChannelMutationResponse =
+            serde_json::from_value(fresh_channel_value).unwrap();
+        validate_channel_mutation_response(
+            StatusCode::CREATED,
+            &fresh_channel,
+            &scope,
+            Some("reconciled"),
+            Some("exact topic"),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        for (label, mut malformed) in [
+            ("created", channel_value.clone()),
+            ("kind", channel_value.clone()),
+            ("identity", channel_value.clone()),
+            ("scope", channel_value.clone()),
+            ("revision", channel_value.clone()),
+            ("name", channel_value.clone()),
+            ("topic", channel_value.clone()),
+            ("voice", channel_value.clone()),
+        ] {
+            match label {
+                "created" => malformed["created"] = serde_json::json!(true),
+                "kind" => malformed["kind"] = serde_json::json!("group_dm"),
+                "identity" => malformed["channel"]["channel_id"] = serde_json::json!("bad"),
+                "scope" => malformed["installation_id"] = serde_json::json!(OTHER_PAID),
+                "revision" => malformed["channel"]["revision"] = serde_json::json!(0),
+                "name" => malformed["channel"]["name"] = serde_json::json!("wrong"),
+                "topic" => malformed["channel"]["topic"] = serde_json::json!("wrong"),
+                "voice" => malformed["channel"]["voice"] = serde_json::json!(false),
+                _ => unreachable!(),
+            }
+            let malformed: MessagingChannelMutationResponse =
+                serde_json::from_value(malformed).unwrap();
+            assert!(
+                validate_channel_mutation_response(
+                    StatusCode::OK,
+                    &malformed,
+                    &scope,
+                    Some("reconciled"),
+                    Some("exact topic"),
+                    Some(true),
+                    None,
+                )
+                .is_err(),
+                "{label} mismatch"
+            );
+        }
+
+        let participant = serde_json::json!({
+            "kind": "human",
+            "human_id": "01900000-0000-7000-8000-000000000009"
+        });
+        let dm_request = serde_json::json!({
+            "workspace_id": &scope.workspace_id,
+            "installation_id": &scope.installation_id,
+            "authority_epoch": &scope.authority_epoch,
+            "participants": [participant.clone()]
+        });
+        let (_, dm_value) = canonical_place_mutation_fixture_response(&dm_request);
+        let dm: MessagingDMMutationResponse = serde_json::from_value(dm_value.clone()).unwrap();
+        let requested = [MessagingParticipant {
+            kind: "human".to_owned(),
+            human_id: Some("01900000-0000-7000-8000-000000000009".to_owned()),
+            personality_agent_id: None,
+        }];
+        validate_dm_mutation_response(StatusCode::OK, &dm, &scope, PAID, &requested, None).unwrap();
+        for (label, mut malformed) in [
+            ("kind", dm_value.clone()),
+            ("identity", dm_value.clone()),
+            ("scope", dm_value.clone()),
+            ("participant set", dm_value.clone()),
+        ] {
+            match label {
+                "kind" => malformed["dm"]["kind"] = serde_json::json!("group_dm"),
+                "identity" => malformed["dm"]["dm_id"] = serde_json::json!("bad"),
+                "scope" => malformed["authority_epoch"] = serde_json::json!("2"),
+                "participant set" => malformed["dm"]["participants"] = serde_json::json!([]),
+                _ => unreachable!(),
+            }
+            let malformed: MessagingDMMutationResponse = serde_json::from_value(malformed).unwrap();
+            assert!(
+                validate_dm_mutation_response(
+                    StatusCode::OK,
+                    &malformed,
+                    &scope,
+                    PAID,
+                    &requested,
+                    None,
+                )
+                .is_err(),
+                "{label} mismatch"
+            );
+        }
+        let mut missing_created = channel_value;
+        missing_created.as_object_mut().unwrap().remove("created");
+        assert!(
+            serde_json::from_value::<MessagingChannelMutationResponse>(missing_created).is_err()
+        );
+        let mut unknown_field = dm_value;
+        unknown_field["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MessagingDMMutationResponse>(unknown_field).is_err());
     }
 
     #[tokio::test]

@@ -1714,7 +1714,7 @@ impl MessagingTool {
                     )
                     .await
                     .map_err(map_messaging_api_error)?;
-                focus_opened_place(&mut *state, &response, "dm", "dm_id");
+                focus_opened_place(&mut *state, &response, "dm", "dm_id")?;
                 response
             }
             BoundMessagingAction::CreateChannel { name, topic, voice } => {
@@ -1732,7 +1732,7 @@ impl MessagingTool {
                     )
                     .await
                     .map_err(map_messaging_api_error)?;
-                focus_opened_place(&mut *state, &response, "channel", "channel_id");
+                focus_opened_place(&mut *state, &response, "channel", "channel_id")?;
                 response
             }
             BoundMessagingAction::UpdateChannel {
@@ -1765,7 +1765,7 @@ impl MessagingTool {
                     )
                     .await
                     .map_err(map_messaging_api_error)?;
-                focus_opened_place(&mut *state, &response, "channel", "channel_id");
+                focus_opened_place(&mut *state, &response, "channel", "channel_id")?;
                 response
             }
         };
@@ -1973,19 +1973,23 @@ fn focus_opened_place(
     response: &Value,
     envelope: &str,
     id_field: &str,
-) {
-    let Some(place_id) = response
+) -> Result<(), ToolError> {
+    let place_id = response
         .get(envelope)
         .and_then(|place| place.get(id_field))
         .and_then(Value::as_str)
-    else {
-        return;
-    };
+        .filter(|place_id| is_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES))
+        .ok_or_else(|| {
+            ToolError::Protocol(format!(
+                "Messaging {envelope} mutation returned no valid {id_field}"
+            ))
+        })?;
     state.focused_place_id = Some(place_id.to_owned());
     // Only this screen is emptied. Read cursors owed for other places are
     // promises already made and are not this gesture's to cancel; a place
     // opened a moment ago cannot have one of its own.
     state.visible_messages.clear();
+    Ok(())
 }
 
 fn messaging_binding(
@@ -3438,8 +3442,6 @@ mod tests {
         open_responses: AsyncMutex<VecDeque<Value>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
         created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
-        created_channels_by_nonce: AsyncMutex<BTreeMap<String, Value>>,
-        lose_create_channel_response_once: AsyncMutex<bool>,
         updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
         duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
@@ -3734,35 +3736,18 @@ mod tests {
         ) -> Result<Value> {
             self.record_scope(scope).await;
             self.calls.lock().await.push("create_channel".to_owned());
-            let response = {
-                let mut created = self.created_channels_by_nonce.lock().await;
-                if let Some(existing) = created.get(request.client_nonce) {
-                    existing.clone()
-                } else {
-                    self.created_channels.lock().await.push((
-                        request.name.to_owned(),
-                        request.topic.map(str::to_owned),
-                        request.voice,
-                    ));
-                    let response = json!({
-                        "channel": {
-                            "channel_id": "channel-new",
-                            "name": request.name,
-                            "topic": request.topic.unwrap_or("")
-                        }
-                    });
-                    created.insert(request.client_nonce.to_owned(), response.clone());
-                    response
+            self.created_channels.lock().await.push((
+                request.name.to_owned(),
+                request.topic.map(str::to_owned),
+                request.voice,
+            ));
+            Ok(json!({
+                "channel": {
+                    "channel_id": "channel-new",
+                    "name": request.name,
+                    "topic": request.topic.unwrap_or("")
                 }
-            };
-            if std::mem::take(&mut *self.lose_create_channel_response_once.lock().await) {
-                return Err(MessagingApiFailure::indeterminate(
-                    "test create channel",
-                    "place committed but the response was lost",
-                )
-                .into());
-            }
-            Ok(response)
+            }))
         }
 
         async fn update_channel(
@@ -6101,39 +6086,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indeterminate_channel_creation_retries_the_same_call_without_a_second_place() {
-        let (api, _tool, registry) = binding_fixture().await;
-        *api.lose_create_channel_response_once.lock().await = true;
-        let action = json!({
-            "action": "create_channel",
-            "name": "incident-room",
-            "topic": "coordination"
-        });
-
-        let first =
-            match execute_bound_action(&registry, "create-channel-retry", action.clone()).await {
-                Err(error) => error,
-                Ok(_) => panic!("lost response after a committed creation is indeterminate"),
-            };
-        assert!(matches!(
-            first,
-            BoundExecutionError::Tool(ToolError::RpcIndeterminate(_))
-        ));
-        assert_eq!(api.created_channels.lock().await.len(), 1);
-
-        let retry = execute_bound_action(&registry, "create-channel-retry", action)
-            .await
-            .expect("the same flow/call nonce replays the committed place");
-        assert_eq!(retry.output.details["channel"]["channel_id"], "channel-new");
-        assert_eq!(api.created_channels.lock().await.len(), 1);
-        assert_eq!(
-            api.created_channels_by_nonce.lock().await.len(),
-            1,
-            "the fake server persisted one creation receipt"
-        );
-    }
-
-    #[tokio::test]
     async fn bound_open_has_no_hidden_overview_or_pre_action_cursor_flush() {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
@@ -7539,5 +7491,28 @@ mod tests {
                 personality_agent_id: None,
             }
         );
+    }
+
+    #[test]
+    fn a_place_mutation_without_its_exact_identity_cannot_change_focus() {
+        let mut state = MessagingViewState {
+            focused_place_id: Some("place-before".to_owned()),
+            visible_messages: vec![VisibleMessage {
+                message_id: "message-before".to_owned(),
+                seq: Some(1),
+                attachments: Vec::new(),
+            }],
+            ..MessagingViewState::default()
+        };
+        let error = focus_opened_place(
+            &mut state,
+            &json!({"channel": {"name": "missing identity"}}),
+            "channel",
+            "channel_id",
+        )
+        .expect_err("missing committed place identity must fail closed");
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert_eq!(state.focused_place_id.as_deref(), Some("place-before"));
+        assert_eq!(state.visible_messages.len(), 1);
     }
 }
