@@ -405,9 +405,8 @@ function latestEditConflict(
  * この編集セッションにおける「競合」の唯一の定義。
  *
  * base より新しい revision を運ぶ message event のうち、このセッションが送信した
- * 本文ではないものだけが競合である。送信済み本文と一致する event は自分の echo
- * として扱う。Message には編集者が載らないため、ここで確実に照合できるのは本文と
- * 送信中の session だけである。
+ * 厳密な次版ではないものだけが競合である。送信済み本文と一致しても +2 以上なら、
+ * 間の編集者を Message から識別できないため自分の echo とは扱えない。
  *
  * 入口は live の `message_edited` に限らない。再接続の catch-up は現在版を
  * `message_created` として再生するので、切断中に別の場所で進んだ revision も
@@ -426,6 +425,7 @@ function conflictFromMessageEvent(
     state.editBaseRevision === null ||
     revision <= state.editBaseRevision ||
     (session.submittedDraft !== null &&
+      revision === session.revision + 1 &&
       message.content === session.submittedDraft.trim())
   )
     return state.editConflict;
@@ -504,15 +504,43 @@ function reduceSuccessfulEditAcknowledgement(
   );
   const base = latestMessageContent(currentMessage, committed);
   const acknowledgedRevision = committed.revision ?? submittedSession.revision;
+  const messagesByPlace = {
+    ...state.messagesByPlace,
+    [key]: upsertMessage(
+      state.messagesByPlace[key] ?? [],
+      committed,
+      "revision",
+    ),
+  };
+  if (currentMessage && (currentMessage.revision ?? 1) > acknowledgedRevision) {
+    if (!isCurrentEditSession(state, submittedSession)) {
+      return {
+        messagesByPlace,
+        ...advanceUnsentEditSessionThroughAck(
+          state,
+          submittedSession,
+          acknowledgedRevision,
+        ),
+      };
+    }
+    return {
+      messagesByPlace,
+      editBaseRevision: acknowledgedRevision,
+      editSession: {
+        ...submittedSession,
+        revision: acknowledgedRevision,
+        submittedDraft: null,
+        token: ++nextEditSessionToken,
+      },
+      editConflict:
+        latestEditConflict(state.editConflict, currentMessage) ??
+        state.editConflict,
+      editFailure: null,
+      editSavedWithPendingChanges: false,
+    };
+  }
   return {
-    messagesByPlace: {
-      ...state.messagesByPlace,
-      [key]: upsertMessage(
-        state.messagesByPlace[key] ?? [],
-        committed,
-        "revision",
-      ),
-    },
+    messagesByPlace,
     ...(isCurrentEditSession(state, submittedSession)
       ? state.editDraft === submittedSession.submittedDraft
         ? clearedEditSession()

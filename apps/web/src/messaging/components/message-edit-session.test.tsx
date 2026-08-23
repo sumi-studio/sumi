@@ -664,6 +664,150 @@ describe("編集セッションのタイムライン整合性", () => {
     expect(useMessaging.getState().editConflict).toBeNull();
   });
 
+  it("同一本文のWS N+2が先行したら遅延2xx N+1でdraftと競合を消さない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const submitted = "同じ本文でも版が二つ先";
+    const acknowledged = {
+      ...target,
+      content: submitted,
+      revision: (target.revision ?? 1) + 1,
+    };
+    const projected = {
+      ...acknowledged,
+      revision: (target.revision ?? 1) + 2,
+    };
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+    let resolveSave: ((message: Message) => void) | undefined;
+    const save = new Promise<Message>((resolve) => {
+      resolveSave = resolve;
+    });
+    vi.spyOn(backend, "editMessage").mockImplementationOnce(() => save);
+    renderList();
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    const textarea = await screen.findByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: submitted } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    act(() => emit({ type: "message_edited", message: projected }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "別の場所で編集されました",
+    );
+    await act(async () => {
+      resolveSave?.(acknowledged);
+      await save;
+    });
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: submitted,
+      editBaseRevision: acknowledged.revision,
+      editConflict: {
+        content: projected.content,
+        revision: projected.revision,
+      },
+    });
+    expect(screen.getByLabelText("メッセージを編集")).toHaveValue(submitted);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "別の場所で編集されました",
+    );
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        ),
+    ).toMatchObject(projected);
+  });
+
+  it("WS N+2が再試行409より先行したらN+1 lost ACKでdraftと競合を消さない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const submitted = "応答を失ったN+1本文";
+    const acknowledged = {
+      ...target,
+      content: submitted,
+      revision: (target.revision ?? 1) + 1,
+    };
+    const projected = {
+      ...target,
+      content: "その後に確定したN+2本文",
+      revision: (target.revision ?? 1) + 2,
+    };
+    const emit = (
+      backend as unknown as {
+        emit(event: { type: "message_edited"; message: Message }): void;
+      }
+    ).emit.bind(backend);
+    let rejectRetry: ((error: unknown) => void) | undefined;
+    const retry = new Promise<Message>((_resolve, reject) => {
+      rejectRetry = reject;
+    });
+    vi.spyOn(backend, "editMessage")
+      .mockRejectedValueOnce(new Error("edit response lost"))
+      .mockImplementationOnce(() => retry);
+    renderList();
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    const textarea = await screen.findByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: submitted } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(useMessaging.getState().editFailure).not.toBeNull(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    act(() => emit({ type: "message_edited", message: projected }));
+
+    await act(async () => {
+      rejectRetry?.(
+        new MessagingAPIError("edit_conflict", 409, {
+          message: conflictWire(acknowledged),
+        }),
+      );
+      await retry.catch(() => undefined);
+    });
+
+    expect(useMessaging.getState()).toMatchObject({
+      editingMessageId: target.messageId,
+      editDraft: submitted,
+      editBaseRevision: acknowledged.revision,
+      editConflict: {
+        content: projected.content,
+        revision: projected.revision,
+      },
+    });
+    expect(screen.getByLabelText("メッセージを編集")).toHaveValue(submitted);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "別の場所で編集されました",
+    );
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        ),
+    ).toMatchObject(projected);
+  });
+
   it("同一本文でも409正本が期待次版を越えていれば競合として残す", async () => {
     const backend = await bootStore();
     const target = useMessaging
