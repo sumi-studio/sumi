@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+readonly SOURCE_URL="https://github.com/sumi-studio/sumi"
+readonly REVISION_LABEL="org.opencontainers.image.revision"
+readonly SOURCE_LABEL="org.opencontainers.image.source"
+
+COMMIT=
+TAG=
+MANIFEST=
+DRY_RUN=false
+TEMP_MANIFEST=
+
+declare -a ROLES=(api agent provisioner web)
+declare -A REPOSITORIES=(
+  [api]="ghcr.io/sumi-studio/sumi-api"
+  [agent]="ghcr.io/sumi-studio/sumi-agent"
+  [provisioner]="ghcr.io/sumi-studio/sumi-provisioner"
+  [web]="ghcr.io/sumi-studio/sumi-web"
+)
+declare -A DOCKERFILES=(
+  [api]="deploy/api/Dockerfile"
+  [agent]="deploy/agent/Dockerfile"
+  [provisioner]="deploy/provisioner/Dockerfile"
+  [web]="deploy/web/Dockerfile"
+)
+declare -A IMAGE_IDS=()
+declare -A IMAGE_DIGESTS=()
+
+log() {
+  printf '[sumi-dogfood-images] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/operations/build-dogfood-images \
+  --commit <full-lowercase-sha> --tag <same-full-lowercase-sha> \
+  --manifest <new-path> [--dry-run]
+
+Builds and locally verifies the API, agent, provisioner, and web images. It
+never pushes an image and never invokes Docker Compose.
+EOF
+}
+
+cleanup() {
+  if [[ -n "${TEMP_MANIFEST}" && -e "${TEMP_MANIFEST}" ]]; then
+    rm -f -- "${TEMP_MANIFEST}"
+  fi
+}
+trap cleanup EXIT
+
+while (($#)); do
+  case "$1" in
+    --commit)
+      (($# >= 2)) || fail "--commit requires a value"
+      COMMIT="$2"
+      shift 2
+      ;;
+    --tag)
+      (($# >= 2)) || fail "--tag requires a value"
+      TAG="$2"
+      shift 2
+      ;;
+    --manifest)
+      (($# >= 2)) || fail "--manifest requires a value"
+      MANIFEST="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      fail "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ "${COMMIT}" =~ ^[0-9a-f]{40}$ ]] || fail "commit must be a full lowercase Git SHA"
+[[ "${TAG}" =~ ^[0-9a-f]{40}$ ]] || fail "tag must be a full lowercase Git SHA; floating tags are refused"
+[[ "${TAG}" == "${COMMIT}" ]] || fail "tag must exactly equal the source commit"
+[[ -n "${MANIFEST}" ]] || fail "--manifest is required"
+
+[[ "$(pwd -P)" == "${REPOSITORY_ROOT}" ]] || fail "run from the repository root: ${REPOSITORY_ROOT}"
+[[ "$(git rev-parse --show-toplevel 2>/dev/null)" == "${REPOSITORY_ROOT}" ]] ||
+  fail "script path is not inside the active repository root"
+[[ "$(git rev-parse HEAD 2>/dev/null)" == "${COMMIT}" ]] || fail "HEAD is not the requested exact commit"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || fail "worktree is not clean"
+
+for variable in SUMI_DOGFOOD_IMAGE_TAG SUMI_API_IMAGE_TAG SUMI_AGENT_IMAGE_TAG \
+  SUMI_PROVISIONER_IMAGE_TAG SUMI_WEB_IMAGE_TAG; do
+  if [[ -n "${!variable:-}" && "${!variable}" != "${TAG}" ]]; then
+    fail "${variable} does not match the one exact image tag"
+  fi
+done
+
+for role in "${ROLES[@]}"; do
+  [[ -f "${DOCKERFILES[${role}]}" ]] || fail "missing Dockerfile: ${DOCKERFILES[${role}]}"
+done
+
+manifest_parent="$(dirname -- "${MANIFEST}")"
+manifest_name="$(basename -- "${MANIFEST}")"
+[[ "${manifest_name}" != "." && "${manifest_name}" != ".." ]] || fail "manifest must name a file"
+[[ -d "${manifest_parent}" ]] || fail "manifest parent directory does not exist"
+manifest_parent="$(cd "${manifest_parent}" && pwd -P)" || fail "cannot resolve manifest parent"
+MANIFEST="${manifest_parent}/${manifest_name}"
+[[ ! -e "${MANIFEST}" && ! -L "${MANIFEST}" ]] || fail "manifest path already exists"
+
+print_command() {
+  printf 'DRY-RUN:'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+if [[ "${DRY_RUN}" == true ]]; then
+  for role in "${ROLES[@]}"; do
+    reference="${REPOSITORIES[${role}]}:${TAG}"
+    print_command docker build \
+      --file "${DOCKERFILES[${role}]}" \
+      --label "${REVISION_LABEL}=${COMMIT}" \
+      --label "${SOURCE_LABEL}=${SOURCE_URL}" \
+      --tag "${reference}" .
+  done
+  log "dry run complete; no Docker command ran and no manifest was written"
+  exit 0
+fi
+
+command -v docker >/dev/null 2>&1 || fail "docker is required"
+
+for role in "${ROLES[@]}"; do
+  reference="${REPOSITORIES[${role}]}:${TAG}"
+  if docker image inspect "${reference}" >/dev/null 2>&1; then
+    fail "immutable image tag already exists locally: ${reference}"
+  fi
+done
+
+inspect_field() {
+  local reference="$1" format="$2"
+  docker image inspect --format "${format}" "${reference}"
+}
+
+for role in "${ROLES[@]}"; do
+  reference="${REPOSITORIES[${role}]}:${TAG}"
+  log "building ${role} as ${reference}"
+  docker build \
+    --file "${DOCKERFILES[${role}]}" \
+    --label "${REVISION_LABEL}=${COMMIT}" \
+    --label "${SOURCE_LABEL}=${SOURCE_URL}" \
+    --tag "${reference}" .
+
+  image_id="$(inspect_field "${reference}" '{{.Id}}')" || fail "cannot inspect ${reference} ID"
+  revision="$(inspect_field "${reference}" '{{index .Config.Labels "org.opencontainers.image.revision"}}')" ||
+    fail "cannot inspect ${reference} revision label"
+  source="$(inspect_field "${reference}" '{{index .Config.Labels "org.opencontainers.image.source"}}')" ||
+    fail "cannot inspect ${reference} source label"
+  repo_tags="$(inspect_field "${reference}" '{{join .RepoTags ","}}')" || fail "cannot inspect ${reference} tags"
+  repo_digests="$(inspect_field "${reference}" '{{join .RepoDigests ","}}')" ||
+    fail "cannot inspect ${reference} digests"
+
+  [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "${reference} has an invalid image ID"
+  [[ "${revision}" == "${COMMIT}" ]] || fail "${reference} has the wrong revision label"
+  [[ "${source}" == "${SOURCE_URL}" ]] || fail "${reference} has the wrong source label"
+  [[ "${repo_tags}" == "${reference}" ]] || fail "${reference} has missing, floating, or mixed RepoTags"
+
+  if [[ -n "${repo_digests}" ]]; then
+    IFS=',' read -r -a digest_items <<< "${repo_digests}"
+    for digest in "${digest_items[@]}"; do
+      digest_hash="${digest#"${REPOSITORIES[${role}]}@sha256:"}"
+      [[ "${digest}" == "${REPOSITORIES[${role}]}@sha256:${digest_hash}" &&
+        "${digest_hash}" =~ ^[0-9a-f]{64}$ ]] ||
+        fail "${reference} has an unexpected RepoDigest"
+    done
+    repo_digests="$(printf '%s\n' "${digest_items[@]}" | LC_ALL=C sort -u | paste -sd, -)"
+  fi
+  IMAGE_IDS[${role}]="${image_id}"
+  IMAGE_DIGESTS[${role}]="${repo_digests}"
+done
+
+json_digest_array() {
+  local csv="$1" first=true digest
+  printf '['
+  if [[ -n "${csv}" ]]; then
+    IFS=',' read -r -a items <<< "${csv}"
+    for digest in "${items[@]}"; do
+      if [[ "${first}" == false ]]; then printf ','; fi
+      printf '"%s"' "${digest}"
+      first=false
+    done
+  fi
+  printf ']'
+}
+
+umask 077
+TEMP_MANIFEST="$(mktemp "${manifest_parent}/.dogfood-images.XXXXXX")" || fail "cannot create manifest temporary file"
+{
+  printf '{\n'
+  printf '  "schema_version": 1,\n'
+  printf '  "status": "COMPLETE",\n'
+  printf '  "source": {"repository": "%s", "revision": "%s"},\n' "${SOURCE_URL}" "${COMMIT}"
+  printf '  "tag": "%s",\n' "${TAG}"
+  printf '  "images": [\n'
+  for index in "${!ROLES[@]}"; do
+    role="${ROLES[${index}]}"
+    reference="${REPOSITORIES[${role}]}:${TAG}"
+    printf '    {"name": "%s", "reference": "%s", "id": "%s", "repo_digests": ' \
+      "${role}" "${reference}" "${IMAGE_IDS[${role}]}"
+    json_digest_array "${IMAGE_DIGESTS[${role}]}"
+    printf ', "labels": {"%s": "%s", "%s": "%s"}}' \
+      "${REVISION_LABEL}" "${COMMIT}" "${SOURCE_LABEL}" "${SOURCE_URL}"
+    if (( index + 1 < ${#ROLES[@]} )); then printf ','; fi
+    printf '\n'
+  done
+  printf '  ]\n'
+  printf '}\n'
+} > "${TEMP_MANIFEST}"
+chmod 0600 "${TEMP_MANIFEST}"
+[[ "$(stat -Lc '%a:%h' -- "${TEMP_MANIFEST}")" == "600:1" ]] || fail "temporary manifest is not mode-safe"
+ln -- "${TEMP_MANIFEST}" "${MANIFEST}" || fail "manifest path was created concurrently"
+rm -f -- "${TEMP_MANIFEST}"
+TEMP_MANIFEST=
+[[ "$(stat -Lc '%a:%h' -- "${MANIFEST}")" == "600:1" ]] || fail "published manifest is not mode 0600 with one link"
+log "COMPLETE manifest written atomically: ${MANIFEST}"
