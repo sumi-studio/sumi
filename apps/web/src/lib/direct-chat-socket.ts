@@ -1,7 +1,7 @@
 import type {
+  DirectChatStatusFrame as APIClientDirectChatStatusFrame,
   BrowserEventEnvelope,
   CommandDispositionEvent,
-  DirectChatStatusFrame as APIClientDirectChatStatusFrame,
 } from "@sumi/api-client";
 import { secureRandomUUID } from "./random-uuid";
 
