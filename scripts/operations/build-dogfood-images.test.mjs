@@ -218,6 +218,28 @@ async function run(fixture, extraArgs = [], extraEnv = {}) {
   );
 }
 
+async function runWithGitVersion(fixture, version) {
+  const fakeGitBin = join(fixture.container, "fake-git-bin");
+  await mkdir(fakeGitBin, { recursive: true });
+  const { stdout } = await execFileAsync("sh", ["-c", "command -v git"]);
+  const realGit = stdout.trim();
+  await writeFile(
+    join(fakeGitBin, "git"),
+    `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${!#}" == version ]]; then
+  printf '%s\\n' ${JSON.stringify(version)}
+  exit 0
+fi
+exec ${JSON.stringify(realGit)} "$@"
+`,
+    { mode: 0o755 },
+  );
+  return run(fixture, ["--dry-run"], {
+    PATH: `${fakeGitBin}:${fixture.env.PATH}`,
+  });
+}
+
 async function refreshFixtureCommit(fixture, message) {
   await git(fixture.root, ["commit", "--quiet", "-m", message]);
   const { stdout } = await git(fixture.root, ["rev-parse", "HEAD"]);
@@ -316,6 +338,32 @@ test("mixed Compose image tag variables are refused", async () => {
       /SUMI_AGENT_IMAGE_TAG does not match/,
     );
   });
+});
+
+test("Git version preflight accepts supported vendor suffixes and rejects old or malformed versions", async (t) => {
+  for (const version of [
+    "git version 2.40",
+    "git version 2.40.0",
+    "git version 2.47.1.windows.1",
+    "git version 2.47.1 (Apple Git-147)",
+    "git version 3.0.0-rc1",
+  ]) {
+    await t.test(version, async () => {
+      await withFixture(async (fixture) => {
+        await runWithGitVersion(fixture, version);
+      });
+    });
+  }
+  for (const version of ["git version 2.39.9", "git version 2.x"]) {
+    await t.test(`reject ${version}`, async () => {
+      await withFixture(async (fixture) => {
+        await assert.rejects(
+          runWithGitVersion(fixture, version),
+          /Git 2\.40 or newer is required/,
+        );
+      });
+    });
+  }
 });
 
 test("an existing local exact-SHA tag is never reassigned", async () => {

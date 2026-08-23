@@ -122,7 +122,7 @@ done
 [[ -n "${MANIFEST}" ]] || fail "--manifest is required"
 
 git_version="$(git_clean version 2>/dev/null)" || fail "Git 2.40 or newer is required"
-if [[ ! "${git_version}" =~ ^git\ version\ ([0-9]+)\.([0-9]+)(\.[0-9]+)?([[:space:]].*)?$ ]] ||
+if [[ ! "${git_version}" =~ ^git\ version\ ([0-9]+)\.([0-9]+)(\.[0-9]+)?([.-][0-9A-Za-z][0-9A-Za-z.-]*)?([[:space:]].*)?$ ]] ||
   ((BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 40))); then
   fail "Git 2.40 or newer is required"
 fi
