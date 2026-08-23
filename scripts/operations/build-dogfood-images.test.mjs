@@ -174,6 +174,7 @@ control() {
 }
 FAKE_ALIAS_ALL_BINDINGS="$(control FAKE_ALIAS_ALL_BINDINGS)"
 FAKE_APPEAR_BEFORE_ROLE="$(control FAKE_APPEAR_BEFORE_ROLE)"
+FAKE_ABSENCE_PREFIX_NEWLINES="$(control FAKE_ABSENCE_PREFIX_NEWLINES)"
 FAKE_ASSERT_EXCLUDED="$(control FAKE_ASSERT_EXCLUDED)"
 FAKE_BAD_IID_ROLE="$(control FAKE_BAD_IID_ROLE)"
 FAKE_BAD_LABEL_ROLE="$(control FAKE_BAD_LABEL_ROLE)"
@@ -222,6 +223,15 @@ role_hex() {
 role_id() {
   hex="$(role_hex "$1")"
   printf 'sha256:%064s' '' | tr ' ' "$hex"
+}
+print_image_absence() {
+  case "$FAKE_ABSENCE_PREFIX_NEWLINES" in
+    "") ;;
+    1) printf '\\n' >&2 ;;
+    2) printf '\\n\\n' >&2 ;;
+    *) exit 89 ;;
+  esac
+  printf 'Error response from daemon: No such image: %s\\n' "$1" >&2
 }
 if [[ "\${1:-}" == build ]]; then
   dockerfile= iidfile= reference= context="\${!#}"
@@ -307,11 +317,11 @@ else
     marker="$state/appeared-$role"
     if [[ ! -e "$marker" ]]; then
       : > "$marker"
-      printf 'Error response from daemon: No such image: %s\\n' "$subject" >&2
+      print_image_absence "$subject"
       exit 1
     fi
   elif [[ ! -e "$state/built-$role" ]]; then
-    printf 'Error response from daemon: No such image: %s\\n' "$subject" >&2
+    print_image_absence "$subject"
     exit 1
   fi
   id="$(role_id "$role")"
@@ -691,10 +701,33 @@ test("an existing local exact-SHA tag is never reassigned", async () => {
 });
 
 test("only verified Docker not-found permits mutable-reference assignment", async (t) => {
-  await t.test("verified absence", async () => {
+  await t.test("verified absence without a leading LF", async () => {
     await withFixture(async (fixture) => {
       await run(fixture);
       await stat(fixture.manifest);
+    });
+  });
+
+  await t.test(
+    "verified live Docker absence with exactly one leading LF",
+    async () => {
+      await withFixture(async (fixture) => {
+        await run(fixture, [], { FAKE_ABSENCE_PREFIX_NEWLINES: "1" });
+        await stat(fixture.manifest);
+      });
+    },
+  );
+
+  await t.test("two leading LFs fail closed", async () => {
+    await withFixture(async (fixture) => {
+      await assert.rejects(
+        run(fixture, [], { FAKE_ABSENCE_PREFIX_NEWLINES: "2" }),
+        /cannot inspect requested mutable reference safely/,
+      );
+      await assert.rejects(stat(join(fixture.state, "built-api")), {
+        code: "ENOENT",
+      });
+      await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
     });
   });
 
