@@ -209,11 +209,10 @@ try {
 
   const writeDomainError = goFunctionBody(workspaceHTTP, "writeDomainError");
   for (const { domainError, status, code } of [
-    {
-      domainError: "applicationapps.ErrAlreadyInstalled",
-      status: "http.StatusConflict",
-      code: "conflict",
-    },
+    // Only active Go domain errors belong here. The legacy
+    // `ErrAlreadyInstalled` symbol no longer exists; its name is also a prefix
+    // of `ErrInstallIntentAlreadyInstalled`, so retaining it produced a false
+    // substring match instead of checking a real public mapping.
     {
       domainError: "applicationapps.ErrInstallIntentAlreadyInstalled",
       status: "http.StatusConflict",

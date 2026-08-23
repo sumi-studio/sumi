@@ -65,6 +65,10 @@ pub(crate) const fn normal_reauthorization_exhausted(attempts: usize) -> bool {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "approval authority remains single-owner without a second heap allocation"
+)]
 pub(crate) enum RouteApprovalOutcome {
     Allowed {
         grant: ExecutableGrant,
@@ -80,6 +84,10 @@ pub(crate) enum RouteApprovalOutcome {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the approved resolution carries its exact non-cloneable grant by value"
+)]
 pub(crate) enum CurrentCallResolution {
     /// An authenticated command named this request but did not own its exact
     /// tenant/PA/Human scope. It must neither consume nor project the pending
@@ -126,6 +134,10 @@ pub(crate) struct PendingApprovalRequest {
 }
 
 impl PendingApprovalRequest {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the Human review lanes remain explicit and cannot be positionally conflated"
+    )]
     pub(crate) fn from_bound(
         id: String,
         route: ToolInvocationRoute,
@@ -320,6 +332,10 @@ impl std::fmt::Debug for RouteApprovalBroker {
 }
 
 impl RouteApprovalBroker {
+    #[allow(
+        dead_code,
+        reason = "the direct constructor is retained for exact broker tests; production uses hydrated construction"
+    )]
     pub(crate) fn new(
         policy: RoutePolicy,
         redactor: Redactor,
@@ -369,6 +385,10 @@ impl RouteApprovalBroker {
         self
     }
 
+    #[allow(
+        dead_code,
+        reason = "live policy replacement is exercised by broker authority tests"
+    )]
     pub(crate) async fn replace_policy(&self, next: RoutePolicy) -> Result<()> {
         let now = (self.clock)();
         let mut current = self.policy.write().await;
@@ -972,6 +992,10 @@ impl RouteApprovalBroker {
             .contains_key(request_id)
     }
 
+    #[allow(
+        dead_code,
+        reason = "pending-state inspection is a broker lifecycle test seam"
+    )]
     pub(crate) fn any_pending(&self) -> bool {
         !self
             .pending
@@ -980,6 +1004,10 @@ impl RouteApprovalBroker {
             .is_empty()
     }
 
+    #[allow(
+        dead_code,
+        reason = "exact pending-call inspection is retained for broker lifecycle consumers"
+    )]
     pub(crate) fn pending_tool_call_id(&self, request_id: &str) -> Option<String> {
         self.pending
             .lock()
@@ -2023,7 +2051,7 @@ mod tests {
             }),
         );
         let broker = broker.with_clock(move || {
-            if clock_ticks.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+            if clock_ticks.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
                 before_expiry
             } else {
                 after_expiry

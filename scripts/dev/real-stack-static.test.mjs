@@ -391,13 +391,18 @@ function attachmentRootFor(launcher, environment) {
   const start = launcher.indexOf('readonly CONFIGURED_PERSISTENT_STATE_ROOT="');
   const end = launcher.indexOf(
     "\n",
-    launcher.indexOf('\nPERSISTENT_STATE_ROOT="$(provision_persistent_state_root'),
+    launcher.indexOf(
+      '\nPERSISTENT_STATE_ROOT="$(provision_persistent_state_root',
+    ),
   );
   assert.ok(start > 0 && end > start);
   const script = [
     'RUNTIME_ROOT="$DISPOSABLE_RUNTIME_ROOT"',
     launcher.slice(start, end),
-    'printf %s "${CONFIGURED_PERSISTENT_STATE_ROOT}/messaging-attachments"',
+    [
+      'printf %s "$',
+      '{CONFIGURED_PERSISTENT_STATE_ROOT}/messaging-attachments"',
+    ].join(""),
   ].join("\n");
   return runBash(script, environment);
 }

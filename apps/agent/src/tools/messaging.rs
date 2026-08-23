@@ -230,6 +230,10 @@ struct ExactMessagingOutcome {
     live_post_commit: Option<LiveAppPostCommit>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "attachment metadata and response remain one allocation-free exact outcome"
+)]
 enum ExactMessagingResponse {
     Json(Value),
     Attachment {

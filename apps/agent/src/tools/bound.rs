@@ -1081,10 +1081,12 @@ mod tests {
     }
 
     fn aggregate_bound_json_object() -> Map<String, Value> {
-        assert!(5 * MAX_BOUND_STRING_BYTES > MAX_BOUND_JSON_BYTES);
-        assert!(5 < MAX_BOUND_CONTAINER_ITEMS);
-        assert!(7 < MAX_BOUND_JSON_NODES);
-        assert!(3 < MAX_BOUND_JSON_DEPTH);
+        const {
+            assert!(5 * MAX_BOUND_STRING_BYTES > MAX_BOUND_JSON_BYTES);
+            assert!(5 < MAX_BOUND_CONTAINER_ITEMS);
+            assert!(7 < MAX_BOUND_JSON_NODES);
+            assert!(3 < MAX_BOUND_JSON_DEPTH);
+        }
 
         let mut object = Map::new();
         object.insert(

@@ -376,7 +376,7 @@ impl ExecutorClient {
                 if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                     let mut line = buffer.drain(..=newline).collect::<Vec<u8>>();
                     let terminator = line.pop();
-                    if terminator != Some(b'\n') || line.iter().any(|byte| *byte == b'\r') {
+                    if terminator != Some(b'\n') || line.contains(&b'\r') {
                         return Err(indeterminate(
                             "executor source transfer terminal has invalid framing",
                         ));

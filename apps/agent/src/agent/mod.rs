@@ -915,6 +915,10 @@ pub(crate) enum RunOwnership {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "RunCore ownership stays allocation-free across every session termination path"
+)]
 pub(crate) enum SessionResult {
     Completed(RunCore),
     Failed {
@@ -1215,19 +1219,19 @@ impl<G: Gateway + 'static> Session<G> {
                 SessionResult::Failed { failure, ownership }
             }
             Ok(SessionLoopExit::ShutdownRequested) => {
-                if self.active.is_some() {
-                    if let Err(failure) = self.shutdown_active_gracefully().await {
-                        self.abort_writer().await;
-                        let ownership = if self.durable_core_invalidated {
-                            self.core.take();
-                            RunOwnership::Lost
-                        } else {
-                            self.core.take().map_or(RunOwnership::Lost, |core| {
-                                RunOwnership::Recovered(Box::new(core))
-                            })
-                        };
-                        return SessionResult::Failed { failure, ownership };
-                    }
+                if self.active.is_some()
+                    && let Err(failure) = self.shutdown_active_gracefully().await
+                {
+                    self.abort_writer().await;
+                    let ownership = if self.durable_core_invalidated {
+                        self.core.take();
+                        RunOwnership::Lost
+                    } else {
+                        self.core.take().map_or(RunOwnership::Lost, |core| {
+                            RunOwnership::Recovered(Box::new(core))
+                        })
+                    };
+                    return SessionResult::Failed { failure, ownership };
                 }
                 self.abort_writer().await;
                 match self.core.take() {
@@ -1258,6 +1262,10 @@ impl<G: Gateway + 'static> Session<G> {
         loop {
             if self.active.is_none() {
                 self.apply_idle_memory_maintenance().await?;
+                #[expect(
+                    clippy::large_enum_variant,
+                    reason = "select outcomes remain allocation-free so cancellation ordering is unchanged"
+                )]
                 enum IdleSelected {
                     Shutdown,
                     Command(Result<InboundCommand>),
@@ -2419,6 +2427,10 @@ impl<G: Gateway + 'static> Session<G> {
     async fn settle_active_shutdown(&mut self) -> Result<(), SessionFailure> {
         let mut events_open = true;
         loop {
+            #[expect(
+                clippy::large_enum_variant,
+                reason = "shutdown select keeps event ownership allocation-free at the cancellation boundary"
+            )]
             enum ShutdownSelected {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Event(Option<RunOutput>),

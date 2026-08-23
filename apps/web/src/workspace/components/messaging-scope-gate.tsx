@@ -5,12 +5,12 @@ import { type ReactNode, useState } from "react";
 import { useAuth } from "../../auth/auth-context";
 import { messagingScopeKey, sameMessagingScope } from "../../messaging/scope";
 import { getMessagingScope, useMessaging } from "../../messaging/store";
+import { messagingScopeForWorkspace } from "../messaging-scope";
 import {
   effectiveWorkspacePermissions,
   exactHumanMembership,
   useWorkspaceControl,
 } from "../store";
-import { messagingScopeForWorkspace } from "../messaging-scope";
 
 export function MessagingScopeGate({
   workspaceId,

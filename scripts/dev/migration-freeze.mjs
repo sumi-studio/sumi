@@ -3,12 +3,14 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdir, readFile, writeFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../..",
+);
 const migrationDir = path.join(repoRoot, "apps/api/internal/db/migrations");
 const manifestPath = path.join(migrationDir, "FROZEN.sha256");
 const migrationTreePath = "apps/api/internal/db/migrations";
@@ -27,7 +29,9 @@ async function manifestForAssets(names, readAsset) {
 
 async function manifest() {
   const names = await readdir(migrationDir);
-  return manifestForAssets(names, (name) => readFile(path.join(migrationDir, name)));
+  return manifestForAssets(names, (name) =>
+    readFile(path.join(migrationDir, name)),
+  );
 }
 
 const migrationName = /^(\d{4})_([a-z0-9_]+)\.(up|down)\.sql$/;
@@ -35,20 +39,38 @@ const exactCommit = /^[0-9a-f]{40}$/;
 
 function entries(text) {
   if (!text.endsWith("\n") || text.length === 1) {
-    throw new Error("migration freeze manifest must be non-empty and end with a newline");
+    throw new Error(
+      "migration freeze manifest must be non-empty and end with a newline",
+    );
   }
-  const parsed = text.slice(0, -1).split("\n").map((line) => {
-    const [digest, name, ...extra] = line.split("  ");
-    const match = migrationName.exec(name ?? "");
-    if (extra.length !== 0 || line !== `${digest}  ${name}` ||
-        !/^[0-9a-f]{64}$/.test(digest ?? "") || !match) {
-      throw new Error(`invalid migration freeze entry: ${line}`);
-    }
-    return { line, digest, name, version: Number(match[1]), stem: match[2], direction: match[3] };
-  });
+  const parsed = text
+    .slice(0, -1)
+    .split("\n")
+    .map((line) => {
+      const [digest, name, ...extra] = line.split("  ");
+      const match = migrationName.exec(name ?? "");
+      if (
+        extra.length !== 0 ||
+        line !== `${digest}  ${name}` ||
+        !/^[0-9a-f]{64}$/.test(digest ?? "") ||
+        !match
+      ) {
+        throw new Error(`invalid migration freeze entry: ${line}`);
+      }
+      return {
+        line,
+        digest,
+        name,
+        version: Number(match[1]),
+        stem: match[2],
+        direction: match[3],
+      };
+    });
   for (let index = 1; index < parsed.length; index++) {
     if (parsed[index - 1].name >= parsed[index].name) {
-      throw new Error("migration freeze entries must use canonical filename order");
+      throw new Error(
+        "migration freeze entries must use canonical filename order",
+      );
     }
   }
   return parsed;
@@ -62,9 +84,14 @@ export function validateSeal(actualText) {
     grouped.set(entry.version, group);
   }
   for (const [version, pair] of grouped) {
-    if (pair.length !== 2 || new Set(pair.map((entry) => entry.direction)).size !== 2 ||
-        new Set(pair.map((entry) => entry.stem)).size !== 1) {
-      throw new Error(`migration version ${version} must have one matching up/down pair`);
+    if (
+      pair.length !== 2 ||
+      new Set(pair.map((entry) => entry.direction)).size !== 2 ||
+      new Set(pair.map((entry) => entry.stem)).size !== 1
+    ) {
+      throw new Error(
+        `migration version ${version} must have one matching up/down pair`,
+      );
     }
   }
 }
@@ -84,7 +111,9 @@ export function validateExtension(expectedText, actualText) {
   const actual = entries(actualText);
   for (let index = 0; index < expected.length; index++) {
     if (actual[index]?.line !== expected[index].line) {
-      throw new Error(`sealed migration changed, disappeared, or moved: ${expected[index].line}`);
+      throw new Error(
+        `sealed migration changed, disappeared, or moved: ${expected[index].line}`,
+      );
     }
   }
   const added = actual.slice(expected.length);
@@ -95,12 +124,19 @@ export function validateExtension(expectedText, actualText) {
   }
   const [newVersion] = addedVersions;
   if (newVersion !== sealedMaximum + 1) {
-    throw new Error(`new migration version ${newVersion} must immediately follow sealed maximum ${sealedMaximum}`);
+    throw new Error(
+      `new migration version ${newVersion} must immediately follow sealed maximum ${sealedMaximum}`,
+    );
   }
   const pair = added.filter((entry) => entry.version === newVersion);
-  if (pair.length !== 2 || new Set(pair.map((entry) => entry.direction)).size !== 2 ||
-      new Set(pair.map((entry) => entry.stem)).size !== 1) {
-    throw new Error(`migration version ${newVersion} must add one matching up/down pair`);
+  if (
+    pair.length !== 2 ||
+    new Set(pair.map((entry) => entry.direction)).size !== 2 ||
+    new Set(pair.map((entry) => entry.stem)).size !== 1
+  ) {
+    throw new Error(
+      `migration version ${newVersion} must add one matching up/down pair`,
+    );
   }
 }
 
@@ -119,7 +155,9 @@ export function validateCandidateAgainstBase({
 
   if (baseManifest === undefined) {
     if (candidateManifest !== baseActual) {
-      throw new Error("initial seal must preserve and exactly seal the base migration SQL assets");
+      throw new Error(
+        "initial seal must preserve and exactly seal the base migration SQL assets",
+      );
     }
     return "initial seal";
   }
@@ -141,7 +179,9 @@ async function gitOutput(root, args) {
     });
     return stdout;
   } catch (error) {
-    throw new Error(`cannot read base Git object with git ${args[0]}: ${error.message}`);
+    throw new Error(
+      `cannot read base Git object with git ${args[0]}: ${error.message}`,
+    );
   }
 }
 
@@ -149,24 +189,40 @@ async function baseSnapshot(root, baseCommit) {
   if (!exactCommit.test(baseCommit ?? "") || /^0{40}$/.test(baseCommit)) {
     throw new Error("base commit must be an exact lowercase 40-hex object ID");
   }
-  const objectType = (await gitOutput(root, ["cat-file", "-t", baseCommit])).toString("utf8").trim();
+  const objectType = (await gitOutput(root, ["cat-file", "-t", baseCommit]))
+    .toString("utf8")
+    .trim();
   if (objectType !== "commit") {
-    throw new Error(`base object ${baseCommit} is ${objectType || "unknown"}, not a commit`);
+    throw new Error(
+      `base object ${baseCommit} is ${objectType || "unknown"}, not a commit`,
+    );
   }
 
   const tree = await gitOutput(root, [
-    "ls-tree", "-rz", "--name-only", baseCommit, "--", migrationTreePath,
+    "ls-tree",
+    "-rz",
+    "--name-only",
+    baseCommit,
+    "--",
+    migrationTreePath,
   ]);
   const prefix = `${migrationTreePath}/`;
-  const names = tree.toString("utf8").split("\0").filter(Boolean).map((entryPath) => {
-    if (!entryPath.startsWith(prefix)) {
-      throw new Error(`unexpected migration path in base tree: ${entryPath}`);
-    }
-    return entryPath.slice(prefix.length);
-  });
-  const readBaseAsset = (name) => gitOutput(root, [
-    "cat-file", "blob", `${baseCommit}:${migrationTreePath}/${name}`,
-  ]);
+  const names = tree
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .map((entryPath) => {
+      if (!entryPath.startsWith(prefix)) {
+        throw new Error(`unexpected migration path in base tree: ${entryPath}`);
+      }
+      return entryPath.slice(prefix.length);
+    });
+  const readBaseAsset = (name) =>
+    gitOutput(root, [
+      "cat-file",
+      "blob",
+      `${baseCommit}:${migrationTreePath}/${name}`,
+    ]);
   const actual = await manifestForAssets(names, readBaseAsset);
   const frozen = names.includes("FROZEN.sha256")
     ? (await readBaseAsset("FROZEN.sha256")).toString("utf8")
@@ -176,10 +232,9 @@ async function baseSnapshot(root, baseCommit) {
 
 export async function verifyAgainstBase(baseCommit, root = repoRoot) {
   const candidateDir = path.join(root, migrationTreePath);
-  const candidateActualPromise = readdir(candidateDir).then((names) => manifestForAssets(
-    names,
-    (name) => readFile(path.join(candidateDir, name)),
-  ));
+  const candidateActualPromise = readdir(candidateDir).then((names) =>
+    manifestForAssets(names, (name) => readFile(path.join(candidateDir, name))),
+  );
   const [base, candidateManifest, candidateActual] = await Promise.all([
     baseSnapshot(root, baseCommit),
     readFile(path.join(candidateDir, "FROZEN.sha256"), "utf8"),
@@ -223,12 +278,17 @@ async function main() {
     const result = await verifyAgainstBase(process.argv[3]);
     console.log(`migration history is valid against base commit: ${result}`);
   } else {
-    console.error("usage: node scripts/dev/migration-freeze.mjs seal|extend|check|verify-base <40-hex-commit>");
+    console.error(
+      "usage: node scripts/dev/migration-freeze.mjs seal|extend|check|verify-base <40-hex-commit>",
+    );
     process.exitCode = 2;
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+) {
   try {
     await main();
   } catch (error) {
