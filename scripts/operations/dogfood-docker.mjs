@@ -214,16 +214,13 @@ function isVerifiedImageAbsence(result, subject) {
   const expectedError = Buffer.from(
     `Error response from daemon: No such image: ${subject}\n`,
   );
-  const expectedErrorWithLeadingLf = Buffer.concat([
-    Buffer.from("\n"),
-    expectedError,
-  ]);
+  const stdoutIsExpected =
+    result.stdout.length === 0 || result.stdout.equals(Buffer.from("\n"));
   return (
     result.code === 1 &&
     result.signal === null &&
-    result.stdout.length === 0 &&
-    (result.stderr.equals(expectedError) ||
-      result.stderr.equals(expectedErrorWithLeadingLf))
+    stdoutIsExpected &&
+    result.stderr.equals(expectedError)
   );
 }
 

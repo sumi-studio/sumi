@@ -174,7 +174,7 @@ control() {
 }
 FAKE_ALIAS_ALL_BINDINGS="$(control FAKE_ALIAS_ALL_BINDINGS)"
 FAKE_APPEAR_BEFORE_ROLE="$(control FAKE_APPEAR_BEFORE_ROLE)"
-FAKE_ABSENCE_PREFIX_NEWLINES="$(control FAKE_ABSENCE_PREFIX_NEWLINES)"
+FAKE_ABSENCE_STDOUT_NEWLINES="$(control FAKE_ABSENCE_STDOUT_NEWLINES)"
 FAKE_ASSERT_EXCLUDED="$(control FAKE_ASSERT_EXCLUDED)"
 FAKE_BAD_IID_ROLE="$(control FAKE_BAD_IID_ROLE)"
 FAKE_BAD_LABEL_ROLE="$(control FAKE_BAD_LABEL_ROLE)"
@@ -225,10 +225,10 @@ role_id() {
   printf 'sha256:%064s' '' | tr ' ' "$hex"
 }
 print_image_absence() {
-  case "$FAKE_ABSENCE_PREFIX_NEWLINES" in
+  case "$FAKE_ABSENCE_STDOUT_NEWLINES" in
     "") ;;
-    1) printf '\\n' >&2 ;;
-    2) printf '\\n\\n' >&2 ;;
+    1) printf '\\n' ;;
+    2) printf '\\n\\n' ;;
     *) exit 89 ;;
   esac
   printf 'Error response from daemon: No such image: %s\\n' "$1" >&2
@@ -708,20 +708,17 @@ test("only verified Docker not-found permits mutable-reference assignment", asyn
     });
   });
 
-  await t.test(
-    "verified live Docker absence with exactly one leading LF",
-    async () => {
-      await withFixture(async (fixture) => {
-        await run(fixture, [], { FAKE_ABSENCE_PREFIX_NEWLINES: "1" });
-        await stat(fixture.manifest);
-      });
-    },
-  );
+  await t.test("verified live Docker absence with one stdout LF", async () => {
+    await withFixture(async (fixture) => {
+      await run(fixture, [], { FAKE_ABSENCE_STDOUT_NEWLINES: "1" });
+      await stat(fixture.manifest);
+    });
+  });
 
-  await t.test("two leading LFs fail closed", async () => {
+  await t.test("two stdout LFs fail closed", async () => {
     await withFixture(async (fixture) => {
       await assert.rejects(
-        run(fixture, [], { FAKE_ABSENCE_PREFIX_NEWLINES: "2" }),
+        run(fixture, [], { FAKE_ABSENCE_STDOUT_NEWLINES: "2" }),
         /cannot inspect requested mutable reference safely/,
       );
       await assert.rejects(stat(join(fixture.state, "built-api")), {
