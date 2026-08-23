@@ -155,6 +155,7 @@ type messageWire struct {
 	ClientNonce string            `json:"client_nonce"`
 	CreatedAt   time.Time         `json:"created_at"`
 	EditedAt    *time.Time        `json:"edited_at"`
+	Revision    int64             `json:"revision"`
 	Deleted     bool              `json:"deleted"`
 }
 
@@ -238,6 +239,7 @@ func messageToWire(place Place, m Message) messageWire {
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
+		Revision:    m.Revision,
 		Deleted:     m.Deleted,
 	}
 	if m.ReplyTo != "" {
@@ -1051,13 +1053,18 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Content string `json:"content"`
+		Content  string `json:"content"`
+		Revision int64  `json:"revision"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Content == "" || !messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
+		return
+	}
+	if req.Revision <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_revision")
 		return
 	}
 	store := scopedStoreForRequest(r)
@@ -1069,13 +1076,34 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	var msg Message
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, opErr = store.EditMessage(r.Context(), placeID, r.PathValue("message_id"), req.Content)
+		msg, opErr = store.EditMessage(r.Context(), placeID, r.PathValue("message_id"), req.Content, req.Revision)
 		return opErr
 	})
 	if !done {
 		return
 	}
 	if err != nil {
+		var conflict *messageRevisionConflictError
+		if errors.As(err, &conflict) {
+			writeJSON(w, http.StatusConflict, struct {
+				Error   string      `json:"error"`
+				Message messageWire `json:"message"`
+			}{
+				Error:   "edit_conflict",
+				Message: messageToWire(place, conflict.Current),
+			})
+			return
+		}
+		if errors.Is(err, ErrMessageDeleted) {
+			writeJSON(w, http.StatusConflict, struct {
+				Error   string      `json:"error"`
+				Message messageWire `json:"message"`
+			}{
+				Error:   "message_deleted",
+				Message: messageToWire(place, msg),
+			})
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
@@ -1113,7 +1141,9 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	wire := messageToWire(place, msg)
 	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: wire})
 }
 
 // serveToggleReaction toggles the viewer's emoji on a message. The same store
@@ -1449,6 +1479,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "not_reachable")
 	case errors.Is(err, ErrMessageDeleted):
 		writeError(w, http.StatusConflict, "message_deleted")
+	case errors.Is(err, ErrMessageRevisionConflict):
+		writeError(w, http.StatusConflict, "edit_conflict")
 	case errors.Is(err, ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, "idempotency_conflict")
 	case errors.Is(err, ErrAttachmentNotFound):

@@ -133,6 +133,8 @@ export interface Message {
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
+  /** 編集の compare-and-swap 用の単調増加版。 */
+  revision?: number;
   /** 削除済みはtombstone: contentは空になり、消えた事実とseqだけが残る。 */
   deleted: boolean;
   /** 送信者自身の楽観的描画とACK/echoを照合するidempotency key。 */
@@ -392,8 +394,13 @@ export interface MessagingBackend {
    * そのまま使う。scopeが変われば別のURLになる。
    */
   attachmentURL(attachmentId: string): string;
-  editMessage(place: Place, messageId: string, content: string): Promise<void>;
-  deleteMessage(place: Place, messageId: string): Promise<void>;
+  editMessage(
+    place: Place,
+    messageId: string,
+    content: string,
+    expectedRevision: number,
+  ): Promise<Message>;
+  deleteMessage(place: Place, messageId: string): Promise<Message>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
   /**
    * 自己申告のattentionの現在値。status_updatedはvolatileでreplayされず、

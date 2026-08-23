@@ -167,8 +167,12 @@ class FakePresenceBackend implements MessagingBackend {
   async sendMessage(): Promise<SendReceipt> {
     throw new Error("unused");
   }
-  async editMessage(): Promise<void> {}
-  async deleteMessage(): Promise<void> {}
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
+    throw new Error("unused");
+  }
+  async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
+    throw new Error("unused");
+  }
   async markRead(): Promise<void> {}
   async setStatus(): Promise<ParticipantStatus> {
     return this.nextStatus;

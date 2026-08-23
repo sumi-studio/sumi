@@ -49,6 +49,7 @@ type Message struct {
 	ClientNonce string
 	CreatedAt   time.Time
 	EditedAt    *time.Time
+	Revision    int64
 	Deleted     bool
 }
 
@@ -99,7 +100,7 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		)
 		if err := rows.Scan(&m.MessageID, &m.PlaceID, &m.Seq, &authorKind, &m.Author.ID,
 			&content, &m.Urgency, &replyTo, &m.ClientNonce,
-			&m.CreatedAt, &m.EditedAt, &deletedAt); err != nil {
+			&m.CreatedAt, &m.EditedAt, &m.Revision, &deletedAt); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		m.Author.Kind = ParticipantKind(authorKind)

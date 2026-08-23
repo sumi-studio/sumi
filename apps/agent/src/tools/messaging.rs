@@ -307,6 +307,7 @@ struct OpenMessageWire {
     client_nonce: String,
     created_at: String,
     edited_at: Value,
+    revision: u64,
     deleted: bool,
     attachments: Vec<MessagingAttachmentMetadata>,
 }
@@ -2401,6 +2402,11 @@ fn validate_open_message(
             "Messaging open message has an invalid message_id".to_owned(),
         ));
     }
+    if message.revision == 0 {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid revision".to_owned(),
+        ));
+    }
     validate_open_participant(&message.author, "author")?;
     for mention in &message.mentions {
         validate_open_participant(mention, "mention")?;
@@ -2697,6 +2703,7 @@ mod tests {
             "client_nonce": format!("nonce-{seq}"),
             "created_at": "2026-08-12T00:00:00Z",
             "edited_at": null,
+            "revision": 1,
             "deleted": deleted,
             "attachments": []
         })
@@ -5611,6 +5618,38 @@ mod tests {
                 ("general".to_owned(), 15),
                 ("general".to_owned(), 25)
             ]
+        );
+    }
+
+    #[test]
+    fn strict_open_wire_requires_positive_message_revision() {
+        let present = test_open_response("general", 1, 0, 1, 1, None);
+        assert!(
+            validate_open_response(&present, "general", None, None).is_ok(),
+            "a positive revision must be admitted"
+        );
+
+        let mut missing = present.clone();
+        missing["messages"][0]
+            .as_object_mut()
+            .expect("message object")
+            .remove("revision");
+        assert!(
+            matches!(
+                validate_open_response(&missing, "general", None, None),
+                Err(ToolError::Protocol(_))
+            ),
+            "an omitted revision must fail closed"
+        );
+
+        let mut zero = present;
+        zero["messages"][0]["revision"] = json!(0);
+        assert!(
+            matches!(
+                validate_open_response(&zero, "general", None, None),
+                Err(ToolError::Protocol(_))
+            ),
+            "revision zero must fail closed"
         );
     }
 

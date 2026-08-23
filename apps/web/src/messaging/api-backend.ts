@@ -44,12 +44,19 @@ const UPLOAD_TIMEOUT_MS = 120_000;
 export class MessagingAPIError extends Error {
   readonly code: string;
   readonly status: number;
+  /** 409 edit_conflict が返す、サーバで確定した現在のメッセージ。 */
+  readonly currentMessage: Message | null;
+  /** 失敗応答が返した対象メッセージ。tombstone を含み得る。 */
+  readonly responseMessage: Message | null;
 
-  constructor(code: string, status: number) {
+  constructor(code: string, status: number, body: unknown = null) {
     super(code);
     this.name = "MessagingAPIError";
     this.code = code;
     this.status = status;
+    this.responseMessage = parseResponseMessage(body);
+    this.currentMessage =
+      code === "edit_conflict" ? this.responseMessage : null;
   }
 }
 
@@ -324,18 +331,25 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     content: string,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "PATCH", body: { content } },
+    expectedRevision: number,
+  ): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
+        { method: "PATCH", body: { content, revision: expectedRevision } },
+      ),
     );
+    return parseMessage(body.message);
   }
 
-  async deleteMessage(place: Place, messageId: string): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "DELETE" },
+  async deleteMessage(place: Place, messageId: string): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
+        { method: "DELETE" },
+      ),
     );
+    return parseMessage(body.message);
   }
 
   async markRead(place: Place, lastReadSeq: number): Promise<void> {
@@ -667,16 +681,26 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
     if (!response.ok) {
       let code = "messaging_request_failed";
+      let body: unknown = null;
       try {
-        const body = asRecord(await response.json());
-        if (typeof body.error === "string") code = body.error;
+        body = await response.json();
+        const error = asRecord(body);
+        if (typeof error.error === "string") code = error.error;
       } catch {
         // Status remains the authoritative non-sensitive signal.
       }
-      throw new MessagingAPIError(code, response.status);
+      throw new MessagingAPIError(code, response.status, body);
     }
     if (response.status === 204) return null;
     return response.json() as Promise<unknown>;
+  }
+}
+
+function parseResponseMessage(body: unknown): Message | null {
+  try {
+    return parseMessage(asRecord(body).message);
+  } catch {
+    return null;
   }
 }
 
@@ -823,6 +847,7 @@ function parseMessage(value: unknown): Message {
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
+    revision: asRevision(wire.revision),
     deleted: asBoolean(wire.deleted),
   };
 }
@@ -888,6 +913,11 @@ function asSeq(value: unknown): number {
     throw new Error("invalid messaging sequence");
   }
   return Number(value);
+}
+function asRevision(value: unknown): number {
+  const revision = asSeq(value);
+  if (revision < 1) throw new Error("invalid messaging revision");
+  return revision;
 }
 function asTimestamp(value: unknown): number {
   const parsed = Date.parse(asString(value));

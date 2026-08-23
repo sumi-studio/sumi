@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BrowserContext } from "@playwright/test";
+import { hasExactOpenMessageWireShape } from "../../src/messaging/real-agent-wire";
 
 const supportDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(supportDirectory, "../../../..");
@@ -582,12 +583,19 @@ class LoopbackReviewerProvider {
       }
       const raw = await readBoundedJSON(request);
       const responseFormat = raw.response_format;
+      const initialReview =
+        responseFormat === undefined &&
+        Array.isArray(raw.tools) &&
+        raw.tools.length > 0;
+      const structuredRetry =
+        isRecord(responseFormat) &&
+        responseFormat.type === this.expectedResponseFormat &&
+        (!Array.isArray(raw.tools) || raw.tools.length === 0);
       if (
         raw.stream !== true ||
         raw.model !== this.model ||
         !Array.isArray(raw.messages) ||
-        !isRecord(responseFormat) ||
-        responseFormat.type !== this.expectedResponseFormat
+        (!initialReview && !structuredRetry)
       ) {
         respondJSON(response, 422, { error: "invalid_reviewer_request" });
         return;
@@ -1991,13 +1999,14 @@ function exactSingleMessagingChannel(
     workspace.name.length === 0 ||
     !isRecord(channel) ||
     Object.keys(channel).sort().join("\0") !==
-      "channel_id\0name\0topic\0visibility\0workspace_id" ||
+      "channel_id\0name\0topic\0visibility\0voice\0workspace_id" ||
     !isCanonicalUUIDv7(channel.channel_id) ||
     channel.workspace_id !== workspaceID ||
     typeof channel.name !== "string" ||
     channel.name.length === 0 ||
     typeof channel.topic !== "string" ||
-    typeof channel.visibility !== "string"
+    typeof channel.visibility !== "string" ||
+    typeof channel.voice !== "boolean"
   ) {
     return undefined;
   }
@@ -2082,6 +2091,7 @@ function exactMessagingWriteReceipt(
 function exactOpenMessages(value: unknown): Array<{
   messageID: string;
   content: string;
+  revision: number;
   author: { kind: string; id: string };
   attachments: Array<{
     attachmentID: string;
@@ -2104,11 +2114,7 @@ function exactOpenMessages(value: unknown): Array<{
   }
   const messages = value.messages.flatMap((entry) => {
     if (
-      !isRecord(entry) ||
-      Object.keys(entry).sort().join("\0") !==
-        "attachments\0author\0client_nonce\0content\0created_at\0deleted\0edited_at\0mentions\0message_id\0place\0reactions\0reply_to\0seq\0urgency" ||
-      !isCanonicalUUIDv7(entry.message_id) ||
-      typeof entry.content !== "string" ||
+      !hasExactOpenMessageWireShape(entry) ||
       !isRecord(entry.author) ||
       !Array.isArray(entry.attachments)
     ) {
@@ -2163,6 +2169,7 @@ function exactOpenMessages(value: unknown): Array<{
       {
         messageID: entry.message_id,
         content: entry.content,
+        revision: entry.revision,
         author: { kind: author.kind, id: authorID },
         attachments,
       },

@@ -396,8 +396,12 @@ func TestEditAndDeleteAuthorization(t *testing.T) {
 	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.agent); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("member delete: got %v, want ErrForbidden", err)
 	}
-	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA); err != nil {
+	deleted, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA)
+	if err != nil {
 		t.Fatalf("owner delete: %v", err)
+	}
+	if deleted.Revision != edited.Revision+1 {
+		t.Fatalf("delete revision = %d, want %d", deleted.Revision, edited.Revision+1)
 	}
 	// Idempotent: deleting a tombstone is a no-op.
 	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanB); err != nil {

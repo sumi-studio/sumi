@@ -60,6 +60,20 @@ afterEach(() => {
 });
 
 describe("ApiMessagingBackend", () => {
+  it("rejects zero message revisions before they can become a CAS base", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({ messages: [{ ...messageWire(1, "invalid"), revision: 0 }] }),
+      ),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(backend.fetchMessages(channel)).rejects.toThrow(
+      "invalid messaging revision",
+    );
+  });
+
   it("rejects attachment wires that omit required spoiler or alt declarations", async () => {
     for (const missing of ["spoiler", "alt"] as const) {
       const attachment: Record<string, unknown> = {
@@ -147,6 +161,120 @@ describe("ApiMessagingBackend", () => {
         body: JSON.stringify({ seq: 2 }),
       }),
     );
+  });
+
+  it("keeps the server current message on an edit conflict", async () => {
+    const current = {
+      ...messageWire(1, "サーバで確定した本文"),
+      edited_at: "2026-08-18T12:00:00Z",
+      revision: 2,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.endsWith("/messages/message-1")) {
+        return json({ error: "edit_conflict", message: current }, 409);
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.editMessage(channel, "message-1", "古い書きかけ", 1),
+    ).rejects.toMatchObject({
+      code: "edit_conflict",
+      status: 409,
+      currentMessage: expect.objectContaining({
+        content: "サーバで確定した本文",
+        revision: 2,
+      }),
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/places/channel-1/messages/message-1"),
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ content: "古い書きかけ", revision: 1 }),
+      }),
+    );
+  });
+
+  it("keeps the terminal tombstone on a deleted edit target", async () => {
+    const deleted = {
+      ...messageWire(1, ""),
+      deleted: true,
+      revision: 2,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.endsWith("/messages/message-1")) {
+        return json({ error: "message_deleted", message: deleted }, 409);
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.editMessage(channel, "message-1", "古い書きかけ", 1),
+    ).rejects.toMatchObject({
+      code: "message_deleted",
+      status: 409,
+      responseMessage: expect.objectContaining({
+        deleted: true,
+        revision: 2,
+      }),
+    });
+  });
+
+  it("returns the committed message from a successful edit", async () => {
+    const committed = {
+      ...messageWire(1, "サーバで確定した本文"),
+      edited_at: "2026-08-18T12:00:00Z",
+      revision: 2,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = expectScopedMessagingPath(input);
+      if (path.endsWith("/messages/message-1")) {
+        return json({ message: committed });
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.editMessage(channel, "message-1", "サーバで確定した本文", 1),
+    ).resolves.toMatchObject({
+      messageId: "message-1",
+      content: "サーバで確定した本文",
+      revision: 2,
+    });
+  });
+
+  it("returns the revisioned tombstone from DELETE", async () => {
+    const deleted = {
+      ...messageWire(1, ""),
+      deleted: true,
+      revision: 2,
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path.endsWith("/messages/message-1") && init?.method === "DELETE") {
+          return json({ message: deleted });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(
+      backend.deleteMessage(channel, "message-1"),
+    ).resolves.toMatchObject({
+      deleted: true,
+      revision: 2,
+    });
   });
 
   it("requests the scoped bounded search projection", async () => {
@@ -872,6 +1000,7 @@ function messageWire(
     client_nonce: `nonce-${seq}`,
     created_at: "2026-08-01T10:00:00Z",
     edited_at: null,
+    revision: 1,
     deleted: false,
   };
 }
