@@ -369,17 +369,78 @@ func (tracker *supervisorControlTracker) grace(override time.Duration) time.Dura
 	return bound
 }
 
-func (tracker *supervisorControlTracker) signalNested(signal syscall.Signal) error {
+func (tracker *supervisorControlTracker) forceNestedAndRetain() (int, error) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	if tracker.nestedState == nestedIdle || tracker.nestedPID <= 0 || tracker.nestedPIDFD < 0 {
+		return -1, nil
+	}
+	joinFD, err := unix.FcntlInt(uintptr(tracker.nestedPIDFD), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("retain nested anchor pidfd: %w", err)
+	}
+	if err := forceNestedPIDFD(tracker.nestedPIDFD); err != nil {
+		_ = unix.Close(joinFD)
+		return -1, err
+	}
+	return joinFD, nil
+}
+
+func (tracker *supervisorControlTracker) forceNestedAndTake() (int, error) {
+	// The caller must first join the control reader, which makes ownership of
+	// the tracked pidfd exclusive and prevents a later nested-done from closing
+	// the transferred descriptor.
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.nestedState == nestedIdle || tracker.nestedPID <= 0 || tracker.nestedPIDFD < 0 {
+		return -1, nil
+	}
+	pidfd := tracker.nestedPIDFD
+	err := forceNestedPIDFD(pidfd)
+	tracker.nestedPID = 0
+	tracker.nestedStart = 0
+	tracker.nestedPIDFD = -1
+	tracker.nestedState = nestedIdle
+	return pidfd, err
+}
+
+func forceNestedPIDFD(pidfd int) error {
+	// A protocol-valid anchor is stopped until its supervisor sends CONT. Make
+	// it runnable before requesting the anchor's graceful force path; otherwise
+	// SIGUSR2 remains pending and killing the detached supervisor group cannot
+	// reach either the anchor or its descendants.
+	for _, signal := range []syscall.Signal{syscall.SIGCONT, syscall.SIGUSR2} {
+		if err := unix.PidfdSendSignal(pidfd, signal, nil, 0); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return nil
+			}
+			return fmt.Errorf("signal nested anchor %s: %w", signal, err)
+		}
+	}
+	return nil
+}
+
+func waitForNestedExit(pidfd int) error {
+	if pidfd < 0 {
 		return nil
 	}
-	err := unix.PidfdSendSignal(tracker.nestedPIDFD, signal, nil, 0)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
+	defer unix.Close(pidfd)
+	poll := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for {
+		count, err := unix.Poll(poll, -1)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("join nested anchor: %w", err)
+		}
+		if count > 0 && poll[0].Revents&unix.POLLIN != 0 {
+			return nil
+		}
+		if count > 0 {
+			return fmt.Errorf("join nested anchor: unexpected pidfd poll events %#x", poll[0].Revents)
+		}
 	}
-	return err
 }
 
 func (tracker *supervisorControlTracker) close() {
@@ -485,18 +546,26 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 			return errors.Join(errors.New("supervisor control drain exceeded its advertised reserve"), <-consumeDone)
 		}
 	}
+	forceAndJoinFinalNested := func() error {
+		pidfd, forceErr := tracker.forceNestedAndTake()
+		return errors.Join(forceErr, waitForNestedExit(pidfd))
+	}
 	select {
 	case <-exited:
 		err := command.Wait()
 		controlErr := drainControl(time.Now().Add(supervisorControlDrainJoinReserve))
+		nestedErr := forceAndJoinFinalNested()
 		if err != nil {
 			return nil, &supervisorCommandError{
-				cause:      errors.Join(err, controlErr),
+				cause:      errors.Join(err, controlErr, nestedErr),
 				diagnostic: sanitizeSupervisorError(stderr.String(), environment),
 			}
 		}
-		if controlErr != nil {
-			return nil, &supervisorCommandError{cause: controlErr, diagnostic: "supervisor cleanup control protocol failed closed"}
+		if controlErr != nil || nestedErr != nil {
+			return nil, &supervisorCommandError{
+				cause:      errors.Join(controlErr, nestedErr),
+				diagnostic: "supervisor cleanup control protocol failed closed",
+			}
 		}
 		return stdout.Bytes(), nil
 	case <-ctx.Done():
@@ -521,6 +590,7 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 	}
 	timer := time.NewTimer(forceAfter)
 	var killErr error
+	nestedJoinFD := -1
 	cleanupExpired := false
 	select {
 	case <-exited:
@@ -531,7 +601,7 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 			}
 		}
 	case <-timer.C:
-		killErr = tracker.signalNested(syscall.SIGUSR2)
+		nestedJoinFD, killErr = tracker.forceNestedAndRetain()
 		remaining := time.Until(cleanupDeadline)
 		if remaining < 0 {
 			remaining = 0
@@ -557,7 +627,15 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 	killErr = errors.Join(killErr, syscall.Kill(-command.Process.Pid, syscall.SIGKILL))
 	waitErr := command.Wait()
 	controlErr := drainControl(cleanupDeadline)
-	killErr = errors.Join(killErr, controlErr)
+	// Once the supervisor and its control writer are gone, no new anchor can be
+	// admitted. Retain and force any anchor that became current after the first
+	// escalation, then join every retained pidfd. Anchor exit is the proof that
+	// its child-subreaper wait4 observed exact descendant absence; never close a
+	// live stable handle merely because the advertised deadline was reached.
+	killErr = errors.Join(killErr, controlErr, waitForNestedExit(nestedJoinFD), forceAndJoinFinalNested())
+	if time.Now().After(cleanupDeadline) {
+		cleanupExpired = true
+	}
 	diagnostic := sanitizeSupervisorError(stderr.String(), environment)
 	if cleanupExpired {
 		diagnostic = "supervisor cleanup exceeded its advertised bound; host lifecycle state is indeterminate and requires reconciliation; " + diagnostic

@@ -365,6 +365,74 @@ while :; do sleep 1; done
 	waitForProcessGroupGone(t, nestedPID, "detached cleanup session")
 }
 
+func TestExecCommandRunnerCancelsAfterNestedReadyBeforeContinue(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready-before-continue")
+	pidPath := filepath.Join(dir, "nested-pid")
+	scriptPath := filepath.Join(dir, "supervisor.sh")
+	script := `#!/bin/bash
+set -eu
+printf 'cleanup-bound-ms 150\n' >&3
+trap 'exit 143' TERM
+setsid "${ANCHOR}" /bin/bash -p -c 'trap "" TERM; while :; do sleep 1; done' 3>&- &
+nested=$!
+while :; do
+  stat="$(<"/proc/${nested}/stat")"
+  remainder="${stat##*) }"
+  read -r -a fields <<<"${remainder}"
+  [[ "${fields[0]}" == T ]] && break
+  sleep 0.005
+done
+identity="${nested}:${fields[19]}"
+printf '%s' "${nested}" >"${PID_PATH}"
+printf 'nested-start %s\n' "${identity}" >&3
+read -r ack <&3
+printf 'nested-ready %s\n' "${identity}" >&3
+read -r ack <&3
+# This marker makes the cancellation point deterministic: the tracker has
+# acknowledged a protocol-valid stopped anchor, and this fixture never sends
+# the supervisor's normal CONT.
+printf ready >"${READY_PATH}"
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	anchorPath := composeAnchorBinary(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := (execCommandRunner{pipeWait: 25 * time.Millisecond}).Run(
+			ctx,
+			scriptPath,
+			nil,
+			[]string{
+				"PATH=/usr/bin:/bin",
+				"ANCHOR=" + anchorPath,
+				"READY_PATH=" + readyPath,
+				"PID_PATH=" + pidPath,
+			},
+		)
+		result <- err
+	}()
+	waitForFile(t, readyPath)
+	nestedPID := readPID(t, pidPath)
+	t.Cleanup(func() {
+		_ = syscall.Kill(nestedPID, syscall.SIGCONT)
+		_ = syscall.Kill(nestedPID, syscall.SIGUSR2)
+	})
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runner error = %v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not join the stopped nested anchor after cancellation")
+	}
+	waitForProcessGroupGone(t, nestedPID, "stopped nested cleanup anchor")
+}
+
 func TestSupervisorControlTrackerRejectsDuplicateWithoutDroppingLiveAnchor(t *testing.T) {
 	anchor := exec.Command("/bin/sleep", "30")
 	anchor.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
