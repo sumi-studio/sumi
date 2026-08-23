@@ -590,7 +590,7 @@ func TestPlaceEditsOverHTTPRefuseANoOpAndAnnounceTheCopy(t *testing.T) {
 	}
 
 	resp, body = call(t, ts, http.MethodPost, "/messaging/places/"+channel.PlaceID+"/duplicate", w.humanA.ID,
-		map[string]any{})
+		map[string]any{"client_nonce": "http-duplicate-place"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("duplicate: status %d body %v", resp.StatusCode, body)
 	}
@@ -621,6 +621,62 @@ func TestPlaceEditsOverHTTPRefuseANoOpAndAnnounceTheCopy(t *testing.T) {
 	}
 	if !sawUpdated || !sawCreated {
 		t.Fatalf("place edits were not announced (updated=%v created=%v)", sawUpdated, sawCreated)
+	}
+}
+
+func TestPlaceCreationHTTPRequiresClientNonceBeforeMutation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+
+	var before int
+	if err := w.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM places WHERE workspace_id = $1`, workspace.WorkspaceID,
+	).Scan(&before); err != nil {
+		t.Fatalf("count places before missing nonces: %v", err)
+	}
+	tests := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{
+			name: "create channel",
+			path: "/messaging/channels",
+			body: map[string]any{"workspace_id": workspace.WorkspaceID, "name": "missing-nonce"},
+		},
+		{
+			name: "duplicate channel",
+			path: "/messaging/places/" + channel.PlaceID + "/duplicate",
+			body: map[string]any{},
+		},
+		{
+			name: "create group DM",
+			path: "/messaging/group-dms",
+			body: map[string]any{"participants": []any{
+				map[string]any{"kind": "human", "human_id": w.humanB.ID},
+				map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resp, body := call(t, ts, http.MethodPost, test.path, w.humanA.ID, test.body)
+			if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_client_nonce" {
+				t.Fatalf("missing nonce: status %d body %v", resp.StatusCode, body)
+			}
+		})
+	}
+
+	var after int
+	if err := w.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM places WHERE workspace_id = $1`, workspace.WorkspaceID,
+	).Scan(&after); err != nil {
+		t.Fatalf("count places after missing nonces: %v", err)
+	}
+	if after != before {
+		t.Fatalf("missing-nonce requests mutated places: before %d after %d", before, after)
 	}
 }
 

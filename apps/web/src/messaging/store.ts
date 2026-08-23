@@ -117,6 +117,33 @@ let nextDMStartToken = 0;
 let nextEditSessionToken = 0;
 
 /**
+ * One entry is one unresolved human place-creation gesture. A transport
+ * failure keeps its nonce for a manual retry with the exact same declaration;
+ * a canonical response removes it so a later explicit gesture is new. The map
+ * is cleared with the exact Messaging session/installation scope.
+ */
+const placeCreationAttempts = new Map<string, string>();
+const MAX_RETAINED_PLACE_CREATION_ATTEMPTS = 32;
+
+function placeCreationAttemptNonce(key: string): string {
+  const retained = placeCreationAttempts.get(key);
+  if (retained) return retained;
+  if (placeCreationAttempts.size >= MAX_RETAINED_PLACE_CREATION_ATTEMPTS) {
+    const oldest = placeCreationAttempts.keys().next().value;
+    if (oldest !== undefined) placeCreationAttempts.delete(oldest);
+  }
+  const nonce = secureRandomUUID();
+  placeCreationAttempts.set(key, nonce);
+  return nonce;
+}
+
+function completePlaceCreationAttempt(key: string, nonce: string): void {
+  if (placeCreationAttempts.get(key) === nonce) {
+    placeCreationAttempts.delete(key);
+  }
+}
+
+/**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
  * Fileと AbortController はここで持つ。resetで必ず全部止めて捨てる。
  */
@@ -2160,9 +2187,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const request = beginMessagingBackendRequest();
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
+      const attemptKey = JSON.stringify([
+        "create_channel",
+        workspaceId,
+        name,
+        topic,
+        voice,
+      ]);
+      const clientNonce = placeCreationAttemptNonce(attemptKey);
       const channel = await request.wait((backend) =>
-        backend.createChannel(workspaceId, name, topic, voice),
+        backend.createChannel(workspaceId, name, topic, voice, clientNonce),
       );
+      if (channel) completePlaceCreationAttempt(attemptKey, clientNonce);
       if (
         !channel ||
         !request.isCurrent() ||
@@ -2189,14 +2225,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
       const token = ++nextDMStartToken;
+      const groupAttemptKey =
+        participants.length > 1
+          ? JSON.stringify([
+              "create_group_dm",
+              ...participants.map(participantKey).sort(),
+            ])
+          : null;
+      const clientNonce =
+        groupAttemptKey === null
+          ? null
+          : placeCreationAttemptNonce(groupAttemptKey);
       set({ startingDM: { participants, token } });
       try {
         const dm =
           participants.length === 1
             ? await request.wait((backend) => backend.ensureDM(first))
             : await request.wait((backend) =>
-                backend.createGroupDM(participants),
+                backend.createGroupDM(participants, clientNonce ?? ""),
               );
+        if (dm && groupAttemptKey && clientNonce) {
+          completePlaceCreationAttempt(groupAttemptKey, clientNonce);
+        }
         if (
           !dm ||
           !request.isCurrent() ||
@@ -2252,9 +2302,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const request = beginMessagingBackendRequest();
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
+      const attemptKey = JSON.stringify(["duplicate_channel", channelId]);
+      const clientNonce = placeCreationAttemptNonce(attemptKey);
       const channel = await request.wait((backend) =>
-        backend.duplicateChannel(channelId),
+        backend.duplicateChannel(channelId, clientNonce),
       );
+      if (channel) completePlaceCreationAttempt(attemptKey, clientNonce);
       if (
         !channel ||
         !request.isCurrent() ||
@@ -3048,6 +3101,7 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
 
 function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
+  placeCreationAttempts.clear();
   reactionProjectionByPlace.clear();
   releaseAllDraftFiles();
   backend.dispose();

@@ -414,10 +414,14 @@ export interface MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary>;
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
-  createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
+  createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary>;
   /**
    * channelのmutableな身元（名前・トピック）を書き換える。省いた項目は
    * そのまま残る——名前を変えただけでトピックが消えては困る。
@@ -431,7 +435,11 @@ export interface MessagingBackend {
    * メッセージ・既読・通知設定は元のchannelのもの。nameを省くとサーバーが
    * 既定の名前（「〜 のコピー」）を決める。
    */
-  duplicateChannel(channelId: string, name?: string): Promise<ChannelSummary>;
+  duplicateChannel(
+    channelId: string,
+    clientNonce: string,
+    name?: string,
+  ): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /** メッセージより先にbytesを預ける。受領したIDをsendMessageのattachmentsへ。 */
   uploadAttachment(

@@ -197,10 +197,14 @@ export class ApiMessagingBackend implements MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary> {
-    const body = await this.request("/messaging/channels", {
-      method: "POST",
-      body: { workspace_id: workspaceId, name, topic, voice },
+    const body = await this.requestPlaceCreation("/messaging/channels", {
+      workspace_id: workspaceId,
+      name,
+      topic,
+      voice,
+      client_nonce: clientNonce,
     });
     return this.registerChannel(body);
   }
@@ -213,10 +217,13 @@ export class ApiMessagingBackend implements MessagingBackend {
     return this.registerDm(body);
   }
 
-  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
-    const body = await this.request("/messaging/group-dms", {
-      method: "POST",
-      body: { participants: participants.map(participantToWire) },
+  async createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary> {
+    const body = await this.requestPlaceCreation("/messaging/group-dms", {
+      participants: participants.map(participantToWire),
+      client_nonce: clientNonce,
     });
     return this.registerDm(body);
   }
@@ -241,12 +248,16 @@ export class ApiMessagingBackend implements MessagingBackend {
 
   async duplicateChannel(
     channelId: string,
+    clientNonce: string,
     name?: string,
   ): Promise<ChannelSummary> {
-    const body = await this.request(
+    const body = await this.requestPlaceCreation(
       `/messaging/places/${encodeURIComponent(channelId)}/duplicate`,
       // 名前を言わないなら送らない。サーバーが「〜 のコピー」を決める。
-      { method: "POST", body: name === undefined ? {} : { name } },
+      {
+        ...(name === undefined ? {} : { name }),
+        client_nonce: clientNonce,
+      },
     );
     return this.registerChannel(body);
   }
@@ -731,6 +742,28 @@ export class ApiMessagingBackend implements MessagingBackend {
     }
     if (response.status === 204) return null;
     return response.json() as Promise<unknown>;
+  }
+
+  /**
+   * A transport failure after POST is ambiguous: the place may already be
+   * committed. Retry once with the caller-owned logical-attempt nonce so the
+   * server reconciles to that receipt instead of creating another place.
+   */
+  private async requestPlaceCreation(
+    path: string,
+    body: unknown,
+  ): Promise<unknown> {
+    try {
+      return await this.request(path, { method: "POST", body });
+    } catch (error) {
+      if (
+        error instanceof MessagingAPIError ||
+        this.abortController.signal.aborted
+      ) {
+        throw error;
+      }
+      return this.request(path, { method: "POST", body });
+    }
   }
 }
 

@@ -256,6 +256,7 @@ describe("messaging session boundary", () => {
       "dev",
       "開発",
       true,
+      expect.any(String),
     );
   });
 

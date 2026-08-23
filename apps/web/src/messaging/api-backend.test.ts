@@ -540,7 +540,13 @@ describe("ApiMessagingBackend", () => {
     await backend.bootstrap();
 
     await expect(
-      backend.createChannel("workspace-1", "dev", "開発の相談", true),
+      backend.createChannel(
+        "workspace-1",
+        "dev",
+        "開発の相談",
+        true,
+        "create-channel-gesture",
+      ),
     ).resolves.toEqual({
       channelId: "channel-2",
       workspaceId: "workspace-1",
@@ -559,6 +565,7 @@ describe("ApiMessagingBackend", () => {
           name: "dev",
           topic: "開発の相談",
           voice: true,
+          client_nonce: "create-channel-gesture",
         }),
       }),
     );
@@ -577,11 +584,30 @@ describe("ApiMessagingBackend", () => {
     );
 
     await expect(
-      backend.createGroupDM([
-        { kind: "human", humanId: "human-2" },
-        { kind: "personality_agent", personalityAgentId: "agent-1" },
-      ]),
+      backend.createGroupDM(
+        [
+          { kind: "human", humanId: "human-2" },
+          { kind: "personality_agent", personalityAgentId: "agent-1" },
+        ],
+        "create-group-gesture",
+      ),
     ).resolves.toMatchObject({ dmId: "group-dm-1", kind: "group_dm" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/group-dms"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          participants: [
+            { kind: "human", human_id: "human-2" },
+            {
+              kind: "personality_agent",
+              personality_agent_id: "agent-1",
+            },
+          ],
+          client_nonce: "create-group-gesture",
+        }),
+      }),
+    );
 
     // 省いた項目はwireにも載せない。トピックだけの編集で名前を巻き込まない。
     await expect(
@@ -596,13 +622,66 @@ describe("ApiMessagingBackend", () => {
     );
 
     // 複製の名前はサーバーが決める。クライアントは「〜 のコピー」を組み立てない。
-    await expect(backend.duplicateChannel("channel-2")).resolves.toMatchObject({
-      channelId: "channel-2",
-    });
+    await expect(
+      backend.duplicateChannel("channel-2", "duplicate-channel-gesture"),
+    ).resolves.toMatchObject({ channelId: "channel-2" });
     expect(fetchMock).toHaveBeenCalledWith(
       scopedMessagingTestPath("/messaging/places/channel-2/duplicate"),
-      expect.objectContaining({ method: "POST", body: JSON.stringify({}) }),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          client_nonce: "duplicate-channel-gesture",
+        }),
+      }),
     );
+  });
+
+  it("retries an ambiguous committed place creation once with the same nonce", async () => {
+    const creationBodies: string[] = [];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          creationBodies.push(String(init.body));
+          if (creationBodies.length === 1) {
+            // The server committed, but no response reached the browser.
+            throw new TypeError("response lost after commit");
+          }
+          return json(channelSummaryWire("reconciled"), 200);
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.createChannel(
+        "workspace-1",
+        "incident",
+        "reconciled",
+        false,
+        "stable-logical-gesture",
+      ),
+    ).resolves.toMatchObject({ channelId: "channel-2" });
+    expect(creationBodies).toEqual([
+      JSON.stringify({
+        workspace_id: "workspace-1",
+        name: "incident",
+        topic: "reconciled",
+        voice: false,
+        client_nonce: "stable-logical-gesture",
+      }),
+      JSON.stringify({
+        workspace_id: "workspace-1",
+        name: "incident",
+        topic: "reconciled",
+        voice: false,
+        client_nonce: "stable-logical-gesture",
+      }),
+    ]);
   });
 
   it("projects place_created and place_updated from the socket", async () => {

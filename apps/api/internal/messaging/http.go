@@ -768,7 +768,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Name        string `json:"name"`
 		Topic       string `json:"topic"`
 		Voice       bool   `json:"voice"`
-		ClientNonce string `json:"client_nonce,omitempty"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -781,7 +781,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_topic")
 		return
 	}
-	if len(req.ClientNonce) > 128 {
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
@@ -792,11 +792,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		if req.WorkspaceID != "" && req.WorkspaceID != scopedStoreForRequest(r).Scope.WorkspaceID {
 			return ErrInvalidScope
 		}
-		if req.ClientNonce == "" {
-			place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic, req.Voice)
-		} else {
-			place, created, opErr = scopedStoreForRequest(r).CreateChannelOnce(r.Context(), req.Name, req.Topic, req.Voice, req.ClientNonce)
-		}
+		place, created, opErr = scopedStoreForRequest(r).CreateChannelOnce(r.Context(), req.Name, req.Topic, req.Voice, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -872,7 +868,7 @@ func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Name        string `json:"name"`
-		ClientNonce string `json:"client_nonce,omitempty"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -881,7 +877,7 @@ func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
-	if len(req.ClientNonce) > 128 {
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
@@ -889,11 +885,7 @@ func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
 	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		if req.ClientNonce == "" {
-			place, opErr = scopedStoreForRequest(r).DuplicateChannel(r.Context(), r.PathValue("place_id"), req.Name)
-		} else {
-			place, created, opErr = scopedStoreForRequest(r).DuplicateChannelOnce(r.Context(), r.PathValue("place_id"), req.Name, req.ClientNonce)
-		}
+		place, created, opErr = scopedStoreForRequest(r).DuplicateChannelOnce(r.Context(), r.PathValue("place_id"), req.Name, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -973,7 +965,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Participants []participantWire `json:"participants"`
-		ClientNonce  string            `json:"client_nonce,omitempty"`
+		ClientNonce  string            `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -996,7 +988,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if len(req.ClientNonce) > 128 {
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
 		return
 	}
@@ -1004,11 +996,7 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		if req.ClientNonce == "" {
-			place, opErr = scopedStoreForRequest(r).CreateGroupDM(r.Context(), others)
-		} else {
-			place, created, opErr = scopedStoreForRequest(r).CreateGroupDMOnce(r.Context(), others, req.ClientNonce)
-		}
+		place, created, opErr = scopedStoreForRequest(r).CreateGroupDMOnce(r.Context(), others, req.ClientNonce)
 		return opErr
 	})
 	if !done {

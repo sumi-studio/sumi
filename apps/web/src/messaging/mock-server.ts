@@ -442,6 +442,10 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly statusRevisions = new Map<string, number>();
   private readonly clearedStatuses = new Map<string, StatusCleared>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
+  private readonly placeCreationReceipts = new Map<
+    string,
+    { digest: string; result: ChannelSummary | DmSummary }
+  >();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
     owner: SELF,
@@ -627,7 +631,20 @@ export class MockMessagingServer implements MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary> {
+    if (!clientNonce || clientNonce.length > 128) {
+      throw new Error("invalid client nonce");
+    }
+    const receiptKey = `create_channel:${clientNonce}`;
+    const digest = JSON.stringify([workspaceId, name, topic, voice]);
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("channelId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyChannel(receipt.result);
+    }
     const channel: ChannelSummary = {
       channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
       workspaceId,
@@ -639,6 +656,10 @@ export class MockMessagingServer implements MessagingBackend {
     };
     CHANNELS.push(channel);
     const response = copyChannel(channel);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyChannel(response),
+    });
     this.emit({ type: "place_created", channel: copyChannel(response) });
     return response;
   }
@@ -661,7 +682,22 @@ export class MockMessagingServer implements MessagingBackend {
     return response;
   }
 
-  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+  async createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary> {
+    if (!clientNonce || clientNonce.length > 128) {
+      throw new Error("invalid client nonce");
+    }
+    const receiptKey = `create_group_dm:${clientNonce}`;
+    const digest = JSON.stringify(participants.map(participantKey).sort());
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("dmId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyDM(receipt.result);
+    }
     const dm: DmSummary = {
       dmId: `gdm-${secureRandomUUID().slice(0, 8)}`,
       kind: "group_dm",
@@ -669,6 +705,10 @@ export class MockMessagingServer implements MessagingBackend {
     };
     DMS.push(dm);
     const response = copyDM(dm);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyDM(response),
+    });
     this.emit({ type: "place_created", dm: copyDM(response) });
     return response;
   }
@@ -697,8 +737,21 @@ export class MockMessagingServer implements MessagingBackend {
 
   async duplicateChannel(
     channelId: string,
+    clientNonce: string,
     name?: string,
   ): Promise<ChannelSummary> {
+    if (!clientNonce || clientNonce.length > 128) {
+      throw new Error("invalid client nonce");
+    }
+    const receiptKey = `duplicate_channel:${clientNonce}`;
+    const digest = JSON.stringify([channelId, name ?? ""]);
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("channelId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyChannel(receipt.result);
+    }
     const source = CHANNELS.find((entry) => entry.channelId === channelId);
     if (!source) throw new Error("unknown channel");
     // 名前の既定はサーバーが決める。UIもagentも自分では組み立てない。
@@ -713,6 +766,10 @@ export class MockMessagingServer implements MessagingBackend {
     };
     CHANNELS.push(copy);
     const response = copyChannel(copy);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyChannel(response),
+    });
     this.emit({ type: "place_created", channel: copyChannel(response) });
     return response;
   }

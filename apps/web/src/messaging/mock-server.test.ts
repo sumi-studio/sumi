@@ -125,18 +125,65 @@ describe("MockMessagingServer admission", () => {
 });
 
 describe("MockMessagingServer place edits", () => {
+  it("reconciles every place creation by operation nonce", async () => {
+    const server = new MockMessagingServer();
+    const channel = await server.createChannel(
+      "workspace-1",
+      "incident",
+      "",
+      false,
+      "mock-create-once",
+    );
+    const channelReplay = await server.createChannel(
+      "workspace-1",
+      "incident",
+      "",
+      false,
+      "mock-create-once",
+    );
+    expect(channelReplay.channelId).toBe(channel.channelId);
+
+    const participants = [
+      { kind: "human", humanId: "human-b" },
+      { kind: "human", humanId: "human-c" },
+    ] as const;
+    const group = await server.createGroupDM(
+      [...participants],
+      "mock-group-once",
+    );
+    const groupReplay = await server.createGroupDM(
+      [...participants],
+      "mock-group-once",
+    );
+    expect(groupReplay.dmId).toBe(group.dmId);
+
+    const duplicate = await server.duplicateChannel(
+      "ch-general",
+      "mock-duplicate-once",
+    );
+    const duplicateReplay = await server.duplicateChannel(
+      "ch-general",
+      "mock-duplicate-once",
+    );
+    expect(duplicateReplay.channelId).toBe(duplicate.channelId);
+  });
+
   it("複製の既定名は本番と同じ規則で、コピーのコピーでも重ならない", async () => {
     const server = new MockMessagingServer();
 
-    const copy = await server.duplicateChannel("ch-general");
+    const copy = await server.duplicateChannel("ch-general", "copy-once");
     expect(copy.name).toBe("general のコピー");
     expect(copy.channelId).not.toBe("ch-general");
 
-    const second = await server.duplicateChannel(copy.channelId);
+    const second = await server.duplicateChannel(copy.channelId, "copy-twice");
     expect(second.name).toBe("general のコピー");
 
     // 名前を指名したときはそれが勝つ。
-    const named = await server.duplicateChannel("ch-general", "general-2");
+    const named = await server.duplicateChannel(
+      "ch-general",
+      "copy-named",
+      "general-2",
+    );
     expect(named.name).toBe("general-2");
   });
 
@@ -145,7 +192,7 @@ describe("MockMessagingServer place edits", () => {
     const long = "あ".repeat(200);
     await server.updateChannel("ch-general", { name: long });
 
-    const copy = await server.duplicateChannel("ch-general");
+    const copy = await server.duplicateChannel("ch-general", "copy-long");
     // 200文字の上限は places.name のCHECKそのもの。mockがここで超えた名前を
     // 返すと、手で確かめたときだけ通って本番で弾かれる。
     expect([...copy.name].length).toBe(200);
