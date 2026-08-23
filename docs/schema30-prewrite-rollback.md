@@ -23,11 +23,26 @@ mandatory precondition; the tool cannot verify process-level quiescence.
 Provide `SUMI_DB_URL` through the operator's secret environment. Do not put the
 URL in command arguments or logs.
 
-Run the non-mutating check while writers remain quiesced:
+The exact candidate API image contains the offline operator at
+`/usr/local/bin/sumi-schema30-rollback`. Before running it, obtain `API_IID`
+from the reviewed immutable-image manifest and require its canonical
+`sha256:<64 lowercase hex>` form. Set `COMPOSE_PROJECT` to the exact existing
+stack project and verify that `${COMPOSE_PROJECT}_default` is its retained
+network and that its Postgres container is still running. Do not use a tag in
+place of `API_IID`.
+
+Run the non-mutating check while writers remain quiesced. `SUMI_DB_URL` is the
+only environment value passed into this one-shot container:
 
 ```sh
-cd apps/api
-go run ./cmd/schema30-rollback preflight
+test "$(docker image inspect --format '{{.Id}}' "${API_IID}")" = "${API_IID}"
+docker network inspect "${COMPOSE_PROJECT}_default" >/dev/null
+docker run --rm --pull=never --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --network "${COMPOSE_PROJECT}_default" \
+  --env SUMI_DB_URL \
+  --entrypoint /usr/local/bin/sumi-schema30-rollback \
+  "${API_IID}" preflight
 ```
 
 Preflight takes the existing migration advisory lock and refuses unless:
@@ -42,7 +57,12 @@ If and only if external writer quiescence has been verified and preflight
 passes, apply the rollback:
 
 ```sh
-go run ./cmd/schema30-rollback apply
+docker run --rm --pull=never --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --network "${COMPOSE_PROJECT}_default" \
+  --env SUMI_DB_URL \
+  --entrypoint /usr/local/bin/sumi-schema30-rollback \
+  "${API_IID}" apply
 ```
 
 Apply reacquires the same advisory lock, exclusively locks `messages`, repeats

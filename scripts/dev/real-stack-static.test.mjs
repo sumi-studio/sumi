@@ -79,6 +79,19 @@ test("Compose pulls published Sumi images from GHCR", async () => {
   assert.match(firebaseCheck, /up --detach --pull never/);
 });
 
+test("the API image includes the offline schema-30 rollback operator", async () => {
+  const dockerfile = await source("deploy/api/Dockerfile");
+
+  assert.match(
+    dockerfile,
+    /go build -o \/usr\/local\/bin\/sumi-schema30-rollback \.\/cmd\/schema30-rollback/,
+  );
+  assert.match(
+    dockerfile,
+    /COPY --from=build \/usr\/local\/bin\/sumi-schema30-rollback \/usr\/local\/bin\/sumi-schema30-rollback/,
+  );
+});
+
 test("runtime provisioner receives a file-scoped Docker config", async () => {
   const [local, provisionerDockerfile] = await Promise.all([
     source("deploy/local/compose.dev.yaml"),
