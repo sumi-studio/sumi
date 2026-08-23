@@ -41,8 +41,9 @@ royalty-free, transferable license, with the right to sublicense, to:
   license terms of the Owner's choosing, including proprietary and
   commercial licenses.
 
-This ensures the Project can be maintained, commercialized, and have its
-license terms changed (including transfer to a future legal entity)
+This ensures that the Owner — and any future steward of the Project,
+including a legal entity to which the Project is transferred — can
+maintain, commercialize, and change the license terms of the Project
 without requiring renewed consent from each contributor.
 
 You retain copyright in your Contribution. This agreement grants rights
