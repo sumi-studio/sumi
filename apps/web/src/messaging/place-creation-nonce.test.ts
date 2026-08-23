@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "./api-backend";
 import { MockMessagingServer } from "./mock-server";
 import { type ParticipantRef, participantKey } from "./model";
 import {
@@ -96,6 +97,28 @@ describe("place creation logical-attempt nonces", () => {
     expect(nonces[1]).toBe(nonces[0]);
     expect(nonces[2]).not.toBe(nonces[1]);
     expect(laterGesture).not.toBe(reconciled);
+  });
+
+  it("retires a stale group-DM tenure rejection instead of pinning its nonce", async () => {
+    const server = signIn();
+    const nonces: string[] = [];
+    vi.spyOn(server, "createGroupDM").mockImplementation(
+      async (_participants, clientNonce) => {
+        nonces.push(clientNonce);
+        throw new MessagingAPIError("participant_tenure_stale", 409);
+      },
+    );
+
+    const gesture = () => useMessaging.getState().startDM([CAROL, BOB]);
+    await expect(gesture()).rejects.toMatchObject({
+      code: "participant_tenure_stale",
+      status: 409,
+    });
+    await expect(gesture()).rejects.toMatchObject({ status: 409 });
+
+    expect(nonces).toHaveLength(2);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).not.toBe(nonces[0]);
   });
 
   it("converges concurrent duplicate invocations and renews after success", async () => {
@@ -205,6 +228,36 @@ describe("place creation logical-attempt nonces", () => {
       name: "unresolved-0",
       nonce: oldestNonce,
     });
+  });
+
+  it("retires deterministic failures so repeated rejections never exhaust the tab", async () => {
+    const server = signIn();
+    const calls: Array<{ name: string; nonce: string }> = [];
+    vi.spyOn(server, "createChannel").mockImplementation(
+      async (_workspaceId, name, _topic, _voice, clientNonce) => {
+        calls.push({ name, nonce: clientNonce });
+        throw new MessagingAPIError("definitive_rejection", 409);
+      },
+    );
+    const create = (name: string) =>
+      useMessaging.getState().createChannel("workspace-1", name, "", false);
+
+    for (let index = 0; index < 40; index += 1) {
+      await expect(create(`rejected-${index}`)).rejects.toMatchObject({
+        code: "definitive_rejection",
+        status: 409,
+      });
+    }
+    await expect(create("rejected-again")).rejects.toMatchObject({
+      status: 409,
+    });
+    await expect(create("rejected-again")).rejects.toMatchObject({
+      status: 409,
+    });
+
+    expect(calls).toHaveLength(42);
+    expect(calls[40]?.nonce).toBeTruthy();
+    expect(calls[41]?.nonce).not.toBe(calls[40]?.nonce);
   });
 
   it("survives a hard reload until authoritative acknowledgement", () => {

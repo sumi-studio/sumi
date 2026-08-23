@@ -46,7 +46,7 @@ use crate::{
 
 const TOOL_NAME: &str = "messaging";
 const BINDING_ADAPTER_ID: &str = "sumi.messaging";
-const BINDING_ADAPTER_VERSION: u32 = 4;
+const BINDING_ADAPTER_VERSION: u32 = 5;
 const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const ATTACHMENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-attachment-upload-v1";
 const SOURCE_EXECUTION_ID_DOMAIN: &[u8] = b"sumi-messaging-source-execution-v1";
@@ -1230,7 +1230,16 @@ impl BoundToolAdapter for MessagingTool {
             // Its target is named outright — a person clicks a sidebar row
             // without first having been inside it — so there is nothing here
             // to resolve from what happens to be on screen.
-            MessagingAction::StartDm { participants } => {
+            MessagingAction::StartDm { mut participants } => {
+                let actor_id = ctx
+                    .executor_identity
+                    .ok_or(DescribeError::BindingInternal)?
+                    .personality_agent_id()
+                    .as_str();
+                canonicalize_dm_participants(&mut participants, Some(actor_id));
+                if participants.is_empty() {
+                    return Err(DescribeError::InvalidArguments);
+                }
                 let listed = Value::Array(
                     participants
                         .iter()
@@ -1701,8 +1710,7 @@ impl MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
-            BoundMessagingAction::StartDm { mut participants } => {
-                canonicalize_dm_participants(&mut participants);
+            BoundMessagingAction::StartDm { participants } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
                 let response = self
                     .api
@@ -2214,7 +2222,7 @@ fn resolve_raw_action(
         // gesture names its own target, the way a human clicks a sidebar row
         // without first having been inside it.
         MessagingAction::StartDm { mut participants } => {
-            canonicalize_dm_participants(&mut participants);
+            canonicalize_dm_participants(&mut participants, None);
             Ok(BoundMessagingAction::StartDm { participants })
         }
         MessagingAction::CreateChannel { name, topic, voice } => {
@@ -2455,7 +2463,6 @@ fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(),
     if participants.is_empty() || participants.len() > MAX_DM_PARTICIPANTS {
         return Err(ToolError::InvalidArguments);
     }
-    let mut seen = BTreeSet::new();
     for participant in participants {
         let id = match (
             participant.kind.as_str(),
@@ -2466,7 +2473,6 @@ fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(),
             _ => return Err(ToolError::InvalidArguments),
         };
         validate_bounded_nonempty(id, MAX_PARTICIPANT_ID_BYTES)?;
-        seen.insert(format!("{}:{id}", participant.kind));
     }
     Ok(())
 }
@@ -2480,11 +2486,26 @@ fn messaging_participant_key(participant: &MessagingParticipant) -> String {
     format!("{}:{id}", participant.kind)
 }
 
-fn canonicalize_dm_participants(participants: &mut Vec<MessagingParticipant>) {
+fn canonicalize_dm_participants(
+    participants: &mut Vec<MessagingParticipant>,
+    actor_personality_agent_id: Option<&str>,
+) {
+    if let Some(actor_id) = actor_personality_agent_id {
+        participants.retain(|participant| {
+            participant.kind != "personality_agent"
+                || participant.personality_agent_id.as_deref() != Some(actor_id)
+        });
+    }
     participants.sort_by_key(messaging_participant_key);
     participants.dedup_by(|left, right| {
         messaging_participant_key(left) == messaging_participant_key(right)
     });
+}
+
+fn dm_participants_are_canonical(participants: &[MessagingParticipant]) -> bool {
+    let mut canonical = participants.to_vec();
+    canonicalize_dm_participants(&mut canonical, None);
+    canonical == participants
 }
 
 /// Keep the local admission boundary in the same units as the server's
@@ -2622,7 +2643,13 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
                 place_id: place_id.clone(),
             })
         }
-        BoundMessagingAction::StartDm { participants } => validate_dm_participants(participants),
+        BoundMessagingAction::StartDm { participants } => {
+            validate_dm_participants(participants)?;
+            if !dm_participants_are_canonical(participants) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
         BoundMessagingAction::CreateChannel { name, topic, voice } => {
             validate_action(&MessagingAction::CreateChannel {
                 name: name.clone(),
@@ -3212,6 +3239,7 @@ mod tests {
             },
         },
         provider::types::{ToolCall, ToolInvocationRoute, ValidatedToolArguments},
+        runtime::contracts::RpcIdentity,
         store::Redactor,
         tools::{
             BoundExecutionError, BoundToolInvocation, ToolRegistry, ToolRegistryBuilder,
@@ -3223,6 +3251,7 @@ mod tests {
     const TEST_INSTALLATION_ID: &str = "0198f0f4-9b72-7000-8000-000000000301";
     const TEST_WORKSPACE_B_ID: &str = "0198f0f4-9b72-7000-8000-000000000202";
     const TEST_INSTALLATION_B_ID: &str = "0198f0f4-9b72-7000-8000-000000000302";
+    const TEST_PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000401";
     const TEST_WRONG_VARIANT_WORKSPACE_ID: &str = "0198f0f4-9b72-7000-0000-000000000201";
     const TEST_WRONG_VARIANT_INSTALLATION_ID: &str = "0198f0f4-9b72-7000-0000-000000000301";
 
@@ -3457,6 +3486,7 @@ mod tests {
         reply_later_markers: AsyncMutex<Vec<Value>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
+        started_dm_nonces: AsyncMutex<Vec<Option<String>>>,
         created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
         updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
         duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
@@ -3734,6 +3764,10 @@ mod tests {
                 .lock()
                 .await
                 .push(request.participants.to_vec());
+            self.started_dm_nonces
+                .lock()
+                .await
+                .push(request.client_nonce.map(str::to_owned));
             let kind = if request.participants.len() == 1 {
                 "dm"
             } else {
@@ -4020,6 +4054,27 @@ mod tests {
             .await
     }
 
+    async fn bind_and_execute_action(
+        registry: &ToolRegistry,
+        id: &str,
+        action: Value,
+    ) -> Result<(BoundToolInvocation, BoundToolExecutionOutcome), BoundExecutionError> {
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(&tool_call(id, action), "flow", &workspace)
+            .await
+            .map_err(BoundExecutionError::InvalidInvocation)?;
+        let invocation = registry
+            .validate_bound(&sealed)
+            .map_err(BoundExecutionError::InvalidInvocation)?
+            .clone();
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let outcome = registry
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
+            .await?;
+        Ok((invocation, outcome))
+    }
+
     async fn binding_fixture() -> (Arc<FakeMessagingApi>, Arc<MessagingTool>, ToolRegistry) {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
@@ -4066,7 +4121,12 @@ mod tests {
         builder
             .register(tool.clone())
             .expect("register Messaging binder");
-        (api, tool, builder.build())
+        let identity = RpcIdentity::from_wire(TEST_PERSONALITY_AGENT_ID, 7, "messaging-test")
+            .expect("test executor identity");
+        let registry = builder
+            .build_bound_for_executor_identity(identity)
+            .expect("bind Messaging fixture to executor identity");
+        (api, tool, registry)
     }
 
     async fn attachment_binding_fixture(
@@ -7316,6 +7376,10 @@ mod tests {
         json!({"kind": "human", "human_id": id})
     }
 
+    fn test_pa_participant(id: &str) -> Value {
+        json!({"kind": "personality_agent", "personality_agent_id": id})
+    }
+
     #[tokio::test]
     async fn place_opening_actions_bind_as_app_owned_mutations_without_an_open_view() {
         let (api, tool, registry) = binding_fixture().await;
@@ -7442,6 +7506,7 @@ mod tests {
             json!([{"kind": "human"}]),
             json!([{"kind": "human", "personality_agent_id": "agent-2"}]),
             json!([{"kind": "octopus", "human_id": "human-2"}]),
+            json!([test_pa_participant(TEST_PERSONALITY_AGENT_ID)]),
         ] {
             let error = bind_action(
                 &registry,
@@ -7455,29 +7520,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_dm_transmits_a_canonical_participant_set() {
+    async fn start_dm_seals_and_executes_one_actor_relative_canonical_participant_set() {
         let (api, _tool, registry) = binding_fixture().await;
-        execute_bound_action(
-            &registry,
-            "canonical-start-dm",
-            json!({
-                "action": "start_dm",
-                "participants": [
+        let cases = [
+            (
+                "duplicate-becomes-dm",
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-2")
+                ]),
+                json!([test_dm_participant("human-2")]),
+                "dm",
+                false,
+            ),
+            (
+                "self-is-not-an-other",
+                json!([
+                    test_pa_participant(TEST_PERSONALITY_AGENT_ID),
+                    test_dm_participant("human-2")
+                ]),
+                json!([test_dm_participant("human-2")]),
+                "dm",
+                false,
+            ),
+            (
+                "group-permutation-a",
+                json!([
                     test_dm_participant("human-3"),
+                    test_dm_participant("human-2")
+                ]),
+                json!([
                     test_dm_participant("human-2"),
                     test_dm_participant("human-3")
-                ]
-            }),
-        )
-        .await
-        .expect("execute canonical start_dm");
+                ]),
+                "group_dm",
+                true,
+            ),
+            (
+                "group-permutation-b",
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-3")
+                ]),
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-3")
+                ]),
+                "group_dm",
+                true,
+            ),
+        ];
+
+        let mut canonical_group_effect = None;
+        for (index, (id, proposed, expected, kind, expects_nonce)) in cases.into_iter().enumerate()
+        {
+            let (bound, outcome) = bind_and_execute_action(
+                &registry,
+                id,
+                json!({"action": "start_dm", "participants": proposed}),
+            )
+            .await
+            .expect("bind and execute canonical start_dm");
+
+            assert_eq!(
+                bound.review_projection.as_object()["participants"],
+                expected
+            );
+            assert_eq!(
+                bound.review_projection.as_object()["conversation_kind"],
+                kind
+            );
+            assert_eq!(
+                bound.execution_arguments.as_object()["participants"],
+                expected
+            );
+            assert_eq!(outcome.output.details["dm"]["participants"], expected);
+            assert_eq!(outcome.output.details["dm"]["kind"], kind);
+            if expects_nonce {
+                let effect = Value::Object(bound.execution_arguments.as_object().clone());
+                if let Some(first) = &canonical_group_effect {
+                    assert_eq!(first, &effect, "permutations must seal the same effect");
+                } else {
+                    canonical_group_effect = Some(effect);
+                }
+            }
+
+            let started = api.started_dms.lock().await;
+            assert_eq!(
+                serde_json::to_value(&started[index]).expect("recorded participants serialize"),
+                expected
+            );
+            drop(started);
+            assert_eq!(
+                api.started_dm_nonces.lock().await[index].is_some(),
+                expects_nonce,
+                "only the exact sealed group effect needs a creation receipt nonce"
+            );
+        }
 
         let started = api.started_dms.lock().await;
-        let ids = started[0]
-            .iter()
-            .map(|participant| participant.human_id.as_deref().unwrap_or_default())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["human-2", "human-3"]);
+        assert_eq!(
+            started[2], started[3],
+            "participant permutations must seal and execute the same group effect"
+        );
     }
 
     #[tokio::test]

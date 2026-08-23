@@ -159,6 +159,24 @@ function completePlaceCreationAttempt(key: string, nonce: string): void {
   placeCreationAttempts.complete(key, nonce);
 }
 
+function retireDefinitivePlaceCreationAttempt(
+  key: string,
+  nonce: string,
+  error: unknown,
+): void {
+  if (
+    error instanceof MessagingAPIError &&
+    error.status !== 408 &&
+    error.status !== 429 &&
+    error.status < 500
+  ) {
+    // This response authoritatively rejected the exact nonce/digest under the
+    // current scope. Replaying it cannot reconcile a committed place, so the
+    // failed logical gesture must not consume unresolved-attempt capacity.
+    completePlaceCreationAttempt(key, nonce);
+  }
+}
+
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
  * Fileと AbortController はここで持つ。resetで必ず全部止めて捨てる。
@@ -2215,9 +2233,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
         voice,
       ]);
       const clientNonce = placeCreationAttemptNonce(attemptKey);
-      const channel = await request.wait((backend) =>
-        backend.createChannel(workspaceId, name, topic, voice, clientNonce),
-      );
+      let channel: ChannelSummary | undefined;
+      try {
+        channel = await request.wait((backend) =>
+          backend.createChannel(workspaceId, name, topic, voice, clientNonce),
+        );
+      } catch (error) {
+        retireDefinitivePlaceCreationAttempt(attemptKey, clientNonce, error);
+        throw error;
+      }
       if (channel) completePlaceCreationAttempt(attemptKey, clientNonce);
       if (
         !channel ||
@@ -2270,15 +2294,27 @@ export const useMessaging = create<MessagingState>((set, get) => {
           : placeCreationAttemptNonce(groupAttemptKey);
       set({ startingDM: { participants, token } });
       try {
-        const dm =
-          canonicalParticipants.length === 1
-            ? await request.wait((backend) => backend.ensureDM(first))
-            : await request.wait((backend) =>
-                backend.createGroupDM(
-                  canonicalGroupParticipants ?? [],
-                  clientNonce ?? "",
-                ),
-              );
+        let dm: DmSummary | undefined;
+        try {
+          dm =
+            canonicalParticipants.length === 1
+              ? await request.wait((backend) => backend.ensureDM(first))
+              : await request.wait((backend) =>
+                  backend.createGroupDM(
+                    canonicalGroupParticipants ?? [],
+                    clientNonce ?? "",
+                  ),
+                );
+        } catch (error) {
+          if (groupAttemptKey && clientNonce) {
+            retireDefinitivePlaceCreationAttempt(
+              groupAttemptKey,
+              clientNonce,
+              error,
+            );
+          }
+          throw error;
+        }
         if (dm && groupAttemptKey && clientNonce) {
           completePlaceCreationAttempt(groupAttemptKey, clientNonce);
         }
@@ -2339,9 +2375,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const expectedSelfKey = get().selfKey;
       const attemptKey = JSON.stringify(["duplicate_channel", channelId]);
       const clientNonce = placeCreationAttemptNonce(attemptKey);
-      const channel = await request.wait((backend) =>
-        backend.duplicateChannel(channelId, clientNonce),
-      );
+      let channel: ChannelSummary | undefined;
+      try {
+        channel = await request.wait((backend) =>
+          backend.duplicateChannel(channelId, clientNonce),
+        );
+      } catch (error) {
+        retireDefinitivePlaceCreationAttempt(attemptKey, clientNonce, error);
+        throw error;
+      }
       if (channel) completePlaceCreationAttempt(attemptKey, clientNonce);
       if (
         !channel ||
