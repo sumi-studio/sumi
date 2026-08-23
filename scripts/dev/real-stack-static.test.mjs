@@ -79,8 +79,11 @@ test("Compose pulls published Sumi images from GHCR", async () => {
   assert.match(firebaseCheck, /up --detach --pull never/);
 });
 
-test("the API image includes the offline schema-30 rollback operator", async () => {
-  const dockerfile = await source("deploy/api/Dockerfile");
+test("the API image and runbook bind the offline schema-30 rollback operator", async () => {
+  const [dockerfile, rollbackRunbook] = await Promise.all([
+    source("deploy/api/Dockerfile"),
+    source("docs/schema30-prewrite-rollback.md"),
+  ]);
 
   assert.match(
     dockerfile,
@@ -90,6 +93,21 @@ test("the API image includes the offline schema-30 rollback operator", async () 
     dockerfile,
     /COPY --from=build \/usr\/local\/bin\/sumi-schema30-rollback \/usr\/local\/bin\/sumi-schema30-rollback/,
   );
+
+  const commandBlocks = [...rollbackRunbook.matchAll(/```bash\n([\s\S]*?)```/g)].map(
+    (match) => match[1],
+  );
+  assert.equal(commandBlocks.length, 2);
+  for (const command of commandBlocks) {
+    assert.match(command, /^set \+x\nset -euo pipefail$/m);
+    assert.match(command, /^set -euo pipefail$/m);
+    assert.match(command, /\^sha256:\[0-9a-f\]\{64\}\$/);
+    assert.match(command, /\[\[ -v SUMI_DB_URL \]\]/);
+    assert.doesNotMatch(command, /\$\{SUMI_DB_URL/);
+    assert.match(command, /docker image inspect --format/);
+    assert.match(command, /docker network inspect/);
+    assert.ok(command.indexOf("docker image inspect") < command.indexOf("docker run"));
+  }
 });
 
 test("runtime provisioner receives a file-scoped Docker config", async () => {

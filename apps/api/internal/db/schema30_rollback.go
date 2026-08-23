@@ -18,8 +18,9 @@ const (
 )
 
 var (
-	ErrSchema30RollbackWrongHead  = errors.New("schema 30 rollback requires exact migration head 30")
-	ErrSchema30RollbackUnsafeData = errors.New("schema 30 rollback refuses messages with revision other than 1")
+	ErrSchema30RollbackWrongHead            = errors.New("schema 30 rollback requires exact migration head 30")
+	ErrSchema30RollbackUnsafeData           = errors.New("schema 30 rollback refuses messages with revision other than 1")
+	ErrSchema30RollbackCommitOutcomeUnknown = errors.New("schema 30 rollback commit outcome is unknown; keep writers stopped and inspect exact schema state")
 )
 
 // PreflightSchema30Rollback proves the database is eligible for the one sealed
@@ -74,7 +75,10 @@ func RollbackSchema30To29(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("verify schema 29 rollback head: found %d, want %d", head, schema29Version)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit schema 30 rollback: %w", err)
+			// PostgreSQL may have committed even when the client loses the COMMIT
+			// response. Do not report a refusal or expose transport details, and do
+			// not invite a blind retry.
+			return ErrSchema30RollbackCommitOutcomeUnknown
 		}
 		return nil
 	})
@@ -118,7 +122,7 @@ func preflightSchema30Rollback(ctx context.Context, conn migrationDB) (string, e
 	}
 
 	var unsafeRevision bool
-	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM messages WHERE revision <> 1)").Scan(&unsafeRevision); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM messages WHERE revision IS DISTINCT FROM 1)").Scan(&unsafeRevision); err != nil {
 		return "", fmt.Errorf("inspect message revisions for schema 30 rollback: %w", err)
 	}
 	if unsafeRevision {

@@ -34,7 +34,12 @@ place of `API_IID`.
 Run the non-mutating check while writers remain quiesced. `SUMI_DB_URL` is the
 only environment value passed into this one-shot container:
 
-```sh
+```bash
+set +x
+set -euo pipefail
+[[ ${API_IID:-} =~ ^sha256:[0-9a-f]{64}$ ]]
+: "${COMPOSE_PROJECT:?COMPOSE_PROJECT is required}"
+[[ -v SUMI_DB_URL ]]
 test "$(docker image inspect --format '{{.Id}}' "${API_IID}")" = "${API_IID}"
 docker network inspect "${COMPOSE_PROJECT}_default" >/dev/null
 docker run --rm --pull=never --read-only --cap-drop=ALL \
@@ -56,7 +61,14 @@ Preflight takes the existing migration advisory lock and refuses unless:
 If and only if external writer quiescence has been verified and preflight
 passes, apply the rollback:
 
-```sh
+```bash
+set +x
+set -euo pipefail
+[[ ${API_IID:-} =~ ^sha256:[0-9a-f]{64}$ ]]
+: "${COMPOSE_PROJECT:?COMPOSE_PROJECT is required}"
+[[ -v SUMI_DB_URL ]]
+test "$(docker image inspect --format '{{.Id}}' "${API_IID}")" = "${API_IID}"
+docker network inspect "${COMPOSE_PROJECT}_default" >/dev/null
 docker run --rm --pull=never --read-only --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --network "${COMPOSE_PROJECT}_default" \
@@ -68,8 +80,13 @@ docker run --rm --pull=never --read-only --cap-drop=ALL \
 Apply reacquires the same advisory lock, exclusively locks `messages`, repeats
 all preflight checks, and in one transaction runs the sealed 0030 down SQL,
 deletes exactly the version-30 bookkeeping row, and verifies exact head 29.
-Any error leaves the transaction uncommitted. The command intentionally does
-not print the database URL or underlying connection errors.
+Any error before COMMIT leaves the transaction uncommitted. If the COMMIT
+response is lost, the command reports that the outcome is unknown: keep every
+writer stopped, do not retry blindly, and use a fresh connection to inspect the
+exact `schema_migrations` head and whether `messages.revision` exists. Continue
+only after classifying the database as the complete schema-29 state or the
+complete schema-30 state. The command intentionally does not print the database
+URL or underlying connection errors.
 
 Before admitting traffic, start the exact schema-29 application/migrator build
 and confirm that its migration pass accepts head 29 without changing it. For

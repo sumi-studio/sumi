@@ -98,6 +98,27 @@ func TestPreflightSchema30RollbackRejectsRevisionAboveOne(t *testing.T) {
 	}
 }
 
+func TestPreflightSchema30RollbackRejectsNullRevisionAfterConstraintDrift(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate to schema 30: %v", err)
+	}
+	insertSchema30RollbackMessage(t, ctx, pool)
+	if _, err := pool.Exec(ctx, "ALTER TABLE messages ALTER COLUMN revision DROP NOT NULL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE messages SET revision = NULL"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := PreflightSchema30Rollback(ctx, pool)
+	if !errors.Is(err, ErrSchema30RollbackUnsafeData) {
+		t.Fatalf("preflight error = %v, want null-revision refusal", err)
+	}
+}
+
 func TestRollbackSchema30To29AtomicallyAppliesSealedDownMigration(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

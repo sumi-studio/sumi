@@ -47,9 +47,16 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 		_, _ = fmt.Fprintln(out, "preflight passed: exact schema head 30 is eligible for sealed 0030 -> 0029 rollback")
 	case "apply":
 		if err := db.RollbackSchema30To29(ctx, pool.Pool); err != nil {
-			return fmt.Errorf("rollback refused: %w", err)
+			return classifyApplyError(err)
 		}
 		_, _ = fmt.Fprintln(out, "rollback committed: exact schema head is 29")
 	}
 	return nil
+}
+
+func classifyApplyError(err error) error {
+	if errors.Is(err, db.ErrSchema30RollbackCommitOutcomeUnknown) {
+		return err
+	}
+	return fmt.Errorf("rollback refused: %w", err)
 }

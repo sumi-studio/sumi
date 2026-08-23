@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/db"
 )
 
 func TestRunRejectsUnknownOperationBeforeOpeningDatabase(t *testing.T) {
@@ -13,6 +17,24 @@ func TestRunRejectsUnknownOperationBeforeOpeningDatabase(t *testing.T) {
 	}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "preflight or apply") {
 		t.Fatalf("run error = %v, want exact-operation refusal", err)
+	}
+}
+
+func TestRollbackCommitOutcomeUnknownRemainsDistinguishable(t *testing.T) {
+	err := classifyApplyError(fmt.Errorf("transport boundary: %w", db.ErrSchema30RollbackCommitOutcomeUnknown))
+	if !errors.Is(err, db.ErrSchema30RollbackCommitOutcomeUnknown) {
+		t.Fatal("commit outcome-unknown classification was lost")
+	}
+	if strings.Contains(err.Error(), "rollback refused") {
+		t.Fatalf("commit outcome-unknown was misreported as a refusal: %v", err)
+	}
+	if strings.Contains(err.Error(), "postgres://") {
+		t.Fatalf("commit outcome-unknown error exposed connection detail: %v", err)
+	}
+
+	ordinary := classifyApplyError(errors.New("unsafe data"))
+	if !strings.Contains(ordinary.Error(), "rollback refused") {
+		t.Fatalf("ordinary rollback error lost refusal classification: %v", ordinary)
 	}
 }
 
