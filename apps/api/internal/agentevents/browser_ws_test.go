@@ -776,7 +776,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 			}
 
 			server := &BrowserServer{Events: gateway}
-			err := server.browserEventPump(ctx, personalityAgentID, 0, true, volatile, nil, write)
+			err := server.browserEventPump(ctx, personalityAgentID, 0, directChatReadiness{ready: true}, volatile, nil, write)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("browser event pump returned %v, want context cancellation", err)
 			}
@@ -2351,6 +2351,18 @@ func assertDirectChatStatus(t *testing.T, conn *websocket.Conn, want string) {
 	}
 }
 
+func assertDirectChatStatusReason(t *testing.T, conn *websocket.Conn, want, reason string) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	var frame directChatStatusFrame
+	if err := conn.ReadJSON(&frame); err != nil {
+		t.Fatalf("read direct-chat status: %v", err)
+	}
+	if frame.Type != "direct_chat_status" || frame.Status != want || frame.Reason != reason {
+		t.Fatalf("unexpected direct-chat status: %+v, want status=%q reason=%q", frame, want, reason)
+	}
+}
+
 func assertBrowserConnectionClosedBeforeFrame(t *testing.T, conn *websocket.Conn) {
 	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -2750,6 +2762,21 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 			raw:    `{"type":"direct_chat_status","status":"ready","extra":true}`,
 			target: func() any { return &directChatStatusFrame{} },
 		},
+		{
+			name:   "ready status carries unavailable reason",
+			raw:    `{"type":"direct_chat_status","status":"ready","reason":"stopped"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
+		{
+			name:   "status unknown reason",
+			raw:    `{"type":"direct_chat_status","status":"unavailable","reason":"restarting"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
+		{
+			name:   "unavailable status omits required reason",
+			raw:    `{"type":"direct_chat_status","status":"unavailable"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -2768,13 +2795,6 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 	}
 	if volatile.Envelope.Seq != nil {
 		t.Fatalf("volatile browser event gained seq: %+v", volatile)
-	}
-	var unavailable directChatStatusFrame
-	if err := json.Unmarshal(
-		[]byte(`{"type":"direct_chat_status","status":"unavailable"}`),
-		&unavailable,
-	); err != nil {
-		t.Fatalf("valid unavailable status rejected: %v", err)
 	}
 	for _, status := range []string{"applied", "superseded", "rejected"} {
 		rejectReason := ""

@@ -49,6 +49,35 @@ type HostAnchorSnapshot = Vec<(&'static str, HostAnchorIdentity)>;
 /// per fixture would let the first test that destroys a host anchor become the
 /// next test's "before", so a real regression would be recorded as normal.
 static HOST_RUN_BASELINE: OnceLock<HostAnchorSnapshot> = OnceLock::new();
+static COMPOSE_ANCHOR_BINARY: OnceLock<PathBuf> = OnceLock::new();
+
+fn compose_anchor_binary() -> &'static PathBuf {
+    COMPOSE_ANCHOR_BINARY.get_or_init(|| {
+        let output_path = std::env::temp_dir().join(format!(
+            "sumi-compose-anchor-deployment-test-{}",
+            std::process::id()
+        ));
+        let api_dir = deploy_dir()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("apps/api");
+        let output = Command::new("go")
+            .current_dir(api_dir)
+            .args(["build", "-buildvcs=false", "-o"])
+            .arg(&output_path)
+            .arg("./cmd/compose-anchor")
+            .output()
+            .expect("run Go compiler for Compose anchor deployment fixture");
+        assert!(
+            output.status.success(),
+            "build Compose anchor deployment fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output_path
+    })
+}
 
 fn host_run_baseline() -> &'static HostAnchorSnapshot {
     HOST_RUN_BASELINE.get_or_init(host_run_snapshot)
@@ -202,6 +231,7 @@ fn string_set(values: &[&str]) -> BTreeSet<String> {
 fn launch_env(command: &mut Command, paid: &str) {
     command
         .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_ANCHOR", compose_anchor_binary())
         .env("SUMI_PERSONALITY_AGENT_ID", paid)
         .env("SUMI_GATEWAY_URL", "wss://gateway.invalid/agent")
         .env("SUMI_LOCAL_CONTROL_BEARER", "control-secret")
@@ -237,7 +267,7 @@ fn fixture_skip_is_opted_in() -> bool {
 }
 
 /// Either skip loudly and countably, or fail.  Never return quietly.
-fn unavailable_host(reason: &str) -> Option<HostTrustFixture> {
+fn unavailable_host(reason: &str) {
     assert!(
         fixture_skip_is_opted_in(),
         "deployment fixture host is unavailable: {reason}\nSet {FIXTURE_OPTIONAL_ENV}=1 to \
@@ -246,7 +276,6 @@ fn unavailable_host(reason: &str) -> Option<HostTrustFixture> {
     );
     let skipped = FIXTURE_SKIPS.fetch_add(1, Ordering::SeqCst) + 1;
     eprintln!("HOST_FIXTURE_SKIPPED (opted in, count={skipped}): {reason}");
-    None
 }
 
 /// Reports why the Docker host cannot host the fixture, or `None` when it can.
@@ -309,20 +338,23 @@ impl HostTrustFixture {
         // One process-wide baseline, taken before any fixture can touch anything.
         let host_run_before = host_run_baseline().clone();
         if let Some(reason) = docker_fixture_host_unavailable() {
-            return unavailable_host(reason);
+            unavailable_host(reason);
+            return None;
         }
         let server_uid = unsafe { libc::geteuid() };
         let control_gid = unsafe { libc::getegid() };
         if server_uid == 0 {
-            return unavailable_host(
+            unavailable_host(
                 "the fixture needs a non-root test uid for the dedicated local-control peer",
             );
+            return None;
         }
         if control_gid <= 999
             || control_gid == 65534
             || [10000, 10001, 10002, 10003, 10020, 10021].contains(&control_gid)
         {
-            return unavailable_host("the fixture needs a non-reserved, non-role primary test gid");
+            unavailable_host("the fixture needs a non-reserved, non-role primary test gid");
+            return None;
         }
         let paid = Uuid::now_v7().to_string();
         let compact = paid.replace('-', "");
@@ -654,6 +686,7 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_ANCHOR", compose_anchor_binary())
         .env("SUMI_COMPOSE_TIMEOUT", "10")
         .env("SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "true")
         .env("SUMI_PERSONALITY_AGENT_ID", &fixture.paid)
@@ -688,6 +721,13 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env(
             "SUMI_LOCAL_CONTROL_HOST_DIR",
             fixture.control_socket.parent().unwrap(),
+        )
+        .env(
+            "SUMI_RUNTIME_SECRET_HOST_DIR",
+            fixture
+                .runtime_secret_root
+                .join(fixture.paid.replace('-', ""))
+                .join("acceptance-cleanup"),
         );
     preserve_docker_transport(command);
 }
@@ -1359,8 +1399,8 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
 #[test]
 fn deployed_allocator_cli_durably_advances_two_generations_without_rebinding_outputs() {
     let Some(role_gids) = usable_allocator_role_gids() else {
-        eprintln!(
-            "HOST_UNAVAILABLE: allocator integration requires three usable supplemental groups or chgrp authority"
+        unavailable_host(
+            "allocator integration requires three usable supplemental groups or chgrp authority",
         );
         return;
     };
@@ -1382,8 +1422,8 @@ fn deployed_allocator_cli_durably_advances_two_generations_without_rebinding_out
     if !can_assign_allocator_role_gids(&output, &role_gids) {
         make_tree_removable(&root);
         let _ = std::fs::remove_dir_all(root);
-        eprintln!(
-            "HOST_UNAVAILABLE: allocator integration requires three usable supplemental groups or chgrp authority"
+        unavailable_host(
+            "allocator integration requires three usable supplemental groups or chgrp authority",
         );
         return;
     }
@@ -2042,9 +2082,8 @@ exit 99
             run_as_runtime: false,
         });
     } else {
-        eprintln!(
-            "HOST_UNAVAILABLE: owner-mismatch secret case requires chown authority when tests \
-             already run as uid 10001"
+        unavailable_host(
+            "owner-mismatch secret case requires chown authority when tests already run as uid 10001",
         );
     }
 
@@ -2133,9 +2172,8 @@ exit 99
             run_as_runtime,
         });
     } else {
-        eprintln!(
-            "HOST_UNAVAILABLE: mode/link-count/empty/NUL/CR/LF cases require uid 10001 or \
-             root chown/setuid authority; symlink/nonregular/owner cases still ran"
+        unavailable_host(
+            "mode/link-count/empty/NUL/CR/LF cases require uid 10001 or root chown/setuid authority; symlink/nonregular/owner cases still ran",
         );
     }
 
@@ -2489,7 +2527,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         return;
     }
     if !timeout_available() {
-        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound exact executor smoke");
+        unavailable_host("GNU timeout is required to bound exact executor smoke");
         return;
     }
     if !bounded_docker_output(
@@ -2500,7 +2538,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
     .status
     .success()
     {
-        eprintln!("HOST_UNAVAILABLE: Docker daemon cannot run exact executor smoke");
+        unavailable_host("Docker daemon cannot run exact executor smoke");
         return;
     }
     let _guard = HOST_FIXTURE_LOCK
@@ -3437,6 +3475,14 @@ case "$*" in
     done
     exit 0
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in allocator prepare runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
@@ -3676,6 +3722,8 @@ fn interrupted_up_joins_partial_roles_and_returns_signal_status() {
         std::fs::create_dir_all(&markers).unwrap();
         let fake_docker = bin.join("docker");
         let script = r#"#!/bin/bash -p
+# The supervisor control socket is never Docker/plugin authority.
+[[ ! -e /proc/$$/fd/3 ]] || exit 96
 # Every idle loop below waits on a backgrounded sleep. Bash defers a trap until
 # the running foreground command returns, so `sleep 1` in the foreground would
 # make this fake answer SIGTERM up to a second late per level for reasons that
@@ -3705,6 +3753,14 @@ case "$*" in
     exit 0
     ;;
   *"compose.lifecycle.yaml ps --all --quiet")
+    for role in runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
     for role in runtime executor broker; do
       if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
         printf 'fake-container-%s\n' "$role"
@@ -3810,7 +3866,21 @@ fn tracked_launch_fails_closed_when_the_child_is_not_a_session_group_leader() {
     let markers = root.join("markers");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&markers).unwrap();
-    std::fs::write(bin.join("setsid"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::write(
+        bin.join("setsid"),
+        r#"#!/bin/bash
+case "$*" in
+  *"compose.prepare.yaml up --detach --wait"*)
+    touch "$SUMI_FAKE_MARKERS/up-attempted"
+    exec "$@"
+    ;;
+  *)
+    exec /usr/bin/setsid "$@"
+    ;;
+esac
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(bin.join("setsid"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let fake_docker = bin.join("docker");
     let script = r#"#!/bin/bash
@@ -3834,8 +3904,11 @@ case "$*" in
   *"compose.lifecycle.yaml ps --all --quiet")
     [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]]
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]] || printf 'fake-container-runtime\n'
+    ;;
   *"compose.prepare.yaml up --detach --wait")
-    touch "$SUMI_FAKE_MARKERS/up-attempted" "$SUMI_FAKE_MARKERS/runtime"
+    touch "$SUMI_FAKE_MARKERS/runtime"
     while true; do sleep 1 & wait $!; done
     ;;
   *)
@@ -4098,20 +4171,34 @@ fn local_control_path_swap_is_detected_before_validation_succeeds() {
 
 #[test]
 fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
-    if Command::new("docker")
-        .arg("info")
-        .output()
-        .map_or(true, |output| !output.status.success())
-    {
-        eprintln!("HOST_UNAVAILABLE: docker daemon cannot run prepare capability gate");
+    if !timeout_available() {
+        unavailable_host("GNU timeout is required to bound the prepare capability gate");
         return;
     }
-    if Command::new("docker")
-        .args(["image", "inspect", "debian:bookworm-slim"])
-        .output()
-        .map_or(true, |output| !output.status.success())
+    let deploy = deploy_dir();
+    let docker_workdir = deploy.parent().unwrap().parent().unwrap();
+    if !bounded_docker_output(docker_workdir, 30, &["info".into()])
+        .status
+        .success()
     {
-        eprintln!("HOST_UNAVAILABLE: cached debian:bookworm-slim image is unavailable");
+        unavailable_host("docker info did not succeed within 30s for the prepare capability gate");
+        return;
+    }
+    if !bounded_docker_output(
+        docker_workdir,
+        30,
+        &[
+            "image".into(),
+            "inspect".into(),
+            "debian:bookworm-slim".into(),
+        ],
+    )
+    .status
+    .success()
+    {
+        unavailable_host(
+            "cached debian:bookworm-slim image is unavailable for the prepare capability gate",
+        );
         return;
     }
 
@@ -4234,14 +4321,14 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
 fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
     let version = Command::new("docker").args(["compose", "version"]).output();
     let Ok(version) = version else {
-        eprintln!("HOST_UNAVAILABLE: docker executable is not installed");
+        unavailable_host("docker executable is not installed");
         return;
     };
     if !version.status.success() {
-        eprintln!(
-            "HOST_UNAVAILABLE: Docker Compose v2 is unavailable: {}",
+        unavailable_host(&format!(
+            "Docker Compose v2 is unavailable: {}",
             String::from_utf8_lossy(&version.stderr)
-        );
+        ));
         return;
     }
 
@@ -4407,7 +4494,7 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
 #[test]
 fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
     if !timeout_available() {
-        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound Docker acceptance");
+        unavailable_host("GNU timeout is required to bound Docker acceptance");
         return;
     }
     let output = bounded_docker_output(
@@ -4420,10 +4507,10 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
         ],
     );
     if !output.status.success() {
-        eprintln!(
-            "HOST_UNAVAILABLE: docker daemon cannot be used: {}",
+        unavailable_host(&format!(
+            "docker daemon cannot be used: {}",
             String::from_utf8_lossy(&output.stderr)
-        );
+        ));
         return;
     }
     if std::env::var_os("SUMI_DEPLOYMENT_DOCKER_ACCEPTANCE").is_none() {
@@ -4440,10 +4527,8 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
     };
     let body = catch_unwind(AssertUnwindSafe(|| {
         if !security_options.contains("apparmor") {
-            eprintln!(
-                "HOST_UNAVAILABLE: Docker is running without AppArmor; direct UUID-scoped \
-                 Compose cleanup was exercised, but container mount/network/UID behavior remains \
-                 an explicit Docker/AppArmor host gate"
+            unavailable_host(
+                "Docker is running without AppArmor; direct UUID-scoped Compose cleanup was exercised, but container mount/network/UID behavior remains an explicit Docker/AppArmor host gate",
             );
             return;
         }
@@ -4727,10 +4812,8 @@ fn deployment_fixture_provisions_private_anchors_or_says_why_it_did_not() {
         "the supervisor under test still references the host trust root"
     );
 
+    // `unavailable_host()` is the non-tautological check that this fixture was
+    // provisioned: without its explicit opt-in it asserts instead of returning.
     // Nothing above touched the live host anchors.
     fixture.assert_host_anchors_intact("fixture self-check");
-    assert!(
-        FIXTURE_RUNS.load(Ordering::SeqCst) > 0,
-        "no deployment fixture was provisioned in this process"
-    );
 }

@@ -1182,8 +1182,15 @@ export interface components {
         DirectChatStatusFrame: {
             /** @constant */
             type: "direct_chat_status";
+            /** @constant */
+            status: "ready";
+        } | {
+            /** @constant */
+            type: "direct_chat_status";
+            /** @constant */
+            status: "unavailable";
             /** @enum {string} */
-            status: "ready" | "unavailable";
+            reason: "rehydrating" | "stopped" | "unavailable";
         };
         /** @description opaque ASCII tenant identity */
         TenantId: string;
