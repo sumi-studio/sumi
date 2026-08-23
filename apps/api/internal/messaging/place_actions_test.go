@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 func TestChannelWireCarriesPlaceRevision(t *testing.T) {
@@ -223,8 +224,20 @@ func TestPlaceCreationNonceReplaysTheCommittedPlace(t *testing.T) {
 	if err != nil || created || replayed.PlaceID != group.PlaceID {
 		t.Fatalf("group DM replay = (%+v, %v, %v), want same place and created=false", replayed, created, err)
 	}
-	if _, _, err := scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.agent, w.humanB}, "group-once"); !errors.Is(err, ErrIdempotencyConflict) {
-		t.Fatalf("changed group DM request under nonce = %v, want ErrIdempotencyConflict", err)
+	reordered, created, err := scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.agent, w.humanB}, "group-once")
+	if err != nil || created || reordered.PlaceID != group.PlaceID {
+		t.Fatalf("reordered group DM replay = (%+v, %v, %v), want same set receipt", reordered, created, err)
+	}
+	humanCID, err := koseki.New(w.store.pool).MintHuman(ctx)
+	if err != nil {
+		t.Fatalf("mint different group participant: %v", err)
+	}
+	humanC := Human(humanCID)
+	if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, humanC); err != nil {
+		t.Fatalf("add different group participant: %v", err)
+	}
+	if _, _, err := scoped.CreateGroupDMOnce(ctx, []ParticipantRef{w.humanB, humanC}, "group-once"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("different group DM set under nonce = %v, want ErrIdempotencyConflict", err)
 	}
 
 	// Receipt identity is scoped by actor as well as Workspace. The same nonce

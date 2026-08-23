@@ -689,8 +689,18 @@ export class MockMessagingServer implements MessagingBackend {
     if (!clientNonce || clientNonce.length > 128) {
       throw new Error("invalid client nonce");
     }
+    const canonicalParticipants = [
+      ...new Map(
+        participants.map((participant) => [
+          participantKey(participant),
+          participant,
+        ]),
+      ).entries(),
+    ]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, participant]) => participant);
     const receiptKey = `create_group_dm:${clientNonce}`;
-    const digest = JSON.stringify(participants.map(participantKey).sort());
+    const digest = JSON.stringify(canonicalParticipants.map(participantKey));
     const receipt = this.placeCreationReceipts.get(receiptKey);
     if (receipt) {
       if (receipt.digest !== digest || !("dmId" in receipt.result)) {
@@ -701,7 +711,7 @@ export class MockMessagingServer implements MessagingBackend {
     const dm: DmSummary = {
       dmId: `gdm-${secureRandomUUID().slice(0, 8)}`,
       kind: "group_dm",
-      participants: [SELF, ...participants],
+      participants: [SELF, ...canonicalParticipants],
     };
     DMS.push(dm);
     const response = copyDM(dm);

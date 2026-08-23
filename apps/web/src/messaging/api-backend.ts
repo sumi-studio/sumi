@@ -30,7 +30,12 @@ import type {
   UploadAttachmentInput,
   UploadAttachmentReceipt,
 } from "./model";
-import { MAX_ATTACHMENT_BYTES, MAX_SEQ, parsePlaceKey } from "./model";
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_SEQ,
+  parsePlaceKey,
+  participantKey,
+} from "./model";
 import {
   bindMessagingScopeToURL,
   type MessagingScope,
@@ -221,8 +226,18 @@ export class ApiMessagingBackend implements MessagingBackend {
     participants: ParticipantRef[],
     clientNonce: string,
   ): Promise<DmSummary> {
+    const canonicalParticipants = [
+      ...new Map(
+        participants.map((participant) => [
+          participantKey(participant),
+          participant,
+        ]),
+      ).entries(),
+    ]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, participant]) => participant);
     const body = await this.requestPlaceCreation("/messaging/group-dms", {
-      participants: participants.map(participantToWire),
+      participants: canonicalParticipants.map(participantToWire),
       client_nonce: clientNonce,
     });
     return this.registerDm(body);
@@ -756,12 +771,21 @@ export class ApiMessagingBackend implements MessagingBackend {
     try {
       return await this.request(path, { method: "POST", body });
     } catch (error) {
+      if (this.abortController.signal.aborted) {
+        throw error;
+      }
       if (
-        error instanceof MessagingAPIError ||
-        this.abortController.signal.aborted
+        error instanceof MessagingAPIError &&
+        error.status !== 408 &&
+        error.status !== 429 &&
+        error.status < 500
       ) {
         throw error;
       }
+      // 5xx may be generated after an upstream commit; 408 can be an
+      // intermediary timing out while that commit completes; and 429 can be a
+      // gateway rejecting its acknowledgement after forwarding. One retry is
+      // safe only because it carries the exact same receipt nonce and digest.
       return this.request(path, { method: "POST", body });
     }
   }

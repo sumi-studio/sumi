@@ -152,10 +152,19 @@ describe("MockMessagingServer place edits", () => {
       "mock-group-once",
     );
     const groupReplay = await server.createGroupDM(
-      [...participants],
+      [...participants].reverse(),
       "mock-group-once",
     );
     expect(groupReplay.dmId).toBe(group.dmId);
+    await expect(
+      server.createGroupDM(
+        [
+          { kind: "human", humanId: "human-b" },
+          { kind: "human", humanId: "human-d" },
+        ],
+        "mock-group-once",
+      ),
+    ).rejects.toThrow("idempotency conflict");
 
     const duplicate = await server.duplicateChannel(
       "ch-general",

@@ -1,6 +1,12 @@
+// @vitest-environment jsdom
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
-import type { ParticipantRef } from "./model";
+import { type ParticipantRef, participantKey } from "./model";
+import {
+  PlaceCreationAttemptCapacityError,
+  PlaceCreationAttemptLedger,
+} from "./place-creation-attempt-ledger";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
@@ -29,6 +35,7 @@ function signIn(): MockMessagingServer {
 describe("place creation logical-attempt nonces", () => {
   afterEach(() => {
     bindMessagingSessionIdentity(null);
+    sessionStorage.clear();
     vi.restoreAllMocks();
   });
 
@@ -65,17 +72,26 @@ describe("place creation logical-attempt nonces", () => {
     const server = signIn();
     const create = server.createGroupDM.bind(server);
     const nonces: string[] = [];
+    const participantSets: string[][] = [];
     vi.spyOn(server, "createGroupDM").mockImplementation(async (...args) => {
       nonces.push(args[1]);
+      participantSets.push(args[0].map(participantKey));
       if (nonces.length === 1) throw new TypeError("ambiguous response loss");
       return create(...args);
     });
 
+    await expect(
+      useMessaging.getState().startDM([CAROL, BOB, CAROL]),
+    ).rejects.toThrow("ambiguous response loss");
     const gesture = () => useMessaging.getState().startDM([BOB, CAROL]);
-    await expect(gesture()).rejects.toThrow("ambiguous response loss");
     const reconciled = await gesture();
     const laterGesture = await gesture();
 
+    expect(participantSets).toEqual([
+      ["human:human-b", "human:human-c"],
+      ["human:human-b", "human:human-c"],
+      ["human:human-b", "human:human-c"],
+    ]);
     expect(nonces[0]).toBeTruthy();
     expect(nonces[1]).toBe(nonces[0]);
     expect(nonces[2]).not.toBe(nonces[1]);
@@ -132,5 +148,125 @@ describe("place creation logical-attempt nonces", () => {
     expect(staleNonce).toBeTruthy();
     expect(replacementNonce).toBeTruthy();
     expect(replacementNonce).not.toBe(staleNonce);
+  });
+
+  it("fails closed at capacity without evicting the oldest attempt", async () => {
+    const server = signIn();
+    const calls: Array<{ name: string; nonce: string }> = [];
+    vi.spyOn(server, "createChannel").mockImplementation(
+      async (_workspaceId, name, _topic, _voice, clientNonce) => {
+        calls.push({ name, nonce: clientNonce });
+        throw new TypeError("ambiguous response loss");
+      },
+    );
+    const create = (name: string) =>
+      useMessaging.getState().createChannel("workspace-1", name, "", false);
+
+    for (let index = 0; index < 32; index += 1) {
+      await expect(create(`unresolved-${index}`)).rejects.toThrow(
+        "ambiguous response loss",
+      );
+    }
+    const oldestNonce = calls[0]?.nonce;
+    await expect(create("unresolved-32")).rejects.toBeInstanceOf(
+      PlaceCreationAttemptCapacityError,
+    );
+    expect(calls).toHaveLength(32);
+
+    await expect(create("unresolved-0")).rejects.toThrow(
+      "ambiguous response loss",
+    );
+    expect(calls).toHaveLength(33);
+    expect(calls.at(-1)).toEqual({
+      name: "unresolved-0",
+      nonce: oldestNonce,
+    });
+  });
+
+  it("survives a hard reload until authoritative acknowledgement", () => {
+    const owner = JSON.stringify([
+      "human-a",
+      "workspace-1",
+      "installation-1",
+      "7",
+    ]);
+    const declaration = JSON.stringify([
+      "create_channel",
+      "workspace-1",
+      "reload-safe",
+      "",
+      false,
+    ]);
+    let generated = 0;
+    const nonceFactory = () => `reload-nonce-${++generated}`;
+
+    const beforeReload = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    beforeReload.activate(owner, true);
+    const committedButAmbiguous = beforeReload.nonceFor(declaration);
+
+    // A new ledger instance is the relevant hard-page-reload boundary. No
+    // in-memory state is shared, but the exact authority loads the same nonce.
+    const afterReload = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    afterReload.activate(owner, true);
+    expect(afterReload.nonceFor(declaration)).toBe(committedButAmbiguous);
+
+    afterReload.complete(declaration, committedButAmbiguous);
+    const afterAcknowledgement = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    afterAcknowledgement.activate(owner, true);
+    expect(afterAcknowledgement.nonceFor(declaration)).not.toBe(
+      committedButAmbiguous,
+    );
+  });
+
+  it("does not carry persisted reconciliation state across authority replacement", () => {
+    let generated = 0;
+    const nonceFactory = () => `authority-nonce-${++generated}`;
+    const declaration = JSON.stringify(["duplicate_channel", "channel-1"]);
+    const firstOwner = JSON.stringify([
+      "human-a",
+      "workspace-1",
+      "installation-1",
+      "7",
+    ]);
+    const replacementOwner = JSON.stringify([
+      "human-a",
+      "workspace-1",
+      "installation-1",
+      "8",
+    ]);
+    const first = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    first.activate(firstOwner, true);
+    const obsolete = first.nonceFor(declaration);
+
+    const replacement = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    replacement.activate(replacementOwner, true);
+    const afterReplacement = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    afterReplacement.activate(firstOwner, true);
+
+    expect(afterReplacement.nonceFor(declaration)).not.toBe(obsolete);
   });
 });

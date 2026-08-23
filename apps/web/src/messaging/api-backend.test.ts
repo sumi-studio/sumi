@@ -586,8 +586,8 @@ describe("ApiMessagingBackend", () => {
     await expect(
       backend.createGroupDM(
         [
-          { kind: "human", humanId: "human-2" },
           { kind: "personality_agent", personalityAgentId: "agent-1" },
+          { kind: "human", humanId: "human-2" },
         ],
         "create-group-gesture",
       ),
@@ -682,6 +682,113 @@ describe("ApiMessagingBackend", () => {
         client_nonce: "stable-logical-gesture",
       }),
     ]);
+  });
+
+  it.each([
+    502, 503, 408, 429,
+  ])("reconciles an ambiguous HTTP %i once with the same request", async (status) => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/group-dms" && init?.method === "POST") {
+          bodies.push(String(init.body));
+          if (bodies.length === 1) {
+            return json({ error: "intermediary_response_lost" }, status);
+          }
+          return json(
+            {
+              dm_id: "group-dm-reconciled",
+              kind: "group_dm",
+              participants: [
+                { kind: "human", human_id: "human-1" },
+                { kind: "human", human_id: "human-2" },
+                {
+                  kind: "personality_agent",
+                  personality_agent_id: "agent-1",
+                },
+              ],
+            },
+            200,
+          );
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.createGroupDM(
+        [
+          { kind: "human", humanId: "human-2" },
+          { kind: "personality_agent", personalityAgentId: "agent-1" },
+        ],
+        "ambiguous-http-status",
+      ),
+    ).resolves.toMatchObject({ dmId: "group-dm-reconciled" });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+  });
+
+  it("stops after one reconciliation when both responses are ambiguous", async () => {
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          bodies.push(String(init.body));
+          return json({ error: "upstream_response_unknown" }, 503);
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.createChannel(
+        "workspace-1",
+        "bounded",
+        "",
+        false,
+        "bounded-reconciliation",
+      ),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+  });
+
+  it.each([
+    400, 403, 404, 409,
+  ])("does not retry a definitive pre-mutation HTTP %i rejection", async (status) => {
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (
+          path === "/messaging/places/channel-1/duplicate" &&
+          init?.method === "POST"
+        ) {
+          attempts += 1;
+          return json({ error: "definitive_rejection" }, status);
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.duplicateChannel("channel-1", "definitive-http-status"),
+    ).rejects.toMatchObject({ status });
+    expect(attempts).toBe(1);
   });
 
   it("projects place_created and place_updated from the socket", async () => {

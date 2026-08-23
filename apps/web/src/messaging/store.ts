@@ -51,6 +51,7 @@ import {
   presentationFor,
   presentDesktopNotification,
 } from "./notifications";
+import { PlaceCreationAttemptLedger } from "./place-creation-attempt-ledger";
 import {
   getActiveMessagingScope,
   type MessagingScope,
@@ -122,25 +123,40 @@ let nextEditSessionToken = 0;
  * a canonical response removes it so a later explicit gesture is new. The map
  * is cleared with the exact Messaging session/installation scope.
  */
-const placeCreationAttempts = new Map<string, string>();
-const MAX_RETAINED_PLACE_CREATION_ATTEMPTS = 32;
+const placeCreationAttempts = new PlaceCreationAttemptLedger(
+  typeof sessionStorage === "undefined" ? null : sessionStorage,
+);
+
+function activatePlaceCreationAttemptOwner(): void {
+  const identity = getMessagingSessionIdentity();
+  const scope = getActiveMessagingScope();
+  if (identity && scope) {
+    placeCreationAttempts.activate(
+      JSON.stringify([
+        identity,
+        scope.workspaceId,
+        scope.installationId,
+        scope.authorityEpoch,
+      ]),
+      true,
+    );
+    return;
+  }
+  // Unit/development mock backends can be identity-bound without a real app
+  // installation. Their attempts remain memory-only and generation-fenced.
+  placeCreationAttempts.activate(
+    JSON.stringify(["ephemeral", messagingSessionGeneration, identity]),
+    false,
+  );
+}
 
 function placeCreationAttemptNonce(key: string): string {
-  const retained = placeCreationAttempts.get(key);
-  if (retained) return retained;
-  if (placeCreationAttempts.size >= MAX_RETAINED_PLACE_CREATION_ATTEMPTS) {
-    const oldest = placeCreationAttempts.keys().next().value;
-    if (oldest !== undefined) placeCreationAttempts.delete(oldest);
-  }
-  const nonce = secureRandomUUID();
-  placeCreationAttempts.set(key, nonce);
-  return nonce;
+  activatePlaceCreationAttemptOwner();
+  return placeCreationAttempts.nonceFor(key);
 }
 
 function completePlaceCreationAttempt(key: string, nonce: string): void {
-  if (placeCreationAttempts.get(key) === nonce) {
-    placeCreationAttempts.delete(key);
-  }
+  placeCreationAttempts.complete(key, nonce);
 }
 
 /**
@@ -2216,7 +2232,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async startDM(participants) {
-      const [first] = participants;
+      const canonicalParticipants = [
+        ...new Map(
+          participants.map((participant) => [
+            participantKey(participant),
+            participant,
+          ]),
+        ).entries(),
+      ]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([, participant]) => participant);
+      const [first] = canonicalParticipants;
       if (!first) throw new Error("participants are required");
       if (get().startingDM !== null) {
         throw new Error("A DM start is already pending");
@@ -2225,11 +2251,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
       const token = ++nextDMStartToken;
+      const canonicalGroupParticipants =
+        canonicalParticipants.length > 1 ? canonicalParticipants : null;
       const groupAttemptKey =
-        participants.length > 1
+        canonicalGroupParticipants !== null
           ? JSON.stringify([
               "create_group_dm",
-              ...participants.map(participantKey).sort(),
+              ...canonicalGroupParticipants.map(participantKey),
             ])
           : null;
       const clientNonce =
@@ -2239,10 +2267,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set({ startingDM: { participants, token } });
       try {
         const dm =
-          participants.length === 1
+          canonicalParticipants.length === 1
             ? await request.wait((backend) => backend.ensureDM(first))
             : await request.wait((backend) =>
-                backend.createGroupDM(participants, clientNonce ?? ""),
+                backend.createGroupDM(
+                  canonicalGroupParticipants ?? [],
+                  clientNonce ?? "",
+                ),
               );
         if (dm && groupAttemptKey && clientNonce) {
           completePlaceCreationAttempt(groupAttemptKey, clientNonce);
@@ -3101,7 +3132,7 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
 
 function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
-  placeCreationAttempts.clear();
+  placeCreationAttempts.authorityReplaced();
   reactionProjectionByPlace.clear();
   releaseAllDraftFiles();
   backend.dispose();

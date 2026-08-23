@@ -1701,7 +1701,8 @@ impl MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
-            BoundMessagingAction::StartDm { participants } => {
+            BoundMessagingAction::StartDm { mut participants } => {
+                canonicalize_dm_participants(&mut participants);
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
                 let response = self
                     .api
@@ -2212,7 +2213,8 @@ fn resolve_raw_action(
         // Opening or editing a place needs no place already in view: the
         // gesture names its own target, the way a human clicks a sidebar row
         // without first having been inside it.
-        MessagingAction::StartDm { participants } => {
+        MessagingAction::StartDm { mut participants } => {
+            canonicalize_dm_participants(&mut participants);
             Ok(BoundMessagingAction::StartDm { participants })
         }
         MessagingAction::CreateChannel { name, topic, voice } => {
@@ -2464,11 +2466,25 @@ fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(),
             _ => return Err(ToolError::InvalidArguments),
         };
         validate_bounded_nonempty(id, MAX_PARTICIPANT_ID_BYTES)?;
-        if !seen.insert(format!("{}:{id}", participant.kind)) {
-            return Err(ToolError::InvalidArguments);
-        }
+        seen.insert(format!("{}:{id}", participant.kind));
     }
     Ok(())
+}
+
+fn messaging_participant_key(participant: &MessagingParticipant) -> String {
+    let id = participant
+        .human_id
+        .as_deref()
+        .or(participant.personality_agent_id.as_deref())
+        .unwrap_or_default();
+    format!("{}:{id}", participant.kind)
+}
+
+fn canonicalize_dm_participants(participants: &mut Vec<MessagingParticipant>) {
+    participants.sort_by_key(messaging_participant_key);
+    participants.dedup_by(|left, right| {
+        messaging_participant_key(left) == messaging_participant_key(right)
+    });
 }
 
 /// Keep the local admission boundary in the same units as the server's
@@ -7426,10 +7442,6 @@ mod tests {
             json!([{"kind": "human"}]),
             json!([{"kind": "human", "personality_agent_id": "agent-2"}]),
             json!([{"kind": "octopus", "human_id": "human-2"}]),
-            json!([
-                test_dm_participant("human-2"),
-                test_dm_participant("human-2")
-            ]),
         ] {
             let error = bind_action(
                 &registry,
@@ -7440,6 +7452,32 @@ mod tests {
             .expect_err("a participant must name exactly one identity");
             assert!(matches!(error, DescribeError::InvalidArguments));
         }
+    }
+
+    #[tokio::test]
+    async fn start_dm_transmits_a_canonical_participant_set() {
+        let (api, _tool, registry) = binding_fixture().await;
+        execute_bound_action(
+            &registry,
+            "canonical-start-dm",
+            json!({
+                "action": "start_dm",
+                "participants": [
+                    test_dm_participant("human-3"),
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-3")
+                ]
+            }),
+        )
+        .await
+        .expect("execute canonical start_dm");
+
+        let started = api.started_dms.lock().await;
+        let ids = started[0]
+            .iter()
+            .map(|participant| participant.human_id.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["human-2", "human-3"]);
     }
 
     #[tokio::test]

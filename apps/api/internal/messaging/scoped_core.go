@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"unicode/utf8"
@@ -410,8 +411,9 @@ func copyChannelName(source string) string {
 
 // normalizeDMOthers is the one entrance for a requested DM member set. The
 // actor is never an "other", and each remaining participant occurs once in
-// request order. REST and the agent-local lane use it before choosing the
-// one-to-one/group path and before placing members on the wire.
+// canonical ParticipantRef order. A group DM is a set: REST, agent-local,
+// digesting, receipt replay, and membership insertion must not disagree merely
+// because the same participants arrived in another order.
 func normalizeDMOthers(actor ParticipantRef, requested []ParticipantRef) ([]ParticipantRef, error) {
 	seen := map[string]bool{actor.Key(): true}
 	others := make([]ParticipantRef, 0, len(requested))
@@ -425,6 +427,7 @@ func normalizeDMOthers(actor ParticipantRef, requested []ParticipantRef) ([]Part
 		seen[ref.Key()] = true
 		others = append(others, ref)
 	}
+	sort.Slice(others, func(i, j int) bool { return others[i].Key() < others[j].Key() })
 	return others, nil
 }
 
