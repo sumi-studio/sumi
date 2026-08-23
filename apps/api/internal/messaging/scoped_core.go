@@ -507,6 +507,9 @@ func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef
 		if err != nil {
 			return Place{}, false, err
 		}
+		if err := s.validateGroupDMReplayTenures(ctx, tx, place, others); err != nil {
+			return Place{}, false, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Place{}, false, fmt.Errorf("commit replay create group dm: %w", err)
 		}
@@ -538,6 +541,36 @@ func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef
 		return Place{}, false, fmt.Errorf("commit create group dm: %w", err)
 	}
 	return place, true, nil
+}
+
+// A group-DM receipt remembers a historical creation, not current access.
+// Reconciliation may return its place only while the actor and every exact
+// requested participant still hold both their current Workspace tenure and a
+// private-place tenure bound to that same membership. Removal/rejoin creates a
+// new Workspace tenure and therefore cannot revive the old private audience.
+func (s *ScopedStore) validateGroupDMReplayTenures(
+	ctx context.Context,
+	tx pgx.Tx,
+	place Place,
+	requested []ParticipantRef,
+) error {
+	if place.Kind != PlaceGroupDM {
+		return ErrPlaceNotFound
+	}
+	participants := append([]ParticipantRef{s.Scope.Actor}, requested...)
+	for _, participant := range participants {
+		membership, err := s.workspaces.ActiveMembershipInTx(
+			ctx, tx, s.Scope.WorkspaceID, participant,
+		)
+		if err != nil {
+			return ErrPlaceNotFound
+		}
+		access, err := s.placeAccessAfterAuthorization(ctx, tx, place, participant)
+		if err != nil || access.WorkspaceMemberID != membership.WorkspaceMemberID || access.PlaceMemberID == "" {
+			return ErrPlaceNotFound
+		}
+	}
+	return nil
 }
 
 func admitPlaceTenure(ctx context.Context, tx pgx.Tx, placeID string, membership workspacecontrol.Membership, visibleFrom int64) error {

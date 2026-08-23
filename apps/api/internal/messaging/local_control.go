@@ -492,9 +492,16 @@ func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorizat
 		})
 	}
 	writeJSON(w, http.StatusOK, struct {
-		DM      dmWire `json:"dm"`
-		Created bool   `json:"created"`
-	}{wire, created})
+		DM             dmWire `json:"dm"`
+		Created        bool   `json:"created"`
+		WorkspaceID    string `json:"workspace_id"`
+		InstallationID string `json:"installation_id"`
+		AuthorityEpoch string `json:"authority_epoch"`
+	}{
+		DM: wire, Created: created,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
 }
 
 // localCreateChannel opens a channel in the agent's exact Workspace, the same
@@ -537,8 +544,17 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 		status = http.StatusOK
 	}
 	writeJSON(w, status, struct {
-		Channel channelWire `json:"channel"`
-	}{wire})
+		Channel        channelWire `json:"channel"`
+		Created        bool        `json:"created"`
+		Kind           string      `json:"kind"`
+		WorkspaceID    string      `json:"workspace_id"`
+		InstallationID string      `json:"installation_id"`
+		AuthorityEpoch string      `json:"authority_epoch"`
+	}{
+		Channel: wire, Created: created, Kind: PlaceChannel,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
 }
 
 // localUpdateChannel renames a channel, retopics it, or both. An omitted field
@@ -622,8 +638,17 @@ func (s *Server) localDuplicateChannel(w http.ResponseWriter, r *http.Request, a
 		status = http.StatusOK
 	}
 	writeJSON(w, status, struct {
-		Channel channelWire `json:"channel"`
-	}{wire})
+		Channel        channelWire `json:"channel"`
+		Created        bool        `json:"created"`
+		Kind           string      `json:"kind"`
+		WorkspaceID    string      `json:"workspace_id"`
+		InstallationID string      `json:"installation_id"`
+		AuthorityEpoch string      `json:"authority_epoch"`
+	}{
+		Channel: wire, Created: created, Kind: PlaceChannel,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
 }
 
 // localReplyLater places the agent's own「後で返信します」marker. The tool

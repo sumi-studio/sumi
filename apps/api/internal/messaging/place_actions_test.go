@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -259,6 +260,117 @@ func TestPlaceCreationNonceReplaysTheCommittedPlace(t *testing.T) {
 	}
 }
 
+func TestPlaceCreationReplayRevalidatesCurrentAuthorityAndPrivateTenure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		churn func(testing.TB, context.Context, world, Workspace, *ScopedStore)
+	}{
+		{
+			name: "actor Workspace tenure",
+			churn: func(t testing.TB, ctx context.Context, w world, workspace Workspace, _ *ScopedStore) {
+				if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
+					t.Fatalf("remove actor: %v", err)
+				}
+				if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
+					t.Fatalf("rejoin actor: %v", err)
+				}
+			},
+		},
+		{
+			name: "other participant Workspace tenure",
+			churn: func(t testing.TB, ctx context.Context, w world, workspace Workspace, _ *ScopedStore) {
+				if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+					t.Fatalf("remove participant: %v", err)
+				}
+				if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+					t.Fatalf("rejoin participant: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			workspace, _ := w.workspaceWithChannel(t, ctx)
+			scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+			requested := []ParticipantRef{w.humanA, w.humanB}
+			created, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "tenure-replay")
+			if err != nil || !fresh {
+				t.Fatalf("create group DM = (%+v, %v, %v)", created, fresh, err)
+			}
+			tc.churn(t, ctx, w, workspace, scoped)
+			replayed, _, err := scoped.CreateGroupDMOnce(ctx, requested, "tenure-replay")
+			if err == nil || replayed.PlaceID != "" {
+				t.Fatalf("stale replay = (%+v, %v), want fail closed without place identity", replayed, err)
+			}
+		})
+	}
+
+	t.Run("installation disable and epoch", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		workspace, _ := w.workspaceWithChannel(t, ctx)
+		scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+		requested := []ParticipantRef{w.humanA, w.humanB}
+		created, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "authority-replay")
+		if err != nil || !fresh {
+			t.Fatalf("create group DM = (%+v, %v, %v)", created, fresh, err)
+		}
+		if _, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, false); err != nil {
+			t.Fatalf("disable installation: %v", err)
+		}
+		replayed, _, err := scoped.CreateGroupDMOnce(ctx, requested, "authority-replay")
+		if err == nil || replayed.PlaceID != "" {
+			t.Fatalf("disabled replay = (%+v, %v), want fail closed without place identity", replayed, err)
+		}
+		if _, err := w.apps.SetEnabledByID(ctx, scoped.Scope.InstallationID, w.humanA, true); err != nil {
+			t.Fatalf("re-enable installation: %v", err)
+		}
+		replayed, _, err = scoped.CreateGroupDMOnce(ctx, requested, "authority-replay")
+		if err == nil || replayed.PlaceID != "" {
+			t.Fatalf("stale-epoch replay = (%+v, %v), want fail closed without place identity", replayed, err)
+		}
+		newSession := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+		independent, fresh, err := newSession.CreateGroupDMOnce(ctx, requested, "authority-replay")
+		if err != nil || !fresh || independent.PlaceID == created.PlaceID {
+			t.Fatalf("new-epoch creation = (%+v, %v, %v), want independent place", independent, fresh, err)
+		}
+	})
+
+	t.Run("channel role revoke", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		workspace, source := w.workspaceWithChannel(t, ctx)
+		grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
+		scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+		created, fresh, err := scoped.CreateChannelOnce(ctx, "role-fenced", "", false, "role-replay")
+		if err != nil || !fresh {
+			t.Fatalf("create channel = (%+v, %v, %v)", created, fresh, err)
+		}
+		duplicated, fresh, err := scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "duplicate-role-replay")
+		if err != nil || !fresh {
+			t.Fatalf("duplicate channel = (%+v, %v, %v)", duplicated, fresh, err)
+		}
+		membershipID := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+		if _, err := w.workspaces.SetMembershipRoles(
+			ctx, workspace.WorkspaceID, membershipID, w.humanA, nil,
+		); err != nil {
+			t.Fatalf("revoke channel role: %v", err)
+		}
+		replayed, _, err := scoped.CreateChannelOnce(ctx, "role-fenced", "", false, "role-replay")
+		if !errors.Is(err, ErrForbidden) || replayed.PlaceID != "" {
+			t.Fatalf("role-revoked replay = (%+v, %v), want forbidden without place identity", replayed, err)
+		}
+		replayed, _, err = scoped.DuplicateChannelOnce(ctx, source.PlaceID, "", "duplicate-role-replay")
+		if !errors.Is(err, ErrForbidden) || replayed.PlaceID != "" {
+			t.Fatalf("role-revoked duplicate replay = (%+v, %v), want forbidden without place identity", replayed, err)
+		}
+	})
+}
+
 // The first handler response is intentionally discarded, as when the peer
 // loses the response after commit. A normal second local-control request must
 // recover the canonical place without a PA-only manual retry API.
@@ -271,6 +383,7 @@ func TestLocalPlaceCreationRoutesRecoverACommittedLostResponse(t *testing.T) {
 	server.Hub = NewHub(w.store.core)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
 	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
+	exactScope := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent).Scope
 
 	retry := func(
 		name, path string,
@@ -289,6 +402,13 @@ func TestLocalPlaceCreationRoutesRecoverACommittedLostResponse(t *testing.T) {
 		if secondStatus != http.StatusOK || identity(first) == "" || identity(second) != identity(first) {
 			t.Fatalf("%s retry: first=%v second status=%d body=%v", name, first, secondStatus, second)
 		}
+		for _, response := range []map[string]any{first, second} {
+			if response["workspace_id"] != exactScope.WorkspaceID ||
+				response["installation_id"] != exactScope.InstallationID ||
+				response["authority_epoch"] != strconv.FormatInt(exactScope.AuthorityEpoch, 10) {
+				t.Fatalf("%s response scope = %v, want exact local scope", name, response)
+			}
+		}
 		if created, ok := second["created"]; ok && created != false {
 			t.Fatalf("%s retry created=%v, want false", name, created)
 		}
@@ -303,15 +423,25 @@ func TestLocalPlaceCreationRoutesRecoverACommittedLostResponse(t *testing.T) {
 	retry("one-to-one DM", LocalStartDMPath, server.localStartDM,
 		map[string]any{"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}}},
 		func(body map[string]any) string { return body["dm"].(map[string]any)["dm_id"].(string) })
-	retry("group DM", LocalStartDMPath, server.localStartDM,
-		map[string]any{
-			"client_nonce": "lost-group-nonce",
-			"participants": []any{
-				map[string]any{"kind": "human", "human_id": w.humanA.ID},
-				map[string]any{"kind": "human", "human_id": w.humanB.ID},
-			},
+	groupRequest := map[string]any{
+		"client_nonce": "lost-group-nonce",
+		"participants": []any{
+			map[string]any{"kind": "human", "human_id": w.humanA.ID},
+			map[string]any{"kind": "human", "human_id": w.humanB.ID},
 		},
+	}
+	retry("group DM", LocalStartDMPath, server.localStartDM, groupRequest,
 		func(body map[string]any) string { return body["dm"].(map[string]any)["dm_id"].(string) })
+	if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+		t.Fatalf("remove group participant after reconciliation: %v", err)
+	}
+	if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+		t.Fatalf("rejoin group participant after reconciliation: %v", err)
+	}
+	status, stale := callLocal(t, ctx, server.localStartDM, LocalStartDMPath, groupRequest, authorization)
+	if status != http.StatusNotFound || stale["dm"] != nil || stale["created"] != nil {
+		t.Fatalf("stale group replay leaked a place projection: status %d body %v", status, stale)
+	}
 
 	status, body := callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath,
 		map[string]any{"name": "changed-after-commit", "client_nonce": "lost-create-nonce"}, authorization)
