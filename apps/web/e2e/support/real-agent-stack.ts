@@ -583,12 +583,19 @@ class LoopbackReviewerProvider {
       }
       const raw = await readBoundedJSON(request);
       const responseFormat = raw.response_format;
+      const initialReview =
+        responseFormat === undefined &&
+        Array.isArray(raw.tools) &&
+        raw.tools.length > 0;
+      const structuredRetry =
+        isRecord(responseFormat) &&
+        responseFormat.type === this.expectedResponseFormat &&
+        (!Array.isArray(raw.tools) || raw.tools.length === 0);
       if (
         raw.stream !== true ||
         raw.model !== this.model ||
         !Array.isArray(raw.messages) ||
-        !isRecord(responseFormat) ||
-        responseFormat.type !== this.expectedResponseFormat
+        (!initialReview && !structuredRetry)
       ) {
         respondJSON(response, 422, { error: "invalid_reviewer_request" });
         return;
@@ -1992,13 +1999,14 @@ function exactSingleMessagingChannel(
     workspace.name.length === 0 ||
     !isRecord(channel) ||
     Object.keys(channel).sort().join("\0") !==
-      "channel_id\0name\0topic\0visibility\0workspace_id" ||
+      "channel_id\0name\0topic\0visibility\0voice\0workspace_id" ||
     !isCanonicalUUIDv7(channel.channel_id) ||
     channel.workspace_id !== workspaceID ||
     typeof channel.name !== "string" ||
     channel.name.length === 0 ||
     typeof channel.topic !== "string" ||
-    typeof channel.visibility !== "string"
+    typeof channel.visibility !== "string" ||
+    typeof channel.voice !== "boolean"
   ) {
     return undefined;
   }
