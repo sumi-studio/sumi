@@ -603,6 +603,102 @@ describe("編集セッションのタイムライン整合性", () => {
     );
   });
 
+  it("成功応答とechoを失った編集は同一PATCHの409正本で確定し、偽の競合を出さない", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const submitted = "応答を失った保存本文";
+    const committed = {
+      ...target,
+      content: submitted,
+      editedAt: Date.UTC(2026, 7, 23, 12, 0, 0),
+      revision: (target.revision ?? 1) + 1,
+    };
+    const edit = vi
+      .spyOn(backend, "editMessage")
+      // サーバーでは確定したが、REST応答もWS echoも届かなかった窓を再現する。
+      .mockRejectedValueOnce(new Error("edit response lost"))
+      .mockRejectedValueOnce(
+        new MessagingAPIError("edit_conflict", 409, {
+          message: conflictWire(committed),
+        }),
+      );
+    renderList();
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    const textarea = await screen.findByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: submitted } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(useMessaging.getState().editFailure).toBe(
+        "保存できませんでした。もう一度お試しください。",
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(useMessaging.getState().editingMessageId).toBeNull(),
+    );
+    expect(edit).toHaveBeenNthCalledWith(
+      2,
+      target.place,
+      target.messageId,
+      submitted,
+      target.revision ?? 1,
+    );
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace["channel:ch-general"]?.find(
+          (message) => message.messageId === target.messageId,
+        ),
+    ).toMatchObject({ content: submitted, revision: committed.revision });
+    expect(screen.queryByText("別の場所で編集されました")).toBeNull();
+    expect(useMessaging.getState().editConflict).toBeNull();
+  });
+
+  it("同一本文でも409正本が期待次版を越えていれば競合として残す", async () => {
+    const backend = await bootStore();
+    const target = useMessaging
+      .getState()
+      .messagesByPlace["channel:ch-general"]?.find(
+        (message) =>
+          message.author.kind === "human" &&
+          message.author.humanId === "h-yohaku",
+      );
+    if (!target) throw new Error("target message was not loaded");
+    const submitted = "偶然同じになった本文";
+    const later = {
+      ...target,
+      content: submitted,
+      revision: (target.revision ?? 1) + 2,
+    };
+    vi.spyOn(backend, "editMessage").mockRejectedValueOnce(
+      new MessagingAPIError("edit_conflict", 409, {
+        message: conflictWire(later),
+      }),
+    );
+
+    act(() => useMessaging.getState().startEdit(target.messageId));
+    act(() => useMessaging.getState().setEditDraft(submitted));
+    act(() => useMessaging.getState().submitEdit());
+
+    await waitFor(() =>
+      expect(useMessaging.getState().editConflict).toEqual({
+        content: submitted,
+        revision: later.revision,
+      }),
+    );
+    expect(useMessaging.getState().editingMessageId).toBe(target.messageId);
+  });
+
   it("WS切断中の409 message_deletedはtombstoneを反映して編集を閉じ、再保存しない", async () => {
     const backend = await bootStore();
     const target = useMessaging

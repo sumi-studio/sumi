@@ -484,6 +484,74 @@ function advanceUnsentEditSessionThroughAck(
 }
 
 /**
+ * 成功応答と、成功応答を失った直後の同一 PATCH 再試行は、同じ確定遷移を通す。
+ * 後者を認められるのは、サーバー正本が送信 base の厳密な次版で、かつ送信本文と
+ * 同一のときだけである。それより先の版や別本文は他者編集と区別できない。
+ */
+function reduceSuccessfulEditAcknowledgement(
+  state: MessagingState,
+  submittedSession: EditSession,
+  committed: Message,
+): Partial<MessagingState> {
+  const key = submittedSession.placeKey;
+  if (
+    committed.messageId !== submittedSession.messageId ||
+    placeKey(committed.place) !== key
+  )
+    return {};
+  const currentMessage = (state.messagesByPlace[key] ?? []).find(
+    (message) => message.messageId === committed.messageId,
+  );
+  const base = latestMessageContent(currentMessage, committed);
+  const acknowledgedRevision = committed.revision ?? submittedSession.revision;
+  return {
+    messagesByPlace: {
+      ...state.messagesByPlace,
+      [key]: upsertMessage(
+        state.messagesByPlace[key] ?? [],
+        committed,
+        "revision",
+      ),
+    },
+    ...(isCurrentEditSession(state, submittedSession)
+      ? state.editDraft === submittedSession.submittedDraft
+        ? clearedEditSession()
+        : {
+            editBaseRevision: base?.revision ?? submittedSession.revision,
+            editSession: {
+              ...submittedSession,
+              revision: base?.revision ?? submittedSession.revision,
+              submittedDraft: null,
+              token: ++nextEditSessionToken,
+            },
+            editConflict: clearConflictsThroughSuccessfulEditAck(
+              state.editConflict,
+              acknowledgedRevision,
+            ),
+            editFailure: null,
+            editSavedWithPendingChanges: true,
+          }
+      : advanceUnsentEditSessionThroughAck(
+          state,
+          submittedSession,
+          acknowledgedRevision,
+        )),
+  };
+}
+
+function isLostEditAcknowledgement(
+  current: Message,
+  submittedSession: EditSession,
+): boolean {
+  return (
+    !current.deleted &&
+    current.revision === submittedSession.revision + 1 &&
+    submittedSession.submittedDraft !== null &&
+    current.content === submittedSession.submittedDraft.trim()
+  );
+}
+
+/**
  * 進行中のDM開始。participantsはUIが「誰にDMを始めているか」を表示するための値で、
  * tokenは開始を一意に識別して、古い開始のfinallyが新しい保留を解放しないための値。
  */
@@ -2308,53 +2376,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
         .then(
           (committed) => {
             if (!committed || !request.isCurrent()) return;
-            set((current) => {
-              if (
-                committed.messageId !== submittedSession.messageId ||
-                placeKey(committed.place) !== key
-              )
-                return {};
-              const currentMessage = (current.messagesByPlace[key] ?? []).find(
-                (message) => message.messageId === committed.messageId,
-              );
-              const base = latestMessageContent(currentMessage, committed);
-              const acknowledgedRevision =
-                committed.revision ?? submittedSession.revision;
-              return {
-                messagesByPlace: {
-                  ...current.messagesByPlace,
-                  [key]: upsertMessage(
-                    current.messagesByPlace[key] ?? [],
-                    committed,
-                    "revision",
-                  ),
-                },
-                ...(isCurrentEditSession(current, submittedSession)
-                  ? current.editDraft === submittedSession.submittedDraft
-                    ? clearedEditSession()
-                    : {
-                        editBaseRevision:
-                          base?.revision ?? submittedSession.revision,
-                        editSession: {
-                          ...submittedSession,
-                          revision: base?.revision ?? submittedSession.revision,
-                          submittedDraft: null,
-                          token: ++nextEditSessionToken,
-                        },
-                        editConflict: clearConflictsThroughSuccessfulEditAck(
-                          current.editConflict,
-                          acknowledgedRevision,
-                        ),
-                        editFailure: null,
-                        editSavedWithPendingChanges: true,
-                      }
-                  : advanceUnsentEditSessionThroughAck(
-                      current,
-                      submittedSession,
-                      acknowledgedRevision,
-                    )),
-              };
-            });
+            set((current) =>
+              reduceSuccessfulEditAcknowledgement(
+                current,
+                submittedSession,
+                committed,
+              ),
+            );
           },
           (error: unknown) => {
             if (!request.isCurrent()) return;
@@ -2397,6 +2425,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 placeKey(latest.place) !== key
               )
                 return {};
+              if (isLostEditAcknowledgement(latest, submittedSession)) {
+                return reduceSuccessfulEditAcknowledgement(
+                  current,
+                  submittedSession,
+                  latest,
+                );
+              }
               const messagesByPlace = {
                 ...current.messagesByPlace,
                 [key]: upsertMessage(
