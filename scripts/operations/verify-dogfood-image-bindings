@@ -1,0 +1,158 @@
+#!/usr/bin/env node
+
+import { execFileSync } from "node:child_process";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+
+const SOURCE = "https://github.com/sumi-studio/sumi";
+const ROLES = ["api", "agent", "provisioner", "web"];
+const REPOSITORIES = Object.fromEntries(
+  ROLES.map((role) => [role, `ghcr.io/sumi-studio/sumi-${role}`]),
+);
+const DOCKERFILES = Object.fromEntries(
+  ROLES.map((role) => [role, `deploy/${role}/Dockerfile`]),
+);
+const SHA = /^[0-9a-f]{40}$/;
+const IID = /^sha256:[0-9a-f]{64}$/;
+const DOCKER_INSPECT_TIMEOUT_MS = 5_000;
+const DOCKER_INSPECT_MAX_BUFFER = 64 * 1024;
+
+function fail(message) {
+  process.stderr.write(`[sumi-dogfood-image-bindings] ERROR: ${message}\n`);
+  process.exit(1);
+}
+
+const values = new Map();
+let manifestOnly = false;
+for (let index = 2; index < process.argv.length; index += 1) {
+  const argument = process.argv[index];
+  if (argument === "--manifest-only") {
+    if (manifestOnly) fail("duplicate --manifest-only argument");
+    manifestOnly = true;
+    continue;
+  }
+  if (!["--manifest", "--commit", "--tree", "--tag"].includes(argument)) {
+    fail(`unknown argument: ${argument}`);
+  }
+  if (values.has(argument) || index + 1 >= process.argv.length) {
+    fail(`invalid ${argument} argument`);
+  }
+  values.set(argument, process.argv[++index]);
+}
+
+const manifestPath = values.get("--manifest");
+const commit = values.get("--commit");
+const tree = values.get("--tree");
+const tag = values.get("--tag");
+if (!manifestPath || !SHA.test(commit ?? "") || !SHA.test(tree ?? "") || tag !== commit) {
+  fail("--manifest and exact lowercase --commit/--tree/--tag inputs are required");
+}
+
+let metadata;
+let raw;
+let descriptor;
+try {
+  descriptor = openSync(manifestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  metadata = fstatSync(descriptor);
+  if (!metadata.isFile() || metadata.nlink !== 1) {
+    fail("manifest must be a single-link regular file");
+  }
+  if (metadata.size > 1024 * 1024) fail("manifest exceeds 1 MiB");
+  if ((metadata.mode & 0o077) !== 0) fail("manifest must not be accessible by group or other");
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+    fail("manifest must be owned by the current user");
+  }
+  raw = readFileSync(descriptor, "utf8");
+} catch (error) {
+  fail(`cannot read manifest: ${error.message}`);
+} finally {
+  if (descriptor !== undefined) closeSync(descriptor);
+}
+
+let manifest;
+try {
+  manifest = JSON.parse(raw);
+} catch {
+  fail("manifest is not one JSON document");
+}
+
+function object(value, keys, path) {
+  if (!value || Array.isArray(value) || typeof value !== "object") fail(`${path} must be an object`);
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, i) => key !== expected[i])) {
+    fail(`${path} has missing or unknown keys`);
+  }
+}
+
+object(manifest, [
+  "schema_version",
+  "status",
+  "evidence_scope",
+  "mutable_handles_authoritative",
+  "source",
+  "build",
+  "images",
+], "manifest");
+if (manifest.schema_version !== 2 || manifest.status !== "COMPLETE") fail("wrong schema or status");
+if (manifest.evidence_scope !== "IMMUTABLE_IMAGE_IDS_AND_BUILD_INPUTS_ONLY") fail("wrong evidence scope");
+if (manifest.mutable_handles_authoritative !== false) fail("mutable handles must be explicitly non-authoritative");
+
+object(manifest.source, ["repository", "revision", "tree"], "source");
+if (manifest.source.repository !== SOURCE || manifest.source.revision !== commit || manifest.source.tree !== tree) {
+  fail("source identity does not match the expected revision and tree");
+}
+object(manifest.build, ["context_tree", "requested_tag"], "build");
+if (manifest.build.context_tree !== tree || manifest.build.requested_tag !== tag) fail("build inputs do not match");
+if (!Array.isArray(manifest.images) || manifest.images.length !== ROLES.length) fail("images must contain exactly four roles");
+
+const seen = new Set();
+const seenIds = new Set();
+for (const image of manifest.images) {
+  object(image, ["role", "id", "dockerfile", "requested_reference", "labels"], "image");
+  if (!ROLES.includes(image.role) || seen.has(image.role)) fail("duplicate, missing, or unknown image role");
+  seen.add(image.role);
+  if (!IID.test(image.id)) fail(`non-canonical immutable IID for ${image.role}`);
+  if (seenIds.has(image.id)) fail(`duplicate immutable IID for ${image.role}`);
+  seenIds.add(image.id);
+  if (image.dockerfile !== DOCKERFILES[image.role]) fail(`wrong Dockerfile for ${image.role}`);
+  const reference = `${REPOSITORIES[image.role]}:${tag}`;
+  if (image.requested_reference !== reference || image.requested_reference.length > 200) {
+    fail(`wrong requested reference for ${image.role}`);
+  }
+  object(image.labels, ["org.opencontainers.image.revision", "org.opencontainers.image.source"], "labels");
+  if (image.labels["org.opencontainers.image.revision"] !== commit || image.labels["org.opencontainers.image.source"] !== SOURCE) {
+    fail(`wrong build labels for ${image.role}`);
+  }
+}
+if (seen.size !== ROLES.length || ROLES.some((role) => !seen.has(role))) fail("missing image role");
+
+if (manifestOnly) {
+  process.stdout.write("manifest schema and immutable evidence validated\n");
+  process.exit(0);
+}
+
+for (const image of manifest.images) {
+  let actual;
+  try {
+    actual = execFileSync(
+      "docker",
+      ["image", "inspect", "--format", "{{.Id}}", image.requested_reference],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_INSPECT_TIMEOUT_MS,
+        maxBuffer: DOCKER_INSPECT_MAX_BUFFER,
+      },
+    ).trim();
+  } catch {
+    fail(`requested reference is absent: ${image.requested_reference}`);
+  }
+  if (actual !== image.id) fail(`requested reference does not match immutable IID: ${image.requested_reference}`);
+}
+process.stdout.write("each requested reference matched its immutable IID when individually checked; this check is not an atomic snapshot and does not lock the Docker daemon\n");
