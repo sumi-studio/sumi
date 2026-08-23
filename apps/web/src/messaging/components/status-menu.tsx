@@ -1,5 +1,5 @@
 import { Check, ChevronRight } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import {
   type ParticipantStatus,
@@ -93,9 +93,15 @@ export function StatusMenu() {
   const statusByKey = useMessaging((state) => state.statusByKey);
   const setStatus = useMessaging((state) => state.setStatus);
   const canSetStatus = useMessaging((state) => state.capabilities.status);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState<StatusKind | null>(null);
   const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const mutationToken = useRef(0);
   const overlay = useOverlayPanel<HTMLButtonElement>({
     open,
     onOpenChange: setOpen,
@@ -115,9 +121,44 @@ export function StatusMenu() {
     else setExpanded(null);
   }, [open]);
 
-  const declare = (kind: StatusKind, expiresAt: number | null) => {
-    setStatus(kind, note.trim(), expiresAt);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: transport generation is the authority-replacement signal.
+  useEffect(() => {
+    mutationToken.current += 1;
+    setSubmitting(false);
+    setFailed(false);
     setOpen(false);
+  }, [transportGeneration]);
+
+  const declare = async (
+    kind: StatusKind,
+    expiresAt: number | null,
+    declarationNote = note.trim(),
+  ) => {
+    if (submitting) return;
+    const token = ++mutationToken.current;
+    const generation = transportGeneration;
+    setSubmitting(true);
+    try {
+      await setStatus(kind, declarationNote, expiresAt);
+      if (
+        mutationToken.current !== token ||
+        useMessaging.getState().transportGeneration !== generation
+      ) {
+        return;
+      }
+      setSubmitting(false);
+      setFailed(false);
+      setOpen(false);
+    } catch {
+      if (
+        mutationToken.current !== token ||
+        useMessaging.getState().transportGeneration !== generation
+      ) {
+        return;
+      }
+      setSubmitting(false);
+      setFailed(true);
+    }
   };
 
   return (
@@ -135,13 +176,14 @@ export function StatusMenu() {
             </span>
             <input
               value={note}
+              disabled={submitting}
               onChange={(event) => setNote(event.target.value)}
               onKeyDown={(event) => {
                 // 変換確定のEnterでメニューを閉じない。
                 if (event.key === "Enter" && !isImeComposing(event)) {
                   event.preventDefault();
                   // ひとことだけ書き替えたい人の期限を、黙って外さない。
-                  declare(
+                  void declare(
                     selfStatus?.status ?? "available",
                     selfStatus?.expiresAt ?? null,
                   );
@@ -168,6 +210,7 @@ export function StatusMenu() {
               >
                 <button
                   type="button"
+                  disabled={submitting}
                   aria-haspopup="menu"
                   aria-expanded={submenuOpen}
                   onClick={() =>
@@ -201,13 +244,14 @@ export function StatusMenu() {
                         type="button"
                         role="menuitem"
                         onClick={() =>
-                          declare(
+                          void declare(
                             kind,
                             duration.minutes === null
                               ? null
                               : Date.now() + duration.minutes * 60_000,
                           )
                         }
+                        disabled={submitting}
                         className="flex w-full items-center rounded-md px-2 py-1.5 text-left text-[12.5px] transition-colors hover:bg-accent"
                       >
                         {duration.label}
@@ -228,16 +272,28 @@ export function StatusMenu() {
                   ここで起きるのは「対応可能」と言い直すことだから。 */}
               <button
                 type="button"
+                disabled={submitting}
                 onClick={() => {
-                  setNote("");
-                  setStatus("available", "", null);
-                  setOpen(false);
+                  void declare("available", null, "");
                 }}
                 className="w-full rounded-md px-2 py-1.5 text-left text-[12.5px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
               >
                 対応可能に戻す
               </button>
             </>
+          ) : null}
+          {failed ? (
+            <p role="alert" className="px-2 py-1 text-[11px] text-rose-500">
+              ステータスを更新できませんでした。もう一度お試しください
+            </p>
+          ) : null}
+          {submitting ? (
+            <p
+              role="status"
+              className="px-2 py-1 text-[11px] text-muted-foreground"
+            >
+              更新しています…
+            </p>
           ) : null}
           <p className="px-2 pt-1 pb-0.5 text-[10px] text-muted-foreground/70">
             ステータスは自己申告。誰かが勝手に晒すことはありません

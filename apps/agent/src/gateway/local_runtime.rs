@@ -453,8 +453,8 @@ impl LocalControlHttpClient {
     /// Replay one server-reconcilable Messaging mutation after a transport or
     /// reply loss. Creation receipts cover nonce-bearing operations; the
     /// nonce-less one-to-one DM route resolves one canonical actor/participant
-    /// pair. A terminal rejection is not replayed; a 5xx cannot prove that the
-    /// server did not commit first.
+    /// pair. A terminal rejection is not replayed; a 408, 429, or 5xx cannot
+    /// prove that the server did not commit first.
     async fn post_idempotent_messaging_json<Request, Response>(
         &self,
         path: &str,
@@ -499,7 +499,10 @@ impl LocalControlHttpClient {
                         )
                     })?;
                 if !status.is_success() {
-                    let failure = if status.is_server_error() {
+                    let failure = if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                    {
                         MessagingApiFailure::indeterminate(
                             "Messaging idempotent mutation",
                             format!("server returned {status} after a possibly committed request"),
@@ -4460,6 +4463,32 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct CountedPlaceStatusFixture {
+        status: StatusCode,
+        requests: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    async fn counted_place_status_fixture(
+        State(fixture): State<CountedPlaceStatusFixture>,
+        body: Bytes,
+    ) -> Response {
+        fixture.requests.lock().unwrap().push(body.to_vec());
+        (fixture.status, Json(serde_json::json!({"error":"fixture"}))).into_response()
+    }
+
+    #[derive(Clone)]
+    struct HangingPlaceFixture {
+        attempts: Arc<StdMutex<usize>>,
+        admitted: Arc<tokio::sync::Notify>,
+    }
+
+    async fn hanging_place_fixture(State(fixture): State<HangingPlaceFixture>) -> Response {
+        *fixture.attempts.lock().unwrap() += 1;
+        fixture.admitted.notify_one();
+        std::future::pending::<Response>().await
+    }
+
+    #[derive(Clone)]
     struct SequencedMutationFixture {
         responses: Arc<StdMutex<VecDeque<(StatusCode, serde_json::Value)>>>,
         attempts: Arc<StdMutex<usize>>,
@@ -5138,6 +5167,146 @@ mod tests {
                 server.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn messaging_place_retry_classifies_408_429_and_other_4xx_exactly() {
+        for (status, expected_attempts, expected_class) in [
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (StatusCode::FORBIDDEN, 1, MessagingApiFailureClass::Terminal),
+        ] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:create-channel",
+                    post(counted_place_status_fixture),
+                )
+                .with_state(CountedPlaceStatusFixture {
+                    status,
+                    requests: requests.clone(),
+                });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error =
+                invoke_place_fixture_operation(&client, PlaceFixtureOperation::CreateChannel)
+                    .await
+                    .expect_err("fixture rejection must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                expected_class,
+                "status {status}"
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_attempts, "status {status}");
+            if expected_attempts == 2 {
+                assert_eq!(requests[0], requests[1], "status {status}");
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_place_retry_obeys_cancellation_and_authority_admission() {
+        let attempts = Arc::new(StdMutex::new(0));
+        let admitted = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-channel",
+                post(hanging_place_fixture),
+            )
+            .with_state(HangingPlaceFixture {
+                attempts: attempts.clone(),
+                admitted: admitted.clone(),
+            });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let operation = tokio::spawn(async move {
+            invoke_place_fixture_operation(&client, PlaceFixtureOperation::CreateChannel).await
+        });
+        admitted.notified().await;
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        server.abort();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-channel",
+                post(counted_place_status_fixture),
+            )
+            .with_state(CountedPlaceStatusFixture {
+                status: StatusCode::OK,
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let expected = authority();
+        let foreign = authority_with(OTHER_PAID, 7, "boot-a");
+        let mismatched = LocalControlCredential::new(
+            "control-secret",
+            foreign.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(
+            LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                mismatched,
+            )
+            .is_err()
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
     }
 
     #[test]

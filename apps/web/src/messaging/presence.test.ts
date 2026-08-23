@@ -472,6 +472,37 @@ describe("messaging presence convergence", () => {
     expect(settled?.remindAt).toBe(1_800_000);
   });
 
+  it("returns status rejection to the caller instead of reporting success", async () => {
+    const backend = new FakePresenceBackend();
+    vi.spyOn(backend, "setStatus").mockRejectedValue(
+      new Error("status permission denied"),
+    );
+    await startMessaging(backend);
+
+    await expect(
+      useMessaging.getState().setStatus("busy", "取り込み中"),
+    ).rejects.toThrow("status permission denied");
+    expect(
+      useMessaging.getState().statusByKey["human:human-1"],
+    ).toBeUndefined();
+  });
+
+  it("rejects a stale status acknowledgement after authority replacement", async () => {
+    const backend = new FakePresenceBackend();
+    let release!: (value: ParticipantStatus) => void;
+    vi.spyOn(backend, "setStatus").mockImplementation(
+      () => new Promise((resolve) => (release = resolve)),
+    );
+    await startMessaging(backend);
+
+    const pending = useMessaging.getState().setStatus("away", "旧authority");
+    bindMessagingSessionIdentity("replacement-human");
+    release(status(SELF, "away", "旧authority"));
+
+    await expect(pending).rejects.toThrow(/session changed/i);
+    expect(useMessaging.getState().statusByKey).toEqual({});
+  });
+
   it("replays a status REST acknowledgement over an older presence snapshot", async () => {
     const backend = new FakePresenceBackend();
     backend.presence = {

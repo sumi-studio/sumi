@@ -374,7 +374,11 @@ interface MessagingState {
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
-  setStatus(status: StatusKind, note: string, expiresAt?: number | null): void;
+  setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt?: number | null,
+  ): Promise<void>;
   setPlaceNotificationLevel(
     key: PlaceKey,
     level: NotificationLevel,
@@ -2882,17 +2886,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
-    setStatus(status, note, expiresAt = null) {
+    async setStatus(status, note, expiresAt = null) {
       const request = beginMessagingBackendRequest();
-      void request
-        .wait((backend) => backend.setStatus(status, note, expiresAt))
-        .then(
-          (canonical) => {
-            if (!canonical || !request.isCurrent()) return;
-            applyPresenceProjection({ type: "status", status: canonical });
-          },
-          () => undefined,
-        );
+      const canonical = await request.wait((backend) =>
+        backend.setStatus(status, note, expiresAt),
+      );
+      if (!canonical || !request.isCurrent()) {
+        throw new Error("Messaging session changed during status declaration");
+      }
+      applyPresenceProjection({ type: "status", status: canonical });
     },
 
     setPlaceNotificationLevel(key, level) {

@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ParticipantStatus } from "../model";
 import { useMessaging } from "../store";
@@ -30,6 +36,7 @@ function setSelfStatus(status: ParticipantStatus | undefined) {
 }
 
 beforeEach(() => {
+  setStatus.mockReset();
   vi.useFakeTimers();
   vi.setSystemTime(Date.parse("2026-08-18T09:00:00Z"));
 });
@@ -163,5 +170,110 @@ describe("StatusMenu", () => {
     fireEvent.keyDown(note, { key: "Enter", keyCode: 229 });
 
     expect(setStatus).not.toHaveBeenCalled();
+  });
+
+  it("成功するまで閉じず、送信中の二重申告を止めてから閉じる", async () => {
+    let resolve!: () => void;
+    setStatus.mockImplementationOnce(
+      () => new Promise<void>((done) => (resolve = done)),
+    );
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+    const choice = screen.getByRole("menuitem", { name: "1時間" });
+    fireEvent.click(choice);
+    fireEvent.click(choice);
+
+    expect(setStatus).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent("更新しています");
+    expect(screen.getByRole("dialog", { name: "ステータス" })).toBeVisible();
+
+    await act(async () => {
+      resolve();
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("申告と対応可能へのリセットの失敗を見せ、入力を保って再試行できる", async () => {
+    setStatus
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockRejectedValueOnce(new Error("response remained ambiguous"))
+      .mockResolvedValueOnce(undefined);
+    setSelfStatus({
+      participant: SELF,
+      revision: 1,
+      status: "busy",
+      note: "会議中",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "電話中" },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "ステータスを更新できませんでした",
+    );
+    expect(screen.getByRole("textbox")).toHaveValue("電話中");
+
+    fireEvent.click(screen.getByRole("button", { name: "対応可能に戻す" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("alert")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "対応可能に戻す" }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+    expect(setStatus).toHaveBeenNthCalledWith(2, "available", "", null);
+    expect(setStatus).toHaveBeenNthCalledWith(3, "available", "", null);
+  });
+
+  it("authority replacement clears pending state and fences its late failure", async () => {
+    let reject!: (error: Error) => void;
+    setStatus.mockImplementationOnce(
+      () => new Promise<void>((_resolve, fail) => (reject = fail)),
+    );
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "1時間" }));
+    expect(screen.getByRole("status")).toBeVisible();
+
+    await act(async () => {
+      useMessaging.setState((state) => ({
+        transportGeneration: state.transportGeneration + 1,
+      }));
+      reject(new Error("stale rejection"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
   });
 });

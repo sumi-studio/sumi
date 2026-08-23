@@ -119,6 +119,30 @@ describe("place creation logical-attempt nonces", () => {
     expect(laterGesture).not.toBe(first);
   });
 
+  it("reuses the unresolved duplicate nonce after exhausted reconciliation", async () => {
+    const server = signIn();
+    const duplicate = server.duplicateChannel.bind(server);
+    const nonces: string[] = [];
+    vi.spyOn(server, "duplicateChannel").mockImplementation(async (...args) => {
+      nonces.push(args[1]);
+      if (nonces.length === 1) {
+        throw new TypeError("ambiguous reconciliation exhausted");
+      }
+      return duplicate(...args);
+    });
+
+    const gesture = () =>
+      useMessaging.getState().duplicateChannel("ch-general");
+    await expect(gesture()).rejects.toThrow(
+      "ambiguous reconciliation exhausted",
+    );
+    await expect(gesture()).resolves.toMatch(/^channel:/);
+
+    expect(nonces).toHaveLength(2);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+  });
+
   it("does not carry an unresolved nonce into a replacement session", async () => {
     const firstServer = signIn();
     let staleNonce = "";

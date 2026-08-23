@@ -32,10 +32,12 @@ const realDuplicateChannel = useMessaging.getState().duplicateChannel;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 function setTwoWorkspaceState(
@@ -500,6 +502,76 @@ describe("place menu channel actions", () => {
     );
     expect(navigation.navigate).toHaveBeenCalledWith("channel:alpha-copy");
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("shows definitive and exhausted ambiguous duplicate failures and retries", async () => {
+    duplicateChannel
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockRejectedValueOnce(new Error("ambiguous reconciliation exhausted"))
+      .mockResolvedValueOnce("channel:alpha-copy");
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "複製" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "チャンネルを複製できませんでした",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+    expect(await screen.findByRole("alert")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+
+    await waitFor(() =>
+      expect(navigation.navigate).toHaveBeenCalledWith("channel:alpha-copy"),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(duplicateChannel).toHaveBeenCalledTimes(3);
+    expect(duplicateChannel).toHaveBeenNthCalledWith(1, "channel-a");
+    expect(duplicateChannel).toHaveBeenNthCalledWith(2, "channel-a");
+    expect(duplicateChannel).toHaveBeenNthCalledWith(3, "channel-a");
+  });
+
+  it("disables duplicate double-submit while in flight", async () => {
+    const pending = deferred<PlaceKey>();
+    duplicateChannel.mockReturnValueOnce(pending.promise);
+    openAlphaMenu();
+    const duplicate = screen.getByRole("menuitem", { name: "複製" });
+    fireEvent.click(duplicate);
+
+    // Re-open while the request is pending: its action is visibly disabled.
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+    const pendingAction = screen.getByRole("menuitem", { name: "複製中…" });
+    expect(pendingAction).toBeDisabled();
+    fireEvent.click(pendingAction);
+    expect(duplicateChannel).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pending.resolve("channel:alpha-copy");
+      await pending.promise;
+    });
+    expect(navigation.navigate).toHaveBeenCalledWith("channel:alpha-copy");
+  });
+
+  it("clears duplicate state on authority replacement and fences stale rejection", async () => {
+    const pending = deferred<PlaceKey>();
+    duplicateChannel.mockReturnValueOnce(pending.promise);
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "複製" }));
+
+    useMessaging.setState((state) => ({
+      transportGeneration: state.transportGeneration + 1,
+    }));
+    await act(async () => {
+      pending.reject(new Error("stale failure"));
+      await pending.promise.catch(() => undefined);
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(navigation.navigate).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+    expect(screen.getByRole("menuitem", { name: "複製" })).toBeEnabled();
   });
 
   it("offers no channel-only actions on a direct message", () => {

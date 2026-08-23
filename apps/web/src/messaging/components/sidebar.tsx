@@ -66,6 +66,7 @@ function PlaceRow({
   onEditChannel,
   onDuplicateChannel,
   onCreateChannel,
+  duplicateState,
 }: {
   placeKey: PlaceKey;
   /** channelでなければnull。メニューからchannel専用の項目が消える。 */
@@ -83,6 +84,7 @@ function PlaceRow({
   onEditChannel: (channelId: string) => void;
   onDuplicateChannel: (channelId: string) => void;
   onCreateChannel: () => void;
+  duplicateState: "idle" | "pending" | "failed";
 }) {
   const canConfigureNotifications = useMessaging(
     (state) => state.capabilities.notifications,
@@ -145,6 +147,7 @@ function PlaceRow({
           onEditChannel={onEditChannel}
           onDuplicateChannel={onDuplicateChannel}
           onCreateChannel={onCreateChannel}
+          duplicatePending={duplicateState === "pending"}
         />
       ) : null}
     </div>
@@ -677,6 +680,9 @@ export function Sidebar({
   );
   const selfKey = useMessaging((state) => state.selfKey);
   const duplicateChannel = useMessaging((state) => state.duplicateChannel);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const placeNavigate = usePlaceNavigate();
   const [openDialog, setOpenDialog] = useState<
     | { kind: "channel"; workspaceId: string }
@@ -684,6 +690,13 @@ export function Sidebar({
     | { kind: "dm" }
     | null
   >(null);
+  const [duplicateMutation, setDuplicateMutation] = useState<{
+    channelId: string;
+    failed: boolean;
+    state: "pending" | "failed";
+    token: number;
+  } | null>(null);
+  const nextDuplicateToken = useRef(0);
 
   const activePlace = selectedPlaceKey ? parsePlaceKey(selectedPlaceKey) : null;
   const activeChannel =
@@ -714,6 +727,12 @@ export function Sidebar({
     }
   }, [openDialog, selectedWorkspaceId]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: transport generation is the authority-replacement signal.
+  useEffect(() => {
+    nextDuplicateToken.current += 1;
+    setDuplicateMutation(null);
+  }, [transportGeneration]);
+
   const openCreateChannel = () => {
     if (!activeWorkspace) return;
     setOpenDialog({
@@ -724,13 +743,49 @@ export function Sidebar({
   // 複製はダイアログを挟まない。名前はサーバーが決め（「〜 のコピー」）、
   // できたものへそのまま移る——中身は空なので、直したければ開いた先で直せる。
   const runDuplicate = (channelId: string) => {
+    if (
+      duplicateMutation?.channelId === channelId &&
+      duplicateMutation.state === "pending"
+    ) {
+      return;
+    }
     const currentIdentity = getMessagingSessionIdentity();
+    const generation = transportGeneration;
+    const token = ++nextDuplicateToken.current;
+    setDuplicateMutation({
+      channelId,
+      failed:
+        duplicateMutation?.channelId === channelId && duplicateMutation.failed,
+      state: "pending",
+      token,
+    });
     void duplicateChannel(channelId).then(
       (key) => {
-        if (getMessagingSessionIdentity() !== currentIdentity) return;
+        if (
+          getMessagingSessionIdentity() !== currentIdentity ||
+          useMessaging.getState().transportGeneration !== generation ||
+          nextDuplicateToken.current !== token
+        ) {
+          return;
+        }
+        setDuplicateMutation(null);
         placeNavigate(key);
       },
-      () => undefined,
+      () => {
+        if (
+          getMessagingSessionIdentity() !== currentIdentity ||
+          useMessaging.getState().transportGeneration !== generation ||
+          nextDuplicateToken.current !== token
+        ) {
+          return;
+        }
+        setDuplicateMutation({
+          channelId,
+          failed: true,
+          state: "failed",
+          token,
+        });
+      },
     );
   };
 
@@ -781,7 +836,33 @@ export function Sidebar({
                 unread={unread}
                 mentions={mentions}
                 {...menuActions}
+                duplicateState={
+                  duplicateMutation?.channelId === channel.channelId
+                    ? duplicateMutation.state
+                    : "idle"
+                }
               />
+              {duplicateMutation?.channelId === channel.channelId &&
+              duplicateMutation.failed ? (
+                <div
+                  role="alert"
+                  className="mx-2 mb-1 flex items-center gap-1.5 text-[11px] text-rose-500"
+                >
+                  <span className="min-w-0 flex-1">
+                    チャンネルを複製できませんでした
+                  </span>
+                  <button
+                    type="button"
+                    disabled={duplicateMutation.state === "pending"}
+                    onClick={() => runDuplicate(channel.channelId)}
+                    className="shrink-0 rounded px-1 py-0.5 font-medium hover:bg-accent disabled:opacity-50"
+                  >
+                    {duplicateMutation.state === "pending"
+                      ? "再試行中…"
+                      : "再試行"}
+                  </button>
+                </div>
+              ) : null}
               {channel.voice ? (
                 <>
                   <VoiceChannelMembers placeKey={key} />
@@ -847,6 +928,7 @@ export function Sidebar({
               unread={unread}
               mentions={unread}
               {...menuActions}
+              duplicateState="idle"
             />
           );
         })}

@@ -42,6 +42,7 @@ export function PlaceContextMenu({
   onEditChannel,
   onDuplicateChannel,
   onCreateChannel,
+  duplicatePending = false,
 }: {
   placeKey: PlaceKey;
   /** channel以外（DM・グループDM）ではnull。channel専用の項目が消える。 */
@@ -51,6 +52,7 @@ export function PlaceContextMenu({
   onEditChannel: (channelId: string) => void;
   onDuplicateChannel: (channelId: string) => void;
   onCreateChannel: () => void;
+  duplicatePending?: boolean;
 }) {
   const canConfigureNotifications = useMessaging(
     (state) => state.capabilities.notifications,
@@ -118,6 +120,7 @@ export function PlaceContextMenu({
               <button
                 type="button"
                 role="menuitem"
+                disabled={duplicatePending}
                 className={ITEM_CLASS}
                 onClick={() => {
                   close();
@@ -125,7 +128,7 @@ export function PlaceContextMenu({
                 }}
               >
                 <Copy className="size-3.5 shrink-0 text-muted-foreground" />
-                複製
+                {duplicatePending ? "複製中…" : "複製"}
               </button>
               <button
                 type="button"
