@@ -23,6 +23,10 @@ const sourceScript = join(
   sourceRoot,
   "scripts/operations/build-dogfood-images",
 );
+const sourceValidator = join(
+  sourceRoot,
+  "scripts/operations/verify-dogfood-image-bindings",
+);
 
 async function git(cwd, args) {
   return execFileAsync("git", args, { cwd });
@@ -34,13 +38,21 @@ async function createFixture() {
   const state = join(container, "state");
   const bin = join(container, "bin");
   await mkdir(join(root, "scripts/operations"), { recursive: true });
-  await mkdir(state);
+  await mkdir(state, { mode: 0o700 });
   await mkdir(bin);
   await copyFile(
     sourceScript,
     join(root, "scripts/operations/build-dogfood-images"),
   );
+  await copyFile(
+    sourceValidator,
+    join(root, "scripts/operations/verify-dogfood-image-bindings"),
+  );
   await chmod(join(root, "scripts/operations/build-dogfood-images"), 0o755);
+  await chmod(
+    join(root, "scripts/operations/verify-dogfood-image-bindings"),
+    0o755,
+  );
   for (const role of ["api", "agent", "provisioner", "web"]) {
     await mkdir(join(root, "deploy", role), { recursive: true });
     await writeFile(join(root, "deploy", role, "Dockerfile"), "FROM scratch\n");
@@ -89,6 +101,9 @@ if [[ "\${1:-}" == build ]]; then
   if [[ "\${FAKE_MIDRUN_EDIT:-}" == 1 && "$role" == api ]]; then
     printf 'edited during build\\n' > "\${LIVE_REPO_ROOT}/tracked.txt"
   fi
+  if [[ "\${FAKE_RETAG_AFTER_API:-}" == 1 && "$role" == api ]]; then
+    : > "\${FAKE_RETAG_MARKER}"
+  fi
   if [[ -n "\${FAKE_FAIL_ROLE:-}" && "$dockerfile" == "deploy/\${FAKE_FAIL_ROLE}/Dockerfile" ]]; then
     exit 42
   fi
@@ -104,8 +119,13 @@ fi
 if [[ "\${1:-}" == image && "\${2:-}" == inspect && "$#" -eq 3 ]]; then
   repository="\${3%:*}"
   role="\${repository##*-}"
-  [[ "\${FAKE_EXISTING_ROLE:-}" == "$role" ]]
-  exit
+  if [[ "\${FAKE_EXISTING_ROLE:-}" == "$role" ]]; then exit 0; fi
+  if [[ "\${FAKE_APPEAR_BEFORE_ROLE:-}" == "$role" ]]; then
+    marker="\${FAKE_STATE_DIR}/appeared-$role"
+    if [[ -e "$marker" ]]; then exit 0; fi
+    : > "$marker"
+  fi
+  exit 1
 fi
 [[ "\${1:-}" == image && "\${2:-}" == inspect && "\${3:-}" == --format ]]
 format="$4"
@@ -114,7 +134,7 @@ if [[ "$format" == '{{.Id}}' ]]; then
   repository="\${subject%:*}"
   role="\${repository##*-}"
   if [[ "\${FAKE_REMOVE_TAG_ROLE:-}" == "$role" ]]; then exit 1; fi
-  if [[ "\${FAKE_RETAG_ROLE:-}" == "$role" ]]; then printf 'sha256:%064s\\n' '' | tr ' ' e; else role_id "$role"; printf '\\n'; fi
+  if [[ "\${FAKE_RETAG_ROLE:-}" == "$role" || ( "\${FAKE_RETAG_AFTER_API:-}" == 1 && "$role" == api && -e "\${FAKE_RETAG_MARKER}" ) ]]; then printf 'sha256:%064s\\n' '' | tr ' ' e; else role_id "$role"; printf '\\n'; fi
   exit 0
 fi
 [[ "$format" == '{{json .}}' ]]
@@ -151,11 +171,16 @@ if [[ "\${FAKE_MIXED_INSPECT_ROLE:-}" == "$role" ]]; then printf '%s\\n%s\\n' "$
   await writeFile(join(root, "credentials.env"), "secret\n");
   const { stdout } = await git(root, ["rev-parse", "HEAD"]);
   const sha = stdout.trim();
+  const { stdout: treeStdout } = await git(root, [
+    "rev-parse",
+    `${sha}^{tree}`,
+  ]);
   return {
     container,
     root,
     state,
     sha,
+    tree: treeStdout.trim(),
     script: join(root, "scripts/operations/build-dogfood-images"),
     manifest: join(state, "manifest.json"),
     log: join(state, "docker.log"),
@@ -165,6 +190,8 @@ if [[ "\${FAKE_MIXED_INSPECT_ROLE:-}" == "$role" ]]; then printf '%s\\n%s\\n' "$
       FAKE_DOCKER_LOG: join(state, "docker.log"),
       FAKE_CONTEXT_LOG: join(state, "contexts.log"),
       LIVE_REPO_ROOT: root,
+      FAKE_RETAG_MARKER: join(state, "retagged-after-api"),
+      FAKE_STATE_DIR: state,
       EXPECTED_SHA: sha,
     },
   };
@@ -190,6 +217,11 @@ async function refreshFixtureCommit(fixture, message) {
   await git(fixture.root, ["commit", "--quiet", "-m", message]);
   const { stdout } = await git(fixture.root, ["rev-parse", "HEAD"]);
   fixture.sha = stdout.trim();
+  const { stdout: treeStdout } = await git(fixture.root, [
+    "rev-parse",
+    `${fixture.sha}^{tree}`,
+  ]);
+  fixture.tree = treeStdout.trim();
   fixture.env.EXPECTED_SHA = fixture.sha;
 }
 
@@ -206,7 +238,7 @@ test("dry-run constructs four exact builds without invoking Docker or writing a 
   await withFixture(async (fixture) => {
     const result = await run(fixture, ["--dry-run"]);
     const expected = [
-      `DRY-RUN: export Git tree ${fixture.sha} to /PRIVATE/EXACT-CONTEXT`,
+      `DRY-RUN: export raw Git commit ${fixture.sha} tree ${fixture.tree} to /PRIVATE/EXACT-CONTEXT`,
       ...["api", "agent", "provisioner", "web"].map(
         (role) =>
           `DRY-RUN: docker build --iidfile /PRIVATE/IID-${role} --file /PRIVATE/EXACT-CONTEXT/deploy/${role}/Dockerfile --label org.opencontainers.image.revision=${fixture.sha} --label org.opencontainers.image.source=https://github.com/sumi-studio/sumi --tag ghcr.io/sumi-studio/sumi-${role}:${fixture.sha} /PRIVATE/EXACT-CONTEXT`,
@@ -291,6 +323,16 @@ test("an existing local exact-SHA tag is never reassigned", async () => {
   });
 });
 
+test("a tag appearing after initial preflight is refused immediately before assignment", async () => {
+  await withFixture(async (fixture) => {
+    await assert.rejects(
+      run(fixture, [], { FAKE_APPEAR_BEFORE_ROLE: "api" }),
+      /requested image tag appeared before assignment/,
+    );
+    await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
+  });
+});
+
 test("all builds use one exported tree and exclude live edits and ignored secrets", async () => {
   await withFixture(async (fixture) => {
     await run(fixture, [], {
@@ -344,6 +386,16 @@ test("dirty or incorrectly rooted source trees are refused", async (t) => {
   });
 });
 
+test("evidence parent must be owner-only", async () => {
+  await withFixture(async (fixture) => {
+    await chmod(fixture.state, 0o755);
+    await assert.rejects(
+      run(fixture, ["--dry-run"]),
+      /parent must be owner-only/,
+    );
+  });
+});
+
 test("submodule and Git LFS trees fail closed before export", async (t) => {
   await t.test("submodule", async () => {
     await withFixture(async (fixture) => {
@@ -379,26 +431,21 @@ test("submodule and Git LFS trees fail closed before export", async (t) => {
       await refreshFixtureCommit(fixture, "add lfs policy");
       await assert.rejects(
         run(fixture, ["--dry-run"]),
-        /contains Git LFS paths/,
+        /contains filtered paths.*Git LFS/,
       );
       await assert.rejects(stat(fixture.log), { code: "ENOENT" });
     });
   });
 });
 
-test("wrong image labels, digests, and mixed RepoTags fail closed", async (t) => {
-  for (const [name, env, message] of [
-    ["label", { FAKE_BAD_LABEL_ROLE: "agent" }, /wrong revision label/],
-    ["digest", { FAKE_BAD_DIGEST_ROLE: "web" }, /unexpected RepoDigest/],
-    ["RepoTags", { FAKE_MIXED_TAG_ROLE: "api" }, /floating, or mixed RepoTags/],
-  ]) {
-    await t.test(name, async () => {
-      await withFixture(async (fixture) => {
-        await assert.rejects(run(fixture, [], env), message);
-        await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
-      });
-    });
-  }
+test("wrong immutable image labels fail closed", async () => {
+  await withFixture(async (fixture) => {
+    await assert.rejects(
+      run(fixture, [], { FAKE_BAD_LABEL_ROLE: "agent" }),
+      /wrong revision label/,
+    );
+    await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
+  });
 });
 
 test("mixed immutable-ID inspection responses and iidfile attacks fail closed", async (t) => {
@@ -428,18 +475,33 @@ test("mixed immutable-ID inspection responses and iidfile attacks fail closed", 
   }
 });
 
-test("tag retag and removal before COMPLETE handoff are rejected", async (t) => {
-  for (const [name, env, message] of [
-    ["retag", { FAKE_RETAG_ROLE: "provisioner" }, /retagged before COMPLETE/],
-    ["removal", { FAKE_REMOVE_TAG_ROLE: "web" }, /disappeared before COMPLETE/],
-  ]) {
-    await t.test(name, async () => {
-      await withFixture(async (fixture) => {
-        await assert.rejects(run(fixture, [], env), message);
-        await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
-      });
-    });
-  }
+test("retag after API build cannot falsify immutable COMPLETE evidence", async () => {
+  await withFixture(async (fixture) => {
+    await run(fixture, [], { FAKE_RETAG_AFTER_API: "1" });
+    const manifest = JSON.parse(await readFile(fixture.manifest, "utf8"));
+    assert.equal(manifest.status, "COMPLETE");
+    assert.equal(manifest.mutable_handles_authoritative, false);
+    await assert.rejects(
+      execFileAsync(
+        join(fixture.root, "scripts/operations/verify-dogfood-image-bindings"),
+        [
+          "--manifest",
+          fixture.manifest,
+          "--commit",
+          fixture.sha,
+          "--tree",
+          fixture.tree,
+          "--tag",
+          fixture.sha,
+        ],
+        {
+          cwd: fixture.root,
+          env: { ...fixture.env, FAKE_RETAG_AFTER_API: "1" },
+        },
+      ),
+      /does not match immutable IID/,
+    );
+  });
 });
 
 test("shell metacharacters in a tag cannot execute", async () => {
@@ -464,6 +526,154 @@ test("shell metacharacters in a tag cannot execute", async () => {
   });
 });
 
+test("Git replacement and inherited Git injection cannot relabel alternate bytes", async () => {
+  await withFixture(async (fixture) => {
+    const accepted = fixture.sha;
+    const acceptedTree = fixture.tree;
+    await writeFile(join(fixture.root, "tracked.txt"), "alternate\n");
+    await git(fixture.root, ["add", "tracked.txt"]);
+    await git(fixture.root, ["commit", "--quiet", "-m", "alternate tree"]);
+    const { stdout } = await git(fixture.root, ["rev-parse", "HEAD"]);
+    const alternate = stdout.trim();
+    await git(fixture.root, ["replace", accepted, alternate]);
+    await git(fixture.root, ["checkout", "--detach", "--force", accepted]);
+    assert.equal(
+      await readFile(join(fixture.root, "tracked.txt"), "utf8"),
+      "alternate\n",
+    );
+    await assert.rejects(run(fixture, ["--dry-run"]), /worktree is not clean/);
+    await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
+
+    await execFileAsync("git", ["checkout", "--detach", "--force", accepted], {
+      cwd: fixture.root,
+      env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+    });
+    assert.equal(
+      await readFile(join(fixture.root, "tracked.txt"), "utf8"),
+      "pinned\n",
+    );
+    await run(fixture, [], {
+      GIT_DIR: join(fixture.state, "spoof.git"),
+      GIT_WORK_TREE: fixture.state,
+      GIT_INDEX_FILE: join(fixture.state, "spoof.index"),
+      GIT_OBJECT_DIRECTORY: join(fixture.state, "spoof.objects"),
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: join(
+        fixture.state,
+        "alternate.objects",
+      ),
+      GIT_GRAFT_FILE: join(fixture.state, "spoof.grafts"),
+      GIT_NAMESPACE: "spoof",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.worktree",
+      GIT_CONFIG_VALUE_0: fixture.state,
+      GIT_CONFIG_SYSTEM: join(fixture.state, "spoof.system.config"),
+      GIT_CONFIG_GLOBAL: join(fixture.state, "spoof.global.config"),
+    });
+    const manifest = JSON.parse(await readFile(fixture.manifest, "utf8"));
+    assert.equal(manifest.source.revision, accepted);
+    assert.equal(manifest.source.tree, acceptedTree);
+  });
+});
+
+test("closed manifest validation rejects extras, duplicate roles, and malformed IIDs", async (t) => {
+  await withFixture(async (fixture) => {
+    await run(fixture);
+    const original = JSON.parse(await readFile(fixture.manifest, "utf8"));
+    const validator = join(
+      fixture.root,
+      "scripts/operations/verify-dogfood-image-bindings",
+    );
+    for (const [name, mutate, pattern] of [
+      [
+        "unknown key",
+        (value) => {
+          value.extra = true;
+        },
+        /missing or unknown keys/,
+      ],
+      [
+        "duplicate role",
+        (value) => {
+          value.images[1].role = "api";
+        },
+        /duplicate, missing, or unknown/,
+      ],
+      [
+        "missing role",
+        (value) => {
+          value.images.pop();
+        },
+        /exactly four roles/,
+      ],
+      [
+        "extra role",
+        (value) => {
+          value.images.push({ ...value.images[0], role: "worker" });
+        },
+        /exactly four roles/,
+      ],
+      [
+        "malformed IID",
+        (value) => {
+          value.images[2].id = "sha256:abc";
+        },
+        /non-canonical immutable IID/,
+      ],
+      [
+        "wrong tree",
+        (value) => {
+          value.source.tree = "f".repeat(40);
+        },
+        /source identity/,
+      ],
+    ]) {
+      await t.test(name, async () => {
+        const candidate = structuredClone(original);
+        mutate(candidate);
+        const path = join(fixture.state, `${name.replaceAll(" ", "-")}.json`);
+        await writeFile(path, `${JSON.stringify(candidate)}\n`, {
+          mode: 0o600,
+        });
+        await assert.rejects(
+          execFileAsync(
+            validator,
+            [
+              "--manifest",
+              path,
+              "--commit",
+              fixture.sha,
+              "--tree",
+              fixture.tree,
+              "--tag",
+              fixture.sha,
+              "--manifest-only",
+            ],
+            { cwd: fixture.root, env: fixture.env },
+          ),
+          pattern,
+        );
+      });
+    }
+  });
+});
+
+test("runbook pins the accepted script-bearing SHA and real-Firebase topology inputs", async () => {
+  const runbook = await readFile(
+    join(sourceRoot, "docs/operations/dogfood-cutover.md"),
+    "utf8",
+  );
+  assert.match(
+    runbook,
+    /`S` must itself contain the build and validation scripts/,
+  );
+  assert.match(runbook, /SUMI_LOCAL_COMPOSE_PROJECT=sumi-dev/);
+  assert.match(runbook, /SUMI_LOCAL_ENV_FILE=\/absolute\/path/);
+  assert.match(runbook, /SUMI_LOCAL_RUNTIME_ENV_FILE=\/absolute\/path/);
+  assert.match(runbook, /SUMI_LOCAL_COMPOSE_OVERRIDE_FILE=/);
+  assert.ok(runbook.match(/compose-stack --firebase real/g)?.length >= 4);
+  assert.doesNotMatch(runbook, /manifest\.images\.length !== 4/);
+});
+
 test("successful inspection writes the exact complete mode-safe manifest", async () => {
   await withFixture(async (fixture) => {
     await run(fixture);
@@ -476,20 +686,21 @@ test("successful inspection writes the exact complete mode-safe manifest", async
     };
     const hexes = { api: "a", agent: "b", provisioner: "c", web: "d" };
     assert.deepEqual(manifest, {
-      schema_version: 1,
+      schema_version: 2,
       status: "COMPLETE",
+      evidence_scope: "IMMUTABLE_IMAGE_IDS_AND_BUILD_INPUTS_ONLY",
+      mutable_handles_authoritative: false,
       source: {
         repository: "https://github.com/sumi-studio/sumi",
         revision: fixture.sha,
+        tree: fixture.tree,
       },
-      tag: fixture.sha,
-      images: ["api", "agent", "provisioner", "web"].map((name) => ({
-        name,
-        reference: `${repositories[name]}:${fixture.sha}`,
-        id: `sha256:${hexes[name].repeat(64)}`,
-        repo_digests: [
-          `${repositories[name]}@sha256:${hexes[name].repeat(64)}`,
-        ],
+      build: { context_tree: fixture.tree, requested_tag: fixture.sha },
+      images: ["api", "agent", "provisioner", "web"].map((role) => ({
+        role,
+        id: `sha256:${hexes[role].repeat(64)}`,
+        dockerfile: `deploy/${role}/Dockerfile`,
+        requested_reference: `${repositories[role]}:${fixture.sha}`,
         labels: {
           "org.opencontainers.image.revision": fixture.sha,
           "org.opencontainers.image.source":
@@ -499,5 +710,21 @@ test("successful inspection writes the exact complete mode-safe manifest", async
     });
     assert.equal((await stat(fixture.manifest)).mode & 0o777, 0o600);
     assert.equal((await stat(fixture.manifest)).nlink, 1);
+    const validated = await execFileAsync(
+      join(fixture.root, "scripts/operations/verify-dogfood-image-bindings"),
+      [
+        "--manifest",
+        fixture.manifest,
+        "--commit",
+        fixture.sha,
+        "--tree",
+        fixture.tree,
+        "--tag",
+        fixture.sha,
+        "--manifest-only",
+      ],
+      { cwd: fixture.root, env: fixture.env },
+    );
+    assert.match(validated.stdout, /immutable evidence validated/);
   });
 });

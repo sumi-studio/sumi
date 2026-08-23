@@ -1,9 +1,9 @@
 # Dogfood image build and cutover
 
 This runbook fixes the image identity used by a dogfood cutover. The build
-step creates exactly four local images from one clean Git commit and writes an
-attestation manifest. It does not push, start, stop, migrate, restart, or run
-Compose.
+step creates exactly four local images from one clean raw Git commit/tree and
+writes an immutable-build evidence manifest. It does not push, start, stop,
+migrate, restart, or run Compose.
 
 Database backup/restore rehearsal and workload quiescence are separate release
 gates. A `COMPLETE` image manifest does not satisfy either gate and must not be
@@ -11,38 +11,50 @@ used as evidence that they passed.
 
 ## Build the four exact-SHA images
 
-Use a clean checkout at the exact accepted `main` commit. The tag is the full
+First merge this operations slice. Then choose the final accepted `main` commit
+`S`; `S` must itself contain the build and validation scripts below. An older
+accepted commit that predates these scripts cannot be built by checking out
+that commit and invoking a script only present in a later worktree. Use a clean
+checkout at exact `S`. The requested tag is the full
 lowercase commit SHA, not a branch, date, short SHA, release alias, or `latest`.
 
 ```sh
-git switch main
-git pull --ff-only
-SHA="$(git rev-parse HEAD)"
+S='REPLACE_WITH_FINAL_40_HEX_MAIN_SHA'
+git switch --detach "${S}"
+SHA="$(env -i PATH="${PATH}" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+  GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+  git rev-parse --verify 'HEAD^{commit}')"
 test "${#SHA}" -eq 40
-test -z "$(git status --porcelain)"
-mkdir -p .dogfood-manifests
+test "${SHA}" = "${S}"
+EVIDENCE_DIR=/absolute/path/to/owner-only/dogfood-manifests
+install -d -m 0700 "${EVIDENCE_DIR}"
 
 scripts/operations/build-dogfood-images \
   --commit "${SHA}" \
   --tag "${SHA}" \
-  --manifest ".dogfood-manifests/images-${SHA}.json" \
+  --manifest "${EVIDENCE_DIR}/images-${SHA}.json" \
   --dry-run
 
 scripts/operations/build-dogfood-images \
   --commit "${SHA}" \
   --tag "${SHA}" \
-  --manifest ".dogfood-manifests/images-${SHA}.json"
+  --manifest "${EVIDENCE_DIR}/images-${SHA}.json"
 ```
 
 The manifest is published atomically with mode `0600` only after all four
-builds and inspections succeed. It records image IDs, available RepoDigests,
-and the OCI source/revision labels. A local image commonly has no RepoDigest
-until it has been pushed; an empty `repo_digests` array is explicit, not a
-registry attestation. On any partial build or inspection mismatch there is no
-`COMPLETE` manifest.
+builds and immutable-IID inspections succeed. `COMPLETE` attests only the four
+captured immutable image IDs and the exact raw source commit, tree,
+Dockerfiles, requested tag/reference inputs, and OCI source/revision labels.
+Requested tags are explicitly non-authoritative mutable handles; `COMPLETE`
+does not assert that any tag currently points at a captured ID. On any partial
+build or immutable inspection mismatch there is no `COMPLETE` manifest.
 
-The script exports the pinned commit into one owner-only temporary context,
-re-hashes that exported tree, and uses the same context for all four builds.
+Every Git revision, tree, status, and export operation runs with an empty
+inherited environment, replacement objects disabled, system/global config
+disabled, and only script-controlled Git directory/index/worktree values. The
+script resolves and carries the raw expected tree ID separately, exports it
+into one owner-only temporary context, re-hashes that exported tree, and uses
+the same context for all four builds.
 Ignored and untracked files—including local credentials, `.tfvars`, and native
 build products—never enter the context, and an edit to the live checkout after
 export cannot change a later image. The context is removed on success and on
@@ -53,9 +65,12 @@ of proving the intended bytes.
 
 Each build writes an isolated Docker `--iidfile`. Inspection addresses that
 canonical image ID, not its mutable tag, and consumes one bounded JSON evidence
-object. Immediately before publishing `COMPLETE`, the script resolves every
-intended tag again and requires it to equal the captured ID. A missing or
-retagged reference leaves no completion manifest.
+object. A concurrent retag therefore cannot make immutable build evidence
+false. The script refuses a requested reference that already exists and
+rechecks immediately before each `docker build --tag` assignment. The full-SHA
+namespace is intended to be new. Docker provides no atomic "assign only if
+absent" primitive here, so an unrelated daemon actor can still win the narrow
+check/assignment race; do not treat this script as a daemon lock.
 
 The current Dockerfiles contain upstream image/package selectors that are not
 content-digest pinned. The source SHA and labels therefore prove which Sumi
@@ -105,35 +120,42 @@ configuration file in place even when pulls are disabled; that file mount is a
 separate provisioner boundary.
 
 Local Docker tags remain mutable after the manifest is written. Immediately
-before the reviewed cutover, the operator must re-resolve all four references
-and compare their image IDs with the manifest. Treat any elapsed handoff where
-that comparison was not performed, or any mismatch, as a failed image gate;
-the manifest is point-in-time evidence, not a lock on the Docker daemon.
+before the reviewed cutover, use the closed validator to require the exact
+schema/version/revision/tree, exactly one of each known role, canonical IIDs,
+the exact requested repositories/tags/Dockerfiles, no unknown keys, and current
+reference-to-IID equality. A successful result is only a time-of-check fact; it
+does not lock Docker or exclude unrelated daemon actors. Minimize the interval
+between this check and use, and fail closed on any intervening daemon activity.
 
 ```sh
-MANIFEST=".dogfood-manifests/images-${SHA}.json"
-node - "${MANIFEST}" <<'NODE'
-const fs = require("node:fs");
-const { execFileSync } = require("node:child_process");
-const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-if (manifest.status !== "COMPLETE" || manifest.images.length !== 4) process.exit(1);
-for (const image of manifest.images) {
-  const actual = execFileSync(
-    "docker",
-    ["image", "inspect", "--format", "{{.Id}}", image.reference],
-    { encoding: "utf8" },
-  ).trim();
-  if (actual !== image.id) throw new Error(`local tag mismatch: ${image.reference}`);
-}
-NODE
+MANIFEST="${EVIDENCE_DIR}/images-${SHA}.json"
+TREE="$(env -i PATH="${PATH}" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+  GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+  git rev-parse --verify "${SHA}^{tree}")"
+scripts/operations/verify-dogfood-image-bindings \
+  --manifest "${MANIFEST}" --commit "${SHA}" --tree "${TREE}" --tag "${SHA}"
 ```
 
 ```sh
 export SUMI_AGENT_IMAGE_PULL_POLICY=never
 export SUMI_DOCKER_CONFIG_FILE=/absolute/path/to/owner-only/config.json
+export SUMI_LOCAL_COMPOSE_PROJECT=sumi-dev
+export SUMI_LOCAL_ENV_FILE=/absolute/path/to/deploy/local/.env.local
+export SUMI_LOCAL_RUNTIME_ENV_FILE=/absolute/path/to/deploy/local/.env.runtime
+export SUMI_LOCAL_COMPOSE_OVERRIDE_FILE=
+readonly SUMI_LOCAL_COMPOSE_PROJECT SUMI_LOCAL_ENV_FILE \
+  SUMI_LOCAL_RUNTIME_ENV_FILE SUMI_LOCAL_COMPOSE_OVERRIDE_FILE
 
-scripts/dev/compose-stack config
-scripts/dev/compose-stack up --pull never
+umask 077
+scripts/dev/compose-stack --firebase real config > "${EVIDENCE_DIR}/compose-${SHA}.yaml"
+sha256sum "${SUMI_LOCAL_ENV_FILE}" "${SUMI_LOCAL_RUNTIME_ENV_FILE}" \
+  > "${EVIDENCE_DIR}/compose-inputs-${SHA}.sha256"
+
+# Immediately before use: fail if config inputs or mutable tag bindings changed.
+sha256sum --check "${EVIDENCE_DIR}/compose-inputs-${SHA}.sha256"
+scripts/operations/verify-dogfood-image-bindings \
+  --manifest "${MANIFEST}" --commit "${SHA}" --tree "${TREE}" --tag "${SHA}"
+scripts/dev/compose-stack --firebase real up --pull never
 ```
 
 `--pull never` governs the control-plane Compose invocation. The explicit
@@ -175,9 +197,19 @@ and select pulls explicitly:
 ```sh
 export SUMI_AGENT_IMAGE_PULL_POLICY=always
 export SUMI_DOCKER_CONFIG_FILE=/absolute/path/to/owner-only/config.json
+export SUMI_LOCAL_COMPOSE_PROJECT=sumi-dev
+export SUMI_LOCAL_ENV_FILE=/absolute/path/to/deploy/local/.env.local
+export SUMI_LOCAL_RUNTIME_ENV_FILE=/absolute/path/to/deploy/local/.env.runtime
+export SUMI_LOCAL_COMPOSE_OVERRIDE_FILE=
+readonly SUMI_LOCAL_COMPOSE_PROJECT SUMI_LOCAL_ENV_FILE \
+  SUMI_LOCAL_RUNTIME_ENV_FILE SUMI_LOCAL_COMPOSE_OVERRIDE_FILE
 
-scripts/dev/compose-stack config
-scripts/dev/compose-stack up --pull always
+umask 077
+scripts/dev/compose-stack --firebase real config > "${EVIDENCE_DIR}/compose-${SHA}.yaml"
+sha256sum "${SUMI_LOCAL_ENV_FILE}" "${SUMI_LOCAL_RUNTIME_ENV_FILE}" \
+  > "${EVIDENCE_DIR}/compose-inputs-${SHA}.sha256"
+sha256sum --check "${EVIDENCE_DIR}/compose-inputs-${SHA}.sha256"
+scripts/dev/compose-stack --firebase real up --pull always
 ```
 
 If any pulled image ID, RepoDigest, source label, revision label, or tag differs

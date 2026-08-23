@@ -6,6 +6,7 @@ readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 readonly SOURCE_URL="https://github.com/sumi-studio/sumi"
 readonly REVISION_LABEL="org.opencontainers.image.revision"
 readonly SOURCE_LABEL="org.opencontainers.image.source"
+readonly MANIFEST_VALIDATOR="${SCRIPT_DIR}/verify-dogfood-image-bindings"
 
 COMMIT=
 TAG=
@@ -14,6 +15,9 @@ DRY_RUN=false
 TEMP_MANIFEST=
 PRIVATE_BUILD_ROOT=
 BUILD_CONTEXT=
+GIT_DIRECTORY=
+ACCEPTED_COMMIT=
+EXPECTED_TREE=
 
 declare -a ROLES=(api agent provisioner web)
 declare -A REPOSITORIES=(
@@ -29,7 +33,19 @@ declare -A DOCKERFILES=(
   [web]="deploy/web/Dockerfile"
 )
 declare -A IMAGE_IDS=()
-declare -A IMAGE_DIGEST_JSON=()
+
+git_clean() {
+  env -i PATH="${PATH}" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 git -C "${REPOSITORY_ROOT}" "$@"
+}
+
+git_with_index() {
+  local index_file="$1" work_tree="$2"
+  shift 2
+  env -i PATH="${PATH}" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_DIR="${GIT_DIRECTORY}" GIT_INDEX_FILE="${index_file}" \
+    GIT_WORK_TREE="${work_tree}" git "$@"
+}
 
 log() {
   printf '[sumi-dogfood-images] %s\n' "$*" >&2
@@ -106,11 +122,19 @@ done
 [[ -n "${MANIFEST}" ]] || fail "--manifest is required"
 
 [[ "$(pwd -P)" == "${REPOSITORY_ROOT}" ]] || fail "run from the repository root: ${REPOSITORY_ROOT}"
-[[ "$(git rev-parse --show-toplevel 2>/dev/null)" == "${REPOSITORY_ROOT}" ]] ||
+[[ "$(git_clean rev-parse --show-toplevel 2>/dev/null)" == "${REPOSITORY_ROOT}" ]] ||
   fail "script path is not inside the active repository root"
-[[ "$(git rev-parse HEAD 2>/dev/null)" == "${COMMIT}" ]] || fail "HEAD is not the requested exact commit"
-[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || fail "worktree is not clean"
+GIT_DIRECTORY="$(git_clean rev-parse --absolute-git-dir)" || fail "cannot resolve sanitized Git directory"
+[[ "${GIT_DIRECTORY}" == /* ]] || fail "Git directory is not absolute"
+[[ "$(git_clean cat-file -t "${COMMIT}" 2>/dev/null)" == commit ]] || fail "requested SHA is not a raw commit object"
+ACCEPTED_COMMIT="$(git_clean rev-parse --verify "${COMMIT}^{commit}")" || fail "cannot resolve raw accepted commit"
+[[ "${ACCEPTED_COMMIT}" == "${COMMIT}" ]] || fail "raw accepted commit does not equal the requested SHA"
+EXPECTED_TREE="$(git_clean rev-parse --verify "${ACCEPTED_COMMIT}^{tree}")" || fail "cannot resolve raw accepted tree"
+[[ "${EXPECTED_TREE}" =~ ^[0-9a-f]{40}$ ]] || fail "raw accepted tree is not canonical"
+[[ "$(git_clean rev-parse HEAD 2>/dev/null)" == "${ACCEPTED_COMMIT}" ]] || fail "HEAD is not the requested exact commit"
+[[ -z "$(git_clean status --porcelain=v1 --untracked-files=all)" ]] || fail "worktree is not clean"
 command -v node >/dev/null 2>&1 || fail "node is required to validate the pinned tree and image evidence"
+[[ -x "${MANIFEST_VALIDATOR}" ]] || fail "manifest validator is missing or not executable"
 
 for variable in SUMI_DOGFOOD_IMAGE_TAG SUMI_API_IMAGE_TAG SUMI_AGENT_IMAGE_TAG \
   SUMI_PROVISIONER_IMAGE_TAG SUMI_WEB_IMAGE_TAG; do
@@ -129,20 +153,20 @@ MANIFEST="${manifest_parent}/${manifest_name}"
 read -r manifest_parent_owner manifest_parent_mode < <(stat -Lc '%u %a' -- "${manifest_parent}") ||
   fail "cannot inspect manifest parent"
 [[ "${manifest_parent_owner}" == "$(id -u)" ]] || fail "manifest parent must be owned by the current user"
-(( (8#${manifest_parent_mode} & 8#022) == 0 )) || fail "manifest parent must not be group/other writable"
+(( (8#${manifest_parent_mode} & 8#077) == 0 )) || fail "manifest parent must be owner-only"
 
 for role in "${ROLES[@]}"; do
-  [[ "$(git cat-file -t "${COMMIT}:${DOCKERFILES[${role}]}" 2>/dev/null)" == "blob" ]] ||
+  [[ "$(git_clean cat-file -t "${EXPECTED_TREE}:${DOCKERFILES[${role}]}" 2>/dev/null)" == "blob" ]] ||
     fail "pinned tree is missing a regular Dockerfile: ${DOCKERFILES[${role}]}"
 done
 
-tree_entries="$(git ls-tree -r "${COMMIT}")" || fail "cannot inspect pinned Git tree"
+tree_entries="$(git_clean ls-tree -r "${EXPECTED_TREE}")" || fail "cannot inspect pinned Git tree"
 if awk '$1 == "160000" && $2 == "commit" { found = 1 } END { exit !found }' <<< "${tree_entries}"; then
   fail "pinned tree contains submodules; exact recursive export is not supported"
 fi
 lfs_policy="$({
-  git ls-tree -r -z --name-only "${COMMIT}" |
-    git check-attr -z --stdin --source="${COMMIT}" filter |
+  git_clean ls-tree -r -z --name-only "${EXPECTED_TREE}" |
+    git_clean check-attr -z --stdin --source="${ACCEPTED_COMMIT}" filter |
     node -e '
       const input = require("node:fs").readFileSync(0);
       const fields = input.toString("utf8").split("\0");
@@ -150,12 +174,12 @@ lfs_policy="$({
       if (fields.length % 3 !== 0) process.exit(2);
       let found = false;
       for (let index = 0; index < fields.length; index += 3) {
-        if (fields[index + 1] === "filter" && fields[index + 2] === "lfs") found = true;
+        if (fields[index + 1] === "filter" && !["unspecified", "unset"].includes(fields[index + 2])) found = true;
       }
-      process.stdout.write(found ? "lfs" : "none");
+      process.stdout.write(found ? "filtered" : "none");
     '
 })" || fail "cannot determine pinned tree Git LFS policy"
-[[ "${lfs_policy}" == "none" ]] || fail "pinned tree contains Git LFS paths; exact object export is not supported"
+[[ "${lfs_policy}" == "none" ]] || fail "pinned tree contains filtered paths (including Git LFS); exact object export is not supported"
 
 print_command() {
   printf 'DRY-RUN:'
@@ -164,7 +188,7 @@ print_command() {
 }
 
 if [[ "${DRY_RUN}" == true ]]; then
-  printf 'DRY-RUN: export Git tree %q to %s\n' "${COMMIT}" '/PRIVATE/EXACT-CONTEXT'
+  printf 'DRY-RUN: export raw Git commit %q tree %q to %s\n' "${ACCEPTED_COMMIT}" "${EXPECTED_TREE}" '/PRIVATE/EXACT-CONTEXT'
   for role in "${ROLES[@]}"; do
     reference="${REPOSITORIES[${role}]}:${TAG}"
     print_command docker build \
@@ -188,24 +212,21 @@ PRIVATE_BUILD_ROOT="$(mktemp -d "${manifest_parent}/.dogfood-build.XXXXXX")" ||
   fail "private build root is not owner-only"
 BUILD_CONTEXT="${PRIVATE_BUILD_ROOT}/context"
 mkdir -m 0700 -- "${BUILD_CONTEXT}"
-git_directory="$(git rev-parse --absolute-git-dir)" || fail "cannot resolve Git object directory"
 export_index="${PRIVATE_BUILD_ROOT}/export.index"
 verify_index="${PRIVATE_BUILD_ROOT}/verify.index"
-GIT_DIR="${git_directory}" GIT_INDEX_FILE="${export_index}" git read-tree "${COMMIT}" ||
+git_with_index "${export_index}" "${REPOSITORY_ROOT}" read-tree "${EXPECTED_TREE}" ||
   fail "cannot read pinned Git tree"
-GIT_DIR="${git_directory}" GIT_INDEX_FILE="${export_index}" git checkout-index \
+git_with_index "${export_index}" "${REPOSITORY_ROOT}" checkout-index \
   --all --force --prefix="${BUILD_CONTEXT}/" || fail "cannot export pinned Git tree"
-GIT_DIR="${git_directory}" GIT_INDEX_FILE="${verify_index}" git read-tree --empty ||
+git_with_index "${verify_index}" "${BUILD_CONTEXT}" read-tree --empty ||
   fail "cannot initialize context verification index"
 (
   cd "${BUILD_CONTEXT}"
-  GIT_DIR="${git_directory}" GIT_INDEX_FILE="${verify_index}" GIT_WORK_TREE="${BUILD_CONTEXT}" \
-    git add --all -- .
+  git_with_index "${verify_index}" "${BUILD_CONTEXT}" add --all -- .
 ) || fail "cannot hash exported build context"
-exported_tree="$(GIT_DIR="${git_directory}" GIT_INDEX_FILE="${verify_index}" git write-tree)" ||
+exported_tree="$(git_with_index "${verify_index}" "${BUILD_CONTEXT}" write-tree)" ||
   fail "cannot derive exported build tree"
-expected_tree="$(git rev-parse "${COMMIT}^{tree}")" || fail "cannot resolve pinned tree ID"
-[[ "${exported_tree}" == "${expected_tree}" ]] || fail "exported build context differs from pinned Git tree"
+[[ "${exported_tree}" == "${EXPECTED_TREE}" ]] || fail "exported build context differs from raw accepted Git tree"
 for role in "${ROLES[@]}"; do
   [[ -f "${BUILD_CONTEXT}/${DOCKERFILES[${role}]}" &&
     ! -L "${BUILD_CONTEXT}/${DOCKERFILES[${role}]}" ]] ||
@@ -220,8 +241,8 @@ for role in "${ROLES[@]}"; do
 done
 
 inspect_immutable_id() {
-  local image_id="$1" reference="$2" repository="$3"
-  local response evidence inspection_file
+  local image_id="$1"
+  local response inspection_file
   inspection_file="${PRIVATE_BUILD_ROOT}/${image_id#sha256:}.inspect.json"
   if ! docker image inspect --format '{{json .}}' "${image_id}" |
     head -c 1048577 > "${inspection_file}"; then
@@ -230,9 +251,9 @@ inspect_immutable_id() {
   (($(stat -Lc '%s' -- "${inspection_file}") <= 1048576)) ||
     fail "immutable image inspection response exceeds 1 MiB"
   response="$(< "${inspection_file}")"
-  evidence="$(node -e '
+  node -e '
     const fs = require("node:fs");
-    const [expectedId, expectedReference, expectedRepository, revision, source] = process.argv.slice(1);
+    const [expectedId, revision, source] = process.argv.slice(1);
     let value;
     try {
       value = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -244,25 +265,16 @@ inspect_immutable_id() {
     const labels = value.Config?.Labels;
     if (!labels || labels["org.opencontainers.image.revision"] !== revision) throw new Error("wrong revision label");
     if (labels["org.opencontainers.image.source"] !== source) throw new Error("wrong source label");
-    if (!Array.isArray(value.RepoTags) || value.RepoTags.length !== 1 || value.RepoTags[0] !== expectedReference) {
-      throw new Error("missing, floating, or mixed RepoTags");
-    }
-    if (!Array.isArray(value.RepoDigests)) throw new Error("RepoDigests is not an array");
-    const prefix = `${expectedRepository}@sha256:`;
-    for (const digest of value.RepoDigests) {
-      if (typeof digest !== "string" || !digest.startsWith(prefix) || !/^[0-9a-f]{64}$/.test(digest.slice(prefix.length))) {
-        throw new Error("unexpected RepoDigest");
-      }
-    }
-    process.stdout.write(JSON.stringify([...new Set(value.RepoDigests)].sort()));
-  ' "${image_id}" "${reference}" "${repository}" "${COMMIT}" "${SOURCE_URL}" <<< "${response}")" ||
-    fail "${reference} has invalid immutable-ID inspection evidence"
-  printf '%s' "${evidence}"
+  ' "${image_id}" "${COMMIT}" "${SOURCE_URL}" <<< "${response}" ||
+    fail "${image_id} has invalid immutable-ID inspection evidence"
 }
 
 for role in "${ROLES[@]}"; do
   reference="${REPOSITORIES[${role}]}:${TAG}"
   iidfile="${PRIVATE_BUILD_ROOT}/${role}.iid"
+  if docker image inspect "${reference}" >/dev/null 2>&1; then
+    fail "requested image tag appeared before assignment: ${reference}"
+  fi
   log "building ${role} as ${reference}"
   docker build \
     --iidfile "${iidfile}" \
@@ -277,25 +289,24 @@ for role in "${ROLES[@]}"; do
     fail "${reference} wrote a non-canonical or mixed iidfile"
   image_id="${iid_lines[0]}"
   IMAGE_IDS[${role}]="${image_id}"
-  IMAGE_DIGEST_JSON[${role}]="$(inspect_immutable_id \
-    "${image_id}" "${reference}" "${REPOSITORIES[${role}]}")"
+  inspect_immutable_id "${image_id}"
 done
 
 TEMP_MANIFEST="$(mktemp "${manifest_parent}/.dogfood-images.XXXXXX")" || fail "cannot create manifest temporary file"
 {
   printf '{\n'
-  printf '  "schema_version": 1,\n'
+  printf '  "schema_version": 2,\n'
   printf '  "status": "COMPLETE",\n'
-  printf '  "source": {"repository": "%s", "revision": "%s"},\n' "${SOURCE_URL}" "${COMMIT}"
-  printf '  "tag": "%s",\n' "${TAG}"
+  printf '  "evidence_scope": "IMMUTABLE_IMAGE_IDS_AND_BUILD_INPUTS_ONLY",\n'
+  printf '  "mutable_handles_authoritative": false,\n'
+  printf '  "source": {"repository": "%s", "revision": "%s", "tree": "%s"},\n' "${SOURCE_URL}" "${ACCEPTED_COMMIT}" "${EXPECTED_TREE}"
+  printf '  "build": {"context_tree": "%s", "requested_tag": "%s"},\n' "${EXPECTED_TREE}" "${TAG}"
   printf '  "images": [\n'
   for index in "${!ROLES[@]}"; do
     role="${ROLES[${index}]}"
     reference="${REPOSITORIES[${role}]}:${TAG}"
-    printf '    {"name": "%s", "reference": "%s", "id": "%s", "repo_digests": ' \
-      "${role}" "${reference}" "${IMAGE_IDS[${role}]}"
-    printf '%s' "${IMAGE_DIGEST_JSON[${role}]}"
-    printf ', "labels": {"%s": "%s", "%s": "%s"}}' \
+    printf '    {"role": "%s", "id": "%s", "dockerfile": "%s", "requested_reference": "%s", "labels": {"%s": "%s", "%s": "%s"}}' \
+      "${role}" "${IMAGE_IDS[${role}]}" "${DOCKERFILES[${role}]}" "${reference}" \
       "${REVISION_LABEL}" "${COMMIT}" "${SOURCE_LABEL}" "${SOURCE_URL}"
     if (( index + 1 < ${#ROLES[@]} )); then printf ','; fi
     printf '\n'
@@ -305,16 +316,11 @@ TEMP_MANIFEST="$(mktemp "${manifest_parent}/.dogfood-images.XXXXXX")" || fail "c
 } > "${TEMP_MANIFEST}"
 chmod 0600 "${TEMP_MANIFEST}"
 [[ "$(stat -Lc '%a:%h' -- "${TEMP_MANIFEST}")" == "600:1" ]] || fail "temporary manifest is not mode-safe"
-
-for role in "${ROLES[@]}"; do
-  reference="${REPOSITORIES[${role}]}:${TAG}"
-  resolved_id="$(docker image inspect --format '{{.Id}}' "${reference}")" ||
-    fail "intended tag disappeared before COMPLETE handoff: ${reference}"
-  [[ "${resolved_id}" == "${IMAGE_IDS[${role}]}" ]] ||
-    fail "intended tag was retagged before COMPLETE handoff: ${reference}"
-done
+"${MANIFEST_VALIDATOR}" --manifest "${TEMP_MANIFEST}" --commit "${ACCEPTED_COMMIT}" \
+  --tree "${EXPECTED_TREE}" --tag "${TAG}" --manifest-only >/dev/null ||
+  fail "generated COMPLETE manifest failed closed validation"
 ln -- "${TEMP_MANIFEST}" "${MANIFEST}" || fail "manifest path was created concurrently"
 rm -f -- "${TEMP_MANIFEST}"
 TEMP_MANIFEST=
 [[ "$(stat -Lc '%a:%h' -- "${MANIFEST}")" == "600:1" ]] || fail "published manifest is not mode 0600 with one link"
-log "COMPLETE manifest written atomically: ${MANIFEST}"
+log "COMPLETE immutable-IID/build-input manifest written atomically: ${MANIFEST}"
