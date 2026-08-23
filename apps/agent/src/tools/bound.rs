@@ -6,7 +6,7 @@
 //! that metadata around this value, but must not reinterpret the app-owned
 //! operation or resource identities recorded here.
 
-use std::path::Path;
+use std::{io, path::Path};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
@@ -911,15 +911,38 @@ fn validate_bound_json<E>(
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
-    let encoded_len = serde_json::to_vec(value)
-        .map_err(|error| invalid(format!("{field} serialization failed: {error}")))?
-        .len();
-    if encoded_len > MAX_BOUND_JSON_BYTES {
-        return Err(invalid(format!(
-            "{field} must not exceed {MAX_BOUND_JSON_BYTES} encoded bytes"
-        )));
+    let mut size = CappedJsonSizeWriter::default();
+    if let Err(error) = serde_json::to_writer(&mut size, value) {
+        if size.exceeded {
+            return Err(invalid(format!(
+                "{field} must not exceed {MAX_BOUND_JSON_BYTES} encoded bytes"
+            )));
+        }
+        return Err(invalid(format!("{field} serialization failed: {error}")));
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct CappedJsonSizeWriter {
+    written: usize,
+    exceeded: bool,
+}
+
+impl io::Write for CappedJsonSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_BOUND_JSON_BYTES.saturating_sub(self.written) {
+            self.written = MAX_BOUND_JSON_BYTES + 1;
+            self.exceeded = true;
+            return Err(io::Error::other("bound JSON size limit exceeded"));
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn digest_json(domain: &[u8], value: &Value) -> Result<InvocationDigest, DescribeError> {
@@ -1446,6 +1469,18 @@ mod tests {
                 "value": "x".repeat(MAX_BOUND_JSON_BYTES)
             }))
             .is_err()
+        );
+
+        let individually_bounded_values = (0..5)
+            .map(|_| Value::String("x".repeat(MAX_BOUND_STRING_BYTES)))
+            .collect::<Vec<_>>();
+        assert!(individually_bounded_values.len() < MAX_BOUND_CONTAINER_ITEMS);
+        assert!(
+            BoundExecutionArguments::from_value(json!({
+                "values": individually_bounded_values
+            }))
+            .is_err(),
+            "aggregate JSON above the cap must fail without allocating an encoded copy"
         );
     }
 
