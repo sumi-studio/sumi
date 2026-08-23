@@ -20,6 +20,26 @@ func TestSchema30RollbackArtifactsAreSealed(t *testing.T) {
 	}
 }
 
+func TestSchema30CleanupContextIsIndependentAndBounded(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller()
+
+	cleanupCtx, cancelCleanup := schema30CleanupContext(callerCtx)
+	defer cancelCleanup()
+
+	if err := cleanupCtx.Err(); err != nil {
+		t.Fatalf("cleanup context inherited caller cancellation: %v", err)
+	}
+	deadline, ok := cleanupCtx.Deadline()
+	if !ok {
+		t.Fatal("cleanup context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > schema30CleanupTimeout {
+		t.Fatalf("cleanup deadline remaining = %v, want within (0, %v]", remaining, schema30CleanupTimeout)
+	}
+}
+
 func TestPreflightSchema30RollbackDoesNotMutateCanonicalHead(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

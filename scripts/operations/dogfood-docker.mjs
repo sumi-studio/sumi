@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 
 const DOCKER_INSPECT_TIMEOUT_MS = 5_000;
 const DOCKER_TERM_GRACE_MS = 250;
+const DOCKER_REAP_TIMEOUT_MS = 1_000;
 const DOCKER_STDOUT_LIMIT = 1024 * 1024;
 const DOCKER_STDERR_LIMIT = 64 * 1024;
 const PRIVATE_CONFIG_PREFIX = "/tmp/sumi-dogfood-docker.";
@@ -48,11 +49,17 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function terminateProcessGroup(child, signal = "SIGTERM") {
+export async function terminateProcessGroup(child, signal = "SIGTERM") {
   signalGroup(child, signal);
   await delay(DOCKER_TERM_GRACE_MS);
   signalGroup(child, "SIGKILL");
-  while (processGroupExists(child)) await delay(10);
+  const reapDeadline = Date.now() + DOCKER_REAP_TIMEOUT_MS;
+  while (processGroupExists(child)) {
+    if (Date.now() >= reapDeadline) {
+      throw new Error("Docker process group did not exit after SIGKILL");
+    }
+    await delay(10);
+  }
 }
 
 function appendBounded(chunks, chunk, state, limit) {

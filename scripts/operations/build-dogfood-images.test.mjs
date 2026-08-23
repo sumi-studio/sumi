@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -193,6 +193,7 @@ FAKE_MIXED_INSPECT_ROLE="$(control FAKE_MIXED_INSPECT_ROLE)"
 FAKE_RETAG_AFTER_API="$(control FAKE_RETAG_AFTER_API)"
 FAKE_REQUIRE_STDIN_ROLE="$(control FAKE_REQUIRE_STDIN_ROLE)"
 FAKE_STDIN_TOKEN="$(control FAKE_STDIN_TOKEN)"
+FAKE_UNTRUST_PRIVATE_ROOT_ROLE="$(control FAKE_UNTRUST_PRIVATE_ROOT_ROLE)"
 
 [[ "\${1:-}" == --config && -n "\${2:-}" ]]
 client_config="$2"
@@ -239,6 +240,13 @@ if [[ "\${1:-}" == build ]]; then
   if [[ "$FAKE_REQUIRE_STDIN_ROLE" == "$role" ]]; then
     IFS= read -r stdin_token
     [[ "$stdin_token" == "$FAKE_STDIN_TOKEN" ]]
+  fi
+  if [[ "$FAKE_UNTRUST_PRIVATE_ROOT_ROLE" == "$role" ]]; then
+    private_root="$(dirname "$context")"
+    moved_root="$state/untrusted-private-root"
+    [[ ! -e "$moved_root" && ! -L "$moved_root" ]]
+    mv -- "$private_root" "$moved_root"
+    ln -s -- "$moved_root" "$private_root"
   fi
   if [[ "$FAKE_CANCEL_BUILD_ROLE" == "$role" ]]; then
     printf '%s\\n' "$$" > "$state/cancel-build-leader.pid"
@@ -565,6 +573,48 @@ test("a partial build failure publishes no COMPLETE manifest", async () => {
       .split("\n")[0];
     await assert.rejects(stat(dirname(context)), { code: "ENOENT" });
   });
+});
+
+test("EXIT cleanup preserves a primary failure and fails closed for an untrusted private root", async (t) => {
+  await t.test("preserves an existing Docker failure", async () => {
+    await withFixture(async (fixture) => {
+      await assert.rejects(
+        run(fixture, [], {
+          FAKE_FAIL_ROLE: "api",
+          FAKE_UNTRUST_PRIVATE_ROOT_ROLE: "api",
+        }),
+        (error) => {
+          assert.equal(error.code, 42);
+          assert.match(
+            error.stderr,
+            /refusing to clean an untrusted private build root/,
+          );
+          return true;
+        },
+      );
+      await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
+    });
+  });
+
+  await t.test(
+    "turns an otherwise successful exit into a failure",
+    async () => {
+      await withFixture(async (fixture) => {
+        await assert.rejects(
+          run(fixture, [], { FAKE_UNTRUST_PRIVATE_ROOT_ROLE: "api" }),
+          (error) => {
+            assert.equal(error.code, 1);
+            assert.match(
+              error.stderr,
+              /refusing to clean an untrusted private build root/,
+            );
+            return true;
+          },
+        );
+        await stat(fixture.manifest);
+      });
+    },
+  );
 });
 
 test("tag mismatch and floating tags are refused before Docker", async () => {
@@ -1206,6 +1256,36 @@ test("immutable-IID inspection times out without exposing Docker output", async 
   });
 });
 
+test("post-SIGKILL process-group waiting is bounded and fails closed", async () => {
+  const moduleUrl = pathToFileURL(sourceDockerWrapper).href;
+  const program = `
+    import assert from "node:assert/strict";
+    import process from "node:process";
+    import { terminateProcessGroup } from ${JSON.stringify(moduleUrl)};
+
+    const signals = [];
+    process.kill = (pid, signal) => {
+      assert.equal(pid, -4242);
+      signals.push(signal);
+      return true;
+    };
+    await assert.rejects(
+      terminateProcessGroup({ pid: 4242 }),
+      /Docker process group did not exit after SIGKILL/,
+    );
+    assert.deepEqual(signals.slice(0, 2), ["SIGTERM", "SIGKILL"]);
+    assert.ok(signals.slice(2).length > 0);
+    assert.ok(signals.slice(2).every((signal) => signal === 0));
+    process.stdout.write("bounded process-group failure observed\\n");
+  `;
+  const result = await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "--eval", program],
+    { timeout: 5_000 },
+  );
+  assert.match(result.stdout, /bounded process-group failure observed/);
+});
+
 test("external SIGTERM kills bounded inspection and removes private config", async () => {
   await withFixture(async (fixture) => {
     const secret = "must-not-escape-cancelled-inspection";
@@ -1626,10 +1706,89 @@ test("live binding inspection times out without exposing Docker output", async (
       failure = error;
     }
     assert.ok(Date.now() - started < 10_000, "binding timeout was not bounded");
-    assert.match(failure.stderr, /requested reference is absent/);
+    assert.match(
+      failure.stderr,
+      /cannot inspect requested reference safely \(timeout\)/,
+    );
+    assert.doesNotMatch(failure.stderr, /requested reference is absent/);
     assert.doesNotMatch(failure.stderr, new RegExp(secret));
     assert.doesNotMatch(failure.stdout, new RegExp(secret));
     await assertHangingDockerWasKilled(fixture);
+  });
+});
+
+test("live binding distinguishes verified absence from inspection unavailability", async (t) => {
+  await t.test("verified absence", async () => {
+    await withFixture(async (fixture) => {
+      await run(fixture);
+      await rm(join(fixture.state, "built-agent"));
+      await assert.rejects(
+        execFileAsync(
+          join(
+            fixture.root,
+            "scripts/operations/verify-dogfood-image-bindings",
+          ),
+          [
+            "--manifest",
+            fixture.manifest,
+            "--commit",
+            fixture.sha,
+            "--tree",
+            fixture.tree,
+            "--tag",
+            fixture.sha,
+          ],
+          { cwd: fixture.root, env: fixture.env },
+        ),
+        (error) => {
+          assert.match(error.stderr, /requested reference is absent/);
+          assert.doesNotMatch(
+            error.stderr,
+            /cannot inspect requested reference safely/,
+          );
+          return true;
+        },
+      );
+    });
+  });
+
+  await t.test("Docker CLI unavailable", async () => {
+    await withFixture(async (fixture) => {
+      await run(fixture);
+      const emptyPath = join(fixture.state, "empty-path");
+      await mkdir(emptyPath);
+      await assert.rejects(
+        execFileAsync(
+          process.execPath,
+          [
+            join(
+              fixture.root,
+              "scripts/operations/verify-dogfood-image-bindings",
+            ),
+            "--manifest",
+            fixture.manifest,
+            "--commit",
+            fixture.sha,
+            "--tree",
+            fixture.tree,
+            "--tag",
+            fixture.sha,
+          ],
+          {
+            cwd: fixture.root,
+            env: { ...fixture.env, PATH: emptyPath },
+          },
+        ),
+        (error) => {
+          assert.match(
+            error.stderr,
+            /cannot inspect requested reference safely \(unavailable\)/,
+          );
+          assert.doesNotMatch(error.stderr, /requested reference is absent/);
+          return true;
+        },
+      );
+    });
   });
 });
 

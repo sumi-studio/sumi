@@ -138,7 +138,12 @@ if (manifestOnly) {
 for (const image of manifest.images) {
   const inspection = await inspectDockerObject(image.requested_reference);
   if (!inspection.ok) {
-    fail(`requested reference is absent: ${image.requested_reference}`);
+    if (inspection.reason === "absent") {
+      fail(`requested reference is absent: ${image.requested_reference}`);
+    }
+    fail(
+      `cannot inspect requested reference safely (${inspection.reason ?? "unknown"}): ${image.requested_reference}`,
+    );
   }
   const actual = inspection.value.Id;
   if (actual !== image.id) fail(`requested reference does not match immutable IID: ${image.requested_reference}`);

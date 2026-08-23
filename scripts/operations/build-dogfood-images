@@ -67,7 +67,8 @@ EOF
 }
 
 cleanup() {
-  trap - INT TERM
+  local status=$?
+  trap - INT TERM EXIT
   if [[ -n "${TEMP_MANIFEST}" && -e "${TEMP_MANIFEST}" ]]; then
     rm -f -- "${TEMP_MANIFEST}"
   fi
@@ -78,9 +79,12 @@ cleanup() {
       rm -rf -- "${PRIVATE_BUILD_ROOT}"
     else
       log "ERROR: refusing to clean an untrusted private build root: ${PRIVATE_BUILD_ROOT}"
-      return 1
+      if ((status == 0)); then
+        status=1
+      fi
     fi
   fi
+  exit "${status}"
 }
 trap cleanup EXIT
 

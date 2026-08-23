@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -15,6 +16,7 @@ const (
 	schema30DownName           = "0030_message_revisions.down.sql"
 	sealedSchema30UpChecksum   = "6b6e311be7580df5903c331829f1393e9a7866c394b3e8bc07195518e08c9c13"
 	sealedSchema30DownChecksum = "474077eb1f738008a2aaff71e1ab04ffb376e3704658474da746af24fc0938e2"
+	schema30CleanupTimeout     = 5 * time.Second
 )
 
 var (
@@ -44,7 +46,11 @@ func RollbackSchema30To29(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("begin schema 30 rollback: %w", err)
 		}
-		defer func() { _ = tx.Rollback(ctx) }()
+		defer func() {
+			cleanupCtx, cleanupCancel := schema30CleanupContext(ctx)
+			defer cleanupCancel()
+			_ = tx.Rollback(cleanupCtx)
+		}()
 
 		// External writer quiescence remains mandatory. This lock closes the
 		// database race between the final revision check and DROP COLUMN.
@@ -95,9 +101,15 @@ func withSchema30MigrationLock(ctx context.Context, pool *pgxpool.Pool, run func
 		return fmt.Errorf("acquire migration lock for schema 30 rollback: %w", err)
 	}
 	defer func() {
-		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
+		cleanupCtx, cleanupCancel := schema30CleanupContext(ctx)
+		defer cleanupCancel()
+		_, _ = conn.Exec(cleanupCtx, "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
 	}()
 	return run(conn)
+}
+
+func schema30CleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), schema30CleanupTimeout)
 }
 
 func preflightSchema30Rollback(ctx context.Context, conn migrationDB) (string, error) {

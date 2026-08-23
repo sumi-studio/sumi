@@ -106,6 +106,10 @@ test("the API image and runbook bind the offline schema-30 rollback operator", a
     assert.doesNotMatch(command, /\$\{SUMI_DB_URL/);
     assert.match(command, /docker image inspect --format/);
     assert.match(command, /docker network inspect/);
+    assert.match(
+      command,
+      /docker run --rm --pull=never --read-only --cap-drop=ALL \\\n\s+--security-opt=no-new-privileges \\/,
+    );
     assert.ok(
       command.indexOf("docker image inspect") < command.indexOf("docker run"),
     );
