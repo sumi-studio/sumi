@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+readonly SOURCE_URL="https://github.com/sumi-studio/sumi"
+readonly REVISION_LABEL="org.opencontainers.image.revision"
+readonly SOURCE_LABEL="org.opencontainers.image.source"
+readonly MANIFEST_VALIDATOR="${SCRIPT_DIR}/verify-dogfood-image-bindings"
+readonly DOCKER_WRAPPER="${SCRIPT_DIR}/dogfood-docker.mjs"
+readonly MAX_TREE_ENTRIES=2048
+readonly MAX_PATH_BYTES=512
+readonly MAX_BLOB_BYTES=4194304
+readonly MAX_CONTEXT_BYTES=67108864
+
+COMMIT=
+TAG=
+MANIFEST=
+DRY_RUN=false
+TEMP_MANIFEST=
+PRIVATE_BUILD_ROOT=
+BUILD_CONTEXT=
+ACCEPTED_COMMIT=
+EXPECTED_TREE=
+ACTIVE_DOCKER_WRAPPER_PID=
+RECEIVED_SIGNAL=
+
+declare -a ROLES=(api agent provisioner web)
+declare -A REPOSITORIES=(
+  [api]="ghcr.io/sumi-studio/sumi-api"
+  [agent]="ghcr.io/sumi-studio/sumi-agent"
+  [provisioner]="ghcr.io/sumi-studio/sumi-provisioner"
+  [web]="ghcr.io/sumi-studio/sumi-web"
+)
+declare -A DOCKERFILES=(
+  [api]="deploy/api/Dockerfile"
+  [agent]="deploy/agent/Dockerfile"
+  [provisioner]="deploy/provisioner/Dockerfile"
+  [web]="deploy/web/Dockerfile"
+)
+declare -A IMAGE_IDS=()
+
+git_clean() {
+  env -i PATH="${PATH}" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 git -C "${REPOSITORY_ROOT}" "$@"
+}
+
+log() {
+  printf '[sumi-dogfood-images] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/operations/build-dogfood-images \
+  --commit <full-lowercase-sha> --tag <same-full-lowercase-sha> \
+  --manifest <new-path> [--dry-run]
+
+Builds and locally verifies the API, agent, provisioner, and web images. It
+never pushes an image and never invokes Docker Compose.
+EOF
+}
+
+cleanup() {
+  trap - INT TERM
+  if [[ -n "${TEMP_MANIFEST}" && -e "${TEMP_MANIFEST}" ]]; then
+    rm -f -- "${TEMP_MANIFEST}"
+  fi
+  if [[ -n "${PRIVATE_BUILD_ROOT}" && -d "${PRIVATE_BUILD_ROOT}" ]]; then
+    if [[ ! -L "${PRIVATE_BUILD_ROOT}" &&
+      "${PRIVATE_BUILD_ROOT}" == "${manifest_parent}/.dogfood-build."* &&
+      "$(stat -Lc '%u' -- "${PRIVATE_BUILD_ROOT}")" == "$(id -u)" ]]; then
+      rm -rf -- "${PRIVATE_BUILD_ROOT}"
+    else
+      log "ERROR: refusing to clean an untrusted private build root: ${PRIVATE_BUILD_ROOT}"
+      return 1
+    fi
+  fi
+}
+trap cleanup EXIT
+
+external_signal_exit_code() {
+  if [[ "$1" == INT ]]; then
+    printf '130\n'
+  else
+    printf '143\n'
+  fi
+}
+
+forward_external_signal() {
+  local signal="$1"
+  RECEIVED_SIGNAL="${RECEIVED_SIGNAL:-${signal}}"
+  if [[ -n "${ACTIVE_DOCKER_WRAPPER_PID}" ]]; then
+    kill -s "${signal}" "${ACTIVE_DOCKER_WRAPPER_PID}" 2>/dev/null || true
+    return
+  fi
+  trap - INT TERM
+  exit "$(external_signal_exit_code "${RECEIVED_SIGNAL}")"
+}
+trap 'forward_external_signal INT' INT
+trap 'forward_external_signal TERM' TERM
+
+run_docker_wrapper() {
+  local wrapper_status
+  "${DOCKER_WRAPPER}" "$@" <&0 &
+  ACTIVE_DOCKER_WRAPPER_PID=$!
+  while true; do
+    if wait "${ACTIVE_DOCKER_WRAPPER_PID}"; then
+      wrapper_status=0
+    else
+      wrapper_status=$?
+    fi
+    if kill -0 "${ACTIVE_DOCKER_WRAPPER_PID}" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  ACTIVE_DOCKER_WRAPPER_PID=
+  if [[ -n "${RECEIVED_SIGNAL}" ]]; then
+    trap - INT TERM
+    exit "$(external_signal_exit_code "${RECEIVED_SIGNAL}")"
+  fi
+  return "${wrapper_status}"
+}
+
+while (($#)); do
+  case "$1" in
+    --commit)
+      (($# >= 2)) || fail "--commit requires a value"
+      COMMIT="$2"
+      shift 2
+      ;;
+    --tag)
+      (($# >= 2)) || fail "--tag requires a value"
+      TAG="$2"
+      shift 2
+      ;;
+    --manifest)
+      (($# >= 2)) || fail "--manifest requires a value"
+      MANIFEST="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      fail "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ "${COMMIT}" =~ ^[0-9a-f]{40}$ ]] || fail "commit must be a full lowercase Git SHA"
+[[ "${TAG}" =~ ^[0-9a-f]{40}$ ]] || fail "tag must be a full lowercase Git SHA; floating tags are refused"
+[[ "${TAG}" == "${COMMIT}" ]] || fail "tag must exactly equal the source commit"
+[[ -n "${MANIFEST}" ]] || fail "--manifest is required"
+
+git_version="$(git_clean version 2>/dev/null)" || fail "Git 2.40 or newer is required"
+if [[ ! "${git_version}" =~ ^git\ version\ ([0-9]+)\.([0-9]+)(\.[0-9]+)?([.-][0-9A-Za-z][0-9A-Za-z.-]*)?([[:space:]].*)?$ ]] ||
+  ((BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 40))); then
+  fail "Git 2.40 or newer is required"
+fi
+
+[[ "$(pwd -P)" == "${REPOSITORY_ROOT}" ]] || fail "run from the repository root: ${REPOSITORY_ROOT}"
+[[ "$(git_clean rev-parse --show-toplevel 2>/dev/null)" == "${REPOSITORY_ROOT}" ]] ||
+  fail "script path is not inside the active repository root"
+[[ "$(git_clean cat-file -t "${COMMIT}" 2>/dev/null)" == commit ]] || fail "requested SHA is not a raw commit object"
+ACCEPTED_COMMIT="$(git_clean rev-parse --verify "${COMMIT}^{commit}")" || fail "cannot resolve raw accepted commit"
+[[ "${ACCEPTED_COMMIT}" == "${COMMIT}" ]] || fail "raw accepted commit does not equal the requested SHA"
+EXPECTED_TREE="$(git_clean rev-parse --verify "${ACCEPTED_COMMIT}^{tree}")" || fail "cannot resolve raw accepted tree"
+[[ "${EXPECTED_TREE}" =~ ^[0-9a-f]{40}$ ]] || fail "raw accepted tree is not canonical"
+[[ "$(git_clean rev-parse HEAD 2>/dev/null)" == "${ACCEPTED_COMMIT}" ]] || fail "HEAD is not the requested exact commit"
+[[ -z "$(git_clean status --porcelain=v1 --untracked-files=all)" ]] || fail "worktree is not clean"
+command -v node >/dev/null 2>&1 || fail "node is required to validate the pinned tree and image evidence"
+[[ -x "${MANIFEST_VALIDATOR}" ]] || fail "manifest validator is missing or not executable"
+[[ -x "${DOCKER_WRAPPER}" ]] || fail "sanitized Docker wrapper is missing or not executable"
+info_attributes="$(git_clean rev-parse --path-format=absolute --git-path info/attributes)" ||
+  fail "cannot resolve repository-local Git attributes path"
+[[ "${info_attributes}" == /* ]] || fail "repository-local Git attributes path is not absolute"
+[[ ! -e "${info_attributes}" && ! -L "${info_attributes}" ]] ||
+  fail "repository-local Git attributes are not allowed: ${info_attributes}"
+
+manifest_parent="$(dirname -- "${MANIFEST}")"
+manifest_name="$(basename -- "${MANIFEST}")"
+[[ "${manifest_name}" != "." && "${manifest_name}" != ".." ]] || fail "manifest must name a file"
+[[ -d "${manifest_parent}" ]] || fail "manifest parent directory does not exist"
+manifest_parent="$(cd "${manifest_parent}" && pwd -P)" || fail "cannot resolve manifest parent"
+MANIFEST="${manifest_parent}/${manifest_name}"
+[[ ! -e "${MANIFEST}" && ! -L "${MANIFEST}" ]] || fail "manifest path already exists"
+read -r manifest_parent_owner manifest_parent_mode < <(stat -Lc '%u %a' -- "${manifest_parent}") ||
+  fail "cannot inspect manifest parent"
+[[ "${manifest_parent_owner}" == "$(id -u)" ]] || fail "manifest parent must be owned by the current user"
+(( (8#${manifest_parent_mode} & 8#077) == 0 )) || fail "manifest parent must be owner-only"
+
+for role in "${ROLES[@]}"; do
+  [[ "$(git_clean cat-file -t "${EXPECTED_TREE}:${DOCKERFILES[${role}]}" 2>/dev/null)" == "blob" ]] ||
+    fail "pinned tree is missing a regular Dockerfile: ${DOCKERFILES[${role}]}"
+done
+
+umask 077
+PRIVATE_BUILD_ROOT="$(mktemp -d "${manifest_parent}/.dogfood-build.XXXXXX")" ||
+  fail "cannot create private build root"
+[[ "$(stat -Lc '%u:%a' -- "${PRIVATE_BUILD_ROOT}")" == "$(id -u):700" ]] ||
+  fail "private build root is not owner-only"
+tree_listing="${PRIVATE_BUILD_ROOT}/tree.entries"
+git_clean ls-tree -r -z --long --full-tree "${EXPECTED_TREE}" |
+  node -e '
+    const limits = {
+      entries: Number(process.argv[1]),
+      pathBytes: Number(process.argv[2]),
+      blobBytes: Number(process.argv[3]),
+      aggregateBytes: Number(process.argv[4]),
+    };
+    let pending = Buffer.alloc(0);
+    let entries = 0;
+    let aggregateBytes = 0;
+    const fail = (message) => {
+      process.stderr.write(`[sumi-dogfood-images] ERROR: ${message}\n`);
+      process.exit(1);
+    };
+    const validate = (record) => {
+      const separator = record.indexOf(0x09);
+      if (separator < 0) fail("malformed raw Git tree entry");
+      const metadata = record.subarray(0, separator).toString("ascii");
+      const path = record.subarray(separator + 1);
+      const match = /^(\d{6}) (blob|commit) ([0-9a-f]{40}) +(-|\d+)$/.exec(metadata);
+      if (!match) fail("malformed raw Git tree metadata");
+      const [, mode, type, , sizeText] = match;
+      if (mode === "160000" && type === "commit") {
+        fail("pinned tree contains submodules; exact recursive export is not supported");
+      }
+      if (mode === "120000" && type === "blob") {
+        fail("pinned tree contains symbolic links; exact build-context path containment is not supported");
+      }
+      if (type !== "blob" || !["100644", "100755"].includes(mode) || sizeText === "-") {
+        fail("pinned tree contains an unsupported raw Git entry");
+      }
+      entries += 1;
+      if (entries > limits.entries) {
+        fail(`raw tree entry count exceeds ${limits.entries}`);
+      }
+      if (path.length === 0 || path.length > limits.pathBytes) {
+        fail(`raw tree path exceeds ${limits.pathBytes} bytes`);
+      }
+      const size = Number(sizeText);
+      if (!Number.isSafeInteger(size) || size < 0 || size > limits.blobBytes) {
+        fail(`raw tree blob exceeds ${limits.blobBytes} bytes`);
+      }
+      aggregateBytes += size;
+      if (!Number.isSafeInteger(aggregateBytes) || aggregateBytes > limits.aggregateBytes) {
+        fail(`raw tree aggregate exceeds ${limits.aggregateBytes} bytes`);
+      }
+      process.stdout.write(record);
+      process.stdout.write("\0");
+    };
+    process.stdin.on("data", (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      for (;;) {
+        const separator = pending.indexOf(0);
+        if (separator < 0) break;
+        validate(pending.subarray(0, separator));
+        pending = pending.subarray(separator + 1);
+      }
+      if (pending.length > limits.pathBytes + 128) {
+        fail("raw Git tree record exceeds its bounded representation");
+      }
+    });
+    process.stdin.on("end", () => {
+      if (pending.length !== 0) fail("raw Git tree listing is not NUL terminated");
+      if (entries === 0) fail("pinned Git tree is empty");
+    });
+  ' "${MAX_TREE_ENTRIES}" "${MAX_PATH_BYTES}" "${MAX_BLOB_BYTES}" "${MAX_CONTEXT_BYTES}" \
+  > "${tree_listing}" || fail "cannot validate bounded raw accepted Git tree"
+
+attribute_baseline_file="$(mktemp "${PRIVATE_BUILD_ROOT}/attributes.XXXXXX")" ||
+  fail "cannot create private Git attributes baseline"
+attribute_baseline_value="sumi-unconfigured-${attribute_baseline_file##*.}"
+printf '* filter=%s\n' "${attribute_baseline_value}" > "${attribute_baseline_file}"
+lfs_policy="$({
+  git_clean ls-tree -r -z --name-only "${EXPECTED_TREE}" |
+    git_clean -c core.attributesFile="${attribute_baseline_file}" check-attr -z --stdin --source="${ACCEPTED_COMMIT}" filter |
+    node -e '
+      const input = require("node:fs").readFileSync(0);
+      const baseline = process.argv[1];
+      const fields = input.toString("utf8").split("\0");
+      if (fields.at(-1) === "") fields.pop();
+      if (fields.length % 3 !== 0) process.exit(2);
+      let found = false;
+      for (let index = 0; index < fields.length; index += 3) {
+        if (fields[index + 1] === "filter" && fields[index + 2] !== baseline) found = true;
+      }
+      process.stdout.write(found ? "filtered" : "none");
+    ' "${attribute_baseline_value}"
+})" || fail "cannot determine pinned tree Git LFS policy"
+[[ "${lfs_policy}" == "none" ]] || fail "pinned tree contains filtered paths (including Git LFS); exact object export is not supported"
+
+print_command() {
+  printf 'DRY-RUN:'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+if [[ "${DRY_RUN}" == true ]]; then
+  printf 'DRY-RUN: export raw Git commit %q tree %q to %s\n' "${ACCEPTED_COMMIT}" "${EXPECTED_TREE}" '/PRIVATE/EXACT-CONTEXT'
+  for role in "${ROLES[@]}"; do
+    reference="${REPOSITORIES[${role}]}:${TAG}"
+    print_command docker --config "/PRIVATE/EMPTY-DOCKER-CONFIG" --context default build \
+      --iidfile "/PRIVATE/IID-${role}" \
+      --file "/PRIVATE/EXACT-CONTEXT/${DOCKERFILES[${role}]}" \
+      --label "${REVISION_LABEL}=${COMMIT}" \
+      --label "${SOURCE_LABEL}=${SOURCE_URL}" \
+      --tag "${reference}" "/PRIVATE/EXACT-CONTEXT"
+  done
+  log "dry run complete; no Docker command ran and no manifest was written"
+  exit 0
+fi
+
+command -v docker >/dev/null 2>&1 || fail "docker is required"
+BUILD_CONTEXT="${PRIVATE_BUILD_ROOT}/context"
+mkdir -m 0700 -- "${BUILD_CONTEXT}"
+entry_count=0
+context_bytes=0
+while IFS= read -r -d '' entry; do
+  [[ "${entry}" == *$'\t'* ]] || fail "malformed raw Git tree entry"
+  metadata="${entry%%$'\t'*}"
+  path="${entry#*$'\t'}"
+  read -r mode type object blob_size extra <<< "${metadata}"
+  [[ -z "${extra:-}" && "${type}" == blob && "${object}" =~ ^[0-9a-f]{40}$ &&
+    "${blob_size}" =~ ^[0-9]+$ ]] ||
+    fail "unsupported raw Git tree entry: ${path}"
+  case "${mode}" in
+    100644) file_mode=0600 ;;
+    100755) file_mode=0700 ;;
+    120000) fail "pinned tree contains symbolic links; exact build-context path containment is not supported" ;;
+    160000) fail "pinned tree contains submodules; exact recursive export is not supported" ;;
+    *) fail "pinned tree contains unsupported mode ${mode}: ${path}" ;;
+  esac
+  [[ -n "${path}" && "${path}" != /* && "${path}" != "." && "${path}" != ".." &&
+    "${path}" != ../* && "${path}" != */../* && "${path}" != */.. ]] ||
+    fail "pinned tree contains an unsafe path"
+  ((entry_count += 1))
+  ((entry_count <= MAX_TREE_ENTRIES)) ||
+    fail "streaming raw tree entry count exceeds ${MAX_TREE_ENTRIES}"
+  (("${#path}" <= MAX_PATH_BYTES)) ||
+    fail "streaming raw tree path exceeds ${MAX_PATH_BYTES} bytes"
+  ((blob_size <= MAX_BLOB_BYTES)) ||
+    fail "streaming raw tree blob exceeds ${MAX_BLOB_BYTES} bytes"
+  ((context_bytes += blob_size))
+  ((context_bytes <= MAX_CONTEXT_BYTES)) ||
+    fail "streaming raw tree aggregate exceeds ${MAX_CONTEXT_BYTES} bytes"
+  target="${BUILD_CONTEXT}/${path}"
+  parent="$(dirname -- "${target}")"
+  mkdir -p -m 0700 -- "${parent}"
+  [[ ! -e "${target}" && ! -L "${target}" ]] || fail "raw Git tree path collides during export: ${path}"
+  git_clean cat-file blob "${object}" > "${target}" || fail "cannot materialize raw Git blob: ${path}"
+  chmod "${file_mode}" -- "${target}"
+  materialized_size="$(stat -Lc '%s' -- "${target}")" ||
+    fail "cannot measure materialized raw Git blob: ${path}"
+  [[ "${materialized_size}" == "${blob_size}" ]] ||
+    fail "materialized blob size differs from raw Git tree: ${path}"
+  materialized_object="$(git_clean hash-object --no-filters "${target}")" ||
+    fail "cannot hash materialized raw Git blob: ${path}"
+  [[ "${materialized_object}" == "${object}" ]] ||
+    fail "materialized bytes differ from raw Git blob: ${path}"
+done < "${tree_listing}"
+((entry_count > 0)) || fail "pinned Git tree is empty"
+for role in "${ROLES[@]}"; do
+  [[ -f "${BUILD_CONTEXT}/${DOCKERFILES[${role}]}" &&
+    ! -L "${BUILD_CONTEXT}/${DOCKERFILES[${role}]}" ]] ||
+    fail "exported context is missing a regular Dockerfile: ${DOCKERFILES[${role}]}"
+done
+
+for role in "${ROLES[@]}"; do
+  reference="${REPOSITORIES[${role}]}:${TAG}"
+  if run_docker_wrapper reference-status "${reference}"; then
+    fail "requested mutable reference already exists locally: ${reference}"
+  else
+    inspect_status=$?
+    ((inspect_status == 1)) ||
+      fail "cannot inspect requested mutable reference safely: ${reference}"
+  fi
+done
+
+inspect_immutable_id() {
+  local image_id="$1"
+  run_docker_wrapper verify-iid "${image_id}" "${COMMIT}" "${SOURCE_URL}" ||
+    fail "${image_id} has invalid immutable-ID inspection evidence"
+}
+
+for role in "${ROLES[@]}"; do
+  reference="${REPOSITORIES[${role}]}:${TAG}"
+  iidfile="${PRIVATE_BUILD_ROOT}/${role}.iid"
+  if run_docker_wrapper reference-status "${reference}"; then
+    fail "requested mutable reference appeared before build: ${reference}"
+  else
+    inspect_status=$?
+    ((inspect_status == 1)) ||
+      fail "cannot inspect requested mutable reference safely: ${reference}"
+  fi
+  log "building ${role} as ${reference}"
+  run_docker_wrapper build \
+    --iidfile "${iidfile}" \
+    --file "${BUILD_CONTEXT}/${DOCKERFILES[${role}]}" \
+    --label "${REVISION_LABEL}=${COMMIT}" \
+    --label "${SOURCE_LABEL}=${SOURCE_URL}" \
+    --tag "${reference}" "${BUILD_CONTEXT}"
+
+  [[ -f "${iidfile}" && ! -L "${iidfile}" ]] || fail "${reference} did not write a regular iidfile"
+  mapfile -t iid_lines < "${iidfile}"
+  [[ "${#iid_lines[@]}" -eq 1 && "${iid_lines[0]}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    fail "${reference} wrote a non-canonical or mixed iidfile"
+  image_id="${iid_lines[0]}"
+  IMAGE_IDS[${role}]="${image_id}"
+  inspect_immutable_id "${image_id}"
+done
+
+TEMP_MANIFEST="$(mktemp "${manifest_parent}/.dogfood-images.XXXXXX")" || fail "cannot create manifest temporary file"
+{
+  printf '{\n'
+  printf '  "schema_version": 2,\n'
+  printf '  "status": "COMPLETE",\n'
+  printf '  "evidence_scope": "IMMUTABLE_IMAGE_IDS_AND_BUILD_INPUTS_ONLY",\n'
+  printf '  "mutable_handles_authoritative": false,\n'
+  printf '  "source": {"repository": "%s", "revision": "%s", "tree": "%s"},\n' "${SOURCE_URL}" "${ACCEPTED_COMMIT}" "${EXPECTED_TREE}"
+  printf '  "build": {"context_tree": "%s", "requested_tag": "%s"},\n' "${EXPECTED_TREE}" "${TAG}"
+  printf '  "images": [\n'
+  for index in "${!ROLES[@]}"; do
+    role="${ROLES[${index}]}"
+    reference="${REPOSITORIES[${role}]}:${TAG}"
+    printf '    {"role": "%s", "id": "%s", "dockerfile": "%s", "requested_reference": "%s", "labels": {"%s": "%s", "%s": "%s"}}' \
+      "${role}" "${IMAGE_IDS[${role}]}" "${DOCKERFILES[${role}]}" "${reference}" \
+      "${REVISION_LABEL}" "${COMMIT}" "${SOURCE_LABEL}" "${SOURCE_URL}"
+    if (( index + 1 < ${#ROLES[@]} )); then printf ','; fi
+    printf '\n'
+  done
+  printf '  ]\n'
+  printf '}\n'
+} > "${TEMP_MANIFEST}"
+chmod 0600 "${TEMP_MANIFEST}"
+[[ "$(stat -Lc '%a:%h' -- "${TEMP_MANIFEST}")" == "600:1" ]] || fail "temporary manifest is not mode-safe"
+"${MANIFEST_VALIDATOR}" --manifest "${TEMP_MANIFEST}" --commit "${ACCEPTED_COMMIT}" \
+  --tree "${EXPECTED_TREE}" --tag "${TAG}" --manifest-only >/dev/null ||
+  fail "generated COMPLETE manifest failed closed validation"
+ln -- "${TEMP_MANIFEST}" "${MANIFEST}" || fail "manifest path was created concurrently"
+rm -f -- "${TEMP_MANIFEST}"
+TEMP_MANIFEST=
+[[ "$(stat -Lc '%a:%h' -- "${MANIFEST}")" == "600:1" ]] || fail "published manifest is not mode 0600 with one link"
+log "COMPLETE immutable-IID/build-input manifest written atomically: ${MANIFEST}"

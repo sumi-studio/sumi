@@ -13,7 +13,7 @@
     "lint": "biome check . && turbo run lint",
     "check-types": "turbo run check-types",
     "test": "pnpm run test:operability && turbo run test",
-    "test:operability": "node --test scripts/dev/real-stack-static.test.mjs scripts/dev/compose-stack.test.mjs",
+    "test:operability": "node --test scripts/dev/real-stack-static.test.mjs scripts/dev/compose-stack.test.mjs scripts/operations/build-dogfood-images.test.mjs",
     "format": "biome format --write ."
   },
   "devDependencies": {
