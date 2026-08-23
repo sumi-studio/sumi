@@ -86,7 +86,9 @@ writer stopped, do not retry blindly, and use a fresh connection to inspect the
 exact `schema_migrations` head and whether `messages.revision` exists. Continue
 only after classifying the database as the complete schema-29 state or the
 complete schema-30 state. The command intentionally does not print the database
-URL or underlying connection errors.
+URL. Initial connection errors and commit-outcome transport details are
+redacted; other refusal diagnostics are reported so the operator can classify
+the database state without exposing the DSN.
 
 Before admitting traffic, start the exact schema-29 application/migrator build
 and confirm that its migration pass accepts head 29 without changing it. For

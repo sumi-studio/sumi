@@ -933,6 +933,36 @@ test("dirty or incorrectly rooted source trees are refused", async (t) => {
       );
     });
   });
+  await t.test("failed cleanliness inspection", async () => {
+    await withFixture(async (fixture) => {
+      const fakeGitBin = join(fixture.container, "failing-status-git-bin");
+      await mkdir(fakeGitBin);
+      const { stdout: realGitStdout } = await execFileAsync("sh", [
+        "-c",
+        "command -v git",
+      ]);
+      const realGit = realGitStdout.trim();
+      await writeFile(
+        join(fakeGitBin, "git"),
+        `#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *" status --porcelain=v1 --untracked-files=all "* ]]; then
+  exit 23
+fi
+exec ${JSON.stringify(realGit)} "$@"
+`,
+        { mode: 0o755 },
+      );
+
+      await assert.rejects(
+        run(fixture, ["--dry-run"], {
+          PATH: `${fakeGitBin}:${fixture.env.PATH}`,
+        }),
+        /cannot verify worktree cleanliness/,
+      );
+      await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
+    });
+  });
   await t.test("wrong working directory", async () => {
     await withFixture(async (fixture) => {
       await assert.rejects(
