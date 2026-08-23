@@ -8,6 +8,17 @@ contribution to this repository (including code, documentation, or other
 materials, via pull request or any other means), you accept and agree to
 the following terms for all of your present and future contributions.
 
+> **A note to contributors**
+>
+> This agreement is a first version, written defensively to keep the
+> Project's options open while it is young (including plans to establish
+> a legal entity). It is very likely to change as the Project grows and
+> its governance matures. When it does, we will announce changes openly
+> and the updated terms will only apply to Contributions made after the
+> change. If anything here gives you pause, please raise it before
+> contributing — we would rather talk it through than have you sign
+> something you are uncomfortable with.
+
 ## 1. Definitions
 
 "Contribution" means any original work of authorship, including any
