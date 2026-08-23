@@ -470,7 +470,7 @@ readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
 #
 # Docker call                         Inner operation                 One total group budget                         Signal target
 # down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop grace + post-stop allowance + TERM grace Docker process group (all descendants)
-# ps --all --quiet                    none                             verification timeout + TERM grace              Docker process group (all descendants)
+# ps --all --filter project-label     none                             verification timeout + TERM grace              Docker process group (all descendants)
 #
 # `down --timeout` is Docker's container-stop grace, not a cap on the CLI or
 # daemon response. After that grace expires, Compose still has to observe the
@@ -482,7 +482,7 @@ readonly CLEANUP_DOWN_TIMEOUT_SECONDS=$((
   SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS
 ))
 readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
-# `cleanup_project_is_empty` runs once after each cleanup `down`. Bound both
+# `project_is_empty` runs once after each cleanup `down`. Bound both
 # its query and the time allowed for a TERM-resistant Docker process group to
 # exit before its KILL fallback.
 readonly CLEANUP_VERIFICATION_TIMEOUT_SECONDS=5
@@ -608,11 +608,24 @@ cleanup_down_lifecycle_compose() {
     "$@"
 }
 
-cleanup_verification_lifecycle_compose() {
-  run_bounded_cleanup_lifecycle_compose \
+cleanup_verification_docker() {
+  run_bounded_cleanup_docker \
     "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}" \
     "${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}" \
     "$@"
+}
+
+run_bounded_cleanup_lifecycle_compose() {
+  local timeout_seconds="$1"
+  local kill_grace_seconds="$2"
+  shift 2
+  run_bounded_cleanup_docker \
+    "${timeout_seconds}" \
+    "${kill_grace_seconds}" \
+    compose \
+      --project-name "${SUMI_COMPOSE_PROJECT}" \
+      --file "${LIFECYCLE_COMPOSE_FILE}" \
+      "$@"
 }
 
 prepare_compose() {
@@ -633,7 +646,9 @@ run_tracked_compose() {
     "$@" 3>&- 4>&- &
   ACTIVE_COMPOSE_PID=$!
   publish_supervisor_control "nested-start ${ACTIVE_COMPOSE_PID}"
-  if ! wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
+  if wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
+    publish_supervisor_control "nested-ready ${ACTIVE_COMPOSE_PID}"
+  else
     # A no-op lifecycle `down` can legitimately finish before /proc is
     # inspected. A launch must instead remain live and prove the PID/group
     # ownership that later signal cleanup relies on.
@@ -738,27 +753,11 @@ cleanup_compose_group_alive() {
   kill -0 -- "-${pid}" 2>/dev/null
 }
 
-reap_cleanup_compose_leader() {
-  local pid="$1"
-  local status_name="$2"
-  local reaped_name="$3"
-  local leader_status
-  if [[ "${!reaped_name}" == 0 ]] && tracked_compose_child_is_zombie "${pid}"; then
-    if wait "${pid}"; then
-      leader_status=0
-    else
-      leader_status=$?
-    fi
-    printf -v "${status_name}" '%s' "${leader_status}"
-    printf -v "${reaped_name}" '%s' 1
-  fi
-}
-
-run_bounded_cleanup_lifecycle_compose() {
+run_bounded_cleanup_docker() {
   local timeout_seconds="$1"
   local kill_grace_seconds="$2"
   shift 2
-  local pid status=0 leader_reaped=0 deadline_milliseconds remaining_milliseconds
+  local pid status=0 deadline_milliseconds remaining_milliseconds
 
   # A cleanup call has one clock from launch through its probe, normal wait,
   # TERM grace, and KILL. Reserve the advertised TERM grace from the normal
@@ -770,17 +769,27 @@ run_bounded_cleanup_lifecycle_compose() {
   # Keep every Docker helper in a dedicated session/process group. Waiting for
   # the group, rather than just Docker's leader, makes the cleanup deadline
   # cover Compose plugins and helpers even if the CLI exits first.
-  setsid docker compose \
-    --project-name "${SUMI_COMPOSE_PROJECT}" \
-    --file "${LIFECYCLE_COMPOSE_FILE}" \
-    "$@" 3>&- 4>&- &
+  # Stop the new group leader before it execs Docker. This handshake lets the
+  # supervisor prove PID == PGID == SID and publish that durable numeric group
+  # identity before a fast Docker leader can exit while leaving helpers behind.
+  setsid /bin/bash -c 'kill -STOP "$$"; exec docker "$@"' bash "$@" 3>&- 4>&- &
   pid=$!
+  publish_supervisor_control "nested-start ${pid}"
 
   # The isolation probe spends from the same total deadline as Docker itself.
   # Its centisecond resolution leaves the ordinary scheduling margin in the
   # advertised cleanup bound to absorb wakeup jitter.
-  if ! wait_for_cleanup_compose_group_isolation \
+  if wait_for_cleanup_compose_group_isolation \
     "${pid}" "${deadline_milliseconds}" "${kill_grace_seconds}"; then
+    publish_supervisor_control "nested-ready ${pid}"
+    kill -CONT "${pid}" 2>/dev/null || true
+  else
+    # A broken `setsid` implementation is not trusted as a process group, but
+    # let the stopped best-effort cleanup command run before fencing its PID.
+    # It receives no nested-ready acknowledgement, so the API never performs
+    # an unsafe numeric group signal for this path.
+    kill -CONT "${pid}" 2>/dev/null || true
+    sleep_cleanup_normal_milliseconds 10 "${deadline_milliseconds}" "${kill_grace_seconds}" || true
     # `setsid` has already made this PID the group identifier. The leader can
     # disappear before /proc is sampled while a Compose helper remains in that
     # group, so keep policing the group instead of treating the leader's exit
@@ -789,10 +798,12 @@ run_bounded_cleanup_lifecycle_compose() {
       :
     elif tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
       if wait "${pid}"; then
-        return 0
+        status=0
       else
-        return $?
+        status=$?
       fi
+      publish_supervisor_control "nested-done ${pid}"
+      return "${status}"
     else
       log "ERROR: cleanup Docker child did not become its own session and process group"
       kill -TERM "${pid}" 2>/dev/null || true
@@ -803,20 +814,19 @@ run_bounded_cleanup_lifecycle_compose() {
       done
       kill -KILL "${pid}" 2>/dev/null || true
       wait "${pid}" 2>/dev/null || true
+      publish_supervisor_control "nested-done ${pid}"
       return 125
     fi
   fi
 
   while :; do
-    reap_cleanup_compose_leader "${pid}" status leader_reaped
     if ! cleanup_compose_group_alive "${pid}"; then
-      if (( ! leader_reaped )); then
-        if wait "${pid}"; then
-          status=0
-        else
-          status=$?
-        fi
+      if wait "${pid}"; then
+        status=0
+      else
+        status=$?
       fi
+      publish_supervisor_control "nested-done ${pid}"
       return "${status}"
     fi
     remaining_milliseconds="$(milliseconds_until_cleanup_term "${deadline_milliseconds}" "${kill_grace_seconds}")"
@@ -826,11 +836,9 @@ run_bounded_cleanup_lifecycle_compose() {
 
   kill -TERM -- "-${pid}" 2>/dev/null || true
   while :; do
-    reap_cleanup_compose_leader "${pid}" status leader_reaped
     if ! cleanup_compose_group_alive "${pid}"; then
-      if (( ! leader_reaped )); then
-        wait "${pid}" 2>/dev/null || true
-      fi
+      wait "${pid}" 2>/dev/null || true
+      publish_supervisor_control "nested-done ${pid}"
       return 124
     fi
     remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
@@ -838,9 +846,8 @@ run_bounded_cleanup_lifecycle_compose() {
     sleep_cleanup_milliseconds 100 "${deadline_milliseconds}" || break
   done
   kill -KILL -- "-${pid}" 2>/dev/null || true
-  if (( ! leader_reaped )); then
-    wait "${pid}" 2>/dev/null || true
-  fi
+  wait "${pid}" 2>/dev/null || true
+  publish_supervisor_control "nested-done ${pid}"
   return 124
 }
 
@@ -1110,7 +1117,7 @@ project_is_empty() {
   # Treat an inspection failure as non-empty so a failed `down` cannot turn an
   # unobserved project into a physical-recovery receipt.
   local output
-  output="$(docker ps --all \
+  output="$(cleanup_verification_docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
     --format '{{.ID}}' 2>/dev/null)" || return 1
   [[ -z "${output//[[:space:]]/}" ]]

@@ -307,6 +307,7 @@ while [[ ! -f "${NESTED_READY_PATH}" ]]; do
   sleep 0.005
 done
 printf 'nested-start %s\n' "${nested}" >&3
+printf 'nested-ready %s\n' "${nested}" >&3
 printf '%s' "${nested}" >"${PID_PATH}"
 printf ready >"${READY_PATH}"
 while :; do sleep 1; done
@@ -352,24 +353,39 @@ while :; do sleep 1; done
 	waitForProcessGroupGone(t, nestedPID, "detached cleanup session")
 }
 
-func TestExecCommandRunnerKillsTrackedDetachedSessionAfterCleanupBound(t *testing.T) {
+func TestExecCommandRunnerKillsTrackedGroupAfterCleanupLeaderExit(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
 	nestedReadyPath := filepath.Join(dir, "nested-ready")
 	pidPath := filepath.Join(dir, "nested-pid")
+	helperPIDPath := filepath.Join(dir, "helper-pid")
+	releasePath := filepath.Join(dir, "release")
+	nestedScriptPath := filepath.Join(dir, "nested.sh")
 	scriptPath := filepath.Join(dir, "stuck-supervisor.sh")
+	nestedScript := `#!/bin/bash
+set -eu
+/bin/bash -c 'trap "" TERM; printf "%s" "$$" >"${HELPER_PID_PATH}"; printf ready >"${NESTED_READY_PATH}"; while :; do sleep 1; done' &
+while [[ ! -f "${RELEASE_PATH}" ]]; do sleep 0.005; done
+exit 0
+`
+	if err := os.WriteFile(nestedScriptPath, []byte(nestedScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	script := `#!/bin/bash
 set -eu
 printf 'cleanup-bound-ms 100\n' >&3
 trap '' TERM
-setsid /bin/bash -c 'trap "" TERM; printf ready >"${NESTED_READY_PATH}"; while :; do sleep 1; done' 3>&- &
+setsid "${NESTED_SCRIPT_PATH}" 3>&- &
 nested=$!
 while [[ ! -f "${NESTED_READY_PATH}" ]]; do
-  kill -0 "${nested}" 2>/dev/null || { wait "${nested}"; exit $?; }
+  kill -0 "${nested}" 2>/dev/null || exit 91
   sleep 0.005
 done
 printf 'nested-start %s\n' "${nested}" >&3
+printf 'nested-ready %s\n' "${nested}" >&3
 printf '%s' "${nested}" >"${PID_PATH}"
+printf release >"${RELEASE_PATH}"
+wait "${nested}" || true
 printf ready >"${READY_PATH}"
 while :; do sleep 1; done
 `
@@ -388,12 +404,16 @@ while :; do sleep 1; done
 				"READY_PATH=" + readyPath,
 				"NESTED_READY_PATH=" + nestedReadyPath,
 				"PID_PATH=" + pidPath,
+				"HELPER_PID_PATH=" + helperPIDPath,
+				"RELEASE_PATH=" + releasePath,
+				"NESTED_SCRIPT_PATH=" + nestedScriptPath,
 			},
 		)
 		result <- err
 	}()
 	waitForFile(t, readyPath)
 	nestedPID := readPID(t, pidPath)
+	helperPID := readPID(t, helperPIDPath)
 	cancel()
 	select {
 	case err := <-result:
@@ -407,7 +427,10 @@ while :; do sleep 1; done
 	case <-time.After(3 * time.Second):
 		t.Fatal("runner exceeded the advertised cleanup bound")
 	}
-	waitForProcessGroupGone(t, nestedPID, "stuck detached session")
+	waitForProcessGroupGone(t, nestedPID, "detached cleanup group whose leader exited")
+	if err := syscall.Kill(helperPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("TERM-resistant cleanup helper %d survived cancellation: %v", helperPID, err)
+	}
 }
 
 func readPID(t *testing.T, path string) int {

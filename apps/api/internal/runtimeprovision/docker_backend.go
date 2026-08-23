@@ -47,13 +47,14 @@ type execCommandRunner struct {
 }
 
 type supervisorControlTracker struct {
-	mu           sync.Mutex
-	cleanupBound time.Duration
-	boundReady   chan struct{}
-	boundOnce    sync.Once
-	nestedPID    int
-	nestedPIDFD  int
-	closed       bool
+	mu                  sync.Mutex
+	cleanupBound        time.Duration
+	boundReady          chan struct{}
+	boundOnce           sync.Once
+	nestedPID           int
+	nestedPIDFD         int
+	nestedGroupVerified bool
+	closed              bool
 }
 
 func newSupervisorControlTracker() *supervisorControlTracker {
@@ -100,7 +101,7 @@ func (tracker *supervisorControlTracker) consume(reader io.Reader) {
 			pid := int(value)
 			pidfd, err := unix.PidfdOpen(pid, 0)
 			if err != nil {
-				continue
+				pidfd = -1
 			}
 			tracker.mu.Lock()
 			if tracker.closed {
@@ -113,6 +114,16 @@ func (tracker *supervisorControlTracker) consume(reader io.Reader) {
 			}
 			tracker.nestedPID = pid
 			tracker.nestedPIDFD = pidfd
+			tracker.nestedGroupVerified = false
+			tracker.mu.Unlock()
+		case "nested-ready":
+			tracker.mu.Lock()
+			if tracker.nestedPID == int(value) {
+				// The trusted supervisor emits this only after observing PID ==
+				// PGID == SID. Retain that verified numeric group identity until
+				// nested-done even if the leader exits and its pidfd becomes ESRCH.
+				tracker.nestedGroupVerified = true
+			}
 			tracker.mu.Unlock()
 		case "nested-done":
 			tracker.mu.Lock()
@@ -122,6 +133,7 @@ func (tracker *supervisorControlTracker) consume(reader io.Reader) {
 				}
 				tracker.nestedPID = 0
 				tracker.nestedPIDFD = -1
+				tracker.nestedGroupVerified = false
 			}
 			tracker.mu.Unlock()
 		}
@@ -148,7 +160,17 @@ func (tracker *supervisorControlTracker) grace(override time.Duration) time.Dura
 func (tracker *supervisorControlTracker) signalNested(signal syscall.Signal) error {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	if tracker.nestedPID <= 0 || tracker.nestedPIDFD < 0 {
+	if tracker.nestedPID <= 0 {
+		return nil
+	}
+	if tracker.nestedGroupVerified {
+		err := syscall.Kill(-tracker.nestedPID, signal)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	if tracker.nestedPIDFD < 0 {
 		return nil
 	}
 	if err := unix.PidfdSendSignal(tracker.nestedPIDFD, 0, nil, 0); err != nil {
@@ -183,6 +205,7 @@ func (tracker *supervisorControlTracker) close() {
 	}
 	tracker.nestedPID = 0
 	tracker.nestedPIDFD = -1
+	tracker.nestedGroupVerified = false
 }
 
 func supervisorEnvironment(environment []string) []string {

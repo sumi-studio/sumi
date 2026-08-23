@@ -3437,6 +3437,14 @@ case "$*" in
     done
     exit 0
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in allocator prepare runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
@@ -3712,6 +3720,14 @@ case "$*" in
     done
     exit 0
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.prepare.yaml up --detach --wait")
     touch \
       "$SUMI_FAKE_MARKERS/runtime" \
@@ -3833,6 +3849,9 @@ case "$*" in
     ;;
   *"compose.lifecycle.yaml ps --all --quiet")
     [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]]
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]] || printf 'fake-container-runtime\n'
     ;;
   *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted" "$SUMI_FAKE_MARKERS/runtime"
@@ -4102,7 +4121,8 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
         unavailable_host("GNU timeout is required to bound the prepare capability gate");
         return;
     }
-    let docker_workdir = deploy_dir().parent().unwrap().parent().unwrap();
+    let deploy = deploy_dir();
+    let docker_workdir = deploy.parent().unwrap().parent().unwrap();
     if !bounded_docker_output(docker_workdir, 30, &["info".into()])
         .status
         .success()

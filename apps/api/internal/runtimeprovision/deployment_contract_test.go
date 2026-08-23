@@ -1134,7 +1134,7 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	}
 	for _, row := range []string{
 		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance + TERM grace Docker process group (all descendants)",
-		"ps --all --quiet none verification timeout + TERM grace Docker process group (all descendants)",
+		"ps --all --filter project-label none verification timeout + TERM grace Docker process group (all descendants)",
 	} {
 		if !strings.Contains(compactSupervisor, row) {
 			t.Fatalf("supervisor cleanup group-deadline table omits %q:\n%s", row, compactSupervisor)
@@ -1143,8 +1143,14 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	if !strings.Contains(compactSupervisor, "cleanup_down_lifecycle_compose down --remove-orphans --timeout \"${SUMI_COMPOSE_TIMEOUT}\"") {
 		t.Fatalf("cleanup down is not subject to the advertised timeout: %s", compactSupervisor)
 	}
-	if !strings.Contains(compactSupervisor, "containers=\"$(cleanup_verification_lifecycle_compose ps --all --quiet 2>/dev/null)\"") {
-		t.Fatalf("cleanup emptiness verification is not subject to the advertised timeout: %s", compactSupervisor)
+	for _, required := range []string{
+		`output="$(cleanup_verification_docker ps --all`,
+		`--filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}"`,
+		`--format '{{.ID}}' 2>/dev/null)"`,
+	} {
+		if !strings.Contains(compactSupervisor, required) {
+			t.Fatalf("direct project-label absence proof is not subject to the advertised timeout; missing %q: %s", required, compactSupervisor)
+		}
 	}
 	for _, required := range []string{
 		"deadline_milliseconds=$(( $(monotonic_time_milliseconds) + (timeout_seconds + kill_grace_seconds) * MILLISECONDS_PER_SECOND ))",
@@ -1160,9 +1166,6 @@ func TestSupervisorCleanupKillsForkedDockerChildAfterLeaderExit(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
 	}
-	if _, err := exec.LookPath("perl"); err != nil {
-		t.Skip("perl is required to hold a cleanup process group outside a new session")
-	}
 	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
 		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
 	}
@@ -1171,7 +1174,6 @@ func TestSupervisorCleanupKillsForkedDockerChildAfterLeaderExit(t *testing.T) {
 	dockerLog := filepath.Join(testRoot, "docker.log")
 	prepareReady := filepath.Join(testRoot, "prepare-ready")
 	hangCleanupDown := filepath.Join(testRoot, "hang-cleanup-down")
-	forceUnisolatedCleanup := filepath.Join(testRoot, "force-unisolated-cleanup")
 	cleanupDownStarted := filepath.Join(testRoot, "cleanup-down-started")
 	cleanupChildPID := filepath.Join(testRoot, "cleanup-child-pid")
 	fakeDocker := filepath.Join(testRoot, "docker")
@@ -1193,24 +1195,6 @@ case "$*" in
 esac
 `
 	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	fakeSetsid := filepath.Join(testRoot, "setsid")
-	fakeSetsidScript := `#!/bin/sh
-set -eu
-case "$*" in
-  *"compose.lifecycle.yaml"*)
-    if [ -e "$SUMI_FORCE_UNISOLATED_CLEANUP" ]; then
-      # Keep the child process group alive but outside a new session. This
-      # makes the supervisor's /proc isolation probe consume its full normal
-      # budget before the process-group cleanup path takes over.
-      exec /usr/bin/perl -MPOSIX -e 'POSIX::setpgid(0, 0) or die "$!\n"; exec @ARGV' "$@"
-    fi
-    ;;
-esac
-exec /usr/bin/setsid "$@"
-`
-	if err := os.WriteFile(fakeSetsid, []byte(fakeSetsidScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	fakeStat := filepath.Join(testRoot, "stat")
@@ -1248,7 +1232,6 @@ exec /usr/bin/stat "$@"
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
 		"SUMI_PREPARE_READY=" + prepareReady,
 		"SUMI_HANG_CLEANUP_DOWN=" + hangCleanupDown,
-		"SUMI_FORCE_UNISOLATED_CLEANUP=" + forceUnisolatedCleanup,
 		"SUMI_CLEANUP_DOWN_STARTED=" + cleanupDownStarted,
 		"SUMI_CLEANUP_CHILD_PID=" + cleanupChildPID,
 		"SUMI_SUPERVISOR_CONTROL_FD=3",
@@ -1267,9 +1250,6 @@ exec /usr/bin/stat "$@"
 	}
 	waitForSupervisorFile(t, prepareReady, 5*time.Second)
 	if err := os.WriteFile(hangCleanupDown, []byte("hang"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(forceUnisolatedCleanup, []byte("force"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1298,6 +1278,7 @@ exec /usr/bin/stat "$@"
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertBalancedNestedLifecycle(t, controlOutput)
 	match := regexp.MustCompile(`(?m)^cleanup-bound-ms ([0-9]+)$`).FindSubmatch(controlOutput)
 	if match == nil {
 		t.Fatalf("supervisor did not advertise cleanup bound: control=%s output=%s", controlOutput, output.String())
@@ -1425,6 +1406,45 @@ func waitForSupervisorFile(t *testing.T, path string, limit time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", path)
+}
+
+func assertBalancedNestedLifecycle(t *testing.T, output []byte) {
+	t.Helper()
+	var active string
+	var starts int
+	var readies int
+	ready := false
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || (fields[0] != "nested-start" && fields[0] != "nested-ready" && fields[0] != "nested-done") {
+			continue
+		}
+		if fields[0] == "nested-start" {
+			if active != "" {
+				t.Fatalf("nested lifecycle overlapped %s with %s: %s", active, fields[1], output)
+			}
+			active = fields[1]
+			ready = false
+			starts++
+			continue
+		}
+		if fields[0] == "nested-ready" {
+			if active == "" || active != fields[1] || ready {
+				t.Fatalf("nested group verification was not ordered for %s while %s was active: %s", fields[1], active, output)
+			}
+			ready = true
+			readies++
+			continue
+		}
+		if active == "" || active != fields[1] {
+			t.Fatalf("nested lifecycle completed %s while %s was active: %s", fields[1], active, output)
+		}
+		active = ""
+		ready = false
+	}
+	if starts == 0 || readies == 0 || active != "" {
+		t.Fatalf("nested lifecycle was not balanced and verified: starts=%d readies=%d active=%q output=%s", starts, readies, active, output)
+	}
 }
 
 func readSupervisorPID(t *testing.T, path string) int {
