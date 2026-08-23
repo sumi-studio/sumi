@@ -3533,13 +3533,8 @@ mod tests {
                 exact_projection.contains(INVITE_CODE_SENTINEL),
                 "{id} must preserve exact local Human review content"
             );
-            let provider_projection = serde_json::to_string(&bound.provider_review_projection)
-                .expect("provider-safe projection");
-            assert_eq!(
-                provider_projection.matches(INVITE_CODE_SENTINEL).count(),
-                0,
-                "{id} leaked through the provider-safe projection"
-            );
+            let evidence = serde_json::to_value(&bound).expect("bound Messaging evidence");
+            assert!(evidence.get("provider_review_projection").is_none());
 
             let human_request = PendingApprovalRequest::from_bound(
                 format!("approval-{id}"),

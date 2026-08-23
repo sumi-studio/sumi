@@ -939,11 +939,16 @@ mod tests {
             self.bind_count.fetch_add(1, Ordering::Relaxed);
             Ok(ToolBinding::new(
                 AppActionDescriptor::new(
-                    "inspect",
+                    "inspect_opaque_record",
                     CapabilityClass::Read,
-                    vec![ResourceScope::collection("test", "item")],
+                    vec![ResourceScope::collection(
+                        "third_party.audit",
+                        "opaque_subject",
+                    )],
                 )?,
-                ReviewProjection::from_value(json!({"operation": "inspect"}))?,
+                ReviewProjection::from_value(json!({
+                    "operation": "inspect_opaque_record"
+                }))?,
                 BoundExecutionArguments::from_value(Value::Object(ctx.args.as_object().clone()))?,
             ))
         }
@@ -1323,6 +1328,20 @@ mod tests {
             .expect("bind invocation");
 
         assert_eq!(
+            sealed.invocation().descriptor,
+            AppActionDescriptor::new(
+                "inspect_opaque_record",
+                CapabilityClass::Read,
+                vec![ResourceScope::collection(
+                    "third_party.audit",
+                    "opaque_subject",
+                )],
+            )
+            .expect("opaque descriptor fixture"),
+            "the live registered adapter, not foundation noun vocabulary, admits the descriptor"
+        );
+
+        assert_eq!(
             origin
                 .validate_bound(&sealed)
                 .expect("origin registry accepts its seal")
@@ -1380,6 +1399,51 @@ mod tests {
             origin.validate_bound(&altered_arguments),
             Err(DescribeError::SealedEvidenceMismatch)
         ));
+
+        let mut altered_descriptors = Vec::new();
+        for label in [
+            "tool name",
+            "operation",
+            "capability",
+            "scope",
+            "adapter id",
+            "adapter version",
+        ] {
+            let mut altered = origin
+                .bind(
+                    &call("call-1", "inspect", json!({"path": "alpha"})),
+                    "flow-1",
+                    &workspace,
+                )
+                .await
+                .expect("bind descriptor mutation fixture");
+            match label {
+                "tool name" => altered.invocation.tool_name = "other_tool".to_owned(),
+                "operation" => altered.invocation.descriptor.operation = "changed".to_owned(),
+                "capability" => altered.invocation.descriptor.capability = CapabilityClass::Mutate,
+                "scope" => {
+                    altered.invocation.descriptor.resource_scopes = vec![ResourceScope::resource(
+                        "third_party.audit",
+                        "opaque_subject",
+                        "changed-id",
+                    )]
+                }
+                "adapter id" => altered.invocation.adapter.id = "other.adapter".to_owned(),
+                "adapter version" => altered.invocation.adapter.version += 1,
+                _ => unreachable!(),
+            }
+            altered_descriptors.push((label, altered));
+        }
+        for (label, altered) in &altered_descriptors {
+            assert!(
+                matches!(
+                    origin.validate_bound(altered),
+                    Err(DescribeError::SealedEvidenceMismatch
+                        | DescribeError::RegistryIdentityMismatch)
+                ),
+                "individual {label} tamper was accepted"
+            );
+        }
 
         let mut altered_flow = origin
             .bind(
