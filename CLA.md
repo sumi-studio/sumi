@@ -1,5 +1,9 @@
 # Sumi Contributor License Agreement (CLA)
 
+A Japanese translation is provided in CLA.ja.md for reference only.
+The English version is the authoritative legal text and prevails in
+case of any discrepancy.
+
 Thank you for your interest in contributing to Sumi ("the Project"),
 owned by Hakumei Iro no Wasureji ("the Owner").
 
