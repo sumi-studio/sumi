@@ -1311,7 +1311,7 @@ exec /usr/bin/stat "$@"
 	var waitErr error
 	select {
 	case waitErr = <-done:
-	case <-time.After(8 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("supervisor cleanup did not bound a hung docker compose down")
 	}
 	elapsed := time.Since(started)
@@ -1321,9 +1321,11 @@ exec /usr/bin/stat "$@"
 	waitForSupervisorFile(t, cleanupDownStarted, time.Second)
 	childPID := readSupervisorPID(t, cleanupChildPID)
 	waitForSupervisorProcessGone(t, childPID, 2*time.Second)
-	// This tighter assertion makes the fake daemon hang observable. The
-	// advertised bound also includes three retries and conservative host margin.
-	if elapsed > 8*time.Second {
+	// This tighter assertion makes the fake daemon hang observable while
+	// reserving the exact descendant join and control acknowledgement after the
+	// eight-second down/TERM/force group budget. The advertised bound also
+	// includes retries and conservative host margin.
+	if elapsed > 10*time.Second {
 		t.Fatalf("forked cleanup child escaped its process-group deadline: cleanup took %s", elapsed)
 	}
 }

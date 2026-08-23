@@ -42,6 +42,32 @@ func startTestAnchor(t *testing.T, script string, environment ...string) *exec.C
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if command.ProcessState != nil && command.ProcessState.Exited() {
+			return
+		}
+		// A failed assertion must not strand a stopped anchor or one of its
+		// detached adopted descendants on the host running the test suite.
+		_ = command.Process.Signal(syscall.SIGCONT)
+		_ = command.Process.Signal(syscall.SIGTERM)
+		_ = command.Process.Signal(syscall.SIGUSR2)
+		done := make(chan struct{})
+		go func() {
+			_, _ = command.Process.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Second):
+		}
+		_ = signalContainedDescendants(command.Process.Pid, syscall.SIGKILL)
+		_ = command.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	})
 	return command
 }
 
@@ -128,6 +154,22 @@ func TestAnchorWaitsForOrdinaryHelperAfterLeaderExit(t *testing.T) {
 	}
 }
 
+func TestAnchorWaitsForDetachedDescendantAfterLeaderExit(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "detached-done")
+	command := startTestAnchor(t, `setsid /bin/bash -c 'sleep 0.15; printf done >"$MARKER"' & exit 0`, "MARKER="+marker)
+	continueAnchor(t, command)
+	started := time.Now()
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) < 100*time.Millisecond {
+		t.Fatal("anchor exited before a detached descendant was reaped")
+	}
+	if raw, err := os.ReadFile(marker); err != nil || string(raw) != "done" {
+		t.Fatalf("detached descendant did not finish: %q %v", raw, err)
+	}
+}
+
 func TestAnchorForceKillsTermResistantLeaderFirstHelperBeforeExit(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "ready")
 	command := startTestAnchor(t, `(trap '' TERM; printf ready >"$READY"; while :; do sleep 1; done) & exit 0`, "READY="+ready)
@@ -154,6 +196,32 @@ func TestAnchorForceKillsTermResistantLeaderFirstHelperBeforeExit(t *testing.T) 
 	}
 	if err := syscall.Kill(-command.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("anchor reported done before exact group absence: %v", err)
+	}
+}
+
+func TestAnchorForceKillsDetachedAdoptedDescendantBeforeExit(t *testing.T) {
+	ready := filepath.Join(t.TempDir(), "detached-ready")
+	command := startTestAnchor(t, `setsid /bin/bash -c 'trap "" TERM; printf ready >"$READY"; while :; do sleep 1; done' & exit 0`, "READY="+ready)
+	continueAnchor(t, command)
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("detached TERM-resistant descendant did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := command.Process.Signal(syscall.SIGUSR2); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("terminated anchor unexpectedly reported success")
 	}
 }
 

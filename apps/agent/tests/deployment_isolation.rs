@@ -721,6 +721,13 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env(
             "SUMI_LOCAL_CONTROL_HOST_DIR",
             fixture.control_socket.parent().unwrap(),
+        )
+        .env(
+            "SUMI_RUNTIME_SECRET_HOST_DIR",
+            fixture
+                .runtime_secret_root
+                .join(fixture.paid.replace('-', ""))
+                .join("acceptance-cleanup"),
         );
     preserve_docker_transport(command);
 }
@@ -3715,6 +3722,8 @@ fn interrupted_up_joins_partial_roles_and_returns_signal_status() {
         std::fs::create_dir_all(&markers).unwrap();
         let fake_docker = bin.join("docker");
         let script = r#"#!/bin/bash -p
+# The supervisor control socket is never Docker/plugin authority.
+[[ ! -e /proc/$$/fd/3 ]] || exit 96
 # Every idle loop below waits on a backgrounded sleep. Bash defers a trap until
 # the running foreground command returns, so `sleep 1` in the foreground would
 # make this fake answer SIGTERM up to a second late per level for reasons that
@@ -3857,7 +3866,21 @@ fn tracked_launch_fails_closed_when_the_child_is_not_a_session_group_leader() {
     let markers = root.join("markers");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&markers).unwrap();
-    std::fs::write(bin.join("setsid"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::write(
+        bin.join("setsid"),
+        r#"#!/bin/bash
+case "$*" in
+  *"compose.prepare.yaml up --detach --wait"*)
+    touch "$SUMI_FAKE_MARKERS/up-attempted"
+    exec "$@"
+    ;;
+  *)
+    exec /usr/bin/setsid "$@"
+    ;;
+esac
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(bin.join("setsid"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let fake_docker = bin.join("docker");
     let script = r#"#!/bin/bash
@@ -3885,7 +3908,7 @@ case "$*" in
     [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]] || printf 'fake-container-runtime\n'
     ;;
   *"compose.prepare.yaml up --detach --wait")
-    touch "$SUMI_FAKE_MARKERS/up-attempted" "$SUMI_FAKE_MARKERS/runtime"
+    touch "$SUMI_FAKE_MARKERS/runtime"
     while true; do sleep 1 & wait $!; done
     ;;
   *)

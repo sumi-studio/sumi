@@ -1,7 +1,7 @@
 //go:build linux
 
-// Package composeanchor keeps a Compose invocation's process-group identity
-// alive until every other member of that group has disappeared.
+// Package composeanchor keeps a Compose invocation's process tree attached to
+// a child subreaper until the kernel reports that no descendant remains.
 package composeanchor
 
 import (
@@ -66,6 +66,8 @@ func Run(argv []string) error {
 
 	var commandErr error
 	commandDone := false
+	descendantsAbsent := false
+	var descendantsDone <-chan error
 	terminating := false
 	forcing := false
 	var containmentErr error
@@ -80,10 +82,14 @@ func Run(argv []string) error {
 			}
 		case commandErr = <-waited:
 			commandDone = true
+			done := make(chan error, 1)
+			descendantsDone = done
+			go func() { done <- waitForDescendantAbsence() }()
+		case err := <-descendantsDone:
+			descendantsAbsent = true
+			descendantsDone = nil
+			containmentErr = errors.Join(containmentErr, err)
 		case <-ticker.C:
-		}
-		if commandDone {
-			reapExitedChildren()
 		}
 
 		if terminating {
@@ -91,16 +97,17 @@ func Run(argv []string) error {
 			if forcing {
 				signal = syscall.SIGKILL
 			}
-			if err := signalOtherGroupMembers(pid, signal); err != nil {
+			if !commandDone {
+				if err := command.Process.Signal(signal); err != nil && !errors.Is(err, os.ErrProcessDone) &&
+					!errors.Is(err, syscall.ESRCH) {
+					containmentErr = errors.Join(containmentErr, fmt.Errorf("signal anchored command: %w", err))
+				}
+			}
+			if err := signalContainedDescendants(pid, signal); err != nil {
 				containmentErr = errors.Join(containmentErr, err)
 			}
 		}
-		members, err := otherGroupMembers(pid)
-		if err != nil {
-			containmentErr = errors.Join(containmentErr, err)
-			continue
-		}
-		if commandDone && len(members) == 0 {
+		if commandDone && descendantsAbsent {
 			if terminating {
 				return errors.Join(fmt.Errorf("anchored command terminated: %w", commandErr), containmentErr)
 			}
@@ -109,23 +116,48 @@ func Run(argv []string) error {
 	}
 }
 
-func reapExitedChildren() {
+// waitForDescendantAbsence uses the child-subreaper contract as the emptiness
+// proof. Once the command leader has been reaped, every surviving descendant
+// is either a direct child or has a living ancestor that is a direct child.
+// The kernel reparents descendants before reporting their parent's exit, so
+// wait4 returning ECHILD is an atomic proof that the anchored tree is empty.
+func waitForDescendantAbsence() error {
 	for {
 		var status unix.WaitStatus
-		pid, err := unix.Wait4(-1, &status, unix.WNOHANG, nil)
-		if pid <= 0 || err != nil {
-			return
+		pid, err := unix.Wait4(-1, &status, 0, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if errors.Is(err, syscall.ECHILD) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("wait for anchored descendants: %w", err)
+		}
+		if pid <= 0 {
+			return errors.New("wait for anchored descendants returned no child")
 		}
 	}
 }
 
-func signalOtherGroupMembers(group int, signal syscall.Signal) error {
+func signalContainedDescendants(group int, signal syscall.Signal) error {
 	members, err := otherGroupMembers(group)
 	if err != nil {
 		return err
 	}
-	var result error
+	direct, err := directChildren(group)
+	if err != nil {
+		return err
+	}
+	seen := make(map[int]struct{}, len(members)+len(direct))
 	for _, pid := range members {
+		seen[pid] = struct{}{}
+	}
+	for pid := range direct {
+		seen[pid] = struct{}{}
+	}
+	var result error
+	for pid := range seen {
 		pidfd, err := unix.PidfdOpen(pid, 0)
 		if err != nil {
 			if errors.Is(err, syscall.ESRCH) {
@@ -137,7 +169,18 @@ func signalOtherGroupMembers(group int, signal syscall.Signal) error {
 		// Recheck membership after acquiring the stable handle. A process that
 		// exited or changed groups between the scan and pidfd_open is not ours.
 		member, checkErr := processInGroup(pid, group)
-		if checkErr == nil && member {
+		startTime, adopted := direct[pid]
+		if adopted {
+			identity, identityErr := readProcessStatIdentity(pid)
+			if identityErr != nil || identity.ppid != group || identity.startTime != startTime {
+				_ = unix.Close(pidfd)
+				if identityErr != nil && !errors.Is(identityErr, os.ErrNotExist) {
+					result = errors.Join(result, fmt.Errorf("recheck adopted child %d: %w", pid, identityErr))
+				}
+				continue
+			}
+		}
+		if adopted || (checkErr == nil && member) {
 			if err := unix.PidfdSendSignal(pidfd, signal, nil, 0); err != nil && !errors.Is(err, syscall.ESRCH) {
 				result = errors.Join(result, fmt.Errorf("signal group member %d: %w", pid, err))
 			}
@@ -145,6 +188,40 @@ func signalOtherGroupMembers(group int, signal syscall.Signal) error {
 		_ = unix.Close(pidfd)
 	}
 	return result
+}
+
+func directChildren(anchor int) (map[int]uint64, error) {
+	tasks, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(anchor), "task"))
+	if err != nil {
+		return nil, fmt.Errorf("scan anchor tasks for direct children: %w", err)
+	}
+	seen := make(map[int]uint64)
+	for _, task := range tasks {
+		raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(anchor), "task", task.Name(), "children"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("read anchor direct children: %w", err)
+		}
+		for _, field := range strings.Fields(string(raw)) {
+			pid, err := strconv.Atoi(field)
+			if err != nil || pid <= 0 {
+				return nil, errors.New("kernel returned an invalid direct-child PID")
+			}
+			identity, err := readProcessStatIdentity(pid)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return nil, fmt.Errorf("inspect anchor direct child: %w", err)
+			}
+			if identity.ppid == anchor {
+				seen[pid] = identity.startTime
+			}
+		}
+	}
+	return seen, nil
 }
 
 func otherGroupMembers(group int) ([]int, error) {
@@ -167,26 +244,48 @@ func otherGroupMembers(group int) ([]int, error) {
 }
 
 func processInGroup(pid, group int) (bool, error) {
-	file, err := os.Open(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	identity, err := readProcessStatIdentity(pid)
 	if err != nil {
 		return false, err
+	}
+	return identity.pgid == group, nil
+}
+
+type processStatIdentity struct {
+	ppid      int
+	pgid      int
+	startTime uint64
+}
+
+func readProcessStatIdentity(pid int) (processStatIdentity, error) {
+	file, err := os.Open(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return processStatIdentity{}, err
 	}
 	defer file.Close()
 	line, err := bufio.NewReader(file).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
+		return processStatIdentity{}, err
 	}
 	closeParen := strings.LastIndex(line, ") ")
 	if closeParen < 0 {
-		return false, errors.New("malformed process stat")
+		return processStatIdentity{}, errors.New("malformed process stat")
 	}
 	fields := strings.Fields(line[closeParen+2:])
-	if len(fields) < 4 {
-		return false, errors.New("short process stat")
+	if len(fields) < 20 {
+		return processStatIdentity{}, errors.New("short process stat")
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return processStatIdentity{}, err
 	}
 	pgid, err := strconv.Atoi(fields[2])
 	if err != nil {
-		return false, err
+		return processStatIdentity{}, err
 	}
-	return pgid == group, nil
+	startTime, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil || startTime == 0 {
+		return processStatIdentity{}, errors.New("invalid process start time")
+	}
+	return processStatIdentity{ppid: ppid, pgid: pgid, startTime: startTime}, nil
 }
