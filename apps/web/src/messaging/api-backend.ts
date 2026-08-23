@@ -847,7 +847,7 @@ function parseMessage(value: unknown): Message {
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
-    revision: asSeq(wire.revision),
+    revision: asRevision(wire.revision),
     deleted: asBoolean(wire.deleted),
   };
 }
@@ -913,6 +913,11 @@ function asSeq(value: unknown): number {
     throw new Error("invalid messaging sequence");
   }
   return Number(value);
+}
+function asRevision(value: unknown): number {
+  const revision = asSeq(value);
+  if (revision < 1) throw new Error("invalid messaging revision");
+  return revision;
 }
 function asTimestamp(value: unknown): number {
   const parsed = Date.parse(asString(value));

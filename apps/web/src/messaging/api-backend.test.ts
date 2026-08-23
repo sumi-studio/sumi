@@ -60,6 +60,20 @@ afterEach(() => {
 });
 
 describe("ApiMessagingBackend", () => {
+  it("rejects zero message revisions before they can become a CAS base", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({ messages: [{ ...messageWire(1, "invalid"), revision: 0 }] }),
+      ),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(backend.fetchMessages(channel)).rejects.toThrow(
+      "invalid messaging revision",
+    );
+  });
+
   it("rejects attachment wires that omit required spoiler or alt declarations", async () => {
     for (const missing of ["spoiler", "alt"] as const) {
       const attachment: Record<string, unknown> = {
