@@ -293,16 +293,17 @@ pub(crate) struct BoundExecutionArguments(Map<String, Value>);
 
 impl BoundExecutionArguments {
     pub(crate) fn from_value(value: Value) -> Result<Self, DescribeError> {
-        let Value::Object(arguments) = value else {
+        if !value.is_object() {
             return Err(DescribeError::InvalidBoundArguments {
                 reason: "bound execution arguments must be a JSON object".to_owned(),
             });
+        }
+        validate_bound_json(&value, "bound execution arguments", |reason| {
+            DescribeError::InvalidBoundArguments { reason }
+        })?;
+        let Value::Object(arguments) = value else {
+            unreachable!("bound execution arguments were checked as an object")
         };
-        validate_bound_json(
-            &Value::Object(arguments.clone()),
-            "bound execution arguments",
-            |reason| DescribeError::InvalidBoundArguments { reason },
-        )?;
         Ok(Self(arguments))
     }
 
@@ -322,16 +323,17 @@ pub(crate) struct ReviewProjection(Map<String, Value>);
 
 impl ReviewProjection {
     pub(crate) fn from_value(value: Value) -> Result<Self, DescribeError> {
-        let Value::Object(projection) = value else {
+        if !value.is_object() {
             return Err(DescribeError::InvalidReviewProjection {
                 reason: "review projection must be a JSON object".to_owned(),
             });
+        }
+        validate_bound_json(&value, "review projection", |reason| {
+            DescribeError::InvalidReviewProjection { reason }
+        })?;
+        let Value::Object(projection) = value else {
+            unreachable!("review projection was checked as an object")
         };
-        validate_bound_json(
-            &Value::Object(projection.clone()),
-            "review projection",
-            |reason| DescribeError::InvalidReviewProjection { reason },
-        )?;
         Ok(Self(projection))
     }
 
@@ -531,13 +533,13 @@ impl BoundToolInvocation {
         validate_proposal_label(tool_name, "tool name")?;
         adapter.validate()?;
         binding.descriptor.normalize_and_validate()?;
-        validate_bound_json(
-            &Value::Object(binding.review_projection.as_object().clone()),
+        validate_bound_json_object(
+            binding.review_projection.as_object(),
             "review projection",
             |reason| DescribeError::InvalidReviewProjection { reason },
         )?;
-        validate_bound_json(
-            &Value::Object(binding.execution_arguments.as_object().clone()),
+        validate_bound_json_object(
+            binding.execution_arguments.as_object(),
             "bound execution arguments",
             |reason| DescribeError::InvalidBoundArguments { reason },
         )?;
@@ -856,7 +858,29 @@ fn validate_bound_json<E>(
     field: &str,
     invalid: impl Fn(String) -> E,
 ) -> Result<(), E> {
-    let mut stack = vec![(value, 1_usize)];
+    validate_bound_json_root(BoundJsonRef::Value(value), field, invalid)
+}
+
+fn validate_bound_json_object<E>(
+    object: &Map<String, Value>,
+    field: &str,
+    invalid: impl Fn(String) -> E,
+) -> Result<(), E> {
+    validate_bound_json_root(BoundJsonRef::Object(object), field, invalid)
+}
+
+#[derive(Clone, Copy)]
+enum BoundJsonRef<'a> {
+    Value(&'a Value),
+    Object(&'a Map<String, Value>),
+}
+
+fn validate_bound_json_root<E>(
+    root: BoundJsonRef<'_>,
+    field: &str,
+    invalid: impl Fn(String) -> E,
+) -> Result<(), E> {
+    let mut stack = vec![(root, 1_usize)];
     let mut nodes = 0_usize;
     while let Some((value, depth)) = stack.pop() {
         nodes = nodes.saturating_add(1);
@@ -871,7 +895,7 @@ fn validate_bound_json<E>(
             )));
         }
         match value {
-            Value::String(text) => {
+            BoundJsonRef::Value(Value::String(text)) => {
                 if text.len() > MAX_BOUND_STRING_BYTES {
                     return Err(invalid(format!(
                         "{field} string values must not exceed {MAX_BOUND_STRING_BYTES} bytes"
@@ -885,15 +909,19 @@ fn validate_bound_json<E>(
                     )));
                 }
             }
-            Value::Array(values) => {
+            BoundJsonRef::Value(Value::Array(values)) => {
                 if values.len() > MAX_BOUND_CONTAINER_ITEMS {
                     return Err(invalid(format!(
                         "{field} arrays must not exceed {MAX_BOUND_CONTAINER_ITEMS} items"
                     )));
                 }
-                stack.extend(values.iter().map(|value| (value, depth + 1)));
+                stack.extend(
+                    values
+                        .iter()
+                        .map(|value| (BoundJsonRef::Value(value), depth + 1)),
+                );
             }
-            Value::Object(object) => {
+            BoundJsonRef::Value(Value::Object(object)) | BoundJsonRef::Object(object) => {
                 if object.len() > MAX_BOUND_CONTAINER_ITEMS {
                     return Err(invalid(format!(
                         "{field} objects must not exceed {MAX_BOUND_CONTAINER_ITEMS} fields"
@@ -905,14 +933,18 @@ fn validate_bound_json<E>(
                             "{field} field names must be at most {MAX_LABEL_BYTES} bytes and contain no control characters"
                         )));
                     }
-                    stack.push((value, depth + 1));
+                    stack.push((BoundJsonRef::Value(value), depth + 1));
                 }
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            BoundJsonRef::Value(Value::Null | Value::Bool(_) | Value::Number(_)) => {}
         }
     }
     let mut size = CappedJsonSizeWriter::default();
-    if let Err(error) = serde_json::to_writer(&mut size, value) {
+    let encoded = match root {
+        BoundJsonRef::Value(value) => serde_json::to_writer(&mut size, value),
+        BoundJsonRef::Object(object) => serde_json::to_writer(&mut size, object),
+    };
+    if let Err(error) = encoded {
         if size.exceeded {
             return Err(invalid(format!(
                 "{field} must not exceed {MAX_BOUND_JSON_BYTES} encoded bytes"
@@ -1046,6 +1078,43 @@ mod tests {
             .as_object()
             .unwrap()
             .clone()
+    }
+
+    fn aggregate_bound_json_object() -> Map<String, Value> {
+        assert!(5 * MAX_BOUND_STRING_BYTES > MAX_BOUND_JSON_BYTES);
+        assert!(5 < MAX_BOUND_CONTAINER_ITEMS);
+        assert!(7 < MAX_BOUND_JSON_NODES);
+        assert!(3 < MAX_BOUND_JSON_DEPTH);
+
+        let mut object = Map::new();
+        object.insert(
+            "values".to_owned(),
+            Value::Array(
+                (0..5)
+                    .map(|_| Value::String("x".repeat(MAX_BOUND_STRING_BYTES)))
+                    .collect(),
+            ),
+        );
+        object
+    }
+
+    fn exactly_max_bound_json_object() -> Map<String, Value> {
+        const ENCODED_OVERHEAD: usize = r#"{"values":["","","",""]}"#.len();
+        let final_string_bytes =
+            MAX_BOUND_JSON_BYTES - ENCODED_OVERHEAD - (3 * MAX_BOUND_STRING_BYTES);
+        assert!(final_string_bytes <= MAX_BOUND_STRING_BYTES);
+
+        let mut object = Map::new();
+        object.insert(
+            "values".to_owned(),
+            Value::Array(vec![
+                Value::String("x".repeat(MAX_BOUND_STRING_BYTES)),
+                Value::String("x".repeat(MAX_BOUND_STRING_BYTES)),
+                Value::String("x".repeat(MAX_BOUND_STRING_BYTES)),
+                Value::String("x".repeat(final_string_bytes)),
+            ]),
+        );
+        object
     }
 
     fn seal_generic(
@@ -1432,6 +1501,18 @@ mod tests {
 
     #[test]
     fn descriptor_and_payload_bounds_fail_closed() {
+        assert_eq!(
+            BoundExecutionArguments::from_value(Value::Null),
+            Err(DescribeError::InvalidBoundArguments {
+                reason: "bound execution arguments must be a JSON object".to_owned(),
+            })
+        );
+        assert_eq!(
+            ReviewProjection::from_value(Value::Null),
+            Err(DescribeError::InvalidReviewProjection {
+                reason: "review projection must be a JSON object".to_owned(),
+            })
+        );
         assert!(
             AppActionDescriptor::new(
                 "x".repeat(MAX_LABEL_BYTES + 1),
@@ -1470,18 +1551,83 @@ mod tests {
             }))
             .is_err()
         );
+    }
 
-        let individually_bounded_values = (0..5)
-            .map(|_| Value::String("x".repeat(MAX_BOUND_STRING_BYTES)))
-            .collect::<Vec<_>>();
-        assert!(individually_bounded_values.len() < MAX_BOUND_CONTAINER_ITEMS);
-        assert!(
-            BoundExecutionArguments::from_value(json!({
-                "values": individually_bounded_values
-            }))
-            .is_err(),
-            "aggregate JSON above the cap must fail without allocating an encoded copy"
+    #[test]
+    fn aggregate_bounds_reject_in_constructors_and_seal_without_prevalidation_clones() {
+        let exactly_max = exactly_max_bound_json_object();
+        assert_eq!(
+            serde_json::to_vec(&exactly_max).unwrap().len(),
+            MAX_BOUND_JSON_BYTES
         );
+        validate_bound_json_object(&exactly_max, "exact boundary", |reason| reason).unwrap();
+        BoundExecutionArguments::from_value(Value::Object(exactly_max)).unwrap();
+
+        let execution_error =
+            BoundExecutionArguments::from_value(Value::Object(aggregate_bound_json_object()))
+                .unwrap_err();
+        assert!(matches!(
+            execution_error,
+            DescribeError::InvalidBoundArguments { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
+
+        let projection_error =
+            ReviewProjection::from_value(Value::Object(aggregate_bound_json_object())).unwrap_err();
+        assert!(matches!(
+            projection_error,
+            DescribeError::InvalidReviewProjection { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
+
+        let proposal = json!({"value": "fixture"});
+        let proposal_arguments = proposal.as_object().unwrap();
+        let descriptor = || {
+            AppActionDescriptor::new(
+                "update",
+                CapabilityClass::Mutate,
+                vec![ResourceScope::resource("example", "record", "record-a")],
+            )
+            .unwrap()
+        };
+
+        let seal_projection_error = BoundToolInvocation::seal(
+            "aggregate-projection",
+            "example",
+            proposal_arguments,
+            AdapterIdentity::new("sumi.example", 1).unwrap(),
+            execution_identity("aggregate-flow", "/workspace"),
+            ToolBinding::new(
+                descriptor(),
+                ReviewProjection(aggregate_bound_json_object()),
+                BoundExecutionArguments::from_value(proposal.clone()).unwrap(),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            seal_projection_error,
+            DescribeError::InvalidReviewProjection { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
+
+        let seal_execution_error = BoundToolInvocation::seal(
+            "aggregate-execution",
+            "example",
+            proposal_arguments,
+            AdapterIdentity::new("sumi.example", 1).unwrap(),
+            execution_identity("aggregate-flow", "/workspace"),
+            ToolBinding::new(
+                descriptor(),
+                ReviewProjection::from_value(json!({"value": "fixture"})).unwrap(),
+                BoundExecutionArguments(aggregate_bound_json_object()),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            seal_execution_error,
+            DescribeError::InvalidBoundArguments { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
     }
 
     #[test]
