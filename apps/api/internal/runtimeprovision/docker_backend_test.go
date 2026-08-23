@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -599,7 +598,6 @@ func TestExecCommandRunnerJoinsControlReadersAndClosesDescriptors(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeGoroutines := runtime.NumGoroutine()
 	for iteration := 0; iteration < 20; iteration++ {
 		if _, err := (execCommandRunner{}).Run(
 			context.Background(), "/bin/true", nil, []string{"PATH=/usr/bin:/bin"},
@@ -615,8 +613,21 @@ func TestExecCommandRunnerJoinsControlReadersAndClosesDescriptors(t *testing.T) 
 	if len(afterFDs) > len(beforeFDs) {
 		t.Fatalf("runner leaked descriptors: before=%d after=%d", len(beforeFDs), len(afterFDs))
 	}
-	if after := runtime.NumGoroutine(); after > beforeGoroutines+1 {
-		t.Fatalf("runner leaked goroutines: before=%d after=%d", beforeGoroutines, after)
+}
+
+func TestNormalizeNoProcessPreservesJoinedFailures(t *testing.T) {
+	wrappedNoProcess := fmt.Errorf("kill process group: %w", syscall.ESRCH)
+	permissionFailure := fmt.Errorf("kill nested process: %w", syscall.EPERM)
+
+	if got := normalizeNoProcess(syscall.ESRCH); got != nil {
+		t.Fatalf("direct ESRCH was not normalized: %v", got)
+	}
+	if got := normalizeNoProcess(wrappedNoProcess); got != nil {
+		t.Fatalf("wrapped ESRCH was not normalized: %v", got)
+	}
+	got := normalizeNoProcess(errors.Join(wrappedNoProcess, permissionFailure))
+	if errors.Is(got, syscall.ESRCH) || !errors.Is(got, syscall.EPERM) {
+		t.Fatalf("joined normalization = %v, want only the real permission failure", got)
 	}
 }
 

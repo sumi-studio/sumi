@@ -651,10 +651,8 @@ prepare_compose() {
 
 run_tracked_compose() {
   local compose_file="$1"
-  local require_live_group="$2"
-  shift 2
+  shift
   local status identity
-  : "${require_live_group}"
   setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash \
     compose --project-name "${SUMI_COMPOSE_PROJECT}" --file "${compose_file}" \
     "$@" 3>&- 4>&- &
@@ -664,6 +662,7 @@ run_tracked_compose() {
     terminate_active_compose
     return 125
   fi
+  identity="${TRACKED_COMPOSE_IDENTITY}"
   ACTIVE_COMPOSE_IDENTITY="${identity}"
   ACTIVE_COMPOSE_PROTOCOL_BROKEN=1
   if ! exchange_supervisor_control nested-start "${identity}" ||
@@ -726,7 +725,6 @@ wait_for_tracked_compose_anchor_stopped() {
   local attempt
   for ((attempt = 0; attempt < TRACKED_COMPOSE_ISOLATION_ATTEMPTS; attempt++)); do
     if tracked_compose_anchor_stopped "${pid}"; then
-      identity="${TRACKED_COMPOSE_IDENTITY}"
       return 0
     fi
     tracked_compose_child_is_zombie "${pid}" && return 1
@@ -752,7 +750,6 @@ wait_for_cleanup_compose_anchor_stopped() {
   local deadline_milliseconds="$2"
   while :; do
     if tracked_compose_anchor_stopped "${pid}"; then
-      identity="${TRACKED_COMPOSE_IDENTITY}"
       return 0
     fi
     if tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
@@ -788,10 +785,15 @@ run_bounded_cleanup_docker() {
   # supplies the kernel emptiness proof; the privileged shell ignores BASH_ENV.
   setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash "$@" 3>&- 4>&- &
   pid=$!
-  if ! wait_for_cleanup_compose_anchor_stopped "${pid}" "${normal_deadline_milliseconds}" ||
-    ! exchange_supervisor_control nested-start "${identity}" ||
-    ! exchange_supervisor_control nested-ready "${identity}" ||
-    ! kill -CONT "${pid}"; then
+  if wait_for_cleanup_compose_anchor_stopped "${pid}" "${normal_deadline_milliseconds}"; then
+    identity="${TRACKED_COMPOSE_IDENTITY}"
+    if exchange_supervisor_control nested-start "${identity}" &&
+      exchange_supervisor_control nested-ready "${identity}" &&
+      kill -CONT "${pid}"; then
+      handshake_complete=1
+    fi
+  fi
+  if (( ! handshake_complete )); then
     kill -CONT "${pid}" 2>/dev/null || true
     kill -TERM "${pid}" 2>/dev/null || true
     kill -USR2 "${pid}" 2>/dev/null || true
@@ -805,7 +807,6 @@ run_bounded_cleanup_docker() {
     wait "${pid}" 2>/dev/null || true
     return "${CLEANUP_CONTAINMENT_FAILURE_STATUS}"
   fi
-  handshake_complete=1
 
   while compose_anchor_alive "${pid}"; do
     sleep_cleanup_milliseconds 100 "${normal_deadline_milliseconds}" || break
@@ -1212,14 +1213,14 @@ case "${action}" in
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
-    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
+    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" \
       down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null
     remove_runtime_secret_tree
     prepare_status=0
     # Same bounded stderr contract as activation below: the provisioner captures
     # and value-redacts it on failure. Discarding it left a failed prepare with
     # no stated cause at all.
-    if run_tracked_compose "${PREPARE_COMPOSE_FILE}" 1 up --detach --wait \
+    if run_tracked_compose "${PREPARE_COMPOSE_FILE}" up --detach --wait \
       >/dev/null; then
       prepare_status=0
     else
@@ -1254,7 +1255,7 @@ case "${action}" in
     # The provisioner captures and value-redacts this bounded stderr stream on
     # failure. Keep activation diagnostics available so a daemon rejection is
     # classified instead of collapsing to an opaque timeout.
-    if run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --no-deps \
+    if run_tracked_compose "${COMPOSE_FILE}" up --detach --no-deps \
       executor broker runtime >/dev/null; then
       activation_status=0
     else

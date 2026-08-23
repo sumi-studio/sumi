@@ -1441,45 +1441,6 @@ func waitForSupervisorFile(t *testing.T, path string, limit time.Duration) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
-func assertBalancedNestedLifecycle(t *testing.T, output []byte) {
-	t.Helper()
-	var active string
-	var starts int
-	var readies int
-	ready := false
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || (fields[0] != "nested-start" && fields[0] != "nested-ready" && fields[0] != "nested-done") {
-			continue
-		}
-		if fields[0] == "nested-start" {
-			if active != "" {
-				t.Fatalf("nested lifecycle overlapped %s with %s: %s", active, fields[1], output)
-			}
-			active = fields[1]
-			ready = false
-			starts++
-			continue
-		}
-		if fields[0] == "nested-ready" {
-			if active == "" || active != fields[1] || ready {
-				t.Fatalf("nested group verification was not ordered for %s while %s was active: %s", fields[1], active, output)
-			}
-			ready = true
-			readies++
-			continue
-		}
-		if active == "" || active != fields[1] {
-			t.Fatalf("nested lifecycle completed %s while %s was active: %s", fields[1], active, output)
-		}
-		active = ""
-		ready = false
-	}
-	if starts == 0 || readies == 0 || active != "" {
-		t.Fatalf("nested lifecycle was not balanced and verified: starts=%d readies=%d active=%q output=%s", starts, readies, active, output)
-	}
-}
-
 func readSupervisorPID(t *testing.T, path string) int {
 	t.Helper()
 	raw, err := os.ReadFile(path)

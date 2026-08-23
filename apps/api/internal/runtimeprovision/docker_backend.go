@@ -577,7 +577,7 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 	// command.Wait has not run, so the supervisor PID remains reserved even if
 	// it exits while signals are delivered. Its process-group number therefore
 	// cannot be recycled under either group signal.
-	termErr := syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
+	termErr := normalizeNoProcess(syscall.Kill(-command.Process.Pid, syscall.SIGTERM))
 	grace := tracker.grace(runner.terminationGrace)
 	cleanupDeadline := time.Now().Add(grace)
 	forceDeadline := cleanupDeadline.Add(-supervisorControlDrainJoinReserve)
@@ -617,14 +617,14 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 			}
 		case <-finalTimer.C:
 			cleanupExpired = true
-			killErr = errors.Join(killErr, syscall.Kill(-command.Process.Pid, syscall.SIGKILL))
+			killErr = errors.Join(killErr, normalizeNoProcess(syscall.Kill(-command.Process.Pid, syscall.SIGKILL)))
 			<-exited
 		}
 	}
 	// A child may have kept inherited output descriptors open after the shell
 	// exited. WaitDelay closes those pipes; this final group kill removes any
 	// remaining same-hierarchy descendant before returning.
-	killErr = errors.Join(killErr, syscall.Kill(-command.Process.Pid, syscall.SIGKILL))
+	killErr = errors.Join(killErr, normalizeNoProcess(syscall.Kill(-command.Process.Pid, syscall.SIGKILL)))
 	waitErr := command.Wait()
 	controlErr := drainControl(cleanupDeadline)
 	// Once the supervisor and its control writer are gone, no new anchor can be
@@ -641,13 +641,27 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 		diagnostic = "supervisor cleanup exceeded its advertised bound; host lifecycle state is indeterminate and requires reconciliation; " + diagnostic
 	}
 	return nil, &supervisorCommandError{
-		cause:      errors.Join(ctx.Err(), normalizeNoProcess(termErr), normalizeNoProcess(killErr), waitErr),
+		cause:      errors.Join(ctx.Err(), termErr, killErr, waitErr),
 		diagnostic: diagnostic,
 	}
 }
 
 func normalizeNoProcess(err error) error {
-	if err == syscall.ESRCH {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		parts := joined.Unwrap()
+		normalized := make([]error, 0, len(parts))
+		for _, part := range parts {
+			normalized = append(normalized, normalizeNoProcess(part))
+		}
+		return errors.Join(normalized...)
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		if wrapped := errors.Unwrap(err); wrapped != nil {
+			return normalizeNoProcess(wrapped)
+		}
 		return nil
 	}
 	return err
