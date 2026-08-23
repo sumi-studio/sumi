@@ -164,6 +164,9 @@ tree_entries="$(git_clean ls-tree -r "${EXPECTED_TREE}")" || fail "cannot inspec
 if awk '$1 == "160000" && $2 == "commit" { found = 1 } END { exit !found }' <<< "${tree_entries}"; then
   fail "pinned tree contains submodules; exact recursive export is not supported"
 fi
+if awk '$1 == "120000" && $2 == "blob" { found = 1 } END { exit !found }' <<< "${tree_entries}"; then
+  fail "pinned tree contains symbolic links; exact build-context path containment is not supported"
+fi
 lfs_policy="$({
   git_clean ls-tree -r -z --name-only "${EXPECTED_TREE}" |
     git_clean check-attr -z --stdin --source="${ACCEPTED_COMMIT}" filter |

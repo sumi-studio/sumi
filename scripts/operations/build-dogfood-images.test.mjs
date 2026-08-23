@@ -9,6 +9,7 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -133,8 +134,15 @@ subject="$5"
 if [[ "$format" == '{{.Id}}' ]]; then
   repository="\${subject%:*}"
   role="\${repository##*-}"
+  if [[ "\${FAKE_HANG_BINDING_ROLE:-}" == "$role" ]]; then
+    printf '%s' "\${FAKE_DOCKER_SECRET:-}" >&2
+    exec sleep 60
+  fi
   if [[ "\${FAKE_REMOVE_TAG_ROLE:-}" == "$role" ]]; then exit 1; fi
-  if [[ "\${FAKE_RETAG_ROLE:-}" == "$role" || ( "\${FAKE_RETAG_AFTER_API:-}" == 1 && "$role" == api && -e "\${FAKE_RETAG_MARKER}" ) ]]; then printf 'sha256:%064s\\n' '' | tr ' ' e; else role_id "$role"; printf '\\n'; fi
+  if [[ "\${FAKE_ALIAS_ALL_BINDINGS:-}" == 1 ]]; then
+    role_id api
+    printf '\\n'
+  elif [[ "\${FAKE_RETAG_ROLE:-}" == "$role" || ( "\${FAKE_RETAG_AFTER_API:-}" == 1 && "$role" == api && -e "\${FAKE_RETAG_MARKER}" ) ]]; then printf 'sha256:%064s\\n' '' | tr ' ' e; else role_id "$role"; printf '\\n'; fi
   exit 0
 fi
 [[ "$format" == '{{json .}}' ]]
@@ -396,7 +404,7 @@ test("evidence parent must be owner-only", async () => {
   });
 });
 
-test("submodule and Git LFS trees fail closed before export", async (t) => {
+test("submodule, symlink, and Git LFS trees fail closed before export", async (t) => {
   await t.test("submodule", async () => {
     await withFixture(async (fixture) => {
       const child = join(fixture.container, "child");
@@ -421,6 +429,26 @@ test("submodule and Git LFS trees fail closed before export", async (t) => {
       await assert.rejects(stat(fixture.log), { code: "ENOENT" });
     });
   });
+  for (const [name, target] of [
+    ["path-escaping symlink", "../../outside-secret"],
+    ["benign symlink", "tracked.txt"],
+  ]) {
+    await t.test(name, async () => {
+      await withFixture(async (fixture) => {
+        await symlink(
+          target,
+          join(fixture.root, `fixture-${name.replaceAll(" ", "-")}`),
+        );
+        await git(fixture.root, ["add", "."]);
+        await refreshFixtureCommit(fixture, `add ${name}`);
+        await assert.rejects(
+          run(fixture, ["--dry-run"]),
+          /contains symbolic links/,
+        );
+        await assert.rejects(stat(fixture.log), { code: "ENOENT" });
+      });
+    });
+  }
   await t.test("Git LFS", async () => {
     await withFixture(async (fixture) => {
       await writeFile(
@@ -501,6 +529,71 @@ test("retag after API build cannot falsify immutable COMPLETE evidence", async (
       ),
       /does not match immutable IID/,
     );
+  });
+});
+
+test("live binding rejects four tags aliased to one component IID", async () => {
+  await withFixture(async (fixture) => {
+    await run(fixture);
+    await assert.rejects(
+      execFileAsync(
+        join(fixture.root, "scripts/operations/verify-dogfood-image-bindings"),
+        [
+          "--manifest",
+          fixture.manifest,
+          "--commit",
+          fixture.sha,
+          "--tree",
+          fixture.tree,
+          "--tag",
+          fixture.sha,
+        ],
+        {
+          cwd: fixture.root,
+          env: { ...fixture.env, FAKE_ALIAS_ALL_BINDINGS: "1" },
+        },
+      ),
+      /does not match immutable IID/,
+    );
+  });
+});
+
+test("live binding inspection times out without exposing Docker output", async () => {
+  await withFixture(async (fixture) => {
+    await run(fixture);
+    const secret = "must-not-escape-docker-stderr";
+    const started = Date.now();
+    let failure;
+    try {
+      await execFileAsync(
+        join(fixture.root, "scripts/operations/verify-dogfood-image-bindings"),
+        [
+          "--manifest",
+          fixture.manifest,
+          "--commit",
+          fixture.sha,
+          "--tree",
+          fixture.tree,
+          "--tag",
+          fixture.sha,
+        ],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.env,
+            FAKE_HANG_BINDING_ROLE: "agent",
+            FAKE_DOCKER_SECRET: secret,
+          },
+        },
+      );
+      assert.fail("non-returning Docker inspection unexpectedly passed");
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(Date.now() - started < 10_000, "binding timeout was not bounded");
+    assert.match(failure.stderr, /requested reference is absent/);
+    assert.doesNotMatch(failure.stderr, new RegExp(secret));
+    assert.doesNotMatch(failure.stdout, new RegExp(secret));
   });
 });
 
@@ -618,6 +711,13 @@ test("closed manifest validation rejects extras, duplicate roles, and malformed 
           value.images[2].id = "sha256:abc";
         },
         /non-canonical immutable IID/,
+      ],
+      [
+        "duplicate IID",
+        (value) => {
+          value.images[1].id = value.images[0].id;
+        },
+        /duplicate immutable IID/,
       ],
       [
         "wrong tree",

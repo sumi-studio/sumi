@@ -58,10 +58,10 @@ the same context for all four builds.
 Ignored and untracked files—including local credentials, `.tfvars`, and native
 build products—never enter the context, and an edit to the live checkout after
 export cannot change a later image. The context is removed on success and on
-failure. The repository currently uses neither submodules nor Git LFS; the
-script fails closed if either policy appears because a plain tracked-tree
-export would otherwise omit submodule content or preserve LFS pointers instead
-of proving the intended bytes.
+failure. The repository currently uses no submodules, symbolic links, or Git
+LFS. The script fails closed if any appears: a plain tracked-tree export would
+otherwise omit submodule content, retain path-indirecting links, or preserve
+LFS pointers instead of proving one contained context of regular tracked files.
 
 Each build writes an isolated Docker `--iidfile`. Inspection addresses that
 canonical image ID, not its mutable tag, and consumes one bounded JSON evidence
@@ -122,10 +122,12 @@ separate provisioner boundary.
 Local Docker tags remain mutable after the manifest is written. Immediately
 before the reviewed cutover, use the closed validator to require the exact
 schema/version/revision/tree, exactly one of each known role, canonical IIDs,
-the exact requested repositories/tags/Dockerfiles, no unknown keys, and current
-reference-to-IID equality. A successful result is only a time-of-check fact; it
-does not lock Docker or exclude unrelated daemon actors. Minimize the interval
-between this check and use, and fail closed on any intervening daemon activity.
+four distinct IIDs, the exact requested repositories/tags/Dockerfiles, no
+unknown keys, and current reference-to-IID equality. Each Docker inspection has
+a five-second timeout and 64-KiB output bound. A successful result is only a
+time-of-check fact; it does not lock Docker or exclude unrelated daemon actors.
+Minimize the interval between this check and use, and fail closed on any
+intervening daemon activity.
 
 ```sh
 MANIFEST="${EVIDENCE_DIR}/images-${SHA}.json"

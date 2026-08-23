@@ -19,6 +19,8 @@ const DOCKERFILES = Object.fromEntries(
 );
 const SHA = /^[0-9a-f]{40}$/;
 const IID = /^sha256:[0-9a-f]{64}$/;
+const DOCKER_INSPECT_TIMEOUT_MS = 5_000;
+const DOCKER_INSPECT_MAX_BUFFER = 64 * 1024;
 
 function fail(message) {
   process.stderr.write(`[sumi-dogfood-image-bindings] ERROR: ${message}\n`);
@@ -110,11 +112,14 @@ if (manifest.build.context_tree !== tree || manifest.build.requested_tag !== tag
 if (!Array.isArray(manifest.images) || manifest.images.length !== ROLES.length) fail("images must contain exactly four roles");
 
 const seen = new Set();
+const seenIds = new Set();
 for (const image of manifest.images) {
   object(image, ["role", "id", "dockerfile", "requested_reference", "labels"], "image");
   if (!ROLES.includes(image.role) || seen.has(image.role)) fail("duplicate, missing, or unknown image role");
   seen.add(image.role);
   if (!IID.test(image.id)) fail(`non-canonical immutable IID for ${image.role}`);
+  if (seenIds.has(image.id)) fail(`duplicate immutable IID for ${image.role}`);
+  seenIds.add(image.id);
   if (image.dockerfile !== DOCKERFILES[image.role]) fail(`wrong Dockerfile for ${image.role}`);
   const reference = `${REPOSITORIES[image.role]}:${tag}`;
   if (image.requested_reference !== reference || image.requested_reference.length > 200) {
@@ -138,7 +143,12 @@ for (const image of manifest.images) {
     actual = execFileSync(
       "docker",
       ["image", "inspect", "--format", "{{.Id}}", image.requested_reference],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_INSPECT_TIMEOUT_MS,
+        maxBuffer: DOCKER_INSPECT_MAX_BUFFER,
+      },
     ).trim();
   } catch {
     fail(`requested reference is absent: ${image.requested_reference}`);
