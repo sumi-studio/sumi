@@ -121,6 +121,12 @@ done
 [[ "${TAG}" == "${COMMIT}" ]] || fail "tag must exactly equal the source commit"
 [[ -n "${MANIFEST}" ]] || fail "--manifest is required"
 
+git_version="$(git_clean version 2>/dev/null)" || fail "Git 2.40 or newer is required"
+if [[ ! "${git_version}" =~ ^git\ version\ ([0-9]+)\.([0-9]+)(\.[0-9]+)?([[:space:]].*)?$ ]] ||
+  ((BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 40))); then
+  fail "Git 2.40 or newer is required"
+fi
+
 [[ "$(pwd -P)" == "${REPOSITORY_ROOT}" ]] || fail "run from the repository root: ${REPOSITORY_ROOT}"
 [[ "$(git_clean rev-parse --show-toplevel 2>/dev/null)" == "${REPOSITORY_ROOT}" ]] ||
   fail "script path is not inside the active repository root"
@@ -225,7 +231,7 @@ git_with_index "${verify_index}" "${BUILD_CONTEXT}" read-tree --empty ||
   fail "cannot initialize context verification index"
 (
   cd "${BUILD_CONTEXT}"
-  git_with_index "${verify_index}" "${BUILD_CONTEXT}" add --all -- .
+  git_with_index "${verify_index}" "${BUILD_CONTEXT}" add --all --force -- .
 ) || fail "cannot hash exported build context"
 exported_tree="$(git_with_index "${verify_index}" "${BUILD_CONTEXT}" write-tree)" ||
   fail "cannot derive exported build tree"

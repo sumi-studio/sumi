@@ -105,9 +105,6 @@ if [[ "\${1:-}" == build ]]; then
   if [[ "\${FAKE_RETAG_AFTER_API:-}" == 1 && "$role" == api ]]; then
     : > "\${FAKE_RETAG_MARKER}"
   fi
-  if [[ -n "\${FAKE_FAIL_ROLE:-}" && "$dockerfile" == "deploy/\${FAKE_FAIL_ROLE}/Dockerfile" ]]; then
-    exit 42
-  fi
   if [[ "\${FAKE_FAIL_ROLE:-}" == "$role" ]]; then exit 42; fi
   if [[ "\${FAKE_BAD_IID_ROLE:-}" == "$role" ]]; then
     printf '%s\\n%s\\n' "$(role_id "$role")" 'injected'
@@ -359,6 +356,20 @@ test("all builds use one exported tree and exclude live edits and ignored secret
     assert.equal(contexts.length, 4);
     assert.equal(new Set(contexts).size, 1);
     await assert.rejects(stat(dirname(contexts[0])), { code: "ENOENT" });
+  });
+});
+
+test("a tracked path matched by ignore rules remains in the exact exported tree", async () => {
+  await withFixture(async (fixture) => {
+    await writeFile(join(fixture.root, "tracked-input.tfvars"), "nonsecret\n");
+    await git(fixture.root, ["add", "--force", "tracked-input.tfvars"]);
+    await refreshFixtureCommit(fixture, "track an ignored build input");
+
+    await run(fixture);
+
+    const manifest = JSON.parse(await readFile(fixture.manifest, "utf8"));
+    assert.equal(manifest.status, "COMPLETE");
+    assert.equal(manifest.source.tree, fixture.tree);
   });
 });
 

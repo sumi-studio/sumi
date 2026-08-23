@@ -17,6 +17,8 @@ accepted commit that predates these scripts cannot be built by checking out
 that commit and invoking a script only present in a later worktree. Use a clean
 checkout at exact `S`. The requested tag is the full
 lowercase commit SHA, not a branch, date, short SHA, release alias, or `latest`.
+The build host must provide Git 2.40 or newer; the script checks this before it
+uses the pinned-tree `git check-attr --source` boundary.
 
 ```sh
 S='REPLACE_WITH_FINAL_40_HEX_MAIN_SHA'
