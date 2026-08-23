@@ -330,52 +330,98 @@ func TestChannelCreationReceiptsDoNotReplayAcrossWorkspaceTenures(t *testing.T) 
 	}
 }
 
-func TestPlaceCreationReplayRevalidatesCurrentAuthorityAndPrivateTenure(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		churn func(testing.TB, context.Context, world, Workspace, *ScopedStore)
-	}{
-		{
-			name: "actor Workspace tenure",
-			churn: func(t testing.TB, ctx context.Context, w world, workspace Workspace, _ *ScopedStore) {
-				if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
-					t.Fatalf("remove actor: %v", err)
-				}
-				if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
-					t.Fatalf("rejoin actor: %v", err)
-				}
-			},
-		},
-		{
-			name: "other participant Workspace tenure",
-			churn: func(t testing.TB, ctx context.Context, w world, workspace Workspace, _ *ScopedStore) {
-				if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
-					t.Fatalf("remove participant: %v", err)
-				}
-				if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
-					t.Fatalf("rejoin participant: %v", err)
-				}
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			w := newWorld(t, ctx)
-			workspace, _ := w.workspaceWithChannel(t, ctx)
-			scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
-			requested := []ParticipantRef{w.humanA, w.humanB}
-			created, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "tenure-replay")
-			if err != nil || !fresh {
-				t.Fatalf("create group DM = (%+v, %v, %v)", created, fresh, err)
-			}
-			tc.churn(t, ctx, w, workspace, scoped)
-			replayed, _, err := scoped.CreateGroupDMOnce(ctx, requested, "tenure-replay")
-			if err == nil || replayed.PlaceID != "" {
-				t.Fatalf("stale replay = (%+v, %v), want fail closed without place identity", replayed, err)
-			}
-		})
+func TestGroupDMCreationReceiptsDoNotReplayAcrossActorWorkspaceTenures(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	requested := []ParticipantRef{w.humanA, w.humanB}
+	membershipM1 := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+
+	createdM1, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "group-tenure-nonce")
+	if err != nil || !fresh {
+		t.Fatalf("M1 group DM = (%+v, %v, %v), want fresh", createdM1, fresh, err)
 	}
+	if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("remove M1: %v", err)
+	}
+	if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("join M2: %v", err)
+	}
+	membershipM2 := activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.agent)
+	if membershipM2 == membershipM1 {
+		t.Fatalf("rejoin reused Workspace membership %s", membershipM2)
+	}
+
+	createdM2, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "group-tenure-nonce")
+	if err != nil || !fresh || createdM2.PlaceID == createdM1.PlaceID {
+		t.Fatalf("M2 group DM = (%+v, %v, %v), want independent fresh place from M1 %s", createdM2, fresh, err, createdM1.PlaceID)
+	}
+	replayedM2, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "group-tenure-nonce")
+	if err != nil || fresh || replayedM2.PlaceID != createdM2.PlaceID {
+		t.Fatalf("M2 group DM replay = (%+v, %v, %v), want M2 place %s", replayedM2, fresh, err, createdM2.PlaceID)
+	}
+}
+
+func TestConcurrentGroupDMCreationReceiptIsStableWithinOneWorkspaceTenure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	requested := []ParticipantRef{w.humanA, w.humanB}
+
+	type result struct {
+		place Place
+		fresh bool
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			place, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "concurrent-group-tenure-nonce")
+			results <- result{place: place, fresh: fresh, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent group DM errors = (%v, %v)", first.err, second.err)
+	}
+	if first.place.PlaceID == "" || second.place.PlaceID != first.place.PlaceID {
+		t.Fatalf("concurrent group DMs = (%+v, %+v), want one stable place", first.place, second.place)
+	}
+	if first.fresh == second.fresh {
+		t.Fatalf("concurrent group DM freshness = (%v, %v), want one creator and one replay", first.fresh, second.fresh)
+	}
+}
+
+func TestPlaceCreationReplayRevalidatesCurrentAuthorityAndPrivateTenure(t *testing.T) {
+	t.Run("other participant Workspace tenure", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w := newWorld(t, ctx)
+		workspace, _ := w.workspaceWithChannel(t, ctx)
+		scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+		requested := []ParticipantRef{w.humanA, w.humanB}
+		created, fresh, err := scoped.CreateGroupDMOnce(ctx, requested, "tenure-replay")
+		if err != nil || !fresh {
+			t.Fatalf("create group DM = (%+v, %v, %v)", created, fresh, err)
+		}
+		if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+			t.Fatalf("remove participant: %v", err)
+		}
+		if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
+			t.Fatalf("rejoin participant: %v", err)
+		}
+		replayed, _, err := scoped.CreateGroupDMOnce(ctx, requested, "tenure-replay")
+		if err == nil || replayed.PlaceID != "" {
+			t.Fatalf("stale replay = (%+v, %v), want fail closed without place identity", replayed, err)
+		}
+	})
 
 	t.Run("installation disable and epoch", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

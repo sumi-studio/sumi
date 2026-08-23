@@ -515,7 +515,7 @@ func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef
 	if err != nil {
 		return Place{}, false, err
 	}
-	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest, ""); err != nil || replayed {
+	if place, replayed, err := s.replayPlaceCreation(ctx, tx, placeCreationGroupDM, nonce, digest, actorMembership.WorkspaceMemberID); err != nil || replayed {
 		if err != nil {
 			return Place{}, false, err
 		}
