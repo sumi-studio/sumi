@@ -23,9 +23,17 @@ import (
 )
 
 const defaultSupervisorCleanupBound = 100 * time.Second
-const supervisorCleanupDeliveryOverhead = time.Second
 const defaultSupervisorPipeWait = time.Second
 const supervisorControlFD = 3
+const supervisorControlDrainJoinReserve = time.Second
+
+type nestedControlState uint8
+
+const (
+	nestedIdle nestedControlState = iota
+	nestedStarted
+	nestedVerified
+)
 
 // DockerBackend reaches Docker only through the root-owned supervisor. No
 // Docker client or socket is exposed through the protocol or linked into API,
@@ -47,14 +55,15 @@ type execCommandRunner struct {
 }
 
 type supervisorControlTracker struct {
-	mu                  sync.Mutex
-	cleanupBound        time.Duration
-	boundReady          chan struct{}
-	boundOnce           sync.Once
-	nestedPID           int
-	nestedPIDFD         int
-	nestedGroupVerified bool
-	closed              bool
+	mu           sync.Mutex
+	cleanupBound time.Duration
+	boundReady   chan struct{}
+	boundOnce    sync.Once
+	nestedPID    int
+	nestedPIDFD  int
+	nestedState  nestedControlState
+	protocolErr  error
+	closed       bool
 }
 
 func newSupervisorControlTracker() *supervisorControlTracker {
@@ -69,20 +78,35 @@ type supervisorCommandError struct {
 func (err *supervisorCommandError) Error() string { return err.cause.Error() }
 func (err *supervisorCommandError) Unwrap() error { return err.cause }
 
-func (tracker *supervisorControlTracker) consume(reader io.Reader) {
-	scanner := bufio.NewScanner(reader)
+func (tracker *supervisorControlTracker) consume(control io.ReadWriter) error {
+	acknowledge := func(event string, value int64) error {
+		_, err := fmt.Fprintf(control, "ack-%s %d\n", event, value)
+		return err
+	}
+	reject := func(event string, value int64) {
+		_, _ = fmt.Fprintf(control, "reject-%s %d\n", event, value)
+	}
+	recordProtocolError := func(err error) {
+		tracker.mu.Lock()
+		tracker.protocolErr = errors.Join(tracker.protocolErr, err)
+		tracker.mu.Unlock()
+	}
+	scanner := bufio.NewScanner(control)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) != 2 {
+			recordProtocolError(fmt.Errorf("malformed supervisor control record %q", scanner.Text()))
 			continue
 		}
 		value, err := strconv.ParseInt(fields[1], 10, 64)
 		if err != nil || value <= 0 {
+			recordProtocolError(fmt.Errorf("invalid supervisor control value for %s", fields[0]))
 			continue
 		}
 		switch fields[0] {
 		case "cleanup-bound-ms":
 			if value > int64((2*time.Hour)/time.Millisecond) {
+				recordProtocolError(errors.New("supervisor cleanup bound is out of range"))
 				continue
 			}
 			bound := time.Duration(value) * time.Millisecond
@@ -91,53 +115,86 @@ func (tracker *supervisorControlTracker) consume(reader io.Reader) {
 				tracker.mu.Unlock()
 				continue
 			}
-			tracker.cleanupBound = bound
+			if tracker.cleanupBound != 0 {
+				tracker.protocolErr = errors.Join(tracker.protocolErr, errors.New("duplicate supervisor cleanup bound"))
+			} else {
+				tracker.cleanupBound = bound
+			}
 			tracker.mu.Unlock()
 			tracker.boundOnce.Do(func() { close(tracker.boundReady) })
 		case "nested-start":
 			if value > 1<<30 {
+				recordProtocolError(errors.New("nested PID is out of range"))
 				continue
 			}
 			pid := int(value)
-			pidfd, err := unix.PidfdOpen(pid, 0)
-			if err != nil {
-				pidfd = -1
-			}
 			tracker.mu.Lock()
-			if tracker.closed {
+			if tracker.closed || tracker.nestedState != nestedIdle {
+				tracker.protocolErr = errors.Join(tracker.protocolErr, errors.New("nested-start outside idle state"))
 				tracker.mu.Unlock()
-				_ = unix.Close(pidfd)
+				reject(fields[0], value)
 				continue
 			}
-			if tracker.nestedPIDFD >= 0 {
-				_ = unix.Close(tracker.nestedPIDFD)
+			pidfd, openErr := unix.PidfdOpen(pid, 0)
+			if openErr != nil {
+				tracker.protocolErr = errors.Join(tracker.protocolErr, fmt.Errorf("open nested anchor pidfd: %w", openErr))
+				tracker.mu.Unlock()
+				reject(fields[0], value)
+				continue
 			}
 			tracker.nestedPID = pid
 			tracker.nestedPIDFD = pidfd
-			tracker.nestedGroupVerified = false
+			tracker.nestedState = nestedStarted
 			tracker.mu.Unlock()
+			if err := acknowledge(fields[0], value); err != nil {
+				recordProtocolError(fmt.Errorf("acknowledge nested-start: %w", err))
+			}
 		case "nested-ready":
 			tracker.mu.Lock()
-			if tracker.nestedPID == int(value) {
-				// The trusted supervisor emits this only after observing PID ==
-				// PGID == SID. Retain that verified numeric group identity until
-				// nested-done even if the leader exits and its pidfd becomes ESRCH.
-				tracker.nestedGroupVerified = true
+			if tracker.nestedState != nestedStarted || tracker.nestedPID != int(value) {
+				tracker.protocolErr = errors.Join(tracker.protocolErr, errors.New("nested-ready does not match the live started anchor"))
+				tracker.mu.Unlock()
+				reject(fields[0], value)
+				continue
 			}
+			tracker.nestedState = nestedVerified
 			tracker.mu.Unlock()
+			if err := acknowledge(fields[0], value); err != nil {
+				recordProtocolError(fmt.Errorf("acknowledge nested-ready: %w", err))
+			}
 		case "nested-done":
 			tracker.mu.Lock()
-			if tracker.nestedPID == int(value) {
-				if tracker.nestedPIDFD >= 0 {
-					_ = unix.Close(tracker.nestedPIDFD)
-				}
-				tracker.nestedPID = 0
-				tracker.nestedPIDFD = -1
-				tracker.nestedGroupVerified = false
+			if tracker.nestedState != nestedVerified || tracker.nestedPID != int(value) {
+				tracker.protocolErr = errors.Join(tracker.protocolErr, errors.New("nested-done does not match the live verified anchor"))
+				tracker.mu.Unlock()
+				reject(fields[0], value)
+				continue
 			}
 			tracker.mu.Unlock()
+			if err := acknowledge(fields[0], value); err != nil {
+				recordProtocolError(fmt.Errorf("acknowledge nested-done: %w", err))
+				continue
+			}
+			tracker.mu.Lock()
+			_ = unix.Close(tracker.nestedPIDFD)
+			tracker.nestedPID = 0
+			tracker.nestedPIDFD = -1
+			tracker.nestedState = nestedIdle
+			tracker.mu.Unlock()
+		default:
+			recordProtocolError(fmt.Errorf("unknown supervisor control event %q", fields[0]))
 		}
 	}
+	tracker.mu.Lock()
+	if err := scanner.Err(); err != nil {
+		tracker.protocolErr = errors.Join(tracker.protocolErr, fmt.Errorf("scan supervisor control: %w", err))
+	}
+	if tracker.nestedState != nestedIdle {
+		tracker.protocolErr = errors.Join(tracker.protocolErr, errors.New("supervisor control closed with a live nested anchor"))
+	}
+	err := tracker.protocolErr
+	tracker.mu.Unlock()
+	return err
 }
 
 func (tracker *supervisorControlTracker) grace(override time.Duration) time.Duration {
@@ -154,42 +211,16 @@ func (tracker *supervisorControlTracker) grace(override time.Duration) time.Dura
 	if bound <= 0 {
 		bound = defaultSupervisorCleanupBound
 	}
-	return bound + supervisorCleanupDeliveryOverhead
+	return bound
 }
 
 func (tracker *supervisorControlTracker) signalNested(signal syscall.Signal) error {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	if tracker.nestedPID <= 0 {
+	if tracker.nestedState == nestedIdle || tracker.nestedPID <= 0 || tracker.nestedPIDFD < 0 {
 		return nil
 	}
-	if tracker.nestedGroupVerified {
-		err := syscall.Kill(-tracker.nestedPID, signal)
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		return err
-	}
-	if tracker.nestedPIDFD < 0 {
-		return nil
-	}
-	if err := unix.PidfdSendSignal(tracker.nestedPIDFD, 0, nil, 0); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		return err
-	}
-	pgid, err := syscall.Getpgid(tracker.nestedPID)
-	if err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		return err
-	}
-	if pgid != tracker.nestedPID {
-		return unix.PidfdSendSignal(tracker.nestedPIDFD, signal, nil, 0)
-	}
-	err = syscall.Kill(-tracker.nestedPID, signal)
+	err := unix.PidfdSendSignal(tracker.nestedPIDFD, signal, nil, 0)
 	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
@@ -205,7 +236,7 @@ func (tracker *supervisorControlTracker) close() {
 	}
 	tracker.nestedPID = 0
 	tracker.nestedPIDFD = -1
-	tracker.nestedGroupVerified = false
+	tracker.nestedState = nestedIdle
 }
 
 func supervisorEnvironment(environment []string) []string {
@@ -223,15 +254,17 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 	if err := ctx.Err(); err != nil {
 		return nil, &supervisorCommandError{cause: err, diagnostic: "supervisor operation canceled before launch"}
 	}
-	controlRead, controlWrite, err := os.Pipe()
+	controlFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, &supervisorCommandError{cause: err, diagnostic: "cannot establish supervisor cleanup control"}
 	}
+	controlParent := os.NewFile(uintptr(controlFDs[0]), "supervisor-control-parent")
+	controlChild := os.NewFile(uintptr(controlFDs[1]), "supervisor-control-child")
 	tracker := newSupervisorControlTracker()
 	command := exec.Command(path, args...)
 	command.Env = supervisorEnvironment(environment)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	command.ExtraFiles = []*os.File{controlWrite}
+	command.ExtraFiles = []*os.File{controlChild}
 	pipeWait := runner.pipeWait
 	if pipeWait <= 0 {
 		pipeWait = defaultSupervisorPipeWait
@@ -242,28 +275,61 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
-		_ = controlRead.Close()
-		_ = controlWrite.Close()
+		_ = controlParent.Close()
+		_ = controlChild.Close()
 		return nil, &supervisorCommandError{
 			cause:      err,
 			diagnostic: sanitizeSupervisorError(stderr.String(), environment),
 		}
 	}
-	_ = controlWrite.Close()
-	go tracker.consume(controlRead)
+	_ = controlChild.Close()
+	supervisorPIDFD, err := unix.PidfdOpen(command.Process.Pid, 0)
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		_ = controlParent.Close()
+		return nil, &supervisorCommandError{cause: err, diagnostic: "cannot acquire stable supervisor process handle"}
+	}
+	consumeDone := make(chan error, 1)
+	go func() { consumeDone <- tracker.consume(controlParent) }()
 	defer func() {
-		_ = controlRead.Close()
+		_ = unix.Close(supervisorPIDFD)
+		_ = controlParent.Close()
 		tracker.close()
 	}()
-	waited := make(chan error, 1)
-	go func() { waited <- command.Wait() }()
+	exited := make(chan struct{})
+	go func() {
+		poll := []unix.PollFd{{Fd: int32(supervisorPIDFD), Events: unix.POLLIN}}
+		for {
+			_, err := unix.Poll(poll, -1)
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			break
+		}
+		close(exited)
+	}()
+	drainControl := func() error {
+		select {
+		case err := <-consumeDone:
+			return err
+		case <-time.After(supervisorControlDrainJoinReserve):
+			_ = controlParent.Close()
+			return errors.Join(errors.New("supervisor control drain exceeded its advertised reserve"), <-consumeDone)
+		}
+	}
 	select {
-	case err := <-waited:
+	case <-exited:
+		err := command.Wait()
+		controlErr := drainControl()
 		if err != nil {
 			return nil, &supervisorCommandError{
-				cause:      err,
+				cause:      errors.Join(err, controlErr),
 				diagnostic: sanitizeSupervisorError(stderr.String(), environment),
 			}
+		}
+		if controlErr != nil {
+			return nil, &supervisorCommandError{cause: controlErr, diagnostic: "supervisor cleanup control protocol failed closed"}
 		}
 		return stdout.Bytes(), nil
 	case <-ctx.Done():
@@ -272,14 +338,20 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 		// its detached Compose session is tracked over the control descriptor.
 	}
 
-	termErr := signalSupervisorHierarchy(command.Process.Pid, syscall.SIGTERM)
+	// command.Wait has not run, so the supervisor PID remains reserved even if
+	// it exits while signals are delivered. Its process-group number therefore
+	// cannot be recycled under either group signal.
+	termErr := syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
 	grace := tracker.grace(runner.terminationGrace)
-	timer := time.NewTimer(grace)
-	var waitErr error
+	forceAfter := grace - supervisorControlDrainJoinReserve
+	if forceAfter <= 0 {
+		forceAfter = grace
+	}
+	timer := time.NewTimer(forceAfter)
 	var killErr error
 	cleanupExpired := false
 	select {
-	case waitErr = <-waited:
+	case <-exited:
 		if !timer.Stop() {
 			select {
 			case <-timer.C:
@@ -287,34 +359,38 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 			}
 		}
 	case <-timer.C:
-		cleanupExpired = true
-		killErr = errors.Join(
-			tracker.signalNested(syscall.SIGKILL),
-			signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL),
-		)
-		waitErr = <-waited
+		killErr = tracker.signalNested(syscall.SIGUSR2)
+		finalTimer := time.NewTimer(supervisorControlDrainJoinReserve)
+		select {
+		case <-exited:
+			if !finalTimer.Stop() {
+				<-finalTimer.C
+			}
+		case <-finalTimer.C:
+			cleanupExpired = true
+			killErr = errors.Join(killErr, syscall.Kill(-command.Process.Pid, syscall.SIGKILL))
+			<-exited
+		}
 	}
 	// A child may have kept inherited output descriptors open after the shell
 	// exited. WaitDelay closes those pipes; this final group kill removes any
 	// remaining same-hierarchy descendant before returning.
-	killErr = errors.Join(
-		killErr,
-		tracker.signalNested(syscall.SIGKILL),
-		signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL),
-	)
+	killErr = errors.Join(killErr, syscall.Kill(-command.Process.Pid, syscall.SIGKILL))
+	waitErr := command.Wait()
+	controlErr := drainControl()
+	killErr = errors.Join(killErr, controlErr)
 	diagnostic := sanitizeSupervisorError(stderr.String(), environment)
 	if cleanupExpired {
 		diagnostic = "supervisor cleanup exceeded its advertised bound; host lifecycle state is indeterminate and requires reconciliation; " + diagnostic
 	}
 	return nil, &supervisorCommandError{
-		cause:      errors.Join(ctx.Err(), termErr, killErr, waitErr),
+		cause:      errors.Join(ctx.Err(), normalizeNoProcess(termErr), normalizeNoProcess(killErr), waitErr),
 		diagnostic: diagnostic,
 	}
 }
 
-func signalSupervisorHierarchy(pid int, signal syscall.Signal) error {
-	err := syscall.Kill(-pid, signal)
-	if errors.Is(err, syscall.ESRCH) {
+func normalizeNoProcess(err error) error {
+	if err == syscall.ESRCH {
 		return nil
 	}
 	return err

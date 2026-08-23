@@ -1,11 +1,14 @@
 package runtimeprovision
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -299,7 +302,7 @@ func TestExecCommandRunnerHonorsCleanupBoundForDetachedSession(t *testing.T) {
 	script := `#!/bin/bash
 set -eu
 printf 'cleanup-bound-ms 600\n' >&3
-trap 'sleep 0.2; kill -TERM -- "-${nested}"; wait "${nested}" || true; printf "nested-done %s\n" "${nested}" >&3; printf cleaned >"${CLEANED_PATH}"; exit 143' TERM
+trap 'sleep 0.2; kill -TERM -- "-${nested}"; wait "${nested}" || true; printf "nested-done %s\n" "${nested}" >&3; read -r ack <&3; printf cleaned >"${CLEANED_PATH}"; exit 143' TERM
 setsid /bin/bash -c 'trap "exit 0" TERM; printf ready >"${NESTED_READY_PATH}"; while :; do sleep 1; done' 3>&- &
 nested=$!
 while [[ ! -f "${NESTED_READY_PATH}" ]]; do
@@ -307,7 +310,9 @@ while [[ ! -f "${NESTED_READY_PATH}" ]]; do
   sleep 0.005
 done
 printf 'nested-start %s\n' "${nested}" >&3
+read -r ack <&3
 printf 'nested-ready %s\n' "${nested}" >&3
+read -r ack <&3
 printf '%s' "${nested}" >"${PID_PATH}"
 printf ready >"${READY_PATH}"
 while :; do sleep 1; done
@@ -353,83 +358,157 @@ while :; do sleep 1; done
 	waitForProcessGroupGone(t, nestedPID, "detached cleanup session")
 }
 
-func TestExecCommandRunnerKillsTrackedGroupAfterCleanupLeaderExit(t *testing.T) {
-	dir := t.TempDir()
-	readyPath := filepath.Join(dir, "ready")
-	nestedReadyPath := filepath.Join(dir, "nested-ready")
-	pidPath := filepath.Join(dir, "nested-pid")
-	helperPIDPath := filepath.Join(dir, "helper-pid")
-	releasePath := filepath.Join(dir, "release")
-	nestedScriptPath := filepath.Join(dir, "nested.sh")
-	scriptPath := filepath.Join(dir, "stuck-supervisor.sh")
-	nestedScript := `#!/bin/bash
-set -eu
-/bin/bash -c 'trap "" TERM; printf "%s" "$$" >"${HELPER_PID_PATH}"; printf ready >"${NESTED_READY_PATH}"; while :; do sleep 1; done' &
-while [[ ! -f "${RELEASE_PATH}" ]]; do sleep 0.005; done
-exit 0
-`
-	if err := os.WriteFile(nestedScriptPath, []byte(nestedScript), 0o700); err != nil {
+func TestSupervisorControlTrackerRejectsDuplicateWithoutDroppingLiveAnchor(t *testing.T) {
+	anchor := exec.Command("/bin/sleep", "30")
+	if err := anchor.Start(); err != nil {
 		t.Fatal(err)
 	}
-	script := `#!/bin/bash
-set -eu
-printf 'cleanup-bound-ms 100\n' >&3
-trap '' TERM
-setsid "${NESTED_SCRIPT_PATH}" 3>&- &
-nested=$!
-while [[ ! -f "${NESTED_READY_PATH}" ]]; do
-  kill -0 "${nested}" 2>/dev/null || exit 91
-  sleep 0.005
-done
-printf 'nested-start %s\n' "${nested}" >&3
-printf 'nested-ready %s\n' "${nested}" >&3
-printf '%s' "${nested}" >"${PID_PATH}"
-printf release >"${RELEASE_PATH}"
-wait "${nested}" || true
-printf ready >"${READY_PATH}"
-while :; do sleep 1; done
-`
-	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+	t.Cleanup(func() { _ = anchor.Process.Kill(); _ = anchor.Wait() })
+	parentFDs, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() {
-		_, err := (execCommandRunner{pipeWait: 25 * time.Millisecond}).Run(
-			ctx,
-			scriptPath,
-			nil,
-			[]string{
-				"PATH=/usr/bin:/bin",
-				"READY_PATH=" + readyPath,
-				"NESTED_READY_PATH=" + nestedReadyPath,
-				"PID_PATH=" + pidPath,
-				"HELPER_PID_PATH=" + helperPIDPath,
-				"RELEASE_PATH=" + releasePath,
-				"NESTED_SCRIPT_PATH=" + nestedScriptPath,
-			},
-		)
-		result <- err
-	}()
-	waitForFile(t, readyPath)
-	nestedPID := readPID(t, pidPath)
-	helperPID := readPID(t, helperPIDPath)
-	cancel()
-	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("runner error = %v, want context cancellation", err)
+	parent := os.NewFile(uintptr(parentFDs[0]), "tracker-test-parent")
+	peer := os.NewFile(uintptr(parentFDs[1]), "tracker-test-peer")
+	defer parent.Close()
+	defer peer.Close()
+	tracker := newSupervisorControlTracker()
+	done := make(chan error, 1)
+	go func() { done <- tracker.consume(parent) }()
+	write := func(record string) string {
+		if _, err := peer.WriteString(record + "\n"); err != nil {
+			t.Fatal(err)
 		}
-		var commandError *supervisorCommandError
-		if !errors.As(err, &commandError) || !strings.Contains(commandError.diagnostic, "host lifecycle state is indeterminate and requires reconciliation") {
-			t.Fatalf("runner omitted indeterminate-state reconciliation diagnostic: %v", err)
+		buffer := make([]byte, 128)
+		count, err := peer.Read(buffer)
+		if err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("runner exceeded the advertised cleanup bound")
+		return strings.TrimSpace(string(buffer[:count]))
 	}
-	waitForProcessGroupGone(t, nestedPID, "detached cleanup group whose leader exited")
-	if err := syscall.Kill(helperPID, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("TERM-resistant cleanup helper %d survived cancellation: %v", helperPID, err)
+	pid := anchor.Process.Pid
+	if got := write(fmt.Sprintf("nested-start %d", pid)); got != fmt.Sprintf("ack-nested-start %d", pid) {
+		t.Fatalf("start acknowledgement = %q", got)
+	}
+	if got := write(fmt.Sprintf("nested-start %d", pid)); got != fmt.Sprintf("reject-nested-start %d", pid) {
+		t.Fatalf("duplicate start response = %q", got)
+	}
+	tracker.mu.Lock()
+	if tracker.nestedPID != pid || tracker.nestedPIDFD < 0 || tracker.nestedState != nestedStarted {
+		t.Fatalf("duplicate start overwrote the live handle: %#v", tracker)
+	}
+	tracker.mu.Unlock()
+	if got := write(fmt.Sprintf("nested-ready %d", pid+1)); got != fmt.Sprintf("reject-nested-ready %d", pid+1) {
+		t.Fatalf("mismatched ready response = %q", got)
+	}
+	if got := write(fmt.Sprintf("nested-ready %d", pid)); got != fmt.Sprintf("ack-nested-ready %d", pid) {
+		t.Fatalf("ready acknowledgement = %q", got)
+	}
+	if got := write(fmt.Sprintf("nested-ready %d", pid)); got != fmt.Sprintf("reject-nested-ready %d", pid) {
+		t.Fatalf("duplicate ready response = %q", got)
+	}
+	if got := write(fmt.Sprintf("nested-done %d", pid+1)); got != fmt.Sprintf("reject-nested-done %d", pid+1) {
+		t.Fatalf("mismatched done response = %q", got)
+	}
+	if got := write(fmt.Sprintf("nested-done %d", pid)); got != fmt.Sprintf("ack-nested-done %d", pid) {
+		t.Fatalf("done acknowledgement = %q", got)
+	}
+	_ = peer.Close()
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "outside idle") ||
+		!strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("protocol violations were not retained: %v", err)
+	}
+}
+
+func TestExecCommandRunnerIgnoresForgedStdoutControlRecords(t *testing.T) {
+	output, err := (execCommandRunner{}).Run(
+		context.Background(),
+		"/bin/bash",
+		[]string{"-c", `printf 'nested-start 1\nnested-ready 1\nnested-done 1\n'`},
+		[]string{"PATH=/usr/bin:/bin"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(output) != "nested-start 1\nnested-ready 1\nnested-done 1\n" {
+		t.Fatalf("stdout was altered or interpreted as control: %q", output)
+	}
+}
+
+func TestExecCommandRunnerFailsClosedOnControlScannerError(t *testing.T) {
+	_, err := (execCommandRunner{}).Run(
+		context.Background(),
+		"/bin/bash",
+		[]string{"-c", `head -c 70000 /dev/zero | tr '\0' x >&3`},
+		[]string{"PATH=/usr/bin:/bin"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "token too long") {
+		t.Fatalf("control scanner failure was not fail-closed: %v", err)
+	}
+}
+
+func TestControlScannerErrorRetainsLiveHandle(t *testing.T) {
+	anchor := exec.Command("/bin/sleep", "30")
+	if err := anchor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = anchor.Process.Kill(); _ = anchor.Wait() })
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := os.NewFile(uintptr(fds[0]), "scanner-parent")
+	peer := os.NewFile(uintptr(fds[1]), "scanner-peer")
+	defer parent.Close()
+	tracker := newSupervisorControlTracker()
+	done := make(chan error, 1)
+	go func() { done <- tracker.consume(parent) }()
+	if _, err := fmt.Fprintf(peer, "nested-start %d\n", anchor.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	ack := make([]byte, 128)
+	if _, err := peer.Read(ack); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Write(bytes.Repeat([]byte{'x'}, 70_000)); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.Close()
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "token too long") {
+		t.Fatalf("scanner failure was not retained: %v", err)
+	}
+	tracker.mu.Lock()
+	if tracker.nestedState != nestedStarted || tracker.nestedPID != anchor.Process.Pid || tracker.nestedPIDFD < 0 {
+		tracker.mu.Unlock()
+		t.Fatalf("scanner failure dropped the live handle: %#v", tracker)
+	}
+	tracker.mu.Unlock()
+	tracker.close()
+}
+
+func TestExecCommandRunnerJoinsControlReadersAndClosesDescriptors(t *testing.T) {
+	beforeFDs, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGoroutines := runtime.NumGoroutine()
+	for iteration := 0; iteration < 20; iteration++ {
+		if _, err := (execCommandRunner{}).Run(
+			context.Background(), "/bin/true", nil, []string{"PATH=/usr/bin:/bin"},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(25 * time.Millisecond)
+	afterFDs, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterFDs) > len(beforeFDs) {
+		t.Fatalf("runner leaked descriptors: before=%d after=%d", len(beforeFDs), len(afterFDs))
+	}
+	if after := runtime.NumGoroutine(); after > beforeGoroutines+1 {
+		t.Fatalf("runner leaked goroutines: before=%d after=%d", beforeGoroutines, after)
 	}
 }
 

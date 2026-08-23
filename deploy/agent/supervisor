@@ -12,6 +12,7 @@ readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly COMPOSE_FILE="${SUPERVISOR_DIR}/compose.yaml"
 readonly PREPARE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.prepare.yaml"
 readonly LIFECYCLE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.lifecycle.yaml"
+readonly COMPOSE_ANCHOR="${SUMI_COMPOSE_ANCHOR:-/usr/local/libexec/sumi-compose-anchor}"
 readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks
 readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control
 readonly RUNTIME_SECRET_HOST_ROOT="${SUMI_RUNTIME_SECRET_HOST_ROOT:-/run/sumi/runtime-secrets}"
@@ -59,6 +60,20 @@ publish_supervisor_control() {
   printf '%s\n' "$1" >&3 || true
 }
 
+exchange_supervisor_control() {
+  local event="$1" value="$2" acknowledgement
+  publish_supervisor_control "${event} ${value}"
+  (( SUPERVISOR_CONTROL_ENABLED )) || return 0
+  if ! IFS= read -r -t "${SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS}" acknowledgement <&3; then
+    log "ERROR: provisioner did not acknowledge ${event}"
+    return 1
+  fi
+  [[ "${acknowledgement}" == "ack-${event} ${value}" ]] || {
+    log "ERROR: provisioner rejected ${event}"
+    return 1
+  }
+}
+
 log() {
   printf '[sumi-supervisor] %s\n' "$*" >&4
 }
@@ -81,6 +96,8 @@ require_docker() {
 
 require_tracked_compose_support() {
   command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
+  [[ -f "${COMPOSE_ANCHOR}" && -x "${COMPOSE_ANCHOR}" ]] ||
+    fail "the privileged Compose lifetime anchor is required"
 }
 
 configure_apparmor_profile() {
@@ -463,14 +480,21 @@ declare SUMI_RUNTIME_SECRET_HOST_DIR="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT
 export SUMI_RUNTIME_SECRET_HOST_DIR
 declare CLEANUP_ARMED=0
 declare ACTIVE_COMPOSE_PID=
+declare ACTIVE_COMPOSE_VERIFIED=0
 readonly MILLISECONDS_PER_SECOND=1000
 readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
+readonly SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS=1
+# One nested Compose anchor can be active when cancellation begins; cleanup can
+# then run one down and one exact-absence query per attempt. Every anchor uses
+# start, verified, and done acknowledgements.
+readonly SUPERVISOR_MAX_NESTED_ANCHORS=$((1 + CLEANUP_MAX_ATTEMPTS * 2))
+readonly SUPERVISOR_CONTROL_DRAIN_JOIN_SECONDS=1
 # Every cleanup-path Docker CLI call has a wall-clock cap:
 #
 # Docker call                         Inner operation                 One total group budget                         Signal target
-# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop grace + post-stop allowance + TERM grace Docker process group (all descendants)
-# ps --all --filter project-label     none                             verification timeout + TERM grace              Docker process group (all descendants)
+# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop + TERM + force + ACK/join                anchored Docker process group
+# ps --all --filter project-label     none                             query + TERM + force + ACK/join               anchored Docker process group
 #
 # `down --timeout` is Docker's container-stop grace, not a cap on the CLI or
 # daemon response. After that grace expires, Compose still has to observe the
@@ -482,6 +506,7 @@ readonly CLEANUP_DOWN_TIMEOUT_SECONDS=$((
   SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS
 ))
 readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
+readonly CLEANUP_ANCHOR_FORCE_GRACE_SECONDS=1
 # `project_is_empty` runs once after each cleanup `down`. Bound both
 # its query and the time allowed for a TERM-resistant Docker process group to
 # exit before its KILL fallback.
@@ -510,12 +535,17 @@ readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
 readonly SUPERVISOR_CLEANUP_BOUND_MILLISECONDS=$((
   COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS +
   CLEANUP_MAX_ATTEMPTS * (
-    CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS
+    CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS +
+    CLEANUP_ANCHOR_FORCE_GRACE_SECONDS
   ) * MILLISECONDS_PER_SECOND +
   CLEANUP_MAX_ATTEMPTS * (
-    CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS
+    CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS +
+    CLEANUP_ANCHOR_FORCE_GRACE_SECONDS
   ) * MILLISECONDS_PER_SECOND +
   (CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS +
+  SUPERVISOR_MAX_NESTED_ANCHORS * 3 * SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS *
+    MILLISECONDS_PER_SECOND +
+  SUPERVISOR_CONTROL_DRAIN_JOIN_SECONDS * MILLISECONDS_PER_SECOND +
   SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS * MILLISECONDS_PER_SECOND
 ))
 publish_supervisor_control "cleanup-bound-ms ${SUPERVISOR_CLEANUP_BOUND_MILLISECONDS}"
@@ -548,38 +578,11 @@ milliseconds_until_cleanup_deadline() {
   fi
 }
 
-# The normal Docker phase must leave the advertised TERM grace in the same
-# absolute deadline. No probe, wait, or fallback may create a new budget.
-milliseconds_until_cleanup_term() {
-  local deadline_milliseconds="$1"
-  local kill_grace_seconds="$2"
-  local remaining_milliseconds
-  remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
-  if (( remaining_milliseconds <= kill_grace_seconds * MILLISECONDS_PER_SECOND )); then
-    printf '0\n'
-  else
-    printf '%d\n' "$((remaining_milliseconds - kill_grace_seconds * MILLISECONDS_PER_SECOND))"
-  fi
-}
-
 sleep_cleanup_milliseconds() {
   local requested_milliseconds="$1"
   local deadline_milliseconds="$2"
   local remaining_milliseconds
   remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
-  (( remaining_milliseconds > 0 )) || return 1
-  if (( requested_milliseconds > remaining_milliseconds )); then
-    requested_milliseconds="${remaining_milliseconds}"
-  fi
-  sleep_milliseconds "${requested_milliseconds}"
-}
-
-sleep_cleanup_normal_milliseconds() {
-  local requested_milliseconds="$1"
-  local deadline_milliseconds="$2"
-  local kill_grace_seconds="$3"
-  local remaining_milliseconds
-  remaining_milliseconds="$(milliseconds_until_cleanup_term "${deadline_milliseconds}" "${kill_grace_seconds}")"
   (( remaining_milliseconds > 0 )) || return 1
   if (( requested_milliseconds > remaining_milliseconds )); then
     requested_milliseconds="${remaining_milliseconds}"
@@ -640,46 +643,35 @@ run_tracked_compose() {
   local require_live_group="$2"
   shift 2
   local status
-  setsid docker compose \
-    --project-name "${SUMI_COMPOSE_PROJECT}" \
-    --file "${compose_file}" \
+  : "${require_live_group}"
+  setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash \
+    compose --project-name "${SUMI_COMPOSE_PROJECT}" --file "${compose_file}" \
     "$@" 3>&- 4>&- &
   ACTIVE_COMPOSE_PID=$!
-  publish_supervisor_control "nested-start ${ACTIVE_COMPOSE_PID}"
-  if wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
-    publish_supervisor_control "nested-ready ${ACTIVE_COMPOSE_PID}"
-  else
-    # A no-op lifecycle `down` can legitimately finish before /proc is
-    # inspected. A launch must instead remain live and prove the PID/group
-    # ownership that later signal cleanup relies on.
-    if tracked_compose_child_is_zombie "${ACTIVE_COMPOSE_PID}" ||
-      ! kill -0 "${ACTIVE_COMPOSE_PID}" 2>/dev/null; then
-      if wait "${ACTIVE_COMPOSE_PID}"; then
-        status=0
-      else
-        status=$?
-      fi
-      publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
-      ACTIVE_COMPOSE_PID=
-      return "${status}"
-    fi
-    if (( require_live_group )); then
-      log "ERROR: supervised Compose child did not become its own live session and process group"
-      terminate_active_compose
-      return 125
-    fi
+  if ! exchange_supervisor_control nested-start "${ACTIVE_COMPOSE_PID}" ||
+    ! wait_for_tracked_compose_anchor_stopped "${ACTIVE_COMPOSE_PID}" ||
+    ! exchange_supervisor_control nested-ready "${ACTIVE_COMPOSE_PID}"; then
+    log "ERROR: supervised Compose anchor did not complete its stopped handshake"
+    terminate_active_compose
+    return 125
   fi
+  ACTIVE_COMPOSE_VERIFIED=1
+  kill -CONT "${ACTIVE_COMPOSE_PID}" || {
+    terminate_active_compose
+    return 125
+  }
   if wait "${ACTIVE_COMPOSE_PID}"; then
     status=0
   else
     status=$?
   fi
-  publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
+  exchange_supervisor_control nested-done "${ACTIVE_COMPOSE_PID}" || status=125
   ACTIVE_COMPOSE_PID=
+  ACTIVE_COMPOSE_VERIFIED=0
   return "${status}"
 }
 
-tracked_compose_child_isolated() {
+tracked_compose_anchor_stopped() {
   local pid="$1"
   local stat state ppid pgid sid remainder
   [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
@@ -687,7 +679,7 @@ tracked_compose_child_isolated() {
   remainder="${stat##*) }"
   [[ "${remainder}" != "${stat}" ]] || return 1
   read -r state ppid pgid sid _ <<< "${remainder}"
-  [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+  [[ "${state}" == T && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
 }
 
 # `setsid` normally makes the child its own session and group within
@@ -697,11 +689,11 @@ tracked_compose_child_isolated() {
 # so initial tracking and later group recovery use one bounded host-load budget.
 readonly TRACKED_COMPOSE_ISOLATION_ATTEMPTS=1500
 
-wait_for_tracked_compose_child_isolation() {
+wait_for_tracked_compose_anchor_stopped() {
   local pid="$1"
   local attempt
   for ((attempt = 0; attempt < TRACKED_COMPOSE_ISOLATION_ATTEMPTS; attempt++)); do
-    tracked_compose_child_isolated "${pid}" && return 0
+    tracked_compose_anchor_stopped "${pid}" && return 0
     tracked_compose_child_is_zombie "${pid}" && return 1
     kill -0 "${pid}" 2>/dev/null || return 1
     sleep 0.01
@@ -720,163 +712,113 @@ tracked_compose_child_is_zombie() {
   [[ "${state}" == Z ]]
 }
 
-tracked_compose_group_isolated() {
-  local pid="$1"
-  local stat state ppid pgid sid remainder
-  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
-  stat="$(<"/proc/${pid}/stat")" || return 1
-  remainder="${stat##*) }"
-  [[ "${remainder}" != "${stat}" ]] || return 1
-  read -r state ppid pgid sid _ <<< "${remainder}"
-  [[ "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
-}
-
-wait_for_cleanup_compose_group_isolation() {
+wait_for_cleanup_compose_anchor_stopped() {
   local pid="$1"
   local deadline_milliseconds="$2"
-  local kill_grace_seconds="$3"
   while :; do
-    # Unlike the launch path, a cleanup Docker leader may finish before this
-    # probe. Its session/group still identifies any helper it left behind.
-    if tracked_compose_group_isolated "${pid}"; then
+    if tracked_compose_anchor_stopped "${pid}"; then
       return 0
     fi
-    if ! kill -0 "${pid}" 2>/dev/null; then
+    if tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
       return 1
     fi
-    sleep_cleanup_normal_milliseconds 10 "${deadline_milliseconds}" "${kill_grace_seconds}" || return 1
+    sleep_cleanup_milliseconds 10 "${deadline_milliseconds}" || return 1
   done
 }
 
-cleanup_compose_group_alive() {
+compose_anchor_alive() {
   local pid="$1"
-  kill -0 -- "-${pid}" 2>/dev/null
+  ! tracked_compose_child_is_zombie "${pid}" && kill -0 "${pid}" 2>/dev/null
 }
 
 run_bounded_cleanup_docker() {
   local timeout_seconds="$1"
   local kill_grace_seconds="$2"
   shift 2
-  local pid status=0 deadline_milliseconds remaining_milliseconds
+  local pid status=0 normal_deadline_milliseconds term_deadline_milliseconds
+  local force_deadline_milliseconds
 
   # A cleanup call has one clock from launch through its probe, normal wait,
   # TERM grace, and KILL. Reserve the advertised TERM grace from the normal
   # phase, but never reset this absolute deadline after a probe race.
-  deadline_milliseconds=$(( $(monotonic_time_milliseconds) +
-    (timeout_seconds + kill_grace_seconds) * MILLISECONDS_PER_SECOND
-  ))
+  normal_deadline_milliseconds=$(( $(monotonic_time_milliseconds) +
+    timeout_seconds * MILLISECONDS_PER_SECOND ))
+  term_deadline_milliseconds=$(( normal_deadline_milliseconds +
+    kill_grace_seconds * MILLISECONDS_PER_SECOND ))
+  force_deadline_milliseconds=$(( term_deadline_milliseconds +
+    CLEANUP_ANCHOR_FORCE_GRACE_SECONDS * MILLISECONDS_PER_SECOND ))
 
-  # Keep every Docker helper in a dedicated session/process group. Waiting for
-  # the group, rather than just Docker's leader, makes the cleanup deadline
-  # cover Compose plugins and helpers even if the CLI exits first.
-  # Stop the new group leader before it execs Docker. This handshake lets the
-  # supervisor prove PID == PGID == SID and publish that durable numeric group
-  # identity before a fast Docker leader can exit while leaving helpers behind.
-  setsid /bin/bash -c 'kill -STOP "$$"; exec docker "$@"' bash "$@" 3>&- 4>&- &
+  # The anchor is the group leader and remains alive until its pidfd-scanned
+  # group contains no other process. The privileged shell ignores BASH_ENV.
+  setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash "$@" 3>&- 4>&- &
   pid=$!
-  publish_supervisor_control "nested-start ${pid}"
-
-  # The isolation probe spends from the same total deadline as Docker itself.
-  # Its centisecond resolution leaves the ordinary scheduling margin in the
-  # advertised cleanup bound to absorb wakeup jitter.
-  if wait_for_cleanup_compose_group_isolation \
-    "${pid}" "${deadline_milliseconds}" "${kill_grace_seconds}"; then
-    publish_supervisor_control "nested-ready ${pid}"
+  if ! exchange_supervisor_control nested-start "${pid}" ||
+    ! wait_for_cleanup_compose_anchor_stopped "${pid}" "${normal_deadline_milliseconds}" ||
+    ! exchange_supervisor_control nested-ready "${pid}" ||
+    ! kill -CONT "${pid}"; then
     kill -CONT "${pid}" 2>/dev/null || true
-  else
-    # A broken `setsid` implementation is not trusted as a process group, but
-    # let the stopped best-effort cleanup command run before fencing its PID.
-    # It receives no nested-ready acknowledgement, so the API never performs
-    # an unsafe numeric group signal for this path.
-    kill -CONT "${pid}" 2>/dev/null || true
-    sleep_cleanup_normal_milliseconds 10 "${deadline_milliseconds}" "${kill_grace_seconds}" || true
-    # `setsid` has already made this PID the group identifier. The leader can
-    # disappear before /proc is sampled while a Compose helper remains in that
-    # group, so keep policing the group instead of treating the leader's exit
-    # as successful cleanup.
-    if cleanup_compose_group_alive "${pid}"; then
-      :
-    elif tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
-      if wait "${pid}"; then
-        status=0
-      else
-        status=$?
-      fi
-      publish_supervisor_control "nested-done ${pid}"
-      return "${status}"
-    else
-      log "ERROR: cleanup Docker child did not become its own session and process group"
-      kill -TERM "${pid}" 2>/dev/null || true
-      while sleep_cleanup_milliseconds 100 "${deadline_milliseconds}"; do
-        if tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
-          break
-        fi
-      done
-      kill -KILL "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
-      publish_supervisor_control "nested-done ${pid}"
-      return 125
-    fi
+    kill -TERM "${pid}" 2>/dev/null || true
+    kill -USR2 "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    return 125
   fi
 
-  while :; do
-    if ! cleanup_compose_group_alive "${pid}"; then
-      if wait "${pid}"; then
-        status=0
-      else
-        status=$?
-      fi
-      publish_supervisor_control "nested-done ${pid}"
-      return "${status}"
-    fi
-    remaining_milliseconds="$(milliseconds_until_cleanup_term "${deadline_milliseconds}" "${kill_grace_seconds}")"
-    (( remaining_milliseconds > 0 )) || break
-    sleep_cleanup_normal_milliseconds 100 "${deadline_milliseconds}" "${kill_grace_seconds}" || break
+  while compose_anchor_alive "${pid}"; do
+    sleep_cleanup_milliseconds 100 "${normal_deadline_milliseconds}" || break
   done
-
-  kill -TERM -- "-${pid}" 2>/dev/null || true
-  while :; do
-    if ! cleanup_compose_group_alive "${pid}"; then
-      wait "${pid}" 2>/dev/null || true
-      publish_supervisor_control "nested-done ${pid}"
-      return 124
-    fi
-    remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
-    (( remaining_milliseconds > 0 )) || break
-    sleep_cleanup_milliseconds 100 "${deadline_milliseconds}" || break
-  done
-  kill -KILL -- "-${pid}" 2>/dev/null || true
-  wait "${pid}" 2>/dev/null || true
-  publish_supervisor_control "nested-done ${pid}"
-  return 124
+  if compose_anchor_alive "${pid}"; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    while compose_anchor_alive "${pid}"; do
+      sleep_cleanup_milliseconds 100 "${term_deadline_milliseconds}" || break
+    done
+  fi
+  if compose_anchor_alive "${pid}"; then
+    kill -USR2 "${pid}" 2>/dev/null || true
+    while compose_anchor_alive "${pid}"; do
+      sleep_cleanup_milliseconds 10 "${force_deadline_milliseconds}" || break
+    done
+  fi
+  if compose_anchor_alive "${pid}"; then
+    log "ERROR: Compose anchor could not prove exact group absence before its deadline"
+    return 125
+  fi
+  if wait "${pid}"; then status=0; else status=$?; fi
+  exchange_supervisor_control nested-done "${pid}" || return 125
+  if (( $(monotonic_time_milliseconds) >= normal_deadline_milliseconds )); then
+    return 124
+  fi
+  return "${status}"
 }
 
 terminate_active_compose() {
   local pid="${ACTIVE_COMPOSE_PID:-}"
   local attempt
   [[ -n "${pid}" ]] || return 0
-  ACTIVE_COMPOSE_PID=
-
-  if kill -0 "${pid}" 2>/dev/null; then
-    if tracked_compose_group_isolated "${pid}"; then
-      kill -TERM -- "-${pid}" 2>/dev/null || true
-    else
-      kill -TERM "${pid}" 2>/dev/null || true
-    fi
+  if compose_anchor_alive "${pid}"; then
+    kill -CONT "${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
     for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
-      kill -0 "${pid}" 2>/dev/null || break
+      compose_anchor_alive "${pid}" || break
       sleep_milliseconds "${COMPOSE_CHILD_TERM_DELAY_MILLISECONDS}"
     done
-    if kill -0 "${pid}" 2>/dev/null; then
-      if tracked_compose_group_isolated "${pid}"; then
-        kill -KILL -- "-${pid}" 2>/dev/null || true
-      else
-        kill -KILL "${pid}" 2>/dev/null || true
-      fi
+    if compose_anchor_alive "${pid}"; then
+      kill -USR2 "${pid}" 2>/dev/null || true
+      for ((attempt = 0; attempt < 100; attempt++)); do
+        compose_anchor_alive "${pid}" || break
+        sleep_milliseconds 10
+      done
     fi
   fi
+  if compose_anchor_alive "${pid}"; then
+    log "ERROR: active Compose anchor could not prove exact group absence"
+    return 125
+  fi
   wait "${pid}" 2>/dev/null || true
-  publish_supervisor_control "nested-done ${pid}"
+  if (( ACTIVE_COMPOSE_VERIFIED )); then
+    exchange_supervisor_control nested-done "${pid}" || return 125
+  fi
+  ACTIVE_COMPOSE_PID=
+  ACTIVE_COMPOSE_VERIFIED=0
 }
 
 validate_compose_redacted() {
@@ -1117,6 +1059,14 @@ project_is_empty() {
   # Treat an inspection failure as non-empty so a failed `down` cannot turn an
   # unobserved project into a physical-recovery receipt.
   local output
+  output="$(docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}' 2>/dev/null)" || return 1
+  [[ -z "${output//[[:space:]]/}" ]]
+}
+
+cleanup_project_is_empty() {
+  local output
   output="$(cleanup_verification_docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
     --format '{{.ID}}' 2>/dev/null)" || return 1
@@ -1140,7 +1090,7 @@ cleanup_partial_generation() {
     for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
       cleanup_down_lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
         >/dev/null 2>&1
-      if project_is_empty; then
+      if cleanup_project_is_empty; then
         cleanup_complete=1
         break
       fi

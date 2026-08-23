@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,10 +12,49 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+var (
+	testComposeAnchorOnce sync.Once
+	testComposeAnchorDir  string
+	testComposeAnchorPath string
+	testComposeAnchorErr  error
+)
+
+func composeAnchorBinary(t *testing.T) string {
+	t.Helper()
+	testComposeAnchorOnce.Do(func() {
+		directory, err := os.MkdirTemp("", "sumi-compose-anchor-test-")
+		if err != nil {
+			testComposeAnchorErr = err
+			return
+		}
+		testComposeAnchorDir = directory
+		testComposeAnchorPath = filepath.Join(directory, "sumi-compose-anchor")
+		command := exec.Command("go", "build", "-buildvcs=false", "-o", testComposeAnchorPath, "./cmd/compose-anchor")
+		command.Dir = filepath.Dir(repositoryFilePath("apps", "api", "go.mod"))
+		output, err := command.CombinedOutput()
+		if err != nil {
+			testComposeAnchorErr = fmt.Errorf("build Compose anchor: %w: %s", err, output)
+		}
+	})
+	if testComposeAnchorErr != nil {
+		t.Fatal(testComposeAnchorErr)
+	}
+	return testComposeAnchorPath
+}
+
+func TestMain(testingMain *testing.M) {
+	status := testingMain.Run()
+	if testComposeAnchorDir != "" {
+		_ = os.RemoveAll(testComposeAnchorDir)
+	}
+	os.Exit(status)
+}
 
 func TestSupervisorRecoveryInspectionDecodesAndPinsFencedReconcile(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
@@ -244,6 +283,7 @@ exec /usr/bin/stat "$@"
 	command.Env = []string{
 		"PATH=" + testRoot + ":/usr/bin:/bin",
 		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_COMPOSE_ANCHOR=" + composeAnchorBinary(t),
 		"SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true",
 		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
@@ -1067,6 +1107,18 @@ func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	}
 }
 
+func TestProvisionerImageInstallsComposeLifetimeAnchor(t *testing.T) {
+	dockerfile := readDeploymentFile(t, "../provisioner/Dockerfile")
+	for _, required := range []string{
+		"go build -o /usr/local/libexec/sumi-compose-anchor ./cmd/compose-anchor",
+		"COPY --from=build /usr/local/libexec/sumi-compose-anchor /usr/local/libexec/sumi-compose-anchor",
+	} {
+		if !strings.Contains(dockerfile, required) {
+			t.Fatalf("provisioner image omits Compose lifetime anchor contract %q:\n%s", required, dockerfile)
+		}
+	}
+}
+
 func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	const (
 		millisecondsPerSecond               = 1000
@@ -1078,6 +1130,10 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 		downKillGraceSeconds                = 1
 		verificationTimeoutSeconds          = 5
 		verificationKillGraceSeconds        = 1
+		anchorForceGraceSeconds             = 1
+		controlAckTimeoutSeconds            = 1
+		maximumNestedAnchors                = 7
+		controlDrainJoinSeconds             = 1
 		schedulingMarginSeconds             = 10
 		composeTimeoutSeconds               = 7
 	)
@@ -1112,7 +1168,10 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 		composeChildTermAttempts*composeChildTermDelayMilliseconds +
 			cleanupMaxAttempts*(composeTimeoutSeconds+composeDownPostStopAllowanceSeconds+downKillGraceSeconds)*millisecondsPerSecond +
 			cleanupMaxAttempts*(verificationTimeoutSeconds+verificationKillGraceSeconds)*millisecondsPerSecond +
+			cleanupMaxAttempts*2*anchorForceGraceSeconds*millisecondsPerSecond +
 			(cleanupMaxAttempts-1)*cleanupRetryDelayMilliseconds +
+			maximumNestedAnchors*3*controlAckTimeoutSeconds*millisecondsPerSecond +
+			controlDrainJoinSeconds*millisecondsPerSecond +
 			schedulingMarginSeconds*millisecondsPerSecond,
 	)
 	if got != want {
@@ -1123,9 +1182,11 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 	for _, term := range []string{
 		"COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS",
 		"SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS",
-		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
-		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
+		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS + CLEANUP_ANCHOR_FORCE_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
+		"CLEANUP_MAX_ATTEMPTS * ( CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS + CLEANUP_ANCHOR_FORCE_GRACE_SECONDS ) * MILLISECONDS_PER_SECOND",
 		"(CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS",
+		"SUPERVISOR_MAX_NESTED_ANCHORS * 3 * SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS * MILLISECONDS_PER_SECOND",
+		"SUPERVISOR_CONTROL_DRAIN_JOIN_SECONDS * MILLISECONDS_PER_SECOND",
 		"SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS * MILLISECONDS_PER_SECOND",
 	} {
 		if !strings.Contains(compactSupervisor, term) {
@@ -1133,8 +1194,8 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 		}
 	}
 	for _, row := range []string{
-		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop grace + post-stop allowance + TERM grace Docker process group (all descendants)",
-		"ps --all --filter project-label none verification timeout + TERM grace Docker process group (all descendants)",
+		"down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace stop + TERM + force + ACK/join anchored Docker process group",
+		"ps --all --filter project-label none query + TERM + force + ACK/join anchored Docker process group",
 	} {
 		if !strings.Contains(compactSupervisor, row) {
 			t.Fatalf("supervisor cleanup group-deadline table omits %q:\n%s", row, compactSupervisor)
@@ -1153,8 +1214,9 @@ func TestSupervisorAdvertisesCleanupBoundForFullCleanupPath(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"deadline_milliseconds=$(( $(monotonic_time_milliseconds) + (timeout_seconds + kill_grace_seconds) * MILLISECONDS_PER_SECOND ))",
-		"milliseconds_until_cleanup_term \"${deadline_milliseconds}\" \"${kill_grace_seconds}\"",
+		"normal_deadline_milliseconds=$(( $(monotonic_time_milliseconds) + timeout_seconds * MILLISECONDS_PER_SECOND ))",
+		"term_deadline_milliseconds=$(( normal_deadline_milliseconds + kill_grace_seconds * MILLISECONDS_PER_SECOND ))",
+		"force_deadline_milliseconds=$(( term_deadline_milliseconds + CLEANUP_ANCHOR_FORCE_GRACE_SECONDS * MILLISECONDS_PER_SECOND ))",
 	} {
 		if !strings.Contains(compactSupervisor, required) {
 			t.Fatalf("supervisor cleanup deadline does not reserve TERM grace from one clock %q:\n%s", required, compactSupervisor)
@@ -1215,18 +1277,10 @@ exec /usr/bin/stat "$@"
 	if err != nil {
 		t.Fatal(err)
 	}
-	controlRead, controlWrite, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlRead.Close()
-	command := exec.Command(
-		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
-		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" prepare`, "--", supervisor,
-	)
-	command.Env = []string{
+	environment := []string{
 		"PATH=" + testRoot + ":/usr/bin:/bin",
 		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_COMPOSE_ANCHOR=" + composeAnchorBinary(t),
 		"SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true",
 		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
@@ -1234,63 +1288,39 @@ exec /usr/bin/stat "$@"
 		"SUMI_HANG_CLEANUP_DOWN=" + hangCleanupDown,
 		"SUMI_CLEANUP_DOWN_STARTED=" + cleanupDownStarted,
 		"SUMI_CLEANUP_CHILD_PID=" + cleanupChildPID,
-		"SUMI_SUPERVISOR_CONTROL_FD=3",
 		"SUMI_COMPOSE_TIMEOUT=1",
 	}
-	command.ExtraFiles = []*os.File{controlWrite}
-	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
-	if err := command.Start(); err != nil {
-		_ = controlWrite.Close()
-		t.Fatal(err)
-	}
-	if err := controlWrite.Close(); err != nil {
-		t.Fatal(err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := (execCommandRunner{pipeWait: 100 * time.Millisecond}).Run(
+			ctx,
+			"unshare",
+			[]string{"-Urnm", "/bin/bash", "-eu", "-c", `mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" prepare`, "--", supervisor},
+			environment,
+		)
+		done <- err
+	}()
 	waitForSupervisorFile(t, prepareReady, 5*time.Second)
 	if err := os.WriteFile(hangCleanupDown, []byte("hang"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	started := time.Now()
-	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
+	cancel()
 	var waitErr error
 	select {
 	case waitErr = <-done:
 	case <-time.After(8 * time.Second):
-		_ = command.Process.Kill()
-		<-done
 		t.Fatal("supervisor cleanup did not bound a hung docker compose down")
 	}
 	elapsed := time.Since(started)
-	if waitErr == nil {
-		t.Fatal("supervisor prepare unexpectedly succeeded after TERM")
+	if !errors.Is(waitErr, context.Canceled) {
+		t.Fatalf("supervisor cancellation error = %v, want context cancellation", waitErr)
 	}
 	waitForSupervisorFile(t, cleanupDownStarted, time.Second)
 	childPID := readSupervisorPID(t, cleanupChildPID)
 	waitForSupervisorProcessGone(t, childPID, 2*time.Second)
-	controlOutput, err := io.ReadAll(controlRead)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertBalancedNestedLifecycle(t, controlOutput)
-	match := regexp.MustCompile(`(?m)^cleanup-bound-ms ([0-9]+)$`).FindSubmatch(controlOutput)
-	if match == nil {
-		t.Fatalf("supervisor did not advertise cleanup bound: control=%s output=%s", controlOutput, output.String())
-	}
-	boundMilliseconds, err := strconv.ParseInt(string(match[1]), 10, 64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	advertisedBound := time.Duration(boundMilliseconds) * time.Millisecond
-	if elapsed > advertisedBound {
-		t.Fatalf("cleanup took %s, exceeding advertised bound %s", elapsed, advertisedBound)
-	}
 	// This tighter assertion makes the fake daemon hang observable. The
 	// advertised bound also includes three retries and conservative host margin.
 	if elapsed > 8*time.Second {
@@ -1360,6 +1390,7 @@ exec /usr/bin/stat "$@"
 	command.Env = []string{
 		"PATH=" + testRoot + ":/usr/bin:/bin",
 		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_COMPOSE_ANCHOR=" + composeAnchorBinary(t),
 		"SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true",
 		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
 		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,

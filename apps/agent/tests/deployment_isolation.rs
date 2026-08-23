@@ -49,6 +49,35 @@ type HostAnchorSnapshot = Vec<(&'static str, HostAnchorIdentity)>;
 /// per fixture would let the first test that destroys a host anchor become the
 /// next test's "before", so a real regression would be recorded as normal.
 static HOST_RUN_BASELINE: OnceLock<HostAnchorSnapshot> = OnceLock::new();
+static COMPOSE_ANCHOR_BINARY: OnceLock<PathBuf> = OnceLock::new();
+
+fn compose_anchor_binary() -> &'static PathBuf {
+    COMPOSE_ANCHOR_BINARY.get_or_init(|| {
+        let output_path = std::env::temp_dir().join(format!(
+            "sumi-compose-anchor-deployment-test-{}",
+            std::process::id()
+        ));
+        let api_dir = deploy_dir()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("apps/api");
+        let output = Command::new("go")
+            .current_dir(api_dir)
+            .args(["build", "-buildvcs=false", "-o"])
+            .arg(&output_path)
+            .arg("./cmd/compose-anchor")
+            .output()
+            .expect("run Go compiler for Compose anchor deployment fixture");
+        assert!(
+            output.status.success(),
+            "build Compose anchor deployment fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output_path
+    })
+}
 
 fn host_run_baseline() -> &'static HostAnchorSnapshot {
     HOST_RUN_BASELINE.get_or_init(host_run_snapshot)
@@ -202,6 +231,7 @@ fn string_set(values: &[&str]) -> BTreeSet<String> {
 fn launch_env(command: &mut Command, paid: &str) {
     command
         .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_ANCHOR", compose_anchor_binary())
         .env("SUMI_PERSONALITY_AGENT_ID", paid)
         .env("SUMI_GATEWAY_URL", "wss://gateway.invalid/agent")
         .env("SUMI_LOCAL_CONTROL_BEARER", "control-secret")
@@ -656,6 +686,7 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_ANCHOR", compose_anchor_binary())
         .env("SUMI_COMPOSE_TIMEOUT", "10")
         .env("SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "true")
         .env("SUMI_PERSONALITY_AGENT_ID", &fixture.paid)
