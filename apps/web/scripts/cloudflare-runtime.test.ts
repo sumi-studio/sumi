@@ -649,31 +649,32 @@ async function verifyClosedTabGenericPush(
     await inspectionPage.goto(`${origin}/direct`, {
       waitUntil: "domcontentloaded",
     });
-    await inspectionPage.waitForFunction(async () => {
-      const registration = await navigator.serviceWorker.getRegistration("/");
-      return (await registration?.getNotifications())?.length === 1;
-    });
-    const notifications = await inspectionPage.evaluate(async () => {
-      const registration = await navigator.serviceWorker.getRegistration("/");
-      if (!registration) return [];
-      return (await registration.getNotifications()).map((notification) => ({
-        title: notification.title,
-        body: notification.body,
-        tag: notification.tag,
-        data: notification.data as unknown,
-      }));
-    });
-    assert.deepEqual(notifications, [
-      {
-        title: "Sumi",
-        body: "新しいメッセージがあります",
-        tag: "sumi:workspace-private-pointer:channel:place-private-pointer",
-        data: {
-          url: "/w/workspace-private-pointer/messaging/c/place-private-pointer",
-        },
+    const notificationHandle = await inspectionPage.waitForFunction(
+      async () => {
+        const registration = await navigator.serviceWorker.getRegistration("/");
+        if (!registration) return false;
+        const notifications = await registration.getNotifications();
+        if (notifications.length !== 1) return false;
+        const [notification] = notifications;
+        return {
+          title: notification.title,
+          body: notification.body,
+          tag: notification.tag,
+          data: notification.data as unknown,
+        };
       },
-    ]);
-    const visible = `${notifications[0]?.title}\n${notifications[0]?.body}`;
+    );
+    const notification = await notificationHandle.jsonValue();
+    await notificationHandle.dispose();
+    assert.deepEqual(notification, {
+      title: "Sumi",
+      body: "新しいメッセージがあります",
+      tag: "sumi:workspace-private-pointer:channel:place-private-pointer",
+      data: {
+        url: "/w/workspace-private-pointer/messaging/c/place-private-pointer",
+      },
+    });
+    const visible = `${notification.title}\n${notification.body}`;
     assert.doesNotMatch(
       visible,
       /workspace-private-pointer|place-private-pointer|participant|attachment/i,
