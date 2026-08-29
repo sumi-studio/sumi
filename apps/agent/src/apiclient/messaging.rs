@@ -491,7 +491,7 @@ mod tests {
 
         let multibyte = "é".repeat(128);
         let bounded = canonical_attachment_filename(&multibyte);
-        assert_eq!(bounded.as_bytes().len(), 254);
+        assert_eq!(bounded.len(), 254);
         assert_eq!(bounded, "é".repeat(127));
     }
 

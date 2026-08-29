@@ -6,8 +6,8 @@ import {
   getMessagingScope,
   useMessaging,
 } from "../../messaging/store";
-import { useWorkspaceControl } from "../store";
 import { messagingScopeForWorkspace } from "../messaging-scope";
+import { useWorkspaceControl } from "../store";
 
 /**
  * Shell-lifetime owner for the Messaging transport. The selected Workspace
@@ -29,17 +29,26 @@ export function MessagingTransport() {
     installations,
     members,
   });
+  const desiredWorkspaceId = desired?.workspaceId ?? null;
+  const desiredInstallationId = desired?.installationId ?? null;
+  const desiredAuthorityEpoch = desired?.authorityEpoch ?? null;
 
   useLayoutEffect(() => {
-    if (!sameMessagingScope(getMessagingScope(), desired)) {
-      bindMessagingScope(desired);
+    const next =
+      desiredWorkspaceId !== null &&
+      desiredInstallationId !== null &&
+      desiredAuthorityEpoch !== null
+        ? {
+            workspaceId: desiredWorkspaceId,
+            installationId: desiredInstallationId,
+            authorityEpoch: desiredAuthorityEpoch,
+          }
+        : null;
+    if (!sameMessagingScope(getMessagingScope(), next)) {
+      bindMessagingScope(next);
     }
-    if (desired) useMessaging.getState().init();
-  }, [
-    desired?.authorityEpoch,
-    desired?.installationId,
-    desired?.workspaceId,
-  ]);
+    if (next) useMessaging.getState().init();
+  }, [desiredAuthorityEpoch, desiredInstallationId, desiredWorkspaceId]);
 
   // Deliberately no unmount cleanup: AppShell persists across in-app routes.
   // Session logout resets Messaging through AuthGate; scope changes above close

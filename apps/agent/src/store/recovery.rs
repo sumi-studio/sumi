@@ -200,14 +200,8 @@ impl LogicalRecoveryExecutor {
         // this recovery writer exclusive through the final atomic batch.
         let writer = EventWriter::new(Arc::new(store.clone()));
         let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
-        let batch = Self::plan_batch(
-            store,
-            &recovery,
-            steps,
-            lease.generation(),
-            &HashMap::new(),
-        )
-        .await?;
+        let batch =
+            Self::plan_batch(store, &recovery, steps, lease.generation(), &HashMap::new()).await?;
         recovery
             .apply_recovery_batch(batch)
             .await
@@ -307,6 +301,10 @@ impl LogicalRecoveryExecutor {
 }
 
 impl ToolUseRecoverySnapshot {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "logical recovery authenticates each owner, turn, approval, and physical-resolution dimension explicitly"
+    )]
     async fn load(
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         messages: &[ContextMessage],
@@ -1133,6 +1131,10 @@ impl SuffixRecovery {
     /// physical recovery receipt.  EventWriter owns the transaction boundary;
     /// this wrapper intentionally does not kill/reap processes or persist the
     /// T27 proof store.
+    #[allow(
+        dead_code,
+        reason = "receipt replay is retained for exact boot-recovery tests"
+    )]
     pub(crate) async fn apply_physical_receipt(
         writer: &EventWriter,
         lease: &ProcessGenerationLease,
@@ -2792,11 +2794,9 @@ pub(crate) mod tests {
         let readiness_path = std::path::PathBuf::from(
             std::env::var("SUMI_T27_READY").expect("child readiness environment"),
         );
-        let (store, writer) = setup_boot_running_tools_on_disk(
-            &database_path,
-            &[("tool-boot-kill", "read_file", 0)],
-        )
-        .await;
+        let (store, writer) =
+            setup_boot_running_tools_on_disk(&database_path, &[("tool-boot-kill", "read_file", 0)])
+                .await;
         let (lease, fence, attestation) = boot_recovery_authority(&store);
         let intents = match store
             .hydrate(&lease, &fence)

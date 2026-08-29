@@ -1869,7 +1869,7 @@ fn has_valid_percent_encoding(value: &str) -> bool {
 fn is_canonical_attachment_mime(value: &str) -> bool {
     value.parse::<mime::Mime>().is_ok_and(|parsed| {
         parsed.params().next().is_none()
-            && parsed.to_string() == value
+            && parsed.essence_str() == value
             && (!value.starts_with("image/") || is_inline_attachment_image_mime(value))
     })
 }
@@ -2576,6 +2576,10 @@ pub(crate) struct LocalReadyProof {
 }
 
 impl LocalReadyProof {
+    #[allow(
+        dead_code,
+        reason = "hydration receipt inspection is retained for exact readiness tests"
+    )]
     pub(crate) const fn hydration_ready(&self) -> &HydrationReady {
         &self.ready
     }
@@ -4240,9 +4244,20 @@ mod tests {
         body: Vec<u8>,
     }
 
+    type MessagingReplayRequest = (String, String, Vec<u8>);
+
+    #[test]
+    fn attachment_mime_requires_exact_canonical_spelling_without_parameters() {
+        assert!(is_canonical_attachment_mime("text/plain"));
+        assert!(is_canonical_attachment_mime("image/png"));
+        assert!(!is_canonical_attachment_mime("TEXT/PLAIN"));
+        assert!(!is_canonical_attachment_mime("text/plain; charset=utf-8"));
+        assert!(!is_canonical_attachment_mime("image/svg+xml"));
+    }
+
     #[derive(Clone, Default)]
     struct MessagingReplayFixtureState {
-        requests: Arc<StdMutex<Vec<(String, String, Vec<u8>)>>>,
+        requests: Arc<StdMutex<Vec<MessagingReplayRequest>>>,
     }
 
     fn committed_response_loss() -> Response {
@@ -4774,10 +4789,7 @@ mod tests {
         assert_eq!(request["installation_id"], scope.installation_id);
         assert_eq!(request["authority_epoch"], scope.authority_epoch);
         assert!(request.get("app_id").is_none());
-        assert_eq!(
-            request["content"].as_str().unwrap().as_bytes().len(),
-            64 * 1024
-        );
+        assert_eq!(request["content"].as_str().unwrap().len(), 64 * 1024);
         server.abort();
     }
 

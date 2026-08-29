@@ -165,7 +165,14 @@ type browserEventEnvelope struct {
 type directChatStatusFrame struct {
 	Type   string `json:"type"`
 	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
 }
+
+const (
+	directChatUnavailableRehydrating = "rehydrating"
+	directChatUnavailableStopped     = "stopped"
+	directChatUnavailableUnknown     = "unavailable"
+)
 
 func (f *browserEventFrame) UnmarshalJSON(data []byte) error {
 	if err := checkDuplicateKeys(data); err != nil {
@@ -299,7 +306,13 @@ func (f *directChatStatusFrame) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	value := directChatStatusFrame(decoded)
-	if value.Type != "direct_chat_status" || (value.Status != "ready" && value.Status != "unavailable") {
+	if value.Type != "direct_chat_status" ||
+		(value.Status != "ready" && value.Status != "unavailable") ||
+		(value.Status == "ready" && value.Reason != "") ||
+		(value.Status == "unavailable" &&
+			value.Reason != directChatUnavailableRehydrating &&
+			value.Reason != directChatUnavailableStopped &&
+			value.Reason != directChatUnavailableUnknown) {
 		return errors.New("invalid direct chat status frame")
 	}
 	*f = value
@@ -583,14 +596,17 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.removeConnection(conn)
 	defer conn.Close()
 	if runtimeUnavailable {
-		_ = conn.WriteControl(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(
-				DirectChatRuntimeUnavailableCloseCode,
-				DirectChatRuntimeUnavailableCloseReason,
-			),
-			s.sessionDeadline(claims, s.writeTimeout()),
-		)
+		deadline := s.sessionDeadline(claims, s.writeTimeout())
+		if deadline.After(time.Now()) {
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(
+					DirectChatRuntimeUnavailableCloseCode,
+					DirectChatRuntimeUnavailableCloseReason,
+				),
+				deadline,
+			)
+		}
 		return
 	}
 	if err := s.run(r.Context(), conn, claims, scope); err != nil && !errors.Is(err, context.Canceled) {
@@ -820,11 +836,11 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	}
 	// Replay may block on the durable log, so sample readiness only after it
 	// completes instead of publishing a status captured before the barrier.
-	ready, err := s.Events.IsPersonalityAgentReady(ctx, claims.PersonalityAgentID)
+	readiness, err := s.Events.directChatReadiness(ctx, claims.PersonalityAgentID)
 	if err != nil {
 		return fmt.Errorf("read direct-chat readiness: %w", err)
 	}
-	if err := write(directChatStatusFrame{Type: "direct_chat_status", Status: readinessStatus(ready)}); err != nil {
+	if err := write(readiness.directChatStatusFrame()); err != nil {
 		return err
 	}
 
@@ -834,7 +850,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 			ctx,
 			claims.PersonalityAgentID,
 			next,
-			ready,
+			readiness,
 			volatile,
 			authorize,
 			write,
@@ -869,7 +885,7 @@ func (s *BrowserServer) browserEventPump(
 	ctx context.Context,
 	personalityAgentID string,
 	lastConsumed uint64,
-	ready bool,
+	readiness directChatReadiness,
 	volatile <-chan Envelope,
 	authorize func(func() error) error,
 	write func(any) error,
@@ -933,13 +949,13 @@ func (s *BrowserServer) browserEventPump(
 				return fmt.Errorf("revalidate browser direct chat: %w", err)
 			}
 		case <-ticker.C:
-			current, err := s.Events.IsPersonalityAgentReady(ctx, personalityAgentID)
+			current, err := s.Events.directChatReadiness(ctx, personalityAgentID)
 			if err != nil {
 				return fmt.Errorf("poll direct-chat readiness: %w", err)
 			}
-			if current != ready {
-				ready = current
-				if err := write(directChatStatusFrame{Type: "direct_chat_status", Status: readinessStatus(ready)}); err != nil {
+			if current != readiness {
+				readiness = current
+				if err := write(readiness.directChatStatusFrame()); err != nil {
 					return err
 				}
 			}

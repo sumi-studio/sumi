@@ -135,7 +135,11 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   assert.deepEqual(wire.sent.map(JSON.parse), [
     { type: "hello", last_event_seq: 0 },
   ]);
-  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  wire.receive({
+    type: "direct_chat_status",
+    status: "unavailable",
+    reason: "rehydrating",
+  });
   assert.deepEqual(wire.sent.map(JSON.parse), [
     { type: "hello", last_event_seq: 0 },
   ]);
@@ -229,7 +233,11 @@ test("retries an uncertain command with its original key and stops after accepta
   assert.deepEqual(second.sent.map(JSON.parse), [
     { type: "hello", last_event_seq: 0 },
   ]);
-  second.receive({ type: "direct_chat_status", status: "unavailable" });
+  second.receive({
+    type: "direct_chat_status",
+    status: "unavailable",
+    reason: "unavailable",
+  });
   assert.equal(
     second.sent.map(JSON.parse).filter((frame) => frame.type === "command")
       .length,
@@ -303,7 +311,11 @@ test("unavailable status retains pending commands without sending until ready", 
       .length,
     0,
   );
-  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  wire.receive({
+    type: "direct_chat_status",
+    status: "unavailable",
+    reason: "rehydrating",
+  });
   assert.deepEqual(socket.pendingIdempotencyKeys(), ["unavailable-key"]);
   assert.equal(
     wire.sent.map(JSON.parse).filter((frame) => frame.type === "command")
@@ -468,11 +480,35 @@ test("tracks browser connection separately from authoritative agent readiness", 
   socket.connect();
   const wire = FakeWebSocket.instances.at(-1);
   wire.open();
-  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  wire.receive({
+    type: "direct_chat_status",
+    status: "unavailable",
+    reason: "rehydrating",
+  });
   wire.receive({ type: "direct_chat_status", status: "ready" });
   assert.deepEqual(connections, ["connecting", "connected"]);
-  assert.deepEqual(readiness, ["unknown", "not_ready", "ready"]);
+  assert.deepEqual(readiness, ["unknown", "rehydrating", "ready"]);
   socket.close();
+});
+
+test("missing or unknown unavailable reasons fail closed instead of claiming a transition", () => {
+  for (const frame of [
+    { type: "direct_chat_status", status: "unavailable" },
+    { type: "direct_chat_status", status: "unavailable", reason: "other" },
+  ]) {
+    FakeWebSocket.instances = [];
+    const socket = new DirectChatSocket();
+    const readiness = [];
+    socket.bindInstallation(binding);
+    socket.onReady((state) => readiness.push(state));
+    socket.connect();
+    const wire = FakeWebSocket.instances.at(-1);
+    wire.open();
+    wire.receive(frame);
+    assert.deepEqual(readiness, ["unknown", "unknown"]);
+    assert.equal(wire.readyState, FakeWebSocket.CLOSED);
+    socket.close();
+  }
 });
 
 test("rejects legacy target-bearing and malformed server frames", () => {

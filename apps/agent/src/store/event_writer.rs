@@ -883,6 +883,10 @@ impl InjectedCommand {
         &self.message_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "injected provenance inspection is retained for durable binding tests"
+    )]
     pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
         &self.provenance
     }
@@ -2764,6 +2768,10 @@ impl EventWriter {
     /// projection must be part of the supplied batch (normally as its final
     /// eventless write); EventWriter then commits the logical suffix, terminal
     /// tool events/results, and T17 application ledger in one SQLite transaction.
+    #[allow(
+        dead_code,
+        reason = "physical recovery application is invoked by boot recovery tests and the production composition successor"
+    )]
     pub(crate) async fn apply_physical_recovery(
         &self,
         lease: &ProcessGenerationLease,
@@ -2851,6 +2859,10 @@ impl EventWriter {
     /// transaction failpoint, so a hard kill can be taken on the exact
     /// transaction production commits.
     #[cfg(all(test, unix))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the test failpoint mirrors the exact production recovery authority and crash boundary"
+    )]
     pub(in crate::store) async fn apply_boot_physical_recovery_with_abrupt_failpoint(
         &self,
         lease: &ProcessGenerationLease,
@@ -5674,6 +5686,10 @@ impl EventWriter {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "replay validation compares every authenticated command dimension explicitly"
+    )]
     async fn verify_replay(
         &self,
         incoming_seq: u64,
@@ -20999,7 +21015,6 @@ mod tests {
         assert!(decrypt_content(&key, &ciphertext, &wrong_seq).is_err());
         let wrong_conversation = AgentScope {
             personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ..scope()
         }
         .row_aad("inbound_commands", "1", DataKeyPurpose::Command);
         assert!(decrypt_content(&key, &ciphertext, &wrong_conversation).is_err());
@@ -31514,8 +31529,15 @@ mod tests {
         let run_id = "run-1";
         let tool_call_id = "tool-1";
         let decision_id = "00000000-0000-4000-8000-000000000002";
-        seed_running_tool_execution(&store, &writer, "request-1", tool_call_id, run_id, decision_id)
-            .await;
+        seed_running_tool_execution(
+            &store,
+            &writer,
+            "request-1",
+            tool_call_id,
+            run_id,
+            decision_id,
+        )
+        .await;
 
         let lease = test_lease(2);
         let fence = test_fence(&lease);

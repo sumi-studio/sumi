@@ -12,6 +12,7 @@ readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly COMPOSE_FILE="${SUPERVISOR_DIR}/compose.yaml"
 readonly PREPARE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.prepare.yaml"
 readonly LIFECYCLE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.lifecycle.yaml"
+readonly COMPOSE_ANCHOR="${SUMI_COMPOSE_ANCHOR:-/usr/local/libexec/sumi-compose-anchor}"
 readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks
 readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control
 readonly RUNTIME_SECRET_HOST_ROOT="${SUMI_RUNTIME_SECRET_HOST_ROOT:-/run/sumi/runtime-secrets}"
@@ -59,6 +60,20 @@ publish_supervisor_control() {
   printf '%s\n' "$1" >&3 || true
 }
 
+exchange_supervisor_control() {
+  local event="$1" value="$2" acknowledgement
+  publish_supervisor_control "${event} ${value}"
+  (( SUPERVISOR_CONTROL_ENABLED )) || return 0
+  if ! IFS= read -r -t "${SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS}" acknowledgement <&3; then
+    log "ERROR: provisioner did not acknowledge ${event}"
+    return 1
+  fi
+  [[ "${acknowledgement}" == "ack-${event} ${value}" ]] || {
+    log "ERROR: provisioner rejected ${event}"
+    return 1
+  }
+}
+
 log() {
   printf '[sumi-supervisor] %s\n' "$*" >&4
 }
@@ -76,11 +91,13 @@ require_paid() {
 
 require_docker() {
   command -v docker >/dev/null 2>&1 || fail "docker is required"
-  docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
+  run_external docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
 }
 
 require_tracked_compose_support() {
   command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
+  [[ -f "${COMPOSE_ANCHOR}" && -x "${COMPOSE_ANCHOR}" ]] ||
+    fail "the privileged Compose lifetime anchor is required"
 }
 
 configure_apparmor_profile() {
@@ -104,12 +121,12 @@ validate_root_owned_anchor() {
   local owner mode canonical
   [[ -d "${path}" && ! -L "${path}" ]] ||
     fail "trusted path must be a real directory: ${path}"
-  canonical="$(readlink -e -- "${path}")" ||
+  canonical="$(run_external readlink -e -- "${path}")" ||
     fail "cannot canonicalize trusted path: ${path}"
   [[ "${canonical}" == "${path}" ]] ||
     fail "trusted path must be canonical: ${path}"
-  owner="$(stat -c '%u' -- "${path}")"
-  mode="$(stat -c '%a' -- "${path}")"
+  owner="$(run_external stat -c '%u' -- "${path}")"
+  mode="$(run_external stat -c '%a' -- "${path}")"
   [[ "${owner}" == "0" ]] ||
     fail "trusted path must be owned by root: ${path}"
   (( (8#${mode} & 0022) == 0 )) ||
@@ -122,14 +139,14 @@ ensure_host_trust_roots() {
   if [[ ! -e /run/sumi ]]; then
     [[ "${EUID}" -eq 0 ]] ||
       fail "trusted host root does not exist: /run/sumi"
-    install -d -m 0755 -o root -g root /run/sumi
+    run_external install -d -m 0755 -o root -g root /run/sumi
   fi
   [[ ! -L "${SUPERVISOR_LOCK_ROOT}" ]] ||
     fail "trusted lock root must not be a symlink: ${SUPERVISOR_LOCK_ROOT}"
   if [[ ! -e "${SUPERVISOR_LOCK_ROOT}" ]]; then
     [[ "${EUID}" -eq 0 ]] ||
       fail "trusted lock root does not exist: ${SUPERVISOR_LOCK_ROOT}"
-    install -d -m 0755 -o root -g root "${SUPERVISOR_LOCK_ROOT}"
+    run_external install -d -m 0755 -o root -g root "${SUPERVISOR_LOCK_ROOT}"
   fi
   for path in / /run /run/sumi "${SUPERVISOR_LOCK_ROOT}"; do
     validate_root_owned_anchor "${path}"
@@ -151,24 +168,24 @@ acquire_supervisor_lock() {
   fi
   [[ -f "${lock_path}" && ! -L "${lock_path}" ]] ||
     fail "supervisor lock must be a regular non-symlink"
-  lock_owner="$(stat -c '%u' -- "${lock_path}")"
-  lock_mode="$(stat -c '%a' -- "${lock_path}")"
-  lock_links="$(stat -c '%h' -- "${lock_path}")"
+  lock_owner="$(run_external stat -c '%u' -- "${lock_path}")"
+  lock_mode="$(run_external stat -c '%a' -- "${lock_path}")"
+  lock_links="$(run_external stat -c '%h' -- "${lock_path}")"
   [[ "${lock_owner}" == "${EUID}" ]] ||
     fail "supervisor lock must be owned by the invoking uid"
   [[ "${lock_mode}" == "600" ]] ||
     fail "supervisor lock mode must be 0600"
   [[ "${lock_links}" == "1" ]] ||
     fail "supervisor lock must have exactly one link"
-  path_identity="$(stat -Lc '%d:%i' -- "${lock_path}")"
+  path_identity="$(run_external stat -Lc '%d:%i' -- "${lock_path}")"
   exec {SUPERVISOR_LOCK_FD}<>"${lock_path}" ||
     fail "cannot open supervisor lock"
-  fd_identity="$(stat -Lc '%d:%i' -- "/proc/$$/fd/${SUPERVISOR_LOCK_FD}")"
+  fd_identity="$(run_external stat -Lc '%d:%i' -- "/proc/$$/fd/${SUPERVISOR_LOCK_FD}")"
   [[ "${path_identity}" == "${fd_identity}" ]] ||
     fail "supervisor lock changed while it was opened"
-  flock -n "${SUPERVISOR_LOCK_FD}" ||
+  run_external flock -n "${SUPERVISOR_LOCK_FD}" ||
     fail "another supervisor invocation owns ${SUMI_COMPOSE_PROJECT}"
-  [[ "$(stat -Lc '%d:%i' -- "${lock_path}")" == "${fd_identity}" ]] ||
+  [[ "$(run_external stat -Lc '%d:%i' -- "${lock_path}")" == "${fd_identity}" ]] ||
     fail "supervisor lock changed after acquisition"
 }
 
@@ -190,23 +207,23 @@ local_control_snapshot() {
   done
   [[ -d "${LOCAL_CONTROL_HOST_ROOT}" && ! -L "${LOCAL_CONTROL_HOST_ROOT}" ]] ||
     fail "local-control registry root must be a real directory"
-  canonical="$(readlink -e -- "${LOCAL_CONTROL_HOST_ROOT}")" ||
+  canonical="$(run_external readlink -e -- "${LOCAL_CONTROL_HOST_ROOT}")" ||
     fail "cannot canonicalize local-control registry root"
   [[ "${canonical}" == "${LOCAL_CONTROL_HOST_ROOT}" ]] ||
     fail "local-control registry root must be canonical"
-  [[ "$(stat -c '%u:%g:%a' -- "${LOCAL_CONTROL_HOST_ROOT}")" == \
+  [[ "$(run_external stat -c '%u:%g:%a' -- "${LOCAL_CONTROL_HOST_ROOT}")" == \
     "${SUMI_LOCAL_CONTROL_SERVER_UID}:${SUMI_LOCAL_CONTROL_SOCKET_GID}:750" ]] ||
     fail "local-control registry root owner, group, or mode is not trusted"
 
   [[ -d "${SUMI_LOCAL_CONTROL_HOST_DIR}" && ! -L "${SUMI_LOCAL_CONTROL_HOST_DIR}" ]] ||
     fail "local-control parent must pre-exist as a real directory"
-  canonical="$(readlink -e -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")" ||
+  canonical="$(run_external readlink -e -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")" ||
     fail "cannot canonicalize local-control parent"
   [[ "${canonical}" == "${SUMI_LOCAL_CONTROL_HOST_DIR}" ]] ||
     fail "local-control parent must be canonical"
-  directory_owner="$(stat -c '%u' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
-  directory_gid="$(stat -c '%g' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
-  directory_mode="$(stat -c '%a' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_owner="$(run_external stat -c '%u' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_gid="$(run_external stat -c '%g' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_mode="$(run_external stat -c '%a' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
   [[ "${directory_owner}" == "${SUMI_LOCAL_CONTROL_SERVER_UID}" ]] ||
     fail "local-control parent uid does not match SUMI_LOCAL_CONTROL_SERVER_UID"
   [[ "${directory_gid}" == "${SUMI_LOCAL_CONTROL_SOCKET_GID}" ]] ||
@@ -217,14 +234,14 @@ local_control_snapshot() {
   local socket="${SUMI_LOCAL_CONTROL_HOST_DIR}/control.sock"
   [[ -S "${socket}" && ! -L "${socket}" ]] ||
     fail "local-control socket must pre-exist"
-  canonical="$(readlink -e -- "${socket}")" ||
+  canonical="$(run_external readlink -e -- "${socket}")" ||
     fail "cannot canonicalize local-control socket"
   [[ "${canonical}" == "${socket}" ]] ||
     fail "local-control socket must be canonical"
-  socket_owner="$(stat -c '%u' -- "${socket}")"
-  socket_gid="$(stat -c '%g' -- "${socket}")"
-  socket_mode="$(stat -c '%a' -- "${socket}")"
-  socket_links="$(stat -c '%h' -- "${socket}")"
+  socket_owner="$(run_external stat -c '%u' -- "${socket}")"
+  socket_gid="$(run_external stat -c '%g' -- "${socket}")"
+  socket_mode="$(run_external stat -c '%a' -- "${socket}")"
+  socket_links="$(run_external stat -c '%h' -- "${socket}")"
   [[ "${socket_owner}" == "${SUMI_LOCAL_CONTROL_SERVER_UID}" ]] ||
     fail "local-control socket uid does not match SUMI_LOCAL_CONTROL_SERVER_UID"
   [[ "${socket_gid}" == "${SUMI_LOCAL_CONTROL_SOCKET_GID}" ]] ||
@@ -234,7 +251,7 @@ local_control_snapshot() {
   [[ "${socket_links}" == "1" ]] ||
     fail "local-control socket must have exactly one link"
 
-  stat -c '%d:%i:%u:%g:%a:%h' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}" "${socket}"
+  run_external stat -c '%d:%i:%u:%g:%a:%h' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}" "${socket}"
 }
 
 validate_local_control_socket() {
@@ -275,9 +292,9 @@ validate_runtime_secret_anchor() {
   fi
   [[ -d "${path}" && ! -L "${path}" ]] ||
     fail "runtime secret trust path must be a real directory"
-  [[ "$(readlink -e -- "${path}")" == "${path}" ]] ||
+  [[ "$(run_external readlink -e -- "${path}")" == "${path}" ]] ||
     fail "runtime secret trust path must be canonical"
-  [[ "$(stat -c '%u:%g:%a' -- "${path}")" == "${expected_owner}:${expected_owner}:700" ]] ||
+  [[ "$(run_external stat -c '%u:%g:%a' -- "${path}")" == "${expected_owner}:${expected_owner}:700" ]] ||
     fail "runtime secret trust path owner, group, or mode is not trusted"
 }
 
@@ -293,7 +310,7 @@ ensure_runtime_secret_root() {
   [[ ! -L "${RUNTIME_SECRET_HOST_ROOT}" ]] ||
     fail "runtime secret registry root must not be a symlink"
   if [[ ! -e "${RUNTIME_SECRET_HOST_ROOT}" ]]; then
-    install -d -m 0700 -o "${expected_owner}" -g "${expected_owner}" \
+    run_external install -d -m 0700 -o "${expected_owner}" -g "${expected_owner}" \
       "${RUNTIME_SECRET_HOST_ROOT}"
   fi
   validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}"
@@ -314,7 +331,7 @@ remove_runtime_secret_tree() {
   [[ ! -L "${paid_root}" ]] || fail "runtime secret PAID root must not be a symlink"
   if [[ -e "${paid_root}" ]]; then
     validate_runtime_secret_anchor "${paid_root}"
-    rm -rf -- "${paid_root}"
+    run_external rm -rf -- "${paid_root}"
   fi
 }
 
@@ -324,8 +341,8 @@ remove_runtime_secret_generation() {
   ensure_runtime_secret_root
   validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
   validate_runtime_secret_anchor "${generation_root}"
-  rm -rf -- "${generation_root}"
-  rmdir -- "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}" 2>/dev/null || true
+  run_external rm -rf -- "${generation_root}"
+  run_external rmdir -- "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}" 2>/dev/null || true
 }
 
 runtime_secret_snapshot() {
@@ -351,12 +368,12 @@ runtime_secret_snapshot() {
     path="${SUMI_RUNTIME_SECRET_HOST_DIR}/${path}"
     [[ -f "${path}" && ! -L "${path}" ]] ||
       fail "runtime secret must be a regular non-symlink"
-    canonical="$(readlink -e -- "${path}")" || fail "cannot canonicalize runtime secret"
+    canonical="$(run_external readlink -e -- "${path}")" || fail "cannot canonicalize runtime secret"
     [[ "${canonical}" == "${path}" ]] || fail "runtime secret path must be canonical"
-    [[ "$(stat -c '%u:%g:%a:%h' -- "${path}")" == \
+    [[ "$(run_external stat -c '%u:%g:%a:%h' -- "${path}")" == \
       "${secret_owner}:${secret_group}:400:1" ]] ||
       fail "runtime secret owner, group, mode, or link count is not trusted"
-    stat -c '%d:%i:%u:%g:%a:%h:%s' -- "${path}"
+    run_external stat -c '%d:%i:%u:%g:%a:%h:%s' -- "${path}"
   done
 }
 
@@ -375,10 +392,10 @@ materialize_runtime_secrets() {
   [[ ! -e "${paid_root}" && ! -L "${paid_root}" ]] ||
     fail "runtime secret PAID root already exists"
   if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
-    install -d -m 0700 "${paid_root}" "${SUMI_RUNTIME_SECRET_HOST_DIR}"
+    run_external install -d -m 0700 "${paid_root}" "${SUMI_RUNTIME_SECRET_HOST_DIR}"
   else
-    install -d -m 0700 -o root -g root "${paid_root}"
-    install -d -m 0700 -o root -g root "${SUMI_RUNTIME_SECRET_HOST_DIR}"
+    run_external install -d -m 0700 -o root -g root "${paid_root}"
+    run_external install -d -m 0700 -o root -g root "${SUMI_RUNTIME_SECRET_HOST_DIR}"
   fi
   for name in "${mappings[@]}"; do
     path="${SUMI_RUNTIME_SECRET_HOST_DIR}/${name#*:}"
@@ -386,10 +403,10 @@ materialize_runtime_secrets() {
     (umask 077; set -o noclobber; printf '%s' "${!name}" > "${path}") ||
       fail "cannot materialize runtime secret"
     if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
-      chmod 0400 "${path}"
+      run_external chmod 0400 "${path}"
     else
-      chown "${RUNTIME_SECRET_UID}:${RUNTIME_SECRET_GID}" "${path}"
-      chmod 0400 "${path}"
+      run_external chown "${RUNTIME_SECRET_UID}:${RUNTIME_SECRET_GID}" "${path}"
+      run_external chmod 0400 "${path}"
     fi
   done
   RUNTIME_SECRET_TRUST_SNAPSHOT="$(runtime_secret_snapshot)"
@@ -463,39 +480,170 @@ declare SUMI_RUNTIME_SECRET_HOST_DIR="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT
 export SUMI_RUNTIME_SECRET_HOST_DIR
 declare CLEANUP_ARMED=0
 declare ACTIVE_COMPOSE_PID=
+declare ACTIVE_COMPOSE_IDENTITY=
+declare ACTIVE_COMPOSE_VERIFIED=0
+declare ACTIVE_COMPOSE_PROTOCOL_BROKEN=0
+declare TRACKED_COMPOSE_IDENTITY=
+readonly MILLISECONDS_PER_SECOND=1000
 readonly CLEANUP_MAX_ATTEMPTS=3
-readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
-readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
-readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
+readonly CLEANUP_RETRY_DELAY_MILLISECONDS=100
+readonly CLEANUP_CONTAINMENT_FAILURE_STATUS=126
+readonly SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS=1
+# One nested Compose anchor can be active when cancellation begins; cleanup can
+# then run one down and one exact-absence query per attempt. Every anchor uses
+# start, verified, and done acknowledgements.
+readonly SUPERVISOR_MAX_NESTED_ANCHORS=$((1 + CLEANUP_MAX_ATTEMPTS * 2))
+readonly SUPERVISOR_CONTROL_DRAIN_JOIN_SECONDS=1
+# Every cleanup-path Docker CLI call has a wall-clock cap:
+#
+# Docker call                         Inner operation                 One total group budget                         Signal target
+# down --timeout SUMI_COMPOSE_TIMEOUT container-stop grace             stop + TERM + force + ACK/join                anchored Docker process group
+# ps --all --filter project-label     none                             query + TERM + force + ACK/join               anchored Docker process group
+#
+# `down --timeout` is Docker's container-stop grace, not a cap on the CLI or
+# daemon response. After that grace expires, Compose still has to observe the
+# exits and remove containers, networks, and orphans. Five seconds (the same
+# bounded allowance used for the follow-up `ps`) reserves that local teardown
+# work, so the outer budget does not TERM Compose at the stop-grace boundary.
+readonly COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS=5
+readonly CLEANUP_DOWN_TIMEOUT_SECONDS=$((
+  SUMI_COMPOSE_TIMEOUT + COMPOSE_DOWN_POST_STOP_ALLOWANCE_SECONDS
+))
+readonly CLEANUP_DOWN_KILL_GRACE_SECONDS=1
+readonly CLEANUP_ANCHOR_FORCE_GRACE_SECONDS=1
+# `project_is_empty` runs once after each cleanup `down`. Bound both
+# its query and the time allowed for a TERM-resistant Docker process group to
+# exit before its KILL fallback.
+readonly CLEANUP_VERIFICATION_TIMEOUT_SECONDS=5
+readonly CLEANUP_VERIFICATION_KILL_GRACE_SECONDS=1
+# Keep the post-TERM grace on the same 15s ceiling as initial session/group
+# isolation below: both bounds protect the same tracked Compose child, and a
+# slower host must not classify it as untrackable before its group can be
+# recovered.
+readonly COMPOSE_CHILD_TERM_ATTEMPTS=150
+readonly COMPOSE_CHILD_TERM_DELAY_MILLISECONDS=100
 # An epoch's live process set is deliberately limited to the roles that outlive
 # allocation. Allocator and prepare are successful one-shot setup evidence, not
 # runtime processes: Compose retains their exited containers after activation.
 readonly LONG_LIVED_ROLES=(runtime executor broker)
-# One explicit bound covers termination of the active detached Compose session,
-# every cleanup retry at the configured Compose timeout, verification calls,
-# retry delays, and a small scheduling margin. The provisioner receives this
-# exact contract over its private control descriptor before lifecycle work.
-readonly SUPERVISOR_CLEANUP_BOUND_SECONDS=$((
-  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT + 10
+readonly SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS=10
+# The cancellation cleanup can first wait for the tracked Compose child to
+# honour TERM, then run each bounded `down`, verify each attempt, and wait
+# between unsuccessful attempts. `flock -n` has no wait to add: cleanup is
+# armed only after that lock has already been acquired. Keep this in the same
+# constants that drive those waits, rather than a hand-maintained total. The
+# outer `down` cap includes its inner stop grace plus post-stop allowance.
+#
+# Each process-group KILL grace and the final scheduling margin cover joining
+# its leader plus local secret removal after the bounded Docker calls.
+readonly SUPERVISOR_CLEANUP_BOUND_MILLISECONDS=$((
+  COMPOSE_CHILD_TERM_ATTEMPTS * COMPOSE_CHILD_TERM_DELAY_MILLISECONDS +
+  CLEANUP_MAX_ATTEMPTS * (
+    CLEANUP_DOWN_TIMEOUT_SECONDS + CLEANUP_DOWN_KILL_GRACE_SECONDS +
+    CLEANUP_ANCHOR_FORCE_GRACE_SECONDS
+  ) * MILLISECONDS_PER_SECOND +
+  CLEANUP_MAX_ATTEMPTS * (
+    CLEANUP_VERIFICATION_TIMEOUT_SECONDS + CLEANUP_VERIFICATION_KILL_GRACE_SECONDS +
+    CLEANUP_ANCHOR_FORCE_GRACE_SECONDS
+  ) * MILLISECONDS_PER_SECOND +
+  (CLEANUP_MAX_ATTEMPTS - 1) * CLEANUP_RETRY_DELAY_MILLISECONDS +
+  SUPERVISOR_MAX_NESTED_ANCHORS * 3 * SUPERVISOR_CONTROL_ACK_TIMEOUT_SECONDS *
+    MILLISECONDS_PER_SECOND +
+  SUPERVISOR_CONTROL_DRAIN_JOIN_SECONDS * MILLISECONDS_PER_SECOND +
+  SUPERVISOR_CLEANUP_SCHEDULING_MARGIN_SECONDS * MILLISECONDS_PER_SECOND
 ))
-publish_supervisor_control "cleanup-bound-ms $((SUPERVISOR_CLEANUP_BOUND_SECONDS * 1000))"
+publish_supervisor_control "cleanup-bound-ms ${SUPERVISOR_CLEANUP_BOUND_MILLISECONDS}"
+
+# The bidirectional descriptor is a supervisor-only authority. Every external
+# helper, including Docker plugins and credential helpers, is launched with it
+# closed so it cannot forge lifecycle records or retain the control stream.
+run_external() {
+  "$@" 3>&-
+}
+
+sleep_milliseconds() {
+  local milliseconds="$1"
+  local duration
+  printf -v duration '%d.%03d' \
+    "$((milliseconds / MILLISECONDS_PER_SECOND))" \
+    "$((milliseconds % MILLISECONDS_PER_SECOND))"
+  run_external sleep "${duration}"
+}
+
+monotonic_time_milliseconds() {
+  local uptime seconds fractional_milliseconds
+  read -r uptime _ < /proc/uptime
+  seconds="${uptime%.*}"
+  fractional_milliseconds="${uptime#*.}000"
+  printf '%d\n' "$((10#${seconds} * MILLISECONDS_PER_SECOND + 10#${fractional_milliseconds:0:3}))"
+}
+
+milliseconds_until_cleanup_deadline() {
+  local deadline_milliseconds="$1"
+  local now_milliseconds
+  now_milliseconds="$(monotonic_time_milliseconds)"
+  if (( now_milliseconds >= deadline_milliseconds )); then
+    printf '0\n'
+  else
+    printf '%d\n' "$((deadline_milliseconds - now_milliseconds))"
+  fi
+}
+
+sleep_cleanup_milliseconds() {
+  local requested_milliseconds="$1"
+  local deadline_milliseconds="$2"
+  local remaining_milliseconds
+  remaining_milliseconds="$(milliseconds_until_cleanup_deadline "${deadline_milliseconds}")"
+  (( remaining_milliseconds > 0 )) || return 1
+  if (( requested_milliseconds > remaining_milliseconds )); then
+    requested_milliseconds="${remaining_milliseconds}"
+  fi
+  sleep_milliseconds "${requested_milliseconds}"
+}
 
 launch_compose() {
-  docker compose \
+  run_external docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${COMPOSE_FILE}" \
     "$@"
 }
 
 lifecycle_compose() {
-  docker compose \
+  run_external docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${LIFECYCLE_COMPOSE_FILE}" \
     "$@"
 }
 
+cleanup_down_lifecycle_compose() {
+  run_bounded_cleanup_lifecycle_compose \
+    "${CLEANUP_DOWN_TIMEOUT_SECONDS}" \
+    "${CLEANUP_DOWN_KILL_GRACE_SECONDS}" \
+    "$@"
+}
+
+cleanup_verification_docker() {
+  run_bounded_cleanup_docker \
+    "${CLEANUP_VERIFICATION_TIMEOUT_SECONDS}" \
+    "${CLEANUP_VERIFICATION_KILL_GRACE_SECONDS}" \
+    "$@"
+}
+
+run_bounded_cleanup_lifecycle_compose() {
+  local timeout_seconds="$1"
+  local kill_grace_seconds="$2"
+  shift 2
+  run_bounded_cleanup_docker \
+    "${timeout_seconds}" \
+    "${kill_grace_seconds}" \
+    compose \
+      --project-name "${SUMI_COMPOSE_PROJECT}" \
+      --file "${LIFECYCLE_COMPOSE_FILE}" \
+      "$@"
+}
+
 prepare_compose() {
-  docker compose \
+  run_external docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${PREPARE_COMPOSE_FILE}" \
     "$@"
@@ -503,71 +651,85 @@ prepare_compose() {
 
 run_tracked_compose() {
   local compose_file="$1"
-  local require_live_group="$2"
-  shift 2
-  local status
-  setsid docker compose \
-    --project-name "${SUMI_COMPOSE_PROJECT}" \
-    --file "${compose_file}" \
+  shift
+  local status identity
+  setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash \
+    compose --project-name "${SUMI_COMPOSE_PROJECT}" --file "${compose_file}" \
     "$@" 3>&- 4>&- &
   ACTIVE_COMPOSE_PID=$!
-  publish_supervisor_control "nested-start ${ACTIVE_COMPOSE_PID}"
-  if ! wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
-    # A no-op lifecycle `down` can legitimately finish before /proc is
-    # inspected. A launch must instead remain live and prove the PID/group
-    # ownership that later signal cleanup relies on.
-    if tracked_compose_child_is_zombie "${ACTIVE_COMPOSE_PID}" ||
-      ! kill -0 "${ACTIVE_COMPOSE_PID}" 2>/dev/null; then
-      if wait "${ACTIVE_COMPOSE_PID}"; then
-        status=0
-      else
-        status=$?
-      fi
-      publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
-      ACTIVE_COMPOSE_PID=
-      return "${status}"
-    fi
-    if (( require_live_group )); then
-      log "ERROR: supervised Compose child did not become its own live session and process group"
-      terminate_active_compose
-      return 125
-    fi
+  if ! wait_for_tracked_compose_anchor_stopped "${ACTIVE_COMPOSE_PID}"; then
+    log "ERROR: supervised Compose anchor did not complete its stopped handshake"
+    terminate_active_compose
+    return 125
   fi
+  identity="${TRACKED_COMPOSE_IDENTITY}"
+  ACTIVE_COMPOSE_IDENTITY="${identity}"
+  ACTIVE_COMPOSE_PROTOCOL_BROKEN=1
+  if ! exchange_supervisor_control nested-start "${identity}" ||
+    ! exchange_supervisor_control nested-ready "${identity}"; then
+    log "ERROR: supervised Compose anchor did not complete its control handshake"
+    terminate_active_compose
+    return 125
+  fi
+  ACTIVE_COMPOSE_PROTOCOL_BROKEN=0
+  ACTIVE_COMPOSE_VERIFIED=1
+  kill -CONT "${ACTIVE_COMPOSE_PID}" || {
+    terminate_active_compose
+    return 125
+  }
   if wait "${ACTIVE_COMPOSE_PID}"; then
     status=0
   else
     status=$?
   fi
-  publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
+  exchange_supervisor_control nested-done "${ACTIVE_COMPOSE_IDENTITY}" || status=125
   ACTIVE_COMPOSE_PID=
+  ACTIVE_COMPOSE_IDENTITY=
+  ACTIVE_COMPOSE_VERIFIED=0
+  ACTIVE_COMPOSE_PROTOCOL_BROKEN=0
   return "${status}"
 }
 
-tracked_compose_child_isolated() {
+tracked_compose_anchor_stopped() {
+  tracked_compose_anchor_identity "$1"
+}
+
+tracked_compose_anchor_identity() {
   local pid="$1"
-  local stat state ppid pgid sid remainder
+  local stat remainder expected_executable observed_executable
+  local -a fields
   [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
   stat="$(<"/proc/${pid}/stat")" || return 1
   remainder="${stat##*) }"
   [[ "${remainder}" != "${stat}" ]] || return 1
-  read -r state ppid pgid sid _ <<< "${remainder}"
-  [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+  read -r -a fields <<< "${remainder}"
+  (( ${#fields[@]} >= 20 )) || return 1
+  [[ "${fields[0]}" == T && "${fields[1]}" == "${BASHPID}" && \
+    "${fields[2]}" == "${pid}" && "${fields[3]}" == "${pid}" && \
+    "${fields[19]}" =~ ^[1-9][0-9]*$ ]] || return 1
+  expected_executable="$(run_external readlink -e -- "${COMPOSE_ANCHOR}")" || return 1
+  observed_executable="$(run_external readlink -e -- "/proc/${pid}/exe")" || return 1
+  [[ "${observed_executable}" == "${expected_executable}" ]] || return 1
+  TRACKED_COMPOSE_IDENTITY="${pid}:${fields[19]}"
 }
 
-# `setsid` makes the child its own session and group within microseconds on an
-# idle host, but this suite starts thirteen Docker fixtures while Cargo builds.
-# A 500ms ceiling lost that race and turned load into a launch failure, so the
-# bound is generous while still bounded.
+# `setsid` normally makes the child its own session and group within
+# microseconds. Under the recorded test load (thirteen Docker fixtures plus
+# Cargo builds), the old 500ms ceiling lost that scheduling race; 20/20 runs
+# with six busy loops completed at the 15s ceiling. Match the TERM grace above
+# so initial tracking and later group recovery use one bounded host-load budget.
 readonly TRACKED_COMPOSE_ISOLATION_ATTEMPTS=1500
 
-wait_for_tracked_compose_child_isolation() {
+wait_for_tracked_compose_anchor_stopped() {
   local pid="$1"
   local attempt
   for ((attempt = 0; attempt < TRACKED_COMPOSE_ISOLATION_ATTEMPTS; attempt++)); do
-    tracked_compose_child_isolated "${pid}" && return 0
+    if tracked_compose_anchor_stopped "${pid}"; then
+      return 0
+    fi
     tracked_compose_child_is_zombie "${pid}" && return 1
     kill -0 "${pid}" 2>/dev/null || return 1
-    sleep 0.01
+    run_external sleep 0.01
   done
   return 1
 }
@@ -583,43 +745,133 @@ tracked_compose_child_is_zombie() {
   [[ "${state}" == Z ]]
 }
 
-tracked_compose_group_isolated() {
+wait_for_cleanup_compose_anchor_stopped() {
   local pid="$1"
-  local stat state ppid pgid sid remainder
-  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
-  stat="$(<"/proc/${pid}/stat")" || return 1
-  remainder="${stat##*) }"
-  [[ "${remainder}" != "${stat}" ]] || return 1
-  read -r state ppid pgid sid _ <<< "${remainder}"
-  [[ "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+  local deadline_milliseconds="$2"
+  while :; do
+    if tracked_compose_anchor_stopped "${pid}"; then
+      return 0
+    fi
+    if tracked_compose_child_is_zombie "${pid}" || ! kill -0 "${pid}" 2>/dev/null; then
+      return 1
+    fi
+    sleep_cleanup_milliseconds 10 "${deadline_milliseconds}" || return 1
+  done
+}
+
+compose_anchor_alive() {
+  local pid="$1"
+  ! tracked_compose_child_is_zombie "${pid}" && kill -0 "${pid}" 2>/dev/null
+}
+
+run_bounded_cleanup_docker() {
+  local timeout_seconds="$1"
+  local kill_grace_seconds="$2"
+  shift 2
+  local pid status=0 normal_deadline_milliseconds term_deadline_milliseconds
+  local force_deadline_milliseconds identity handshake_complete=0
+
+  # A cleanup call has one clock from launch through its probe, normal wait,
+  # TERM grace, and KILL. Reserve the advertised TERM grace from the normal
+  # phase, but never reset this absolute deadline after a probe race.
+  normal_deadline_milliseconds=$(( $(monotonic_time_milliseconds) +
+    timeout_seconds * MILLISECONDS_PER_SECOND ))
+  term_deadline_milliseconds=$(( normal_deadline_milliseconds +
+    kill_grace_seconds * MILLISECONDS_PER_SECOND ))
+  force_deadline_milliseconds=$(( term_deadline_milliseconds +
+    CLEANUP_ANCHOR_FORCE_GRACE_SECONDS * MILLISECONDS_PER_SECOND ))
+
+  # The anchor is the stopped direct-child session leader. Its subreaper wait
+  # supplies the kernel emptiness proof; the privileged shell ignores BASH_ENV.
+  setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash "$@" 3>&- 4>&- &
+  pid=$!
+  if wait_for_cleanup_compose_anchor_stopped "${pid}" "${normal_deadline_milliseconds}"; then
+    identity="${TRACKED_COMPOSE_IDENTITY}"
+    if exchange_supervisor_control nested-start "${identity}" &&
+      exchange_supervisor_control nested-ready "${identity}" &&
+      kill -CONT "${pid}"; then
+      handshake_complete=1
+    fi
+  fi
+  if (( ! handshake_complete )); then
+    kill -CONT "${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
+    kill -USR2 "${pid}" 2>/dev/null || true
+    while compose_anchor_alive "${pid}"; do
+      sleep_cleanup_milliseconds 10 "${force_deadline_milliseconds}" || break
+    done
+    if compose_anchor_alive "${pid}"; then
+      log "ERROR: Compose anchor handshake failed without a bounded join"
+      return "${CLEANUP_CONTAINMENT_FAILURE_STATUS}"
+    fi
+    wait "${pid}" 2>/dev/null || true
+    return "${CLEANUP_CONTAINMENT_FAILURE_STATUS}"
+  fi
+
+  while compose_anchor_alive "${pid}"; do
+    sleep_cleanup_milliseconds 100 "${normal_deadline_milliseconds}" || break
+  done
+  if compose_anchor_alive "${pid}"; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    while compose_anchor_alive "${pid}"; do
+      sleep_cleanup_milliseconds 100 "${term_deadline_milliseconds}" || break
+    done
+  fi
+  if compose_anchor_alive "${pid}"; then
+    kill -USR2 "${pid}" 2>/dev/null || true
+    while compose_anchor_alive "${pid}"; do
+      sleep_cleanup_milliseconds 10 "${force_deadline_milliseconds}" || break
+    done
+  fi
+  if compose_anchor_alive "${pid}"; then
+    log "ERROR: Compose anchor could not prove exact descendant absence before its deadline"
+    return "${CLEANUP_CONTAINMENT_FAILURE_STATUS}"
+  fi
+  if wait "${pid}"; then status=0; else status=$?; fi
+  if (( handshake_complete )); then
+    exchange_supervisor_control nested-done "${identity}" || return 125
+  fi
+  if (( $(monotonic_time_milliseconds) >= normal_deadline_milliseconds )); then
+    return 124
+  fi
+  return "${status}"
 }
 
 terminate_active_compose() {
   local pid="${ACTIVE_COMPOSE_PID:-}"
+  local identity="${ACTIVE_COMPOSE_IDENTITY:-}"
   local attempt
   [[ -n "${pid}" ]] || return 0
-  ACTIVE_COMPOSE_PID=
-
-  if kill -0 "${pid}" 2>/dev/null; then
-    if tracked_compose_group_isolated "${pid}"; then
-      kill -TERM -- "-${pid}" 2>/dev/null || true
-    else
-      kill -TERM "${pid}" 2>/dev/null || true
-    fi
+  if compose_anchor_alive "${pid}"; then
+    kill -CONT "${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
     for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
-      kill -0 "${pid}" 2>/dev/null || break
-      sleep "${COMPOSE_CHILD_TERM_DELAY_SECONDS}"
+      compose_anchor_alive "${pid}" || break
+      sleep_milliseconds "${COMPOSE_CHILD_TERM_DELAY_MILLISECONDS}"
     done
-    if kill -0 "${pid}" 2>/dev/null; then
-      if tracked_compose_group_isolated "${pid}"; then
-        kill -KILL -- "-${pid}" 2>/dev/null || true
-      else
-        kill -KILL "${pid}" 2>/dev/null || true
-      fi
+    if compose_anchor_alive "${pid}"; then
+      kill -USR2 "${pid}" 2>/dev/null || true
+      for ((attempt = 0; attempt < 100; attempt++)); do
+        compose_anchor_alive "${pid}" || break
+        sleep_milliseconds 10
+      done
     fi
   fi
+  if compose_anchor_alive "${pid}"; then
+    log "ERROR: active Compose anchor could not prove exact descendant absence"
+    return "${CLEANUP_CONTAINMENT_FAILURE_STATUS}"
+  fi
   wait "${pid}" 2>/dev/null || true
-  publish_supervisor_control "nested-done ${pid}"
+  if (( ACTIVE_COMPOSE_VERIFIED )); then
+    exchange_supervisor_control nested-done "${identity}" || return 125
+  fi
+  if (( ACTIVE_COMPOSE_PROTOCOL_BROKEN )); then
+    return "${CLEANUP_CONTAINMENT_FAILURE_STATUS}"
+  fi
+  ACTIVE_COMPOSE_PID=
+  ACTIVE_COMPOSE_IDENTITY=
+  ACTIVE_COMPOSE_VERIFIED=0
+  ACTIVE_COMPOSE_PROTOCOL_BROKEN=0
 }
 
 validate_compose_redacted() {
@@ -639,7 +891,7 @@ prepare_roles_exited_successfully() {
   for role in allocator prepare; do
     container="$(prepare_compose ps --all --quiet "${role}" 2>/dev/null)" || return 1
     [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
-    state="$(docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "${container}" 2>/dev/null)" || return 1
+    state="$(run_external docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "${container}" 2>/dev/null)" || return 1
     [[ "${state}" == "exited:0" ]] || return 1
   done
 }
@@ -649,7 +901,7 @@ report_long_lived_role_states() {
   for role in runtime executor broker; do
     container="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || continue
     [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || continue
-    docker inspect --format \
+    run_external docker inspect --format \
       'role={{index .Config.Labels "com.docker.compose.service"}} status={{.State.Status}} exit={{.State.ExitCode}} error={{json .State.Error}}' \
       "${container}" >&2 || true
   done
@@ -682,8 +934,8 @@ report_long_lived_role_logs() {
     container="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || continue
     [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || continue
     printf '[sumi-supervisor] bounded role=%s logs follow\n' "${role}" >&2
-    docker logs --tail 80 "${container}" 2>&1 |
-      tail -c 8192 |
+    run_external docker logs --tail 80 "${container}" 2>&1 |
+      run_external tail -c 8192 |
       redact_activation_diagnostic_stream >&2 || true
   done
 }
@@ -725,7 +977,7 @@ epoch_identity() {
 # project-labelled containers: those containers do not make this generation
 # live.
 long_lived_role_states() {
-  docker ps --all \
+  run_external docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
     --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}' 2>/dev/null
 }
@@ -784,7 +1036,7 @@ prepared_project_containers_match_expected_roles() {
   local -A observed=()
   local role
 
-  output="$(docker ps --all \
+  output="$(run_external docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
     --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}' 2>/dev/null)" || return 1
   while IFS=$'\t' read -r container_id service; do
@@ -860,35 +1112,59 @@ project_is_empty() {
   # Treat an inspection failure as non-empty so a failed `down` cannot turn an
   # unobserved project into a physical-recovery receipt.
   local output
-  output="$(docker ps --all \
+  output="$(run_external docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
     --format '{{.ID}}' 2>/dev/null)" || return 1
   [[ -z "${output//[[:space:]]/}" ]]
 }
 
+cleanup_project_is_empty() {
+  local output status=0
+  output="$(cleanup_verification_docker ps --all \
+    --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
+    --format '{{.ID}}' 2>/dev/null)" || status=$?
+  (( status == 0 )) || return "${status}"
+  [[ -z "${output//[[:space:]]/}" ]]
+}
+
 cleanup_partial_generation() {
   local status="$1"
-  local attempt
+  local attempt active_status=0 down_status verification_status
   local cleanup_complete=0
   trap - ERR EXIT
   # Once teardown starts, do not let a repeated terminal signal interrupt the
   # synchronous join. The saved launch/signal status is returned afterward.
   trap '' INT TERM
   set +e
-  terminate_active_compose
+  terminate_active_compose || active_status=$?
+  if (( active_status == CLEANUP_CONTAINMENT_FAILURE_STATUS )); then
+    log "ERROR: active cleanup containment failed; refusing to overlap another Docker invocation"
+  fi
   if (( CLEANUP_ARMED )); then
     CLEANUP_ARMED=0
     # A nonzero `down` can still leave an empty project, while a zero status is
     # not the cleanup contract by itself. Bound retries on observed emptiness.
-    for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
-      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-        >/dev/null 2>&1
-      if project_is_empty; then
+    for ((attempt = 1; active_status != CLEANUP_CONTAINMENT_FAILURE_STATUS && attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
+      down_status=0
+      cleanup_down_lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1 || down_status=$?
+      if (( down_status == CLEANUP_CONTAINMENT_FAILURE_STATUS )); then
+        log "ERROR: cleanup containment failed; refusing to overlap another Docker invocation"
+        break
+      fi
+      verification_status=0
+      if cleanup_project_is_empty; then
         cleanup_complete=1
+        break
+      else
+        verification_status=$?
+      fi
+      if (( verification_status == CLEANUP_CONTAINMENT_FAILURE_STATUS )); then
+        log "ERROR: cleanup verification containment failed; refusing to overlap another Docker invocation"
         break
       fi
       if (( attempt < CLEANUP_MAX_ATTEMPTS )); then
-        sleep "${CLEANUP_RETRY_DELAY_SECONDS}"
+        sleep_milliseconds "${CLEANUP_RETRY_DELAY_MILLISECONDS}"
       fi
     done
     if (( ! cleanup_complete )); then
@@ -937,14 +1213,14 @@ case "${action}" in
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
-    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
+    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" \
       down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null
     remove_runtime_secret_tree
     prepare_status=0
     # Same bounded stderr contract as activation below: the provisioner captures
     # and value-redacts it on failure. Discarding it left a failed prepare with
     # no stated cause at all.
-    if run_tracked_compose "${PREPARE_COMPOSE_FILE}" 1 up --detach --wait \
+    if run_tracked_compose "${PREPARE_COMPOSE_FILE}" up --detach --wait \
       >/dev/null; then
       prepare_status=0
     else
@@ -979,7 +1255,7 @@ case "${action}" in
     # The provisioner captures and value-redacts this bounded stderr stream on
     # failure. Keep activation diagnostics available so a daemon rejection is
     # classified instead of collapsing to an opaque timeout.
-    if run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --no-deps \
+    if run_tracked_compose "${COMPOSE_FILE}" up --detach --no-deps \
       executor broker runtime >/dev/null; then
       activation_status=0
     else

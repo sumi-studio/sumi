@@ -629,7 +629,12 @@ function assistantToolCall(toolCallId: string): PublicAssistantMessage {
     content: [
       {
         type: "tool_call",
-        tool_call: { id: toolCallId, name: "bash", route: "normal", arguments: {} },
+        tool_call: {
+          id: toolCallId,
+          name: "bash",
+          route: "normal",
+          arguments: {},
+        },
         wire_item_index: 0,
       },
     ],

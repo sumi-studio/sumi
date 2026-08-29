@@ -238,6 +238,10 @@ impl ToolStartCommitResult {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the test-only grant owner mirrors production single-owner start authority"
+)]
 enum ToolStartGrant {
     #[cfg(test)]
     Legacy(LegacyExecutableGrant),
