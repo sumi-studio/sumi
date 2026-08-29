@@ -557,6 +557,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -615,6 +616,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -647,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_review_vocabulary_is_closed_and_hides_exact_invitation_inputs() {
+    async fn invitation_bindings_use_exact_generic_descriptors_without_legacy_vocabulary() {
         let api = fake_api();
         let mut builder = crate::tools::ToolRegistryBuilder::default();
         builder
@@ -671,34 +673,20 @@ mod tests {
                 &workspace,
             )
             .await
-            .expect("seal invitation list provider vocabulary");
+            .expect("seal invitation list descriptor");
         let list = registry
             .validate_bound(&list)
             .expect("validate invitation list binding");
+        assert_eq!(list.descriptor.operation, "list_invitations");
+        assert_eq!(list.descriptor.capability, CapabilityClass::Read);
         assert_eq!(
-            serde_json::to_value(&list.provider_review_identity).unwrap(),
-            json!("workspace_invitation_list_v1")
+            list.descriptor.resource_scopes,
+            vec![ResourceScope::collection("workspace", "invitation")]
         );
-        assert_eq!(
-            serde_json::to_value(&list.provider_review_descriptor.operation).unwrap(),
-            json!("list_invitations")
-        );
-        assert_eq!(
-            serde_json::to_value(&list.provider_review_descriptor.resource_scopes).unwrap(),
-            json!([{
-                "scope_type": "collection",
-                "namespace": "workspace",
-                "kind": "invitation",
-                "count": 1
-            }])
-        );
-        let list_provider_wire = serde_json::to_string(&json!({
-            "identity": &list.provider_review_identity,
-            "descriptor": &list.provider_review_descriptor,
-            "projection": &list.provider_review_projection
-        }))
-        .unwrap();
-        assert!(!list_provider_wire.contains(CURSOR));
+        let list_wire = serde_json::to_value(list).unwrap();
+        assert!(list_wire.get("provider_review_identity").is_none());
+        assert!(list_wire.get("provider_review_descriptor").is_none());
+        assert!(list_wire.get("provider_review_projection").is_none());
 
         let accept = registry
             .bind(
@@ -716,36 +704,23 @@ mod tests {
         let accept = registry
             .validate_bound(&accept)
             .expect("validate invitation acceptance binding");
-        assert_eq!(
-            serde_json::to_value(&accept.provider_review_identity).unwrap(),
-            json!("workspace_invitation_accept_v1")
+        assert_eq!(accept.descriptor.operation, "accept_invitation");
+        assert_eq!(accept.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(accept.descriptor.resource_scopes.len(), 2);
+        assert!(
+            accept
+                .descriptor
+                .resource_scopes
+                .contains(&ResourceScope::resource(
+                    "workspace",
+                    "invitation",
+                    INVITATION_ID,
+                ))
         );
-        assert_eq!(
-            serde_json::to_value(&accept.provider_review_descriptor.operation).unwrap(),
-            json!("accept_invitation")
-        );
-        let accept_scopes =
-            serde_json::to_value(&accept.provider_review_descriptor.resource_scopes).unwrap();
-        assert_eq!(accept_scopes.as_array().unwrap().len(), 2);
-        assert!(accept_scopes.as_array().unwrap().contains(&json!({
-            "scope_type": "resource",
-            "namespace": "workspace",
-            "kind": "invitation",
-            "count": 1
-        })));
-        assert!(accept_scopes.as_array().unwrap().contains(&json!({
-            "scope_type": "resource",
-            "namespace": "workspace",
-            "kind": "membership",
-            "count": 1
-        })));
-        let accept_provider_wire = serde_json::to_string(&json!({
-            "identity": &accept.provider_review_identity,
-            "descriptor": &accept.provider_review_descriptor,
-            "projection": &accept.provider_review_projection
-        }))
-        .unwrap();
-        assert!(!accept_provider_wire.contains(INVITATION_ID));
+        let accept_wire = serde_json::to_value(accept).unwrap();
+        assert!(accept_wire.get("provider_review_identity").is_none());
+        assert!(accept_wire.get("provider_review_descriptor").is_none());
+        assert!(accept_wire.get("provider_review_projection").is_none());
     }
 
     #[tokio::test]
@@ -771,6 +746,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -836,6 +812,7 @@ mod tests {
             ToolBindCtx {
                 args: &list_arguments,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -863,6 +840,7 @@ mod tests {
             ToolBindCtx {
                 args: &accept_arguments,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -1021,6 +999,7 @@ mod tests {
                 ToolBindCtx {
                     args: &args,
                     workspace: &workspace,
+                    executor_identity: None,
                 },
             )
             .await

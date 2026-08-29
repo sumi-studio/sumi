@@ -71,6 +71,8 @@ function ChatScreenContent({
     lastError,
     recoverableDrafts,
     acquireConnection,
+    disconnect,
+    resumeMountedConnection,
     sendMessage,
     restoreDraft,
     abort,
@@ -141,6 +143,10 @@ function ChatScreenContent({
     (item) => item.kind === "prose" && item.agentMessageFinal,
   );
   const status = describeAvailability(connection, ready);
+  const retryAgent = () => {
+    disconnect();
+    resumeMountedConnection();
+  };
 
   return (
     <div className="flex h-full bg-background text-foreground">
@@ -317,6 +323,32 @@ function ChatScreenContent({
               {lastError}
             </p>
           )}
+          {ready === "rehydrating" && (
+            <section
+              role="alert"
+              className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900 text-sm"
+            >
+              エージェントを切り替え中です。接続を回復しています。
+            </section>
+          )}
+          {(ready === "not_ready" ||
+            ready === "stopped" ||
+            ready === "unavailable") && (
+            <section
+              role="alert"
+              className="mb-2 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900 text-sm"
+            >
+              <span>{unavailableMessage(ready)}</span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={retryAgent}
+              >
+                再試行
+              </Button>
+            </section>
+          )}
           <ChatPromptInput
             value={draft}
             onValueChange={setDraft}
@@ -406,23 +438,55 @@ function EmptyState({ available }: { available: boolean }) {
 
 function describeAvailability(
   connection: "connecting" | "connected" | "closed",
-  ready: "unknown" | "ready" | "not_ready",
+  ready:
+    | "unknown"
+    | "ready"
+    | "rehydrating"
+    | "stopped"
+    | "unavailable"
+    | "not_ready",
 ) {
+  if (ready === "rehydrating")
+    return connection === "connected"
+      ? "エージェント切り替え中"
+      : "エージェント切り替え中（再接続中）";
+  if (ready === "not_ready" || ready === "stopped" || ready === "unavailable")
+    return connection === "connected"
+      ? "エージェント利用不可"
+      : "エージェント利用不可（再接続中）";
   if (connection === "connecting") return "接続中";
   if (connection === "closed") return "再接続中";
   if (ready === "ready") return "エージェント利用可能";
-  if (ready === "not_ready") return "エージェント利用不可";
   return "エージェント確認中";
 }
 
 function composerPlaceholder(
   connection: "connecting" | "connected" | "closed",
-  ready: "unknown" | "ready" | "not_ready",
+  ready:
+    | "unknown"
+    | "ready"
+    | "rehydrating"
+    | "stopped"
+    | "unavailable"
+    | "not_ready",
 ) {
   if (connection !== "connected") return "接続を待っています…";
-  if (ready === "not_ready") return "現在エージェントを利用できません";
+  if (ready === "rehydrating") return "エージェントを切り替えています…";
+  if (ready === "not_ready" || ready === "stopped" || ready === "unavailable")
+    return "現在エージェントを利用できません";
   if (ready === "unknown") return "エージェントを確認しています…";
   return "メッセージを入力…";
+}
+
+function unavailableMessage(ready: "stopped" | "unavailable" | "not_ready") {
+  switch (ready) {
+    case "stopped":
+      return "エージェントは停止しています。再試行して起動してください。";
+    case "unavailable":
+      return "エージェントを利用できません。再試行してください。";
+    case "not_ready":
+      return "エージェントを起動できませんでした。しばらくしてから再試行してください。";
+  }
 }
 
 function previewRecoverableText(text: string): string {

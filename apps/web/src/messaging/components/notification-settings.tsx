@@ -4,7 +4,7 @@ import { isImeComposing } from "../../lib/ime";
 import type { NotificationLevel } from "../model";
 import { type NotificationWriteResult, useMessaging } from "../store";
 import { useOverlayPanel } from "./overlay";
-import { NOTIFICATION_LEVEL_LABEL } from "./sidebar";
+import { NOTIFICATION_LEVEL_LABEL } from "./place-context-menu";
 
 const FEEDBACK_MS = 2_400;
 

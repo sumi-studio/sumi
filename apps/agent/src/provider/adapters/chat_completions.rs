@@ -526,10 +526,11 @@ fn convert_tool(tool: &ToolDefinition, spec: &ModelSpec, compat: &ChatCompat) ->
 /// Kimi rejects `$ref` siblings.
 fn sanitize_kimi_tool_parameters(value: &Value) -> Value {
     let mut sanitized = sanitize_kimi_tool_schema(value);
-    if let Value::Object(root) = &mut sanitized {
-        if !root.contains_key("type") && !root.contains_key("$ref") {
-            root.insert("type".to_owned(), json!("object"));
-        }
+    if let Value::Object(root) = &mut sanitized
+        && !root.contains_key("type")
+        && !root.contains_key("$ref")
+    {
+        root.insert("type".to_owned(), json!("object"));
     }
     sanitized
 }

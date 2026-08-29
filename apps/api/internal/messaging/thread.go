@@ -62,6 +62,11 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 	if !clientNonceValid(clientNonce) {
 		return Thread{}, false, errors.New("client nonce must be 1..128 bytes")
 	}
+	digest := placeCreationDigest(placeCreationThread, struct {
+		ParentPlaceID   string `json:"parent_place_id"`
+		Name            string `json:"name"`
+		OriginMessageID string `json:"origin_message_id"`
+	}{parentPlaceID, name, originMessageID})
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Thread{}, false, fmt.Errorf("begin create thread: %w", err)
@@ -81,20 +86,22 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 	if parent.Kind != PlaceChannel {
 		return Thread{}, false, ErrNotThreadable
 	}
-	// Serialize an operation identity before looking up its receipt. The lock
-	// makes a concurrent retry observe the first committed receipt instead of
-	// racing into a second empty-origin thread.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)",
-		reactionMutationLockKey(s.Scope.Actor, "thread-create:"+s.Scope.WorkspaceID+":"+clientNonce)); err != nil {
-		return Thread{}, false, fmt.Errorf("lock thread creation: %w", err)
-	}
-	if existing, found, err := s.threadCreationReplay(ctx, tx, membership.WorkspaceMemberID, parentPlaceID, name, originMessageID, clientNonce); err != nil {
+	if replayed, found, err := s.replayPlaceCreation(ctx, tx, placeCreationThread,
+		clientNonce, digest, membership.WorkspaceMemberID); err != nil {
 		return Thread{}, false, err
 	} else if found {
+		threads, err := s.threadsWhere(ctx, tx, membership.WorkspaceMemberID,
+			"t.place_id = $3", replayed.PlaceID)
+		if err != nil {
+			return Thread{}, false, err
+		}
+		if len(threads) != 1 {
+			return Thread{}, false, fmt.Errorf("thread creation receipt %q has no thread", clientNonce)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Thread{}, false, fmt.Errorf("commit replayed thread creation: %w", err)
 		}
-		return existing, false, nil
+		return threads[0], false, nil
 	}
 	var origin *string
 	if originMessageID != "" {
@@ -140,10 +147,11 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 		ParentPlaceID: parentPlaceID, ParentMessageID: originMessageID,
 		Participants: []ParticipantRef{s.Scope.Actor},
 	}
-	_, err = tx.Exec(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO places (place_id, kind, workspace_id, name, parent_place_id, parent_message_id)
-		VALUES ($1, 'thread', $2, $3, $4, $5)`,
-		thread.Place.PlaceID, s.Scope.WorkspaceID, name, parentPlaceID, origin)
+		VALUES ($1, 'thread', $2, $3, $4, $5)
+		RETURNING revision`,
+		thread.Place.PlaceID, s.Scope.WorkspaceID, name, parentPlaceID, origin).Scan(&thread.Place.Revision)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return Thread{}, false, ErrThreadExists
@@ -153,53 +161,14 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 	if err := joinThread(ctx, tx, thread.Place.PlaceID, membership); err != nil {
 		return Thread{}, false, err
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO thread_creation_receipts
-			(workspace_id, creator_kind, creator_id, client_nonce, thread_id, parent_place_id, parent_message_id, name)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, clientNonce,
-		thread.Place.PlaceID, parentPlaceID, origin, name); err != nil {
-		return Thread{}, false, fmt.Errorf("record thread creation receipt: %w", err)
+	if err := s.recordPlaceCreation(ctx, tx, placeCreationThread, clientNonce, digest,
+		thread.Place.PlaceID, membership.WorkspaceMemberID); err != nil {
+		return Thread{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Thread{}, false, fmt.Errorf("commit create thread: %w", err)
 	}
 	return thread, true, nil
-}
-
-// threadCreationReplay returns the durable result of this caller's creation
-// nonce. A nonce is an operation identity, so changing any creation input is a
-// conflict rather than a replay of a different request.
-func (s *ScopedStore) threadCreationReplay(ctx context.Context, q querier, workspaceMemberID, parentPlaceID, name, originMessageID, clientNonce string) (Thread, bool, error) {
-	var threadID, storedParent, storedName string
-	var storedOrigin *string
-	err := q.QueryRow(ctx, `
-		SELECT thread_id, parent_place_id, parent_message_id, name
-		FROM thread_creation_receipts
-		WHERE workspace_id=$1 AND creator_kind=$2 AND creator_id=$3 AND client_nonce=$4`,
-		s.Scope.WorkspaceID, s.Scope.Actor.Kind, s.Scope.Actor.ID, clientNonce,
-	).Scan(&threadID, &storedParent, &storedOrigin, &storedName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Thread{}, false, nil
-	}
-	if err != nil {
-		return Thread{}, false, fmt.Errorf("load thread creation receipt: %w", err)
-	}
-	storedOriginID := ""
-	if storedOrigin != nil {
-		storedOriginID = *storedOrigin
-	}
-	if storedParent != parentPlaceID || storedName != name || storedOriginID != originMessageID {
-		return Thread{}, false, ErrIdempotencyConflict
-	}
-	threads, err := s.threadsWhere(ctx, q, workspaceMemberID, "t.place_id = $3", threadID)
-	if err != nil {
-		return Thread{}, false, err
-	}
-	if len(threads) != 1 {
-		return Thread{}, false, fmt.Errorf("thread creation receipt %q has no thread", clientNonce)
-	}
-	return threads[0], true, nil
 }
 
 func joinThread(ctx context.Context, tx pgx.Tx, placeID string, membership workspacecontrol.Membership) error {
@@ -326,7 +295,7 @@ func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemb
 	queryArgs := []any{s.Scope.WorkspaceID, workspaceMemberID}
 	queryArgs = append(queryArgs, args...)
 	rows, err := q.Query(ctx, fmt.Sprintf(`
-		SELECT t.place_id, t.workspace_id, t.name, t.topic, t.visibility, t.last_seq,
+		SELECT t.place_id, t.workspace_id, t.revision, t.name, t.topic, t.visibility, t.last_seq,
 		       t.parent_place_id, t.parent_message_id,
 		       (SELECT count(*) FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL),
 		       (SELECT m.created_at FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL ORDER BY m.seq DESC LIMIT 1),
@@ -353,7 +322,7 @@ func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemb
 		var name string
 		var origin, preview *string
 		var kinds, ids []string
-		if err := rows.Scan(&t.Place.PlaceID, &t.Place.WorkspaceID, &name, &t.Place.Topic,
+		if err := rows.Scan(&t.Place.PlaceID, &t.Place.WorkspaceID, &t.Place.Revision, &name, &t.Place.Topic,
 			&t.Place.Visibility, &t.Place.LastSeq, &t.ParentPlaceID, &origin,
 			&t.MessageCount, &t.LastMessageAt, &preview, &kinds, &ids); err != nil {
 			return nil, fmt.Errorf("scan thread: %w", err)

@@ -1,7 +1,6 @@
 import { MessagesSquare } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
-import { secureRandomUUID } from "../../lib/random-uuid";
 import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import type { Message } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -49,7 +48,6 @@ export function MessageThreadAction({ message }: { message: Message }) {
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const creatingRef = useRef(false);
-  const createNonceRef = useRef<string | null>(null);
   const initializedDraftRef = useRef(false);
   const overlay = useOverlayPanel<HTMLButtonElement>({
     open,
@@ -76,16 +74,13 @@ export function MessageThreadAction({ message }: { message: Message }) {
     ) {
       return;
     }
-    const nonce = createNonceRef.current ?? secureRandomUUID();
-    createNonceRef.current = nonce;
     creatingRef.current = true;
     setCreating(true);
     setError(null);
     try {
       navigate(
-        await createThread(activePlaceKey, trimmed, message.messageId, nonce),
+        await createThread(activePlaceKey, trimmed, message.messageId),
       );
-      createNonceRef.current = null;
       initializedDraftRef.current = false;
       setName("");
       overlay.close();
@@ -145,7 +140,6 @@ export function MessageThreadAction({ message }: { message: Message }) {
               value={name}
               disabled={creating}
               onChange={(event) => {
-                createNonceRef.current = null;
                 setError(null);
                 setName(
                   clampCodePoints(

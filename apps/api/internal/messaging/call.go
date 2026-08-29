@@ -590,14 +590,14 @@ func (s *Store) callDeliveryScope(ctx context.Context, placeID string) (Place, S
 	var authorityEpoch int64
 	var name *string
 	err := s.pool.QueryRow(ctx, `
-		SELECT p.place_id, p.kind, p.workspace_id, p.name, p.topic, p.visibility,
+		SELECT p.place_id, p.kind, p.workspace_id, p.revision, p.name, p.topic, p.visibility,
 		       p.last_seq, p.voice, ai.installation_id, ai.authority_epoch
 		FROM places p
 		JOIN app_installations ai
 		  ON ai.owner_kind='workspace' AND ai.owner_id=p.workspace_id
 		 AND ai.app_id=$2 AND ai.enabled
 		WHERE p.place_id=$1`, placeID, MessagingAppID).Scan(
-		&place.PlaceID, &place.Kind, &place.WorkspaceID, &name, &place.Topic,
+		&place.PlaceID, &place.Kind, &place.WorkspaceID, &place.Revision, &name, &place.Topic,
 		&place.Visibility, &place.LastSeq, &place.Voice, &installationID, &authorityEpoch,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -54,6 +54,10 @@ impl PolicySourceState {
     /// Reconstruct a durable requirement when its verified overlay is absent.
     /// A cache miss cannot erase this authenticated requirement and silently
     /// fall back to baseline-only operation.
+    #[allow(
+        dead_code,
+        reason = "required-source construction is exercised by policy recovery tests"
+    )]
     pub fn required_unavailable_v1(reason: impl Into<String>, minimum_version: u64) -> Self {
         Self::RequiredUnavailable {
             baseline_version: BUILT_IN_POLICY_VERSION_V1.to_owned(),
@@ -62,6 +66,10 @@ impl PolicySourceState {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "verified overlays are exercised by signed policy tests"
+    )]
     pub fn verified_overlay_v1(
         bundle_version: u64,
         bundle_digest: impl Into<String>,
@@ -221,6 +229,10 @@ impl RoutePolicy {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "required policy construction is exercised by recovery tests"
+    )]
     pub fn required_unavailable_v1(reason: impl Into<String>, minimum_version: u64) -> Self {
         Self {
             source: PolicySourceState::required_unavailable_v1(reason, minimum_version),
@@ -229,6 +241,10 @@ impl RoutePolicy {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "verified policy overlays are exercised by signed policy tests"
+    )]
     pub fn verified_overlay_v1(
         source: PolicySourceState,
         overlay: BTreeMap<CapabilityClass, NormalPolicyDecision>,
@@ -243,6 +259,10 @@ impl RoutePolicy {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "exact authenticated policy-source inspection is retained for recovery consumers"
+    )]
     pub fn source(&self) -> &PolicySourceState {
         &self.source
     }
@@ -315,6 +335,10 @@ impl RoutePolicy {
     /// deletion or an older signed bundle to widen authority. Optional
     /// overlays age out through `PolicySourceState::at`; they are not removed
     /// early by replacing them with BaselineOnly.
+    #[allow(
+        dead_code,
+        reason = "replacement validation is exercised by monotonic policy tests"
+    )]
     pub fn validate_replacement(&self, next: &Self, now: DateTime<Utc>) -> Result<()> {
         let current = self.source.at(now);
         let next_source = next.source.at(now);
@@ -486,6 +510,10 @@ pub enum PolicyAvailability {
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "source failures are constructed by signed policy tests"
+)]
 pub enum PolicySourceError {
     #[error("verified policy overlay digest must not be empty")]
     InvalidDigest,

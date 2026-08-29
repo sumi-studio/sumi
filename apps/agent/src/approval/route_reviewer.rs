@@ -268,6 +268,10 @@ pub struct ReviewerModelSpec {
 }
 
 impl ReviewerModelSpec {
+    #[allow(
+        dead_code,
+        reason = "direct reviewer model construction is retained for provider contract tests"
+    )]
     pub fn new(
         id: impl Into<String>,
         provider: impl Into<String>,
@@ -1222,6 +1226,10 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reviewer identity, schema, prompt, tool offset, and cancellation remain explicit at the provider boundary"
+)]
 async fn complete_provider_review(
     spec: &ModelSpec,
     reviewer: ReviewerKind,

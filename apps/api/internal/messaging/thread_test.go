@@ -66,7 +66,7 @@ func TestEditingThreadMessageAdmitsNewMention(t *testing.T) {
 		t.Fatalf("mentioned member started as nonparticipant: threads=%+v err=%v", threads, err)
 	}
 
-	if _, err := a.EditMessage(ctx, thread.Place.PlaceID, message.MessageID, "@Haru この件もお願いします"); err != nil {
+	if _, err := a.EditMessage(ctx, thread.Place.PlaceID, message.MessageID, "@Haru この件もお願いします", message.Revision); err != nil {
 		t.Fatalf("edit thread message: %v", err)
 	}
 	threads, err := b.ThreadsFor(ctx)

@@ -33,6 +33,7 @@ function threadIn(
 ): ThreadSummary {
   return {
     threadId,
+    revision: 1,
     workspaceId: "ws",
     parentPlace: PARENT_CHANNEL,
     parentMessageId: "message-0",
@@ -89,6 +90,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "ws",
+          revision: 1,
           name: "dev",
           topic: "",
           visibility: "public",
@@ -134,13 +136,18 @@ class StubBackend implements MessagingBackend {
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): ReturnType<
-    MessagingBackend["updateChannelTopic"]
-  > {
+  async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): ReturnType<MessagingBackend["duplicateChannel"]> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {
     throw new Error("uploadAttachment is not part of this test");
+  }
+
+  async updateDraftAttachment(): Promise<never> {
+    throw new Error("updateDraftAttachment is not part of this test");
   }
   attachmentURL(attachmentId: string): string {
     return `/test/attachments/${attachmentId}`;
@@ -153,8 +160,12 @@ class StubBackend implements MessagingBackend {
       created: true,
     };
   }
-  async editMessage(): Promise<void> {}
-  async deleteMessage(): Promise<void> {}
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
+    throw new Error("unused");
+  }
+  async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
+    throw new Error("unused");
+  }
   async markRead(): Promise<void> {}
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
@@ -446,7 +457,7 @@ describe("notification settings in the store", () => {
 });
 
 describe("presenting an incoming message", () => {
-  it("calls the person when the server said so and the tab is elsewhere", () => {
+  it("leaves OS notification presentation to the Service Worker", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
 
     backend.emit({
@@ -455,11 +466,7 @@ describe("presenting an incoming message", () => {
       notify: { reason: "keyword" },
     });
 
-    expect(FakeNotification.constructed).toHaveLength(1);
-    expect(FakeNotification.constructed[0]?.title).toBe("#dev — Kuro");
-    expect(FakeNotification.constructed[0]?.options.body).toBe(
-      "デプロイの件です",
-    );
+    expect(FakeNotification.constructed).toHaveLength(0);
   });
 
   it("presents a repeated message_created frame only once", () => {
@@ -480,6 +487,7 @@ describe("presenting an incoming message", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const thread: ThreadSummary = {
       threadId: "thread-1",
+      revision: 1,
       workspaceId: "ws",
       parentPlace: CHANNEL,
       parentMessageId: "message-0",

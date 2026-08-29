@@ -383,6 +383,20 @@ export type BrowserEventEnvelope =
     };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "DirectChatStatusFrame".
+ */
+export type DirectChatStatusFrame =
+  | {
+      type: "direct_chat_status";
+      status: "ready";
+    }
+  | {
+      type: "direct_chat_status";
+      status: "unavailable";
+      reason: "rehydrating" | "stopped" | "unavailable";
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "BrowserServerFrame".
  */
 export type BrowserServerFrame =
@@ -814,14 +828,6 @@ export interface BrowserCommandRejectedFrame {
     | "not_allowed"
     | "idempotency_conflict"
     | "unavailable";
-}
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "DirectChatStatusFrame".
- */
-export interface DirectChatStatusFrame {
-  type: "direct_chat_status";
-  status: "ready" | "unavailable";
 }
 /**
  * placeholder for v1; no attachments are accepted yet

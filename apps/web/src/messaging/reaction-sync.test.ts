@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "./api-backend";
 import type {
   ConnectionState,
   Message,
@@ -512,6 +513,136 @@ describe("reaction convergence in the messaging store", () => {
     });
   });
 
+  it("keeps a tombstone when message_deleted precedes the PATCH response and replay", async () => {
+    const harness = new StubBackend();
+    const committed = deferred<Message>();
+    harness.editMessage = vi.fn(async () => await committed.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = { ...message(1, "編集前"), revision: 1 };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+    });
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("PATCHで確定した本文");
+    useMessaging.getState().submitEdit();
+    expect(harness.editMessage).toHaveBeenCalledOnce();
+
+    const tombstone = {
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: 3,
+    };
+    harness.emit({ type: "message_deleted", message: tombstone });
+    committed.resolve({
+      ...target,
+      content: "PATCHで確定した本文",
+      revision: 2,
+    });
+    await harness.settle();
+
+    // reconnectのcatch-upはmessage_createdで運ばれるが、旧編集eventも同じ
+    // 単調適用を通るためtombstoneを覆えない。
+    harness.emit({
+      type: "message_created",
+      message: { ...target, content: "replayされた古い編集", revision: 2 },
+      notify: null,
+    });
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ content: "", deleted: true, revision: 3 });
+  });
+
+  it("keeps a reaction published before a successful edit response", async () => {
+    const harness = new StubBackend();
+    const committed = deferred<Message>();
+    harness.editMessage = vi.fn(async () => await committed.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = { ...message(1, "編集前"), revision: 1 };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+    });
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("PATCHで確定した本文");
+    useMessaging.getState().submitEdit();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [other] }],
+    });
+    committed.resolve({
+      ...target,
+      content: "PATCHで確定した本文",
+      revision: 2,
+      reactions: [],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "PATCHで確定した本文",
+      revision: 2,
+      reactions: [{ emoji: "👍", participants: [other] }],
+    });
+  });
+
+  it("keeps a reaction published before a 409 edit-conflict response", async () => {
+    const harness = new StubBackend();
+    const target = { ...message(1, "編集前"), revision: 1 };
+    const conflict = new MessagingAPIError("edit_conflict", 409);
+    Object.defineProperty(conflict, "currentMessage", {
+      value: {
+        ...target,
+        content: "別クライアントの編集",
+        revision: 2,
+        reactions: [],
+      },
+    });
+    harness.editMessage = vi.fn(async () => {
+      throw conflict;
+    });
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+    });
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("競合する編集");
+    useMessaging.getState().submitEdit();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "🎉", participants: [other] }],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "別クライアントの編集",
+      revision: 2,
+      reactions: [{ emoji: "🎉", participants: [other] }],
+    });
+  });
+
   it("discards toggle ACKs and queued mutations from an earlier session", async () => {
     const oldHarness = new StubBackend();
     const acknowledgement = deferred<ReactionMutationResult>();
@@ -607,6 +738,62 @@ describe("reaction convergence in the messaging store", () => {
       reactions: [{ emoji: "🎉", participants: [self] }],
     });
   });
+
+  it("does not apply a delayed deletion ACK to the replacement session", async () => {
+    const oldHarness = new StubBackend();
+    const deleted = deferred<Message>();
+    oldHarness.deleteMessage = vi.fn(async () => await deleted.promise);
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    const target = {
+      ...message(1, "old session"),
+      author: other,
+      mentions: [self],
+      revision: 1,
+    };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+      lastReadByPlace: { [placeKey]: 0 },
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+    useMessaging.getState().deleteMessage(target.messageId);
+    expect(oldHarness.deleteMessage).toHaveBeenCalledOnce();
+
+    bindMessagingSessionIdentity("reaction-test-delete-new-session");
+    const newHarness = new StubBackend();
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [{ ...target, content: "new session" }] },
+      lastReadByPlace: { [placeKey]: 0 },
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+
+    deleted.resolve({
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: 2,
+    });
+    await oldHarness.settle();
+
+    expect(useMessaging.getState()).toMatchObject({
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ content: "new session", deleted: false });
+  });
 });
 
 const self = { kind: "human", humanId: "human-1" } as const;
@@ -648,6 +835,7 @@ function message(
 function threadSummary(): ThreadSummary {
   return {
     threadId: "thread-1",
+    revision: 1,
     workspaceId: "workspace-1",
     parentPlace: { kind: "channel", channelId: "channel-1" },
     parentMessageId: "message-1",
@@ -705,7 +893,11 @@ class StubBackend implements MessagingBackend {
   }
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
-    queueMicrotask(() => this.resolveBootstrapped());
+    // Store request fencing validates the response in its own microtask before
+    // applying bootstrap.  Resolve the test readiness marker after that chain.
+    queueMicrotask(() =>
+      queueMicrotask(() => queueMicrotask(() => this.resolveBootstrapped())),
+    );
     return {
       self,
       workspaces: [],
@@ -713,6 +905,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "workspace-1",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",
@@ -767,7 +960,8 @@ class StubBackend implements MessagingBackend {
   createChannel = vi.fn();
   ensureDM = vi.fn();
   createGroupDM = vi.fn();
-  updateChannelTopic = vi.fn();
+  updateChannel = vi.fn();
+  duplicateChannel = vi.fn();
   fetchPresence = vi.fn(async () => ({
     statuses: [],
     replyLaterMarkers: [],
@@ -776,12 +970,20 @@ class StubBackend implements MessagingBackend {
   async uploadAttachment(): Promise<never> {
     throw new Error("uploadAttachment is not part of this test");
   }
+
+  async updateDraftAttachment(): Promise<never> {
+    throw new Error("updateDraftAttachment is not part of this test");
+  }
   attachmentURL(attachmentId: string): string {
     return `/test/attachments/${attachmentId}`;
   }
   sendMessage = vi.fn();
-  editMessage = vi.fn(async () => undefined);
-  deleteMessage = vi.fn(async () => undefined);
+  editMessage = async (): ReturnType<MessagingBackend["editMessage"]> => {
+    throw new Error("editMessage is not part of this test");
+  };
+  deleteMessage = vi.fn(async (): Promise<Message> => {
+    throw new Error("deleteMessage is not part of this test");
+  });
   markRead = vi.fn(async () => undefined);
   setStatus = vi.fn(async () => {
     throw new Error("unused");

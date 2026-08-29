@@ -26,10 +26,12 @@ func run() error {
 	var socketGID int
 	var supervisorPath string
 	var socketModeText string
+	var stateDirectory string
 	flag.StringVar(&socketPath, "socket", "/run/sumi/runtime-provisioner/control.sock", "root-managed Unix socket")
 	flag.IntVar(&socketGID, "socket-gid", 0, "group allowed to connect to the Unix socket")
 	flag.StringVar(&socketModeText, "socket-mode", "0660", "Unix socket permission mode")
 	flag.StringVar(&supervisorPath, "supervisor", "/usr/local/libexec/sumi-agent-supervisor", "host Docker supervisor")
+	flag.StringVar(&stateDirectory, "state-dir", "/run/sumi/runtime-provisioner/state", "durable runtime provision state directory")
 	flag.Parse()
 
 	parsedMode, err := strconv.ParseUint(socketModeText, 8, 32)
@@ -43,7 +45,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	service, err := runtimeprovision.NewService(backend)
+	service, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{StateDirectory: stateDirectory})
 	if err != nil {
 		return err
 	}

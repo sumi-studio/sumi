@@ -66,6 +66,7 @@ function thread(
     participants: [],
     latestSeq: 0,
     ...overrides,
+    revision: overrides.revision ?? 1,
   };
 }
 

@@ -23,10 +23,15 @@ type BootstrapSnapshot = Awaited<ReturnType<MessagingBackend["bootstrap"]>>;
 const SELF = { kind: "human", humanId: "human-a" } as const;
 const OTHER = { kind: "human", humanId: "human-b" } as const;
 
-function channel(channelId: string, topic: string): ChannelSummary {
+function channel(
+  channelId: string,
+  topic: string,
+  revision = 1,
+): ChannelSummary {
   return {
     channelId,
     workspaceId: "workspace-1",
+    revision,
     name: channelId,
     topic,
     visibility: "public",
@@ -41,6 +46,7 @@ function dm(dmId: string): DmSummary {
 function thread(threadId: string): ThreadSummary {
   return {
     threadId,
+    revision: 1,
     workspaceId: "workspace-1",
     parentPlace: { kind: "channel", channelId: "channel-1" },
     parentMessageId: "message-1",
@@ -179,11 +185,18 @@ class FakeBackend implements MessagingBackend {
   async createGroupDM(): Promise<DmSummary> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): Promise<ChannelSummary> {
+  async updateChannel(): Promise<ChannelSummary> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): Promise<ChannelSummary> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {
     throw new Error("uploadAttachment is not part of this test");
+  }
+
+  async updateDraftAttachment(): Promise<never> {
+    throw new Error("updateDraftAttachment is not part of this test");
   }
   attachmentURL(attachmentId: string): string {
     return `/test/attachments/${attachmentId}`;
@@ -196,8 +209,12 @@ class FakeBackend implements MessagingBackend {
       created: true,
     }),
   );
-  async editMessage() {}
-  async deleteMessage() {}
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
+    throw new Error("unused");
+  }
+  async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
+    throw new Error("unused");
+  }
   async markRead() {}
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
@@ -547,7 +564,6 @@ describe("place lifecycleの再接続突き合わせ", () => {
         CHANNEL_1,
         stale.name,
         stale.parentMessageId,
-        "create-race",
       );
     backend.emit({
       type: "message_created",
@@ -839,7 +855,10 @@ describe("place lifecycleの再接続突き合わせ", () => {
     await settle();
 
     backend.next = snapshot({
-      channels: [channel("channel-1", "新トピック"), channel("channel-2", "")],
+      channels: [
+        channel("channel-1", "新トピック", 2),
+        channel("channel-2", ""),
+      ],
       dms: [dm("dm-9")],
       unread: {
         [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 },
@@ -878,7 +897,6 @@ describe("place lifecycleの再接続突き合わせ", () => {
       threads: [thread("thread-admitted-offline")],
       unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
     });
-
     backend.emitConnection("reconnecting");
     backend.emitConnection("connected");
     await settle();
@@ -911,6 +929,15 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(useMessaging.getState().threadsLoadedForPlace[CHANNEL_1]).toBe(true);
   });
 
+  it("再接続snapshotから消えたchannelを保持しない", async () => {
+    backend.next = snapshot({ channels: [], dms: [], unread: {} });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    expect(useMessaging.getState().channels).toEqual([]);
+  });
+
   it("進行中の未読・既読・ローカルstateを突き合わせで壊さない", async () => {
     useMessaging.getState().selectPlace(CHANNEL_1);
     useMessaging.getState().setDraft(CHANNEL_1, "書きかけ");
@@ -922,7 +949,10 @@ describe("place lifecycleの再接続突き合わせ", () => {
 
     // serverのsnapshotはまだ既読前（未読3・メンション1、read marker 0）。
     backend.next = snapshot({
-      channels: [channel("channel-1", "新トピック"), channel("channel-2", "")],
+      channels: [
+        channel("channel-1", "新トピック", 2),
+        channel("channel-2", ""),
+      ],
       dms: [],
       unread: {
         [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 },
@@ -1174,5 +1204,48 @@ describe("place lifecycleの再接続突き合わせ", () => {
       "channel-1",
     ]);
     expect(state.connection).toBe("connected");
+  });
+
+  it("遅れて届く古いplace_updatedで新しい表示へ戻さない", () => {
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-1", "新しいtopic", 3),
+      });
+    });
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-1", "古いtopic", 2),
+      });
+    });
+
+    expect(useMessaging.getState().channels[0]).toMatchObject({
+      topic: "新しいtopic",
+      revision: 3,
+    });
+  });
+
+  it("未知のplace_updatedを挿入し、後着の古いplace_createdを退ける", () => {
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-2", "編集済みtopic", 2),
+      });
+    });
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_created",
+        channel: channel("channel-2", "作成時topic", 1),
+      });
+    });
+
+    expect(useMessaging.getState().channels).toContainEqual(
+      expect.objectContaining({
+        channelId: "channel-2",
+        topic: "編集済みtopic",
+        revision: 2,
+      }),
+    );
   });
 });

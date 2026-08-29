@@ -19,6 +19,13 @@ const workspaceId = "018f1e72-6e9a-7c20-8e90-123456789abc";
 const humanId = "018f1e72-6e9a-7c20-8e90-123456789abd";
 const operationId = "00000000-0000-4000-8000-000000000101";
 
+export const workspaceInstallWithOperation: InstallAppRequest = {
+  owner: { kind: "workspace", workspace_id: workspaceId },
+  app_id: "messaging",
+  operation_id: operationId,
+};
+
+// @ts-expect-error All install intents require their durable operation identity.
 export const workspaceInstallWithoutOperation: InstallAppRequest = {
   owner: { kind: "workspace", workspace_id: workspaceId },
   app_id: "messaging",

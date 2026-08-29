@@ -27,6 +27,10 @@ pub const AUTHORIZATION_EVIDENCE_VERSION_V1: &str = "tool-execution-authorizatio
 pub const DENIAL_EVIDENCE_VERSION_V1: &str = "tool-execution-denial-evidence/v1";
 pub const HUMAN_DECISION_PROVENANCE_VERSION_V1: u8 = 1;
 const AUTHORIZATION_DIGEST_DOMAIN: &[u8] = b"sumi-tool-authorization-evidence/v1\0";
+#[allow(
+    dead_code,
+    reason = "denial evidence is exercised by the mirrored authority tests"
+)]
 const DENIAL_DIGEST_DOMAIN: &[u8] = b"sumi-tool-denial-evidence/v1\0";
 const EXECUTOR_AUTHORIZATION_PROJECTION_DIGEST_DOMAIN: &[u8] =
     b"sumi-executor-authorization-projection/v1\0";
@@ -107,6 +111,10 @@ pub struct HumanAuthorizationContextV1<'a> {
 }
 
 impl PolicyDecisionRecord {
+    #[allow(
+        dead_code,
+        reason = "the stable policy label is consumed by authority tests until production persistence is wired"
+    )]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Allow => "allow",
@@ -356,6 +364,10 @@ pub fn authorization_context_digest(value: &impl Serialize) -> Result<String> {
     Ok(digest(AUTHORIZATION_DIGEST_DOMAIN, &encoded))
 }
 
+#[allow(
+    dead_code,
+    reason = "authorization evidence digest is validated by mirrored authority tests"
+)]
 pub fn authorization_evidence_digest(
     evidence: &ToolExecutionAuthorizationEvidence,
     bound: &BoundToolInvocation,
@@ -469,6 +481,10 @@ pub(crate) fn executor_grant_digest(grant_id: &str) -> Result<String> {
     Ok(digest(EXECUTOR_GRANT_DIGEST_DOMAIN, grant_id.as_bytes()))
 }
 
+#[allow(
+    dead_code,
+    reason = "denial evidence digest is validated by mirrored authority tests"
+)]
 pub fn denial_evidence_digest(
     evidence: &ToolExecutionDenialEvidence,
     bound: &BoundToolInvocation,
@@ -1309,7 +1325,7 @@ mod effect_type_tests {
     }
     struct CloneImplemented;
     impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-    impl<T: ?Sized + Clone> AmbiguousIfClone<CloneImplemented> for T {}
+    impl<T: Clone> AmbiguousIfClone<CloneImplemented> for T {}
 
     trait AmbiguousIfSerialize<A> {
         fn marker() {}

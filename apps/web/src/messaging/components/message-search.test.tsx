@@ -110,6 +110,7 @@ describe("MessageSearch", () => {
     state.threadsById = {
       "thread-1": {
         threadId: "thread-1",
+        revision: 1,
         parentPlace: { kind: "channel", channelId: "channel-1" },
         parentMessageId: null,
         workspaceId: "workspace-1",

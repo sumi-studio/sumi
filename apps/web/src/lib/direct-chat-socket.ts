@@ -1,4 +1,5 @@
 import type {
+  DirectChatStatusFrame as APIClientDirectChatStatusFrame,
   BrowserEventEnvelope,
   CommandDispositionEvent,
 } from "@sumi/api-client";
@@ -18,17 +19,34 @@ export type DirectChatCommand =
       decision: { type: "approve_once" } | { type: "deny_once" };
     };
 
+/**
+ * The API accepts the upgrade and closes with this code/reason pair when an
+ * authorized session could not get an agent runtime started. It is the only
+ * channel a page can read a cause on, and it mirrors
+ * `DirectChatRuntimeUnavailableCloseCode` in
+ * `apps/api/internal/agentevents/browser_ws.go`.
+ */
+export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE = 4001;
+export const DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON = "runtime_not_ready";
+
 export type DirectChatConnectionState = "connecting" | "connected" | "closed";
-export type DirectChatReadyState = "unknown" | "ready" | "not_ready";
+// Only a server-stated unavailable reason can describe lifecycle progress. A
+// 4001 close is the distinct, attributed failure to start.
+export type DirectChatReadyState =
+  | "unknown"
+  | "ready"
+  | "rehydrating"
+  | "stopped"
+  | "unavailable"
+  | "not_ready";
 
 export type DirectChatEventFrame = {
   type: "event";
   envelope: BrowserEventEnvelope;
 };
-export type DirectChatStatusFrame = {
-  type: "direct_chat_status";
-  status: "ready" | "unavailable";
-};
+// This status frame is generated from the public agent-events contract. In
+// particular, `reason` is prohibited for ready and required for unavailable.
+export type DirectChatStatusFrame = APIClientDirectChatStatusFrame;
 export type DirectChatAcceptedFrame = {
   type: "command_accepted";
   idempotency_key: string;
@@ -125,6 +143,24 @@ const ToolArgumentErrors = new Set([
 const AuditOutcomes = new Set(["allow", "deny"]);
 const RiskLevels = new Set(["low", "medium", "high", "critical"]);
 const UserAuthorizations = new Set(["unknown", "low", "medium", "high"]);
+type DirectChatUnavailableReason = Extract<
+  DirectChatStatusFrame,
+  { status: "unavailable" }
+>["reason"];
+const DirectChatUnavailableReasons = new Set<DirectChatUnavailableReason>([
+  "rehydrating",
+  "stopped",
+  "unavailable",
+]);
+
+function isDirectChatUnavailableReason(
+  value: unknown,
+): value is DirectChatUnavailableReason {
+  return (
+    typeof value === "string" &&
+    DirectChatUnavailableReasons.has(value as DirectChatUnavailableReason)
+  );
+}
 
 function reconnectDelay(attempt: number): number {
   const exponential = InitialReconnectDelay * 2 ** attempt;
@@ -748,12 +784,21 @@ export function parseDirectChatServerFrame(
   lastEventSeq: number,
 ): DirectChatServerFrame | undefined {
   if (!isRecord(value)) return undefined;
-  if (
-    value.type === "direct_chat_status" &&
-    (value.status === "ready" || value.status === "unavailable") &&
-    hasOnlyKeys(value, ["type", "status"])
-  ) {
-    return value as DirectChatStatusFrame;
+  if (value.type === "direct_chat_status") {
+    if (
+      value.status === "ready" &&
+      hasRequiredAndOnlyKeys(value, ["type", "status"])
+    ) {
+      return value as DirectChatStatusFrame;
+    }
+    if (
+      value.status === "unavailable" &&
+      hasRequiredAndOnlyKeys(value, ["type", "status", "reason"]) &&
+      isDirectChatUnavailableReason(value.reason)
+    ) {
+      return value as DirectChatStatusFrame;
+    }
+    return undefined;
   }
   if (
     value.type === "event" &&
@@ -950,7 +995,6 @@ export class DirectChatSocket {
     this.socket = socket;
     socket.onopen = () => {
       if (this.socket !== socket) return;
-      this.reconnectAttempt = 0;
       this.setConnectionState("connected");
       this.admissionReady = false;
       this.setReadyState("unknown");
@@ -983,8 +1027,22 @@ export class DirectChatSocket {
       }
       if (frame.type === "direct_chat_status") {
         this.admissionReady = frame.status === "ready";
-        this.setReadyState(frame.status === "ready" ? "ready" : "not_ready");
-        if (this.admissionReady) this.flushPending();
+        this.setReadyState(
+          frame.status === "ready"
+            ? "ready"
+            : frame.reason === "rehydrating"
+              ? "rehydrating"
+              : frame.reason === "stopped"
+                ? "stopped"
+                : "unavailable",
+        );
+        if (this.admissionReady) {
+          // An accepted upgrade can still immediately report a failed lazy
+          // runtime spawn. Only an explicit ready frame proves this connection
+          // is usable enough to restart the reconnect backoff.
+          this.reconnectAttempt = 0;
+          this.flushPending();
+        }
       }
       if (frame.type === "command_accepted")
         this.pending.delete(frame.idempotency_key);
@@ -992,12 +1050,21 @@ export class DirectChatSocket {
         this.pending.delete(frame.idempotency_key);
       for (const listener of this.listeners) listener(frame);
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.admissionReady = false;
       this.setConnectionState("closed");
-      this.setReadyState("unknown");
+      // Only a cause the server states is a cause. A page cannot read the HTTP
+      // status of a refused upgrade, so a logged-out session, a disallowed
+      // origin, an offline network, and a DNS or TLS failure are all the same
+      // unattributable close here and stay "unknown".
+      this.setReadyState(
+        event?.code === DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_CODE &&
+          event.reason === DIRECT_CHAT_RUNTIME_UNAVAILABLE_CLOSE_REASON
+          ? "not_ready"
+          : "unknown",
+      );
       this.scheduleReconnect();
     };
   }

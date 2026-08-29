@@ -12,10 +12,12 @@ import {
   ConversationVirtualizer,
   type ConversationVirtualizerHandle,
 } from "../../components/conversation-virtualizer";
+import { copyText } from "../../lib/clipboard";
 import { type Message, participantKey } from "../model";
 import { placePath } from "../place-route";
 import { getMessagingScope, useMessaging } from "../store";
 import { buildRows, type PendingMessage, type TimelineRow } from "../timeline";
+import type { ImageViewerRequest } from "./message-attachments";
 import { MessageItem } from "./message-item";
 
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
@@ -46,8 +48,14 @@ function estimateRowSize(row: ListRow): number {
 
 export function MessageList({
   handleRef,
+  revealedAttachmentIds,
+  onRevealAttachment,
+  onOpenImage,
 }: {
   handleRef?: Ref<MessageListHandle>;
+  revealedAttachmentIds: ReadonlySet<string>;
+  onRevealAttachment: (attachmentId: string) => void;
+  onOpenImage: (request: ImageViewerRequest) => void;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const messages = useMessaging((state) =>
@@ -71,6 +79,26 @@ export function MessageList({
   const noteReadUpTo = useMessaging((state) => state.noteReadUpTo);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
   const startEdit = useMessaging((state) => state.startEdit);
+  const submitEdit = useMessaging((state) => state.submitEdit);
+  const cancelEdit = useMessaging((state) => state.cancelEdit);
+  const editDraft = useMessaging((state) => state.editDraft);
+  const editConflict = useMessaging((state) => state.editConflict);
+  const editFailure = useMessaging((state) => state.editFailure);
+  const editSavedWithPendingChanges = useMessaging(
+    (state) => state.editSavedWithPendingChanges,
+  );
+  const editSaving = useMessaging(
+    (state) =>
+      state.editSession !== null && state.editSession.submittedDraft !== null,
+  );
+  const editOpenedToken = useMessaging(
+    (state) => state.editSession?.openedToken ?? null,
+  );
+  const deleteFailedMessageIds = useMessaging(
+    (state) => state.deleteFailedMessageIds,
+  );
+  const setEditDraft = useMessaging((state) => state.setEditDraft);
+  const reloadEditConflict = useMessaging((state) => state.reloadEditConflict);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
@@ -95,6 +123,15 @@ export function MessageList({
   const highlightTimer = useRef<number | null>(null);
   const visibleIdsRef = useRef<string[]>([]);
   const positionedPlaceRef = useRef<string | null>(null);
+  // 入室直後の位置決めは数フレームに分けて再適用される。その間に別の
+  // 意図的な移動（編集の対象へ運ぶ等）が入ったら、残りの再適用は取り下げる。
+  const positioningTimersRef = useRef<number[]>([]);
+  const abandonInitialPositioning = useCallback(() => {
+    for (const timer of positioningTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    positioningTimersRef.current = [];
+  }, []);
 
   const rows = useMemo(() => {
     if (!messages || !self) return [];
@@ -225,8 +262,10 @@ export function MessageList({
     for (const delay of [0, 120, 300]) {
       timers.push(window.setTimeout(apply, delay));
     }
+    positioningTimersRef.current = timers;
     return () => {
       for (const timer of timers) window.clearTimeout(timer);
+      positioningTimersRef.current = [];
       // StrictModeの二重マウントで未発火のままcleanupされた場合は
       // ガードを解除し、再マウント側で位置決めをやり直せるようにする。
       if (!applied && positionedPlaceRef.current === activePlaceKey) {
@@ -234,6 +273,18 @@ export function MessageList({
       }
     };
   }, [activePlaceKey, rows]);
+
+  // 編集は対象行の位置で起きる。仮想リストは見えている範囲しか行を作らないので、
+  // 画面外のメッセージを編集し始めると編集欄がどこにも現れない。開始と同時に
+  // 対象まで運ぶ（「描画済みの行だけ編集できる」は使う側の期待に反する）。
+  useEffect(() => {
+    if (!editingMessageId) return;
+    abandonInitialPositioning();
+    virtualizerRef.current?.scrollToMessage(editingMessageId, {
+      align: "center",
+      behavior: "auto",
+    });
+  }, [editingMessageId, abandonInitialPositioning]);
 
   // 最下部にいるときだけ新着へ自動追従する（読んでいる視点は奪わない）。
   const lastRowId = rows.length > 0 ? rows[rows.length - 1].id : null;
@@ -265,12 +316,13 @@ export function MessageList({
     return () => window.removeEventListener("focus", onFocus);
   }, [advanceRead]);
 
+  // コピーは成否を返す。呼び出し側（操作チップ）が完了表示を出すため。
   const copyLink = useCallback(
     (message: Message) => {
       const workspaceId = getMessagingScope()?.workspaceId;
-      if (!activePlaceKey || !workspaceId) return;
+      if (!activePlaceKey || !workspaceId) return Promise.resolve(false);
       const url = `${window.location.origin}${placePath(workspaceId, activePlaceKey)}?m=${message.seq}`;
-      void navigator.clipboard.writeText(url);
+      return copyText(url);
     },
     [activePlaceKey],
   );
@@ -280,6 +332,32 @@ export function MessageList({
       deleteMessage(message.messageId);
     },
     [deleteMessage],
+  );
+
+  // 行に渡す関数は identity を固定する。MessageItem は memo なので、渡す値が
+  // 変わらない行は再描画されない。編集欄の1キーストロークで可視行すべてを
+  // 描き直さないための前提（編集中の値は編集行にだけ渡す）。
+  const retryMessage = useCallback(
+    (message: Message) => {
+      if (message.clientNonce) retrySend(message.clientNonce);
+    },
+    [retrySend],
+  );
+  const findMessage = useCallback(
+    (id: string) => messagesById.get(id),
+    [messagesById],
+  );
+  const replyTo = useCallback(
+    (message: Message) => setReplyTarget(message.messageId),
+    [setReplyTarget],
+  );
+  const replyLater = useCallback(
+    (message: Message, delayMs?: number) => createReplyLater(message, delayMs),
+    [createReplyLater],
+  );
+  const editMessage = useCallback(
+    (message: Message) => startEdit(message.messageId),
+    [startEdit],
   );
 
   const loadOlderAnchored = useCallback(async () => {
@@ -329,12 +407,13 @@ export function MessageList({
           </div>
         );
       }
+      const editing = editingMessageId === row.message.messageId;
       return (
         <div
           className={
             highlightedId === row.message.messageId
               ? "rounded-md bg-primary/8 ring-1 ring-primary/25 transition-colors"
-              : editingMessageId === row.message.messageId
+              : editing
                 ? "rounded-md ring-1 ring-primary/40"
                 : undefined
           }
@@ -349,21 +428,36 @@ export function MessageList({
             }
             allowReactions={allowReactions}
             allowReplyLater={allowReplyLater}
-            onRetry={(message) => {
-              if (message.clientNonce) retrySend(message.clientNonce);
-            }}
+            onRetry={retryMessage}
             selfKey={selfKey}
             membersByKey={membersByKey}
-            findMessage={(id) => messagesById.get(id)}
-            onReply={(message) => setReplyTarget(message.messageId)}
-            onReplyLater={(message, delayMs) =>
-              createReplyLater(message, delayMs)
-            }
+            findMessage={findMessage}
+            onReply={replyTo}
+            onReplyLater={replyLater}
             onToggleReaction={toggleReaction}
             onCopyLink={copyLink}
-            onEdit={(message) => startEdit(message.messageId)}
+            onEdit={editMessage}
             onDelete={deleteMessage2}
             onJumpTo={flashMessage}
+            revealedAttachmentIds={revealedAttachmentIds}
+            onRevealAttachment={onRevealAttachment}
+            onOpenImage={onOpenImage}
+            editing={editing}
+            // 編集セッションの値は編集行にだけ渡す。他の行の props は
+            // キーストロークで変わらないので、memo が効いて描き直されない。
+            editDraft={editing ? editDraft : ""}
+            editConflict={editing ? editConflict : null}
+            editFailure={editing ? editFailure : null}
+            editSavedWithPendingChanges={
+              editing ? editSavedWithPendingChanges : false
+            }
+            editSaving={editing ? editSaving : false}
+            editOpenedToken={editing ? editOpenedToken : null}
+            onEditDraftChange={setEditDraft}
+            onSubmitEdit={submitEdit}
+            onCancelEdit={cancelEdit}
+            onReloadEditConflict={reloadEditConflict}
+            deleteFailed={deleteFailedMessageIds.has(row.message.messageId)}
           />
         </div>
       );
@@ -371,21 +465,35 @@ export function MessageList({
     [
       highlightedId,
       editingMessageId,
+      editDraft,
+      editConflict,
+      editFailure,
+      editSavedWithPendingChanges,
+      editSaving,
+      editOpenedToken,
+      deleteFailedMessageIds,
+      setEditDraft,
+      reloadEditConflict,
+      submitEdit,
+      cancelEdit,
       selfKey,
       membersByKey,
-      messagesById,
+      findMessage,
       replyLaterByMessage,
-      setReplyTarget,
-      createReplyLater,
+      replyTo,
+      replyLater,
       toggleReaction,
       allowReactions,
       allowReplyLater,
-      retrySend,
+      retryMessage,
       copyLink,
-      startEdit,
+      editMessage,
       deleteMessage2,
       flashMessage,
       loadOlderAnchored,
+      revealedAttachmentIds,
+      onRevealAttachment,
+      onOpenImage,
     ],
   );
 

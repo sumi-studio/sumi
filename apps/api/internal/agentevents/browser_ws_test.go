@@ -776,7 +776,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 			}
 
 			server := &BrowserServer{Events: gateway}
-			err := server.browserEventPump(ctx, personalityAgentID, 0, true, volatile, nil, write)
+			err := server.browserEventPump(ctx, personalityAgentID, 0, directChatReadiness{ready: true}, volatile, nil, write)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("browser event pump returned %v, want context cancellation", err)
 			}
@@ -1302,14 +1302,26 @@ func TestBrowserWebSocketLifecycleMutationWaitsForBoundedProvisioning(t *testing
 			t.Fatal("timed-out provisioning wedged direct-chat lifecycle")
 		}
 		got := <-dialed
-		if got.conn != nil {
-			got.conn.Close()
-		}
 		if got.response != nil && got.response.Body != nil {
 			defer got.response.Body.Close()
 		}
-		if got.err == nil || got.response == nil || got.response.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("spawn timeout response=%v err=%v, want 503", got.response, got.err)
+		// The upgrade is accepted so the timed-out provisioning can be named on
+		// the only channel the browser can read.
+		if got.err != nil || got.conn == nil {
+			t.Fatalf("spawn timeout response=%v err=%v, want an accepted upgrade", got.response, got.err)
+		}
+		defer got.conn.Close()
+		got.conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, _, readErr := got.conn.ReadMessage()
+		closeErr, ok := readErr.(*websocket.CloseError)
+		if !ok {
+			t.Fatalf("read after spawn timeout = %v, want a close frame", readErr)
+		}
+		if closeErr.Code != DirectChatRuntimeUnavailableCloseCode ||
+			closeErr.Text != DirectChatRuntimeUnavailableCloseReason {
+			t.Fatalf("spawn timeout close = %d %q, want %d %q",
+				closeErr.Code, closeErr.Text,
+				DirectChatRuntimeUnavailableCloseCode, DirectChatRuntimeUnavailableCloseReason)
 		}
 	})
 }
@@ -2339,6 +2351,18 @@ func assertDirectChatStatus(t *testing.T, conn *websocket.Conn, want string) {
 	}
 }
 
+func assertDirectChatStatusReason(t *testing.T, conn *websocket.Conn, want, reason string) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	var frame directChatStatusFrame
+	if err := conn.ReadJSON(&frame); err != nil {
+		t.Fatalf("read direct-chat status: %v", err)
+	}
+	if frame.Type != "direct_chat_status" || frame.Status != want || frame.Reason != reason {
+		t.Fatalf("unexpected direct-chat status: %+v, want status=%q reason=%q", frame, want, reason)
+	}
+}
+
 func assertBrowserConnectionClosedBeforeFrame(t *testing.T, conn *websocket.Conn) {
 	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -2738,6 +2762,21 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 			raw:    `{"type":"direct_chat_status","status":"ready","extra":true}`,
 			target: func() any { return &directChatStatusFrame{} },
 		},
+		{
+			name:   "ready status carries unavailable reason",
+			raw:    `{"type":"direct_chat_status","status":"ready","reason":"stopped"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
+		{
+			name:   "status unknown reason",
+			raw:    `{"type":"direct_chat_status","status":"unavailable","reason":"restarting"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
+		{
+			name:   "unavailable status omits required reason",
+			raw:    `{"type":"direct_chat_status","status":"unavailable"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -2757,13 +2796,6 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 	if volatile.Envelope.Seq != nil {
 		t.Fatalf("volatile browser event gained seq: %+v", volatile)
 	}
-	var unavailable directChatStatusFrame
-	if err := json.Unmarshal(
-		[]byte(`{"type":"direct_chat_status","status":"unavailable"}`),
-		&unavailable,
-	); err != nil {
-		t.Fatalf("valid unavailable status rejected: %v", err)
-	}
 	for _, status := range []string{"applied", "superseded", "rejected"} {
 		rejectReason := ""
 		if status == "rejected" {
@@ -2778,5 +2810,148 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &accepted); err != nil {
 			t.Fatalf("valid %s accepted disposition rejected: %v", status, err)
 		}
+	}
+}
+
+type failingDirectChatSpawner struct {
+	err error
+}
+
+func (s *failingDirectChatSpawner) EnsureRunning(context.Context, string) error {
+	return s.err
+}
+
+func (*failingDirectChatSpawner) Touch(string) {}
+
+// A pre-upgrade 503 is unreadable to a page: the browser reports only a close
+// without a status, exactly as it does for an expired session, a disallowed
+// origin, or an offline network. The API therefore accepts the upgrade this
+// authorized session already earned and names the cause in the close frame.
+func TestBrowserWebSocketNamesAnUnstartableRuntimeInTheCloseFrame(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	sessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{browserAuthTestOrigin}
+	server.Spawner = &failingDirectChatSpawner{
+		err: errors.New("supervisor prepare failed"),
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) +
+		"/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"Origin": {browserAuthTestOrigin},
+		"Cookie": {BrowserSessionCookie + "=" + session},
+	})
+	if err != nil {
+		t.Fatalf("upgrade must be accepted so the cause can be read: err=%v response=%v", err, response)
+	}
+	defer conn.Close()
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status=%d, want 101", response.StatusCode)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, readErr := conn.ReadMessage()
+	closeErr, ok := readErr.(*websocket.CloseError)
+	if !ok {
+		t.Fatalf("read after unstartable runtime = %v, want a close frame", readErr)
+	}
+	if closeErr.Code != DirectChatRuntimeUnavailableCloseCode {
+		t.Fatalf("close code=%d, want %d", closeErr.Code, DirectChatRuntimeUnavailableCloseCode)
+	}
+	if closeErr.Text != DirectChatRuntimeUnavailableCloseReason {
+		t.Fatalf("close reason=%q, want %q", closeErr.Text, DirectChatRuntimeUnavailableCloseReason)
+	}
+	waitForBrowserConnectionStats(
+		t,
+		server,
+		BrowserConnectionStats{Active: 0, Accepted: 1},
+	)
+}
+
+// A rejection the browser cannot attribute must stay unattributed: these fail
+// before the upgrade, so the page sees only a closed socket and must not blame
+// the agent runtime.
+func TestBrowserWebSocketRejectsUnauthorizedSessionsBeforeAnyCloseCode(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	sessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newAuthorizedBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{browserAuthTestOrigin}
+	server.Spawner = &countingDirectChatSpawner{}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) +
+		"/direct-chat/ws?installation_id=" + testDirectChatInstallationID + "&authority_epoch=1"
+	for _, test := range []struct {
+		name       string
+		origin     string
+		session    string
+		wantStatus int
+	}{
+		{
+			name:       "invalid session",
+			origin:     browserAuthTestOrigin,
+			session:    "not-a-session",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "disallowed origin",
+			origin:     "https://evil.example",
+			session:    "not-a-session",
+			wantStatus: http.StatusForbidden,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, http.Header{
+				"Origin": {test.origin},
+				"Cookie": {BrowserSessionCookie + "=" + test.session},
+			})
+			if conn != nil {
+				conn.Close()
+			}
+			if dialErr == nil {
+				t.Fatal("unauthorized dial was upgraded")
+			}
+			if response == nil || response.StatusCode != test.wantStatus {
+				t.Fatalf("response=%v, want status %d", response, test.wantStatus)
+			}
+			if response.Body != nil {
+				defer response.Body.Close()
+			}
+			// No close frame exists on this path, so nothing can carry the
+			// runtime diagnosis and the page must not infer one.
+			if _, ok := response.Header["Sec-Websocket-Accept"]; ok {
+				t.Fatal("unauthorized dial completed a handshake")
+			}
+		})
 	}
 }

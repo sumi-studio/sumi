@@ -315,6 +315,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -493,6 +494,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -554,13 +556,8 @@ mod tests {
 
         assert_eq!(bound.review_projection.as_object()["cursor"], CURSOR);
         assert_eq!(bound.execution_arguments.as_object()["cursor"], CURSOR);
-        assert_eq!(
-            serde_json::to_string(&bound.provider_review_projection)
-                .expect("provider-safe cursor projection")
-                .matches(CURSOR)
-                .count(),
-            0
-        );
+        let evidence = serde_json::to_value(bound).expect("bound cursor evidence");
+        assert!(evidence.get("provider_review_projection").is_none());
 
         let human_request = PendingApprovalRequest::from_bound(
             "approval-cursor".to_owned(),

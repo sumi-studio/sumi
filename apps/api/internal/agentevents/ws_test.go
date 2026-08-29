@@ -669,7 +669,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	if err := browser.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, browser, "unavailable")
+	assertDirectChatStatusReason(t, browser, "unavailable", directChatUnavailableRehydrating)
 
 	server := NewServer(
 		&fakeTokenVerifier{},
@@ -872,7 +872,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, browser, "unavailable")
+	assertDirectChatStatusReason(t, browser, "unavailable", directChatUnavailableStopped)
 	if err := browser.WriteJSON(browserCommandFrame{
 		Type:           "command",
 		IdempotencyKey: "shutdown-command",

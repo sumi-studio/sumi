@@ -14,6 +14,9 @@
 /sw.js
   Cache-Control: no-cache, must-revalidate
 
+/place-path.js
+  Cache-Control: no-cache, must-revalidate
+
 /theme-bootstrap.js
   Cache-Control: no-cache, must-revalidate
 

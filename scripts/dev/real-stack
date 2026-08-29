@@ -97,6 +97,74 @@ require_value() {
   [[ -n "${!name:-}" ]] || fail "${name} is required"
 }
 
+# Prepares the one directory whose contents outlive a run. The launcher owns
+# only the directory it creates itself: a root that already exists may have
+# other duties (${HOME}, ${TMPDIR}), so its mode is verified and never forced,
+# because fitting it to 0700 would strip access the rest of the system relies
+# on. The root must also be absolute, since the API resolves
+# SUMI_MESSAGING_ATTACHMENT_ROOT against its own working directory (apps/api)
+# rather than the one make dev was invoked from: a relative root would have the
+# launcher provision one parent while the API demands another, and would move
+# the store whenever the stack is started from somewhere else.
+validate_persistent_state_root_ancestors() {
+  local root="$1" ancestor metadata mode owner reason
+  ancestor="$(dirname -- "${root}")"
+  while :; do
+    metadata="$(stat -c '%a %u' -- "${ancestor}")" ||
+      fail "cannot inspect an ancestor of the persistent local state root: ${ancestor}"
+    mode="${metadata%% *}"
+    owner="${metadata##* }"
+    reason=""
+    if [[ "${owner}" != "${UID}" && "${owner}" != "0" ]]; then
+      reason="owner uid ${owner} is neither uid ${UID} nor root"
+    fi
+    if [[ "${mode: -2:1}" =~ [2367] || "${mode: -1}" =~ [2367] ]]; then
+      if (( (8#${mode} & 8#1000) == 0 )); then
+        [[ -z "${reason}" ]] || reason+="; "
+        reason+="is writable by group or other and is not sticky"
+      fi
+    fi
+    [[ -z "${reason}" ]] ||
+      fail "the persistent local state root is unsafe: ancestor ${ancestor} ${reason}"
+    [[ "${ancestor}" == "/" ]] && return 0
+    ancestor="$(dirname -- "${ancestor}")"
+  done
+}
+
+provision_persistent_state_root() {
+  local root="$1" canonical_root metadata mode owner
+  # Normalize trailing separators once before every subsequent path check.
+  # In particular, -L follows a symlink when its operand has a trailing slash.
+  while [[ "${root}" != "/" && "${root}" == */ ]]; do
+    root="${root%/}"
+  done
+  [[ "${root}" == /* ]] ||
+    fail "the persistent local state root must be an absolute path; fix SUMI_REAL_STACK_STATE_ROOT or XDG_STATE_HOME: ${root}"
+  (umask 077; mkdir -p -- "$(dirname -- "${root}")") ||
+    fail "cannot create the parent of the persistent local state root: ${root}"
+  # mkdir without -p reports the difference between "created for us" and
+  # "already there", which is exactly the line the launcher must not cross.
+  if [[ ! -e "${root}" && ! -L "${root}" ]]; then
+    mkdir -m 0700 -- "${root}" ||
+      fail "cannot create the persistent local state root: ${root}"
+  fi
+  [[ -d "${root}" && ! -L "${root}" ]] ||
+    fail "the persistent local state root must be a real directory: ${root}"
+  metadata="$(stat -c '%a %u' -- "${root}")" ||
+    fail "cannot inspect the persistent local state root: ${root}"
+  mode="${metadata%% *}"
+  owner="${metadata##* }"
+  [[ "${mode: -3}" == 700 && "${owner}" == "${UID}" ]] ||
+    fail "the persistent local state root already exists as mode ${mode} owned by uid ${owner}; it must be a private directory of this user (mode 0700, uid ${UID}) before it can hold attachments: ${root}"
+  # Resolve every ancestor once after the root exists and its own symlink
+  # check has passed. From here on, use this stable real path only: a later
+  # replacement of an ancestor link cannot redirect the API to unchecked data.
+  canonical_root="$(realpath -e -- "${root}")" ||
+    fail "cannot resolve the persistent local state root: ${root}"
+  validate_persistent_state_root_ancestors "${canonical_root}"
+  printf '%s\n' "${canonical_root}"
+}
+
 valid_paid() {
   [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
 }
@@ -524,13 +592,29 @@ trap cleanup EXIT INT TERM
 
 readonly COMMAND_LOG_DIR="${RUNTIME_ROOT}/command-log"
 readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
-readonly MESSAGING_ATTACHMENT_DIR="${RUNTIME_ROOT}/messaging-attachments"
+# Attachment bytes have to outlive one run. Postgres keeps the rows that name
+# them in a named Compose volume, so holding the bytes under the disposable
+# runtime root left the database pointing at files that shutdown had already
+# deleted: attachments then referred to missing objects after every restart.
+# The persistent root sits under the user state directory instead. Resolve it
+# once after provisioning so both validation and the API use one real path.
+readonly CONFIGURED_PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
+PERSISTENT_STATE_ROOT="$(provision_persistent_state_root "${CONFIGURED_PERSISTENT_STATE_ROOT}")"
+readonly PERSISTENT_STATE_ROOT
+if [[ "${PERSISTENT_STATE_ROOT}" != "${CONFIGURED_PERSISTENT_STATE_ROOT}" ]]; then
+  log "persistent local state root normalized: configured ${CONFIGURED_PERSISTENT_STATE_ROOT}; using ${PERSISTENT_STATE_ROOT}"
+fi
+readonly MESSAGING_ATTACHMENT_DIR="${PERSISTENT_STATE_ROOT}/messaging-attachments"
 # Local runs use explicit bounded attachment caps; the API refuses to serve
 # attachments unless every Workspace and store-wide byte/object cap is set.
 readonly MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES="${SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES:-268435456}"
 readonly MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS="${SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS:-5000}"
 readonly MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES="${SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES:-1073741824}"
 readonly MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS="${SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS:-25000}"
+# VAPID keys are deployment-owned and persisted in Postgres. The local subject
+# is only the standards-required operator contact carried in the signed push
+# request; no message content is configured here.
+readonly MESSAGING_PUSH_SUBJECT="${SUMI_MESSAGING_PUSH_SUBJECT:-mailto:dev@sumi.local}"
 readonly AGENT_STATE_DIR="${RUNTIME_ROOT}/agent-state"
 readonly WORKSPACE_DIR="${RUNTIME_ROOT}/workspace"
 readonly IPC_DIR="${RUNTIME_ROOT}/ipc"
@@ -539,13 +623,11 @@ readonly BIN_DIR="${RUNTIME_ROOT}/bin"
 mkdir -m 0700 \
   "${COMMAND_LOG_DIR}" \
   "${GATEWAY_STATE_DIR}" \
-  "${MESSAGING_ATTACHMENT_DIR}" \
   "${AGENT_STATE_DIR}" \
   "${WORKSPACE_DIR}" \
   "${IPC_DIR}" \
   "${LOG_DIR}" \
   "${BIN_DIR}"
-
 readonly API_BINARY="${BIN_DIR}/sumi-api"
 readonly AGENT_BINARY="${REPOSITORY_ROOT}/apps/agent/target/debug/sumi-agent"
 readonly EXECUTOR_SOCKET="${IPC_DIR}/executor.sock"
@@ -647,6 +729,7 @@ log "starting API"
     "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS=${MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS}" \
     "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES=${MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES}" \
     "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS=${MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS}" \
+    "SUMI_MESSAGING_PUSH_SUBJECT=${MESSAGING_PUSH_SUBJECT}" \
     "SUMI_AGENT_TOKEN_SECRET=${SUMI_AGENT_TOKEN_SECRET}" \
     "SUMI_BROWSER_SESSION_SECRET=${SUMI_BROWSER_SESSION_SECRET}" \
     "SUMI_BROWSER_SESSION_AUDIENCE=sumi:web" \
@@ -802,7 +885,7 @@ wait_for_http "${WEB_ORIGIN}/" "${VITE_PID}" "Vite"
 assert_exact_tcp_listener "${PUBLIC_HOST}:${WEB_PORT}" "${WEB_PORT}" "Vite"
 
 log "Sumi is Ready: ${WEB_ORIGIN}"
-log "Press Ctrl-C to stop; disposable state and non-production secrets will be removed."
+log "Press Ctrl-C to stop; disposable state and non-production secrets will be removed, while uploaded attachments persist."
 while true; do
   for pid in "${CHILD_PIDS[@]}"; do
     process_is_running "${pid}" || fail "a required Sumi process exited"

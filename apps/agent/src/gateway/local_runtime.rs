@@ -48,14 +48,18 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest, ExactMessagingScope,
+    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+    CreateMessagingThreadRequest, DuplicateMessagingChannelRequest, ExactMessagingScope,
     GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure,
-    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingWriteReceipt,
+    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingNotificationSettingsRequest,
+    MessagingParticipant, MessagingWriteReceipt,
     OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
-    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
     UploadMessagingAttachmentRequest, UploadMessagingAttachmentResponse,
     WriteMessagingMessageRequest, canonical_attachment_filename,
+    forbidden_attachment_display_character,
 };
 use crate::apiclient::workspace::{
     WorkspaceApi, WorkspaceApiError, WorkspaceApiResult, WorkspaceInvitationApi,
@@ -114,6 +118,53 @@ impl<'a, T> ScopedMessagingRequest<'a, T> {
 #[serde(deny_unknown_fields)]
 struct EmptyMessagingOperation {}
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingPlaceResponseScope {
+    workspace_id: String,
+    installation_id: String,
+    authority_epoch: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingChannelWire {
+    channel_id: String,
+    workspace_id: String,
+    revision: u64,
+    name: String,
+    topic: String,
+    visibility: String,
+    voice: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingChannelMutationResponse {
+    channel: MessagingChannelWire,
+    created: bool,
+    kind: String,
+    #[serde(flatten)]
+    scope: MessagingPlaceResponseScope,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingDMWire {
+    dm_id: String,
+    kind: String,
+    participants: Vec<MessagingParticipant>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingDMMutationResponse {
+    dm: MessagingDMWire,
+    created: bool,
+    #[serde(flatten)]
+    scope: MessagingPlaceResponseScope,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalControlErrorResponse {
@@ -129,6 +180,8 @@ struct MessagingAttachmentWire {
     size_bytes: u64,
     sha256: String,
     position: u8,
+    spoiler: bool,
+    alt: String,
 }
 
 #[derive(Deserialize)]
@@ -399,6 +452,152 @@ impl LocalControlHttpClient {
         serde_json::from_slice(body.as_slice()).context("decode strict local control response")
     }
 
+    /// Replay one server-reconcilable Messaging mutation after a transport or
+    /// reply loss. Creation receipts cover nonce-bearing operations; the
+    /// nonce-less one-to-one DM route resolves one canonical actor/participant
+    /// pair. A terminal rejection is not replayed; a 408, 429, or 5xx cannot
+    /// prove that the server did not commit first.
+    async fn post_idempotent_messaging_json<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        self.post_idempotent_messaging_json_validated(
+            path,
+            body,
+            max_response_bytes,
+            |_, _: &Response| Ok(()),
+        )
+        .await
+    }
+
+    async fn post_idempotent_messaging_json_validated<Request, Response, Validate>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+        validate: Validate,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+        Validate: Fn(reqwest::StatusCode, &Response) -> Result<()>,
+    {
+        let mut first_indeterminate = None;
+        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
+            let result = async {
+                let (status, response) = self
+                    .post_json_bounded_raw(path, body, max_response_bytes)
+                    .await
+                    .map_err(|error| {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging idempotent mutation",
+                            format!("transport or response framing failed: {error}"),
+                        )
+                    })?;
+                if !status.is_success() {
+                    let failure = if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                    {
+                        MessagingApiFailure::indeterminate(
+                            "Messaging idempotent mutation",
+                            format!("server returned {status} after a possibly committed request"),
+                        )
+                    } else {
+                        MessagingApiFailure::terminal(
+                            "Messaging idempotent mutation",
+                            format!("local control request was rejected with status {status}"),
+                        )
+                    };
+                    return Err(anyhow::Error::new(failure));
+                }
+                let decoded = serde_json::from_slice(response.as_slice()).map_err(|error| {
+                    anyhow::Error::new(MessagingApiFailure::indeterminate(
+                        "Messaging idempotent mutation",
+                        format!("decode strict local control response: {error}"),
+                    ))
+                })?;
+                validate(status, &decoded).map_err(|error| {
+                    anyhow::Error::new(MessagingApiFailure::indeterminate(
+                        "Messaging idempotent mutation",
+                        format!("validate exact local control response: {error}"),
+                    ))
+                })?;
+                Ok(decoded)
+            }
+            .await;
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
+                        && is_indeterminate_messaging_failure(&error) =>
+                {
+                    first_indeterminate = Some(error);
+                }
+                Err(_replay_error) if first_indeterminate.is_some() => {
+                    return Err(first_indeterminate
+                        .take()
+                        .expect("only a replay has an initial indeterminate result"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded Messaging retry loop always returns")
+    }
+
+    /// A nonce-less remote mutation still must not be reported as a plain RPC
+    /// failure after dispatch: a response loss cannot prove that the server
+    /// did not commit. It deliberately does not replay automatically because
+    /// those endpoints have no operation receipt to make that safe.
+    async fn post_mutating_messaging_json<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        let (status, response) = self
+            .post_json_bounded_raw(path, body, MAX_LOCAL_CONTROL_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                MessagingApiFailure::indeterminate(
+                    "Messaging mutation",
+                    format!("transport or response framing failed: {error}"),
+                )
+            })?;
+        if !status.is_success() {
+            let failure = if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+            {
+                MessagingApiFailure::indeterminate(
+                    "Messaging mutation",
+                    format!("server returned {status} after a possibly committed request"),
+                )
+            } else {
+                MessagingApiFailure::terminal(
+                    "Messaging mutation",
+                    format!("local control request was rejected with status {status}"),
+                )
+            };
+            return Err(anyhow::Error::new(failure));
+        }
+        serde_json::from_slice(response.as_slice()).map_err(|error| {
+            anyhow::Error::new(MessagingApiFailure::indeterminate(
+                "Messaging mutation",
+                format!("decode strict local control response: {error}"),
+            ))
+        })
+    }
+
     async fn post_json_bounded_raw<Request>(
         &self,
         path: &str,
@@ -457,6 +656,97 @@ impl LocalControlHttpClient {
             body.extend_from_slice(&chunk);
         }
         Ok((status, body))
+    }
+
+    async fn post_messaging_notification_settings_update<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        const OPERATION: &str = "Messaging notification settings update";
+
+        // Keep failures before execute() terminal: the request cannot have
+        // reached the server before its credential, URL, body, and transport
+        // identity have all been validated.
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let url = self
+            .base_url
+            .join(path)
+            .context("join local control endpoint URL")?;
+        let mut request = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .json(body);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request.build().context("build local control request")?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint.revalidate()?;
+        }
+
+        // Once execute() begins, a transport failure or lost/malformed
+        // response cannot prove that the server did not commit the mutation.
+        let response = http.execute(request).await.map_err(|error| {
+            MessagingApiFailure::indeterminate(
+                OPERATION,
+                format!("transport failed after request admission: {error}"),
+            )
+        })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_LOCAL_CONTROL_RESPONSE_BYTES as u64)
+        {
+            return Err(MessagingApiFailure::indeterminate(
+                OPERATION,
+                "response exceeded its bounded size after request admission",
+            )
+            .into());
+        }
+        let mut response_body = Zeroizing::new(Vec::new());
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                MessagingApiFailure::indeterminate(
+                    OPERATION,
+                    format!("response body was incomplete after request admission: {error}"),
+                )
+            })?;
+            if response_body.len().saturating_add(chunk.len()) > MAX_LOCAL_CONTROL_RESPONSE_BYTES {
+                return Err(MessagingApiFailure::indeterminate(
+                    OPERATION,
+                    "response exceeded its bounded size after request admission",
+                )
+                .into());
+            }
+            response_body.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(messaging_mutation_rejection(
+                status,
+                response_body.as_slice(),
+                OPERATION,
+            ));
+        }
+        serde_json::from_slice(response_body.as_slice()).map_err(|error| {
+            MessagingApiFailure::indeterminate(
+                OPERATION,
+                format!("committed success response was malformed: {error}"),
+            )
+            .into()
+        })
     }
 
     async fn post_runtime_state(
@@ -689,6 +979,131 @@ fn is_canonical_authority_epoch(value: &str) -> bool {
     value.parse::<i64>().is_ok_and(|epoch| epoch > 0)
 }
 
+fn validate_place_response_scope(
+    response: &MessagingPlaceResponseScope,
+    expected: &ExactMessagingScope,
+) -> Result<()> {
+    if response.workspace_id != expected.workspace_id
+        || response.installation_id != expected.installation_id
+        || response.authority_epoch != expected.authority_epoch
+        || !is_canonical_uuid_v7(&response.workspace_id)
+        || !is_canonical_uuid_v7(&response.installation_id)
+        || !is_canonical_authority_epoch(&response.authority_epoch)
+    {
+        bail!("Messaging place response scope mismatch");
+    }
+    Ok(())
+}
+
+fn validate_channel_mutation_response(
+    status: reqwest::StatusCode,
+    response: &MessagingChannelMutationResponse,
+    scope: &ExactMessagingScope,
+    expected_name: Option<&str>,
+    expected_topic: Option<&str>,
+    expected_voice: Option<bool>,
+    different_from_place_id: Option<&str>,
+) -> Result<()> {
+    validate_place_response_scope(&response.scope, scope)?;
+    if response.kind != "channel" {
+        bail!("Messaging channel response kind mismatch");
+    }
+    if !is_canonical_uuid_v7(&response.channel.channel_id)
+        || different_from_place_id.is_some_and(|source| response.channel.channel_id == source)
+    {
+        bail!("Messaging channel response identity mismatch");
+    }
+    if response.channel.workspace_id != scope.workspace_id {
+        bail!("Messaging channel response Workspace mismatch");
+    }
+    if response.channel.revision == 0 || response.channel.revision > i64::MAX as u64 {
+        bail!("Messaging channel response revision is invalid");
+    }
+    if response.channel.name.is_empty()
+        || response.channel.name.len() > 800
+        || response.channel.name.chars().count() > 200
+        || expected_name.is_some_and(|name| response.channel.name != name)
+    {
+        bail!("Messaging channel response name mismatch");
+    }
+    if response.channel.topic.len() > 1000
+        || expected_topic.is_some_and(|topic| response.channel.topic != topic)
+    {
+        bail!("Messaging channel response topic mismatch");
+    }
+    if response.channel.visibility != "workspace"
+        || expected_voice.is_some_and(|voice| response.channel.voice != voice)
+    {
+        bail!("Messaging channel response shape mismatch");
+    }
+    let expected_status = if response.created {
+        reqwest::StatusCode::CREATED
+    } else {
+        reqwest::StatusCode::OK
+    };
+    if status != expected_status {
+        bail!("Messaging channel response created/status mismatch");
+    }
+    Ok(())
+}
+
+fn messaging_participant_key(participant: &MessagingParticipant) -> Result<String> {
+    let id = match participant.kind.as_str() {
+        "human" if participant.personality_agent_id.is_none() => participant.human_id.as_deref(),
+        "personality_agent" if participant.human_id.is_none() => {
+            participant.personality_agent_id.as_deref()
+        }
+        _ => None,
+    }
+    .filter(|id| is_canonical_uuid_v7(id))
+    .context("invalid Messaging participant identity")?;
+    Ok(format!("{}:{id}", participant.kind))
+}
+
+fn validate_dm_mutation_response(
+    status: reqwest::StatusCode,
+    response: &MessagingDMMutationResponse,
+    scope: &ExactMessagingScope,
+    actor_id: &str,
+    requested: &[MessagingParticipant],
+    client_nonce: Option<&str>,
+) -> Result<()> {
+    validate_place_response_scope(&response.scope, scope)?;
+    let actor_key = format!("personality_agent:{actor_id}");
+    if !is_canonical_uuid_v7(actor_id) || status != reqwest::StatusCode::OK {
+        bail!("Messaging DM mutation response has invalid actor or status");
+    }
+    let mut expected = std::collections::BTreeSet::from([actor_key.clone()]);
+    for participant in requested {
+        expected.insert(messaging_participant_key(participant)?);
+    }
+    expected.remove(&actor_key);
+    let expected_kind = match expected.len() {
+        // The server normalizes an explicitly listed actor away. The raw
+        // request can therefore carry a nonce while still naming one actual
+        // other participant and resolving to the canonical 1:1 DM.
+        1 => "dm",
+        count if count >= 2 && client_nonce.is_some() => "group_dm",
+        _ => bail!("Messaging DM request kind and nonce disagree"),
+    };
+    expected.insert(actor_key);
+
+    let mut actual = std::collections::BTreeSet::new();
+    for participant in &response.dm.participants {
+        if !actual.insert(messaging_participant_key(participant)?) {
+            bail!("Messaging DM response repeats a participant");
+        }
+    }
+    if !is_canonical_uuid_v7(&response.dm.dm_id)
+        || response.dm.kind != expected_kind
+        || response.dm.participants.len() > 33
+        || actual != expected
+    {
+        bail!("Messaging DM mutation response does not match its canonical participant set");
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl MessagingApi for LocalControlHttpClient {
     async fn overview(&self, scope: &ExactMessagingScope) -> Result<serde_json::Value> {
@@ -731,54 +1146,30 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: CreateMessagingThreadRequest<'_>,
     ) -> Result<serde_json::Value> {
-        let mut first_indeterminate = None;
-        for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
-            // Thread creation has a durable nonce receipt. Re-send this exact
-            // request only when the first response may have been committed but
-            // lost; a definite rejection must remain a one-shot failure.
-            let result = async {
-                let (status, body) = self
-                    .post_json_bounded_raw(
-                        "/local-control/v1/messaging:create-thread",
-                        &ScopedMessagingRequest::new(
-                            scope,
-                            CreateMessagingThreadRequest {
-                                parent_place_id: request.parent_place_id,
-                                name: request.name,
-                                parent_message_id: request.parent_message_id,
-                                client_nonce: request.client_nonce,
-                            },
-                        ),
-                        MAX_MESSAGING_RESPONSE_BYTES,
-                    )
-                    .await
-                    .map_err(|error| {
-                        MessagingApiFailure::indeterminate(
-                            "Messaging thread creation",
-                            format!("transport or response framing failed: {error}"),
-                        )
-                    })?;
-                validate_messaging_thread_creation_response(status, body.as_slice())
-            }
-            .await;
-            match result {
-                Ok(response) => return Ok(response),
-                Err(error)
-                    if attempt + 1 < MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS
-                        && is_indeterminate_messaging_failure(&error) =>
-                {
-                    first_indeterminate = Some(error);
-                    continue;
-                }
-                Err(_replay_error) if first_indeterminate.is_some() => {
-                    return Err(first_indeterminate
-                        .take()
-                        .expect("only a replay has an initial indeterminate result"));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("the bounded Messaging retry loop always returns")
+        // The HTTP API canonicalizes surrounding whitespace before recording
+        // its idempotency digest. Send and validate that same canonical name so
+        // a committed response can never be misclassified as indeterminate.
+        let operation = CreateMessagingThreadRequest {
+            parent_place_id: request.parent_place_id,
+            name: request.name.trim(),
+            parent_message_id: request.parent_message_id,
+            client_nonce: request.client_nonce,
+        };
+        let request = ScopedMessagingRequest::new(scope, operation);
+        self.post_idempotent_messaging_json_validated(
+            "/local-control/v1/messaging:create-thread",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+            |status, response| {
+                validate_messaging_thread_creation_response(
+                    status,
+                    response,
+                    scope,
+                    &request.operation,
+                )
+            },
+        )
+        .await
     }
 
     async fn write(
@@ -1016,7 +1407,7 @@ impl MessagingApi for LocalControlHttpClient {
         // The response echoes the full message (content up to 64 KiB plus its
         // reaction state), so it shares the messaging screen bound rather than
         // the tighter control-plane bound.
-        self.post_json_bounded(
+        self.post_idempotent_messaging_json(
             "/local-control/v1/messaging:react",
             &ScopedMessagingRequest::new(scope, request),
             MAX_MESSAGING_RESPONSE_BYTES,
@@ -1029,11 +1420,112 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:status",
             &ScopedMessagingRequest::new(scope, request),
         )
         .await
+    }
+
+    async fn start_dm(
+        &self,
+        scope: &ExactMessagingScope,
+        request: StartMessagingDMRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        // Group creation is nonce-idempotent. A one-to-one DM has no nonce,
+        // but the server reconciles the canonical actor/participant pair, so
+        // the same bounded replay is safe after a lost committed response.
+        let request = ScopedMessagingRequest::new(scope, request);
+        let response: MessagingDMMutationResponse = self
+            .post_idempotent_messaging_json_validated(
+                "/local-control/v1/messaging:start-dm",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                |status, response| {
+                    validate_dm_mutation_response(
+                        status,
+                        response,
+                        scope,
+                        self.authority.personality_agent_id().as_str(),
+                        request.operation.participants,
+                        request.operation.client_nonce,
+                    )
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({"dm": response.dm, "created": response.created}))
+    }
+
+    async fn create_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        let request = ScopedMessagingRequest::new(scope, request);
+        let response: MessagingChannelMutationResponse = self
+            .post_idempotent_messaging_json_validated(
+                "/local-control/v1/messaging:create-channel",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                |status, response| {
+                    validate_channel_mutation_response(
+                        status,
+                        response,
+                        scope,
+                        Some(request.operation.name),
+                        Some(request.operation.topic.unwrap_or("")),
+                        Some(request.operation.voice),
+                        None,
+                    )
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({
+            "channel": response.channel,
+            "created": response.created
+        }))
+    }
+
+    async fn update_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: UpdateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_mutating_messaging_json(
+            "/local-control/v1/messaging:update-channel",
+            &ScopedMessagingRequest::new(scope, request),
+        )
+        .await
+    }
+
+    async fn duplicate_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: DuplicateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        let request = ScopedMessagingRequest::new(scope, request);
+        let response: MessagingChannelMutationResponse = self
+            .post_idempotent_messaging_json_validated(
+                "/local-control/v1/messaging:duplicate-channel",
+                &request,
+                MAX_LOCAL_CONTROL_RESPONSE_BYTES,
+                |status, response| {
+                    validate_channel_mutation_response(
+                        status,
+                        response,
+                        scope,
+                        request.operation.name,
+                        None,
+                        None,
+                        Some(request.operation.place_id),
+                    )
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({
+            "channel": response.channel,
+            "created": response.created
+        }))
     }
 
     async fn reply_later(
@@ -1041,7 +1533,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: CreateMessagingReplyLaterRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:reply-later",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -1053,7 +1545,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: ResolveMessagingReplyLaterRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:reply-later-resolve",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -1065,7 +1557,7 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: ReadMessagingThroughRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
+        self.post_mutating_messaging_json(
             "/local-control/v1/messaging:read-through",
             &ScopedMessagingRequest::new(scope, request),
         )
@@ -1083,6 +1575,35 @@ impl MessagingApi for LocalControlHttpClient {
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
+    }
+
+    async fn search(
+        &self,
+        scope: &ExactMessagingScope,
+        request: SearchMessagingRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:search",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn notification_settings(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        const PATH: &str = "/local-control/v1/messaging:notification-settings";
+        let changes_setting = request.changes_setting();
+        let request = ScopedMessagingRequest::new(scope, request);
+        if changes_setting {
+            self.post_messaging_notification_settings_update(PATH, &request)
+                .await
+        } else {
+            self.post_json(PATH, &request).await
+        }
     }
 }
 
@@ -1201,30 +1722,43 @@ fn validate_messaging_write_response(
 
 fn validate_messaging_thread_creation_response(
     status: reqwest::StatusCode,
-    body: &[u8],
-) -> Result<serde_json::Value> {
-    const OPERATION: &str = "Messaging thread creation";
+    response: &serde_json::Value,
+    scope: &ExactMessagingScope,
+    request: &CreateMessagingThreadRequest<'_>,
+) -> Result<()> {
     if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
-        return Err(messaging_mutation_rejection(status, body, OPERATION));
+        bail!("Messaging thread creation returned an invalid success status");
     }
-    let response: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
-        MessagingApiFailure::indeterminate(
-            OPERATION,
-            format!("committed success receipt was malformed: {error}"),
-        )
-    })?;
-    if response
+    let thread_id = response
         .get("thread_id")
         .and_then(serde_json::Value::as_str)
-        .is_none_or(str::is_empty)
+        .context("Messaging thread creation omitted thread_id")?;
+    if !is_canonical_uuid_v7(thread_id)
+        || response.get("workspace_id").and_then(serde_json::Value::as_str)
+            != Some(scope.workspace_id.as_str())
+        || response.get("name").and_then(serde_json::Value::as_str) != Some(request.name)
+        || response
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|revision| revision == 0 || revision > i64::MAX as u64)
+        || response
+            .get("parent_place")
+            .and_then(|place| place.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("channel")
+        || response
+            .get("parent_place")
+            .and_then(|place| place.get("channel_id"))
+            .and_then(serde_json::Value::as_str)
+            != Some(request.parent_place_id)
+        || response
+            .get("parent_message_id")
+            .and_then(serde_json::Value::as_str)
+            != request.parent_message_id
     {
-        return Err(MessagingApiFailure::indeterminate(
-            OPERATION,
-            "committed success receipt omitted thread_id",
-        )
-        .into());
+        bail!("Messaging thread creation response does not match its exact request scope");
     }
-    Ok(response)
+    Ok(())
 }
 
 fn is_indeterminate_messaging_failure(error: &anyhow::Error) -> bool {
@@ -1416,6 +1950,11 @@ fn messaging_attachment_from_wire(
     if wire.position >= 10 {
         bail!("invalid Messaging attachment position");
     }
+    if wire.alt.chars().count() > 1000
+        || wire.alt.chars().any(forbidden_attachment_display_character)
+    {
+        bail!("invalid Messaging attachment description");
+    }
     Ok(MessagingAttachmentMetadata {
         attachment_id: wire.attachment_id,
         filename: wire.filename,
@@ -1423,6 +1962,8 @@ fn messaging_attachment_from_wire(
         size_bytes: wire.size_bytes,
         sha256: wire.sha256,
         position: wire.position,
+        spoiler: wire.spoiler,
+        alt: wire.alt,
     })
 }
 
@@ -1538,7 +2079,7 @@ fn has_valid_percent_encoding(value: &str) -> bool {
 fn is_canonical_attachment_mime(value: &str) -> bool {
     value.parse::<mime::Mime>().is_ok_and(|parsed| {
         parsed.params().next().is_none()
-            && parsed.to_string() == value
+            && parsed.essence_str() == value
             && (!value.starts_with("image/") || is_inline_attachment_image_mime(value))
     })
 }
@@ -2245,6 +2786,10 @@ pub(crate) struct LocalReadyProof {
 }
 
 impl LocalReadyProof {
+    #[allow(
+        dead_code,
+        reason = "hydration receipt inspection is retained for exact readiness tests"
+    )]
     pub(crate) const fn hydration_ready(&self) -> &HydrationReady {
         &self.ready
     }
@@ -2674,7 +3219,7 @@ mod tests {
     use axum::Json;
     use axum::Router;
     use axum::body::Bytes;
-    use axum::extract::State;
+    use axum::extract::{OriginalUri, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
@@ -2682,7 +3227,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::apiclient::messaging::MessagingApiFailureClass;
+    use crate::apiclient::messaging::{MessagingApiFailureClass, MessagingNotificationPlace};
     use crate::runtime::contracts::{
         GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease, RpcBootNonce,
     };
@@ -3902,6 +4447,14 @@ mod tests {
     ) -> Json<serde_json::Value> {
         Json(serde_json::json!({
             "thread_id": "0198f0f4-9b72-7000-8000-000000000799",
+            "revision": 1,
+            "workspace_id": "0198f0f4-9b72-7000-8000-000000000201",
+            "name": "large participant list",
+            "parent_place": {
+                "kind": "channel",
+                "channel_id": "01900000-0000-7000-8000-000000000002"
+            },
+            "parent_message_id": null,
             "participants": ["x".repeat(payload_bytes)]
         }))
     }
@@ -3918,9 +4471,32 @@ mod tests {
         body: Vec<u8>,
     }
 
+    #[derive(Clone, Copy)]
+    enum NotificationSettingsMutationFailureFixture {
+        ResponseLoss,
+        MalformedSuccess,
+    }
+
+    #[derive(Clone)]
+    struct NotificationSettingsMutationFixtureState {
+        behavior: NotificationSettingsMutationFailureFixture,
+        committed_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    type MessagingReplayRequest = (String, String, Vec<u8>);
+
+    #[test]
+    fn attachment_mime_requires_exact_canonical_spelling_without_parameters() {
+        assert!(is_canonical_attachment_mime("text/plain"));
+        assert!(is_canonical_attachment_mime("image/png"));
+        assert!(!is_canonical_attachment_mime("TEXT/PLAIN"));
+        assert!(!is_canonical_attachment_mime("text/plain; charset=utf-8"));
+        assert!(!is_canonical_attachment_mime("image/svg+xml"));
+    }
+
     #[derive(Clone, Default)]
     struct MessagingReplayFixtureState {
-        requests: Arc<StdMutex<Vec<(String, String, Vec<u8>)>>>,
+        requests: Arc<StdMutex<Vec<MessagingReplayRequest>>>,
     }
 
     fn committed_response_loss() -> Response {
@@ -3973,7 +4549,9 @@ mod tests {
                     "mime": "text/plain",
                     "size_bytes": 13,
                     "sha256": format!("{:x}", Sha256::digest(b"retry payload")),
-                    "position": 0
+                    "position": 0,
+                    "spoiler": false,
+                    "alt": ""
                 },
                 "created": false
             })),
@@ -4008,30 +4586,122 @@ mod tests {
             .into_response()
     }
 
-    async fn thread_response_loss_then_replay_fixture(
+    async fn place_response_loss_then_replay_fixture(
         State(state): State<MessagingReplayFixtureState>,
         body: Bytes,
     ) -> Response {
-        let request: serde_json::Value =
-            serde_json::from_slice(&body).expect("strict JSON thread creation");
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("strict place JSON");
         let nonce = request["client_nonce"]
             .as_str()
-            .expect("thread nonce")
+            .unwrap_or("canonical-dm")
             .to_owned();
         let mut requests = state.requests.lock().unwrap();
-        requests.push((nonce, "create_thread".to_owned(), body.to_vec()));
-        if requests.len() == 1 {
+        requests.push((nonce, "place".to_owned(), body.to_vec()));
+        if requests.len() % 2 == 1 {
             return committed_response_loss();
         }
         drop(requests);
+        let (status, response) = canonical_place_mutation_fixture_response(&request);
+        (status, Json(response)).into_response()
+    }
+
+    fn canonical_place_mutation_fixture_response(
+        request: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        if request.get("participants").is_some() {
+            let actor = serde_json::json!({
+                "kind": "personality_agent",
+                "personality_agent_id": PAID
+            });
+            let mut participants = vec![actor.clone()];
+            let mut seen = std::collections::BTreeSet::from([actor.to_string()]);
+            for participant in request["participants"]
+                .as_array()
+                .expect("participant array")
+            {
+                if seen.insert(participant.to_string()) {
+                    participants.push(participant.clone());
+                }
+            }
+            let kind = if participants.len() == 2 {
+                "dm"
+            } else {
+                "group_dm"
+            };
+            return (
+                StatusCode::OK,
+                serde_json::json!({
+                    "dm": {
+                        "dm_id": "0198f0f4-9b72-7000-8000-000000000701",
+                        "kind": kind,
+                        "participants": participants
+                    },
+                    "created": false,
+                    "workspace_id": request["workspace_id"],
+                    "installation_id": request["installation_id"],
+                    "authority_epoch": request["authority_epoch"]
+                }),
+            );
+        }
         (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "thread_id": "0198f0f4-9b72-7000-8000-000000000799",
-                "name": "retry thread"
-            })),
+            serde_json::json!({
+                "channel": {
+                    "channel_id": "0198f0f4-9b72-7000-8000-000000000702",
+                    "workspace_id": request["workspace_id"],
+                    "revision": 1,
+                    "name": request.get("name").and_then(serde_json::Value::as_str).unwrap_or("reconciled"),
+                    "topic": request.get("topic").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    "visibility": "workspace",
+                    "voice": request.get("voice").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                },
+                "created": false,
+                "kind": "channel",
+                "workspace_id": request["workspace_id"],
+                "installation_id": request["installation_id"],
+                "authority_epoch": request["authority_epoch"]
+            }),
         )
-            .into_response()
+    }
+
+    #[derive(Clone, Copy)]
+    enum PlaceMutationFixtureStep {
+        Canonical,
+        Malformed,
+        TimeoutBeforeEffect,
+    }
+
+    #[derive(Clone)]
+    struct PlaceMutationValidationFixtureState {
+        steps: Arc<StdMutex<VecDeque<PlaceMutationFixtureStep>>>,
+        requests: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    async fn place_mutation_validation_fixture(
+        State(state): State<PlaceMutationValidationFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        state.requests.lock().unwrap().push(body.to_vec());
+        let step = state
+            .steps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("one fixture step per request");
+        if matches!(step, PlaceMutationFixtureStep::TimeoutBeforeEffect) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let request: serde_json::Value = serde_json::from_slice(&body).expect("strict place JSON");
+        let (status, mut response) = canonical_place_mutation_fixture_response(&request);
+        if matches!(step, PlaceMutationFixtureStep::Malformed) {
+            if response.get("dm").is_some() {
+                response["dm"]["kind"] = serde_json::json!("channel");
+            } else {
+                response["channel"]["workspace_id"] =
+                    serde_json::json!("0198f0f4-9b72-7000-8000-000000000299");
+            }
+        }
+        (status, Json(response)).into_response()
     }
 
     #[derive(Clone)]
@@ -4044,6 +4714,32 @@ mod tests {
     async fn counted_mutation_fixture(State(fixture): State<CountedMutationFixture>) -> Response {
         *fixture.attempts.lock().unwrap() += 1;
         (fixture.status, Json(fixture.body)).into_response()
+    }
+
+    #[derive(Clone)]
+    struct CountedPlaceStatusFixture {
+        status: StatusCode,
+        requests: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    async fn counted_place_status_fixture(
+        State(fixture): State<CountedPlaceStatusFixture>,
+        body: Bytes,
+    ) -> Response {
+        fixture.requests.lock().unwrap().push(body.to_vec());
+        (fixture.status, Json(serde_json::json!({"error":"fixture"}))).into_response()
+    }
+
+    #[derive(Clone)]
+    struct HangingPlaceFixture {
+        attempts: Arc<StdMutex<usize>>,
+        admitted: Arc<tokio::sync::Notify>,
+    }
+
+    async fn hanging_place_fixture(State(fixture): State<HangingPlaceFixture>) -> Response {
+        *fixture.attempts.lock().unwrap() += 1;
+        fixture.admitted.notify_one();
+        std::future::pending::<Response>().await
     }
 
     #[derive(Clone)]
@@ -4233,6 +4929,20 @@ mod tests {
             .expect("fixture response")
     }
 
+    async fn notification_settings_mutation_failure_fixture(
+        State(state): State<NotificationSettingsMutationFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        let request = serde_json::from_slice(&body).expect("valid notification setting request");
+        state.committed_requests.lock().unwrap().push(request);
+        match state.behavior {
+            NotificationSettingsMutationFailureFixture::ResponseLoss => committed_response_loss(),
+            NotificationSettingsMutationFailureFixture::MalformedSuccess => {
+                (StatusCode::OK, "not-json").into_response()
+            }
+        }
+    }
+
     async fn write_with_fixture_response(
         response: MessagingMutationFixtureResponse,
     ) -> anyhow::Result<MessagingWriteReceipt> {
@@ -4332,10 +5042,7 @@ mod tests {
         assert_eq!(request["installation_id"], scope.installation_id);
         assert_eq!(request["authority_epoch"], scope.authority_epoch);
         assert!(request.get("app_id").is_none());
-        assert_eq!(
-            request["content"].as_str().unwrap().as_bytes().len(),
-            64 * 1024
-        );
+        assert_eq!(request["content"].as_str().unwrap().len(), 64 * 1024);
         server.abort();
     }
 
@@ -4438,20 +5145,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messaging_thread_creation_retries_committed_response_loss_with_same_nonce_and_wire_body()
-     {
+    async fn messaging_place_actions_retry_committed_response_loss_with_the_same_scoped_request() {
         let state = MessagingReplayFixtureState::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
             .route(
-                "/local-control/v1/messaging:create-thread",
-                post(thread_response_loss_then_replay_fixture),
+                "/local-control/v1/messaging:create-channel",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .route(
+                "/local-control/v1/messaging:duplicate-channel",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .route(
+                "/local-control/v1/messaging:start-dm",
+                post(place_response_loss_then_replay_fixture),
             )
             .with_state(state.clone());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let expected = authority();
         let credential = LocalControlCredential::new(
             "control-secret",
@@ -4465,28 +5177,605 @@ mod tests {
             credential,
         )
         .unwrap();
+        let scope = messaging_scope();
 
-        let response = client
-            .create_thread(
-                &messaging_scope(),
-                CreateMessagingThreadRequest {
-                    parent_place_id: "01900000-0000-7000-8000-000000000002",
-                    name: "retry thread",
-                    parent_message_id: None,
-                    client_nonce: "thread-nonce-2",
+        client
+            .create_channel(
+                &scope,
+                CreateMessagingChannelRequest {
+                    name: "reconciled",
+                    topic: None,
+                    voice: false,
+                    client_nonce: "lost-create",
                 },
             )
             .await
-            .expect("same-nonce replay resolves the committed thread");
-        assert_eq!(
-            response["thread_id"],
-            "0198f0f4-9b72-7000-8000-000000000799"
-        );
+            .expect("create response loss reconciles");
+        client
+            .duplicate_channel(
+                &scope,
+                DuplicateMessagingChannelRequest {
+                    place_id: "01900000-0000-7000-8000-000000000002",
+                    name: None,
+                    client_nonce: "lost-duplicate",
+                },
+            )
+            .await
+            .expect("duplicate response loss reconciles");
+        let participants = vec![
+            crate::apiclient::messaging::MessagingParticipant {
+                kind: "human".to_owned(),
+                human_id: Some("01900000-0000-7000-8000-000000000009".to_owned()),
+                personality_agent_id: None,
+            },
+            crate::apiclient::messaging::MessagingParticipant {
+                kind: "human".to_owned(),
+                human_id: Some("01900000-0000-7000-8000-000000000010".to_owned()),
+                personality_agent_id: None,
+            },
+        ];
+        client
+            .start_dm(
+                &scope,
+                StartMessagingDMRequest {
+                    participants: &participants[..1],
+                    client_nonce: None,
+                },
+            )
+            .await
+            .expect("canonical one-to-one DM response loss reconciles");
+        client
+            .start_dm(
+                &scope,
+                StartMessagingDMRequest {
+                    participants: &participants,
+                    client_nonce: Some("lost-group"),
+                },
+            )
+            .await
+            .expect("group DM response loss reconciles");
+
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0], requests[1], "replay must be wire-identical");
-        assert_eq!(requests[0].0, "thread-nonce-2");
+        assert_eq!(requests.len(), 8);
+        for pair in requests.chunks_exact(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "retry must preserve exact scope, digest inputs, and nonce"
+            );
+        }
         server.abort();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PlaceFixtureOperation {
+        CreateChannel,
+        DuplicateChannel,
+        DirectMessage,
+        DirectMessageWithActor,
+        GroupMessage,
+    }
+
+    async fn invoke_place_fixture_operation(
+        client: &LocalControlHttpClient,
+        operation: PlaceFixtureOperation,
+    ) -> Result<serde_json::Value> {
+        let scope = messaging_scope();
+        match operation {
+            PlaceFixtureOperation::CreateChannel => {
+                client
+                    .create_channel(
+                        &scope,
+                        CreateMessagingChannelRequest {
+                            name: "reconciled",
+                            topic: Some("exact topic"),
+                            voice: true,
+                            client_nonce: "typed-create",
+                        },
+                    )
+                    .await
+            }
+            PlaceFixtureOperation::DuplicateChannel => {
+                client
+                    .duplicate_channel(
+                        &scope,
+                        DuplicateMessagingChannelRequest {
+                            place_id: "01900000-0000-7000-8000-000000000002",
+                            name: Some("reconciled"),
+                            client_nonce: "typed-duplicate",
+                        },
+                    )
+                    .await
+            }
+            PlaceFixtureOperation::DirectMessage
+            | PlaceFixtureOperation::DirectMessageWithActor
+            | PlaceFixtureOperation::GroupMessage => {
+                let participants = [
+                    MessagingParticipant {
+                        kind: "human".to_owned(),
+                        human_id: Some("01900000-0000-7000-8000-000000000009".to_owned()),
+                        personality_agent_id: None,
+                    },
+                    MessagingParticipant {
+                        kind: "human".to_owned(),
+                        human_id: Some("01900000-0000-7000-8000-000000000010".to_owned()),
+                        personality_agent_id: None,
+                    },
+                ];
+                let group = matches!(operation, PlaceFixtureOperation::GroupMessage);
+                let includes_actor =
+                    matches!(operation, PlaceFixtureOperation::DirectMessageWithActor);
+                let actor = MessagingParticipant {
+                    kind: "personality_agent".to_owned(),
+                    human_id: None,
+                    personality_agent_id: Some(PAID.to_owned()),
+                };
+                let direct_with_actor = [actor, participants[0].clone()];
+                client
+                    .start_dm(
+                        &scope,
+                        StartMessagingDMRequest {
+                            participants: if group {
+                                &participants
+                            } else if includes_actor {
+                                &direct_with_actor
+                            } else {
+                                &participants[..1]
+                            },
+                            client_nonce: if group {
+                                Some("typed-group")
+                            } else if includes_actor {
+                                Some("typed-direct-with-actor")
+                            } else {
+                                None
+                            },
+                        },
+                    )
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_place_response_validation_replays_once_and_remains_bounded() {
+        for operation in [
+            PlaceFixtureOperation::CreateChannel,
+            PlaceFixtureOperation::DuplicateChannel,
+            PlaceFixtureOperation::DirectMessage,
+            PlaceFixtureOperation::DirectMessageWithActor,
+            PlaceFixtureOperation::GroupMessage,
+        ] {
+            for (label, steps, succeeds) in [
+                (
+                    "malformed then canonical",
+                    VecDeque::from([
+                        PlaceMutationFixtureStep::Malformed,
+                        PlaceMutationFixtureStep::Canonical,
+                    ]),
+                    true,
+                ),
+                (
+                    "persistently malformed",
+                    VecDeque::from([
+                        PlaceMutationFixtureStep::Malformed,
+                        PlaceMutationFixtureStep::Malformed,
+                    ]),
+                    false,
+                ),
+                (
+                    "timeout before effect then canonical",
+                    VecDeque::from([
+                        PlaceMutationFixtureStep::TimeoutBeforeEffect,
+                        PlaceMutationFixtureStep::Canonical,
+                    ]),
+                    true,
+                ),
+            ] {
+                let state = PlaceMutationValidationFixtureState {
+                    steps: Arc::new(StdMutex::new(steps)),
+                    requests: Arc::new(StdMutex::new(Vec::new())),
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new()
+                    .route(
+                        "/local-control/v1/messaging:create-channel",
+                        post(place_mutation_validation_fixture),
+                    )
+                    .route(
+                        "/local-control/v1/messaging:duplicate-channel",
+                        post(place_mutation_validation_fixture),
+                    )
+                    .route(
+                        "/local-control/v1/messaging:start-dm",
+                        post(place_mutation_validation_fixture),
+                    )
+                    .with_state(state.clone());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let expected = authority();
+                let credential = LocalControlCredential::new(
+                    "control-secret",
+                    expected.rpc_identity().clone(),
+                    SystemTime::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+                let client = LocalControlHttpClient::new_loopback_with_timeouts(
+                    format!("http://{address}/"),
+                    expected,
+                    credential,
+                    Duration::from_millis(100),
+                    Duration::from_millis(100),
+                )
+                .unwrap();
+
+                let result = invoke_place_fixture_operation(&client, operation).await;
+                if succeeds {
+                    let output = result.unwrap_or_else(|error| {
+                        panic!("{operation:?} {label} must reconcile: {error:#}")
+                    });
+                    assert!(output.get("workspace_id").is_none());
+                    assert!(output.get("installation_id").is_none());
+                    assert!(output.get("authority_epoch").is_none());
+                } else {
+                    let error = result.expect_err("two semantic failures must remain uncertain");
+                    assert_eq!(
+                        error
+                            .downcast_ref::<MessagingApiFailure>()
+                            .expect("typed indeterminate failure")
+                            .class(),
+                        MessagingApiFailureClass::Indeterminate,
+                        "{operation:?} {label}"
+                    );
+                }
+                let requests = state.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2, "{operation:?} {label}");
+                assert_eq!(requests[0], requests[1], "{operation:?} {label}");
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_place_retry_classifies_408_429_and_other_4xx_exactly() {
+        for (status, expected_attempts, expected_class) in [
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (StatusCode::FORBIDDEN, 1, MessagingApiFailureClass::Terminal),
+        ] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:create-channel",
+                    post(counted_place_status_fixture),
+                )
+                .with_state(CountedPlaceStatusFixture {
+                    status,
+                    requests: requests.clone(),
+                });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error =
+                invoke_place_fixture_operation(&client, PlaceFixtureOperation::CreateChannel)
+                    .await
+                    .expect_err("fixture rejection must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                expected_class,
+                "status {status}"
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_attempts, "status {status}");
+            if expected_attempts == 2 {
+                assert_eq!(requests[0], requests[1], "status {status}");
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_nonce_less_mutation_classifies_408_429_and_other_4xx_without_replay() {
+        for (status, expected_class) in [
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (StatusCode::FORBIDDEN, MessagingApiFailureClass::Terminal),
+        ] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:status",
+                    post(counted_place_status_fixture),
+                )
+                .with_state(CountedPlaceStatusFixture {
+                    status,
+                    requests: requests.clone(),
+                });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error = client
+                .set_status(
+                    &messaging_scope(),
+                    SetMessagingStatusRequest {
+                        status: "busy",
+                        note: Some("meeting"),
+                        expires_in_minutes: Some(30),
+                    },
+                )
+                .await
+                .expect_err("fixture rejection must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                expected_class,
+                "status {status}"
+            );
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "nonce-less mutation must not replay status {status}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_place_retry_obeys_cancellation_and_authority_admission() {
+        let attempts = Arc::new(StdMutex::new(0));
+        let admitted = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-channel",
+                post(hanging_place_fixture),
+            )
+            .with_state(HangingPlaceFixture {
+                attempts: attempts.clone(),
+                admitted: admitted.clone(),
+            });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let operation = tokio::spawn(async move {
+            invoke_place_fixture_operation(&client, PlaceFixtureOperation::CreateChannel).await
+        });
+        admitted.notified().await;
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        server.abort();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:create-channel",
+                post(counted_place_status_fixture),
+            )
+            .with_state(CountedPlaceStatusFixture {
+                status: StatusCode::OK,
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let expected = authority();
+        let foreign = authority_with(OTHER_PAID, 7, "boot-a");
+        let mismatched = LocalControlCredential::new(
+            "control-secret",
+            foreign.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(
+            LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                mismatched,
+            )
+            .is_err()
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn messaging_place_response_validators_require_exact_action_scope_and_participants() {
+        let scope = messaging_scope();
+        let channel_request = serde_json::json!({
+            "workspace_id": &scope.workspace_id,
+            "installation_id": &scope.installation_id,
+            "authority_epoch": &scope.authority_epoch,
+            "name": "reconciled",
+            "topic": "exact topic",
+            "voice": true,
+            "client_nonce": "typed-create"
+        });
+        let (_, channel_value) = canonical_place_mutation_fixture_response(&channel_request);
+        let channel: MessagingChannelMutationResponse =
+            serde_json::from_value(channel_value.clone()).unwrap();
+        validate_channel_mutation_response(
+            StatusCode::OK,
+            &channel,
+            &scope,
+            Some("reconciled"),
+            Some("exact topic"),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        let mut fresh_channel_value = channel_value.clone();
+        fresh_channel_value["created"] = serde_json::json!(true);
+        let fresh_channel: MessagingChannelMutationResponse =
+            serde_json::from_value(fresh_channel_value).unwrap();
+        validate_channel_mutation_response(
+            StatusCode::CREATED,
+            &fresh_channel,
+            &scope,
+            Some("reconciled"),
+            Some("exact topic"),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        for (label, mut malformed) in [
+            ("created", channel_value.clone()),
+            ("kind", channel_value.clone()),
+            ("identity", channel_value.clone()),
+            ("scope", channel_value.clone()),
+            ("revision", channel_value.clone()),
+            ("name", channel_value.clone()),
+            ("topic", channel_value.clone()),
+            ("voice", channel_value.clone()),
+        ] {
+            match label {
+                "created" => malformed["created"] = serde_json::json!(true),
+                "kind" => malformed["kind"] = serde_json::json!("group_dm"),
+                "identity" => malformed["channel"]["channel_id"] = serde_json::json!("bad"),
+                "scope" => malformed["installation_id"] = serde_json::json!(OTHER_PAID),
+                "revision" => malformed["channel"]["revision"] = serde_json::json!(0),
+                "name" => malformed["channel"]["name"] = serde_json::json!("wrong"),
+                "topic" => malformed["channel"]["topic"] = serde_json::json!("wrong"),
+                "voice" => malformed["channel"]["voice"] = serde_json::json!(false),
+                _ => unreachable!(),
+            }
+            let malformed: MessagingChannelMutationResponse =
+                serde_json::from_value(malformed).unwrap();
+            assert!(
+                validate_channel_mutation_response(
+                    StatusCode::OK,
+                    &malformed,
+                    &scope,
+                    Some("reconciled"),
+                    Some("exact topic"),
+                    Some(true),
+                    None,
+                )
+                .is_err(),
+                "{label} mismatch"
+            );
+        }
+
+        let participant = serde_json::json!({
+            "kind": "human",
+            "human_id": "01900000-0000-7000-8000-000000000009"
+        });
+        let dm_request = serde_json::json!({
+            "workspace_id": &scope.workspace_id,
+            "installation_id": &scope.installation_id,
+            "authority_epoch": &scope.authority_epoch,
+            "participants": [participant.clone()]
+        });
+        let (_, dm_value) = canonical_place_mutation_fixture_response(&dm_request);
+        let dm: MessagingDMMutationResponse = serde_json::from_value(dm_value.clone()).unwrap();
+        let requested = [MessagingParticipant {
+            kind: "human".to_owned(),
+            human_id: Some("01900000-0000-7000-8000-000000000009".to_owned()),
+            personality_agent_id: None,
+        }];
+        validate_dm_mutation_response(StatusCode::OK, &dm, &scope, PAID, &requested, None).unwrap();
+        for (label, mut malformed) in [
+            ("kind", dm_value.clone()),
+            ("identity", dm_value.clone()),
+            ("scope", dm_value.clone()),
+            ("participant set", dm_value.clone()),
+        ] {
+            match label {
+                "kind" => malformed["dm"]["kind"] = serde_json::json!("group_dm"),
+                "identity" => malformed["dm"]["dm_id"] = serde_json::json!("bad"),
+                "scope" => malformed["authority_epoch"] = serde_json::json!("2"),
+                "participant set" => malformed["dm"]["participants"] = serde_json::json!([]),
+                _ => unreachable!(),
+            }
+            let malformed: MessagingDMMutationResponse = serde_json::from_value(malformed).unwrap();
+            assert!(
+                validate_dm_mutation_response(
+                    StatusCode::OK,
+                    &malformed,
+                    &scope,
+                    PAID,
+                    &requested,
+                    None,
+                )
+                .is_err(),
+                "{label} mismatch"
+            );
+        }
+        let mut missing_created = channel_value;
+        missing_created.as_object_mut().unwrap().remove("created");
+        assert!(
+            serde_json::from_value::<MessagingChannelMutationResponse>(missing_created).is_err()
+        );
+        let mut unknown_field = dm_value;
+        unknown_field["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MessagingDMMutationResponse>(unknown_field).is_err());
     }
 
     #[tokio::test]
@@ -4815,7 +6104,9 @@ mod tests {
                     "mime": "text/plain",
                     "size_bytes": size_bytes,
                     "sha256": sha256,
-                    "position": position
+                    "position": position,
+                    "spoiler": false,
+                    "alt": ""
                 },
                 "created": created
             }))
@@ -5166,6 +6457,206 @@ mod tests {
         )
         .unwrap();
         (client, server)
+    }
+
+    #[derive(Clone, Default)]
+    struct MessagingReadSurfaceFixtureState {
+        requests: Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    async fn messaging_read_surface_fixture(
+        State(state): State<MessagingReadSurfaceFixtureState>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer control-secret")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let request = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push((uri.path().to_owned(), request));
+        if uri.path().ends_with(":search") {
+            return Ok(Json(serde_json::json!({"results": []})));
+        }
+        Ok(Json(serde_json::json!({
+            "setting": {
+                "owner": {"kind": "personality_agent", "personality_agent_id": PAID},
+                "defaults": {"level": "all"},
+                "per_place": [],
+                "keywords": []
+            }
+        })))
+    }
+
+    #[tokio::test]
+    async fn messaging_search_and_notification_settings_use_focused_local_routes_and_partial_wires()
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = MessagingReadSurfaceFixtureState::default();
+        let app = Router::new()
+            .route(
+                "/local-control/v1/messaging:search",
+                post(messaging_read_surface_fixture),
+            )
+            .route(
+                "/local-control/v1/messaging:notification-settings",
+                post(messaging_read_surface_fixture),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let scope = messaging_scope();
+
+        client
+            .search(
+                &scope,
+                SearchMessagingRequest {
+                    query: "needle",
+                    place_id: Some("place-a"),
+                    limit: Some(7),
+                },
+            )
+            .await
+            .expect("search over focused local route");
+        client
+            .notification_settings(&scope, MessagingNotificationSettingsRequest::default())
+            .await
+            .expect("read notification setting with no patch fields");
+        client
+            .notification_settings(
+                &scope,
+                MessagingNotificationSettingsRequest {
+                    defaults_level: None,
+                    per_place: None,
+                    keywords: Some(vec!["release"]),
+                },
+            )
+            .await
+            .expect("send keyword-only notification patch");
+        client
+            .notification_settings(
+                &scope,
+                MessagingNotificationSettingsRequest {
+                    defaults_level: None,
+                    per_place: Some(Vec::<MessagingNotificationPlace<'_>>::new()),
+                    keywords: Some(Vec::new()),
+                },
+            )
+            .await
+            .expect("preserve explicit empty replacement arrays");
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].0, "/local-control/v1/messaging:search");
+        assert_eq!(
+            requests[0].1,
+            serde_json::json!({
+                "workspace_id": scope.workspace_id,
+                "installation_id": scope.installation_id,
+                "authority_epoch": scope.authority_epoch,
+                "query": "needle",
+                "place_id": "place-a",
+                "limit": 7
+            })
+        );
+        assert_eq!(
+            requests[1].1,
+            serde_json::json!({
+                "workspace_id": scope.workspace_id,
+                "installation_id": scope.installation_id,
+                "authority_epoch": scope.authority_epoch
+            })
+        );
+        assert!(requests[2].1.get("defaults_level").is_none());
+        assert!(requests[2].1.get("per_place").is_none());
+        assert_eq!(requests[2].1["keywords"], serde_json::json!(["release"]));
+        assert_eq!(requests[3].1["per_place"], serde_json::json!([]));
+        assert_eq!(requests[3].1["keywords"], serde_json::json!([]));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn notification_settings_update_response_loss_and_corruption_are_indeterminate() {
+        for behavior in [
+            NotificationSettingsMutationFailureFixture::ResponseLoss,
+            NotificationSettingsMutationFailureFixture::MalformedSuccess,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = NotificationSettingsMutationFixtureState {
+                behavior,
+                committed_requests: Arc::new(StdMutex::new(Vec::new())),
+            };
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:notification-settings",
+                    post(notification_settings_mutation_failure_fixture),
+                )
+                .with_state(state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error = client
+                .notification_settings(
+                    &messaging_scope(),
+                    MessagingNotificationSettingsRequest {
+                        defaults_level: None,
+                        per_place: None,
+                        keywords: Some(vec!["release"]),
+                    },
+                )
+                .await
+                .expect_err("a committed update without a valid response is indeterminate");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                MessagingApiFailureClass::Indeterminate
+            );
+            let committed = state.committed_requests.lock().unwrap();
+            assert_eq!(committed.len(), 1);
+            assert_eq!(committed[0]["keywords"], serde_json::json!(["release"]));
+            drop(committed);
+            server.abort();
+        }
     }
 
     #[tokio::test]

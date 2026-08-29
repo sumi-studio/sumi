@@ -133,10 +133,24 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 	return stored, nil
 }
 
+// SetStatus replaces the actor's own status. Only the actor can set it — the
+// participant is the receiver's scope, never a request field (自己申告: the
+// platform does not speak about anyone's attention on their behalf).
+//
+// A temporary status (expiresAt != nil) remembers the state it replaces, so it
+// lapses back to what the participant had already said. Setting a lasting
+// status clears that memory: the new declaration is the whole truth.
+//
+// The base is derived by the same statement that writes the row, so a
+// participant's declarations are ordered against each other whether or not
+// they already had a row. A read-then-write could not do that: an unwritten
+// participant has no row to lock, so two first declarations would each decide
+// "there was nothing underneath" and the later one would erase the lasting
+// status the earlier one had just made. ON CONFLICT makes the second writer
+// wait on the same key and read what the first actually committed — the same
+// footing as the sweeper, where the row lock is what guarantees the order.
 func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expiresAt *time.Time) (ParticipantStatus, error) {
-	switch status {
-	case StatusAvailable, StatusBusy, StatusAway:
-	default:
+	if !ValidStatus(status) {
 		return ParticipantStatus{}, fmt.Errorf("unknown status %q", status)
 	}
 	if utf8.RuneCountInString(note) > MaxStatusNoteChars {
@@ -150,19 +164,50 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return ParticipantStatus{}, err
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO participant_statuses (member_kind, member_id, status, note, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+	// The CASE arms say what a new temporary declaration lapses back to: a
+	// declaration that holds until replaced is itself the thing underneath,
+	// and anything with an expiry — still holding or already lapsed — hands
+	// on the base it was already carrying, so temporary states in a row
+	// cannot bury the lasting one the participant chose. The rule is written
+	// once, here, where the row is written; a second copy in Go would be a
+	// second answer to the same question.
+	var stored storedStatus
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO participant_statuses
+			(member_kind, member_id, status, note, expires_at, base_status, base_note)
+		VALUES ($1, $2, $3, $4, $5, NULL, '')
 		ON CONFLICT (member_kind, member_id)
 		DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note,
-		              expires_at = EXCLUDED.expires_at, updated_at = now()`,
-		s.Scope.Actor.Kind, s.Scope.Actor.ID, status, note, expiresAt); err != nil {
+		              expires_at = EXCLUDED.expires_at,
+		              base_status = CASE
+		                  WHEN EXCLUDED.expires_at IS NULL THEN NULL
+		                  WHEN participant_statuses.expires_at IS NULL THEN participant_statuses.status
+		                  ELSE participant_statuses.base_status
+		              END,
+		              base_note = CASE
+		                  WHEN EXCLUDED.expires_at IS NULL THEN ''
+		                  WHEN participant_statuses.expires_at IS NULL THEN participant_statuses.note
+		                  WHEN participant_statuses.base_status IS NULL THEN ''
+		                  ELSE participant_statuses.base_note
+		              END,
+		              updated_at = now()
+		RETURNING status, note, expires_at, base_status, base_note, revision`,
+		s.Scope.Actor.Kind, s.Scope.Actor.ID, status, note, expiresAt,
+	).Scan(&stored.status, &stored.note, &stored.expiresAt,
+		&stored.baseStatus, &stored.baseNote, &stored.revision); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("set scoped status: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ParticipantStatus{}, fmt.Errorf("commit scoped status: %w", err)
 	}
-	return ParticipantStatus{Participant: s.Scope.Actor, Status: status, Note: note, ExpiresAt: expiresAt}, nil
+	next := ParticipantStatus{
+		Participant: s.Scope.Actor, Revision: stored.revision, Status: status, Note: stored.note,
+		ExpiresAt: stored.expiresAt, BaseNote: stored.baseNote,
+	}
+	if stored.baseStatus != nil {
+		next.BaseStatus = *stored.baseStatus
+	}
+	return next, nil
 }
 
 func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatus, error) {
@@ -174,25 +219,35 @@ func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatu
 	if _, err := s.authorizeInTx(ctx, tx); err != nil {
 		return nil, err
 	}
+	// Expiry is resolved here, at read time: a lapsed temporary status reports
+	// the state it lapses back to, or nothing when there is none. The sweeper
+	// only makes that same answer durable and announces it, so it can never
+	// disagree with what a reader would have computed anyway.
 	rows, err := tx.Query(ctx, `
-		SELECT ps.member_kind, ps.member_id, ps.status, ps.note, ps.expires_at
+		SELECT ps.member_kind, ps.member_id, ps.status, ps.note, ps.expires_at,
+		       ps.base_status, ps.base_note, ps.revision
 		FROM participant_statuses ps
 		JOIN workspace_members wm
 		  ON wm.member_kind = ps.member_kind AND wm.member_id = ps.member_id
 		WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
-		  AND (ps.expires_at IS NULL OR ps.expires_at > now())
 		ORDER BY ps.member_kind, ps.member_id`, s.Scope.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query scoped statuses: %w", err)
 	}
 	defer rows.Close()
+	now := time.Now()
 	var statuses []ParticipantStatus
 	for rows.Next() {
-		var status ParticipantStatus
-		if err := rows.Scan(&status.Participant.Kind, &status.Participant.ID, &status.Status, &status.Note, &status.ExpiresAt); err != nil {
+		var (
+			participant ParticipantRef
+			stored      storedStatus
+		)
+		if err := rows.Scan(&participant.Kind, &participant.ID, &stored.status,
+			&stored.note, &stored.expiresAt, &stored.baseStatus, &stored.baseNote, &stored.revision); err != nil {
 			return nil, fmt.Errorf("scan scoped status: %w", err)
 		}
-		statuses = append(statuses, status)
+		resolved := stored.resolve(participant, now)
+		statuses = append(statuses, resolved)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -420,9 +475,11 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 	for _, decision := range decisions {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_notification_intents
-				(message_id, recipient_kind, recipient_id, reason)
-			VALUES ($1, $2, $3, $4)`, message.MessageID,
-			decision.Participant.Kind, decision.Participant.ID, decision.Reason); err != nil {
+				(message_id, recipient_kind, recipient_id, reason,
+				 recipient_workspace_member_id, recipient_place_member_id)
+			VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::uuidv7)`, message.MessageID,
+			decision.Participant.Kind, decision.Participant.ID, decision.Reason,
+			decision.workspaceMemberID, decision.placeMemberID); err != nil {
 			return fmt.Errorf("issue scoped notification intent: %w", err)
 		}
 	}
@@ -430,13 +487,15 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 }
 
 func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context, q querier, place Place, message Message, members []MemberProfile) ([]NotificationDecision, error) {
-	candidates := make([]ParticipantRef, 0, len(members))
+	candidates := make([]MemberProfile, 0, len(members))
+	refs := make([]ParticipantRef, 0, len(members))
 	for _, member := range members {
 		if member.Participant != message.Author {
-			candidates = append(candidates, member.Participant)
+			candidates = append(candidates, member)
+			refs = append(refs, member.Participant)
 		}
 	}
-	settings, err := s.scopedNotificationSettingsFor(ctx, q, place.PlaceID, candidates)
+	settings, err := s.scopedNotificationSettingsFor(ctx, q, place.PlaceID, refs)
 	if err != nil {
 		return nil, err
 	}
@@ -447,7 +506,7 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 	lowered := strings.ToLower(message.Content)
 	decisions := make([]NotificationDecision, 0, len(candidates))
 	for _, candidate := range candidates {
-		setting := settings[candidate.Key()]
+		setting := settings[candidate.Participant.Key()]
 		if setting.level == NotifyLevelMute {
 			continue
 		}
@@ -455,7 +514,7 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 		switch {
 		case place.Kind == PlaceDM || place.Kind == PlaceGroupDM:
 			reason = NotifyReasonDM
-		case mentioned[candidate.Key()]:
+		case mentioned[candidate.Participant.Key()]:
 			reason = NotifyReasonMention
 		case matchesKeyword(lowered, setting.keywords):
 			reason = NotifyReasonKeyword
@@ -463,7 +522,12 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 			reason = NotifyReasonAll
 		}
 		if reason != "" {
-			decisions = append(decisions, NotificationDecision{Participant: candidate, Reason: reason})
+			decisions = append(decisions, NotificationDecision{
+				Participant:       candidate.Participant,
+				Reason:            reason,
+				workspaceMemberID: candidate.workspaceMemberID,
+				placeMemberID:     candidate.placeMemberID,
+			})
 		}
 	}
 	return decisions, nil
@@ -531,7 +595,9 @@ func (s *ScopedStore) NotificationIntentsForMessage(ctx context.Context, message
 		return nil, ErrMessageNotFound
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT recipient_kind, recipient_id, reason
+		SELECT recipient_kind, recipient_id, reason,
+		       recipient_workspace_member_id,
+		       COALESCE(recipient_place_member_id::text, '')
 		FROM message_notification_intents
 		WHERE message_id=$1 ORDER BY recipient_kind, recipient_id`, messageID)
 	if err != nil {
@@ -541,7 +607,13 @@ func (s *ScopedStore) NotificationIntentsForMessage(ctx context.Context, message
 	var out []NotificationDecision
 	for rows.Next() {
 		var item NotificationDecision
-		if err := rows.Scan(&item.Participant.Kind, &item.Participant.ID, &item.Reason); err != nil {
+		if err := rows.Scan(
+			&item.Participant.Kind,
+			&item.Participant.ID,
+			&item.Reason,
+			&item.workspaceMemberID,
+			&item.placeMemberID,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

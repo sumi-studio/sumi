@@ -11,7 +11,10 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{
+        Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,11 +28,81 @@ use uuid::Uuid;
 const PAID_A: &str = "0198f0f4-9b72-7000-8000-000000000001";
 const PAID_B: &str = "0198f0f4-9b72-7000-8000-000000000002";
 const LOCAL_CONTROL_GID: u32 = 10022;
-const HOST_RUN_ROOT: &str = "/run/sumi";
+// This is deliberately not /run/sumi.  The deployment supervisor has fixed
+// production trust anchors there, so integration tests run a private copy of
+// the deployment artifact with the same anchors rooted below a fixture-owned
+// directory.  Do not make the production roots configurable by environment.
 const TEST_WRAPPING_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_APPROVAL_DIGEST_KEY: &str =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+/// Fixed base for every fixture-private root.  `TMPDIR` is deliberately not
+/// consulted: the private root is substituted verbatim into the supervisor's
+/// Bash source, and a caller-controlled directory name could inject quoting or
+/// command substitution there.
+const FIXTURE_ROOT_BASE: &str = "/tmp";
+
+type HostAnchorIdentity = Option<(u64, u64, u32, u32, u64)>;
+type HostAnchorSnapshot = Vec<(&'static str, HostAnchorIdentity)>;
+
+/// The one baseline every fixture in this process compares against.  Taking it
+/// per fixture would let the first test that destroys a host anchor become the
+/// next test's "before", so a real regression would be recorded as normal.
+static HOST_RUN_BASELINE: OnceLock<HostAnchorSnapshot> = OnceLock::new();
+static COMPOSE_ANCHOR_BINARY: OnceLock<PathBuf> = OnceLock::new();
+
+fn compose_anchor_binary() -> &'static PathBuf {
+    COMPOSE_ANCHOR_BINARY.get_or_init(|| {
+        let output_path = std::env::temp_dir().join(format!(
+            "sumi-compose-anchor-deployment-test-{}",
+            std::process::id()
+        ));
+        let api_dir = deploy_dir()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("apps/api");
+        let output = Command::new("go")
+            .current_dir(api_dir)
+            .args(["build", "-buildvcs=false", "-o"])
+            .arg(&output_path)
+            .arg("./cmd/compose-anchor")
+            .output()
+            .expect("run Go compiler for Compose anchor deployment fixture");
+        assert!(
+            output.status.success(),
+            "build Compose anchor deployment fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output_path
+    })
+}
+
+fn host_run_baseline() -> &'static HostAnchorSnapshot {
+    HOST_RUN_BASELINE.get_or_init(host_run_snapshot)
+}
+
+/// Identity of the live host trust anchors this suite must never touch.  The
+/// deployment tests used to bind the real `/run` into a container and remove
+/// these, which took down the running development stack.
+fn host_run_snapshot() -> HostAnchorSnapshot {
+    ["/run/sumi", "/run/sumi/local-control"]
+        .into_iter()
+        .map(|path| {
+            let identity = std::fs::symlink_metadata(path).ok().map(|metadata| {
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.nlink(),
+                )
+            });
+            (path, identity)
+        })
+        .collect()
+}
 
 fn deploy_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -158,6 +231,7 @@ fn string_set(values: &[&str]) -> BTreeSet<String> {
 fn launch_env(command: &mut Command, paid: &str) {
     command
         .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_ANCHOR", compose_anchor_binary())
         .env("SUMI_PERSONALITY_AGENT_ID", paid)
         .env("SUMI_GATEWAY_URL", "wss://gateway.invalid/agent")
         .env("SUMI_LOCAL_CONTROL_BEARER", "control-secret")
@@ -178,28 +252,66 @@ fn launch_env(command: &mut Command, paid: &str) {
         .env("SUMI_ESCALATION_REVIEWER_MODEL_PRESET", "glm-5.2");
 }
 
-fn docker_fixture_host_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        timeout_available()
-            && bounded_docker_output(
-                deploy_dir().parent().unwrap().parent().unwrap(),
-                10,
-                &["info".into()],
-            )
+/// Set to `1` on a host that genuinely cannot run the deployment fixture (no
+/// Docker daemon, no cached base image, a root or role-colliding test uid).
+/// Without it an unavailable host is a test failure, because a silent skip
+/// makes a run that never exercised the isolation read exactly like a run that
+/// did.
+const FIXTURE_OPTIONAL_ENV: &str = "SUMI_DEPLOYMENT_FIXTURE_OPTIONAL";
+
+static FIXTURE_RUNS: AtomicUsize = AtomicUsize::new(0);
+static FIXTURE_SKIPS: AtomicUsize = AtomicUsize::new(0);
+
+fn fixture_skip_is_opted_in() -> bool {
+    std::env::var(FIXTURE_OPTIONAL_ENV).is_ok_and(|value| value == "1")
+}
+
+/// Either skip loudly and countably, or fail.  Never return quietly.
+fn unavailable_host(reason: &str) {
+    assert!(
+        fixture_skip_is_opted_in(),
+        "deployment fixture host is unavailable: {reason}\nSet {FIXTURE_OPTIONAL_ENV}=1 to \
+         accept an unexercised deployment isolation on this host; a silent skip would report \
+         a run that never provisioned anything as a passing run"
+    );
+    let skipped = FIXTURE_SKIPS.fetch_add(1, Ordering::SeqCst) + 1;
+    eprintln!("HOST_FIXTURE_SKIPPED (opted in, count={skipped}): {reason}");
+}
+
+/// Reports why the Docker host cannot host the fixture, or `None` when it can.
+/// A transient probe failure is cached like any other, so it is named in the
+/// skip or failure rather than folded into "no Docker here".
+fn docker_fixture_host_unavailable() -> Option<&'static str> {
+    static UNAVAILABLE: OnceLock<Option<&'static str>> = OnceLock::new();
+    *UNAVAILABLE.get_or_init(|| {
+        let workdir = deploy_dir().parent().unwrap().parent().unwrap().to_owned();
+        if !timeout_available() {
+            return Some("the `timeout` utility is required to bound every Docker probe");
+        }
+        if !bounded_docker_output(&workdir, 30, &["info".into()])
             .status
             .success()
-            && bounded_docker_output(
-                deploy_dir().parent().unwrap().parent().unwrap(),
-                10,
-                &[
-                    "image".into(),
-                    "inspect".into(),
-                    "debian:bookworm-slim".into(),
-                ],
-            )
-            .status
-            .success()
+        {
+            return Some(
+                "`docker info` did not succeed within 30s: no reachable Docker daemon, or a \
+                 daemon too slow to provision root-owned fixed trust anchors",
+            );
+        }
+        if !bounded_docker_output(
+            &workdir,
+            30,
+            &[
+                "image".into(),
+                "inspect".into(),
+                "debian:bookworm-slim".into(),
+            ],
+        )
+        .status
+        .success()
+        {
+            return Some("the cached debian:bookworm-slim base image is required");
+        }
+        None
     })
 }
 
@@ -209,7 +321,11 @@ struct HostTrustFixture {
     lock_path: PathBuf,
     control_socket: PathBuf,
     runtime_secret_root: PathBuf,
+    fixture_root: PathBuf,
+    supervisor: PathBuf,
+    host_run_before: HostAnchorSnapshot,
     control_gid: u32,
+    cleaned: bool,
     listener: Option<UnixListener>,
     _guard: MutexGuard<'static, ()>,
 }
@@ -219,19 +335,17 @@ impl HostTrustFixture {
         let guard = HOST_FIXTURE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !docker_fixture_host_available() {
-            eprintln!(
-                "HOST_UNAVAILABLE: Docker and cached debian:bookworm-slim are required to \
-                 provision root-owned fixed supervisor trust anchors"
-            );
+        // One process-wide baseline, taken before any fixture can touch anything.
+        let host_run_before = host_run_baseline().clone();
+        if let Some(reason) = docker_fixture_host_unavailable() {
+            unavailable_host(reason);
             return None;
         }
         let server_uid = unsafe { libc::geteuid() };
         let control_gid = unsafe { libc::getegid() };
         if server_uid == 0 {
-            eprintln!(
-                "HOST_UNAVAILABLE: deployment fixture requires a non-root test uid for the \
-                 dedicated local-control peer"
+            unavailable_host(
+                "the fixture needs a non-root test uid for the dedicated local-control peer",
             );
             return None;
         }
@@ -239,21 +353,77 @@ impl HostTrustFixture {
             || control_gid == 65534
             || [10000, 10001, 10002, 10003, 10020, 10021].contains(&control_gid)
         {
-            eprintln!(
-                "HOST_UNAVAILABLE: deployment fixture requires a non-reserved, non-role \
-                 primary test gid"
-            );
+            unavailable_host("the fixture needs a non-reserved, non-role primary test gid");
             return None;
         }
         let paid = Uuid::now_v7().to_string();
         let compact = paid.replace('-', "");
         let project = format!("sumi-{compact}");
-        let lock_path =
-            PathBuf::from(HOST_RUN_ROOT).join(format!("supervisor-locks/{project}.lock"));
-        let control_dir = PathBuf::from(HOST_RUN_ROOT).join(format!("local-control/{compact}"));
+        // Not `std::env::temp_dir()`: this path is substituted verbatim into the
+        // supervisor's Bash source, so a `TMPDIR` carrying a space, a quote, or a
+        // `$(...)` would rewrite the script rather than the root.  The base is
+        // fixed and the suffix is generated hex.  The private root also carries
+        // production's `local-control/<paid>/control.sock` tail, which still has
+        // to fit in `sun_path`, so the prefix stays short.
+        let unique = Uuid::now_v7().simple().to_string();
+        let fixture_root = PathBuf::from(FIXTURE_ROOT_BASE)
+            .join(format!("sumi-dep-{}", &unique[unique.len() - 12..]));
+        let private_run_root = fixture_root.join("run/sumi");
+        // Only the bind source is created here.  The private `/run/sumi` and
+        // its lock root must be provisioned root-owned inside the container,
+        // exactly like the production anchors the supervisor validates.
+        std::fs::create_dir_all(fixture_root.join("run")).unwrap();
+        let private_deploy_dir = fixture_root.join("deploy");
+        copy_tree(&deploy_dir(), &private_deploy_dir);
+        let supervisor = private_deploy_dir.join("supervisor");
+        let private_run_root_text = private_run_root.display().to_string();
+        assert!(
+            private_run_root_text.starts_with('/')
+                && private_run_root_text.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                }),
+            "the private root is substituted into Bash source and must carry no \
+             shell metacharacter: {private_run_root_text}"
+        );
+        let published_source = std::fs::read_to_string(&supervisor).unwrap();
+        // What the rewrite depends on, checked against the published artifact
+        // instead of against the rewrite's own output.  These fail the day the
+        // supervisor renames a root or stops declaring it as a literal, which is
+        // exactly when a fixture would quietly start pointing at the host again.
+        for declaration in [
+            "readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks",
+            "readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control",
+        ] {
+            assert!(
+                published_source.contains(declaration),
+                "published supervisor no longer declares {declaration:?}; the fixture rewrite \
+                 cannot be trusted to move this root off the host"
+            );
+        }
+        // A single pass over the published source.  Chained replacements would
+        // rewrite the `/run/sumi` tail of an already-substituted private path
+        // and produce `{fixture_root}/{fixture_root}/run/sumi/...`.
+        let supervisor_source = published_source.replace("/run/sumi", &private_run_root_text);
+        assert!(
+            host_root_references_are_all_private(&supervisor_source, &fixture_root),
+            "the private supervisor still references a host root outside {}",
+            fixture_root.display()
+        );
+        std::fs::write(&supervisor, supervisor_source).unwrap();
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lock_path = private_run_root.join(format!("supervisor-locks/{project}.lock"));
+        let control_dir = private_run_root.join(format!("local-control/{compact}"));
         let control_socket = control_dir.join("control.sock");
+        // `sun_path` is 108 bytes including the terminator, and the swap test
+        // renames the socket to `control.sock.swapped` beside it.
+        assert!(
+            control_socket.as_os_str().len() + ".swapped".len() < 108,
+            "fixture local-control socket path does not fit in sun_path; \
+             use a shorter TMPDIR: {}",
+            control_socket.display()
+        );
         let runtime_secret_root =
-            std::env::temp_dir().join(format!("sumi-runtime-secrets-{compact}"));
+            PathBuf::from(FIXTURE_ROOT_BASE).join(format!("sumi-runtime-secrets-{compact}"));
         std::fs::create_dir(&runtime_secret_root).unwrap();
         std::fs::set_permissions(&runtime_secret_root, std::fs::Permissions::from_mode(0o700))
             .unwrap();
@@ -279,7 +449,7 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
                 "--network".into(),
                 "none".into(),
                 "-v".into(),
-                "/run:/host-run".into(),
+                format!("{}:/host-run", fixture_root.join("run").display()),
                 "debian:bookworm-slim".into(),
                 "bash".into(),
                 "-c".into(),
@@ -291,16 +461,38 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
                 control_gid.to_string(),
             ],
         );
+        // Docker and the image were already confirmed above, so a failure here
+        // is our own provisioning breaking, not an absent environment.  Skipping
+        // it would report a green run for a fixture that never executed.
         if !setup.status.success() {
-            eprintln!(
-                "HOST_UNAVAILABLE: fixed trust-anchor provisioning failed: {}",
+            purge_private_run_root(&fixture_root);
+            let _ = std::fs::remove_dir_all(&runtime_secret_root);
+            let _ = std::fs::remove_dir_all(&fixture_root);
+            panic!(
+                "fixed trust-anchor provisioning failed under a working Docker host; \
+                 this is a broken fixture, not an unavailable environment: status={:?}\n\
+                 stdout: {}\nstderr: {}",
+                setup.status,
+                String::from_utf8_lossy(&setup.stdout),
                 String::from_utf8_lossy(&setup.stderr)
             );
-            return None;
         }
+        assert_eq!(
+            host_run_snapshot(),
+            host_run_before,
+            "deployment fixture changed the live host trust anchors while provisioning"
+        );
 
         let listener = UnixListener::bind(&control_socket).unwrap();
         std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let run = FIXTURE_RUNS.fetch_add(1, Ordering::SeqCst) + 1;
+        eprintln!(
+            "HOST_FIXTURE_ACTIVE (count={run}): project={project} run_root={private_run_root_text} \
+             supervisor={} lock={} control={}",
+            supervisor.display(),
+            lock_path.display(),
+            control_socket.display()
+        );
 
         Some(Self {
             paid,
@@ -308,7 +500,11 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
             lock_path,
             control_socket,
             runtime_secret_root,
+            fixture_root,
+            supervisor,
+            host_run_before,
             control_gid,
+            cleaned: false,
             listener: Some(listener),
             _guard: guard,
         })
@@ -327,7 +523,27 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
             );
     }
 
+    fn supervisor_command(&self) -> Command {
+        Command::new(&self.supervisor)
+    }
+
+    /// The private deployment copy the fixture supervisor resolves its Compose
+    /// files against.  Lifecycle assertions must expect these paths, not the
+    /// published ones.
+    fn deploy_dir(&self) -> PathBuf {
+        self.supervisor.parent().unwrap().to_path_buf()
+    }
+
     fn cleanup(&mut self) -> Result<(), String> {
+        // Every container below binds `{fixture_root}/run` as its mount source,
+        // and Docker recreates a missing bind source as a root-owned directory.
+        // A second cleanup (the acceptance tests call it, then `Drop` runs) must
+        // therefore not repeat the work it already evidenced.
+        if self.cleaned {
+            self.assert_host_anchors_intact("post-teardown");
+            return Ok(());
+        }
+        self.cleaned = true;
         self.listener.take();
         let compact = self.paid.replace('-', "");
         let cleanup_script = r#"
@@ -349,7 +565,7 @@ rmdir /host-run/sumi 2>/dev/null || true
                 "--network".into(),
                 "none".into(),
                 "-v".into(),
-                "/run:/host-run".into(),
+                format!("{}:/host-run", self.fixture_root.join("run").display()),
                 "debian:bookworm-slim".into(),
                 "bash".into(),
                 "-c".into(),
@@ -394,18 +610,55 @@ rmdir /host-run/sumi 2>/dev/null || true
                 self.runtime_secret_root.display()
             ));
         }
+        purge_private_run_root(&self.fixture_root);
+        make_tree_removable(&self.fixture_root);
+        if let Err(error) = std::fs::remove_dir_all(&self.fixture_root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!(
+                "cannot remove private deployment fixture {}: {error}",
+                self.fixture_root.display()
+            ));
+        }
+        // The isolation regression itself is never demoted to a returned error.
+        // Only two call sites inspected `cleanup()`'s result, so a destroyed host
+        // anchor used to leave twelve of thirteen fixture tests green.
+        self.assert_host_anchors_intact("teardown");
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors.join("\n"))
         }
     }
+
+    /// Fails whichever test is running, not just the two that inspected
+    /// `cleanup()`. Every fixture compares against the same process-wide
+    /// baseline, so a fixture that starts after another one destroyed an anchor
+    /// fails too instead of adopting the damage as its own "before".
+    fn assert_host_anchors_intact(&self, stage: &str) {
+        let host_run_after = host_run_snapshot();
+        if host_run_after == self.host_run_before {
+            eprintln!("HOST_ANCHORS_UNCHANGED ({stage}): {host_run_after:?}");
+            return;
+        }
+        let report = format!(
+            "the deployment fixture changed the live host trust anchors at {stage}: \
+             baseline={:?} now={host_run_after:?}",
+            self.host_run_before
+        );
+        eprintln!("HOST_ANCHORS_CHANGED ({stage}): {report}");
+        // Panicking while already unwinding aborts the process and would bury
+        // the original failure. That test is failing either way; the stderr
+        // record above is what carries this one.
+        assert!(std::thread::panicking(), "{report}");
+    }
 }
 
 impl Drop for HostTrustFixture {
     fn drop(&mut self) {
-        // The acceptance test calls this fallibly and asserts exact fixture
-        // absence. Drop is only an emergency best-effort fallback.
+        // `cleanup()` is idempotent, so an acceptance test that already called
+        // it fallibly gets `Ok` here. Its host-anchor check is a panic rather
+        // than a returned error, so it reaches every fixture test through here.
         let _ = self.cleanup();
     }
 }
@@ -433,6 +686,7 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_ANCHOR", compose_anchor_binary())
         .env("SUMI_COMPOSE_TIMEOUT", "10")
         .env("SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "true")
         .env("SUMI_PERSONALITY_AGENT_ID", &fixture.paid)
@@ -467,6 +721,13 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env(
             "SUMI_LOCAL_CONTROL_HOST_DIR",
             fixture.control_socket.parent().unwrap(),
+        )
+        .env(
+            "SUMI_RUNTIME_SECRET_HOST_DIR",
+            fixture
+                .runtime_secret_root
+                .join(fixture.paid.replace('-', ""))
+                .join("acceptance-cleanup"),
         );
     preserve_docker_transport(command);
 }
@@ -566,6 +827,22 @@ fn cleanup_owned_compose_resources(fixture: &HostTrustFixture) -> Result<(), Str
         Ok(())
     } else {
         Err(errors.join("\n"))
+    }
+}
+
+/// Wait for a marker that a process this test does not `wait()` on writes.
+/// Asserting on it the instant the supervisor exits turns host load into a test
+/// failure: the signalled grandchild's trap has not necessarily run yet.
+fn assert_marker(markers: &std::path::Path, name: &str) {
+    let path = markers.join(name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "marker {name} was never written under {}",
+            markers.display()
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -991,11 +1268,7 @@ fn compose_has_no_global_name_and_supervisor_derives_one_project_per_paid() {
         command.arg("project-name");
         launch_env(&mut command, paid);
         let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "{}", supervisor_failure(&output));
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
     let project_a = project(PAID_A);
@@ -1126,8 +1399,8 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
 #[test]
 fn deployed_allocator_cli_durably_advances_two_generations_without_rebinding_outputs() {
     let Some(role_gids) = usable_allocator_role_gids() else {
-        eprintln!(
-            "HOST_UNAVAILABLE: allocator integration requires three usable supplemental groups or chgrp authority"
+        unavailable_host(
+            "allocator integration requires three usable supplemental groups or chgrp authority",
         );
         return;
     };
@@ -1149,8 +1422,8 @@ fn deployed_allocator_cli_durably_advances_two_generations_without_rebinding_out
     if !can_assign_allocator_role_gids(&output, &role_gids) {
         make_tree_removable(&root);
         let _ = std::fs::remove_dir_all(root);
-        eprintln!(
-            "HOST_UNAVAILABLE: allocator integration requires three usable supplemental groups or chgrp authority"
+        unavailable_host(
+            "allocator integration requires three usable supplemental groups or chgrp authority",
         );
         return;
     }
@@ -1172,7 +1445,7 @@ fn deployed_allocator_cli_durably_advances_two_generations_without_rebinding_out
         assert!(
             output.status.success(),
             "allocator CLI failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            supervisor_failure(&output)
         );
         serde_json::from_slice::<JsonValue>(&output.stdout).unwrap()
     };
@@ -1430,6 +1703,83 @@ fn assert_no_allocator_temps_or_interrupted_handoff(
     }
 }
 
+/// Everything the supervisor produced, not just its stderr. A tracked Compose
+/// launch that loses a race prints one line of unrelated warning on stderr, so
+/// an assertion that shows only stderr reports a failure with no cause.
+fn supervisor_failure(output: &Output) -> String {
+    format!(
+        "status={:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Every `/run/sumi` in the rewritten supervisor must be the tail of a path
+/// rooted in this fixture. Unlike counting occurrences of the substitution's own
+/// output, this fails on a source that names the host root in a form the
+/// single-pass rewrite did not cover.
+fn host_root_references_are_all_private(source: &str, fixture_root: &std::path::Path) -> bool {
+    let private_prefix = format!("{}/run/sumi", fixture_root.display());
+    let mut cursor = 0;
+    while let Some(offset) = source[cursor..].find("/run/sumi") {
+        let end = cursor + offset + "/run/sumi".len();
+        if !source[..end].ends_with(&private_prefix) {
+            return false;
+        }
+        cursor = end;
+    }
+    true
+}
+
+/// Remove the root-owned private trust anchors the fixture provisioned inside a
+/// container.  The test uid cannot unlink them, so a leftover tree would stay in
+/// the temporary directory forever.  Best effort: callers already report the
+/// failure that made this necessary.
+fn purge_private_run_root(fixture_root: &std::path::Path) {
+    if !fixture_root.join("run/sumi").exists() {
+        return;
+    }
+    let _ = try_bounded_docker_output(
+        deploy_dir().parent().unwrap().parent().unwrap(),
+        30,
+        &[
+            "run".into(),
+            "--rm".into(),
+            "--network".into(),
+            "none".into(),
+            "-v".into(),
+            format!("{}:/host-run", fixture_root.join("run").display()),
+            "debian:bookworm-slim".into(),
+            "bash".into(),
+            "-c".into(),
+            "set -eu\nrm -rf /host-run/sumi\n".into(),
+        ],
+    );
+}
+
+/// Copy a published deployment tree into a fixture-owned directory.  The
+/// supervisor resolves its Compose files relative to its own location, so the
+/// private copy has to carry every nested artifact, not just the top level.
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let child_target = target.join(entry.file_name());
+        let file_type = entry.file_type().unwrap();
+        assert!(
+            !file_type.is_symlink(),
+            "published deployment artifact must not be a symlink: {}",
+            entry.path().display()
+        );
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &child_target);
+        } else {
+            std::fs::copy(entry.path(), &child_target).unwrap();
+        }
+    }
+}
+
 fn make_tree_removable(path: &std::path::Path) {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return;
@@ -1626,12 +1976,13 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
 
 #[test]
 fn exact_runtime_secret_loader_rejects_invalid_files_without_exposing_values() {
+    const UID_NAMESPACE_CHILD_ENV: &str = "SUMI_TEST_RUNTIME_SECRET_UID_NAMESPACE";
+
     struct LoaderCase {
         label: &'static str,
         path: PathBuf,
         expected_diagnostic: &'static str,
         secret_fragments: Vec<&'static [u8]>,
-        run_as_runtime: bool,
     }
 
     fn loader_harness() -> String {
@@ -1660,18 +2011,8 @@ exit 99
         )
     }
 
-    fn chown_runtime(path: &std::path::Path) -> bool {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        unsafe { libc::chown(path.as_ptr(), 10001, 10001) == 0 }
-    }
-
-    fn write_exact_runtime_file(path: &std::path::Path, bytes: &[u8], mode: u32, euid: u32) {
+    fn write_exact_runtime_file(path: &std::path::Path, bytes: &[u8], mode: u32) {
         std::fs::write(path, bytes).unwrap();
-        if euid == 0 {
-            assert!(chown_runtime(path), "cannot chown exact runtime secret");
-        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
@@ -1682,10 +2023,65 @@ exit 99
             .arg(&case.path)
             .env_clear()
             .env("PATH", "/usr/bin:/bin");
-        if case.run_as_runtime {
-            command.gid(10001).uid(10001);
-        }
         command.output().unwrap()
+    }
+
+    fn run_uid_namespace_child(marker: &str, uid: u32) {
+        let mut child = Command::new("/usr/bin/timeout");
+        child
+            .args([
+                "--preserve-status",
+                "--kill-after=5s",
+                "30s",
+                "/usr/bin/unshare",
+                "--user",
+            ])
+            .arg(format!("--map-user={uid}"))
+            .arg(format!("--map-group={uid}"))
+            .arg("--kill-child")
+            .arg(std::env::current_exe().expect("resolve exact deployment test binary"))
+            .args([
+                "--exact",
+                "exact_runtime_secret_loader_rejects_invalid_files_without_exposing_values",
+                "--nocapture",
+            ])
+            .env(UID_NAMESPACE_CHILD_ENV, marker)
+            .env_remove(FIXTURE_OPTIONAL_ENV)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = child.spawn().expect(
+            "/usr/bin/timeout is required to bound exact runtime-secret isolation coverage",
+        );
+        let output = child
+            .wait_with_output()
+            .expect("wait for exact runtime-secret namespace child");
+        let stdout = &output.stdout[..output.stdout.len().min(4096)];
+        let stderr = &output.stderr[..output.stderr.len().min(4096)];
+        assert!(
+            output.status.success(),
+            "runtime-secret namespace child {marker:?} failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr)
+        );
+    }
+
+    let namespace_mode = std::env::var(UID_NAMESPACE_CHILD_ENV).ok();
+    let exact_owner_child = namespace_mode.as_deref() == Some("runtime-owner");
+    let wrong_owner_child = namespace_mode.as_deref() == Some("wrong-owner");
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    match namespace_mode.as_deref() {
+        Some("runtime-owner") => {
+            assert_eq!(euid, 10001, "runtime-secret namespace child euid");
+            assert_eq!(egid, 10001, "runtime-secret namespace child egid");
+        }
+        Some("wrong-owner") => {
+            assert_eq!(euid, 10002, "wrong-owner namespace child euid");
+            assert_eq!(egid, 10002, "wrong-owner namespace child egid");
+        }
+        Some(other) => panic!("unknown private runtime-secret child marker {other:?}"),
+        None => {}
     }
 
     let root = std::env::temp_dir().join(format!("secret-loader-{}", Uuid::now_v7().simple()));
@@ -1697,30 +2093,27 @@ exit 99
 
     let mut cases = Vec::new();
 
-    let symlink_target = root.join("symlink-target");
-    std::fs::write(&symlink_target, b"symlink-secret-must-not-escape").unwrap();
-    let symlink = root.join("symlink-secret");
-    std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
-    cases.push(LoaderCase {
-        label: "symlink",
-        path: symlink,
-        expected_diagnostic: "runtime secret must be a regular non-symlink",
-        secret_fragments: vec![b"symlink-secret-must-not-escape"],
-        run_as_runtime: false,
-    });
+    if wrong_owner_child || (namespace_mode.is_none() && euid != 10001) {
+        let symlink_target = root.join("symlink-target");
+        std::fs::write(&symlink_target, b"symlink-secret-must-not-escape").unwrap();
+        let symlink = root.join("symlink-secret");
+        std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
+        cases.push(LoaderCase {
+            label: "symlink",
+            path: symlink,
+            expected_diagnostic: "runtime secret must be a regular non-symlink",
+            secret_fragments: vec![b"symlink-secret-must-not-escape"],
+        });
 
-    let nonregular = root.join("nonregular-secret");
-    std::fs::create_dir(&nonregular).unwrap();
-    cases.push(LoaderCase {
-        label: "nonregular",
-        path: nonregular,
-        expected_diagnostic: "runtime secret must be a regular non-symlink",
-        secret_fragments: vec![],
-        run_as_runtime: false,
-    });
+        let nonregular = root.join("nonregular-secret");
+        std::fs::create_dir(&nonregular).unwrap();
+        cases.push(LoaderCase {
+            label: "nonregular",
+            path: nonregular,
+            expected_diagnostic: "runtime secret must be a regular non-symlink",
+            secret_fragments: vec![],
+        });
 
-    let euid = unsafe { libc::geteuid() };
-    if euid != 10001 {
         let wrong_owner = root.join("wrong-owner-secret");
         std::fs::write(&wrong_owner, b"owner-secret-must-not-escape").unwrap();
         std::fs::set_permissions(&wrong_owner, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -1729,68 +2122,43 @@ exit 99
             path: wrong_owner,
             expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
             secret_fragments: vec![b"owner-secret-must-not-escape"],
-            run_as_runtime: false,
         });
-    } else {
-        eprintln!(
-            "HOST_UNAVAILABLE: owner-mismatch secret case requires chown authority when tests \
-             already run as uid 10001"
-        );
-    }
-
-    let exact_runtime_owner_available = if euid == 10001 {
-        true
-    } else if euid == 0 {
-        let probe = root.join("chown-probe");
-        std::fs::write(&probe, b"probe").unwrap();
-        let available = chown_runtime(&probe);
-        let _ = std::fs::remove_file(probe);
-        available
-    } else {
-        false
-    };
-    if exact_runtime_owner_available {
-        let run_as_runtime = euid == 0;
-
+    } else if exact_owner_child {
         let wrong_mode = root.join("wrong-mode-secret");
-        write_exact_runtime_file(&wrong_mode, b"mode-secret-must-not-escape", 0o600, euid);
+        write_exact_runtime_file(&wrong_mode, b"mode-secret-must-not-escape", 0o600);
         cases.push(LoaderCase {
             label: "mode",
             path: wrong_mode,
             expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
             secret_fragments: vec![b"mode-secret-must-not-escape"],
-            run_as_runtime,
         });
 
         let linked = root.join("linked-secret");
-        write_exact_runtime_file(&linked, b"linked-secret-must-not-escape", 0o400, euid);
+        write_exact_runtime_file(&linked, b"linked-secret-must-not-escape", 0o400);
         std::fs::hard_link(&linked, root.join("linked-secret-alias")).unwrap();
         cases.push(LoaderCase {
             label: "link-count",
             path: linked,
             expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
             secret_fragments: vec![b"linked-secret-must-not-escape"],
-            run_as_runtime,
         });
 
         let empty = root.join("empty-secret");
-        write_exact_runtime_file(&empty, b"", 0o400, euid);
+        write_exact_runtime_file(&empty, b"", 0o400);
         cases.push(LoaderCase {
             label: "empty",
             path: empty,
             expected_diagnostic: "runtime secret must not be empty",
             secret_fragments: vec![],
-            run_as_runtime,
         });
 
         let nul = root.join("nul-secret");
-        write_exact_runtime_file(&nul, b"nul-secret-prefix\0nul-secret-suffix", 0o400, euid);
+        write_exact_runtime_file(&nul, b"nul-secret-prefix\0nul-secret-suffix", 0o400);
         cases.push(LoaderCase {
             label: "NUL",
             path: nul,
             expected_diagnostic: "runtime secret byte length changed during parsing",
             secret_fragments: vec![b"nul-secret-prefix", b"nul-secret-suffix"],
-            run_as_runtime,
         });
 
         let carriage_return = root.join("cr-secret");
@@ -1798,35 +2166,22 @@ exit 99
             &carriage_return,
             b"cr-secret-prefix\rcr-secret-suffix",
             0o400,
-            euid,
         );
         cases.push(LoaderCase {
             label: "CR",
             path: carriage_return,
             expected_diagnostic: "runtime secret must not contain newline or carriage return",
             secret_fragments: vec![b"cr-secret-prefix", b"cr-secret-suffix"],
-            run_as_runtime,
         });
 
         let line_feed = root.join("lf-secret");
-        write_exact_runtime_file(
-            &line_feed,
-            b"lf-secret-prefix\nlf-secret-suffix",
-            0o400,
-            euid,
-        );
+        write_exact_runtime_file(&line_feed, b"lf-secret-prefix\nlf-secret-suffix", 0o400);
         cases.push(LoaderCase {
             label: "LF",
             path: line_feed,
             expected_diagnostic: "runtime secret must not contain newline or carriage return",
             secret_fragments: vec![b"lf-secret-prefix", b"lf-secret-suffix"],
-            run_as_runtime,
         });
-    } else {
-        eprintln!(
-            "HOST_UNAVAILABLE: mode/link-count/empty/NUL/CR/LF cases require uid 10001 or \
-             root chown/setuid authority; symlink/nonregular/owner cases still ran"
-        );
     }
 
     let results = cases
@@ -1868,6 +2223,13 @@ exit 99
         }
     }
     assert!(cleanup.is_ok(), "secret-loader fixture survived cleanup");
+
+    if namespace_mode.is_none() {
+        if euid == 10001 {
+            run_uid_namespace_child("wrong-owner", 10002);
+        }
+        run_uid_namespace_child("runtime-owner", 10001);
+    }
 }
 
 #[test]
@@ -1938,7 +2300,7 @@ fn identity_loader_enforces_role_minimal_authority_keys_and_exact_hex_without_ec
         assert!(
             output.status.success(),
             "valid {role} identity failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            supervisor_failure(&output)
         );
         assert_eq!(output.stdout, b"IDENTITY_LOADED\n");
     }
@@ -2179,7 +2541,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         return;
     }
     if !timeout_available() {
-        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound exact executor smoke");
+        unavailable_host("GNU timeout is required to bound exact executor smoke");
         return;
     }
     if !bounded_docker_output(
@@ -2190,7 +2552,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
     .status
     .success()
     {
-        eprintln!("HOST_UNAVAILABLE: Docker daemon cannot run exact executor smoke");
+        unavailable_host("Docker daemon cannot run exact executor smoke");
         return;
     }
     let _guard = HOST_FIXTURE_LOCK
@@ -2222,7 +2584,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         assert!(
             build.status.success(),
             "exact executor image build failed or exceeded its bound: {}",
-            String::from_utf8_lossy(&build.stderr)
+            supervisor_failure(&build)
         );
 
         std::fs::write(
@@ -2255,7 +2617,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         assert!(
             setup.status.success(),
             "owned executor fixture setup failed: {}",
-            String::from_utf8_lossy(&setup.stderr)
+            supervisor_failure(&setup)
         );
 
         let seccomp = format!(
@@ -2302,7 +2664,7 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         assert!(
             start.status.success(),
             "exact executor container failed to start: {}",
-            String::from_utf8_lossy(&start.stderr)
+            supervisor_failure(&start)
         );
 
         let socket = smoke.root.join("executor/executor.sock");
@@ -2602,6 +2964,135 @@ fn supervisor_rejects_noncanonical_paid_before_touching_docker() {
 }
 
 #[test]
+fn reconcile_keeps_active_epoch_when_prepare_one_shots_remain() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("reconcile-orphan-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    let script = r#"#!/bin/bash
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version")
+    exit 0
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'cccccccccccc\tbroker\trunning\n'
+    printf 'dddddddddddd\tallocator\texited\n'
+    printf 'eeeeeeeeeeee\tprepare\texited\n'
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml down --remove-orphans"*)
+    touch "$SUMI_FAKE_REAPED"
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    exit 0
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    exit 0
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+"#;
+    std::fs::write(&fake_docker, script).unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = root.join("docker.log");
+    let reaped = root.join("reaped");
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut command = fixture.supervisor_command();
+    command
+        .arg("reconcile")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_DOCKER_LOG", &log)
+        .env("SUMI_FAKE_REAPED", &reaped);
+    launch_runtime_env(&mut command, &fixture);
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "reconcile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !reaped.exists(),
+        "reconcile reaped a healthy active epoch because completed setup roles remained: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(r#""phase":"active","generation":7"#),
+        "reconcile did not preserve the active epoch: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !calls.contains("compose.lifecycle.yaml down --remove-orphans"),
+        "active epoch unexpectedly entered destructive reconciliation: {calls}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn inspect_epoch_returns_recovery_when_any_long_lived_role_is_missing() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("inspect-missing-role-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    let script = r#"#!/bin/bash
+case "$*" in
+  "compose version")
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\truntime\trunning\n'
+    printf 'bbbbbbbbbbbb\texecutor\trunning\n'
+    printf 'dddddddddddd\tallocator\texited\n'
+    printf 'eeeeeeeeeeee\tprepare\texited\n'
+    ;;
+  *"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=fixture-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+"#;
+    std::fs::write(&fake_docker, script).unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut command = fixture.supervisor_command();
+    command
+        .arg("inspect-epoch")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()));
+    launch_runtime_env(&mut command, &fixture);
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(r#""phase":"recovery","generation":7"#),
+        "a missing long-lived role was reported as active: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;
@@ -2612,39 +3103,38 @@ fn replacement_lifecycle_joins_old_project_before_starting_new_generation() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = root.join("docker.log");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
         .env("SUMI_FAKE_DOCKER_LOG", &log);
     launch_runtime_env(&mut command, &fixture);
     let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", supervisor_failure(&output));
 
     let calls = std::fs::read_to_string(&log).unwrap();
     let down = calls
         .find(&format!(
             "compose --project-name {} --file {} down",
             fixture.project,
-            deploy_dir().join("compose.lifecycle.yaml").display()
+            fixture
+                .deploy_dir()
+                .join("compose.lifecycle.yaml")
+                .display()
         ))
         .expect("old project must be stopped");
     let up = calls
         .find(&format!(
             "compose --project-name {} --file {} up",
             fixture.project,
-            deploy_dir().join("compose.prepare.yaml").display()
+            fixture.deploy_dir().join("compose.prepare.yaml").display()
         ))
         .expect("new project must be started");
     assert!(
@@ -2675,7 +3165,7 @@ fn competing_supervisor_invocation_fails_before_lifecycle_mutation() {
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -2714,24 +3204,20 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
     let fake_docker = bin.join("docker");
     std::fs::write(
         &fake_docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in *\"compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator\"*) printf 'SUMI_PERSONALITY_AGENT_ID=%s\\nSUMI_RPC_GENERATION=0\\nSUMI_RPC_NONCE=fixture-nonce\\n' \"$SUMI_PERSONALITY_AGENT_ID\" ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = root.join("docker.log");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut up = Command::new(deploy_dir().join("supervisor"));
+    let mut up = fixture.supervisor_command();
     up.arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
         .env("SUMI_FAKE_DOCKER_LOG", &log);
     launch_runtime_env(&mut up, &fixture);
     let output = up.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", supervisor_failure(&output));
 
     for (action, expected) in [
         ("stop", "down --remove-orphans"),
@@ -2740,7 +3226,7 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
         ("down", "down --remove-orphans"),
     ] {
         std::fs::write(&log, b"").unwrap();
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .env_clear()
             .arg(action)
@@ -2757,19 +3243,22 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
         assert!(
             output.status.success(),
             "{action} required removed launch configuration: {}",
-            String::from_utf8_lossy(&output.stderr)
+            supervisor_failure(&output)
         );
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
             calls.contains(&format!(
                 "--project-name {} --file {} {expected}",
                 fixture.project,
-                deploy_dir().join("compose.lifecycle.yaml").display()
+                fixture
+                    .deploy_dir()
+                    .join("compose.lifecycle.yaml")
+                    .display()
             )),
             "unexpected {action} calls: {calls}"
         );
         assert!(
-            !calls.contains(deploy_dir().join("compose.yaml").to_str().unwrap()),
+            !calls.contains(fixture.deploy_dir().join("compose.yaml").to_str().unwrap()),
             "{action} evaluated the secret-bearing launch descriptor"
         );
     }
@@ -2809,7 +3298,7 @@ fn read_only_supervisor_actions_do_not_require_the_host_mutation_lock() {
         assert!(
             output.status.success(),
             "{action} required or created the host mutation lock: {}",
-            String::from_utf8_lossy(&output.stderr)
+            supervisor_failure(&output)
         );
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(calls.contains("compose version"));
@@ -2865,7 +3354,7 @@ esac
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut logs = Command::new(deploy_dir().join("supervisor"));
+    let mut logs = fixture.supervisor_command();
     logs.arg("logs")
         .arg("-f")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -2881,7 +3370,7 @@ esac
     }
     let logs_started = markers.join("logs-started").exists();
 
-    let mut stop = Command::new(deploy_dir().join("supervisor"));
+    let mut stop = fixture.supervisor_command();
     stop.arg("stop")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
         .env("SUMI_FAKE_MARKERS", &markers)
@@ -2913,6 +3402,10 @@ esac
     }
     if stop_status.is_none() {
         stop_status = wait_for_child_exit(&mut stop, Duration::from_secs(5));
+    } else {
+        // `try_wait` reaps the child; `wait` is idempotent and makes that
+        // ownership settlement explicit on every control-flow path.
+        let _ = stop.wait();
     }
     if stop_status.is_none() {
         let _ = stop.kill();
@@ -3000,6 +3493,14 @@ case "$*" in
     done
     exit 0
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in allocator prepare runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
@@ -3020,7 +3521,7 @@ esac
     let log = root.join("docker.log");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3041,7 +3542,7 @@ esac
             "partial {role} survived failure cleanup"
         );
     }
-    assert!(markers.join("cleanup-lock-held").exists());
+    assert_marker(&markers, "cleanup-lock-held");
     assert!(!markers.join("cleanup-lock-missing").exists());
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("cleanup incomplete"),
@@ -3112,6 +3613,14 @@ case "$*" in
     fi
     exit 88
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'aaaaaaaaaaaa\t%s\texited\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.lifecycle.yaml ps --all --quiet")
     printf '%s %s\n' "$SUMI_CLEANUP_SENTINEL" "$SUMI_PROVIDER_API_KEY" >&2
     for role in allocator prepare runtime executor broker; do
@@ -3141,7 +3650,7 @@ esac
         std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log = root.join("docker.log");
 
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .arg("prepare")
             .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3177,7 +3686,7 @@ esac
             expect_diagnostic,
             "unexpected {mode} cleanup diagnostic: {stderr}"
         );
-        assert!(markers.join("cleanup-lock-held").exists());
+        assert_marker(&markers, "cleanup-lock-held");
         assert!(!markers.join("cleanup-lock-missing").exists());
         assert_eq!(
             std::fs::read_to_string(markers.join("cleanup-attempts"))
@@ -3205,10 +3714,10 @@ esac
         assert_eq!(
             calls
                 .lines()
-                .filter(|line| line.contains("compose.lifecycle.yaml ps --all --quiet"))
+                .filter(|line| line.contains("ps --all --filter label=com.docker.compose.project="))
                 .count(),
             cleanup_attempts,
-            "unexpected {mode} verification attempts: {calls}"
+            "unexpected {mode} long-lived epoch checks: {calls}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3231,6 +3740,13 @@ fn interrupted_up_joins_partial_roles_and_returns_signal_status() {
         std::fs::create_dir_all(&markers).unwrap();
         let fake_docker = bin.join("docker");
         let script = r#"#!/bin/bash -p
+# The supervisor control socket is never Docker/plugin authority.
+[[ ! -e /proc/$$/fd/3 ]] || exit 96
+# Every idle loop below waits on a backgrounded sleep. Bash defers a trap until
+# the running foreground command returns, so `sleep 1` in the foreground would
+# make this fake answer SIGTERM up to a second late per level for reasons that
+# have nothing to do with the supervisor, and a loaded host would then see the
+# supervisor's escalation to SIGKILL as a lost signal contract.
 background_pid=
 trap '[[ -z "$background_pid" ]] || wait "$background_pid" 2>/dev/null || true; touch "$SUMI_FAKE_MARKERS/compose-child-terminated"; exit 143' TERM
 trap '[[ -z "$background_pid" ]] || wait "$background_pid" 2>/dev/null || true; touch "$SUMI_FAKE_MARKERS/compose-child-interrupted"; exit 130' INT
@@ -3262,8 +3778,15 @@ case "$*" in
     done
     exit 0
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    for role in runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.prepare.yaml up --detach --wait")
-    touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
       "$SUMI_FAKE_MARKERS/runtime" \
       "$SUMI_FAKE_MARKERS/executor" \
@@ -3271,11 +3794,17 @@ case "$*" in
     (
       trap 'touch "$SUMI_FAKE_MARKERS/compose-grandchild-terminated"; exit 0' TERM
       trap 'touch "$SUMI_FAKE_MARKERS/compose-grandchild-interrupted"; exit 0' INT
-      while true; do sleep 1; done
+      while true; do sleep 1 & wait $!; done
     ) &
     background_pid=$!
     printf '%s\n' "$background_pid" > "$SUMI_FAKE_MARKERS/compose-grandchild-pid"
-    while true; do sleep 1; done
+    # The test signals the supervisor the moment this marker appears, so it
+    # must mean the whole tracked group exists. Announcing the up phase before
+    # the fork let a loaded host take the signal in between, and the assertion
+    # about the grandchild then failed against a grandchild that was never
+    # started -- a race in the fixture, read as a lost signal contract.
+    touch "$SUMI_FAKE_MARKERS/up-attempted"
+    while true; do sleep 1 & wait $!; done
     ;;
   *)
     exit 94
@@ -3287,7 +3816,7 @@ esac
 
         let bash_env = root.join("bash_env");
         std::fs::write(&bash_env, "set -m\n").unwrap();
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .arg("prepare")
             .process_group(0)
@@ -3324,10 +3853,10 @@ esac
             }
         };
         assert_eq!(status.code(), Some(expected_status));
-        assert!(markers.join("compose-child-terminated").exists());
-        assert!(markers.join("compose-grandchild-terminated").exists());
-        assert!(markers.join("cleanup-complete").exists());
-        assert!(markers.join("cleanup-lock-held").exists());
+        assert_marker(&markers, "compose-child-terminated");
+        assert_marker(&markers, "compose-grandchild-terminated");
+        assert_marker(&markers, "cleanup-complete");
+        assert_marker(&markers, "cleanup-lock-held");
         assert!(!markers.join("cleanup-lock-missing").exists());
         let grandchild_pid = std::fs::read_to_string(markers.join("compose-grandchild-pid"))
             .unwrap()
@@ -3355,7 +3884,21 @@ fn tracked_launch_fails_closed_when_the_child_is_not_a_session_group_leader() {
     let markers = root.join("markers");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&markers).unwrap();
-    std::fs::write(bin.join("setsid"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::write(
+        bin.join("setsid"),
+        r#"#!/bin/bash
+case "$*" in
+  *"compose.prepare.yaml up --detach --wait"*)
+    touch "$SUMI_FAKE_MARKERS/up-attempted"
+    exec "$@"
+    ;;
+  *)
+    exec /usr/bin/setsid "$@"
+    ;;
+esac
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(bin.join("setsid"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let fake_docker = bin.join("docker");
     let script = r#"#!/bin/bash
@@ -3379,9 +3922,12 @@ case "$*" in
   *"compose.lifecycle.yaml ps --all --quiet")
     [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]]
     ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]] || printf 'fake-container-runtime\n'
+    ;;
   *"compose.prepare.yaml up --detach --wait")
-    touch "$SUMI_FAKE_MARKERS/up-attempted" "$SUMI_FAKE_MARKERS/runtime"
-    while true; do sleep 1; done
+    touch "$SUMI_FAKE_MARKERS/runtime"
+    while true; do sleep 1 & wait $!; done
     ;;
   *)
     exit 95
@@ -3391,7 +3937,7 @@ esac
     std::fs::write(&fake_docker, script).unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("prepare")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3400,9 +3946,9 @@ esac
     launch_runtime_env(&mut command, &fixture);
     let output = command.output().unwrap();
     assert_eq!(output.status.code(), Some(125));
-    assert!(markers.join("up-attempted").exists());
-    assert!(markers.join("cleanup-complete").exists());
-    assert!(markers.join("cleanup-lock-held").exists());
+    assert_marker(&markers, "up-attempted");
+    assert_marker(&markers, "cleanup-complete");
+    assert_marker(&markers, "cleanup-lock-held");
     assert!(!markers.join("cleanup-lock-missing").exists());
     assert!(!markers.join("runtime").exists());
     let _ = std::fs::remove_dir_all(root);
@@ -3431,7 +3977,7 @@ fn validate_error_redacts_combined_compose_output() {
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
         "provider-sentinel-not-for-output",
     ];
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3535,7 +4081,7 @@ fn supervisor_rejects_reserved_or_role_colliding_local_control_gids() {
     let inherited_path = std::env::var("PATH").unwrap_or_default();
 
     for gid in ["0", "999", "65534", "10001", "10020"] {
-        let mut command = Command::new(deploy_dir().join("supervisor"));
+        let mut command = fixture.supervisor_command();
         command
             .arg("validate")
             .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3551,7 +4097,7 @@ fn supervisor_rejects_reserved_or_role_colliding_local_control_gids() {
         );
     }
 
-    let mut wrong_uid = Command::new(deploy_dir().join("supervisor"));
+    let mut wrong_uid = fixture.supervisor_command();
     wrong_uid
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()));
@@ -3586,7 +4132,7 @@ fn supervisor_requires_explicit_local_control_socket_gid_before_lifecycle_mutati
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3627,7 +4173,7 @@ fn local_control_path_swap_is_detected_before_validation_succeeds() {
     .unwrap();
     std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut command = Command::new(deploy_dir().join("supervisor"));
+    let mut command = fixture.supervisor_command();
     command
         .arg("validate")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
@@ -3643,20 +4189,34 @@ fn local_control_path_swap_is_detected_before_validation_succeeds() {
 
 #[test]
 fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
-    if Command::new("docker")
-        .arg("info")
-        .output()
-        .map_or(true, |output| !output.status.success())
-    {
-        eprintln!("HOST_UNAVAILABLE: docker daemon cannot run prepare capability gate");
+    if !timeout_available() {
+        unavailable_host("GNU timeout is required to bound the prepare capability gate");
         return;
     }
-    if Command::new("docker")
-        .args(["image", "inspect", "debian:bookworm-slim"])
-        .output()
-        .map_or(true, |output| !output.status.success())
+    let deploy = deploy_dir();
+    let docker_workdir = deploy.parent().unwrap().parent().unwrap();
+    if !bounded_docker_output(docker_workdir, 30, &["info".into()])
+        .status
+        .success()
     {
-        eprintln!("HOST_UNAVAILABLE: cached debian:bookworm-slim image is unavailable");
+        unavailable_host("docker info did not succeed within 30s for the prepare capability gate");
+        return;
+    }
+    if !bounded_docker_output(
+        docker_workdir,
+        30,
+        &[
+            "image".into(),
+            "inspect".into(),
+            "debian:bookworm-slim".into(),
+        ],
+    )
+    .status
+    .success()
+    {
+        unavailable_host(
+            "cached debian:bookworm-slim image is unavailable for the prepare capability gate",
+        );
         return;
     }
 
@@ -3692,7 +4252,7 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
     assert!(
         setup.status.success(),
         "fixture setup failed: {}",
-        String::from_utf8_lossy(&setup.stderr)
+        supervisor_failure(&setup)
     );
 
     let script_mount = format!("{}:/usr/local/bin/sumi-entrypoint:ro", entrypoint.display());
@@ -3741,7 +4301,7 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
     assert!(
         output.status.success(),
         "prepare failed under declared caps: {}",
-        String::from_utf8_lossy(&output.stderr)
+        supervisor_failure(&output)
     );
     assert!(!root.join("executor/executor.sock").exists());
     assert!(!root.join("broker/broker.sock").exists());
@@ -3779,14 +4339,14 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
 fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
     let version = Command::new("docker").args(["compose", "version"]).output();
     let Ok(version) = version else {
-        eprintln!("HOST_UNAVAILABLE: docker executable is not installed");
+        unavailable_host("docker executable is not installed");
         return;
     };
     if !version.status.success() {
-        eprintln!(
-            "HOST_UNAVAILABLE: Docker Compose v2 is unavailable: {}",
+        unavailable_host(&format!(
+            "Docker Compose v2 is unavailable: {}",
             String::from_utf8_lossy(&version.stderr)
-        );
+        ));
         return;
     }
 
@@ -3824,7 +4384,7 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
         assert!(
             output.status.success(),
             "docker compose config failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            supervisor_failure(&output)
         );
         let rendered: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(rendered["name"].as_str(), Some(project));
@@ -3916,7 +4476,7 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
         assert!(
             exact_model.status.success(),
             "docker compose config with exact model failed: {}",
-            String::from_utf8_lossy(&exact_model.stderr)
+            supervisor_failure(&exact_model)
         );
         let exact_model: serde_json::Value = serde_json::from_slice(&exact_model.stdout).unwrap();
         assert_eq!(
@@ -3944,7 +4504,7 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
         assert!(
             lifecycle.status.success(),
             "non-secret lifecycle descriptor failed: {}",
-            String::from_utf8_lossy(&lifecycle.stderr)
+            supervisor_failure(&lifecycle)
         );
     }
 }
@@ -3952,7 +4512,7 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
 #[test]
 fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
     if !timeout_available() {
-        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound Docker acceptance");
+        unavailable_host("GNU timeout is required to bound Docker acceptance");
         return;
     }
     let output = bounded_docker_output(
@@ -3965,10 +4525,10 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
         ],
     );
     if !output.status.success() {
-        eprintln!(
-            "HOST_UNAVAILABLE: docker daemon cannot be used: {}",
+        unavailable_host(&format!(
+            "docker daemon cannot be used: {}",
             String::from_utf8_lossy(&output.stderr)
-        );
+        ));
         return;
     }
     if std::env::var_os("SUMI_DEPLOYMENT_DOCKER_ACCEPTANCE").is_none() {
@@ -3985,17 +4545,15 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
     };
     let body = catch_unwind(AssertUnwindSafe(|| {
         if !security_options.contains("apparmor") {
-            eprintln!(
-                "HOST_UNAVAILABLE: Docker is running without AppArmor; direct UUID-scoped \
-                 Compose cleanup was exercised, but container mount/network/UID behavior remains \
-                 an explicit Docker/AppArmor host gate"
+            unavailable_host(
+                "Docker is running without AppArmor; direct UUID-scoped Compose cleanup was exercised, but container mount/network/UID behavior remains an explicit Docker/AppArmor host gate",
             );
             return;
         }
 
         let expected_project = format!("sumi-{}", fixture.paid.replace('-', ""));
         assert_eq!(fixture.project, expected_project);
-        let supervisor = deploy_dir().join("supervisor");
+        let supervisor = fixture.supervisor.clone();
         let mut project_name = Command::new("timeout");
         project_name
             .args(["--preserve-status", "30s"])
@@ -4022,7 +4580,7 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
         assert!(
             prepared.status.success(),
             "real deployment prepare failed: {}",
-            String::from_utf8_lossy(&prepared.stderr)
+            supervisor_failure(&prepared)
         );
         let prepared_epoch: JsonValue =
             serde_json::from_slice(&prepared.stdout).expect("prepared epoch JSON");
@@ -4045,6 +4603,28 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
         let output = activate
             .output()
             .expect("activate owned Docker/AppArmor acceptance");
+        let mut inspect = Command::new("timeout");
+        inspect
+            .args(["--preserve-status", "60s"])
+            .arg(&supervisor)
+            .arg("inspect-epoch");
+        launch_owned_acceptance_env(&mut inspect, &fixture);
+        let inspect = inspect
+            .output()
+            .expect("inspect activated Docker/AppArmor epoch");
+        let setup_container_ids = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "ps".into(),
+                "--all".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("label=com.docker.compose.project={}", fixture.project),
+                "--filter".into(),
+                "label=com.docker.compose.service=allocator".into(),
+            ],
+        );
         let runtime_id = bounded_docker_output(
             deploy_dir().parent().unwrap().parent().unwrap(),
             30,
@@ -4105,12 +4685,30 @@ done
         assert!(
             stop.status.success(),
             "real deployment cleanup failed: {}",
-            String::from_utf8_lossy(&stop.stderr)
+            supervisor_failure(&stop)
         );
         assert!(
             output.status.success(),
             "real deployment failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            supervisor_failure(&output)
+        );
+        assert!(
+            inspect.status.success(),
+            "inspect after real prepare -> activate failed: {}",
+            supervisor_failure(&inspect)
+        );
+        let inspected_epoch: JsonValue =
+            serde_json::from_slice(&inspect.stdout).expect("active epoch JSON");
+        assert_eq!(inspected_epoch["phase"].as_str(), Some("active"));
+        assert_eq!(inspected_epoch["generation"].as_u64(), Some(generation));
+        assert_eq!(inspected_epoch["rpc_boot_nonce"].as_str(), Some(nonce));
+        assert!(
+            setup_container_ids.status.success()
+                && !String::from_utf8_lossy(&setup_container_ids.stdout)
+                    .trim()
+                    .is_empty(),
+            "prepare's completed allocator container did not remain for the active-epoch assertion: {}",
+            String::from_utf8_lossy(&setup_container_ids.stderr)
         );
         assert!(
             runtime_id.status.success() && !runtime_id_text.is_empty(),
@@ -4120,7 +4718,7 @@ done
         assert!(
             runtime_inspect.status.success(),
             "cannot inspect exact runtime container: {}",
-            String::from_utf8_lossy(&runtime_inspect.stderr)
+            supervisor_failure(&runtime_inspect)
         );
         let runtime_inspect: JsonValue =
             serde_json::from_slice(&runtime_inspect.stdout).expect("runtime inspect JSON");
@@ -4158,7 +4756,7 @@ done
         assert!(
             secret_metadata.status.success(),
             "runtime secret metadata/readability contract failed: {}",
-            String::from_utf8_lossy(&secret_metadata.stderr)
+            supervisor_failure(&secret_metadata)
         );
     }));
     let cleanup = cleanup_owned_compose_resources(&fixture).and_then(|()| fixture.cleanup());
@@ -4174,4 +4772,66 @@ fn scripts_are_executable() {
         let mode = std::fs::metadata(&script).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "{} is not executable", script.display());
     }
+}
+
+/// A green run is compatible with a fixture that never provisioned anything, so
+/// one test makes "the deployment fixture actually ran" a checked property
+/// rather than something a reader has to infer from `--nocapture` output.
+#[test]
+fn deployment_fixture_provisions_private_anchors_or_says_why_it_did_not() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        // `HostTrustFixture::new` only returns None under the explicit opt-in,
+        // and it has already counted and named the skip on stderr.
+        assert!(
+            fixture_skip_is_opted_in(),
+            "the fixture reported unavailable without the opt-in that permits it"
+        );
+        return;
+    };
+    let private_run_root = fixture.fixture_root.join("run/sumi");
+
+    // Root-owned anchors the supervisor will validate, created inside the
+    // container rather than by the test uid.
+    for anchor in [
+        &private_run_root,
+        &private_run_root.join("supervisor-locks"),
+    ] {
+        let metadata = std::fs::metadata(anchor)
+            .unwrap_or_else(|error| panic!("{} was never provisioned: {error}", anchor.display()));
+        assert!(metadata.is_dir(), "{} is not a directory", anchor.display());
+        assert_eq!(metadata.uid(), 0, "{} is not root owned", anchor.display());
+        assert_eq!(
+            metadata.permissions().mode() & 0o022,
+            0,
+            "{} is group or world writable",
+            anchor.display()
+        );
+    }
+
+    // The per-PAID trust the supervisor requires, owned by the test peer.
+    let lock = std::fs::metadata(&fixture.lock_path).expect("per-PAID supervisor lock");
+    assert_eq!(lock.uid(), unsafe { libc::geteuid() });
+    assert_eq!(lock.permissions().mode() & 0o7777, 0o600);
+    let control_dir = std::fs::metadata(fixture.control_socket.parent().unwrap())
+        .expect("per-PAID local-control directory");
+    assert_eq!(control_dir.uid(), unsafe { libc::geteuid() });
+    assert_eq!(control_dir.gid(), fixture.control_gid);
+    assert_eq!(control_dir.permissions().mode() & 0o7777, 0o750);
+
+    // The supervisor under test is the private copy, and it is rooted here.
+    assert!(
+        fixture.supervisor.starts_with(&fixture.fixture_root),
+        "the fixture is running the published supervisor: {}",
+        fixture.supervisor.display()
+    );
+    let private_source = std::fs::read_to_string(&fixture.supervisor).unwrap();
+    assert!(
+        host_root_references_are_all_private(&private_source, &fixture.fixture_root),
+        "the supervisor under test still references the host trust root"
+    );
+
+    // `unavailable_host()` is the non-tautological check that this fixture was
+    // provisioned: without its explicit opt-in it asserts instead of returning.
+    // Nothing above touched the live host anchors.
+    fixture.assert_host_anchors_intact("fixture self-check");
 }

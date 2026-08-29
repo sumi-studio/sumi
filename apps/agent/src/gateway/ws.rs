@@ -58,6 +58,10 @@ impl WebSocketConnector {
     /// The URL must use `ws://` and a literal `127.0.0.0/8` or `::1` host.
     /// Hostnames (including `localhost`) and non-loopback IPs are rejected
     /// before any bearer credential can be added to a request.
+    #[allow(
+        dead_code,
+        reason = "explicit insecure loopback construction is retained for transport boundary tests"
+    )]
     pub fn new_loopback_insecure(
         url: impl Into<String>,
         digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,

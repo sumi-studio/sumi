@@ -8,7 +8,6 @@ import {
   useState,
 } from "react";
 import { isImeComposing } from "../../lib/ime";
-import { secureRandomUUID } from "../../lib/random-uuid";
 import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import type { PlaceKey, ThreadSummary } from "../model";
 import { participantKey, placeKey } from "../model";
@@ -109,7 +108,6 @@ function CreateThreadForm({
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const creatingRef = useRef(false);
-  const createNonceRef = useRef<string | null>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -124,14 +122,11 @@ function CreateThreadForm({
     ) {
       return;
     }
-    const nonce = createNonceRef.current ?? secureRandomUUID();
-    createNonceRef.current = nonce;
     creatingRef.current = true;
     setCreating(true);
     setError(null);
     try {
-      const key = await createThread(parentKey, trimmed, null, nonce);
-      createNonceRef.current = null;
+      const key = await createThread(parentKey, trimmed, null);
       onDone(key);
     } catch {
       setError("スレッドを作成できませんでした。再試行してください。");
@@ -154,7 +149,6 @@ function CreateThreadForm({
         value={name}
         disabled={creating}
         onChange={(event) => {
-          createNonceRef.current = null;
           setError(null);
           setName(
             clampCodePoints(event.target.value, THREAD_NAME_MAX_CODE_POINTS),

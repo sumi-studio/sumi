@@ -176,6 +176,13 @@ pub(crate) struct MessagingAttachmentMetadata {
     pub size_bytes: u64,
     pub sha256: String,
     pub position: u8,
+    /// The sender asked the receiving side to keep this covered until the
+    /// reader opens it. It is carried, never inferred: the agent has to know
+    /// what a human's screen is hiding before it says anything about the file.
+    pub spoiler: bool,
+    /// The sender's description of the content, for whoever cannot or should
+    /// not see it yet. Empty when the sender wrote none.
+    pub alt: String,
 }
 
 /// Metadata proven by the authorized byte response. Position belongs to the
@@ -226,7 +233,7 @@ pub(crate) fn canonical_attachment_filename(source: &str) -> String {
     };
     let mut name = base
         .chars()
-        .filter(|character| !(*character < '\u{20}' || *character == '\u{7f}'))
+        .filter(|character| !forbidden_attachment_display_character(*character))
         .collect::<String>();
     name = name.trim().to_owned();
     if name.is_empty() || matches!(name.as_str(), "." | ".." | "/") {
@@ -240,6 +247,24 @@ pub(crate) fn canonical_attachment_filename(source: &str) -> String {
     } else {
         name
     }
+}
+
+/// Keep agent metadata aligned with the API/web display-text gate: C0/C1
+/// controls (including NEL), Unicode line/paragraph separators, bidi controls,
+/// and zero-width format controls never enter sender-controlled display text.
+pub(crate) fn forbidden_attachment_display_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +289,68 @@ pub(crate) struct SetMessagingStatusRequest<'a> {
     /// status until it is replaced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_minutes: Option<u32>,
+}
+
+/// One person named the way the overview already showed them. The agent copies
+/// a participant object rather than assembling a new identifier, so it can only
+/// name people it has actually seen.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingParticipant {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_agent_id: Option<String>,
+}
+
+/// Opening a direct conversation.  One participant reaches the single dm with
+/// that person; several open a group dm.  There is no field for who is asking:
+/// the transport's credential decides, as the human session does.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartMessagingDMRequest<'a> {
+    pub participants: &'a [MessagingParticipant],
+    /// Group DMs create a new place, so an indeterminate retry must identify
+    /// the original creation. A one-to-one DM already has a canonical pair
+    /// key on the server and consequently needs no nonce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_nonce: Option<&'a str>,
+}
+
+/// Opening a channel.  There is no workspace field: the sealed scope already
+/// names exactly one Workspace's Messaging installation.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingChannelRequest<'a> {
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<&'a str>,
+    pub voice: bool,
+    pub client_nonce: &'a str,
+}
+
+/// Editing a channel's mutable identity.  An omitted field is left alone, so a
+/// rename can never be the reason a topic disappeared.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateMessagingChannelRequest<'a> {
+    pub place_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<&'a str>,
+}
+
+/// Copying a channel's shape into a new, empty one.  An omitted name takes the
+/// server's derived default, so no client decides what a copy is called.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DuplicateMessagingChannelRequest<'a> {
+    pub place_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    pub client_nonce: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +386,45 @@ pub(crate) struct ReadMessagingThroughRequest<'a> {
 pub(crate) struct GetMessagingCallStateRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place_id: Option<&'a str>,
+}
+
+/// Search only messages already visible to the authenticated participant.
+/// Visibility and optional place scoping are enforced by Messaging itself.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchMessagingRequest<'a> {
+    pub query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationPlace<'a> {
+    pub place_id: &'a str,
+    pub level: &'a str,
+}
+
+/// Read or partially update the authenticated participant's notification
+/// setting. No fields means read; fields that are absent must stay absent on
+/// the wire so the server can preserve their current values.
+#[derive(Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationSettingsRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults_level: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_place: Option<Vec<MessagingNotificationPlace<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<&'a str>>,
+}
+
+impl MessagingNotificationSettingsRequest<'_> {
+    pub(crate) const fn changes_setting(&self) -> bool {
+        self.defaults_level.is_some() || self.per_place.is_some() || self.keywords.is_some()
+    }
 }
 
 #[async_trait]
@@ -357,6 +483,30 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<Value>;
 
+    async fn start_dm(
+        &self,
+        scope: &ExactMessagingScope,
+        request: StartMessagingDMRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn create_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingChannelRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn update_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: UpdateMessagingChannelRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn duplicate_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: DuplicateMessagingChannelRequest<'_>,
+    ) -> Result<Value>;
+
     async fn reply_later(
         &self,
         scope: &ExactMessagingScope,
@@ -380,11 +530,23 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         scope: &ExactMessagingScope,
         request: GetMessagingCallStateRequest<'_>,
     ) -> Result<Value>;
+
+    async fn search(
+        &self,
+        scope: &ExactMessagingScope,
+        request: SearchMessagingRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn notification_settings(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<Value>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_attachment_filename;
+    use super::{canonical_attachment_filename, forbidden_attachment_display_character};
 
     #[test]
     fn attachment_filename_canonicalization_matches_the_go_wire_contract() {
@@ -395,6 +557,9 @@ mod tests {
             ("a/b/..", "file"),
             ("///", "file"),
             ("\u{0001}hello\u{007f}.txt", "hello.txt"),
+            ("before\u{0085}after.txt", "beforeafter.txt"),
+            ("before\u{2028}after\u{2029}end.txt", "beforeafterend.txt"),
+            ("before\u{202e}after\u{200b}end.txt", "beforeafterend.txt"),
             ("\u{2003}wide\u{2003}", "wide"),
             ("", "file"),
             (".", "file"),
@@ -409,7 +574,18 @@ mod tests {
 
         let multibyte = "é".repeat(128);
         let bounded = canonical_attachment_filename(&multibyte);
-        assert_eq!(bounded.as_bytes().len(), 254);
+        assert_eq!(bounded.len(), 254);
         assert_eq!(bounded, "é".repeat(127));
+    }
+
+    #[test]
+    fn attachment_display_character_set_covers_controls_bidi_and_zero_width() {
+        for character in ['\u{0085}', '\u{2028}', '\u{2029}', '\u{202e}', '\u{200b}'] {
+            assert!(
+                forbidden_attachment_display_character(character),
+                "{character:?}"
+            );
+        }
+        assert!(!forbidden_attachment_display_character('名'));
     }
 }

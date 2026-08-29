@@ -84,6 +84,9 @@ export function MessageSearch({
   }) => void;
 }) {
   const searchMessages = useMessaging((state) => state.searchMessages);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
   const threadsById = useMessaging((state) => state.threadsById);
@@ -154,6 +157,21 @@ export function MessageSearch({
     },
     [],
   );
+
+  // Search results contain snippets and routes from one authorization
+  // session. Changing authority must synchronously make that state unusable,
+  // including any debounce or response still in flight.
+  useEffect(() => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+    requestID.current += 1;
+    composing.current = false;
+    setOpen(false);
+    setQuery("");
+    setResults(null);
+    setFailed(false);
+    setSearching(false);
+  }, [transportGeneration]);
 
   useEffect(() => {
     if (!open) return;
