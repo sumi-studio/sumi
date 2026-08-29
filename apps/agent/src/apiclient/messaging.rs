@@ -275,18 +275,66 @@ pub(crate) struct SetMessagingStatusRequest<'a> {
     pub expires_in_minutes: Option<u32>,
 }
 
-/// Declaring one's own 名乗り: the display name others see and the one line
-/// under it.  As with status there is no field for whose profile it is — the
-/// transport's credential decides — and an absent field is preserved rather
-/// than cleared, so naming only a tagline cannot silently drop the name.
-/// Naming neither field reads the current profile without changing it.
+/// One person named the way the overview already showed them. The agent copies
+/// a participant object rather than assembling a new identifier, so it can only
+/// name people it has actually seen.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingParticipant {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_agent_id: Option<String>,
+}
+
+/// Opening a direct conversation.  One participant reaches the single dm with
+/// that person; several open a group dm.  There is no field for who is asking:
+/// the transport's credential decides, as the human session does.
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MessagingProfileRequest<'a> {
+pub(crate) struct StartMessagingDMRequest<'a> {
+    pub participants: &'a [MessagingParticipant],
+    /// Group DMs create a new place, so an indeterminate retry must identify
+    /// the original creation. A one-to-one DM already has a canonical pair
+    /// key on the server and consequently needs no nonce.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<&'a str>,
+    pub client_nonce: Option<&'a str>,
+}
+
+/// Opening a channel.  There is no workspace field: the sealed scope already
+/// names exactly one Workspace's Messaging installation.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingChannelRequest<'a> {
+    pub name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tagline: Option<&'a str>,
+    pub topic: Option<&'a str>,
+    pub voice: bool,
+    pub client_nonce: &'a str,
+}
+
+/// Editing a channel's mutable identity.  An omitted field is left alone, so a
+/// rename can never be the reason a topic disappeared.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateMessagingChannelRequest<'a> {
+    pub place_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<&'a str>,
+}
+
+/// Copying a channel's shape into a new, empty one.  An omitted name takes the
+/// server's derived default, so no client decides what a copy is called.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DuplicateMessagingChannelRequest<'a> {
+    pub place_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    pub client_nonce: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -364,10 +412,28 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<Value>;
 
-    async fn profile(
+    async fn start_dm(
         &self,
         scope: &ExactMessagingScope,
-        request: MessagingProfileRequest<'_>,
+        request: StartMessagingDMRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn create_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingChannelRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn update_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: UpdateMessagingChannelRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn duplicate_channel(
+        &self,
+        scope: &ExactMessagingScope,
+        request: DuplicateMessagingChannelRequest<'_>,
     ) -> Result<Value>;
 
     async fn reply_later(
@@ -425,7 +491,7 @@ mod tests {
 
         let multibyte = "é".repeat(128);
         let bounded = canonical_attachment_filename(&multibyte);
-        assert_eq!(bounded.as_bytes().len(), 254);
+        assert_eq!(bounded.len(), 254);
         assert_eq!(bounded, "é".repeat(127));
     }
 

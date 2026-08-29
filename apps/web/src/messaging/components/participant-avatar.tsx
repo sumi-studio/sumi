@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import type { StatusKind } from "../model";
 
 /**
@@ -32,26 +31,16 @@ export function ParticipantAvatar({
   name,
   size = 32,
   status,
-  src,
 }: {
   participantKey: string;
   name: string;
   size?: number;
   status?: StatusKind;
-  /** 顔写真。無いときも読めなかったときもイニシャルへ落ちる。 */
-  src?: string;
 }) {
   const hue = hueFor(participantKey);
-  // 実体が消えた画像や404は「顔が無い」であって壊れた枠ではない。読めなかった
-  // URLだけを覚え、srcが差し替わったら改めて試す。
-  const [failedSrc, setFailedSrc] = useState<string | null>(null);
-  useEffect(() => {
-    setFailedSrc((failed) => (failed === src ? failed : null));
-  }, [src]);
-  const showImage = src !== undefined && src !== "" && src !== failedSrc;
   return (
     <span
-      className="relative inline-flex shrink-0 select-none items-center justify-center overflow-hidden rounded-full font-medium"
+      className="relative inline-flex shrink-0 select-none items-center justify-center rounded-full font-medium"
       style={{
         width: size,
         height: size,
@@ -61,16 +50,7 @@ export function ParticipantAvatar({
       }}
       aria-hidden
     >
-      {showImage ? (
-        <img
-          src={src}
-          alt=""
-          onError={() => setFailedSrc(src)}
-          className="size-full object-cover"
-        />
-      ) : (
-        name.slice(0, 1).toUpperCase()
-      )}
+      {name.slice(0, 1).toUpperCase()}
       {status ? (
         <span
           className={`absolute right-0 bottom-0 block rounded-full ring-2 ring-background ${STATUS_DOT[status]}`}

@@ -85,9 +85,12 @@ function setMembers() {
     statusByKey: {
       [agentKey]: {
         participant: agent,
+        revision: 1,
         status: "busy",
         note: "設計中",
         expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
       },
     },
     startDM,
@@ -492,10 +495,11 @@ describe("Sidebar のプロフィール導線", () => {
     useMessaging.setState({ setStatus });
     renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: "余白 対応可能" }));
-    fireEvent.click(screen.getByRole("radio", { name: /取り込み中/ }));
+    fireEvent.click(screen.getByRole("button", { name: "余白 未設定" }));
+    fireEvent.click(screen.getByRole("button", { name: "取り込み中" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "解除するまで" }));
 
-    expect(setStatus).toHaveBeenCalledWith("busy", "取り込み中");
+    expect(setStatus).toHaveBeenCalledWith("busy", "", null);
     expect(screen.queryByText("創業・デザイン")).not.toBeInTheDocument();
   });
 
@@ -525,7 +529,7 @@ describe("Sidebar のプロフィール導線", () => {
     );
 
     expect(
-      screen.getByRole("dialog", { name: "この場所の通知設定" }),
+      screen.getByRole("group", { name: "この場所のメニュー" }),
     ).toBeInTheDocument();
   });
 
@@ -535,8 +539,11 @@ describe("Sidebar のプロフィール導線", () => {
     allowNotifications();
     renderSidebar();
 
-    fireEvent.click(screen.getAllByRole("button", { name: "通知設定" })[0]);
-    const panel = screen.getByRole("dialog", { name: "この場所の通知設定" });
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+    fireEvent.click(screen.getByRole("button", { name: /通知設定/ }));
+    const panel = screen.getByRole("group", { name: "通知設定" });
     const target = within(panel).getByText("メンションのみ");
     const event = createEvent.contextMenu(target);
     fireEvent(target, event);
@@ -677,7 +684,7 @@ describe("カードの束縛と転送先", () => {
         onReply={vi.fn()}
         onReplyLater={vi.fn()}
         onToggleReaction={vi.fn()}
-        onCopyLink={vi.fn()}
+        onCopyLink={vi.fn().mockResolvedValue(true)}
         onEdit={vi.fn()}
         onDelete={vi.fn()}
         onJumpTo={vi.fn()}
@@ -685,6 +692,13 @@ describe("カードの束縛と転送先", () => {
         revealedAttachmentIds={new Set()}
         onRevealAttachment={vi.fn()}
         onOpenImage={vi.fn()}
+        editing={false}
+        editDraft=""
+        editConflict={null}
+        onEditDraftChange={vi.fn()}
+        onSubmitEdit={vi.fn()}
+        onCancelEdit={vi.fn()}
+        onReloadEditConflict={vi.fn()}
       />,
     );
 

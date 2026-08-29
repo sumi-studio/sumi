@@ -68,7 +68,7 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 
 	// First account: auto-registration mints a Human + Secretary.
 	first, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{
-		UID: "firebase-uid-aaa", DisplayName: "  First Human  ",
+		UID: "firebase-uid-aaa", DisplayName: "  First\nHuman  ",
 	})
 	if err != nil {
 		t.Fatalf("resolve first identity: %v", err)

@@ -34,9 +34,9 @@ vi.mock("./app-rail", async () => {
   };
 });
 
-import { RootLayout } from "../routes/__root";
 import { ApiMessagingBackend } from "../messaging/api-backend";
 import { bindMessagingSessionIdentity, useMessaging } from "../messaging/store";
+import { RootLayout } from "../routes/__root";
 import { useWorkspaceControl } from "../workspace/store";
 
 beforeEach(() => {
@@ -99,9 +99,10 @@ beforeEach(() => {
   vi.spyOn(ApiMessagingBackend.prototype, "subscribe").mockReturnValue(
     () => undefined,
   );
-  vi.spyOn(ApiMessagingBackend.prototype, "subscribeConnection").mockReturnValue(
-    () => undefined,
-  );
+  vi.spyOn(
+    ApiMessagingBackend.prototype,
+    "subscribeConnection",
+  ).mockReturnValue(() => undefined);
 });
 
 afterEach(() => {

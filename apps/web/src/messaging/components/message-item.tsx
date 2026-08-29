@@ -15,21 +15,44 @@ import {
   PopoverTrigger,
 } from "@sumi/ui/components/popover";
 import {
+  Check,
   Clock,
   CornerUpLeft,
   Link as LinkIcon,
   Pencil,
   SmilePlus,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
-import { memo, type ReactNode, useMemo } from "react";
+import {
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { emojiName } from "../emoji-data";
+import {
+  lockMessageActions,
+  releaseMessageActions,
+  useLockedMessageId,
+} from "../message-action-lock";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
+import {
+  noteEmojiUsed,
+  topRecentEmojis,
+  useRecentEmojis,
+} from "../recent-emoji";
+import { EmojiPicker } from "./emoji-picker";
 import {
   type ImageViewerRequest,
   MessageAttachments,
 } from "./message-attachments";
 import { MessageContent } from "./message-content";
+import { MessageEditor } from "./message-editor";
 import { conversationViewport, useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
@@ -45,8 +68,6 @@ const FULL_FORMAT = new Intl.DateTimeFormat("ja-JP", {
   hour: "2-digit",
   minute: "2-digit",
 });
-
-const REACTION_PALETTE = ["👍", "✅", "👀", "🙏", "🎉", "😄", "❤️", "🤔"];
 
 const REPLY_LATER_OPTIONS: { label: string; delayMs: number }[] = [
   { label: "30分後", delayMs: 30 * 60_000 },
@@ -128,7 +149,11 @@ function ReactionChips({
             key={reaction.emoji}
             type="button"
             title={names}
-            onClick={() => onToggleReaction(message, reaction.emoji)}
+            onClick={() => {
+              // 付けるときだけ「使った」に数える（外すのは使用ではない）。
+              if (!mine) noteEmojiUsed(reaction.emoji);
+              onToggleReaction(message, reaction.emoji);
+            }}
             className={`flex items-center gap-1 rounded-full border px-1.5 py-px text-[12px] transition-colors ${
               mine
                 ? "border-primary/40 bg-primary/10"
@@ -161,7 +186,8 @@ export interface MessageItemProps {
   onReply: (message: Message) => void;
   onReplyLater: (message: Message, delayMs: number) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
-  onCopyLink: (message: Message) => void;
+  /** コピーの成否を返す。UIはこの結果でだけ完了表示を出す。 */
+  onCopyLink: (message: Message) => Promise<boolean>;
   onEdit: (message: Message) => void;
   onDelete: (message: Message) => void;
   onJumpTo: (messageId: string) => void;
@@ -169,6 +195,22 @@ export interface MessageItemProps {
   revealedAttachmentIds: ReadonlySet<string>;
   onRevealAttachment: (attachmentId: string) => void;
   onOpenImage: (request: ImageViewerRequest) => void;
+  /** このメッセージをインライン編集中か。 */
+  editing: boolean;
+  /** 編集セッションの書きかけ本文。持ち主は行ではなくstore。 */
+  editDraft: string;
+  editConflict: { content: string; revision: number } | null;
+  editFailure?: string | null;
+  editSavedWithPendingChanges?: boolean;
+  editSaving?: boolean;
+  /** 編集欄を開いた回（editSession.openedToken）。行の再マウントで caret を奪わないための鍵。 */
+  editOpenedToken?: number | null;
+  onEditDraftChange: (content: string) => void;
+  onSubmitEdit: () => void;
+  onCancelEdit: () => void;
+  onReloadEditConflict: () => void;
+  /** このメッセージの削除要求が失敗した。送信失敗と同じく行に出す。 */
+  deleteFailed?: boolean;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -193,7 +235,20 @@ export const MessageItem = memo(function MessageItem({
   revealedAttachmentIds,
   onRevealAttachment,
   onOpenImage,
+  editing,
+  editDraft,
+  editConflict,
+  editFailure,
+  editSavedWithPendingChanges,
+  editSaving = false,
+  editOpenedToken = null,
+  onEditDraftChange,
+  onSubmitEdit,
+  onCancelEdit,
+  onReloadEditConflict,
+  deleteFailed = false,
 }: MessageItemProps) {
+  // パレット類はportalで一覧の外に出る。その上でのホイールは一覧へ渡す。
   const passthroughRef = useWheelPassthrough<HTMLDivElement>();
   const authorKey = participantKey(message.author);
   const author = membersByKey[authorKey];
@@ -216,21 +271,107 @@ export const MessageItem = memo(function MessageItem({
     [editedAt],
   );
 
+  // コピーの結果を短く出すための状態。押しただけでは何も言わない。
+  const [copyResult, setCopyResult] = useState<"done" | "failed" | null>(null);
+  const copyTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (copyTimer.current) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+  const copyLink = useCallback(() => {
+    void Promise.resolve(onCopyLink(message)).then((ok) => {
+      setCopyResult(ok ? "done" : "failed");
+      if (copyTimer.current) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(
+        () => setCopyResult(null),
+        ok ? 1_000 : 1_800,
+      );
+    });
+  }, [message, onCopyLink]);
+
+  // パネル（絵文字ピッカー・後で返信）の開閉はここ1か所に集約する。
+  // 開いている間はこのメッセージが操作の対象を握り、他の行のホバーで
+  // チップが移動しない。Popoverプリミティブを差し替えるときも、
+  // 触るのはこのopenPanelの受け渡しだけで済む。
+  const [openPanel, setOpenPanel] = useState<null | "reaction" | "replyLater">(
+    null,
+  );
+  const lockedId = useLockedMessageId();
+  const holdsTarget = lockedId === message.messageId;
+  // 他のメッセージがパネルを開いている間は、この行のホバー表示を出さない。
+  const suppressed = lockedId !== null && !holdsTarget;
+  const messageId = message.messageId;
+  useEffect(() => {
+    if (openPanel) lockMessageActions(messageId);
+    else releaseMessageActions(messageId);
+  }, [openPanel, messageId]);
+  // 行が消える（仮想リストのアンマウント・place切替）ときも必ず手放す。
+  useEffect(() => () => releaseMessageActions(messageId), [messageId]);
+
+  const recent = useRecentEmojis();
+  const quickEmojis = useMemo(() => topRecentEmojis(recent), [recent]);
+  const chooseEmoji = useCallback(
+    (emoji: string) => {
+      const mine = message.reactions.some(
+        (reaction) =>
+          reaction.emoji === emoji &&
+          reaction.participants.some(
+            (participant) => participantKey(participant) === selfKey,
+          ),
+      );
+      if (!mine) noteEmojiUsed(emoji);
+      onToggleReaction(message, emoji);
+      setOpenPanel(null);
+    },
+    [message, onToggleReaction, selfKey],
+  );
+
   return (
     <div
-      className={`group relative px-4 transition-colors hover:bg-accent/55 sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
+      className={`group relative px-4 transition-colors sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
+        suppressed ? "" : "hover:bg-accent"
+      } ${holdsTarget ? "bg-accent" : ""} ${
         mentionsSelf ? "bg-amber-500/6" : ""
       } ${pending && !failed ? "opacity-55" : ""}`}
     >
+      {/* 行の左端の目印。右端の操作チップだけでは対象行が読み取りにくいので、
+          本文側にも「今どの行に触れているか」を出す。 */}
+      <span
+        aria-hidden
+        className={`pointer-events-none absolute inset-y-0 left-0 w-0.5 transition-colors ${
+          holdsTarget
+            ? "bg-primary/50"
+            : suppressed
+              ? "bg-transparent"
+              : "bg-transparent group-focus-within:bg-primary/50 group-hover:bg-primary/50"
+        }`}
+      />
       {replyTarget && replyAuthor ? (
         <button
           type="button"
           onClick={() => onJumpTo(replyTarget.messageId)}
-          className="mb-0.5 ml-11 flex max-w-full items-center gap-1.5 truncate text-muted-foreground text-xs hover:text-foreground"
+          title={`${replyAuthor.displayName} の返信元へ移動`}
+          className="mb-0.5 flex w-full items-center gap-1.5 text-left text-[12px] text-muted-foreground hover:text-foreground"
         >
-          <CornerUpLeft className="size-3 shrink-0" />
-          <span className="font-medium">{replyAuthor.displayName}</span>
-          <span className="truncate">{replyTarget.content}</span>
+          {/* 本体アバターの中心から立ち上がるカギ線。返信引用・アバター・
+              投稿者名・本文を一つの階層として読ませるための繋ぎ。 */}
+          <span
+            aria-hidden
+            className="mt-2.5 ml-4 w-[22px] shrink-0 self-stretch rounded-tl-[6px] border-border border-t-2 border-l-2"
+          />
+          <ParticipantAvatar
+            participantKey={participantKey(replyTarget.author)}
+            name={replyAuthor.displayName}
+            size={16}
+          />
+          <span className="shrink-0 font-medium text-foreground/80">
+            {replyAuthor.displayName}
+          </span>
+          <span className="truncate">
+            {replyTarget.content || "添付ファイル"}
+          </span>
         </button>
       ) : null}
       <div className="flex gap-3">
@@ -250,7 +391,6 @@ export const MessageItem = memo(function MessageItem({
                 participantKey={authorKey}
                 name={author?.displayName ?? "?"}
                 size={32}
-                src={author?.avatarUrl}
               />
             </ParticipantProfilePopover>
           </span>
@@ -275,17 +415,37 @@ export const MessageItem = memo(function MessageItem({
             </div>
           )}
           <div className="break-words text-[13.5px] leading-6">
-            {grouped && message.urgency !== "normal" ? (
-              <span className="float-left mt-0.5 mr-1.5">
-                <UrgencyChip urgency={message.urgency} />
-              </span>
-            ) : null}
-            <MessageContent
-              content={message.content}
-              members={membersByKey}
-              selfKey={selfKey}
-              trailer={editedTrailer}
-            />
+            {editing ? (
+              // 編集は本文の位置で起きる。画面下のcomposerへ視線を飛ばさない。
+              <MessageEditor
+                value={editDraft}
+                onChange={onEditDraftChange}
+                onSubmit={onSubmitEdit}
+                onCancel={onCancelEdit}
+                conflict={editConflict}
+                failure={editFailure}
+                savedWithPendingChanges={editSavedWithPendingChanges}
+                saving={editSaving}
+                openedToken={editOpenedToken}
+                onReloadConflict={onReloadEditConflict}
+                membersByKey={membersByKey}
+                selfKey={selfKey}
+              />
+            ) : (
+              <>
+                {grouped && message.urgency !== "normal" ? (
+                  <span className="float-left mt-0.5 mr-1.5">
+                    <UrgencyChip urgency={message.urgency} />
+                  </span>
+                ) : null}
+                <MessageContent
+                  content={message.content}
+                  members={membersByKey}
+                  selfKey={selfKey}
+                  trailer={editedTrailer}
+                />
+              </>
+            )}
           </div>
           {message.deleted ? null : (
             <MessageAttachments
@@ -323,47 +483,82 @@ export const MessageItem = memo(function MessageItem({
               </button>
             </div>
           ) : null}
+          {deleteFailed ? (
+            <div
+              role="alert"
+              className="mt-0.5 flex items-center gap-2 text-[11px] text-rose-500"
+            >
+              削除できませんでした
+              <button
+                type="button"
+                onClick={() => onDelete(message)}
+                className="rounded border border-rose-500/40 px-1.5 py-px font-medium hover:bg-rose-500/10"
+              >
+                もう一度
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
-      {pending ? null : (
-        <div className="pointer-events-none absolute top-0 right-4 flex -translate-y-1/2 items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+      {/* 操作チップは対象行の内側（右上）に置く。行の外へはみ出すと
+          どのメッセージに効くのかが読み取れなくなる。 */}
+      {pending || editing || suppressed ? null : (
+        <div
+          className={`absolute top-0.5 right-3 flex items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 shadow-sm transition-opacity ${
+            holdsTarget
+              ? "pointer-events-auto opacity-100"
+              : "pointer-events-none opacity-0 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+          }`}
+        >
           {allowReactions ? (
-            <Popover>
-              <PopoverTrigger
-                render={
-                  <button
-                    type="button"
-                    title="リアクション"
-                    aria-label="リアクション"
-                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  />
-                }
+            <>
+              {/* 直近に使った3つはピッカーを開かずに1クリックで置ける。 */}
+              {quickEmojis.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  title={`${emojiName(emoji)} でリアクション`}
+                  aria-label={`${emojiName(emoji)} でリアクション`}
+                  onClick={() => chooseEmoji(emoji)}
+                  className="flex size-7 items-center justify-center rounded-md text-[15px] transition-colors hover:bg-accent"
+                >
+                  {emoji}
+                </button>
+              ))}
+              <Popover
+                open={openPanel === "reaction"}
+                onOpenChange={(next) => setOpenPanel(next ? "reaction" : null)}
               >
-                <SmilePlus className="size-3.5" />
-              </PopoverTrigger>
-              <PopoverContent
-                ref={passthroughRef}
-                side="top"
-                className="flex gap-0.5 p-1"
-              >
-                {REACTION_PALETTE.map((emoji) => (
-                  <button
-                    key={emoji}
-                    type="button"
-                    onClick={() => onToggleReaction(message, emoji)}
-                    className="flex size-8 items-center justify-center rounded-md text-[16px] transition-colors hover:bg-accent"
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </PopoverContent>
-            </Popover>
+                <PopoverTrigger
+                  render={
+                    <button
+                      type="button"
+                      title="絵文字を追加"
+                      aria-label="絵文字を追加"
+                      className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    />
+                  }
+                >
+                  <SmilePlus className="size-3.5" />
+                </PopoverTrigger>
+                <PopoverContent
+                  ref={passthroughRef}
+                  side="top"
+                  className="p-1.5"
+                >
+                  <EmojiPicker onSelect={chooseEmoji} />
+                </PopoverContent>
+              </Popover>
+            </>
           ) : null}
           <ToolbarButton label="返信" onClick={() => onReply(message)}>
             <CornerUpLeft className="size-3.5" />
           </ToolbarButton>
           {own || !allowReplyLater ? null : (
-            <Popover>
+            <Popover
+              open={openPanel === "replyLater"}
+              onOpenChange={(next) => setOpenPanel(next ? "replyLater" : null)}
+            >
               <PopoverTrigger
                 render={
                   <button
@@ -388,7 +583,10 @@ export const MessageItem = memo(function MessageItem({
                   <button
                     key={option.label}
                     type="button"
-                    onClick={() => onReplyLater(message, option.delayMs)}
+                    onClick={() => {
+                      onReplyLater(message, option.delayMs);
+                      setOpenPanel(null);
+                    }}
                     className="w-full rounded-md px-2 py-1 text-left text-[12.5px] transition-colors hover:bg-accent"
                   >
                     {option.label}
@@ -398,10 +596,22 @@ export const MessageItem = memo(function MessageItem({
             </Popover>
           )}
           <ToolbarButton
-            label="リンクをコピー"
-            onClick={() => onCopyLink(message)}
+            label={
+              copyResult === "done"
+                ? "リンクをコピーしました"
+                : copyResult === "failed"
+                  ? "リンクをコピーできませんでした"
+                  : "リンクをコピー"
+            }
+            onClick={copyLink}
           >
-            <LinkIcon className="size-3.5" />
+            {copyResult === "done" ? (
+              <Check className="size-3.5 text-emerald-500" />
+            ) : copyResult === "failed" ? (
+              <TriangleAlert className="size-3.5 text-rose-500" />
+            ) : (
+              <LinkIcon className="size-3.5" />
+            )}
           </ToolbarButton>
           {own ? (
             <>

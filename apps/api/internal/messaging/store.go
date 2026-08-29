@@ -26,20 +26,38 @@ const (
 // never reveals whether a place exists to a caller who cannot see it
 // (ErrPlaceNotFound doubles as the authorization failure for reads).
 var (
-	ErrWorkspaceNotFound   = errors.New("workspace not found")
-	ErrPlaceNotFound       = errors.New("place not found")
-	ErrParticipantNotFound = errors.New("participant not found in the 戸籍")
-	ErrNotAMember          = errors.New("participant is not an active member of the place")
-	ErrNotReachable        = errors.New("participants share no active workspace membership")
-	ErrMessageNotFound     = errors.New("message not found")
-	ErrNotAuthor           = errors.New("only the author may do this")
-	ErrNotAChannel         = errors.New("place is not a channel")
-	ErrInvalidChannelName  = errors.New("channel name must be 1..200 characters")
-	ErrForbidden           = errors.New("participant lacks the required role")
-	ErrMessageDeleted      = errors.New("message is deleted")
-	ErrIdempotencyConflict = errors.New("idempotency key was already used for another reaction mutation")
-	ErrSeqBeyondLatest     = errors.New("seq is beyond the place's latest seq")
+	ErrWorkspaceNotFound       = errors.New("workspace not found")
+	ErrPlaceNotFound           = errors.New("place not found")
+	ErrParticipantNotFound     = errors.New("participant not found in the 戸籍")
+	ErrNotAMember              = errors.New("participant is not an active member of the place")
+	ErrNotReachable            = errors.New("participants share no active workspace membership")
+	ErrMessageNotFound         = errors.New("message not found")
+	ErrNotAuthor               = errors.New("only the author may do this")
+	ErrNotAChannel             = errors.New("place is not a channel")
+	ErrInvalidChannelName      = errors.New("channel name must be 1..200 characters")
+	ErrEmptyChannelUpdate      = errors.New("a channel edit must name something to change")
+	ErrForbidden               = errors.New("participant lacks the required role")
+	ErrMessageDeleted          = errors.New("message is deleted")
+	ErrMessageRevisionConflict = errors.New("message revision conflict")
+	ErrIdempotencyConflict     = errors.New("idempotency key was already used for another reaction mutation")
+	ErrSeqBeyondLatest         = errors.New("seq is beyond the place's latest seq")
 )
+
+// messageRevisionConflictError carries the current, already-authorized message
+// back to the HTTP boundary. A client may have missed message_edited while its
+// socket was disconnected, so deriving a replacement from its local timeline
+// would preserve the stale revision that caused the conflict.
+type messageRevisionConflictError struct {
+	Current Message
+}
+
+func (e *messageRevisionConflictError) Error() string {
+	return ErrMessageRevisionConflict.Error()
+}
+
+func (e *messageRevisionConflictError) Unwrap() error {
+	return ErrMessageRevisionConflict
+}
 
 // Store persists the messaging surface. All authorization decisions the
 // contract assigns to the service — membership, roles, reachability — are made
@@ -80,6 +98,7 @@ type Place struct {
 	PlaceID     string
 	Kind        string
 	WorkspaceID string
+	Revision    int64
 	Name        string
 	Topic       string
 	Visibility  string
@@ -96,19 +115,10 @@ type MemberProfile struct {
 	DisplayName             string
 	SecretaryForDisplayName string
 	Role                    string // workspace role; empty for dm/group_dm members
-	// Tagline is the one line the participant said about what they do. It
-	// belongs to the Participant, not to a Workspace membership: 人格・本人性は
-	// Workspace をまたいで続くので、肩書きが Workspace ごとに要るようになっても
-	// global tagline を上書きせず membership 側に別に持たせる。
+	// Tagline belongs to the global Participant profile. Workspace-specific
+	// labels remain membership data and must not overwrite it.
 	Tagline string
-	// Revision is assigned by participant_profiles on every profile update.
-	// Receivers use it to reject an older live event or bootstrap snapshot.
-	Revision int64
 }
-
-// ParticipantProfile is the public name for the canonical participant profile
-// returned by shared write boundaries used outside the messaging package.
-type ParticipantProfile = MemberProfile
 
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple
 // Secretaries canonically named Sumi. The composite is presentation only: the

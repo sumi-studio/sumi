@@ -883,6 +883,10 @@ impl InjectedCommand {
         &self.message_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "injected provenance inspection is retained for durable binding tests"
+    )]
     pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
         &self.provenance
     }
@@ -1870,6 +1874,25 @@ impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
     }
 }
 
+impl BootstrapRecoveryGuard<'_> {
+    /// Commit a physical recovery receipt together with everything its intent
+    /// resolution makes necessary, without releasing this guard. The suffix has
+    /// to be planned under the same held gate that will commit it, so boot
+    /// cannot reach `EventWriter::apply_physical_recovery` (which takes the gate
+    /// itself) without splitting the single required transaction.
+    pub(in crate::store) async fn apply_physical_recovery_batch(
+        &mut self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
+        batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        self.writer
+            .apply_physical_recovery_locked(lease, fence, receipt, batch, &mut self.state)
+            .await
+    }
+}
+
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
     admission_open: bool,
@@ -2745,13 +2768,38 @@ impl EventWriter {
     /// projection must be part of the supplied batch (normally as its final
     /// eventless write); EventWriter then commits the logical suffix, terminal
     /// tool events/results, and T17 application ledger in one SQLite transaction.
-    #[allow(dead_code, reason = "T17 hydration caller is composed by T26")]
+    #[allow(
+        dead_code,
+        reason = "physical recovery application is invoked by boot recovery tests and the production composition successor"
+    )]
     pub(crate) async fn apply_physical_recovery(
         &self,
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
         receipt: PhysicalRecoveryReceipt,
+        batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        // Idempotency is decided inside the same SQLite transaction as the
+        // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
+        // Reading `already_present` outside the transaction would create a TOCTOU
+        // window where two callers could both observe the receipt as new.
+        let mut guard = self.gate.lock().await;
+        self.apply_physical_recovery_locked(lease, fence, receipt, batch, &mut guard)
+            .await
+    }
+
+    /// Same commit as `apply_physical_recovery`, for a caller that already owns
+    /// the bootstrap recovery guard. Boot needs this because the logical suffix
+    /// this batch carries can only be planned while the writer gate is held, and
+    /// planning it through a second acquisition would split the one transaction
+    /// the receipt contract requires.
+    async fn apply_physical_recovery_locked(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
         mut batch: EventBatch,
+        guard: &mut MutexGuard<'_, WriterState>,
     ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
         lease
             .validate_exact(
@@ -2781,18 +2829,13 @@ impl EventWriter {
                 projections: vec![Projection::PhysicalRecovery(receipt.clone())],
             });
         }
-        // Idempotency is decided inside the same SQLite transaction as the
-        // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
-        // Reading `already_present` outside the transaction would create a TOCTOU
-        // window where two callers could both observe the receipt as new.
-        let mut guard = self.gate.lock().await;
         let context = PhysicalRecoveryContext {
             lease,
             fence,
             receipt: &receipt,
         };
         let outcome = self
-            .apply_locked_with_failpoint(batch, None, None, Some(context), &mut guard)
+            .apply_locked_with_failpoint(batch, None, None, Some(context), guard)
             .await?;
         let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
             anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
@@ -2810,6 +2853,43 @@ impl EventWriter {
         self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
             .await
             .map(|outcome| outcome.seqs)
+    }
+
+    /// Drive the real boot physical-recovery batch through an abrupt
+    /// transaction failpoint, so a hard kill can be taken on the exact
+    /// transaction production commits.
+    #[cfg(all(test, unix))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the test failpoint mirrors the exact production recovery authority and crash boundary"
+    )]
+    pub(in crate::store) async fn apply_boot_physical_recovery_with_abrupt_failpoint(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: &PhysicalRecoveryReceipt,
+        mut batch: EventBatch,
+        name: &str,
+        after_commit: bool,
+        readiness_path: &std::path::Path,
+    ) -> Result<Vec<u64>> {
+        batch.writes.push(EventWrite {
+            event: None,
+            projections: vec![Projection::PhysicalRecovery(receipt.clone())],
+        });
+        let context = PhysicalRecoveryContext {
+            lease,
+            fence,
+            receipt,
+        };
+        self.apply_with_abrupt_transaction_failpoint(
+            batch,
+            name,
+            after_commit,
+            readiness_path,
+            Some(context),
+        )
+        .await
     }
 
     #[cfg(all(test, unix))]
@@ -5606,6 +5686,10 @@ impl EventWriter {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "replay validation compares every authenticated command dimension explicitly"
+    )]
     async fn verify_replay(
         &self,
         incoming_seq: u64,
@@ -6757,6 +6841,28 @@ fn validate_command_disposition_pairs(batch: &EventBatch) -> Result<()> {
         bail!("command_disposition events must exactly match terminal command projections");
     }
     Ok(())
+}
+
+/// How many durable events an `EventBatch` will occupy once EventWriter
+/// materializes the `command_disposition` event that each terminal command
+/// projection implies.
+///
+/// Physical recovery has to know this before the commit: its receipt names the
+/// exact contiguous sequence range the batch fills, and the batch now carries
+/// the whole logical suffix, including the owner command's disposition.
+pub(in crate::store) fn materialized_event_count(batch: &EventBatch) -> usize {
+    batch
+        .writes
+        .iter()
+        .map(|write| {
+            usize::from(write.event.is_some())
+                + write
+                    .projections
+                    .iter()
+                    .filter(|projection| projection_command_disposition(projection).is_some())
+                    .count()
+        })
+        .sum()
 }
 
 fn materialize_command_dispositions(mut batch: EventBatch) -> Result<EventBatch> {
@@ -11561,6 +11667,29 @@ async fn verify_authenticated_message_projection(
     Ok(())
 }
 
+pub(super) struct RunningToolRecoveryEvidence {
+    pub(super) tool_name: String,
+    pub(super) assistant_message_id: String,
+}
+
+/// How to treat a running tool execution whose owning assistant `ToolCall` is
+/// absent from the authenticated transcript.
+///
+/// This used to be a `#[cfg(test)]` early return, which made the fail-closed
+/// branch unreachable in every test build. It is now an explicit argument, so
+/// the caller states which behaviour it wants and the production choice is the
+/// one that runs in tests unless a fixture deliberately says otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OwnerlessRunningTool {
+    /// An unattributable running row is not recoverable evidence. Production
+    /// hydration always uses this.
+    Reject,
+    /// Accept the row under a synthesized owner. Only low-level EventWriter
+    /// fixtures that create running rows by direct mutation may ask for this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    SynthesizeOwner,
+}
+
 pub(super) async fn authenticate_running_tool_intent(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
@@ -11568,7 +11697,8 @@ pub(super) async fn authenticate_running_tool_intent(
     command_id: &str,
     run_id: &str,
     executor_generation: ProcessGeneration,
-) -> Result<()> {
+    ownerless: OwnerlessRunningTool,
+) -> Result<RunningToolRecoveryEvidence> {
     let sequences: Vec<i64> = sqlx::query_scalar(
         "SELECT seq FROM agent_events
          WHERE event_type = 'tool_execution_start'
@@ -11597,7 +11727,75 @@ pub(super) async fn authenticate_running_tool_intent(
         );
     }
 
-    Ok(())
+    let tool_name = event
+        .envelope
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("running tool execution {tool_call_id} has no tool name"))?
+        .to_owned();
+
+    let assistant_sequences: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT event.seq
+         FROM agent_events AS event,
+              json_each(json_extract(event.envelope, '$.message.content')) AS content
+         WHERE event.event_type = 'message_end'
+           AND json_extract(event.envelope, '$.message.role') = 'assistant'
+           AND json_extract(content.value, '$.type') = 'tool_call'
+           AND json_extract(content.value, '$.tool_call.id') = ?
+         ORDER BY event.seq",
+    )
+    .bind(tool_call_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .context("failed to locate owning assistant ToolCall evidence")?;
+    if assistant_sequences.len() > 1 {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one owning assistant ToolCall"
+        );
+    }
+    if assistant_sequences.is_empty() && ownerless == OwnerlessRunningTool::SynthesizeOwner {
+        return Ok(RunningToolRecoveryEvidence {
+            tool_name,
+            assistant_message_id: format!("synthesized-owner-{tool_call_id}"),
+        });
+    }
+    let Some(assistant_sequence) = assistant_sequences.first().copied() else {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one owning assistant ToolCall"
+        );
+    };
+    let assistant = load_authenticated_event(store, transaction, assistant_sequence).await?;
+    let assistant_message_id = assistant
+        .envelope
+        .get("message_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("owning assistant ToolCall {tool_call_id} has no message_id"))?;
+    let assistant_tool_name = assistant
+        .envelope
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|item| {
+                (item.pointer("/tool_call/id").and_then(Value::as_str) == Some(tool_call_id))
+                    .then(|| item.pointer("/tool_call/name").and_then(Value::as_str))
+                    .flatten()
+            })
+        });
+    if assistant.kind != "message_end"
+        || assistant.metadata.run_id.as_deref() != Some(run_id)
+        || assistant_tool_name != Some(tool_name.as_str())
+    {
+        bail!(
+            "running tool execution {tool_call_id} disagrees with its authenticated owning assistant ToolCall"
+        );
+    }
+
+    Ok(RunningToolRecoveryEvidence {
+        tool_name,
+        assistant_message_id: assistant_message_id.to_owned(),
+    })
 }
 
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
@@ -14979,8 +15177,9 @@ mod tests {
         },
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
-            AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
-            PhysicalRecoveryReceipt, RecoveryStep, ResumeDirective, SuffixRecovery,
+            AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider,
+            PhysicalReapAttestation, PhysicalRecoveryIntent, PhysicalRecoveryReceipt, RecoveryStep,
+            ResumeDirective, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -15008,6 +15207,16 @@ mod tests {
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
         GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
+    }
+
+    fn test_reap_attestation(lease: &ProcessGenerationLease) -> PhysicalReapAttestation {
+        PhysicalReapAttestation::from_wire(
+            lease.personality_agent_id().as_str(),
+            lease.generation().as_u64(),
+            format!("boot-{}", lease.generation().as_u64()),
+            1,
+        )
+        .expect("valid test reap attestation")
     }
 
     fn eviction_footprint_for_test(
@@ -15219,6 +15428,54 @@ mod tests {
             .await
             .expect("open test store")
             .into()
+    }
+
+    /// A store for fixtures that create `running` tool rows by direct mutation
+    /// rather than by replaying an assistant transcript that claims them.
+    /// `Store::open` has no equivalent: production always rejects an
+    /// unattributable running row.
+    async fn ownerless_running_tool_test_store() -> Arc<Store> {
+        let mut store = Store::in_memory(scope(), test_provider())
+            .await
+            .expect("open test store");
+        store.synthesize_owners_for_ownerless_running_tools();
+        store.into()
+    }
+
+    /// Drives one tool call from pending approval through `ToolExecutionStart`,
+    /// leaving exactly one `running` row that no assistant `ToolCall` claims.
+    async fn seed_running_tool_execution(
+        store: &Arc<Store>,
+        writer: &EventWriter,
+        request_id: &str,
+        tool_call_id: &str,
+        run_id: &str,
+        decision_id: &str,
+    ) {
+        seed_pending_approval(store, writer, request_id, tool_call_id, run_id).await;
+        writer
+            .persist_inbound(&approval_command(2, decision_id, request_id))
+            .await
+            .expect("persist approval decision");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    request_id,
+                    "approved_once",
+                    "test",
+                    Some((decision_id, 2, run_id)),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approve tool");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write(tool_call_id, run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start tool");
     }
 
     async fn file_test_store(path: &Path) -> Arc<Store> {
@@ -20758,7 +21015,6 @@ mod tests {
         assert!(decrypt_content(&key, &ciphertext, &wrong_seq).is_err());
         let wrong_conversation = AgentScope {
             personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ..scope()
         }
         .row_aad("inbound_commands", "1", DataKeyPurpose::Command);
         assert!(decrypt_content(&key, &ciphertext, &wrong_conversation).is_err());
@@ -31234,37 +31490,54 @@ mod tests {
         assert!(error.unwrap_err().to_string().contains("lease"));
     }
 
+    /// The transcript this fixture writes never claims `tool-1`, so on a default
+    /// store the running row is unattributable and boot must fail closed. Before
+    /// the ownerless policy became an explicit argument, a `#[cfg(test)]` early
+    /// return made this branch unreachable in every test build.
+    #[tokio::test]
+    async fn hydration_rejects_a_running_tool_no_assistant_tool_call_owns() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_running_tool_execution(
+            &store,
+            &writer,
+            "request-1",
+            "tool-1",
+            "run-1",
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .await;
+
+        let lease = test_lease(2);
+        let fence = test_fence(&lease);
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("running tool with no owning assistant ToolCall must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one owning assistant ToolCall"),
+            "unexpected hydration failure: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn hydrate_returns_recovery_required_for_running_tool() {
-        let store = test_store().await;
+        let store = ownerless_running_tool_test_store().await;
         let writer = EventWriter::new(store.clone());
         let run_id = "run-1";
         let tool_call_id = "tool-1";
         let decision_id = "00000000-0000-4000-8000-000000000002";
-        seed_pending_approval(&store, &writer, "request-1", tool_call_id, run_id).await;
-        writer
-            .persist_inbound(&approval_command(2, decision_id, "request-1"))
-            .await
-            .expect("persist approval decision");
-        writer
-            .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-1",
-                    "approved_once",
-                    "test",
-                    Some((decision_id, 2, run_id)),
-                )],
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("approve tool");
-        writer
-            .apply(EventBatch {
-                writes: vec![tool_start_write(tool_call_id, run_id)],
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("start tool");
+        seed_running_tool_execution(
+            &store,
+            &writer,
+            "request-1",
+            tool_call_id,
+            run_id,
+            decision_id,
+        )
+        .await;
 
         let lease = test_lease(2);
         let fence = test_fence(&lease);
@@ -31774,7 +32047,7 @@ mod tests {
     ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
         let lease = ProcessGenerationLease::new(
             store.scope().personality_agent_id.clone(),
-            test_process_generation(1),
+            test_process_generation(2),
             "test-lease",
         )
         .expect("test process generation lease");
@@ -31842,6 +32115,7 @@ mod tests {
             receipt_id: format!("receipt-{tool_call_id}"),
             lease: lease.clone(),
             fence: fence.clone(),
+            reap_attestation: test_reap_attestation(lease),
             intents: vec![intent],
             logical_suffix_first_seq: next_seq,
             logical_suffix_last_seq: next_seq + 2,
@@ -32055,7 +32329,7 @@ mod tests {
                 // converge to a committed state.
                 let lease = ProcessGenerationLease::new(
                     reopened.scope().personality_agent_id.clone(),
-                    test_process_generation(1),
+                    test_process_generation(2),
                     "test-lease",
                 )
                 .expect("test lease");
@@ -32104,8 +32378,9 @@ mod tests {
             };
             let mut receipt = PhysicalRecoveryReceipt {
                 receipt_id: "receipt-tool-1".to_owned(),
-                lease: test_lease(1),
-                fence: test_fence(&test_lease(1)),
+                lease: test_lease(2),
+                fence: test_fence(&test_lease(2)),
+                reap_attestation: test_reap_attestation(&test_lease(2)),
                 intents: vec![intent],
                 logical_suffix_first_seq: u64::try_from(first_seq).expect("first seq fits u64"),
                 logical_suffix_last_seq: u64::try_from(last_seq).expect("last seq fits u64"),

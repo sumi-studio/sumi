@@ -8,7 +8,7 @@ import (
 	"net/http"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
-	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 const maxHumanProfileRequestBytes = 4 * 1024
@@ -17,17 +17,42 @@ const maxHumanProfileRequestBytes = 4 * 1024
 // comes only from the signed browser session; clients cannot nominate another
 // Human whose profile should be changed.
 type humanProfileServer struct {
-	messaging      *messaging.Server
+	store          *koseki.Store
 	sessions       agentevents.UserSessionAuthorizer
 	allowedOrigins []string
 }
 
-func newHumanProfileServer(messagingServer *messaging.Server, sessions agentevents.UserSessionAuthorizer, allowedOrigins []string) *humanProfileServer {
-	return &humanProfileServer{messaging: messagingServer, sessions: sessions, allowedOrigins: append([]string(nil), allowedOrigins...)}
+func newHumanProfileServer(store *koseki.Store, sessions agentevents.UserSessionAuthorizer, allowedOrigins []string) *humanProfileServer {
+	return &humanProfileServer{store: store, sessions: sessions, allowedOrigins: append([]string(nil), allowedOrigins...)}
 }
 
 func (s *humanProfileServer) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /auth/profile", s.serveRead)
 	mux.HandleFunc("POST /auth/profile", s.serveUpdate)
+}
+
+func (s *humanProfileServer) serveRead(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	called := false
+	var profile koseki.HumanProfile
+	err := s.sessions.AuthorizeSession(r.Context(), claims, func() error {
+		called = true
+		var readErr error
+		profile, readErr = s.store.HumanProfile(r.Context(), claims.UserID)
+		return readErr
+	})
+	if !called {
+		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
+		return
+	}
+	if err != nil {
+		writeHumanProfileStoreError(w, err)
+		return
+	}
+	writeHumanProfile(w, profile)
 }
 
 func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request) {
@@ -44,14 +69,8 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 		writeHumanProfileError(w, http.StatusUnsupportedMediaType, "application_json_required")
 		return
 	}
-	cookies := r.CookiesNamed(agentevents.BrowserSessionCookie)
-	if len(cookies) != 1 || s.sessions == nil || s.messaging == nil {
-		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
-		return
-	}
-	claims, err := s.sessions.VerifySession(r.Context(), cookies[0].Value)
-	if err != nil {
-		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
+	claims, ok := s.viewer(w, r)
+	if !ok {
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxHumanProfileRequestBytes))
@@ -60,19 +79,23 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var request struct {
-		DisplayName string `json:"display_name"`
+		DisplayName *string `json:"display_name"`
+		Tagline     *string `json:"tagline"`
 	}
-	if agentevents.DecodeStrictJSON(body, &request) != nil {
+	if agentevents.DecodeStrictJSON(body, &request) != nil ||
+		(request.DisplayName == nil && request.Tagline == nil) {
 		writeHumanProfileError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 
 	called := false
-	var profile messaging.ParticipantProfile
+	var profile koseki.HumanProfile
 	err = s.sessions.AuthorizeSession(r.Context(), claims, func() error {
 		called = true
 		var updateErr error
-		profile, updateErr = s.messaging.SetHumanProfile(r.Context(), claims.UserID, request.DisplayName)
+		profile, updateErr = s.store.UpdateHumanProfile(
+			r.Context(), claims.UserID, request.DisplayName, request.Tagline,
+		)
 		return updateErr
 	})
 	if !called {
@@ -80,18 +103,43 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err != nil {
-		switch {
-		case errors.Is(err, messaging.ErrInvalidDisplayName):
-			writeHumanProfileError(w, http.StatusBadRequest, "invalid_display_name")
-		case errors.Is(err, messaging.ErrParticipantNotFound):
-			// A valid signed session must always name a live Human. Treat a
-			// missing row as control-plane inconsistency, not caller error.
-			writeHumanProfileError(w, http.StatusServiceUnavailable, "profile_unavailable")
-		default:
-			writeHumanProfileError(w, http.StatusServiceUnavailable, "profile_unavailable")
-		}
+		writeHumanProfileStoreError(w, err)
 		return
 	}
+	writeHumanProfile(w, profile)
+}
+
+func (s *humanProfileServer) viewer(w http.ResponseWriter, r *http.Request) (agentevents.UserSessionClaims, bool) {
+	cookies := r.CookiesNamed(agentevents.BrowserSessionCookie)
+	if len(cookies) != 1 || s.sessions == nil || s.store == nil {
+		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
+		return agentevents.UserSessionClaims{}, false
+	}
+	claims, err := s.sessions.VerifySession(r.Context(), cookies[0].Value)
+	if err != nil {
+		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
+		return agentevents.UserSessionClaims{}, false
+	}
+	return claims, true
+}
+
+func writeHumanProfileStoreError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, koseki.ErrInvalidDisplayName):
+		writeHumanProfileError(w, http.StatusBadRequest, "invalid_display_name")
+	case errors.Is(err, koseki.ErrInvalidTagline):
+		writeHumanProfileError(w, http.StatusBadRequest, "invalid_tagline")
+	case errors.Is(err, koseki.ErrEmptyHumanProfilePatch):
+		writeHumanProfileError(w, http.StatusBadRequest, "invalid_request")
+	default:
+		// A valid signed session must always name a live Human. Missing rows and
+		// database failures are control-plane availability failures, not caller
+		// errors and not identity existence oracles.
+		writeHumanProfileError(w, http.StatusServiceUnavailable, "profile_unavailable")
+	}
+}
+
+func writeHumanProfile(w http.ResponseWriter, profile koseki.HumanProfile) {
 	writeHumanProfileJSON(w, http.StatusOK, struct {
 		User struct {
 			ID          string `json:"id"`
@@ -104,23 +152,21 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 			} `json:"participant"`
 			DisplayName string `json:"display_name"`
 			Tagline     string `json:"tagline"`
-			Revision    int64  `json:"revision"`
 		} `json:"profile"`
 	}{User: struct {
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
-	}{ID: claims.UserID, DisplayName: profile.DisplayName}, Profile: struct {
+	}{ID: profile.HumanID, DisplayName: profile.DisplayName}, Profile: struct {
 		Participant struct {
 			Kind    string `json:"kind"`
 			HumanID string `json:"human_id"`
 		} `json:"participant"`
 		DisplayName string `json:"display_name"`
 		Tagline     string `json:"tagline"`
-		Revision    int64  `json:"revision"`
 	}{Participant: struct {
 		Kind    string `json:"kind"`
 		HumanID string `json:"human_id"`
-	}{Kind: string(profile.Participant.Kind), HumanID: profile.Participant.ID}, DisplayName: profile.ProjectedDisplayName(), Tagline: profile.Tagline, Revision: profile.Revision}})
+	}{Kind: "human", HumanID: profile.HumanID}, DisplayName: profile.DisplayName, Tagline: profile.Tagline}})
 }
 
 func writeHumanProfileError(w http.ResponseWriter, status int, code string) {

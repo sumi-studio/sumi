@@ -1,8 +1,11 @@
+import { hasSafeDisplayCharacters } from "../lib/text-length";
+
 const maxAuthResponseBytes = 4_096;
 const csrfTokenPattern = /^[A-Za-z0-9_-]{43}$/;
 const authorityBindingIDPattern = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 export const authRequestTimeoutMilliseconds = 15_000;
 const maxDisplayNameCodePoints = 80;
+const maxTaglineCodePoints = 100;
 
 export interface SumiSessionUser {
   id: string;
@@ -13,7 +16,11 @@ export interface ConfirmedSumiProfile {
   participant: { kind: "human"; humanId: string };
   displayName: string;
   tagline: string;
-  revision: number;
+}
+
+export interface SumiProfilePatch {
+  displayName?: string;
+  tagline?: string;
 }
 
 export interface SumiProfileUpdate {
@@ -45,7 +52,7 @@ export class SumiProfileUpdateIndeterminateError extends Error {
 
   constructor(cause: unknown) {
     super(
-      "The display-name update may have committed, but its result could not be confirmed.",
+      "The profile update may have committed, but its result could not be confirmed.",
     );
     this.name = "SumiProfileUpdateIndeterminateError";
     this.cause = cause;
@@ -189,19 +196,56 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
   };
 }
 
-export async function updateSumiProfile(
-  displayName: string,
-): Promise<SumiProfileUpdate> {
-  const trimmedDisplayName = canonicalizeSumiDisplayName(displayName);
-  if (
-    !trimmedDisplayName ||
-    Array.from(trimmedDisplayName).length > maxDisplayNameCodePoints
-  ) {
-    throw new AuthAPIError("Invalid display name.", 400);
-  }
-  const body = await postAuthJSON("/auth/profile", {
-    display_name: trimmedDisplayName,
+export async function getSumiProfile(): Promise<ConfirmedSumiProfile> {
+  const response = await fetch("/auth/profile", {
+    credentials: "include",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+    signal: authRequestSignal(),
   });
+  if (!response.ok) {
+    throw await authAPIError(response);
+  }
+  return parseSumiProfileResponse(await readAuthJSON(response), response.status)
+    .profile;
+}
+
+export async function updateSumiProfile(
+  patch: SumiProfilePatch,
+): Promise<SumiProfileUpdate> {
+  const request: Record<string, string> = {};
+  if (patch.displayName !== undefined) {
+    const displayName = canonicalizeSumiDisplayName(patch.displayName);
+    if (
+      !displayName ||
+      Array.from(displayName).length > maxDisplayNameCodePoints ||
+      !hasSafeDisplayCharacters(displayName)
+    ) {
+      throw new AuthAPIError("Invalid display name.", 400);
+    }
+    request.display_name = displayName;
+  }
+  if (patch.tagline !== undefined) {
+    const tagline = patch.tagline.trim();
+    if (
+      Array.from(tagline).length > maxTaglineCodePoints ||
+      !hasSafeDisplayCharacters(tagline)
+    ) {
+      throw new AuthAPIError("Invalid tagline.", 400);
+    }
+    request.tagline = tagline;
+  }
+  if (Object.keys(request).length === 0) {
+    throw new AuthAPIError("Empty profile update.", 400);
+  }
+  const body = await postAuthJSON("/auth/profile", request);
+  return parseSumiProfileResponse(body, 200);
+}
+
+function parseSumiProfileResponse(
+  body: unknown,
+  status: number,
+): SumiProfileUpdate {
   if (
     !isObject(body) ||
     !isObject(body.user) ||
@@ -211,6 +255,7 @@ export async function updateSumiProfile(
     typeof body.user.display_name !== "string" ||
     body.user.display_name.length === 0 ||
     Array.from(body.user.display_name).length > maxDisplayNameCodePoints ||
+    !hasSafeDisplayCharacters(body.user.display_name) ||
     !isObject(body.profile) ||
     !isObject(body.profile.participant) ||
     body.profile.participant.kind !== "human" ||
@@ -218,11 +263,10 @@ export async function updateSumiProfile(
     body.profile.participant.human_id !== body.user.id ||
     body.profile.display_name !== body.user.display_name ||
     typeof body.profile.tagline !== "string" ||
-    typeof body.profile.revision !== "number" ||
-    !Number.isSafeInteger(body.profile.revision) ||
-    body.profile.revision < 1
+    Array.from(body.profile.tagline).length > maxTaglineCodePoints ||
+    !hasSafeDisplayCharacters(body.profile.tagline)
   ) {
-    throw new AuthAPIError("Invalid authentication response.", 200);
+    throw new AuthAPIError("Invalid authentication response.", status);
   }
   return {
     id: body.user.id,
@@ -234,7 +278,6 @@ export async function updateSumiProfile(
       },
       displayName: body.profile.display_name,
       tagline: body.profile.tagline,
-      revision: Number(body.profile.revision),
     },
   };
 }

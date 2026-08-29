@@ -14,7 +14,6 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
-	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -53,6 +52,12 @@ func profileRequest(body string) *http.Request {
 	return r
 }
 
+func profileReadRequest() *http.Request {
+	r := httptest.NewRequest(http.MethodGet, "/auth/profile", nil)
+	r.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: "signed-session"})
+	return r
+}
+
 func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -66,8 +71,8 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
-	request := profileRequest(`{"display_name":"  かずい さん  "}`)
+	server := newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
+	request := profileRequest(`{"display_name":"  かずい\nさん  ","tagline":"  開発  "}`)
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, request)
 	if response.Code != http.StatusOK {
@@ -88,17 +93,17 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 			} `json:"participant"`
 			DisplayName string `json:"display_name"`
 			Tagline     string `json:"tagline"`
-			Revision    int64  `json:"revision"`
 		} `json:"profile"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.User.ID != profileTestHumanID || result.User.DisplayName != "かずい さん" || sessions.operationRun != 1 {
+	if result.User.ID != profileTestHumanID || result.User.DisplayName != "かずい さん" ||
+		result.Profile.Participant.Kind != "human" ||
+		result.Profile.Participant.HumanID != profileTestHumanID ||
+		result.Profile.DisplayName != "かずい さん" || result.Profile.Tagline != "開発" ||
+		sessions.operationRun != 1 {
 		t.Fatalf("result=%+v operationRun=%d", result, sessions.operationRun)
-	}
-	if result.Profile.Participant.Kind != "human" || result.Profile.Participant.HumanID != profileTestHumanID || result.Profile.DisplayName != "かずい さん" || result.Profile.Tagline != "" || result.Profile.Revision != 1 {
-		t.Fatalf("profile=%+v", result.Profile)
 	}
 	var stored string
 	var customized bool
@@ -108,14 +113,26 @@ func TestHumanProfileUpdateUsesSessionHumanAndPersistsExplicitChoice(t *testing.
 	if stored != "かずい さん" || !customized {
 		t.Fatalf("stored name=%q customized=%v", stored, customized)
 	}
-	var revision int64
-	if err := pool.QueryRow(ctx, `
-		SELECT revision FROM participant_profiles
-		WHERE member_kind = 'human' AND member_id = $1`, profileTestHumanID).Scan(&revision); err != nil {
+
+	// A fresh settings read comes from the durable Participant-global row,
+	// rather than a browser-only echo of the successful response.
+	server = newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
+	response = httptest.NewRecorder()
+	server.serveRead(response, profileReadRequest())
+	if response.Code != http.StatusOK {
+		t.Fatalf("read status=%d body=%s", response.Code, response.Body.String())
+	}
+	var reloaded struct {
+		Profile struct {
+			DisplayName string `json:"display_name"`
+			Tagline     string `json:"tagline"`
+		} `json:"profile"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &reloaded); err != nil {
 		t.Fatal(err)
 	}
-	if revision != 1 {
-		t.Fatalf("profile revision = %d, want 1", revision)
+	if reloaded.Profile.DisplayName != "かずい さん" || reloaded.Profile.Tagline != "開発" || sessions.operationRun != 2 {
+		t.Fatalf("reloaded=%+v operationRun=%d", reloaded, sessions.operationRun)
 	}
 
 	// A client-nominated identity is never accepted; the signed session is the
@@ -132,7 +149,7 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(messaging.NewServer(messaging.New(nil, nil, nil), nil), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(koseki.New(nil), sessions, []string{testBrowserOrigin})
 	tests := []struct {
 		name string
 		req  func() *http.Request
@@ -154,8 +171,12 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 			return r
 		}, want: http.StatusUnsupportedMediaType},
 		{name: "duplicate key", req: func() *http.Request { return profileRequest(`{"display_name":"A","display_name":"B"}`) }, want: http.StatusBadRequest},
+		{name: "empty patch", req: func() *http.Request { return profileRequest(`{}`) }, want: http.StatusBadRequest},
 		{name: "control", req: func() *http.Request { return profileRequest(`{"display_name":"safe\u202edanger"}`) }, want: http.StatusBadRequest},
-		{name: "line break", req: func() *http.Request { return profileRequest(`{"display_name":"かずい\nさん"}`) }, want: http.StatusBadRequest},
+		{name: "multiline tagline", req: func() *http.Request { return profileRequest(`{"tagline":"one\ntwo"}`) }, want: http.StatusBadRequest},
+		{name: "overlong tagline", req: func() *http.Request {
+			return profileRequest(`{"tagline":"` + strings.Repeat("名", koseki.MaxHumanTaglineRunes+1) + `"}`)
+		}, want: http.StatusBadRequest},
 		{name: "overlong", req: func() *http.Request {
 			return profileRequest(`{"display_name":"` + strings.Repeat("名", koseki.MaxHumanDisplayNameRunes+1) + `"}`)
 		}, want: http.StatusBadRequest},
@@ -180,6 +201,11 @@ func TestHumanProfileBoundaryRejectsUnsafeRequestsAndLogoutRace(t *testing.T) {
 	if response.Code != http.StatusUnauthorized || sessions.operationRun != before {
 		t.Fatalf("logout fence status=%d operationRun=%d", response.Code, sessions.operationRun)
 	}
+	response = httptest.NewRecorder()
+	server.serveRead(response, profileReadRequest())
+	if response.Code != http.StatusUnauthorized || sessions.operationRun != before {
+		t.Fatalf("read logout fence status=%d operationRun=%d", response.Code, sessions.operationRun)
+	}
 }
 
 func TestHumanProfileDatabaseFailureIsUnavailable(t *testing.T) {
@@ -193,10 +219,15 @@ func TestHumanProfileDatabaseFailureIsUnavailable(t *testing.T) {
 	sessions := &profileSessionAuthorizer{
 		claims: agentevents.UserSessionClaims{UserID: profileTestHumanID}, authorize: true,
 	}
-	server := newHumanProfileServer(messaging.NewServer(messaging.New(pool, nil, nil), nil), sessions, []string{testBrowserOrigin})
+	server := newHumanProfileServer(koseki.New(pool), sessions, []string{testBrowserOrigin})
 	response := httptest.NewRecorder()
 	server.serveUpdate(response, profileRequest(`{"display_name":"Human"}`))
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	server.serveRead(response, profileReadRequest())
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("read status=%d body=%s", response.Code, response.Body.String())
 	}
 }

@@ -560,7 +560,7 @@ func (s *testMessagingStore) EditMessage(ctx context.Context, placeID, messageID
 	if err != nil {
 		return Message{}, err
 	}
-	return scoped.EditMessage(ctx, placeID, messageID, content)
+	return scoped.EditMessage(ctx, placeID, messageID, content, 1)
 }
 
 func (s *testMessagingStore) DeleteMessage(ctx context.Context, placeID, messageID string, actor ParticipantRef) (Message, error) {
@@ -688,22 +688,6 @@ func (s *testMessagingStore) StatusesVisibleTo(ctx context.Context, actor Partic
 		return nil, err
 	}
 	return scoped.StatusesVisibleTo(ctx)
-}
-
-func (s *testMessagingStore) Profile(ctx context.Context, actor ParticipantRef) (MemberProfile, error) {
-	scoped, err := s.scopeForActor(ctx, actor)
-	if err != nil {
-		return MemberProfile{}, err
-	}
-	return scoped.Profile(ctx)
-}
-
-func (s *testMessagingStore) SetProfile(ctx context.Context, actor ParticipantRef, displayName, tagline *string) (MemberProfile, error) {
-	scoped, err := s.scopeForActor(ctx, actor)
-	if err != nil {
-		return MemberProfile{}, err
-	}
-	return scoped.SetProfile(ctx, displayName, tagline, nil)
 }
 
 func (s *testMessagingStore) ParticipantVisible(ctx context.Context, actor, target ParticipantRef) (bool, error) {

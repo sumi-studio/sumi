@@ -1,6 +1,6 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { AppRail } from "./app-rail";
 import { MessagingTransport } from "../workspace/components/messaging-transport";
+import { AppRail } from "./app-rail";
 
 export function AppShell() {
   const pathname = useRouterState({

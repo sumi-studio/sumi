@@ -1,4 +1,4 @@
--- 0029_participant_profiles: the canonical Participant profile.
+-- 0032_participant_profiles: the canonical Participant profile.
 --
 -- 表示名は戸籍（humans / agents）が正本であり続ける。この表が持つのは、参加者が
 -- 自分について名乗った一行 — tagline だけ。Workspace membership ではなく
@@ -14,22 +14,5 @@ CREATE TABLE participant_profiles (
     member_id   uuidv7      NOT NULL,
     -- 職務の説明（例: 秘書、開発）を一行で。伝記ではないので短く縛る。
     tagline     text        NOT NULL DEFAULT '' CHECK (char_length(tagline) <= 100),
-    -- Presentation updates are ordered independently from transport delivery.
-    -- The trigger below owns this value: every UPDATE advances it exactly once.
-    revision    bigint      NOT NULL DEFAULT 1 CHECK (revision > 0),
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (member_kind, member_id)
 );
-
-CREATE FUNCTION participant_profile_next_revision() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    NEW.revision := OLD.revision + 1;
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER participant_profile_revision
-BEFORE UPDATE ON participant_profiles
-FOR EACH ROW EXECUTE FUNCTION participant_profile_next_revision();

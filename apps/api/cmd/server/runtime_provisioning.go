@@ -22,6 +22,7 @@ type runtimeProvisioner interface {
 	Prepare(context.Context, runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error)
 	Activate(context.Context, runtimeprovision.ActivateRequest) (runtimeprovision.Inspection, error)
 	Abort(context.Context, runtimeprovision.AbortRequest) (runtimeprovision.Inspection, error)
+	Inspect(context.Context, runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error)
 	Stop(context.Context, runtimeprovision.StopRequest) (runtimeprovision.Inspection, error)
 	Reconcile(context.Context, runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error)
 }
@@ -101,7 +102,8 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	if err := runtimeprovision.ValidateAgentWrappingKeyID(config.WrappingKey.ID); err != nil {
 		return nil, err
 	}
-	if err := s.reconcilePreviousRuntime(ctx, config.AgentID); err != nil {
+	reapedThroughGeneration, err := s.reconcilePreviousRuntime(ctx, config.AgentID)
+	if err != nil {
 		return nil, err
 	}
 	idempotencyKey, err := randomProvisioningSecret()
@@ -150,6 +152,29 @@ func (s *provisionedRuntimeSpawner) Spawn(
 			PreparedEpoch: epoch,
 		})
 		listenerErr := s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID)
+		if stopErr != nil {
+			inspection, inspectErr := s.config.Provisioner.Inspect(cleanupCtx, runtimeprovision.InspectRequest{
+				Version:            runtimeprovision.ProtocolVersion,
+				PersonalityAgentID: epoch.PersonalityAgentID,
+			})
+			if inspectErr == nil &&
+				inspection.Phase == runtimeprovision.PhaseRecovery &&
+				inspection.Epoch != nil && *inspection.Epoch == epoch {
+				reconcileErr := fenceAndReconcileRecovery(
+					cleanupCtx,
+					s.config.Provisioner,
+					s.config.Authorizations,
+					s.config.Listeners,
+					epoch,
+				)
+				// Stop deliberately rejects a recovery-shaped project. Once the
+				// exact fenced reconcile has observed it empty, that rejection is
+				// no longer a teardown failure; Spawn still returns its original
+				// pre-Ready failure.
+				return errors.Join(cause, fenceErr, listenerErr, reconcileErr)
+			}
+			return errors.Join(cause, fenceErr, listenerErr, stopErr, inspectErr)
+		}
 		return errors.Join(cause, fenceErr, listenerErr, stopErr)
 	}
 
@@ -179,6 +204,16 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	activation.LocalControlBearerExpiresAtUnix = time.Now().Add(s.config.BearerTTL).Unix()
 	activation.AgentWrappingKey = config.WrappingKey.Bytes
 	activation.AgentWrappingKeyID = config.WrappingKey.ID
+	if reapedThroughGeneration != nil {
+		activation.ReapAttestation = &runtimeprovision.ReapAttestation{
+			PersonalityAgentID:      epoch.PersonalityAgentID,
+			EpochGeneration:         epoch.Generation,
+			RPCBootNonce:            epoch.RPCBootNonce,
+			ReapedThroughGeneration: *reapedThroughGeneration,
+		}
+	} else {
+		activation.ReapAttestation = nil
+	}
 	inspection, err := s.config.Provisioner.Activate(ctx, runtimeprovision.ActivateRequest{
 		Version:       runtimeprovision.ProtocolVersion,
 		PreparedEpoch: epoch,
@@ -202,6 +237,7 @@ func (s *provisionedRuntimeSpawner) Spawn(
 		epoch:           epoch,
 		timeout:         s.config.LifecycleTimeout,
 		teardownTimeout: s.config.TeardownTimeout,
+		monitorInterval: 5 * time.Second,
 		done:            make(chan struct{}),
 	}, nil
 }
@@ -253,7 +289,7 @@ func (s *provisionedRuntimeSpawner) requireExactActiveEpoch(
 	ctx context.Context,
 	epoch runtimeprovision.PreparedEpoch,
 ) error {
-	inspection, err := s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+	inspection, err := s.config.Provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 		Version:            runtimeprovision.ProtocolVersion,
 		PersonalityAgentID: epoch.PersonalityAgentID,
 	})
@@ -267,21 +303,83 @@ func (s *provisionedRuntimeSpawner) requireExactActiveEpoch(
 	return nil
 }
 
-func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) error {
-	inspection, err := s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) (*uint64, error) {
+	inspection, err := s.config.Provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 		Version:            runtimeprovision.ProtocolVersion,
 		PersonalityAgentID: personalityAgentID,
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile previous runtime: %w", err)
+		return nil, fmt.Errorf("inspect previous runtime before reconcile: %w", err)
+	}
+	var fencedEpoch *runtimeprovision.PreparedEpoch
+	if inspection.Epoch != nil {
+		epoch := *inspection.Epoch
+		if err := s.fenceLocalRuntimeBeforeReap(epoch); err != nil {
+			return nil, err
+		}
+		fencedEpoch = &epoch
+	}
+	inspection, err = s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+		Version:            runtimeprovision.ProtocolVersion,
+		PersonalityAgentID: personalityAgentID,
+		FencedEpoch:        fencedEpoch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reconcile previous runtime: %w", err)
 	}
 	if inspection.Phase == runtimeprovision.PhaseUnknown {
-		return nil
+		if inspection.ReapedThroughGeneration == nil {
+			return nil, nil
+		}
+		reaped := *inspection.ReapedThroughGeneration
+		if fencedEpoch != nil && reaped < fencedEpoch.Generation {
+			return nil, errors.New("reconcile reaped a generation older than the fenced runtime")
+		}
+		return &reaped, nil
 	}
 	if inspection.Epoch == nil {
-		return errors.New("reconcile returned a live phase without an epoch")
+		return nil, errors.New("reconcile returned a live phase without an epoch")
 	}
 	epoch := *inspection.Epoch
+	if fencedEpoch == nil || *fencedEpoch != epoch {
+		if err := s.fenceLocalRuntimeBeforeReap(epoch); err != nil {
+			return nil, err
+		}
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), s.config.TeardownTimeout)
+	defer cancel()
+	var teardown runtimeprovision.Inspection
+	var lifecycleErr error
+	switch inspection.Phase {
+	case runtimeprovision.PhasePrepared:
+		teardown, lifecycleErr = s.config.Provisioner.Abort(cleanupCtx, runtimeprovision.AbortRequest{
+			Version:       runtimeprovision.ProtocolVersion,
+			PreparedEpoch: epoch,
+		})
+	case runtimeprovision.PhaseActive:
+		teardown, lifecycleErr = s.config.Provisioner.Stop(cleanupCtx, runtimeprovision.StopRequest{
+			Version:       runtimeprovision.ProtocolVersion,
+			PreparedEpoch: epoch,
+		})
+	default:
+		lifecycleErr = fmt.Errorf("reconcile returned unsupported phase %q", inspection.Phase)
+	}
+	if lifecycleErr != nil {
+		return nil, fmt.Errorf("retire reconciled runtime: %w", lifecycleErr)
+	}
+	if teardown.Phase != runtimeprovision.PhaseUnknown ||
+		teardown.PersonalityAgentID != epoch.PersonalityAgentID ||
+		teardown.ReapedThroughGeneration == nil ||
+		*teardown.ReapedThroughGeneration != epoch.Generation {
+		return nil, errors.New("retired runtime did not return an exact observed-empty reap receipt")
+	}
+	reaped := *teardown.ReapedThroughGeneration
+	return &reaped, nil
+}
+
+// fenceLocalRuntimeBeforeReap revokes both the bearer/Ready authority and its
+// listener before any call that can destroy this epoch's Compose project.
+func (s *provisionedRuntimeSpawner) fenceLocalRuntimeBeforeReap(epoch runtimeprovision.PreparedEpoch) error {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), s.config.TeardownTimeout)
 	defer cancel()
 	fenceErr := s.config.Authorizations.FenceLocalRuntimeAuthorization(
@@ -290,27 +388,49 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 		epoch.Generation,
 		epoch.RPCBootNonce,
 	)
-	var lifecycleErr error
-	switch inspection.Phase {
-	case runtimeprovision.PhasePrepared:
-		_, lifecycleErr = s.config.Provisioner.Abort(cleanupCtx, runtimeprovision.AbortRequest{
-			Version:       runtimeprovision.ProtocolVersion,
-			PreparedEpoch: epoch,
-		})
-	case runtimeprovision.PhaseActive:
-		_, lifecycleErr = s.config.Provisioner.Stop(cleanupCtx, runtimeprovision.StopRequest{
-			Version:       runtimeprovision.ProtocolVersion,
-			PreparedEpoch: epoch,
-		})
-	default:
-		lifecycleErr = fmt.Errorf("reconcile returned unsupported phase %q", inspection.Phase)
+	if fenceErr != nil {
+		return fmt.Errorf("fence local runtime before reap: %w", fenceErr)
 	}
-	var listenerErr error
-	if lifecycleErr == nil {
-		listenerErr = s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID)
+	if err := s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID); err != nil {
+		return fmt.Errorf("close local runtime before reap: %w", err)
 	}
-	if err := errors.Join(fenceErr, lifecycleErr, listenerErr); err != nil {
-		return fmt.Errorf("retire reconciled runtime: %w", err)
+	return nil
+}
+
+// fenceAndReconcileRecovery removes a partial project only after revoking the
+// exact epoch's local authority. Reconcile's observed-empty receipt is the
+// proof that no runtime containers were stranded by a failed lifecycle call.
+func fenceAndReconcileRecovery(
+	ctx context.Context,
+	provisioner runtimeProvisioner,
+	authorizations localRuntimeAuthorizationController,
+	listeners localRuntimeListenerController,
+	epoch runtimeprovision.PreparedEpoch,
+) error {
+	if err := authorizations.FenceLocalRuntimeAuthorization(
+		ctx,
+		epoch.PersonalityAgentID,
+		epoch.Generation,
+		epoch.RPCBootNonce,
+	); err != nil {
+		return fmt.Errorf("fence recovering runtime before reconcile: %w", err)
+	}
+	if err := listeners.CloseLocalRuntime(ctx, epoch.PersonalityAgentID); err != nil {
+		return fmt.Errorf("close recovering runtime before reconcile: %w", err)
+	}
+	inspection, err := provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+		Version:            runtimeprovision.ProtocolVersion,
+		PersonalityAgentID: epoch.PersonalityAgentID,
+		FencedEpoch:        &epoch,
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile recovering runtime: %w", err)
+	}
+	if inspection.Phase != runtimeprovision.PhaseUnknown ||
+		inspection.PersonalityAgentID != epoch.PersonalityAgentID ||
+		inspection.ReapedThroughGeneration == nil ||
+		*inspection.ReapedThroughGeneration != epoch.Generation {
+		return errors.New("recovering runtime reconcile did not return an exact observed-empty reap receipt")
 	}
 	return nil
 }
@@ -322,13 +442,27 @@ type provisionedProcess struct {
 	epoch           runtimeprovision.PreparedEpoch
 	timeout         time.Duration
 	teardownTimeout time.Duration
+	monitorInterval time.Duration
 	done            chan struct{}
 	stopOnce        sync.Once
 	stopErr         error
 }
 
 func (p *provisionedProcess) Wait() error {
-	ticker := time.NewTicker(5 * time.Second)
+	interval := p.monitorInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	// A single Inspect error is an observation gap (registry/DNS/docker blip),
+	// not a death observation. Fence→reap on one error would kill a healthy PA
+	// for a seconds-long network gap and leave its in-flight tools indeterminate.
+	// Ride through up to monitorInspectErrorThreshold consecutive errors before
+	// treating the host as unobservable; a not-active observation is a positive
+	// death signal and retires immediately. Sustained unobservability still
+	// fences and reaps so no unowned runtime survives the gap.
+	const monitorInspectErrorThreshold = 3
+	inspectFailures := 0
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -336,20 +470,99 @@ func (p *provisionedProcess) Wait() error {
 			return p.stopErr
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-			inspection, err := p.provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+			inspection, err := p.provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 				Version:            runtimeprovision.ProtocolVersion,
 				PersonalityAgentID: p.epoch.PersonalityAgentID,
 			})
 			cancel()
 			if err != nil {
-				return fmt.Errorf("monitor provisioned runtime: %w", err)
+				inspectFailures++
+				if inspectFailures < monitorInspectErrorThreshold {
+					continue
+				}
+				return p.retireAfterMonitorFailure(fmt.Errorf("monitor provisioned runtime: %w", err))
 			}
+			inspectFailures = 0
 			if inspection.Phase != runtimeprovision.PhaseActive ||
 				inspection.Epoch == nil || *inspection.Epoch != p.epoch {
-				return errors.New("provisioned runtime left its active epoch")
+				return p.retireAfterMonitorFailure(errors.New("provisioned runtime left its active epoch"))
 			}
 		}
 	}
+}
+
+// retireAfterMonitorFailure owns an observed-bad runtime until it has fenced
+// its exact epoch and reconciled it to an observed-empty receipt.  Wait must
+// not simply return here: Manager removes a completed process from its map and
+// does not call Stop after Wait, so returning would strand a surviving local
+// runtime outside lifecycle ownership.
+func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
+	p.stopOnce.Do(func() {
+		defer close(p.done)
+		ctx, cancel := context.WithTimeout(context.Background(), p.teardownTimeout)
+		defer cancel()
+
+		if err := p.authorizations.FenceLocalRuntimeAuthorization(
+			ctx,
+			p.epoch.PersonalityAgentID,
+			p.epoch.Generation,
+			p.epoch.RPCBootNonce,
+		); err != nil {
+			p.stopErr = fmt.Errorf("fence monitored runtime before reconcile: %w", err)
+			return
+		}
+		if err := p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID); err != nil {
+			p.stopErr = fmt.Errorf("close monitored runtime before reconcile: %w", err)
+			return
+		}
+
+		inspection, err := p.provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+			Version:            runtimeprovision.ProtocolVersion,
+			PersonalityAgentID: p.epoch.PersonalityAgentID,
+			FencedEpoch:        &p.epoch,
+		})
+		if err != nil {
+			p.stopErr = fmt.Errorf("reconcile monitored runtime: %w", err)
+			return
+		}
+		if inspection.Phase == runtimeprovision.PhaseUnknown {
+			if inspection.ReapedThroughGeneration == nil ||
+				*inspection.ReapedThroughGeneration != p.epoch.Generation {
+				p.stopErr = errors.New("monitored runtime reconcile did not return an exact observed-empty reap receipt")
+			}
+			return
+		}
+		if inspection.Epoch == nil || *inspection.Epoch != p.epoch {
+			p.stopErr = errors.New("monitored runtime reconcile returned a different live epoch")
+			return
+		}
+
+		var teardown runtimeprovision.Inspection
+		switch inspection.Phase {
+		case runtimeprovision.PhasePrepared:
+			teardown, err = p.provisioner.Abort(ctx, runtimeprovision.AbortRequest{
+				Version: runtimeprovision.ProtocolVersion, PreparedEpoch: p.epoch,
+			})
+		case runtimeprovision.PhaseActive:
+			teardown, err = p.provisioner.Stop(ctx, runtimeprovision.StopRequest{
+				Version: runtimeprovision.ProtocolVersion, PreparedEpoch: p.epoch,
+			})
+		default:
+			p.stopErr = fmt.Errorf("reconcile monitored runtime returned unsupported phase %q", inspection.Phase)
+			return
+		}
+		if err != nil {
+			p.stopErr = fmt.Errorf("retire reconciled monitored runtime: %w", err)
+			return
+		}
+		if teardown.Phase != runtimeprovision.PhaseUnknown ||
+			teardown.PersonalityAgentID != p.epoch.PersonalityAgentID ||
+			teardown.ReapedThroughGeneration == nil ||
+			*teardown.ReapedThroughGeneration != p.epoch.Generation {
+			p.stopErr = errors.New("monitored runtime teardown did not return an exact observed-empty reap receipt")
+		}
+	})
+	return errors.Join(cause, p.stopErr)
 }
 
 func (p *provisionedProcess) Stop() error {
@@ -369,10 +582,23 @@ func (p *provisionedProcess) Stop() error {
 			Version:       runtimeprovision.ProtocolVersion,
 			PreparedEpoch: p.epoch,
 		})
-		var listenerErr error
-		if stopErr == nil {
-			listenerErr = p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID)
+		if stopErr != nil {
+			inspection, inspectErr := p.provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
+				Version:            runtimeprovision.ProtocolVersion,
+				PersonalityAgentID: p.epoch.PersonalityAgentID,
+			})
+			if inspectErr == nil &&
+				inspection.Phase == runtimeprovision.PhaseRecovery &&
+				inspection.Epoch != nil && *inspection.Epoch == p.epoch {
+				reconcileErr := fenceAndReconcileRecovery(ctx, p.provisioner, p.authorizations, p.listeners, p.epoch)
+				p.stopErr = errors.Join(fenceErr, reconcileErr)
+				return
+			}
+			p.stopErr = errors.Join(fenceErr, stopErr, inspectErr)
+			return
 		}
+		var listenerErr error
+		listenerErr = p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID)
 		p.stopErr = errors.Join(fenceErr, stopErr, listenerErr)
 	})
 	return p.stopErr

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
 import type { ChannelSummary, DmSummary } from "./model";
 import {
+  bindMessagingScope,
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
   installMessagingBackend,
@@ -9,8 +10,18 @@ import {
   useMessaging,
 } from "./store";
 
+const MESSAGING_SCOPE = {
+  workspaceId: "workspace-1",
+  installationId: "installation-1",
+  authorityEpoch: "1",
+} as const;
+
 describe("messaging session boundary", () => {
-  afterEach(() => bindMessagingSessionIdentity(null));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    bindMessagingScope(null);
+    bindMessagingSessionIdentity(null);
+  });
 
   it("disposes private state before a different signed-in human can render", () => {
     bindMessagingSessionIdentity("human-a");
@@ -22,6 +33,7 @@ describe("messaging session boundary", () => {
         {
           channelId: "private-a",
           workspaceId: "workspace",
+          revision: 1,
           name: "A",
           topic: "",
           visibility: "private",
@@ -64,6 +76,61 @@ describe("messaging session boundary", () => {
     });
   });
 
+  // Every store action that awaits the backend is fenced the same way: the
+  // answer is applied only if it comes back into the session that asked. A
+  // place action that outlives a Workspace switch would otherwise put the old
+  // Workspace's channel into the new one's sidebar — and, for a duplicate,
+  // navigate there.
+  it.each([
+    {
+      name: "duplicateChannel",
+      method: "duplicateChannel" as const,
+      run: () => useMessaging.getState().duplicateChannel("ch-general"),
+    },
+    {
+      name: "updateChannel",
+      method: "updateChannel" as const,
+      run: () =>
+        useMessaging.getState().updateChannel("ch-general", { name: "設計" }),
+    },
+  ])("discards the answer to $name after a Workspace switch", async ({
+    method,
+    run,
+  }) => {
+    bindMessagingSessionIdentity("human-self");
+    bindMessagingScope(MESSAGING_SCOPE);
+    const server = new MockMessagingServer();
+    let release!: (channel: ChannelSummary) => void;
+    const answer = new Promise<ChannelSummary>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(server, method).mockImplementation(() => answer);
+    installMessagingBackend(server);
+    const original: ChannelSummary = {
+      channelId: "ch-general",
+      workspaceId: "workspace-1",
+      revision: 1,
+      name: "general",
+      topic: "",
+      visibility: "public",
+      voice: false,
+    };
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "self" },
+      selfKey: "human:self",
+      channels: [original],
+    });
+
+    const pending = run();
+    // 別のWorkspaceへ移る。ここで前のsessionのstateは捨てられる。
+    bindMessagingScope({ ...MESSAGING_SCOPE, authorityEpoch: "2" });
+    release({ ...original, channelId: "ch-copy", name: "general のコピー" });
+
+    await expect(pending).rejects.toThrow(/session changed/i);
+    expect(useMessaging.getState().channels).toEqual([]);
+  });
+
   it("atomically refreshes Human and contextual agent presentation profiles", async () => {
     bindMessagingSessionIdentity("human-a");
     const server = new MockMessagingServer();
@@ -76,7 +143,6 @@ describe("messaging session boundary", () => {
           participant: { kind: "human", humanId: "human-a" },
           displayName: "After",
           tagline: "",
-          revision: 2,
         },
         {
           participant: {
@@ -85,7 +151,6 @@ describe("messaging session boundary", () => {
           },
           displayName: "Sumi（After）",
           tagline: "",
-          revision: 2,
         },
       ],
     });
@@ -118,7 +183,6 @@ describe("messaging session boundary", () => {
           participant: { kind: "human", humanId: "human-a" },
           displayName: "Before",
           tagline: "",
-          revision: 1,
         },
         "personality_agent:agent-a": {
           participant: {
@@ -127,7 +191,6 @@ describe("messaging session boundary", () => {
           },
           displayName: "Sumi（Before）",
           tagline: "",
-          revision: 1,
         },
       },
       messagesByPlace,
@@ -140,48 +203,6 @@ describe("messaging session boundary", () => {
       "personality_agent:agent-a": { displayName: "Sumi（After）" },
     });
     expect(useMessaging.getState().messagesByPlace).toBe(messagesByPlace);
-  });
-
-  it("refreshの古いprofile snapshotで新しいrevisionを巻き戻さない", async () => {
-    bindMessagingSessionIdentity("human-a");
-    const server = new MockMessagingServer();
-    const snapshot = await server.bootstrap();
-    vi.spyOn(server, "bootstrap").mockResolvedValue({
-      ...snapshot,
-      self: { kind: "human", humanId: "human-a" },
-      members: [
-        {
-          participant: { kind: "human", humanId: "human-a" },
-          displayName: "Stale",
-          tagline: "",
-          revision: 2,
-        },
-      ],
-    });
-    installMessagingBackend(server);
-    useMessaging.setState({
-      ready: true,
-      self: { kind: "human", humanId: "human-a" },
-      selfKey: "human:human-a",
-      membersByKey: {
-        "human:human-a": {
-          participant: { kind: "human", humanId: "human-a" },
-          displayName: "Current",
-          tagline: "最新",
-          revision: 3,
-        },
-      },
-    });
-
-    await refreshMessagingMemberProfiles();
-
-    expect(useMessaging.getState().membersByKey["human:human-a"]).toMatchObject(
-      {
-        displayName: "Current",
-        tagline: "最新",
-        revision: 3,
-      },
-    );
   });
 
   it("rejects a deferred DM result after the messaging identity changes", async () => {
@@ -235,6 +256,7 @@ describe("messaging session boundary", () => {
       "dev",
       "開発",
       true,
+      expect.any(String),
     );
   });
 
@@ -263,6 +285,7 @@ describe("messaging session boundary", () => {
     resolveChannel({
       channelId: "stale-channel",
       workspaceId: "workspace-a",
+      revision: 1,
       name: "private-a",
       topic: "A only",
       visibility: "private",

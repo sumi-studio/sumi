@@ -78,8 +78,9 @@ pub(crate) use self::event_writer::{
 };
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
-    ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
-    PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
+    ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalReapAttestation,
+    PhysicalRecoveryApplier, PhysicalRecoveryIntent, PhysicalRecoveryIntentRequest,
+    PhysicalRecoveryReceipt,
 };
 pub(crate) use self::post_commit::{
     EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability, PostCommitReceiver,
@@ -121,6 +122,11 @@ pub(crate) use memory_state::{
     MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
     MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryJobStatus,
     MemoryLayer,
+};
+#[cfg(test)]
+pub(crate) use recovery::tests::{
+    assert_indeterminate_surface, open_boot_running_tools_store, setup_boot_running_tools,
+    setup_boot_running_tools_on_disk, setup_boot_running_tools_with_rowless_tail,
 };
 #[allow(
     unused_imports,
@@ -347,6 +353,10 @@ pub(crate) struct ArtifactKeyAnchor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "derived deletion authorities are exercised by retention-erasure tests"
+)]
 pub(crate) enum DerivedRetentionEraseAuthority {
     ProviderContextInvalidation,
     MemorySummaryDeletion,
@@ -426,6 +436,10 @@ pub(crate) struct Store {
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
     event_writer_finalizers: event_writer::CommitFinalizerRegistry,
     post_commit_feed: post_commit::PostCommitFeed,
+    /// Hydration policy for a running tool execution with no owning assistant
+    /// `ToolCall`. Every constructor sets `Reject`; only a fixture that creates
+    /// such a row by direct mutation may relax it, and only for itself.
+    ownerless_running_tools: event_writer::OwnerlessRunningTool,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
@@ -492,6 +506,15 @@ impl Store {
         let mut store = Self::finish_open(pool, scope, key_provider).await?;
         store._in_memory_anchor = Some(Arc::new(Mutex::new(anchor)));
         Ok(store)
+    }
+
+    /// Opt one fixture out of owning-`ToolCall` attribution. Only for fixtures
+    /// that create `running` rows by direct mutation instead of by replaying an
+    /// assistant transcript. There is no production equivalent: `Store::open`
+    /// always rejects an ownerless running row.
+    #[cfg(test)]
+    pub(crate) fn synthesize_owners_for_ownerless_running_tools(&mut self) {
+        self.ownerless_running_tools = event_writer::OwnerlessRunningTool::SynthesizeOwner;
     }
 
     #[cfg(test)]
@@ -594,6 +617,7 @@ impl Store {
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
             event_writer_finalizers: event_writer::CommitFinalizerRegistry::default(),
             post_commit_feed: post_commit::PostCommitFeed::new(0),
+            ownerless_running_tools: event_writer::OwnerlessRunningTool::Reject,
             #[cfg(test)]
             _in_memory_anchor: None,
         });
@@ -1481,19 +1505,22 @@ impl Store {
                     row.try_get("executor_generation")?,
                 )
                 .map_err(|error| anyhow!("invalid persisted executor generation: {error}"))?;
-                event_writer::authenticate_running_tool_intent(
+                let evidence = event_writer::authenticate_running_tool_intent(
                     self,
                     transaction,
                     &tool_call_id,
                     &command_id,
                     &run_id,
                     generation,
+                    self.ownerless_running_tools,
                 )
                 .await?;
                 intents.push(PhysicalRecoveryIntentRequest {
                     tool_call_id,
+                    tool_name: evidence.tool_name,
                     command_id,
                     run_id,
+                    assistant_message_id: evidence.assistant_message_id,
                     executor_generation: generation,
                 });
             }
@@ -4871,7 +4898,6 @@ mod tests {
         drop(store);
         let wrong_scope = AgentScope {
             personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ..scope()
         };
         let error = match Store::finish_open(pool, wrong_scope, provider()).await {
             Ok(_) => panic!("scope mismatch must fail closed"),
@@ -4913,7 +4939,6 @@ mod tests {
 
         let wrong_scope = AgentScope {
             personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
-            ..scope()
         };
         let error = match Store::finish_open(pool.clone(), wrong_scope, provider()).await {
             Ok(_) => panic!("wrong scope must fail before projection initialization"),
@@ -7852,7 +7877,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18, 19]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",

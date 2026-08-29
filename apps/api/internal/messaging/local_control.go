@@ -24,15 +24,18 @@ const (
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
 	LocalCallStatePath         = "/local-control/v1/messaging:call-state"
+	// The place-opening and place-editing operations the human sidebar has.
+	// Each is the same app-owned Store path the Human REST route uses, so a
+	// PersonalityAgent gains no reach a person in that Workspace lacks.
+	LocalStartDMPath          = "/local-control/v1/messaging:start-dm"
+	LocalCreateChannelPath    = "/local-control/v1/messaging:create-channel"
+	LocalUpdateChannelPath    = "/local-control/v1/messaging:update-channel"
+	LocalDuplicateChannelPath = "/local-control/v1/messaging:duplicate-channel"
 	// LocalNotificationSettingsPath reads and writes the same app-owned
 	// notification-setting resource for a PersonalityAgent that the Human UI
 	// uses for a Human. This adapter route does not itself define which agent
 	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
-	// LocalProfilePath reads and writes the same self-declared 名乗り
-	// (display name + tagline) for a PersonalityAgent that the Human settings
-	// screen writes for a Human, through the identical ScopedStore path.
-	LocalProfilePath = "/local-control/v1/messaging:profile"
 	// LocalUploadAttachmentPattern is the PAID-local raw-body upload route. The
 	// exact Messaging scope travels in headers because the body is the file.
 	LocalUploadAttachmentPattern = "/local-control/v1/messaging/places/{place_id}/attachments"
@@ -79,8 +82,11 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
+		{"POST " + LocalStartDMPath, s.localStartDM},
+		{"POST " + LocalCreateChannelPath, s.localCreateChannel},
+		{"POST " + LocalUpdateChannelPath, s.localUpdateChannel},
+		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
-		{"POST " + LocalProfilePath, s.localProfile},
 		{"POST " + LocalAttachmentPath, s.localAttachment},
 	}
 	if s.Calls != nil {
@@ -265,7 +271,11 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	}
 	members := make([]memberWire, len(snapshot.Members))
 	for i, profile := range snapshot.Members {
-		members[i] = memberToWire(profile)
+		members[i] = memberWire{
+			Participant: participantToWire(profile.Participant),
+			DisplayName: profile.ProjectedDisplayName(),
+			Tagline:     profile.Tagline,
+		}
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place       placeWire     `json:"place"`
@@ -416,6 +426,235 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 	}{statusToWire(status)})
 }
 
+// localStartDM opens the agent's direct conversation with one participant, or
+// a group conversation with several — the same split the human sidebar's
+// 「ダイレクトメッセージを開始」makes by how many people were ticked. One
+// person takes EnsureDM (so a second attempt returns the conversation that
+// already exists rather than a second one), several take CreateGroupDM. Both
+// are the exact Store paths POST /messaging/dms and /messaging/group-dms use,
+// so reachability and authorization are identical.
+func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Participants []participantWire `json:"participants"`
+		ClientNonce  string            `json:"client_nonce,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	requested := make([]ParticipantRef, 0, len(request.Participants))
+	for _, wire := range request.Participants {
+		ref, err := wire.ref()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_participant")
+			return
+		}
+		requested = append(requested, ref)
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	others, normalizeErr := normalizeDMOthers(store.Scope.Actor, requested)
+	if normalizeErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var (
+		place   Place
+		created bool
+		err     error
+	)
+	if len(others) == 1 {
+		place, created, err = store.EnsureDM(r.Context(), others[0])
+	} else {
+		if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+			writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+			return
+		}
+		place, created, err = store.CreateGroupDMOnce(r.Context(), others, request.ClientNonce)
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := dmWire{
+		DMID: place.PlaceID, Kind: place.Kind,
+		Participants: append(
+			[]participantWire{participantToWire(store.Scope.Actor)},
+			participantsToWire(others)...,
+		),
+	}
+	// Only a place that did not exist a moment ago is news.
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire,
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		DM             dmWire `json:"dm"`
+		Created        bool   `json:"created"`
+		WorkspaceID    string `json:"workspace_id"`
+		InstallationID string `json:"installation_id"`
+		AuthorityEpoch string `json:"authority_epoch"`
+	}{
+		DM: wire, Created: created,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
+}
+
+// localCreateChannel opens a channel in the agent's exact Workspace, the same
+// Store path as POST /messaging/channels. There is no workspace_id field to
+// choose with: the sealed scope already names one Workspace, so the agent
+// cannot be talked into opening a channel somewhere else.
+func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Name        string `json:"name"`
+		Topic       string `json:"topic,omitempty"`
+		Voice       bool   `json:"voice"`
+		ClientNonce string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.Name == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || utf8.RuneCountInString(request.Name) > MaxChannelNameChars ||
+		len(request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, created, err := store.CreateChannelOnce(r.Context(), request.Name, request.Topic, request.Voice, request.ClientNonce)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		Channel        channelWire `json:"channel"`
+		Created        bool        `json:"created"`
+		Kind           string      `json:"kind"`
+		WorkspaceID    string      `json:"workspace_id"`
+		InstallationID string      `json:"installation_id"`
+		AuthorityEpoch string      `json:"authority_epoch"`
+	}{
+		Channel: wire, Created: created, Kind: PlaceChannel,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
+}
+
+// localUpdateChannel renames a channel, retopics it, or both. An omitted field
+// is left alone; naming neither is refused rather than answered as a
+// successful edit, so the model cannot read a no-op as a rename that happened.
+func (s *Server) localUpdateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		PlaceID string  `json:"place_id"`
+		Name    *string `json:"name,omitempty"`
+		Topic   *string `json:"topic,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || (request.Name == nil && request.Topic == nil) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if request.Name != nil &&
+		(*request.Name == "" || utf8.RuneCountInString(*request.Name) > MaxChannelNameChars) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if request.Topic != nil && len(*request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, err := store.UpdateChannel(r.Context(), request.PlaceID, request.Name, request.Topic)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	_ = s.Hub.PublishScoped(r.Context(), store, Event{
+		Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire,
+	})
+	writeJSON(w, http.StatusOK, struct {
+		Channel channelWire `json:"channel"`
+	}{wire})
+}
+
+// localDuplicateChannel copies a channel's shape into a new, empty one. An
+// omitted name takes the server's derived default, so neither the human menu
+// nor the agent has to decide what「コピー」is called.
+func (s *Server) localDuplicateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		PlaceID     string `json:"place_id"`
+		Name        string `json:"name,omitempty"`
+		ClientNonce string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || utf8.RuneCountInString(request.Name) > MaxChannelNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, created, err := store.DuplicateChannelOnce(r.Context(), request.PlaceID, request.Name, request.ClientNonce)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		Channel        channelWire `json:"channel"`
+		Created        bool        `json:"created"`
+		Kind           string      `json:"kind"`
+		WorkspaceID    string      `json:"workspace_id"`
+		InstallationID string      `json:"installation_id"`
+		AuthorityEpoch string      `json:"authority_epoch"`
+	}{
+		Channel: wire, Created: created, Kind: PlaceChannel,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
+}
+
 // localReplyLater places the agent's own「後で返信します」marker. The tool
 // layer scopes it to messages visible in the currently open view, the same
 // rule as react (ADR 0011 §3); the server enforces the shared permission
@@ -559,47 +798,6 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
-}
-
-// localProfile reads or updates the agent's own 名乗り — its display name and
-// tagline — through the identical store path the Human settings screen uses.
-// Like notification settings a request with no field set is a read, and a named
-// field changes only that field, so an agent that renames itself cannot
-// silently clear its own tagline. The rules for what a name and a tagline may
-// be live in ScopedStore.SetProfile alone; this lane adds none of its own, so
-// Human and PersonalityAgent cannot drift apart.
-func (s *Server) localProfile(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
-	var request struct {
-		localScopeWire
-		DisplayName *string `json:"display_name,omitempty"`
-		Tagline     *string `json:"tagline,omitempty"`
-	}
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
-	if !ok {
-		return
-	}
-	if request.DisplayName == nil && request.Tagline == nil {
-		profile, err := store.Profile(r.Context())
-		if err != nil {
-			writeStoreError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, struct {
-			Profile memberWire `json:"profile"`
-		}{memberToWire(profile)})
-		return
-	}
-	profile, err := s.setProfile(r.Context(), store, request.DisplayName, request.Tagline)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, struct {
-		Profile memberWire `json:"profile"`
-	}{memberToWire(profile)})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

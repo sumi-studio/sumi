@@ -62,6 +62,15 @@ func run(ctx context.Context) (runErr error) {
 	defer func() {
 		runErr = errors.Join(runErr, app.Close())
 	}()
+	if app.messagingServer != nil {
+		// Readers resolve temporary status expiry themselves; this worker makes
+		// it visible on already-open screens. Start it only after run owns the
+		// application so Close can cancel it.
+		go app.messagingServer.RunStatusExpiry(
+			app.backgroundCtx,
+			messaging.DefaultStatusExpiryInterval,
+		)
+	}
 
 	publicServer := &http.Server{
 		Addr:              publicAddress,
@@ -211,16 +220,18 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux     *http.ServeMux
-	localMux      *http.ServeMux
-	localListener *localControlListenerConfig
-	store         *agentevents.CommandStore
-	browser       *agentevents.BrowserServer
-	database      *db.Pool
-	spawnManager  *spawn.Manager
-	localRuntimes *agentevents.LocalControlListenerRegistry
+	publicMux       *http.ServeMux
+	localMux        *http.ServeMux
+	localListener   *localControlListenerConfig
+	store           *agentevents.CommandStore
+	browser         *agentevents.BrowserServer
+	database        *db.Pool
+	spawnManager    *spawn.Manager
+	localRuntimes   *agentevents.LocalControlListenerRegistry
+	messagingServer *messaging.Server
+	backgroundCtx   context.Context
 	// stopBackground cancels process-lifetime workers such as the attachment
-	// reconciler.
+	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
 	closeOnce      sync.Once
 	closeErr       error
@@ -361,6 +372,9 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	if authEnabled {
 		authServer.RegisterRoutes(mux)
+		if database != nil {
+			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
+		}
 	}
 	// The /messaging surface requires the control-plane database. Without a
 	// session verifier the routes stay mounted but fail closed (401), matching
@@ -392,9 +406,6 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
 		messagingServer.RegisterRoutes(mux)
-		if authEnabled {
-			newHumanProfileServer(messagingServer, sv, browserOrigins).RegisterRoutes(mux)
-		}
 		livekit, callsEnabled, configErr := liveKitConfigFromEnv()
 		if configErr != nil {
 			closeOnError()
@@ -481,15 +492,17 @@ func newApplicationFromEnv() (*application, error) {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
 	return &application{
-		publicMux:      mux,
-		localMux:       localMux,
-		localListener:  localListener,
-		store:          store,
-		browser:        browser,
-		database:       database,
-		spawnManager:   spawnManager,
-		localRuntimes:  localRuntimes,
-		stopBackground: stopBackground,
+		publicMux:       mux,
+		localMux:        localMux,
+		localListener:   localListener,
+		store:           store,
+		browser:         browser,
+		database:        database,
+		spawnManager:    spawnManager,
+		localRuntimes:   localRuntimes,
+		messagingServer: messagingServer,
+		backgroundCtx:   backgroundCtx,
+		stopBackground:  stopBackground,
 	}, nil
 }
 

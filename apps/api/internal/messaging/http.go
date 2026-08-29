@@ -62,14 +62,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/group-dms", s.serveCreateGroupDM)
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
+	mux.HandleFunc("POST /messaging/places/{place_id}/duplicate", s.serveDuplicatePlace)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
-	mux.HandleFunc("GET /messaging/profile", s.serveProfile)
-	mux.HandleFunc("PUT /messaging/profile", s.serveSetProfile)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
@@ -157,6 +156,7 @@ type messageWire struct {
 	ClientNonce string            `json:"client_nonce"`
 	CreatedAt   time.Time         `json:"created_at"`
 	EditedAt    *time.Time        `json:"edited_at"`
+	Revision    int64             `json:"revision"`
 	Deleted     bool              `json:"deleted"`
 }
 
@@ -240,6 +240,7 @@ func messageToWire(place Place, m Message) messageWire {
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
+		Revision:    m.Revision,
 		Deleted:     m.Deleted,
 	}
 	if m.ReplyTo != "" {
@@ -256,6 +257,7 @@ type workspaceWire struct {
 type channelWire struct {
 	ChannelID   string `json:"channel_id"`
 	WorkspaceID string `json:"workspace_id"`
+	Revision    int64  `json:"revision"`
 	Name        string `json:"name"`
 	Topic       string `json:"topic"`
 	Visibility  string `json:"visibility"`
@@ -266,6 +268,7 @@ func channelToWire(p Place) channelWire {
 	return channelWire{
 		ChannelID:   p.PlaceID,
 		WorkspaceID: p.WorkspaceID,
+		Revision:    p.Revision,
 		Name:        p.Name,
 		Topic:       p.Topic,
 		Visibility:  p.Visibility,
@@ -279,23 +282,10 @@ type dmWire struct {
 	Participants []participantWire `json:"participants"`
 }
 
-// memberWire is the presentation of one participant. The tagline rides with
-// every member list rather than needing a second round trip: it is what the
-// member list, the profile card and the composer all show next to the name.
 type memberWire struct {
 	Participant participantWire `json:"participant"`
 	DisplayName string          `json:"display_name"`
 	Tagline     string          `json:"tagline"`
-	Revision    int64           `json:"revision"`
-}
-
-func memberToWire(profile MemberProfile) memberWire {
-	return memberWire{
-		Participant: participantToWire(profile.Participant),
-		DisplayName: profile.ProjectedDisplayName(),
-		Tagline:     profile.Tagline,
-		Revision:    profile.Revision,
-	}
 }
 
 type readMarkerWire struct {
@@ -303,20 +293,31 @@ type readMarkerWire struct {
 	LastReadSeq int64     `json:"last_read_seq"`
 }
 
-// statusWire matches the web model's ParticipantStatus.
+// statusWire matches the web model's ParticipantStatus. A cleared status (a
+// temporary one that lapsed with nothing behind it) travels with an empty
+// status: the participant is no longer saying anything about their attention,
+// which is a different answer from saying they are available.
 type statusWire struct {
 	Participant participantWire `json:"participant"`
+	Revision    int64           `json:"revision"`
 	Status      string          `json:"status"`
 	Note        string          `json:"note"`
 	ExpiresAt   *time.Time      `json:"expires_at"`
+	// What this temporary status lapses back to. Empty means the lapse ends
+	// the declaration instead of restoring an earlier one.
+	BaseStatus string `json:"base_status"`
+	BaseNote   string `json:"base_note"`
 }
 
 func statusToWire(status ParticipantStatus) statusWire {
 	return statusWire{
 		Participant: participantToWire(status.Participant),
+		Revision:    status.Revision,
 		Status:      status.Status,
 		Note:        status.Note,
 		ExpiresAt:   status.ExpiresAt,
+		BaseStatus:  status.BaseStatus,
+		BaseNote:    status.BaseNote,
 	}
 }
 
@@ -480,33 +481,55 @@ func (s *Server) publishStatus(ctx context.Context, store *ScopedStore, status P
 	_ = s.Hub.PublishScoped(ctx, store, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
 }
 
-// publishProfile fans a replaced profile out to every Workspace where its
-// participant is presently visible. Unlike status it is durable: bootstrap
-// already carries the current value, so a missed frame is repaired by
-// reconnecting rather than by a replay.
-func (s *Server) publishProfile(ctx context.Context, scopes []Scope, profile MemberProfile) {
-	if s.Hub == nil {
-		return
+// DefaultStatusExpiryInterval is how often lapsed temporary statuses are swept.
+// Readers already resolve expiry themselves, so this only bounds how late the
+// live announcement is — a minute of lag on「1時間だけ取り込み中」is invisible,
+// and a tighter loop would buy nothing but wakeups.
+const DefaultStatusExpiryInterval = time.Minute
+
+// RunStatusExpiry sweeps lapsed temporary statuses until ctx is done,
+// announcing each participant's restored state so a screen left open stops
+// showing「取り込み中」after it stopped being true. A sweep has no actor, so it
+// carries the Workspace's exact app address instead and the Hub re-resolves the
+// audience there. Expiry is still resolved at read time, so this loop is
+// liveness, not correctness: skipping it entirely leaves no reader with a stale
+// declaration.
+func (s *Server) RunStatusExpiry(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = DefaultStatusExpiryInterval
 	}
-	subject := profile.Participant
-	wire := memberToWire(profile)
-	for _, scope := range scopes {
-		_ = s.Hub.PublishSystemScoped(ctx, scope, Event{Type: EventProfileUpdated, Subject: &subject, Profile: &wire})
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sweepExpiredStatuses(ctx)
+		}
 	}
 }
 
-// setProfile is the scoped transport adapter for Store.setProfile. Receivers
-// resolve any delivery reordering through the profile revision.
-func (s *Server) setProfile(ctx context.Context, store *ScopedStore, displayName, tagline *string) (MemberProfile, error) {
-	return store.SetProfile(ctx, displayName, tagline, s.publishProfile)
-}
-
-// SetHumanProfile lets the account settings surface use the exact same
-// profile write boundary as Messaging. Session authorization belongs to that
-// outer transport; this method owns the durable name/revision write and the
-// post-commit fan-out to every Workspace where the Human is visible.
-func (s *Server) SetHumanProfile(ctx context.Context, humanID string, displayName string) (MemberProfile, error) {
-	return s.Store.setProfile(ctx, ParticipantRef{Kind: KindHuman, ID: humanID}, &displayName, nil, nil, s.publishProfile)
+// sweepExpiredStatuses publishes each lapse only after its transaction commits.
+// A participant who declares something new before the sweep leaves nothing to
+// lapse; one who declares afterwards carries a greater database revision, which
+// recipients keep even if this best-effort expiry frame arrives later.
+func (s *Server) sweepExpiredStatuses(ctx context.Context) {
+	announce := func(ctx context.Context, expiry StatusExpiry) {
+		if s.Hub == nil {
+			return
+		}
+		subject := expiry.Status.Participant
+		wire := statusToWire(expiry.Status)
+		for _, scope := range expiry.Scopes {
+			_ = s.Hub.PublishSystemScoped(ctx, scope, Event{
+				Type: EventStatusUpdated, Subject: &subject, Status: &wire,
+			})
+		}
+	}
+	// Best effort: readers still resolve expiry themselves, and the next tick
+	// retries.
+	_ = s.Store.ExpireStatuses(ctx, announce)
 }
 
 type unreadSummaryWire struct {
@@ -631,7 +654,11 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			if _, seen := memberSet[key]; seen {
 				continue
 			}
-			memberSet[key] = memberToWire(p)
+			memberSet[key] = memberWire{
+				Participant: participantToWire(p.Participant),
+				DisplayName: p.ProjectedDisplayName(),
+				Tagline:     p.Tagline,
+			}
 			memberOrder = append(memberOrder, key)
 		}
 	}
@@ -743,11 +770,12 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Name        string `json:"name"`
 		Topic       string `json:"topic"`
 		Voice       bool   `json:"voice"`
+		ClientNonce string `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Name == "" || len(req.Name) > 200 {
+	if req.Name == "" || utf8.RuneCountInString(req.Name) > MaxChannelNameChars {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
@@ -755,13 +783,18 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_topic")
 		return
 	}
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
 	var place Place
+	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
 		if req.WorkspaceID != "" && req.WorkspaceID != scopedStoreForRequest(r).Scope.WorkspaceID {
 			return ErrInvalidScope
 		}
-		place, opErr = scopedStoreForRequest(r).CreateChannel(r.Context(), req.Name, req.Topic, req.Voice)
+		place, created, opErr = scopedStoreForRequest(r).CreateChannelOnce(r.Context(), req.Name, req.Topic, req.Voice, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -772,30 +805,47 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wire := channelToWire(place)
-	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
-// serveUpdatePlace edits a channel's mutable fields (v0: topic only).
+// serveUpdatePlace edits a channel's mutable identity: name, topic, or both.
+// An omitted field is left alone, so renaming a channel never clears its
+// topic; naming neither is refused rather than answered as a successful edit.
 func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	_, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		Topic string `json:"topic"`
+		Name  *string `json:"name"`
+		Topic *string `json:"topic"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if len(req.Topic) > maxTopicBytes {
+	if req.Name == nil && req.Topic == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if req.Name != nil && (*req.Name == "" || utf8.RuneCountInString(*req.Name) > MaxChannelNameChars) {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	if req.Topic != nil && len(*req.Topic) > maxTopicBytes {
 		writeError(w, http.StatusBadRequest, "invalid_topic")
 		return
 	}
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = scopedStoreForRequest(r).UpdateChannelTopic(r.Context(), r.PathValue("place_id"), req.Topic)
+		place, opErr = scopedStoreForRequest(r).UpdateChannel(r.Context(), r.PathValue("place_id"), req.Name, req.Topic)
 		return opErr
 	})
 	if !done {
@@ -808,6 +858,54 @@ func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	wire := channelToWire(place)
 	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire})
 	writeJSON(w, http.StatusOK, wire)
+}
+
+// serveDuplicatePlace opens a new channel beside an existing one. An omitted
+// or empty name takes the server's derived default, so the human menu and the
+// agent tool produce the same copy.
+func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
+	_, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		ClientNonce string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > MaxChannelNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
+	}
+	var place Place
+	created := true
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		place, created, opErr = scopedStoreForRequest(r).DuplicateChannelOnce(r.Context(), r.PathValue("place_id"), req.Name, req.ClientNonce)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
@@ -826,6 +924,16 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_participant")
 		return
 	}
+	others, err := normalizeDMOthers(viewer, []ParticipantRef{other})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) != 1 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	other = others[0]
 	var (
 		place   Place
 		created bool
@@ -859,23 +967,38 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Participants []participantWire `json:"participants"`
+		ClientNonce  string            `json:"client_nonce"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	others := make([]ParticipantRef, 0, len(req.Participants))
+	requested := make([]ParticipantRef, 0, len(req.Participants))
 	for _, pw := range req.Participants {
 		ref, err := pw.ref()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_participant")
 			return
 		}
-		others = append(others, ref)
+		requested = append(requested, ref)
+	}
+	others, err := normalizeDMOthers(viewer, requested)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) < 2 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+		return
 	}
 	var place Place
+	created := true
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = scopedStoreForRequest(r).CreateGroupDM(r.Context(), others)
+		place, created, opErr = scopedStoreForRequest(r).CreateGroupDMOnce(r.Context(), others, req.ClientNonce)
 		return opErr
 	})
 	if !done {
@@ -887,10 +1010,16 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	}
 	wire := dmWire{
 		DMID: place.PlaceID, Kind: place.Kind,
-		Participants: append([]participantWire{participantToWire(viewer)}, req.Participants...),
+		Participants: append([]participantWire{participantToWire(viewer)}, participantsToWire(others)...),
 	}
-	_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
-	writeJSON(w, http.StatusCreated, wire)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), scopedStoreForRequest(r), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, wire)
 }
 
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
@@ -911,7 +1040,11 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	members := make([]memberWire, len(profiles))
 	for i, p := range profiles {
-		members[i] = memberToWire(p)
+		members[i] = memberWire{
+			Participant: participantToWire(p.Participant),
+			DisplayName: p.ProjectedDisplayName(),
+			Tagline:     p.Tagline,
+		}
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`
@@ -1093,13 +1226,18 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Content string `json:"content"`
+		Content  string `json:"content"`
+		Revision int64  `json:"revision"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Content == "" || !messageContentFitsStorage(req.Content) {
 		writeError(w, http.StatusBadRequest, "invalid_content")
+		return
+	}
+	if req.Revision <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_revision")
 		return
 	}
 	store := scopedStoreForRequest(r)
@@ -1111,13 +1249,34 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 	var msg Message
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, opErr = store.EditMessage(r.Context(), placeID, r.PathValue("message_id"), req.Content)
+		msg, opErr = store.EditMessage(r.Context(), placeID, r.PathValue("message_id"), req.Content, req.Revision)
 		return opErr
 	})
 	if !done {
 		return
 	}
 	if err != nil {
+		var conflict *messageRevisionConflictError
+		if errors.As(err, &conflict) {
+			writeJSON(w, http.StatusConflict, struct {
+				Error   string      `json:"error"`
+				Message messageWire `json:"message"`
+			}{
+				Error:   "edit_conflict",
+				Message: messageToWire(place, conflict.Current),
+			})
+			return
+		}
+		if errors.Is(err, ErrMessageDeleted) {
+			writeJSON(w, http.StatusConflict, struct {
+				Error   string      `json:"error"`
+				Message messageWire `json:"message"`
+			}{
+				Error:   "message_deleted",
+				Message: messageToWire(place, msg),
+			})
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
@@ -1155,7 +1314,9 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	wire := messageToWire(place, msg)
 	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: wire})
 }
 
 // serveToggleReaction toggles the viewer's emoji on a message. The same store
@@ -1210,53 +1371,6 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	}{Message: messageToWire(place, msg), Reacted: reacted})
 }
 
-// serveProfile returns the viewer's own canonical profile. Everyone else's is
-// already in the member list, so this route exists for the settings screen
-// rather than for looking people up.
-func (s *Server) serveProfile(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.viewer(w, r); !ok {
-		return
-	}
-	profile, err := scopedStoreForRequest(r).Profile(r.Context())
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, memberToWire(profile))
-}
-
-// serveSetProfile replaces the viewer's own profile. Like status there is no
-// route for setting anyone else's: the participant is the authenticated
-// session, never a request field. An absent JSON field is preserved, so a
-// client that only edits the tagline cannot clear the display name.
-func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
-	_, claims, ok := s.viewer(w, r)
-	if !ok {
-		return
-	}
-	var req struct {
-		DisplayName *string `json:"display_name"`
-		Tagline     *string `json:"tagline"`
-	}
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	var profile MemberProfile
-	done, err := s.mutate(w, r, claims, func() error {
-		var opErr error
-		profile, opErr = s.setProfile(r.Context(), scopedStoreForRequest(r), req.DisplayName, req.Tagline)
-		return opErr
-	})
-	if !done {
-		return
-	}
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, memberToWire(profile))
-}
-
 // serveSetStatus replaces the viewer's own status. There is no route for
 // setting anyone else's: the participant is the authenticated session, never a
 // request field (自己申告のattention — the platform does not observe or
@@ -1275,14 +1389,17 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	switch req.Status {
-	case StatusAvailable, StatusBusy, StatusAway:
-	default:
+	if !ValidStatus(req.Status) {
 		writeError(w, http.StatusBadRequest, "invalid_status")
 		return
 	}
 	if utf8.RuneCountInString(req.Note) > MaxStatusNoteChars {
 		writeError(w, http.StatusBadRequest, "invalid_note")
+		return
+	}
+	// An expiry already in the past would be a status nobody ever held.
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "invalid_expires_at")
 		return
 	}
 	var status ParticipantStatus
@@ -1538,6 +1655,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "not_reachable")
 	case errors.Is(err, ErrMessageDeleted):
 		writeError(w, http.StatusConflict, "message_deleted")
+	case errors.Is(err, ErrMessageRevisionConflict):
+		writeError(w, http.StatusConflict, "edit_conflict")
 	case errors.Is(err, ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, "idempotency_conflict")
 	case errors.Is(err, ErrAttachmentNotFound):
@@ -1566,12 +1685,12 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	case errors.Is(err, ErrNotAChannel):
 		writeError(w, http.StatusBadRequest, "not_a_channel")
+	case errors.Is(err, ErrInvalidChannelName):
+		writeError(w, http.StatusBadRequest, "invalid_name")
+	case errors.Is(err, ErrEmptyChannelUpdate):
+		writeError(w, http.StatusBadRequest, "invalid_request")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
-	case errors.Is(err, ErrInvalidDisplayName):
-		writeError(w, http.StatusBadRequest, "invalid_display_name")
-	case errors.Is(err, ErrInvalidTagline):
-		writeError(w, http.StatusBadRequest, "invalid_tagline")
 	case errors.Is(err, ErrInvalidScope):
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 	case errors.Is(err, applicationapps.ErrInstallationNotFound):

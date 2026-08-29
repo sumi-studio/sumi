@@ -6,7 +6,7 @@
 //! that metadata around this value, but must not reinterpret the app-owned
 //! operation or resource identities recorded here.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{io, path::Path};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
@@ -18,9 +18,16 @@ const DESCRIPTOR_DIGEST_DOMAIN: &[u8] = b"sumi-bound-tool-descriptor/v1\0";
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-bound-tool-evidence/v1\0";
 const WORKSPACE_IDENTITY_DOMAIN: &[u8] = b"sumi-workspace-identity/v1\0";
 
-pub(crate) const BOUND_TOOL_INVOCATION_SCHEMA_VERSION: u32 = 2;
-const PROVIDER_REVIEW_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
-const PROVIDER_REVIEW_PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const BOUND_TOOL_INVOCATION_SCHEMA_VERSION: u32 = 3;
+const LEGACY_BOUND_TOOL_INVOCATION_SCHEMA_VERSION: u32 = 2;
+const MAX_LABEL_BYTES: usize = 256;
+const MAX_RESOURCE_ID_BYTES: usize = 16 * 1024;
+const MAX_RESOURCE_SCOPES: usize = 256;
+const MAX_BOUND_JSON_BYTES: usize = 1024 * 1024;
+const MAX_BOUND_JSON_DEPTH: usize = 64;
+const MAX_BOUND_JSON_NODES: usize = 65_536;
+const MAX_BOUND_CONTAINER_ITEMS: usize = 4_096;
+const MAX_BOUND_STRING_BYTES: usize = 256 * 1024;
 
 /// Coarse capability selected by trusted app adapter code.
 ///
@@ -85,7 +92,7 @@ impl ResourceScope {
             } => {
                 validate_label(namespace, "resource namespace")?;
                 validate_label(kind, "resource kind")?;
-                validate_label(id, "resource id")
+                validate_resource_id(id)
             }
         }
     }
@@ -135,6 +142,7 @@ impl AppActionDescriptor {
     ) -> Result<Self, DescribeError> {
         let operation = operation.into();
         validate_label(&operation, "operation")?;
+        validate_scope_count(resource_scopes.len())?;
         for scope in &resource_scopes {
             scope.validate()?;
         }
@@ -149,6 +157,7 @@ impl AppActionDescriptor {
 
     fn normalize_and_validate(&mut self) -> Result<(), DescribeError> {
         validate_label(&self.operation, "operation")?;
+        validate_scope_count(self.resource_scopes.len())?;
         for scope in &self.resource_scopes {
             scope.validate()?;
         }
@@ -158,23 +167,21 @@ impl AppActionDescriptor {
     }
 }
 
-/// Closed provider-visible identity for a production tool registration and
-/// bound adapter pair. Local tool and adapter identities remain exact strings;
-/// only an explicitly audited pair can cross the external review boundary.
+/// Read-only decoder for provider-review evidence emitted by schema v2.
+///
+/// New bindings use the exact app-owned descriptor and the frozen live
+/// registration. This legacy vocabulary is never consulted for admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderReviewIdentity {
+enum LegacyProviderReviewIdentity {
     WorkspaceListV1,
     WorkspaceInvitationListV1,
     WorkspaceInvitationAcceptV1,
     /// Durable recovery identity for seals emitted before authority epochs.
-    /// It and the versions below it are deliberately absent from `from_local`:
-    /// only the current adapter surface can be newly bound.
+    /// It is deliberately absent from `from_local`: new bindings are V2 only.
     MessagingV1,
     MessagingV2,
     MessagingV3,
-    /// V4 adds the self-declared 名乗り (`profile`), which V3 seals cannot carry.
-    MessagingV4,
     WorkspaceReadFileV1,
     WorkspaceListDirV1,
     WorkspaceGlobV1,
@@ -193,46 +200,9 @@ pub(crate) enum ProviderReviewIdentity {
     AppActionFixtureV1,
 }
 
-impl ProviderReviewIdentity {
-    fn from_local(tool_name: &str, adapter: &AdapterIdentity) -> Result<Self, DescribeError> {
-        let identity = match (tool_name, adapter.id.as_str(), adapter.version) {
-            ("workspace_list", "sumi.workspace.list", 1) => Self::WorkspaceListV1,
-            ("workspace_invitation_list", "sumi.workspace.invitation.list", 1) => {
-                Self::WorkspaceInvitationListV1
-            }
-            ("workspace_invitation_accept", "sumi.workspace.invitation.accept", 1) => {
-                Self::WorkspaceInvitationAcceptV1
-            }
-            ("messaging", "sumi.messaging", 4) => Self::MessagingV4,
-            ("read_file", "sumi.foundation.workspace", 1) => Self::WorkspaceReadFileV1,
-            ("list_dir", "sumi.foundation.workspace", 1) => Self::WorkspaceListDirV1,
-            ("glob", "sumi.foundation.workspace", 1) => Self::WorkspaceGlobV1,
-            ("grep", "sumi.foundation.workspace", 1) => Self::WorkspaceGrepV1,
-            #[cfg(test)]
-            ("fixture_tool", "sumi.fixture", 1) => Self::FixtureV1,
-            #[cfg(test)]
-            ("example", "sumi.example", 1) => Self::ExampleV1,
-            #[cfg(test)]
-            ("example", "sumi.example", 2) => Self::ExampleV2,
-            #[cfg(test)]
-            ("other_example", "sumi.example", 1) => Self::OtherExampleV1,
-            #[cfg(test)]
-            ("inspect", "test.binding", 1) => Self::InspectFixtureV1,
-            #[cfg(test)]
-            ("app_action", "test.app", 1) => Self::AppActionFixtureV1,
-            _ => {
-                return Err(DescribeError::InvalidDescriptor {
-                    reason: "tool/adapter pair has no closed provider review identity".to_owned(),
-                });
-            }
-        };
-        Ok(identity)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderReviewOperation {
+enum LegacyProviderReviewAction {
     ListMemberships,
     ListInvitations,
     AcceptInvitation,
@@ -242,7 +212,6 @@ pub(crate) enum ProviderReviewOperation {
     Write,
     React,
     Status,
-    Profile,
     ReplyLater,
     ResolveReplyLater,
     GetCallState,
@@ -262,7 +231,7 @@ pub(crate) enum ProviderReviewOperation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderReviewNamespace {
+enum LegacyProviderReviewNamespace {
     Workspace,
     Messaging,
     FoundationWorkspace,
@@ -276,7 +245,7 @@ pub(crate) enum ProviderReviewNamespace {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderReviewResourceKind {
+enum LegacyProviderReviewResourceKind {
     Membership,
     Invitation,
     Workspace,
@@ -293,335 +262,29 @@ pub(crate) enum ProviderReviewResourceKind {
     Item,
 }
 
-/// Provider-visible shape of an exact local app action descriptor.
-///
-/// Every textual vocabulary member is converted through the closed production
-/// mapping above. Exact resource identifiers remain local because paths,
-/// patterns, opaque tokens, and other caller-controlled strings may appear in
-/// that position. The external reviewer sees only whether each closed scope
-/// class names a collection or concrete resource and how many distinct scopes
-/// of that class were bound.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderReviewDescriptor {
+struct LegacyProviderReviewDescriptor {
     pub schema_version: u32,
-    pub operation: ProviderReviewOperation,
+    pub operation: LegacyProviderReviewAction,
     pub capability: CapabilityClass,
-    pub resource_scopes: Vec<ProviderReviewResourceScope>,
+    pub resource_scopes: Vec<LegacyProviderReviewResourceScope>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderReviewScopeType {
+enum LegacyProviderReviewScopeType {
     Collection,
     Resource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderReviewResourceScope {
-    pub scope_type: ProviderReviewScopeType,
-    pub namespace: ProviderReviewNamespace,
-    pub kind: ProviderReviewResourceKind,
+struct LegacyProviderReviewResourceScope {
+    pub scope_type: LegacyProviderReviewScopeType,
+    pub namespace: LegacyProviderReviewNamespace,
+    pub kind: LegacyProviderReviewResourceKind,
     pub count: u64,
-}
-
-impl ProviderReviewDescriptor {
-    fn from_exact(
-        identity: ProviderReviewIdentity,
-        exact: &AppActionDescriptor,
-    ) -> Result<Self, DescribeError> {
-        let operation = provider_review_operation(identity, exact)?;
-        let mut grouped = BTreeMap::<
-            (
-                ProviderReviewScopeType,
-                ProviderReviewNamespace,
-                ProviderReviewResourceKind,
-            ),
-            u64,
-        >::new();
-        for scope in &exact.resource_scopes {
-            let (scope_type, namespace, kind) = provider_review_scope(identity, scope)?;
-            let count = grouped.entry((scope_type, namespace, kind)).or_default();
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| DescribeError::InvalidDescriptor {
-                    reason: "provider review resource scope count overflowed".to_owned(),
-                })?;
-        }
-
-        Ok(Self {
-            schema_version: PROVIDER_REVIEW_DESCRIPTOR_SCHEMA_VERSION,
-            operation,
-            capability: exact.capability.clone(),
-            resource_scopes: grouped
-                .into_iter()
-                .map(
-                    |((scope_type, namespace, kind), count)| ProviderReviewResourceScope {
-                        scope_type,
-                        namespace,
-                        kind,
-                        count,
-                    },
-                )
-                .collect(),
-        })
-    }
-}
-
-fn provider_review_operation(
-    identity: ProviderReviewIdentity,
-    exact: &AppActionDescriptor,
-) -> Result<ProviderReviewOperation, DescribeError> {
-    use CapabilityClass::{Mutate, Read};
-    use ProviderReviewIdentity as Identity;
-    use ProviderReviewOperation as Operation;
-
-    let operation = match (identity, exact.operation.as_str(), &exact.capability) {
-        (Identity::WorkspaceListV1, "list_memberships", Read) => Operation::ListMemberships,
-        (Identity::WorkspaceInvitationListV1, "list_invitations", Read) => {
-            Operation::ListInvitations
-        }
-        (Identity::WorkspaceInvitationAcceptV1, "accept_invitation", Mutate) => {
-            Operation::AcceptInvitation
-        }
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "overview",
-            Read,
-        ) => Operation::Overview,
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "open",
-            Read,
-        ) => Operation::Open,
-        (Identity::MessagingV3 | Identity::MessagingV4, "open_attachment", Read) => {
-            Operation::OpenAttachment
-        }
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "write",
-            Mutate,
-        ) => Operation::Write,
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "react",
-            Mutate,
-        ) => Operation::React,
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "status",
-            Mutate,
-        ) => Operation::Status,
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "reply_later",
-            Mutate,
-        ) => Operation::ReplyLater,
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "resolve_reply_later",
-            Mutate,
-        ) => Operation::ResolveReplyLater,
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            "get_call_state",
-            Read,
-        ) => Operation::GetCallState,
-        // Reading one's own 名乗り and changing it are the same operation on the
-        // same participant; the capability class is what separates them.
-        (Identity::MessagingV4, "profile", Read | Mutate) => Operation::Profile,
-        (Identity::WorkspaceReadFileV1, "read_file", Read) => Operation::ReadFile,
-        (Identity::WorkspaceListDirV1, "list_dir", Read) => Operation::ListDir,
-        (Identity::WorkspaceGlobV1, "glob", Read) => Operation::Glob,
-        (Identity::WorkspaceGrepV1, "grep", Read) => Operation::Grep,
-        #[cfg(test)]
-        (Identity::FixtureV1, "fixture.operation", _) => Operation::Fixture,
-        #[cfg(test)]
-        (Identity::ExampleV1 | Identity::ExampleV2 | Identity::OtherExampleV1, "update", _) => {
-            Operation::Update
-        }
-        #[cfg(test)]
-        (Identity::InspectFixtureV1, "inspect", _) => Operation::Inspect,
-        #[cfg(test)]
-        (Identity::AppActionFixtureV1, "update_record", _) => Operation::UpdateRecord,
-        _ => {
-            return Err(DescribeError::InvalidDescriptor {
-                reason: "operation/capability has no closed provider review vocabulary".to_owned(),
-            });
-        }
-    };
-    Ok(operation)
-}
-
-fn provider_review_scope(
-    identity: ProviderReviewIdentity,
-    exact: &ResourceScope,
-) -> Result<
-    (
-        ProviderReviewScopeType,
-        ProviderReviewNamespace,
-        ProviderReviewResourceKind,
-    ),
-    DescribeError,
-> {
-    use ProviderReviewIdentity as Identity;
-    use ProviderReviewNamespace as Namespace;
-    use ProviderReviewResourceKind as Kind;
-    use ProviderReviewScopeType::{Collection, Resource};
-
-    let (scope_type, namespace, kind) = match exact {
-        ResourceScope::Collection { namespace, kind } => {
-            (Collection, namespace.as_str(), kind.as_str())
-        }
-        ResourceScope::Resource {
-            namespace, kind, ..
-        } => (Resource, namespace.as_str(), kind.as_str()),
-    };
-    let safe = match (identity, scope_type, namespace, kind) {
-        (Identity::WorkspaceListV1, Collection, "workspace", "membership") => {
-            (Collection, Namespace::Workspace, Kind::Membership)
-        }
-        (Identity::WorkspaceInvitationListV1, Collection, "workspace", "invitation") => {
-            (Collection, Namespace::Workspace, Kind::Invitation)
-        }
-        (Identity::WorkspaceInvitationAcceptV1, Resource, "workspace", "invitation") => {
-            (Resource, Namespace::Workspace, Kind::Invitation)
-        }
-        (Identity::WorkspaceInvitationAcceptV1, Resource, "workspace", "membership") => {
-            (Resource, Namespace::Workspace, Kind::Membership)
-        }
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            Resource,
-            "workspace",
-            "workspace",
-        ) => (Resource, Namespace::Workspace, Kind::Workspace),
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            Collection,
-            "messaging",
-            "place",
-        ) => (Collection, Namespace::Messaging, Kind::Place),
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            Resource,
-            "messaging",
-            "place",
-        ) => (Resource, Namespace::Messaging, Kind::Place),
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            Resource,
-            "messaging",
-            "message",
-        ) => (Resource, Namespace::Messaging, Kind::Message),
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            Resource,
-            "messaging",
-            "participant",
-        ) => (Resource, Namespace::Messaging, Kind::Participant),
-        (
-            Identity::MessagingV1
-            | Identity::MessagingV2
-            | Identity::MessagingV3
-            | Identity::MessagingV4,
-            Resource,
-            "messaging",
-            "reply_later_marker",
-        ) => (Resource, Namespace::Messaging, Kind::ReplyLaterMarker),
-        (Identity::MessagingV3 | Identity::MessagingV4, Resource, "messaging", "attachment") => {
-            (Resource, Namespace::Messaging, Kind::Attachment)
-        }
-        (
-            Identity::MessagingV3 | Identity::MessagingV4,
-            Resource,
-            "sumi.foundation.workspace",
-            "path",
-        ) => {
-            (Resource, Namespace::FoundationWorkspace, Kind::Path)
-        }
-        (
-            Identity::WorkspaceReadFileV1
-            | Identity::WorkspaceListDirV1
-            | Identity::WorkspaceGrepV1,
-            Resource,
-            "sumi.foundation.workspace",
-            "path",
-        ) => (Resource, Namespace::FoundationWorkspace, Kind::Path),
-        (Identity::WorkspaceGlobV1, Resource, "sumi.foundation.workspace", "glob_selector") => {
-            (Resource, Namespace::FoundationWorkspace, Kind::GlobSelector)
-        }
-        #[cfg(test)]
-        (Identity::FixtureV1, Resource, "fixture", "record") => {
-            (Resource, Namespace::Fixture, Kind::Record)
-        }
-        #[cfg(test)]
-        (
-            Identity::ExampleV1 | Identity::ExampleV2 | Identity::OtherExampleV1,
-            Resource,
-            "example",
-            "record",
-        ) => (Resource, Namespace::Example, Kind::Record),
-        #[cfg(test)]
-        (Identity::ExampleV1 | Identity::ExampleV2, Collection, "example", "record") => {
-            (Collection, Namespace::Example, Kind::Record)
-        }
-        #[cfg(test)]
-        (Identity::InspectFixtureV1, Collection, "test", "item") => {
-            (Collection, Namespace::Test, Kind::Item)
-        }
-        #[cfg(test)]
-        (Identity::AppActionFixtureV1, Resource, "test", "record") => {
-            (Resource, Namespace::Test, Kind::Record)
-        }
-        _ => {
-            return Err(DescribeError::InvalidDescriptor {
-                reason: "resource namespace/kind has no closed provider review vocabulary"
-                    .to_owned(),
-            });
-        }
-    };
-    Ok(safe)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -630,10 +293,16 @@ pub(crate) struct BoundExecutionArguments(Map<String, Value>);
 
 impl BoundExecutionArguments {
     pub(crate) fn from_value(value: Value) -> Result<Self, DescribeError> {
-        let Value::Object(arguments) = value else {
+        if !value.is_object() {
             return Err(DescribeError::InvalidBoundArguments {
                 reason: "bound execution arguments must be a JSON object".to_owned(),
             });
+        }
+        validate_bound_json(&value, "bound execution arguments", |reason| {
+            DescribeError::InvalidBoundArguments { reason }
+        })?;
+        let Value::Object(arguments) = value else {
+            unreachable!("bound execution arguments were checked as an object")
         };
         Ok(Self(arguments))
     }
@@ -654,10 +323,16 @@ pub(crate) struct ReviewProjection(Map<String, Value>);
 
 impl ReviewProjection {
     pub(crate) fn from_value(value: Value) -> Result<Self, DescribeError> {
-        let Value::Object(projection) = value else {
+        if !value.is_object() {
             return Err(DescribeError::InvalidReviewProjection {
                 reason: "review projection must be a JSON object".to_owned(),
             });
+        }
+        validate_bound_json(&value, "review projection", |reason| {
+            DescribeError::InvalidReviewProjection { reason }
+        })?;
+        let Value::Object(projection) = value else {
+            unreachable!("review projection was checked as an object")
         };
         Ok(Self(projection))
     }
@@ -667,15 +342,10 @@ impl ReviewProjection {
     }
 }
 
-/// A structural summary of the exact local Human projection.
-///
-/// The exact projection remains in [`BoundToolInvocation::review_projection`]
-/// for authenticated Human consent and local durable evidence. This separate
-/// This remains useful for app-owned validation and diagnostics, but it is not
-/// a substitute for the exact projection sent to AutoReview.
+/// Read-only decoder for the structural summary emitted by schema v2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderReviewProjection {
+struct LegacyProviderReviewProjection {
     pub schema_version: u32,
     pub top_level_fields: u64,
     pub object_fields: u64,
@@ -686,75 +356,6 @@ pub(crate) struct ProviderReviewProjection {
     pub number_values: u64,
     pub boolean_values: u64,
     pub null_values: u64,
-}
-
-impl ProviderReviewProjection {
-    fn from_exact(exact: &ReviewProjection) -> Result<Self, DescribeError> {
-        let mut projection = Self {
-            schema_version: PROVIDER_REVIEW_PROJECTION_SCHEMA_VERSION,
-            top_level_fields: u64::try_from(exact.as_object().len()).map_err(|_| {
-                DescribeError::InvalidReviewProjection {
-                    reason: "review projection field count exceeds u64".to_owned(),
-                }
-            })?,
-            object_fields: 0,
-            array_items: 0,
-            text_values: 0,
-            text_bytes: 0,
-            text_characters: 0,
-            number_values: 0,
-            boolean_values: 0,
-            null_values: 0,
-        };
-        summarize_provider_review_value(
-            &Value::Object(exact.as_object().clone()),
-            &mut projection,
-        )?;
-        Ok(projection)
-    }
-}
-
-fn summarize_provider_review_value(
-    value: &Value,
-    summary: &mut ProviderReviewProjection,
-) -> Result<(), DescribeError> {
-    fn add(target: &mut u64, value: usize) -> Result<(), DescribeError> {
-        let value = u64::try_from(value).map_err(|_| DescribeError::InvalidReviewProjection {
-            reason: "review projection size exceeds u64".to_owned(),
-        })?;
-        *target =
-            target
-                .checked_add(value)
-                .ok_or_else(|| DescribeError::InvalidReviewProjection {
-                    reason: "review projection summary overflowed".to_owned(),
-                })?;
-        Ok(())
-    }
-
-    match value {
-        Value::Null => add(&mut summary.null_values, 1),
-        Value::Bool(_) => add(&mut summary.boolean_values, 1),
-        Value::Number(_) => add(&mut summary.number_values, 1),
-        Value::String(text) => {
-            add(&mut summary.text_values, 1)?;
-            add(&mut summary.text_bytes, text.len())?;
-            add(&mut summary.text_characters, text.chars().count())
-        }
-        Value::Array(values) => {
-            add(&mut summary.array_items, values.len())?;
-            for value in values {
-                summarize_provider_review_value(value, summary)?;
-            }
-            Ok(())
-        }
-        Value::Object(object) => {
-            add(&mut summary.object_fields, object.len())?;
-            for value in object.values() {
-                summarize_provider_review_value(value, summary)?;
-            }
-            Ok(())
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -829,9 +430,14 @@ pub(crate) struct BoundExecutionIdentity {
 
 impl BoundExecutionIdentity {
     pub(super) fn seal(flow_id: &str, workspace_root: &Path) -> Result<Self, DescribeError> {
-        if flow_id.is_empty() || flow_id.chars().any(char::is_control) {
+        if flow_id.is_empty()
+            || flow_id.len() > MAX_LABEL_BYTES
+            || flow_id.chars().any(char::is_control)
+        {
             return Err(DescribeError::InvalidExecutionIdentity {
-                reason: "flow id must be non-empty and contain no control characters".to_owned(),
+                reason: format!(
+                    "flow id must be 1..={MAX_LABEL_BYTES} bytes and contain no control characters"
+                ),
             });
         }
         Ok(Self {
@@ -892,10 +498,25 @@ pub(crate) struct BoundToolInvocation {
     pub descriptor_digest: InvocationDigest,
     pub execution_identity: BoundExecutionIdentity,
     pub descriptor: AppActionDescriptor,
-    pub provider_review_identity: ProviderReviewIdentity,
-    pub provider_review_descriptor: ProviderReviewDescriptor,
+    #[serde(
+        rename = "provider_review_identity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_provider_review_identity: Option<LegacyProviderReviewIdentity>,
+    #[serde(
+        rename = "provider_review_descriptor",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_provider_review_descriptor: Option<LegacyProviderReviewDescriptor>,
     pub review_projection: ReviewProjection,
-    pub provider_review_projection: ProviderReviewProjection,
+    #[serde(
+        rename = "provider_review_projection",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_provider_review_projection: Option<LegacyProviderReviewProjection>,
     pub execution_arguments: BoundExecutionArguments,
 }
 
@@ -912,11 +533,16 @@ impl BoundToolInvocation {
         validate_proposal_label(tool_name, "tool name")?;
         adapter.validate()?;
         binding.descriptor.normalize_and_validate()?;
-        let provider_review_identity = ProviderReviewIdentity::from_local(tool_name, &adapter)?;
-        let provider_review_descriptor =
-            ProviderReviewDescriptor::from_exact(provider_review_identity, &binding.descriptor)?;
-        let provider_review_projection =
-            ProviderReviewProjection::from_exact(&binding.review_projection)?;
+        validate_bound_json_object(
+            binding.review_projection.as_object(),
+            "review projection",
+            |reason| DescribeError::InvalidReviewProjection { reason },
+        )?;
+        validate_bound_json_object(
+            binding.execution_arguments.as_object(),
+            "bound execution arguments",
+            |reason| DescribeError::InvalidBoundArguments { reason },
+        )?;
 
         let proposal_digest = digest_json(
             PROPOSAL_DIGEST_DOMAIN,
@@ -934,10 +560,7 @@ impl BoundToolInvocation {
                 "adapter": &adapter,
                 "execution_identity": &execution_identity,
                 "descriptor": &binding.descriptor,
-                "provider_review_identity": &provider_review_identity,
-                "provider_review_descriptor": &provider_review_descriptor,
                 "review_projection": &binding.review_projection,
-                "provider_review_projection": &provider_review_projection,
                 "execution_arguments": &binding.execution_arguments,
             }),
         )?;
@@ -951,15 +574,58 @@ impl BoundToolInvocation {
             descriptor_digest,
             execution_identity,
             descriptor: binding.descriptor,
-            provider_review_identity,
-            provider_review_descriptor,
+            legacy_provider_review_identity: None,
+            legacy_provider_review_descriptor: None,
             review_projection: binding.review_projection,
-            provider_review_projection,
+            legacy_provider_review_projection: None,
             execution_arguments: binding.execution_arguments,
         })
     }
 
     pub(crate) fn recompute_descriptor_digest(&self) -> Result<InvocationDigest, DescribeError> {
+        if self.schema_version == LEGACY_BOUND_TOOL_INVOCATION_SCHEMA_VERSION {
+            let identity = self
+                .legacy_provider_review_identity
+                .as_ref()
+                .ok_or_else(|| DescribeError::InvalidDescriptor {
+                    reason: "schema v2 evidence is missing provider review identity".to_owned(),
+                })?;
+            let descriptor = self
+                .legacy_provider_review_descriptor
+                .as_ref()
+                .ok_or_else(|| DescribeError::InvalidDescriptor {
+                    reason: "schema v2 evidence is missing provider review descriptor".to_owned(),
+                })?;
+            let projection = self
+                .legacy_provider_review_projection
+                .as_ref()
+                .ok_or_else(|| DescribeError::InvalidDescriptor {
+                    reason: "schema v2 evidence is missing provider review projection".to_owned(),
+                })?;
+            return digest_json(
+                DESCRIPTOR_DIGEST_DOMAIN,
+                &serde_json::json!({
+                    "schema_version": self.schema_version,
+                    "tool": &self.tool_name,
+                    "adapter": &self.adapter,
+                    "execution_identity": &self.execution_identity,
+                    "descriptor": &self.descriptor,
+                    "provider_review_identity": identity,
+                    "provider_review_descriptor": descriptor,
+                    "review_projection": &self.review_projection,
+                    "provider_review_projection": projection,
+                    "execution_arguments": &self.execution_arguments,
+                }),
+            );
+        }
+        if self.schema_version != BOUND_TOOL_INVOCATION_SCHEMA_VERSION {
+            return Err(DescribeError::InvalidDescriptor {
+                reason: format!(
+                    "unknown bound invocation schema version {}",
+                    self.schema_version
+                ),
+            });
+        }
         digest_json(
             DESCRIPTOR_DIGEST_DOMAIN,
             &serde_json::json!({
@@ -968,10 +634,7 @@ impl BoundToolInvocation {
                 "adapter": &self.adapter,
                 "execution_identity": &self.execution_identity,
                 "descriptor": &self.descriptor,
-                "provider_review_identity": &self.provider_review_identity,
-                "provider_review_descriptor": &self.provider_review_descriptor,
                 "review_projection": &self.review_projection,
-                "provider_review_projection": &self.provider_review_projection,
                 "execution_arguments": &self.execution_arguments,
             }),
         )
@@ -1146,21 +809,172 @@ fn hex_nibble(byte: u8) -> u8 {
 }
 
 fn validate_label(value: &str, field: &str) -> Result<(), DescribeError> {
-    if value.is_empty() || value.chars().any(char::is_control) {
+    if value.is_empty() || value.len() > MAX_LABEL_BYTES || value.chars().any(char::is_control) {
         return Err(DescribeError::InvalidDescriptor {
-            reason: format!("{field} must be non-empty and contain no control characters"),
+            reason: format!(
+                "{field} must be 1..={MAX_LABEL_BYTES} bytes and contain no control characters"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_resource_id(value: &str) -> Result<(), DescribeError> {
+    if value.is_empty()
+        || value.len() > MAX_RESOURCE_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(DescribeError::InvalidDescriptor {
+            reason: format!(
+                "resource id must be 1..={MAX_RESOURCE_ID_BYTES} bytes and contain no control characters"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_scope_count(count: usize) -> Result<(), DescribeError> {
+    if count > MAX_RESOURCE_SCOPES {
+        return Err(DescribeError::InvalidDescriptor {
+            reason: format!("resource scope count must not exceed {MAX_RESOURCE_SCOPES}"),
         });
     }
     Ok(())
 }
 
 fn validate_proposal_label(value: &str, field: &str) -> Result<(), DescribeError> {
-    if value.is_empty() || value.chars().any(char::is_control) {
+    if value.is_empty() || value.len() > MAX_LABEL_BYTES || value.chars().any(char::is_control) {
         return Err(DescribeError::InvalidProposalIdentity {
-            reason: format!("{field} must be non-empty and contain no control characters"),
+            reason: format!(
+                "{field} must be 1..={MAX_LABEL_BYTES} bytes and contain no control characters"
+            ),
         });
     }
     Ok(())
+}
+
+fn validate_bound_json<E>(
+    value: &Value,
+    field: &str,
+    invalid: impl Fn(String) -> E,
+) -> Result<(), E> {
+    validate_bound_json_root(BoundJsonRef::Value(value), field, invalid)
+}
+
+fn validate_bound_json_object<E>(
+    object: &Map<String, Value>,
+    field: &str,
+    invalid: impl Fn(String) -> E,
+) -> Result<(), E> {
+    validate_bound_json_root(BoundJsonRef::Object(object), field, invalid)
+}
+
+#[derive(Clone, Copy)]
+enum BoundJsonRef<'a> {
+    Value(&'a Value),
+    Object(&'a Map<String, Value>),
+}
+
+fn validate_bound_json_root<E>(
+    root: BoundJsonRef<'_>,
+    field: &str,
+    invalid: impl Fn(String) -> E,
+) -> Result<(), E> {
+    let mut stack = vec![(root, 1_usize)];
+    let mut nodes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_BOUND_JSON_NODES {
+            return Err(invalid(format!(
+                "{field} must not exceed {MAX_BOUND_JSON_NODES} JSON values"
+            )));
+        }
+        if depth > MAX_BOUND_JSON_DEPTH {
+            return Err(invalid(format!(
+                "{field} must not exceed JSON depth {MAX_BOUND_JSON_DEPTH}"
+            )));
+        }
+        match value {
+            BoundJsonRef::Value(Value::String(text)) => {
+                if text.len() > MAX_BOUND_STRING_BYTES {
+                    return Err(invalid(format!(
+                        "{field} string values must not exceed {MAX_BOUND_STRING_BYTES} bytes"
+                    )));
+                }
+                if text.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                }) {
+                    return Err(invalid(format!(
+                        "{field} string values contain a disallowed control character"
+                    )));
+                }
+            }
+            BoundJsonRef::Value(Value::Array(values)) => {
+                if values.len() > MAX_BOUND_CONTAINER_ITEMS {
+                    return Err(invalid(format!(
+                        "{field} arrays must not exceed {MAX_BOUND_CONTAINER_ITEMS} items"
+                    )));
+                }
+                stack.extend(
+                    values
+                        .iter()
+                        .map(|value| (BoundJsonRef::Value(value), depth + 1)),
+                );
+            }
+            BoundJsonRef::Value(Value::Object(object)) | BoundJsonRef::Object(object) => {
+                if object.len() > MAX_BOUND_CONTAINER_ITEMS {
+                    return Err(invalid(format!(
+                        "{field} objects must not exceed {MAX_BOUND_CONTAINER_ITEMS} fields"
+                    )));
+                }
+                for (key, value) in object {
+                    if key.len() > MAX_LABEL_BYTES || key.chars().any(char::is_control) {
+                        return Err(invalid(format!(
+                            "{field} field names must be at most {MAX_LABEL_BYTES} bytes and contain no control characters"
+                        )));
+                    }
+                    stack.push((BoundJsonRef::Value(value), depth + 1));
+                }
+            }
+            BoundJsonRef::Value(Value::Null | Value::Bool(_) | Value::Number(_)) => {}
+        }
+    }
+    let mut size = CappedJsonSizeWriter::default();
+    let encoded = match root {
+        BoundJsonRef::Value(value) => serde_json::to_writer(&mut size, value),
+        BoundJsonRef::Object(object) => serde_json::to_writer(&mut size, object),
+    };
+    if let Err(error) = encoded {
+        if size.exceeded {
+            return Err(invalid(format!(
+                "{field} must not exceed {MAX_BOUND_JSON_BYTES} encoded bytes"
+            )));
+        }
+        return Err(invalid(format!("{field} serialization failed: {error}")));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CappedJsonSizeWriter {
+    written: usize,
+    exceeded: bool,
+}
+
+impl io::Write for CappedJsonSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_BOUND_JSON_BYTES.saturating_sub(self.written) {
+            self.written = MAX_BOUND_JSON_BYTES + 1;
+            self.exceeded = true;
+            return Err(io::Error::other("bound JSON size limit exceeded"));
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn digest_json(domain: &[u8], value: &Value) -> Result<InvocationDigest, DescribeError> {
@@ -1266,7 +1080,46 @@ mod tests {
             .clone()
     }
 
-    fn seal_with_vocabulary(
+    fn aggregate_bound_json_object() -> Map<String, Value> {
+        const {
+            assert!(5 * MAX_BOUND_STRING_BYTES > MAX_BOUND_JSON_BYTES);
+            assert!(5 < MAX_BOUND_CONTAINER_ITEMS);
+            assert!(7 < MAX_BOUND_JSON_NODES);
+            assert!(3 < MAX_BOUND_JSON_DEPTH);
+        }
+
+        let mut object = Map::new();
+        object.insert(
+            "values".to_owned(),
+            Value::Array(
+                (0..5)
+                    .map(|_| Value::String("x".repeat(MAX_BOUND_STRING_BYTES)))
+                    .collect(),
+            ),
+        );
+        object
+    }
+
+    fn exactly_max_bound_json_object() -> Map<String, Value> {
+        const ENCODED_OVERHEAD: usize = r#"{"values":["","","",""]}"#.len();
+        let final_string_bytes =
+            MAX_BOUND_JSON_BYTES - ENCODED_OVERHEAD - (3 * MAX_BOUND_STRING_BYTES);
+        assert!(final_string_bytes <= MAX_BOUND_STRING_BYTES);
+
+        let mut object = Map::new();
+        object.insert(
+            "values".to_owned(),
+            Value::Array(vec![
+                Value::String("x".repeat(MAX_BOUND_STRING_BYTES)),
+                Value::String("x".repeat(MAX_BOUND_STRING_BYTES)),
+                Value::String("x".repeat(MAX_BOUND_STRING_BYTES)),
+                Value::String("x".repeat(final_string_bytes)),
+            ]),
+        );
+        object
+    }
+
+    fn seal_generic(
         tool_name: &str,
         adapter_id: &str,
         operation: &str,
@@ -1275,11 +1128,11 @@ mod tests {
     ) -> Result<BoundToolInvocation, DescribeError> {
         let proposal = json!({"value": "fixture"});
         BoundToolInvocation::seal(
-            "vocabulary-call",
+            "generic-call",
             tool_name,
             proposal.as_object().unwrap(),
             AdapterIdentity::new(adapter_id, 1)?,
-            execution_identity("vocabulary-flow", "/workspace"),
+            execution_identity("generic-flow", "/workspace"),
             ToolBinding::new(
                 AppActionDescriptor::new(
                     operation,
@@ -1293,80 +1146,48 @@ mod tests {
     }
 
     #[test]
-    fn provider_review_vocabulary_rejects_arbitrary_tool_adapter_operation_and_scope_labels() {
+    fn generic_app_owned_labels_seal_without_foundation_vocabulary() {
         const SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
-        assert_eq!(SENTINEL.chars().count(), 43);
-        assert!(
-            AppActionDescriptor::new(
-                SENTINEL,
-                CapabilityClass::Mutate,
-                vec![ResourceScope::resource(SENTINEL, SENTINEL, "local-id")],
-            )
-            .is_ok(),
-            "the exact local descriptor remains flexible"
+        let invocation = seal_generic(
+            "new_app_tool",
+            "app.new-adapter",
+            "archive_by_retention_rule",
+            "new_app.private_namespace",
+            "retention_subject",
+        )
+        .expect("opaque app-owned descriptor seals");
+        assert_eq!(invocation.tool_name, "new_app_tool");
+        assert_eq!(invocation.adapter.id, "app.new-adapter");
+        assert_eq!(invocation.descriptor.operation, "archive_by_retention_rule");
+        assert_eq!(invocation.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            invocation.descriptor.resource_scopes,
+            vec![ResourceScope::resource(
+                "new_app.private_namespace",
+                "retention_subject",
+                "local-id"
+            )]
         );
+        let wire = serde_json::to_value(&invocation).unwrap();
+        assert_eq!(wire["schema_version"], BOUND_TOOL_INVOCATION_SCHEMA_VERSION);
+        assert!(wire.get("provider_review_identity").is_none());
+        assert!(wire.get("provider_review_descriptor").is_none());
+        assert!(wire.get("provider_review_projection").is_none());
 
-        for (label, result) in [
-            (
-                "tool name",
-                seal_with_vocabulary(
-                    SENTINEL,
-                    "sumi.fixture",
-                    "fixture.operation",
-                    "fixture",
-                    "record",
-                ),
-            ),
-            (
-                "adapter id",
-                seal_with_vocabulary(
-                    "fixture_tool",
-                    SENTINEL,
-                    "fixture.operation",
-                    "fixture",
-                    "record",
-                ),
-            ),
-            (
-                "operation",
-                seal_with_vocabulary(
-                    "fixture_tool",
-                    "sumi.fixture",
-                    SENTINEL,
-                    "fixture",
-                    "record",
-                ),
-            ),
-            (
-                "namespace",
-                seal_with_vocabulary(
-                    "fixture_tool",
-                    "sumi.fixture",
-                    "fixture.operation",
-                    SENTINEL,
-                    "record",
-                ),
-            ),
-            (
-                "resource kind",
-                seal_with_vocabulary(
-                    "fixture_tool",
-                    "sumi.fixture",
-                    "fixture.operation",
-                    "fixture",
-                    SENTINEL,
-                ),
-            ),
-        ] {
-            assert!(
-                matches!(result, Err(DescribeError::InvalidDescriptor { .. })),
-                "arbitrary {label} crossed the provider vocabulary boundary"
-            );
-        }
+        assert!(
+            seal_generic(
+                "new_app_tool",
+                "app.new-adapter",
+                SENTINEL,
+                SENTINEL,
+                SENTINEL,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn provider_projection_summarizes_exact_text_without_copying_keys_values_or_hashes() {
+    fn exact_descriptor_projection_and_arguments_are_digest_bound() {
         const SENTINEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
         let proposal = json!({"content": SENTINEL});
         let invocation = BoundToolInvocation::seal(
@@ -1402,48 +1223,28 @@ mod tests {
         assert!(exact.contains("content"));
         let exact_descriptor = serde_json::to_string(&invocation.descriptor).unwrap();
         assert!(exact_descriptor.contains(SENTINEL));
-        let provider_descriptor =
-            serde_json::to_string(&invocation.provider_review_descriptor).unwrap();
-        assert_eq!(provider_descriptor.matches(SENTINEL).count(), 0);
-        assert!(!provider_descriptor.contains("record-b"));
-        assert_eq!(
-            invocation.provider_review_descriptor.resource_scopes.len(),
-            2
-        );
-        assert_eq!(
-            invocation
-                .provider_review_descriptor
-                .resource_scopes
-                .iter()
-                .find(|scope| scope.scope_type == ProviderReviewScopeType::Resource)
-                .expect("resource scope summary")
-                .count,
-            2
-        );
-        let provider = serde_json::to_string(&invocation.provider_review_projection).unwrap();
-        assert_eq!(provider.matches(SENTINEL).count(), 0);
-        assert!(!provider.contains("content"));
-        assert!(!provider.contains("action"));
-        assert!(!provider.contains(&invocation.proposal_digest.to_hex()));
-        assert!(!provider.contains(&invocation.descriptor_digest.to_hex()));
-        assert_eq!(invocation.provider_review_projection.text_values, 2);
-        assert_eq!(invocation.provider_review_projection.boolean_values, 1);
-
-        let mut tampered = invocation.clone();
-        tampered.provider_review_projection.text_characters += 1;
-        assert_ne!(
-            tampered.recompute_descriptor_digest().unwrap(),
-            invocation.descriptor_digest,
-            "the local descriptor/evidence identity must bind the safe external summary"
-        );
-
-        let mut tampered = invocation.clone();
-        tampered.provider_review_descriptor.resource_scopes[0].count += 1;
-        assert_ne!(
-            tampered.recompute_descriptor_digest().unwrap(),
-            invocation.descriptor_digest,
-            "the local descriptor/evidence identity must bind the safe external descriptor"
-        );
+        let baseline = invocation.descriptor_digest;
+        let mut variants = Vec::new();
+        let mut changed = invocation.clone();
+        changed.descriptor.operation = "different_operation".to_owned();
+        variants.push(changed);
+        let mut changed = invocation.clone();
+        changed.descriptor.capability = CapabilityClass::Read;
+        variants.push(changed);
+        let mut changed = invocation.clone();
+        changed.descriptor.resource_scopes[0] =
+            ResourceScope::resource("other.namespace", "other_kind", "other-id");
+        variants.push(changed);
+        let mut changed = invocation.clone();
+        changed.review_projection = ReviewProjection::from_value(json!({"changed": true})).unwrap();
+        variants.push(changed);
+        let mut changed = invocation.clone();
+        changed.execution_arguments =
+            BoundExecutionArguments::from_value(json!({"content": "changed"})).unwrap();
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(changed.recompute_descriptor_digest().unwrap(), baseline);
+        }
     }
 
     #[test]
@@ -1551,13 +1352,13 @@ mod tests {
         );
         assert_eq!(
             left.proposal_digest.to_hex(),
-            "8fd9e0ce15dab3a10c9d0d1bf0211fafe94bef24ec565bb42c696462301c71f4"
+            "a4db7fd28def17674c97734954ef13e148dd3cacb04bca662eedfb94a052b682"
         );
         assert_eq!(
             left.descriptor_digest.to_hex(),
-            "1260d135657fd045cecca256facb272f57557ef50c98db11d4adf24f17fab9f5"
+            "b94d86d2332a8d6d6974069001117b95152fc4b624693f948b997f0bc102a973"
         );
-        assert_eq!(left.proposal_digest.as_bytes()[0], 0x8f);
+        assert_eq!(left.proposal_digest.as_bytes()[0], 0xa4);
 
         let later_call = BoundToolInvocation::seal(
             "call-2",
@@ -1628,92 +1429,207 @@ mod tests {
     }
 
     #[test]
-    fn superseded_messaging_versions_recover_but_only_v4_can_be_newly_bound() {
-        for (wire, identity) in [
-            ("\"messaging_v1\"", ProviderReviewIdentity::MessagingV1),
-            ("\"messaging_v2\"", ProviderReviewIdentity::MessagingV2),
-            ("\"messaging_v3\"", ProviderReviewIdentity::MessagingV3),
-        ] {
-            assert_eq!(
-                serde_json::from_str::<ProviderReviewIdentity>(wire).unwrap(),
-                identity,
-                "durable evidence must remain decodable during recovery"
-            );
-        }
-        let v4 = AdapterIdentity::new("sumi.messaging", 4).unwrap();
+    fn schema_v2_provider_vocabulary_remains_read_only_decodable() {
         assert_eq!(
-            ProviderReviewIdentity::from_local("messaging", &v4).unwrap(),
-            ProviderReviewIdentity::MessagingV4
+            serde_json::from_str::<LegacyProviderReviewIdentity>("\"messaging_v1\"").unwrap(),
+            LegacyProviderReviewIdentity::MessagingV1,
+            "durable v1 evidence must remain decodable during recovery"
         );
-        for superseded in 1..=3 {
-            let adapter = AdapterIdentity::new("sumi.messaging", superseded).unwrap();
-            assert!(ProviderReviewIdentity::from_local("messaging", &adapter).is_err());
-        }
+        assert_eq!(
+            serde_json::from_str::<LegacyProviderReviewIdentity>("\"messaging_v2\"").unwrap(),
+            LegacyProviderReviewIdentity::MessagingV2,
+            "durable v2 evidence must remain decodable during recovery"
+        );
+        let current = seal_generic(
+            "any_tool",
+            "any.adapter",
+            "new_operation",
+            "new_namespace",
+            "new_kind",
+        )
+        .expect("new seals do not consult legacy vocabulary");
+        assert_eq!(current.schema_version, BOUND_TOOL_INVOCATION_SCHEMA_VERSION);
 
-        // 名乗り arrived with V4, so a V3 seal cannot carry it however it is
-        // classified, while everything V3 already had keeps working.
-        for capability in [CapabilityClass::Read, CapabilityClass::Mutate] {
-            assert!(
-                provider_review_operation(
-                    ProviderReviewIdentity::MessagingV4,
-                    &AppActionDescriptor::new("profile", capability.clone(), vec![]).unwrap(),
-                )
-                .is_ok()
-            );
-            assert!(
-                provider_review_operation(
-                    ProviderReviewIdentity::MessagingV3,
-                    &AppActionDescriptor::new("profile", capability, vec![]).unwrap(),
-                )
-                .is_err()
-            );
-        }
+        let mut legacy = BoundToolInvocation::seal(
+            "legacy-call",
+            "example",
+            json!({"action":"update","content":"hello"})
+                .as_object()
+                .unwrap(),
+            AdapterIdentity::new("sumi.example", 1).unwrap(),
+            execution_identity("legacy-flow", "/workspace"),
+            binding(json!({
+                "action":"update",
+                "record_id":"record-a",
+                "content":"hello",
+                "urgency":"normal"
+            })),
+        )
+        .unwrap();
+        legacy.schema_version = LEGACY_BOUND_TOOL_INVOCATION_SCHEMA_VERSION;
+        legacy.legacy_provider_review_identity = Some(LegacyProviderReviewIdentity::ExampleV1);
+        legacy.legacy_provider_review_descriptor = Some(LegacyProviderReviewDescriptor {
+            schema_version: 1,
+            operation: LegacyProviderReviewAction::Update,
+            capability: CapabilityClass::Mutate,
+            resource_scopes: vec![LegacyProviderReviewResourceScope {
+                scope_type: LegacyProviderReviewScopeType::Resource,
+                namespace: LegacyProviderReviewNamespace::Example,
+                kind: LegacyProviderReviewResourceKind::Record,
+                count: 1,
+            }],
+        });
+        legacy.legacy_provider_review_projection = Some(LegacyProviderReviewProjection {
+            schema_version: 1,
+            top_level_fields: 4,
+            object_fields: 4,
+            array_items: 0,
+            text_values: 3,
+            text_bytes: 19,
+            text_characters: 19,
+            number_values: 1,
+            boolean_values: 0,
+            null_values: 0,
+        });
+        legacy.descriptor_digest = legacy.recompute_descriptor_digest().unwrap();
+        let encoded = serde_json::to_vec(&legacy).unwrap();
+        let decoded: BoundToolInvocation = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, legacy);
+        assert_eq!(
+            decoded.recompute_descriptor_digest().unwrap(),
+            legacy.descriptor_digest
+        );
+    }
 
-        for identity in [
-            ProviderReviewIdentity::MessagingV1,
-            ProviderReviewIdentity::MessagingV2,
-            ProviderReviewIdentity::MessagingV3,
-            ProviderReviewIdentity::MessagingV4,
-        ] {
-            assert!(
-                provider_review_operation(
-                    identity,
-                    &AppActionDescriptor::new("overview", CapabilityClass::Read, vec![]).unwrap(),
-                )
-                .is_ok()
-            );
-            assert!(
-                provider_review_scope(identity, &ResourceScope::collection("messaging", "place"),)
-                    .is_ok()
-            );
-        }
-        for identity in [
-            ProviderReviewIdentity::MessagingV3,
-            ProviderReviewIdentity::MessagingV4,
-        ] {
-            assert!(
-                provider_review_operation(
-                    identity,
-                    &AppActionDescriptor::new("open_attachment", CapabilityClass::Read, vec![],)
-                        .unwrap(),
-                )
-                .is_ok()
-            );
-            assert!(
-                provider_review_scope(
-                    identity,
-                    &ResourceScope::resource("sumi.foundation.workspace", "path", "secret.txt"),
-                )
-                .is_ok()
-            );
-        }
+    #[test]
+    fn descriptor_and_payload_bounds_fail_closed() {
+        assert_eq!(
+            BoundExecutionArguments::from_value(Value::Null),
+            Err(DescribeError::InvalidBoundArguments {
+                reason: "bound execution arguments must be a JSON object".to_owned(),
+            })
+        );
+        assert_eq!(
+            ReviewProjection::from_value(Value::Null),
+            Err(DescribeError::InvalidReviewProjection {
+                reason: "review projection must be a JSON object".to_owned(),
+            })
+        );
         assert!(
-            provider_review_scope(
-                ProviderReviewIdentity::MessagingV2,
-                &ResourceScope::resource("sumi.foundation.workspace", "path", "secret.txt"),
+            AppActionDescriptor::new(
+                "x".repeat(MAX_LABEL_BYTES + 1),
+                CapabilityClass::Read,
+                vec![]
             )
             .is_err()
         );
+        assert!(AppActionDescriptor::new("bad\noperation", CapabilityClass::Read, vec![]).is_err());
+        assert!(
+            AppActionDescriptor::new(
+                "read",
+                CapabilityClass::Read,
+                vec![ResourceScope::resource(
+                    "app",
+                    "record",
+                    &"x".repeat(MAX_RESOURCE_ID_BYTES + 1)
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            AppActionDescriptor::new(
+                "read",
+                CapabilityClass::Read,
+                (0..=MAX_RESOURCE_SCOPES)
+                    .map(|index| ResourceScope::resource("app", "record", &format!("id-{index}")))
+                    .collect(),
+            )
+            .is_err()
+        );
+        assert!(ReviewProjection::from_value(json!({"value": "bad\u{0}value"})).is_err());
+        assert!(
+            BoundExecutionArguments::from_value(json!({
+                "value": "x".repeat(MAX_BOUND_JSON_BYTES)
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn aggregate_bounds_reject_in_constructors_and_seal_without_prevalidation_clones() {
+        let exactly_max = exactly_max_bound_json_object();
+        assert_eq!(
+            serde_json::to_vec(&exactly_max).unwrap().len(),
+            MAX_BOUND_JSON_BYTES
+        );
+        validate_bound_json_object(&exactly_max, "exact boundary", |reason| reason).unwrap();
+        BoundExecutionArguments::from_value(Value::Object(exactly_max)).unwrap();
+
+        let execution_error =
+            BoundExecutionArguments::from_value(Value::Object(aggregate_bound_json_object()))
+                .unwrap_err();
+        assert!(matches!(
+            execution_error,
+            DescribeError::InvalidBoundArguments { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
+
+        let projection_error =
+            ReviewProjection::from_value(Value::Object(aggregate_bound_json_object())).unwrap_err();
+        assert!(matches!(
+            projection_error,
+            DescribeError::InvalidReviewProjection { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
+
+        let proposal = json!({"value": "fixture"});
+        let proposal_arguments = proposal.as_object().unwrap();
+        let descriptor = || {
+            AppActionDescriptor::new(
+                "update",
+                CapabilityClass::Mutate,
+                vec![ResourceScope::resource("example", "record", "record-a")],
+            )
+            .unwrap()
+        };
+
+        let seal_projection_error = BoundToolInvocation::seal(
+            "aggregate-projection",
+            "example",
+            proposal_arguments,
+            AdapterIdentity::new("sumi.example", 1).unwrap(),
+            execution_identity("aggregate-flow", "/workspace"),
+            ToolBinding::new(
+                descriptor(),
+                ReviewProjection(aggregate_bound_json_object()),
+                BoundExecutionArguments::from_value(proposal.clone()).unwrap(),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            seal_projection_error,
+            DescribeError::InvalidReviewProjection { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
+
+        let seal_execution_error = BoundToolInvocation::seal(
+            "aggregate-execution",
+            "example",
+            proposal_arguments,
+            AdapterIdentity::new("sumi.example", 1).unwrap(),
+            execution_identity("aggregate-flow", "/workspace"),
+            ToolBinding::new(
+                descriptor(),
+                ReviewProjection::from_value(json!({"value": "fixture"})).unwrap(),
+                BoundExecutionArguments(aggregate_bound_json_object()),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            seal_execution_error,
+            DescribeError::InvalidBoundArguments { reason }
+                if reason.contains("must not exceed 1048576 encoded bytes")
+        ));
     }
 
     #[test]

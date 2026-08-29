@@ -38,6 +38,23 @@ const testDirectChatAuthorityEpoch int64 = 1
 
 type allowDirectChatAuthorizer struct{}
 
+func TestApplicationCloseCancelsBackgroundWorkers(t *testing.T) {
+	backgroundCtx, stopBackground := context.WithCancel(context.Background())
+	app := &application{
+		backgroundCtx:  backgroundCtx,
+		stopBackground: stopBackground,
+	}
+
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backgroundCtx.Done():
+	default:
+		t.Fatal("application close left its background worker context running")
+	}
+}
+
 func (allowDirectChatAuthorizer) AuthorizeDirectChat(
 	_ context.Context,
 	_, _, installationID string,

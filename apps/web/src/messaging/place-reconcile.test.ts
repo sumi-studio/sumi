@@ -19,10 +19,15 @@ type BootstrapSnapshot = Awaited<ReturnType<MessagingBackend["bootstrap"]>>;
 const SELF = { kind: "human", humanId: "human-a" } as const;
 const OTHER = { kind: "human", humanId: "human-b" } as const;
 
-function channel(channelId: string, topic: string): ChannelSummary {
+function channel(
+  channelId: string,
+  topic: string,
+  revision = 1,
+): ChannelSummary {
   return {
     channelId,
     workspaceId: "workspace-1",
+    revision,
     name: channelId,
     topic,
     visibility: "public",
@@ -46,7 +51,6 @@ function snapshot(options: {
   dms: DmSummary[];
   unread: Record<PlaceKey, { latest: number; unread: number; mention: number }>;
   lastRead?: Record<PlaceKey, number>;
-  members?: BootstrapSnapshot["members"];
 }): BootstrapSnapshot {
   const keys = Object.keys(options.unread) as PlaceKey[];
   return {
@@ -54,9 +58,9 @@ function snapshot(options: {
     workspaces: [{ workspaceId: "workspace-1", name: "Sumi" }],
     channels: options.channels,
     dms: options.dms,
-    members: options.members ?? [
-      { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
-      { participant: OTHER, displayName: "Aoi", tagline: "", revision: 1 },
+    members: [
+      { participant: SELF, displayName: "Yohaku", tagline: "" },
+      { participant: OTHER, displayName: "Aoi", tagline: "" },
     ],
     statuses: [],
     readMarkers: keys.map((key) => ({
@@ -121,7 +125,10 @@ class FakeBackend implements MessagingBackend {
   async createGroupDM(): Promise<DmSummary> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): Promise<ChannelSummary> {
+  async updateChannel(): Promise<ChannelSummary> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): Promise<ChannelSummary> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {
@@ -142,13 +149,14 @@ class FakeBackend implements MessagingBackend {
       created: true,
     };
   }
-  async editMessage() {}
-  async deleteMessage() {}
-  async markRead() {}
-  async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
     throw new Error("unused");
   }
-  async updateProfile(): ReturnType<MessagingBackend["updateProfile"]> {
+  async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
+    throw new Error("unused");
+  }
+  async markRead() {}
+  async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
   }
   async createReplyLater(): ReturnType<MessagingBackend["createReplyLater"]> {
@@ -227,45 +235,9 @@ describe("place lifecycleの再接続突き合わせ", () => {
 
   afterEach(() => bindMessagingSessionIdentity(null));
 
-  // bootstrapはsubscribeより前に読むので、その隙間に起きた変更はどのevent
-  // にも乗らない。初回のconnectedでも再接続と同じ読み直しを走らせる。
-  it("最初のconnectedでもbootstrapを読み直して隙間を閉じる", () => {
-    expect(backend.bootstrapCalls).toBe(2);
+  it("最初のconnectedではbootstrapを読み直さない", () => {
+    expect(backend.bootstrapCalls).toBe(1);
     expect(useMessaging.getState().ready).toBe(true);
-  });
-
-  it("bootstrapとsubscribeの隙間で変わった名乗りを初回接続で取り込む", async () => {
-    bindMessagingSessionIdentity(null);
-    bindMessagingSessionIdentity("human-a");
-    const gap = new FakeBackend(FIRST);
-    installMessagingBackend(gap);
-    useMessaging.getState().init();
-    await settle();
-    // ここまでがbootstrapの読取り。subscriberが登録される前に相手が名乗りを
-    // 変えると、そのprofile_updatedはこのクライアントには届かない。
-    gap.next = snapshot({
-      channels: [channel("channel-1", "旧トピック")],
-      dms: [],
-      unread: { [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 } },
-      members: [
-        { participant: SELF, displayName: "Yohaku", tagline: "", revision: 1 },
-        {
-          participant: OTHER,
-          displayName: "葵",
-          tagline: "デザイン",
-          revision: 2,
-        },
-      ],
-    });
-    gap.emitConnection("connected");
-    await settle();
-
-    expect(useMessaging.getState().membersByKey["human:human-b"]).toMatchObject(
-      {
-        displayName: "葵",
-        tagline: "デザイン",
-      },
-    );
   });
 
   it("切断中に作られたplaceとtopic編集を再接続で取り込む", async () => {
@@ -276,7 +248,10 @@ describe("place lifecycleの再接続突き合わせ", () => {
     await settle();
 
     backend.next = snapshot({
-      channels: [channel("channel-1", "新トピック"), channel("channel-2", "")],
+      channels: [
+        channel("channel-1", "新トピック", 2),
+        channel("channel-2", ""),
+      ],
       dms: [dm("dm-9")],
       unread: {
         [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 },
@@ -289,7 +264,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     await settle();
 
     const state = useMessaging.getState();
-    expect(backend.bootstrapCalls).toBe(3);
+    expect(backend.bootstrapCalls).toBe(2);
     expect(state.channels.map((entry) => entry.channelId)).toEqual([
       "channel-1",
       "channel-2",
@@ -307,6 +282,15 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(backend.listeners.size).toBe(1);
   });
 
+  it("再接続snapshotから消えたchannelを保持しない", async () => {
+    backend.next = snapshot({ channels: [], dms: [], unread: {} });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await settle();
+
+    expect(useMessaging.getState().channels).toEqual([]);
+  });
+
   it("進行中の未読・既読・ローカルstateを突き合わせで壊さない", async () => {
     useMessaging.getState().selectPlace(CHANNEL_1);
     useMessaging.getState().setDraft(CHANNEL_1, "書きかけ");
@@ -318,7 +302,10 @@ describe("place lifecycleの再接続突き合わせ", () => {
 
     // serverのsnapshotはまだ既読前（未読3・メンション1、read marker 0）。
     backend.next = snapshot({
-      channels: [channel("channel-1", "新トピック"), channel("channel-2", "")],
+      channels: [
+        channel("channel-1", "新トピック", 2),
+        channel("channel-2", ""),
+      ],
       dms: [],
       unread: {
         [CHANNEL_1]: { latest: 5, unread: 3, mention: 1 },
@@ -370,10 +357,53 @@ describe("place lifecycleの再接続突き合わせ", () => {
     await settle();
 
     const state = useMessaging.getState();
-    expect(backend.bootstrapCalls).toBe(3);
+    expect(backend.bootstrapCalls).toBe(2);
     expect(state.channels.map((entry) => entry.channelId)).toEqual([
       "channel-1",
     ]);
     expect(state.connection).toBe("connected");
+  });
+
+  it("遅れて届く古いplace_updatedで新しい表示へ戻さない", () => {
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-1", "新しいtopic", 3),
+      });
+    });
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-1", "古いtopic", 2),
+      });
+    });
+
+    expect(useMessaging.getState().channels[0]).toMatchObject({
+      topic: "新しいtopic",
+      revision: 3,
+    });
+  });
+
+  it("未知のplace_updatedを挿入し、後着の古いplace_createdを退ける", () => {
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_updated",
+        channel: channel("channel-2", "編集済みtopic", 2),
+      });
+    });
+    backend.listeners.forEach((listener) => {
+      listener({
+        type: "place_created",
+        channel: channel("channel-2", "作成時topic", 1),
+      });
+    });
+
+    expect(useMessaging.getState().channels).toContainEqual(
+      expect.objectContaining({
+        channelId: "channel-2",
+        topic: "編集済みtopic",
+        revision: 2,
+      }),
+    );
   });
 });

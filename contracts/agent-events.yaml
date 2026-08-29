@@ -894,14 +894,27 @@ $defs:
         enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict, unavailable]
 
   DirectChatStatusFrame:
-    type: object
-    required: [type, status]
-    additionalProperties: false
-    properties:
-      type: { const: direct_chat_status }
-      status:
-        type: string
-        enum: [ready, unavailable]
+    oneOf:
+      # A ready runtime has no unavailable cause to report.
+      - type: object
+        required: [type, status]
+        additionalProperties: false
+        properties:
+          type: { const: direct_chat_status }
+          status: { const: ready }
+      # Every unavailable state is attributable. Keep the vocabulary closed so
+      # clients can distinguish rehydration, terminal shutdown, and an
+      # otherwise unattributed unavailable runtime without accepting arbitrary
+      # server text.
+      - type: object
+        required: [type, status, reason]
+        additionalProperties: false
+        properties:
+          type: { const: direct_chat_status }
+          status: { const: unavailable }
+          reason:
+            type: string
+            enum: [rehydrating, stopped, unavailable]
 
   BrowserServerFrame:
     oneOf:

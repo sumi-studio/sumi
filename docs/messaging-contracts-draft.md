@@ -54,25 +54,21 @@
 {
   "participant": { "kind": "human", "human_id": "<UUIDv7>" },
   "display_name": "Yohaku",
-  "tagline": "開発",
-  "revision": 12
+  "tagline": "開発"
 }
 ```
 
 - プロフィールはParticipantに属するglobal resourceであり、Workspace-localではない。
-  `display_name` の正本は戸籍（human / personality agent）で、`tagline` の正本は
-  `participant_profiles` である。両方を同じprofile wireで全Workspaceに投影する。
-- `GET /messaging/profile` は認証済みの本人の確定プロフィールを返す。別の参加者を
-  指定するfieldやrouteはない。ほかの参加者のプロフィールはbootstrap・member listから読む。
-- `PUT /messaging/profile` は認証済みの本人だけを部分更新する。bodyは
-  `display_name?: string` と `tagline?: string`。省略したfieldは現在値のまま残り、
-  サーバーが表示名とtaglineを正規化・検証し、成功時は正規化後の確定profile wireを返す。
-  HumanとPersonalityAgentは同じ唯一の永続write boundaryを通る。
-- `revision` は一人のプロフィールに対する単調増加の順序鍵である。初期rowはDB defaultの
-  `1`、以後の値は`participant_profiles`のDB triggerだけが各UPDATEで一度ずつ進める。
-  application codeは値を計算・指定しない。consumerは同じparticipantについて低いrevisionの
-  profile projectionを適用せず、同じか高いrevisionだけを現在値にできる。profile rowがまだ
-  無い既存投影のrevisionは`0`である。
+  `display_name` の正本は戸籍（human / personality agent）で、`tagline` は
+  `participant_profiles` の `(member_kind, member_id)` 一行に置く。member listや
+  bootstrapはこのglobal値を各Workspaceへ投影する。
+- 現行のHuman縦切りはglobal設定の `GET /auth/profile` で本人の確定値を読み、
+  `POST /auth/profile` で `display_name?: string` / `tagline?: string` を部分更新する。
+  subjectはsigned browser sessionのHumanだけで、requestから別Participantを指定できない。
+  省略fieldは保持し、同じtransactionで両fieldを確定して完全なprofileを返す。
+- PersonalityAgentの自己編集transportとWorkspace nicknameはこの縦切りに含めない。
+  storage/projectionのParticipant identityをHuman専用やWorkspace専用に狭めず、必要なlaneで
+  それぞれ明示的なauthority boundaryを追加する。
 
 ### Place — メッセージが流れる場所
 
@@ -111,7 +107,8 @@
   "urgency": "urgent | normal | fyi",
   "reply_to": "<message_id> | null",
   "created_at": "...",
-  "edited_at": null
+  "edited_at": null,
+  "revision": 1
 }
 ```
 
@@ -126,6 +123,10 @@
 - `mentions` は入力テキストの `@表示名` をadmission時にmembership lookupで**解決済みParticipantRef**として束縛する。
   raw文字列の一致を認可やmention判定に使わない（ADR 0008: scope-local addressは交換可能な参照）。
 - authorはサーバー側が認証済みactorから構成する。client-assertedのauthor名を信用しない（ADR 0008 §6）。
+- `revision` は作成時に `1`。編集PATCHは現在の `revision` を必須で送り、サーバーは
+  compare-and-swap で一致したときだけ本文・mentions・`edited_at` とともに増分する。
+  古い版は `409 edit_conflict` と現在の完全な `message` を受け取る。clientはローカルの
+  推測やWS到達を使わず、この本文とrevisionを衝突表示・再読込の正本にする。
 
 ### ReadMarker と NotificationSetting — HumanもAgentも同じ形
 
@@ -246,6 +247,9 @@
   `/direct-chat/ws` とは混ぜない（privacy・認可・replay・backpressureの境界が違う）。
 - bootstrap/place一覧は各placeの `latest_seq`、未読数、mention未読数を返す。履歴を
   lazy loadしていても、未訪問placeのバッジを欠落させないための投影である。
+- channel は `revision`（JSON safe integer、作成時は1・`places` の更新ごとに+1）も
+  運ぶ。`place_updated` はreplayされないため、clientは既に持つchannelより**新しい**
+  revisionだけを適用し、遅れて届いた過去の全量projectionで名前やtopicを戻さない。
 - `GET /messaging/search?q=&place_id=&limit=` は、現在の正確なWorkspace app
   scopeの中で、閲覧者が今見られるlive messageだけを部分一致検索する。結果は
   `message_id`、`place`、`seq`、`author`、`created_at` と、全文ではなくサーバー側で
@@ -257,14 +261,6 @@
   `message_deleted`, `read_marker_updated`, `membership_changed`,
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,
   `message_pinned`。
-- WS event（durable、participant-scoped）: `profile_updated`。payloadは上記のprofile
-  wireで、place / place-seqを持たない。profile writeはDB commit後にのみpublishされ、
-  一人分のcommit順は`revision`で判定する。live frameはbest-effortなので、commit順と
-  到着順は一致しなくてもよい。consumerは低いrevisionを捨てる。
-  publishは、そのParticipantが現在memberでMessagingが有効な**全Workspace**へfan-outし、
-  各Workspaceでは現在のauthorized audienceだけへ送る。切断などでframeを逃しても、
-  profileの正本はdurableで、再接続時のbootstrap/member listをrevision規則で適用すれば
-  収束する。profile event自体をWebSocket replayで補完しない。
 - WS event（volatile）: `typing`, `status_updated`（下記）。
 
 ### Status と ReplyLater — 自己申告のattention
@@ -274,7 +270,16 @@
 
 ```json
 // Status: 本人が設定する。期限付き
-{ "participant": ParticipantRef, "status": "available | busy | away", "note": "取り込み中", "expires_at": "..." }
+{
+  "participant": ParticipantRef,
+  "revision": 12,
+  "status": "available | busy | away",
+  "note": "取り込み中",
+  "expires_at": "...",
+  // 期限が切れたとき戻る先。空なら戻る先が無い（宣言そのものが終わる）
+  "base_status": "available | busy | away | \"\"",
+  "base_note": ""
+}
 
 // ReplyLater: mention/メッセージへのワンタップ応答予約
 {
@@ -290,6 +295,20 @@
   リマインドして返信忘れを防ぐ**（通知タブ + 覚醒トリガ「予定された出来事」に合流）。
 - 既読の自動晒し（read receipt）は作らない。見えるのは本人が宣言したものだけ。
 - Statusの現在値はREST、変化はvolatile event `status_updated`。ReplyLaterはdurable。
+- Status wire（HTTP ACK、`status_updated`、bootstrap/presence再同期、期限切れの
+  復元・clearを含む）はparticipantごとの単調増加 `revision` を運ぶ。clientは既知の
+  revisionより新しいprojectionだけを適用するので、HTTP ACKより遅く届いた古いexpiry
+  frameや過去のpresence snapshotは新しい自己申告を巻き戻さない。
+- 期限付きStatusは**置き換える前の宣言を覚える**。`base_status` / `base_note` が
+  それで、`expires_at` に達したら宣言はそこへ戻る。期限付きを期限付きで置き換えても
+  `base_*` は引き継ぐので、短い宣言を重ねても本人が選んだ「期限の無い宣言」は
+  埋もれない。期限の無いStatusを立てると `base_*` は空になる——新しい宣言が全部だから。
+  `base_*` は `expires_at` があるときだけ意味を持つ。
+- 戻る先が無いまま期限が切れた場合は、`status_updated` が**空の `status`** を運ぶ。
+  これは欠損ではなく「その人はもう何も言っていない」という答えで、「対応可能」とは
+  別の状態——プラットフォームは本人の宣言を勝手に既定値へ書き換えない。
+- 期限切れは読み出し時に解決される（RESTもWSも、上の規則で受け手が同じ答えを出せる）。
+  サーバー側のsweepは**通知のため**にあり、正しさのためではない。
 
 ### 権限（最小構成）
 

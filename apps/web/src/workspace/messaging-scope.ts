@@ -1,6 +1,10 @@
-import type { AppDescriptor, AppInstallation, WorkspaceMembership } from "./model";
-import { exactHumanMembership } from "./store";
 import type { MessagingScope } from "../messaging/scope";
+import type {
+  AppDescriptor,
+  AppInstallation,
+  WorkspaceMembership,
+} from "./model";
+import { exactHumanMembership } from "./store";
 
 /**
  * Resolves the single authority tuple Messaging may use for the selected

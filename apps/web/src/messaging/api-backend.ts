@@ -17,7 +17,6 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
-  ProfileInput,
   ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
@@ -25,12 +24,18 @@ import type {
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusCleared,
   StatusKind,
   UnreadSummary,
   UploadAttachmentInput,
   UploadAttachmentReceipt,
 } from "./model";
-import { MAX_ATTACHMENT_BYTES, MAX_SEQ, parsePlaceKey } from "./model";
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_SEQ,
+  parsePlaceKey,
+  participantKey,
+} from "./model";
 import {
   bindMessagingScopeToURL,
   type MessagingScope,
@@ -45,12 +50,19 @@ const UPLOAD_TIMEOUT_MS = 120_000;
 export class MessagingAPIError extends Error {
   readonly code: string;
   readonly status: number;
+  /** 409 edit_conflict が返す、サーバで確定した現在のメッセージ。 */
+  readonly currentMessage: Message | null;
+  /** 失敗応答が返した対象メッセージ。tombstone を含み得る。 */
+  readonly responseMessage: Message | null;
 
-  constructor(code: string, status: number) {
+  constructor(code: string, status: number, body: unknown = null) {
     super(code);
     this.name = "MessagingAPIError";
     this.code = code;
     this.status = status;
+    this.responseMessage = parseResponseMessage(body);
+    this.currentMessage =
+      code === "edit_conflict" ? this.responseMessage : null;
   }
 }
 
@@ -101,7 +113,14 @@ export class ApiMessagingBackend implements MessagingBackend {
     const dms: DmSummary[] = asArray(body.dms).map((entry) =>
       this.registerDm(entry),
     );
-    const members: MemberProfile[] = asArray(body.members).map(parseMember);
+    const members: MemberProfile[] = asArray(body.members).map((entry) => {
+      const value = asRecord(entry);
+      return {
+        participant: parseParticipant(value.participant),
+        displayName: asString(value.display_name),
+        tagline: typeof value.tagline === "string" ? value.tagline : "",
+      };
+    });
     const readMarkers: ReadMarker[] = asArray(body.read_markers).map(
       (entry) => {
         const value = asRecord(entry);
@@ -132,6 +151,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       dms,
       members,
       statuses: presence.statuses,
+      clearedStatuses: presence.clearedStatuses,
       readMarkers,
       unreadSummaries,
       replyLaterMarkers: presence.replyLaterMarkers,
@@ -182,10 +202,14 @@ export class ApiMessagingBackend implements MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary> {
-    const body = await this.request("/messaging/channels", {
-      method: "POST",
-      body: { workspace_id: workspaceId, name, topic, voice },
+    const body = await this.requestPlaceCreation("/messaging/channels", {
+      workspace_id: workspaceId,
+      name,
+      topic,
+      voice,
+      client_nonce: clientNonce,
     });
     return this.registerChannel(body);
   }
@@ -198,21 +222,57 @@ export class ApiMessagingBackend implements MessagingBackend {
     return this.registerDm(body);
   }
 
-  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
-    const body = await this.request("/messaging/group-dms", {
-      method: "POST",
-      body: { participants: participants.map(participantToWire) },
+  async createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary> {
+    const canonicalParticipants = [
+      ...new Map(
+        participants.map((participant) => [
+          participantKey(participant),
+          participant,
+        ]),
+      ).entries(),
+    ]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, participant]) => participant);
+    const body = await this.requestPlaceCreation("/messaging/group-dms", {
+      participants: canonicalParticipants.map(participantToWire),
+      client_nonce: clientNonce,
     });
     return this.registerDm(body);
   }
 
-  async updateChannelTopic(
+  async updateChannel(
     channelId: string,
-    topic: string,
+    input: { name?: string; topic?: string },
   ): Promise<ChannelSummary> {
+    // 省いた項目はbodyに載せない。載せると「その値にして」の意味になる。
     const body = await this.request(
       `/messaging/places/${encodeURIComponent(channelId)}`,
-      { method: "PATCH", body: { topic } },
+      {
+        method: "PATCH",
+        body: {
+          ...(input.name === undefined ? {} : { name: input.name }),
+          ...(input.topic === undefined ? {} : { topic: input.topic }),
+        },
+      },
+    );
+    return this.registerChannel(body);
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    clientNonce: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.requestPlaceCreation(
+      `/messaging/places/${encodeURIComponent(channelId)}/duplicate`,
+      // 名前を言わないなら送らない。サーバーが「〜 のコピー」を決める。
+      {
+        ...(name === undefined ? {} : { name }),
+        client_nonce: clientNonce,
+      },
     );
     return this.registerChannel(body);
   }
@@ -318,18 +378,25 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     content: string,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "PATCH", body: { content } },
+    expectedRevision: number,
+  ): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
+        { method: "PATCH", body: { content, revision: expectedRevision } },
+      ),
     );
+    return parseMessage(body.message);
   }
 
-  async deleteMessage(place: Place, messageId: string): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
-      { method: "DELETE" },
+  async deleteMessage(place: Place, messageId: string): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}`,
+        { method: "DELETE" },
+      ),
     );
+    return parseMessage(body.message);
   }
 
   async markRead(place: Place, lastReadSeq: number): Promise<void> {
@@ -343,25 +410,18 @@ export class ApiMessagingBackend implements MessagingBackend {
   async setStatus(
     status: StatusKind,
     note: string,
+    expiresAt: number | null,
   ): Promise<ParticipantStatus> {
     return parseStatus(
       await this.request("/messaging/status", {
         method: "PUT",
-        body: { status, note },
+        body: {
+          status,
+          note,
+          expires_at:
+            expiresAt === null ? null : new Date(expiresAt).toISOString(),
+        },
       }),
-    );
-  }
-
-  /**
-   * 自分の名乗りだけを置き換える。statusと同じく参加者はsessionが決め、
-   * bodyには載せない。省いたfieldは送らず、サーバー側の現在値を残す。
-   */
-  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
-    const body: Record<string, string> = {};
-    if (input.displayName !== undefined) body.display_name = input.displayName;
-    if (input.tagline !== undefined) body.tagline = input.tagline;
-    return parseMember(
-      await this.request("/messaging/profile", { method: "PUT", body }),
     );
   }
 
@@ -565,10 +625,17 @@ export class ApiMessagingBackend implements MessagingBackend {
       };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
-      parsed = { type: eventType, status: parseStatus(wire.status) };
-    } else if (eventType === "profile_updated") {
-      // 名乗りの変更。statusと同じ参加者スコープで届き、placeを持たない。
-      parsed = { type: eventType, profile: parseMember(wire.profile) };
+      // 空のstatusは欠損ではなく「宣言が終わった」という答え——期限切れで
+      // 戻る先が無かった場合に届く。
+      const status = asRecord(wire.status);
+      parsed =
+        status.status === ""
+          ? {
+              type: "status_cleared",
+              participant: parseParticipant(status.participant),
+              revision: asRevision(status.revision),
+            }
+          : { type: eventType, status: parseStatus(status) };
     } else if (eventType === "reply_later_created") {
       parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
     } else if (eventType === "reply_later_resolved") {
@@ -613,6 +680,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     const channel: ChannelSummary = {
       channelId: asString(wire.channel_id),
       workspaceId: asString(wire.workspace_id),
+      revision: asSeq(wire.revision),
       name: asString(wire.name),
       topic: asString(wire.topic),
       visibility: asVisibility(wire.visibility),
@@ -677,44 +745,58 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
     if (!response.ok) {
       let code = "messaging_request_failed";
+      let body: unknown = null;
       try {
-        const body = asRecord(await response.json());
-        if (typeof body.error === "string") code = body.error;
+        body = await response.json();
+        const error = asRecord(body);
+        if (typeof error.error === "string") code = error.error;
       } catch {
         // Status remains the authoritative non-sensitive signal.
       }
-      throw new MessagingAPIError(code, response.status);
+      throw new MessagingAPIError(code, response.status, body);
     }
     if (response.status === 204) return null;
     return response.json() as Promise<unknown>;
   }
-}
 
-/**
- * 一人分の名乗り。member list・bootstrap・profile_updatedが同じ形を運ぶので、
- * 読み取りも一か所に置く。avatar_urlはまだサーバーが出さないため、無ければ
- * undefinedのままにしてイニシャル表示へ落とす。
- */
-function parseMember(value: unknown): MemberProfile {
-  const wire = asRecord(value);
-  const avatarUrl =
-    typeof wire.avatar_url === "string" && wire.avatar_url !== ""
-      ? wire.avatar_url
-      : undefined;
-  return {
-    participant: parseParticipant(wire.participant),
-    displayName: asString(wire.display_name),
-    tagline: typeof wire.tagline === "string" ? wire.tagline : "",
-    revision: asProfileRevision(wire.revision),
-    ...(avatarUrl === undefined ? {} : { avatarUrl }),
-  };
-}
-
-function asProfileRevision(value: unknown): number {
-  if (!Number.isSafeInteger(value) || Number(value) < 0) {
-    throw new Error("invalid profile revision");
+  /**
+   * A transport failure after POST is ambiguous: the place may already be
+   * committed. Retry once with the caller-owned logical-attempt nonce so the
+   * server reconciles to that receipt instead of creating another place.
+   */
+  private async requestPlaceCreation(
+    path: string,
+    body: unknown,
+  ): Promise<unknown> {
+    try {
+      return await this.request(path, { method: "POST", body });
+    } catch (error) {
+      if (this.abortController.signal.aborted) {
+        throw error;
+      }
+      if (
+        error instanceof MessagingAPIError &&
+        error.status !== 408 &&
+        error.status !== 429 &&
+        error.status < 500
+      ) {
+        throw error;
+      }
+      // 5xx may be generated after an upstream commit; 408 can be an
+      // intermediary timing out while that commit completes; and 429 can be a
+      // gateway rejecting its acknowledgement after forwarding. One retry is
+      // safe only because it carries the exact same receipt nonce and digest.
+      return this.request(path, { method: "POST", body });
+    }
   }
-  return Number(value);
+}
+
+function parseResponseMessage(body: unknown): Message | null {
+  try {
+    return parseMessage(asRecord(body).message);
+  } catch {
+    return null;
+  }
 }
 
 function placeID(place: Place): string {
@@ -798,10 +880,25 @@ function parseReaction(value: unknown): ReactionSummary {
 
 function parsePresence(body: Record<string, unknown>): {
   statuses: ParticipantStatus[];
+  clearedStatuses: StatusCleared[];
   replyLaterMarkers: ReplyLaterMarker[];
 } {
+  const statuses: ParticipantStatus[] = [];
+  const clearedStatuses: StatusCleared[] = [];
+  for (const value of asArray(body.statuses)) {
+    const status = asRecord(value);
+    if (status.status === "") {
+      clearedStatuses.push({
+        participant: parseParticipant(status.participant),
+        revision: asRevision(status.revision),
+      });
+    } else {
+      statuses.push(parseStatus(status));
+    }
+  }
   return {
-    statuses: asArray(body.statuses).map(parseStatus),
+    statuses,
+    clearedStatuses,
     replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
   };
 }
@@ -810,9 +907,18 @@ function parseStatus(value: unknown): ParticipantStatus {
   const wire = asRecord(value);
   return {
     participant: parseParticipant(wire.participant),
+    revision: asRevision(wire.revision),
     status: asStatusKind(wire.status),
     note: asString(wire.note),
     expiresAt: wire.expires_at == null ? null : asTimestamp(wire.expires_at),
+    // 期限切れで戻る先。無ければ期限で宣言そのものが終わる。
+    baseStatus:
+      wire.base_status === undefined ||
+      wire.base_status === null ||
+      wire.base_status === ""
+        ? null
+        : asStatusKind(wire.base_status),
+    baseNote: typeof wire.base_note === "string" ? wire.base_note : "",
   };
 }
 
@@ -860,6 +966,7 @@ function parseMessage(value: unknown): Message {
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
+    revision: asRevision(wire.revision),
     deleted: asBoolean(wire.deleted),
   };
 }
@@ -925,6 +1032,11 @@ function asSeq(value: unknown): number {
     throw new Error("invalid messaging sequence");
   }
   return Number(value);
+}
+function asRevision(value: unknown): number {
+  const revision = asSeq(value);
+  if (revision < 1) throw new Error("invalid messaging revision");
+  return revision;
 }
 function asTimestamp(value: unknown): number {
   const parsed = Date.parse(asString(value));

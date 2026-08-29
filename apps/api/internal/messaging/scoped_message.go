@@ -151,7 +151,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	message := Message{
 		MessageID: newUUIDv7(), PlaceID: in.PlaceID, Seq: seq,
 		Author: s.Scope.Actor, Content: in.Content, Urgency: in.Urgency,
-		Mentions: mentions, ReplyTo: in.ReplyTo, ClientNonce: in.ClientNonce,
+		Mentions: mentions, ReplyTo: in.ReplyTo, ClientNonce: in.ClientNonce, Revision: 1,
 	}
 	var replyTo *string
 	if in.ReplyTo != "" {
@@ -195,7 +195,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendInput) (Message, []byte, bool, error) {
 	rows, err := q.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages
 		WHERE workspace_id = $1 AND place_id = $2
 		  AND author_kind = $3 AND author_id = $4 AND client_nonce = $5`,
@@ -275,7 +275,7 @@ func (s *ScopedStore) historyAfterAuthorization(
 	}
 	rows, err := q.Query(ctx, fmt.Sprintf(`
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages
 		WHERE workspace_id = $1 AND place_id = $2 AND seq >= $3 %s
 		ORDER BY seq DESC LIMIT $4`, before), args...)
@@ -321,7 +321,7 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages
 		WHERE workspace_id = $1 AND place_id = $2 AND seq >= $3
 		ORDER BY seq ASC LIMIT $4`, s.Scope.WorkspaceID, placeID, lower, limit)
@@ -341,7 +341,7 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 	return messages, nil
 }
 
-func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, content string) (Message, error) {
+func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, content string, expectedRevision int64) (Message, error) {
 	if content == "" {
 		return Message{}, errors.New("content must not be empty")
 	}
@@ -375,7 +375,13 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, ErrNotAuthor
 	}
 	if message.Deleted {
-		return Message{}, ErrMessageDeleted
+		// The transport must be able to project the authoritative tombstone when
+		// an edit races a deletion. Returning it with the sentinel keeps the
+		// operation rejected while preserving the revision that made it terminal.
+		return message, ErrMessageDeleted
+	}
+	if expectedRevision <= 0 || message.Revision != expectedRevision {
+		return Message{}, currentRevisionConflict(ctx, tx, message)
 	}
 	members, err := s.activeMembersScoped(ctx, tx, place)
 	if err != nil {
@@ -384,9 +390,13 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	mentions := resolveMentions(content, members)
 	var editedAt time.Time
 	if err := tx.QueryRow(ctx, `
-		UPDATE messages SET content = $1, edited_at = now()
-		WHERE workspace_id = $2 AND message_id = $3 RETURNING edited_at`,
-		content, s.Scope.WorkspaceID, messageID).Scan(&editedAt); err != nil {
+		UPDATE messages SET content = $1, edited_at = now(), revision = revision + 1
+		WHERE workspace_id = $2 AND message_id = $3 AND revision = $4
+		RETURNING edited_at, revision`,
+		content, s.Scope.WorkspaceID, messageID, expectedRevision).Scan(&editedAt, &message.Revision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Message{}, currentRevisionConflict(ctx, tx, message)
+		}
 		return Message{}, fmt.Errorf("update scoped message: %w", err)
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM message_mentions WHERE message_id = $1", messageID); err != nil {
@@ -404,6 +414,17 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		return Message{}, fmt.Errorf("commit scoped edit: %w", err)
 	}
 	return parts[0], nil
+}
+
+// currentRevisionConflict completes the locked message before returning it to
+// the transport. The caller has already checked exact scope, visibility and
+// authorship, so the response cannot disclose a message the editor may not see.
+func currentRevisionConflict(ctx context.Context, q querier, message Message) error {
+	current := []Message{message}
+	if err := attachMessagePartsWith(ctx, q, current); err != nil {
+		return fmt.Errorf("load current scoped message for edit conflict: %w", err)
+	}
+	return &messageRevisionConflictError{Current: current[0]}
 }
 
 func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID string) (Message, error) {
@@ -448,9 +469,10 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel {
 		return Message{}, ErrForbidden
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE messages SET content = NULL, deleted_at = now()
-		WHERE workspace_id = $1 AND message_id = $2`, s.Scope.WorkspaceID, messageID); err != nil {
+	if err := tx.QueryRow(ctx, `
+		UPDATE messages SET content = NULL, deleted_at = now(), revision = revision + 1
+		WHERE workspace_id = $1 AND message_id = $2
+		RETURNING revision`, s.Scope.WorkspaceID, messageID).Scan(&message.Revision); err != nil {
 		return Message{}, fmt.Errorf("tombstone scoped message: %w", err)
 	}
 	// Bytes leave through the durable deletion outbox after commit; the
@@ -609,7 +631,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 			WHERE p.workspace_id = $1
 			  AND (p.kind = 'channel' OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
-		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.name, vp.topic,
+		SELECT vp.place_id, vp.kind, vp.workspace_id, vp.revision, vp.name, vp.topic,
 		       vp.visibility, vp.last_seq, vp.voice, COALESCE(rm.last_read_seq, 0),
 		       (SELECT count(*) FROM messages m
 		        WHERE m.workspace_id = $1 AND m.place_id = vp.place_id
@@ -637,7 +659,7 @@ func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, err
 		var summary UnreadSummary
 		var name *string
 		if err := rows.Scan(&summary.Place.PlaceID, &summary.Place.Kind,
-			&summary.Place.WorkspaceID, &name, &summary.Place.Topic,
+			&summary.Place.WorkspaceID, &summary.Place.Revision, &name, &summary.Place.Topic,
 			&summary.Place.Visibility, &summary.Place.LastSeq, &summary.Place.Voice, &summary.LastReadSeq,
 			&summary.UnreadCount, &summary.MentionCount); err != nil {
 			return nil, fmt.Errorf("scan scoped unread summary: %w", err)
@@ -734,7 +756,7 @@ func attachReactionsWith(ctx context.Context, q querier, messages []Message) err
 func lockMessageScoped(ctx context.Context, tx pgx.Tx, workspaceID, placeID, messageID string) (Message, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
-		       reply_to, client_nonce, created_at, edited_at, deleted_at
+		       reply_to, client_nonce, created_at, edited_at, revision, deleted_at
 		FROM messages WHERE workspace_id = $1 AND place_id = $2 AND message_id = $3
 		FOR UPDATE`, workspaceID, placeID, messageID)
 	if err != nil {

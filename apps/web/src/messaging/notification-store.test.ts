@@ -68,6 +68,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "ws",
+          revision: 1,
           name: "dev",
           topic: "",
           visibility: "public",
@@ -113,9 +114,10 @@ class StubBackend implements MessagingBackend {
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): ReturnType<
-    MessagingBackend["updateChannelTopic"]
-  > {
+  async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): ReturnType<MessagingBackend["duplicateChannel"]> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {
@@ -136,13 +138,14 @@ class StubBackend implements MessagingBackend {
       created: true,
     };
   }
-  async editMessage(): Promise<void> {}
-  async deleteMessage(): Promise<void> {}
-  async markRead(): Promise<void> {}
-  async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
     throw new Error("unused");
   }
-  async updateProfile(): ReturnType<MessagingBackend["updateProfile"]> {
+  async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
+    throw new Error("unused");
+  }
+  async markRead(): Promise<void> {}
+  async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
   }
   async createReplyLater(): ReturnType<MessagingBackend["createReplyLater"]> {

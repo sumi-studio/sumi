@@ -1,17 +1,11 @@
-import {
-  BellOff,
-  Check,
-  Hash,
-  MoreVertical,
-  Plus,
-  Volume2,
-  X,
-} from "lucide-react";
+import { BellOff, Check, Hash, Plus, Search, Volume2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
+import { clampCodePoints, codePointLength } from "../../lib/text-length";
+import { useCurrentWorkspacePermission } from "../../workspace/store";
 import { VoiceChannelMembers } from "../call/voice-channel-members";
 import { VoiceChannelPanel } from "../call/voice-channel-panel";
-import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
+import type { PlaceKey } from "../model";
 import { parsePlaceKey, participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import {
@@ -20,14 +14,11 @@ import {
   useMessaging,
 } from "../store";
 import { ModalDialog } from "./modal-dialog";
-import { ownsEvent, useOverlayPanel } from "./overlay";
-import {
-  ParticipantAvatar,
-  STATUS_DOT,
-  STATUS_LABEL,
-} from "./participant-avatar";
+import { ownsEvent } from "./overlay";
+import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
-import { SettingsTrigger } from "./settings-overlay";
+import { PlaceContextMenu } from "./place-context-menu";
+import { StatusMenu } from "./status-menu";
 
 const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 
@@ -36,18 +27,7 @@ const sidebarPlaces = () => document.querySelector<HTMLElement>(SIDEBAR_PLACES);
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
-
-export const NOTIFICATION_LEVEL_LABEL: Record<NotificationLevel, string> = {
-  all: "すべて通知",
-  mentions: "メンションのみ",
-  mute: "ミュート",
-};
-
-const NOTIFICATION_LEVEL_HINT: Record<NotificationLevel, string> = {
-  all: "この場所の発言で呼ばれます",
-  mentions: "名前を呼ばれたときだけ",
-  mute: "通知も未読バッジも出しません",
-};
+const CHANNEL_NAME_MAX_CODE_POINTS = 200;
 
 export function Badge({
   count,
@@ -72,118 +52,29 @@ export function Badge({
   );
 }
 
-/**
- * placeごとの通知レベル。右クリックとホバーの「…」の両方から開く——
- * 右クリックはDiscordを知っている手が最初に試す操作で、ホバーは知らない手が
- * 見つけられる導線。
- */
-function PlaceNotificationMenu({
-  placeKey: key,
-  open,
-  onOpenChange,
-}: {
-  placeKey: PlaceKey;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const level = useMessaging((state) => notificationLevelFor(state, key));
-  const setPlaceNotificationLevel = useMessaging(
-    (state) => state.setPlaceNotificationLevel,
-  );
-  const overlay = useOverlayPanel<HTMLButtonElement>({
-    open,
-    onOpenChange,
-    // このパネルはサイドバーのスクロール領域内にある。
-    scrollPassthrough: () => null,
-  });
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        aria-label="通知設定"
-        aria-haspopup="dialog"
-        {...overlay.triggerProps}
-        onClick={(event) => {
-          event.stopPropagation();
-          overlay.toggle();
-        }}
-        className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
-          open ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-        }`}
-      >
-        <MoreVertical className="size-3.5" />
-      </button>
-      {open ? (
-        <div
-          {...overlay.panelProps}
-          role="dialog"
-          aria-label="この場所の通知設定"
-          className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
-        >
-          <p
-            id={`place-notification-${key}`}
-            className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground"
-          >
-            通知
-          </p>
-          <div role="radiogroup" aria-labelledby={`place-notification-${key}`}>
-            {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
-              (candidate) => (
-                <label
-                  key={candidate}
-                  className={`flex w-full cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
-                    level === candidate ? "bg-accent/60" : ""
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name={`place-notification-choice-${key}`}
-                    checked={level === candidate}
-                    onChange={() => {
-                      setPlaceNotificationLevel(key, candidate);
-                      onOpenChange(false);
-                    }}
-                    className="sr-only"
-                  />
-                  <Check
-                    aria-hidden
-                    className={`mt-0.5 size-3.5 shrink-0 transition-opacity ${
-                      level === candidate ? "opacity-100" : "opacity-0"
-                    }`}
-                  />
-                  <span className="min-w-0">
-                    <span
-                      className={`block text-[13px] ${
-                        level === candidate ? "font-medium" : ""
-                      }`}
-                    >
-                      {NOTIFICATION_LEVEL_LABEL[candidate]}
-                    </span>
-                    <span className="block text-[11px] text-muted-foreground">
-                      {NOTIFICATION_LEVEL_HINT[candidate]}
-                    </span>
-                  </span>
-                </label>
-              ),
-            )}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
+/** 検索の突き合わせ用。全角/半角と大小文字の違いで隠れないようにする。 */
+export function normalizeForSearch(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("ja");
 }
 
 function PlaceRow({
   placeKey: key,
+  channelId,
   selectedPlaceKey,
   label,
   icon,
   leading,
   unread,
   mentions,
+  onEditChannel,
+  onDuplicateChannel,
+  onCreateChannel,
+  duplicateState,
+  canManageChannel,
 }: {
   placeKey: PlaceKey;
+  /** channelでなければnull。メニューからchannel専用の項目が消える。 */
+  channelId: string | null;
   selectedPlaceKey: PlaceKey | null;
   label: React.ReactNode;
   icon: React.ReactNode;
@@ -194,8 +85,13 @@ function PlaceRow({
   leading?: React.ReactNode;
   unread: number;
   mentions: number;
+  onEditChannel: (channelId: string) => void;
+  onDuplicateChannel: (channelId: string) => void;
+  onCreateChannel: () => void;
+  duplicateState: "idle" | "pending" | "failed";
+  canManageChannel: boolean;
 }) {
-  const canConfigure = useMessaging(
+  const canConfigureNotifications = useMessaging(
     (state) => state.capabilities.notifications,
   );
   const level = useMessaging((state) => notificationLevelFor(state, key));
@@ -203,6 +99,8 @@ function PlaceRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const active = selectedPlaceKey === key;
   const muted = level === "mute";
+  const hasMenu =
+    (channelId !== null && canManageChannel) || canConfigureNotifications;
   return (
     // 右クリックは行そのものが受ける。leadingへ切り出したアバターの上でも
     // 同じ導線が出る（行の右クリック契約はアバター領域を含む）。行内の
@@ -212,7 +110,7 @@ function PlaceRow({
     // biome-ignore lint/a11y/noStaticElementInteractions: 右クリックは補助導線で、正規の入口は同じ行の「…」button。
     <div
       onContextMenu={(event) => {
-        if (!canConfigure || !ownsEvent(event)) return;
+        if (!hasMenu || !ownsEvent(event)) return;
         event.preventDefault();
         setMenuOpen(true);
       }}
@@ -245,11 +143,17 @@ function PlaceRow({
         urgent={mentions > 0}
         muted={muted}
       />
-      {canConfigure ? (
-        <PlaceNotificationMenu
+      {hasMenu ? (
+        <PlaceContextMenu
           placeKey={key}
+          channelId={channelId}
+          canManageChannel={canManageChannel}
           open={menuOpen}
           onOpenChange={setMenuOpen}
+          onEditChannel={onEditChannel}
+          onDuplicateChannel={onDuplicateChannel}
+          onCreateChannel={onCreateChannel}
+          duplicatePending={duplicateState === "pending"}
         />
       ) : null}
     </div>
@@ -314,7 +218,13 @@ function CreateChannelDialog({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     const trimmed = name.trim();
-    if (!trimmed || busy) return;
+    if (
+      !trimmed ||
+      codePointLength(trimmed) > CHANNEL_NAME_MAX_CODE_POINTS ||
+      busy
+    ) {
+      return;
+    }
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = useMessaging.getState().selfKey;
     setBusy(true);
@@ -364,9 +274,15 @@ function CreateChannelDialog({
           <input
             ref={nameRef}
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) =>
+              setName(
+                clampCodePoints(
+                  event.target.value,
+                  CHANNEL_NAME_MAX_CODE_POINTS,
+                ),
+              )
+            }
             disabled={busy}
-            maxLength={80}
             placeholder="例: dev"
             className={INPUT_CLASS}
           />
@@ -400,7 +316,11 @@ function CreateChannelDialog({
           />
         </label>
         {failed ? (
-          <p className="text-[11px] text-rose-500">
+          <p
+            role="alert"
+            aria-live="assertive"
+            className="text-[11px] text-rose-500"
+          >
             チャンネルを作成できませんでした
           </p>
         ) : null}
@@ -414,7 +334,11 @@ function CreateChannelDialog({
           </button>
           <button
             type="submit"
-            disabled={busy || !name.trim()}
+            disabled={
+              busy ||
+              !name.trim() ||
+              codePointLength(name.trim()) > CHANNEL_NAME_MAX_CODE_POINTS
+            }
             className="rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             作成
@@ -425,6 +349,155 @@ function CreateChannelDialog({
   );
 }
 
+/**
+ * channelの名前とトピックを一枚で直す。ヘッダーのその場編集をやめてここへ
+ * 集めたのは、名前とトピックが同じ一つの「このチャンネルは何か」だから——
+ * 別々の場所で別々に直すものではない。
+ *
+ * 何も変えずに「保存」を押せる状態は作らない。変わった項目だけを送るので、
+ * 名前を直したときにトピックが空文字で上書きされることもない。
+ */
+function EditChannelDialog({
+  channelId,
+  onClose,
+}: {
+  channelId: string;
+  onClose: () => void;
+}) {
+  const channel = useMessaging((state) =>
+    state.channels.find((entry) => entry.channelId === channelId),
+  );
+  const updateChannel = useMessaging((state) => state.updateChannel);
+  // 開いたときの値が、この編集セッションの比較対象。後から届く更新は
+  // channel を新しくしても、本人が触っていない項目を「変更」とはしない。
+  const [initial] = useState(() => ({
+    name: channel?.name ?? "",
+    topic: channel?.topic ?? "",
+  }));
+  const [name, setName] = useState(initial.name);
+  const [topic, setTopic] = useState(initial.topic);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const nameRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    nameRef.current?.focus();
+  }, []);
+
+  // 開いている最中にchannelが消えたら、閉じる。
+  useEffect(() => {
+    if (!channel) onClose();
+  }, [channel, onClose]);
+  if (!channel) return null;
+
+  const nextName = name.trim();
+  const nextTopic = topic.trim();
+  const nameTooLong = codePointLength(nextName) > CHANNEL_NAME_MAX_CODE_POINTS;
+  const changed =
+    (nextName !== "" && !nameTooLong && nextName !== initial.name) ||
+    nextTopic !== initial.topic;
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (busy || !changed || nameTooLong) return;
+    const currentIdentity = getMessagingSessionIdentity();
+    setBusy(true);
+    setFailed(false);
+    try {
+      await updateChannel(channelId, {
+        ...(nextName !== "" && nextName !== initial.name
+          ? { name: nextName }
+          : {}),
+        ...(nextTopic !== initial.topic ? { topic: nextTopic } : {}),
+      });
+      onClose();
+    } catch {
+      if (getMessagingSessionIdentity() === currentIdentity) setFailed(true);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <DialogShell title="チャンネルを編集" onClose={onClose}>
+      <form
+        onSubmit={submit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && isImeComposing(event)) {
+            event.preventDefault();
+          }
+        }}
+        className="mt-3 space-y-3"
+      >
+        <label className="block">
+          <span className="mb-1 block text-[11px] text-muted-foreground">
+            名前
+          </span>
+          <input
+            ref={nameRef}
+            value={name}
+            onChange={(event) =>
+              setName(
+                clampCodePoints(
+                  event.target.value,
+                  CHANNEL_NAME_MAX_CODE_POINTS,
+                ),
+              )
+            }
+            disabled={busy}
+            className={INPUT_CLASS}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[11px] text-muted-foreground">
+            トピック
+          </span>
+          <input
+            value={topic}
+            onChange={(event) => setTopic(event.target.value)}
+            disabled={busy}
+            maxLength={200}
+            placeholder="このチャンネルの話題"
+            className={INPUT_CLASS}
+          />
+        </label>
+        {failed ? (
+          <p
+            role="alert"
+            aria-live="assertive"
+            className="text-[11px] text-rose-500"
+          >
+            チャンネルを更新できませんでした
+          </p>
+        ) : null}
+        <div className="flex justify-end gap-1.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md px-2.5 py-1.5 text-[12.5px] text-muted-foreground hover:bg-accent"
+          >
+            キャンセル
+          </button>
+          <button
+            type="submit"
+            disabled={busy || !changed || nameTooLong}
+            className="rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
+          >
+            保存
+          </button>
+        </div>
+      </form>
+    </DialogShell>
+  );
+}
+
+/**
+ * DM/グループDMの相手を選ぶ。名前とtaglineの両方を、NFKCで畳んだ上で
+ * 突き合わせる——「ｸﾛ」と打った人にKUROが出ないのは、探せないのと同じ。
+ *
+ * 絞り込んでも選択済みの相手は消えない。検索語を打ち替えるたびに、さっき
+ * 選んだ人がリストから居なくなって、選んだ覚えのある名前が画面のどこにも
+ * 無い——という状態を作らないため。
+ */
 function StartDMDialog({ onClose }: { onClose: () => void }) {
   const membersByKey = useMessaging((state) => state.membersByKey);
   const statusByKey = useMessaging((state) => state.statusByKey);
@@ -433,8 +506,14 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   const dmPending = useMessaging((state) => state.startingDM !== null);
   const placeNavigate = usePlaceNavigate();
   const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    searchRef.current?.focus();
+  }, []);
 
   const candidates = useMemo(
     () =>
@@ -446,6 +525,15 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   const chosen = candidates.filter(
     (member) => selected[participantKey(member.participant)],
   );
+  const needle = normalizeForSearch(query.trim());
+  const shown = candidates.filter((member) => {
+    if (selected[participantKey(member.participant)]) return true;
+    if (needle === "") return true;
+    return (
+      normalizeForSearch(member.displayName).includes(needle) ||
+      normalizeForSearch(member.tagline ?? "").includes(needle)
+    );
+  });
 
   const submit = async () => {
     if (busy || dmPending || chosen.length === 0) return;
@@ -479,13 +567,34 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
       <p className="mt-1 text-[11px] text-muted-foreground/80">
         1人ならDM、複数人ならグループDMになります
       </p>
+      <label className="relative mt-2 block">
+        <Search className="-translate-y-1/2 absolute top-1/2 left-2 size-3.5 text-muted-foreground/60" />
+        <input
+          ref={searchRef}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || isImeComposing(event)) return;
+            event.preventDefault();
+            void submit();
+          }}
+          disabled={busy}
+          placeholder="名前で絞り込む"
+          aria-label="名前で絞り込む"
+          className={`${INPUT_CLASS} pl-7`}
+        />
+      </label>
       <div className="scrollbar-ui mt-2 max-h-64 overflow-y-auto rounded-md border border-border/70 p-1">
         {candidates.length === 0 ? (
           <p className="px-2 py-3 text-[12px] text-muted-foreground/70">
             話せる相手がいません
           </p>
+        ) : shown.length === 0 ? (
+          <p className="px-2 py-3 text-[12px] text-muted-foreground/70">
+            「{query.trim()}」に当たる相手がいません
+          </p>
         ) : (
-          candidates.map((member) => {
+          shown.map((member) => {
             const key = participantKey(member.participant);
             const checked = selected[key] ?? false;
             return (
@@ -493,6 +602,7 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
                 key={key}
                 type="button"
                 disabled={busy}
+                aria-pressed={checked}
                 onClick={() =>
                   setSelected((entry) => ({ ...entry, [key]: !checked }))
                 }
@@ -528,12 +638,23 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
           })
         )}
       </div>
+      {chosen.length > 0 ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          {chosen.map((member) => member.displayName).join("、")} を選択中
+        </p>
+      ) : null}
       {failed ? (
-        <p className="mt-2 text-[11px] text-rose-500">
+        <p
+          role="alert"
+          aria-live="assertive"
+          className="mt-2 text-[11px] text-rose-500"
+        >
           会話を開始できませんでした
         </p>
       ) : null}
-      <div className="mt-3 flex justify-end gap-1.5">
+      {/* 「やめる」は左、「進む」は右。押し間違いを取り返せない側を、
+          指が流れてくる位置に置かない。 */}
+      <div className="mt-3 flex items-center justify-between gap-1.5">
         <button
           type="button"
           onClick={onClose}
@@ -599,18 +720,27 @@ export function Sidebar({
     (state) => state.mentionCountByPlace,
   );
   const selfKey = useMessaging((state) => state.selfKey);
-  const self = useMessaging((state) => state.self);
-  const setStatus = useMessaging((state) => state.setStatus);
-  const canSetStatus = useMessaging((state) => state.capabilities.status);
-  const [statusMenuOpen, setStatusMenuOpen] = useState(false);
+  const duplicateChannel = useMessaging((state) => state.duplicateChannel);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
+  const canManageChannels = useCurrentWorkspacePermission(
+    "app.messaging.manage_channels",
+  );
+  const placeNavigate = usePlaceNavigate();
   const [openDialog, setOpenDialog] = useState<
-    { kind: "channel"; workspaceId: string } | { kind: "dm" } | null
+    | { kind: "channel"; workspaceId: string }
+    | { kind: "edit"; channelId: string }
+    | { kind: "dm" }
+    | null
   >(null);
-  const statusOverlay = useOverlayPanel<HTMLButtonElement>({
-    open: statusMenuOpen,
-    onOpenChange: setStatusMenuOpen,
-    scrollPassthrough: sidebarPlaces,
-  });
+  const [duplicateMutation, setDuplicateMutation] = useState<{
+    channelId: string;
+    failed: boolean;
+    state: "pending" | "failed";
+    token: number;
+  } | null>(null);
+  const nextDuplicateToken = useRef(0);
 
   const activePlace = selectedPlaceKey ? parsePlaceKey(selectedPlaceKey) : null;
   const activeChannel =
@@ -641,8 +771,74 @@ export function Sidebar({
     }
   }, [openDialog, selectedWorkspaceId]);
 
-  const selfProfile = self ? membersByKey[selfKey] : undefined;
-  const selfStatus = statusByKey[selfKey];
+  // biome-ignore lint/correctness/useExhaustiveDependencies: transport generation is the authority-replacement signal.
+  useEffect(() => {
+    nextDuplicateToken.current += 1;
+    setDuplicateMutation(null);
+  }, [transportGeneration]);
+
+  const openCreateChannel = () => {
+    if (!activeWorkspace) return;
+    setOpenDialog({
+      kind: "channel",
+      workspaceId: activeWorkspace.workspaceId,
+    });
+  };
+  // 複製はダイアログを挟まない。名前はサーバーが決め（「〜 のコピー」）、
+  // できたものへそのまま移る——中身は空なので、直したければ開いた先で直せる。
+  const runDuplicate = (channelId: string) => {
+    if (
+      duplicateMutation?.channelId === channelId &&
+      duplicateMutation.state === "pending"
+    ) {
+      return;
+    }
+    const currentIdentity = getMessagingSessionIdentity();
+    const generation = transportGeneration;
+    const token = ++nextDuplicateToken.current;
+    setDuplicateMutation({
+      channelId,
+      failed:
+        duplicateMutation?.channelId === channelId && duplicateMutation.failed,
+      state: "pending",
+      token,
+    });
+    void duplicateChannel(channelId).then(
+      (key) => {
+        if (
+          getMessagingSessionIdentity() !== currentIdentity ||
+          useMessaging.getState().transportGeneration !== generation ||
+          nextDuplicateToken.current !== token
+        ) {
+          return;
+        }
+        setDuplicateMutation(null);
+        placeNavigate(key);
+      },
+      () => {
+        if (
+          getMessagingSessionIdentity() !== currentIdentity ||
+          useMessaging.getState().transportGeneration !== generation ||
+          nextDuplicateToken.current !== token
+        ) {
+          return;
+        }
+        setDuplicateMutation({
+          channelId,
+          failed: true,
+          state: "failed",
+          token,
+        });
+      },
+    );
+  };
+
+  const menuActions = {
+    onEditChannel: (channelId: string) =>
+      setOpenDialog({ kind: "edit", channelId }),
+    onDuplicateChannel: runDuplicate,
+    onCreateChannel: openCreateChannel,
+  };
 
   return (
     <aside className="flex w-60 shrink-0 flex-col border-border/70 border-r bg-muted/20">
@@ -661,12 +857,8 @@ export function Sidebar({
             label="チャンネル"
             actionTitle="チャンネルを作成"
             onAction={
-              activeWorkspace
-                ? () =>
-                    setOpenDialog({
-                      kind: "channel",
-                      workspaceId: activeWorkspace.workspaceId,
-                    })
+              activeWorkspace && canManageChannels
+                ? openCreateChannel
                 : undefined
             }
           />
@@ -679,6 +871,7 @@ export function Sidebar({
             <div key={key}>
               <PlaceRow
                 placeKey={key}
+                channelId={channel.channelId}
                 selectedPlaceKey={selectedPlaceKey}
                 label={channel.name}
                 icon={
@@ -690,7 +883,35 @@ export function Sidebar({
                 }
                 unread={unread}
                 mentions={mentions}
+                {...menuActions}
+                canManageChannel={canManageChannels}
+                duplicateState={
+                  duplicateMutation?.channelId === channel.channelId
+                    ? duplicateMutation.state
+                    : "idle"
+                }
               />
+              {duplicateMutation?.channelId === channel.channelId &&
+              duplicateMutation.failed ? (
+                <div
+                  role="alert"
+                  className="mx-2 mb-1 flex items-center gap-1.5 text-[11px] text-rose-500"
+                >
+                  <span className="min-w-0 flex-1">
+                    チャンネルを複製できませんでした
+                  </span>
+                  <button
+                    type="button"
+                    disabled={duplicateMutation.state === "pending"}
+                    onClick={() => runDuplicate(channel.channelId)}
+                    className="shrink-0 rounded px-1 py-0.5 font-medium hover:bg-accent disabled:opacity-50"
+                  >
+                    {duplicateMutation.state === "pending"
+                      ? "再試行中…"
+                      : "再試行"}
+                  </button>
+                </div>
+              ) : null}
               {channel.voice ? (
                 <>
                   <VoiceChannelMembers placeKey={key} />
@@ -727,13 +948,13 @@ export function Sidebar({
               name={firstName}
               size={18}
               status={statusByKey[firstKey]?.status}
-              src={membersByKey[firstKey]?.avatarUrl}
             />
           );
           return (
             <PlaceRow
               key={key}
               placeKey={key}
+              channelId={null}
               selectedPlaceKey={selectedPlaceKey}
               label={name}
               icon={avatar}
@@ -755,95 +976,15 @@ export function Sidebar({
               }
               unread={unread}
               mentions={unread}
+              {...menuActions}
+              canManageChannel={false}
+              duplicateState="idle"
             />
           );
         })}
       </nav>
-      <div className="relative shrink-0 border-border/70 border-t p-2">
-        {statusMenuOpen && canSetStatus ? (
-          <div
-            {...statusOverlay.panelProps}
-            role="dialog"
-            aria-label="ステータス"
-            className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
-          >
-            {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => (
-              <label
-                key={kind}
-                className={`flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
-                  selfStatus?.status === kind ? "font-medium" : ""
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="self-status-choice"
-                  checked={selfStatus?.status === kind}
-                  onChange={() => {
-                    setStatus(kind, kind === "busy" ? "取り込み中" : "");
-                    setStatusMenuOpen(false);
-                  }}
-                  className="sr-only"
-                />
-                <span className={`size-2 rounded-full ${STATUS_DOT[kind]}`} />
-                {STATUS_LABEL[kind]}
-                <Check
-                  aria-hidden
-                  className={`ml-auto size-3.5 shrink-0 ${
-                    selfStatus?.status === kind ? "opacity-100" : "opacity-0"
-                  }`}
-                />
-              </label>
-            ))}
-            <p className="px-2 pt-1 pb-0.5 text-[10px] text-muted-foreground/70">
-              ステータスは自己申告。誰かが勝手に晒すことはありません
-            </p>
-          </div>
-        ) : null}
-        {/*
-          アバターは自分のプロフィールカード、名前とステータスは従来どおり
-          ステータス変更。役割の違う2つのbuttonを横に並べる。
-        */}
-        <div
-          className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
-            canSetStatus ? "hover:bg-accent/60" : ""
-          }`}
-        >
-          <ParticipantProfilePopover
-            participantKey={selfKey}
-            label={`${selfProfile?.displayName ?? "自分"}のプロフィール`}
-            side="top"
-            align="start"
-            scrollPassthrough={sidebarPlaces}
-            className="flex shrink-0 rounded-full"
-          >
-            <ParticipantAvatar
-              participantKey={selfKey}
-              name={selfProfile?.displayName ?? "?"}
-              size={26}
-              status={selfStatus?.status ?? "available"}
-              src={selfProfile?.avatarUrl}
-            />
-          </ParticipantProfilePopover>
-          <button
-            type="button"
-            disabled={!canSetStatus}
-            aria-haspopup="dialog"
-            {...statusOverlay.triggerProps}
-            onClick={() => {
-              if (canSetStatus) statusOverlay.toggle();
-            }}
-            className="min-w-0 flex-1 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:cursor-default"
-          >
-            <span className="block truncate font-medium text-[13px]">
-              {selfProfile?.displayName ?? "…"}
-            </span>
-            <span className="block truncate text-[11px] text-muted-foreground">
-              {selfStatus ? STATUS_LABEL[selfStatus.status] : "対応可能"}
-              {selfStatus?.note ? ` — ${selfStatus.note}` : ""}
-            </span>
-          </button>
-          <SettingsTrigger />
-        </div>
+      <div className="shrink-0 border-border/70 border-t p-2">
+        <StatusMenu />
       </div>
       {openDialog?.kind === "channel" &&
       openDialog.workspaceId === selectedWorkspaceId ? (
@@ -852,6 +993,12 @@ export function Sidebar({
           isWorkspaceSelected={() =>
             selectedWorkspaceIdRef.current === openDialog.workspaceId
           }
+          onClose={() => setOpenDialog(null)}
+        />
+      ) : null}
+      {openDialog?.kind === "edit" ? (
+        <EditChannelDialog
+          channelId={openDialog.channelId}
           onClose={() => setOpenDialog(null)}
         />
       ) : null}

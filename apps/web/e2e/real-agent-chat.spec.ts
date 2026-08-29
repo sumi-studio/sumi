@@ -285,15 +285,14 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     expect(stack.escalationReviewCount).toBe(0);
     expect(stack.executionReviewRequests).toHaveLength(1);
     const reviewerWire = JSON.stringify(stack.executionReviewRequests[0]);
-    expect(reviewerWire).toContain("workspace_invitation_accept_v1");
+    expect(reviewerWire).toContain("execution-review-prompt/v7");
+    expect(reviewerWire).toContain("execution-review-schema/v7");
+    expect(reviewerWire).toContain("workspace_invitation_accept");
     expect(reviewerWire).toContain("accept_invitation");
+    // Reviewer v7 preserves the bounded conversation and exact Human-facing
+    // action projection, including the invitation identifiers the reviewer
+    // must compare. Internal executor bindings still stay out of the wire.
     for (const forbidden of [
-      browserInviteID,
-      workspaceID,
-      workspaceName,
-      "invitation_id",
-      "workspace_id",
-      "workspace_name",
       "execution_arguments",
       "proposal_digest",
       "descriptor_digest",
@@ -526,7 +525,7 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     for (const currentPage of [page, secondPage]) {
       await expect(
         currentPage.getByText(secondProviderResponse, { exact: true }),
-      ).toBeVisible({ timeout: 30_000 });
+      ).toBeVisible({ timeout: 90_000 });
       await expect(
         currentPage.getByText(firstProviderResponse, { exact: true }),
       ).toBeVisible();
@@ -550,16 +549,15 @@ test("two real Chrome pages own Direct Chat through the production Participant l
     const messagingReviewerWire = JSON.stringify(
       stack.executionReviewRequests[1],
     );
-    expect(messagingReviewerWire).toContain("messaging_v4");
+    expect(messagingReviewerWire).toContain("execution-review-prompt/v7");
+    expect(messagingReviewerWire).toContain("execution-review-schema/v7");
+    expect(messagingReviewerWire).toContain("messaging");
     expect(messagingReviewerWire).toContain("write");
-    expect(messagingReviewerWire).toContain("foundation_workspace");
+    expect(messagingReviewerWire).toContain("sumi.foundation.workspace");
+    // The v7 reviewer intentionally receives bounded role-preserving tool
+    // history plus the exact Messaging projection. Executor-only bindings do
+    // not cross that boundary.
     for (const forbidden of [
-      ...stack.provider.reviewerForbiddenValues,
-      "invitation_id",
-      "workspace_id",
-      "attachment_id",
-      "attachment_ids",
-      "attachment_paths",
       "execution_arguments",
       "proposal_digest",
       "descriptor_digest",

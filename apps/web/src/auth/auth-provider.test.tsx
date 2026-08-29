@@ -1,6 +1,5 @@
 // @vitest-environment jsdom
 
-import { TooltipProvider } from "@sumi/ui/components/tooltip";
 import "@testing-library/jest-dom/vitest";
 import {
   cleanup,
@@ -9,33 +8,16 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SettingsPopover } from "../components/app-navigation";
-import { Sidebar } from "../messaging/components/sidebar";
-import { MockMessagingServer } from "../messaging/mock-server";
-import { setActiveMessagingScope } from "../messaging/scope";
-import {
-  bindMessagingScope,
-  bindMessagingSessionIdentity,
-  installMessagingBackend,
-  useMessaging,
-} from "../messaging/store";
 import { AuthProvider, useAuth } from "./auth-context";
 import { AuthAPIError, SumiSessionCompensatedError } from "./session-client";
 
 const authorityBindingA = "A".repeat(43);
 const authorityBindingB = `${"B".repeat(42)}E`;
 
-function confirmedProfile(id: string, displayName: string, revision = 1) {
-  return {
-    participant: { kind: "human" as const, humanId: id },
-    displayName,
-    tagline: "",
-    revision,
-  };
-}
-
 const authMocks = vi.hoisted(() => ({
+  getSumiProfile: vi.fn(),
   getSumiSession: vi.fn(),
   logoutSumiSession: vi.fn(),
   updateSumiProfile: vi.fn(),
@@ -76,6 +58,7 @@ const authMocks = vi.hoisted(() => ({
 
 vi.mock("./session-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./session-client")>()),
+  getSumiProfile: authMocks.getSumiProfile,
   getSumiSession: authMocks.getSumiSession,
   logoutSumiSession: authMocks.logoutSumiSession,
   updateSumiProfile: authMocks.updateSumiProfile,
@@ -123,25 +106,8 @@ vi.mock("firebase/auth", () => ({
   signOut: authMocks.signOut,
 }));
 
-vi.mock("../messaging/place-route", () => ({
-  usePlaceNavigate: () => vi.fn(),
-}));
-
-vi.mock("./provider-settings", () => ({
-  ProviderSettings: () => null,
-}));
-
-vi.mock("../theme/theme-provider", () => ({
-  useTheme: () => ({ theme: "system", setTheme: vi.fn() }),
-}));
-
-vi.mock("../participant/app-menu", () => ({
-  ParticipantAppsMenu: () => null,
-}));
-
 afterEach(() => {
   cleanup();
-  bindMessagingSessionIdentity(null);
 });
 
 beforeEach(() => {
@@ -165,10 +131,19 @@ beforeEach(() => {
     expiresAt: "2026-08-01T01:00:00Z",
   });
   authMocks.logoutSumiSession.mockResolvedValue(undefined);
+  authMocks.getSumiProfile.mockResolvedValue({
+    participant: { kind: "human", humanId: "user-a" },
+    displayName: "After",
+    tagline: "",
+  });
   authMocks.updateSumiProfile.mockResolvedValue({
     id: "user-a",
     displayName: "After",
-    profile: confirmedProfile("user-a", "After"),
+    profile: {
+      participant: { kind: "human", humanId: "user-a" },
+      displayName: "After",
+      tagline: "",
+    },
   });
   authMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
   authMocks.beginSameEmailCredentialRecovery.mockResolvedValue(undefined);
@@ -186,11 +161,13 @@ beforeEach(() => {
 
 function AuthStateProbe() {
   const auth = useAuth();
+  const [confirmedTagline, setConfirmedTagline] = useState("none");
   return (
     <>
       <div data-testid="session-state">{auth.sessionState}</div>
       <div data-testid="user-id">{auth.user?.id ?? "none"}</div>
       <div data-testid="display-name">{auth.user?.displayName ?? "none"}</div>
+      <div data-testid="confirmed-tagline">{confirmedTagline}</div>
       <div data-testid="confirmation">
         {auth.confirmation?.action ?? "none"}
       </div>
@@ -235,6 +212,19 @@ function AuthStateProbe() {
       >
         update display name
       </button>
+      <button
+        type="button"
+        onClick={() =>
+          void auth
+            .updateProfile({ tagline: "設計" })
+            .then((profile) => {
+              if (profile !== null) setConfirmedTagline(profile.tagline);
+            })
+            .catch(() => undefined)
+        }
+      >
+        update tagline
+      </button>
     </>
   );
 }
@@ -249,7 +239,11 @@ describe("canonical Human profile", () => {
     authMocks.updateSumiProfile.mockResolvedValue({
       id: "user-a",
       displayName: "After",
-      profile: confirmedProfile("user-a", "After"),
+      profile: {
+        participant: { kind: "human", humanId: "user-a" },
+        displayName: "After",
+        tagline: "",
+      },
     });
 
     render(
@@ -268,113 +262,9 @@ describe("canonical Human profile", () => {
     await waitFor(() => {
       expect(screen.getByTestId("display-name")).toHaveTextContent("After");
     });
-    expect(authMocks.updateSumiProfile).toHaveBeenCalledWith("After");
-  });
-
-  it("projects a self profile_updated into the sidebar and settings from one confirmed profile", async () => {
-    authMocks.getSumiSession.mockResolvedValue({
-      authenticated: true,
-      authorityBindingId: authorityBindingA,
-      user: { id: "h-yohaku", displayName: "session fallback" },
-    });
-    const server = new MockMessagingServer();
-    bindMessagingSessionIdentity("h-yohaku");
-    installMessagingBackend(server);
-    useMessaging.getState().init();
-
-    render(
-      <AuthProvider>
-        <TooltipProvider>
-          <AuthStateProbe />
-          <Sidebar selectedPlaceKey={null} workspaceId="ws-sumi" />
-          <SettingsPopover />
-        </TooltipProvider>
-      </AuthProvider>,
-    );
-    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
-    await waitFor(() =>
-      expect(screen.getByTestId("display-name")).toHaveTextContent("yohaku"),
-    );
-
-    // 別タブでの保存はこのtabではprofile_updatedだけとして届く。
-    await server.updateProfile({ displayName: "別タブの確定名" });
-
-    await waitFor(() =>
-      expect(screen.getByTestId("display-name")).toHaveTextContent(
-        "別タブの確定名",
-      ),
-    );
-    expect(screen.getAllByText("別タブの確定名")).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: "設定" }));
-    const displayName = screen.getByRole("textbox", { name: "表示名" });
-    expect(displayName).toHaveValue("別タブの確定名");
-
-    // Workspace transportを外しても、認証UIはparticipant-globalな投影を読む。
-    setActiveMessagingScope({
-      workspaceId: "ws-sumi",
-      installationId: "installation-sumi",
-      authorityEpoch: "1",
-    });
-    bindMessagingScope(null);
-    expect(useMessaging.getState().self).toBeNull();
-    expect(screen.getByTestId("display-name")).toHaveTextContent(
-      "別タブの確定名",
-    );
-
-    // 同じ参加者で再bindしても、bootstrapと認証UIは同じ確定値に収束する。
-    installMessagingBackend(server);
-    useMessaging.getState().init();
-    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
-    expect(screen.getByTestId("display-name")).toHaveTextContent(
-      "別タブの確定名",
-    );
-  });
-
-  it("projects the /auth/profile ACK while Messaging is unbound and keeps it after rebind", async () => {
-    authMocks.getSumiSession.mockResolvedValue({
-      authenticated: true,
-      authorityBindingId: authorityBindingA,
-      user: { id: "h-yohaku", displayName: "session fallback" },
-    });
-    authMocks.updateSumiProfile.mockResolvedValue({
-      id: "h-yohaku",
+    expect(authMocks.updateSumiProfile).toHaveBeenCalledWith({
       displayName: "After",
-      profile: confirmedProfile("h-yohaku", "After"),
     });
-    const server = new MockMessagingServer();
-    bindMessagingSessionIdentity("h-yohaku");
-    installMessagingBackend(server);
-    useMessaging.getState().init();
-
-    render(
-      <AuthProvider>
-        <AuthStateProbe />
-      </AuthProvider>,
-    );
-    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
-    await waitFor(() =>
-      expect(screen.getByTestId("display-name")).toHaveTextContent("yohaku"),
-    );
-
-    setActiveMessagingScope({
-      workspaceId: "ws-sumi",
-      installationId: "installation-sumi",
-      authorityEpoch: "1",
-    });
-    bindMessagingScope(null);
-    expect(useMessaging.getState().ready).toBe(false);
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "update display name" }),
-    );
-    await waitFor(() =>
-      expect(screen.getByTestId("display-name")).toHaveTextContent("After"),
-    );
-
-    installMessagingBackend(server);
-    useMessaging.getState().init();
-    await waitFor(() => expect(useMessaging.getState().ready).toBe(true));
-    expect(screen.getByTestId("display-name")).toHaveTextContent("After");
   });
 
   it("reconciles a committed profile update whose response was lost", async () => {
@@ -410,6 +300,46 @@ describe("canonical Human profile", () => {
       expect(screen.getByTestId("display-name")).toHaveTextContent("After");
     });
     expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles a committed tagline-only update from the durable profile", async () => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new TypeError("disconnected"),
+    );
+    authMocks.getSumiProfile.mockResolvedValue({
+      participant: { kind: "human", humanId: "user-a" },
+      displayName: "Before",
+      tagline: "設計",
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "update tagline" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("confirmed-tagline")).toHaveTextContent("設計");
+    });
+    expect(authMocks.updateSumiProfile).toHaveBeenCalledWith({
+      tagline: "設計",
+    });
+    expect(authMocks.getSumiProfile).toHaveBeenCalledTimes(1);
   });
 
   it("resets private state before publishing a reconciled authority binding", async () => {
@@ -451,6 +381,11 @@ describe("canonical Human profile", () => {
   });
 
   it("publishes a replacement authority even when the rename did not commit", async () => {
+    authMocks.getSumiProfile.mockResolvedValue({
+      participant: { kind: "human", humanId: "user-a" },
+      displayName: "Before",
+      tagline: "",
+    });
     authMocks.getSumiSession
       .mockResolvedValueOnce({
         authenticated: true,
@@ -553,12 +488,20 @@ describe("canonical Human profile", () => {
     let resolveFirstUpdate!: (value: {
       id: string;
       displayName: string;
-      profile: ReturnType<typeof confirmedProfile>;
+      profile: {
+        participant: { kind: "human"; humanId: string };
+        displayName: string;
+        tagline: string;
+      };
     }) => void;
     const firstUpdate = new Promise<{
       id: string;
       displayName: string;
-      profile: ReturnType<typeof confirmedProfile>;
+      profile: {
+        participant: { kind: "human"; humanId: string };
+        displayName: string;
+        tagline: string;
+      };
     }>((resolve) => {
       resolveFirstUpdate = resolve;
     });
@@ -593,7 +536,11 @@ describe("canonical Human profile", () => {
     resolveFirstUpdate({
       id: "user-a",
       displayName: "After",
-      profile: confirmedProfile("user-a", "After"),
+      profile: {
+        participant: { kind: "human", humanId: "user-a" },
+        displayName: "After",
+        tagline: "",
+      },
     });
 
     await waitFor(() => {

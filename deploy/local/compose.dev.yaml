@@ -274,6 +274,8 @@ services:
       - "20000"
       - -supervisor
       - /opt/sumi/deploy/agent/supervisor
+      - -state-dir
+      - /run/sumi/runtime-provisioner/state
     environment:
       SUMI_CONTROL_PLANE_NETWORK: sumi-control-plane
       # The launcher validates and file-mounts config.json here so the Docker

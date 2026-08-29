@@ -133,6 +133,8 @@ export interface Message {
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
+  /** 編集の compare-and-swap 用の単調増加版。 */
+  revision?: number;
   /** 削除済みはtombstone: contentは空になり、消えた事実とseqだけが残る。 */
   deleted: boolean;
   /** 送信者自身の楽観的描画とACK/echoを照合するidempotency key。 */
@@ -157,6 +159,8 @@ export interface WorkspaceSummary {
 export interface ChannelSummary {
   channelId: string;
   workspaceId: string;
+  /** Monotonic database projection revision for volatile lifecycle frames. */
+  revision: number;
   name: string;
   topic: string;
   visibility: "public" | "private";
@@ -178,30 +182,50 @@ export interface MemberProfile {
   participant: ParticipantRef;
   displayName: string;
   tagline: string;
-  /** Monotonic server revision used to discard stale profile projections. */
-  revision?: number;
-  /**
-   * 顔写真のbytes取得URL。まだ誰も出していない段階では常にundefinedで、
-   * 受け手はイニシャルへ落ちる。読み込みに失敗したときも同じ落とし方をする。
-   */
-  avatarUrl?: string;
-}
-
-/** 自分の名乗りの部分更新。省いたfieldはサーバー側でそのまま残る。 */
-export interface ProfileInput {
-  displayName?: string;
-  tagline?: string;
 }
 
 export type StatusKind = "available" | "busy" | "away";
 
-/** 自己申告のステータス。監視による自動表示はしない。 */
+/**
+ * 自己申告のステータス。監視による自動表示はしない。
+ * 「オフライン」「非表示」が無いのは隠す手段が足りないからではなく、
+ * Sumiが在席を観測しないから——隠すべき自動の表示がそもそも無い。
+ */
 export interface ParticipantStatus {
   participant: ParticipantRef;
+  /** Monotonic database revision of this participant's status projection. */
+  revision: number;
   status: StatusKind;
   note: string;
   expiresAt: number | null;
+  /**
+   * expiresAtが来たときに戻る先。nullなら戻る先が無く、期限で宣言そのものが
+   * 終わる。期限なしのステータスでは常にnull。
+   */
+  baseStatus: StatusKind | null;
+  baseNote: string;
 }
+
+/** A durable empty status projection. It still advances the participant's revision. */
+export interface StatusCleared {
+  participant: ParticipantRef;
+  revision: number;
+}
+
+/** 一時ステータスの期間プリセット。nullは「解除するまで」。 */
+export interface StatusDuration {
+  label: string;
+  minutes: number | null;
+}
+
+export const STATUS_DURATIONS: StatusDuration[] = [
+  { label: "15分", minutes: 15 },
+  { label: "1時間", minutes: 60 },
+  { label: "8時間", minutes: 8 * 60 },
+  { label: "24時間", minutes: 24 * 60 },
+  { label: "3日間", minutes: 3 * 24 * 60 },
+  { label: "解除するまで", minutes: null },
+];
 
 /**
  * 「後で返信します」の応答予約。相手には返信予定が見え、
@@ -279,10 +303,11 @@ export type ServerEvent =
   | { type: "typing"; place: Place; participant: ParticipantRef }
   | { type: "status_updated"; status: ParticipantStatus }
   /**
-   * 名乗りの変更。statusと同じ参加者スコープで届くが、statusと違って正本は
-   * durableなので、取りこぼしはbootstrapの再読み込みで直る。
+   * 一時ステータスが戻る先を持たずに期限切れになった。「対応可能になった」
+   * ではなく「何も言っていない状態に戻った」——サーバーが代わりに何かを
+   * 名乗ることはしない。
    */
-  | { type: "profile_updated"; profile: MemberProfile }
+  | ({ type: "status_cleared" } & StatusCleared)
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   /**
@@ -366,6 +391,8 @@ export interface MessagingBackend {
     dms: DmSummary[];
     members: MemberProfile[];
     statuses: ParticipantStatus[];
+    /** Empty status wires, split from statuses so UI state remains status-only. */
+    clearedStatuses?: StatusCleared[];
     readMarkers: ReadMarker[];
     unreadSummaries: UnreadSummary[];
     replyLaterMarkers: ReplyLaterMarker[];
@@ -387,11 +414,32 @@ export interface MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary>;
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
-  createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
-  updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
+  createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary>;
+  /**
+   * channelのmutableな身元（名前・トピック）を書き換える。省いた項目は
+   * そのまま残る——名前を変えただけでトピックが消えては困る。
+   */
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<ChannelSummary>;
+  /**
+   * 同じ形（名前・トピック）の空のchannelを新しく作る。中身は複製しない:
+   * メッセージ・既読・通知設定は元のchannelのもの。nameを省くとサーバーが
+   * 既定の名前（「〜 のコピー」）を決める。
+   */
+  duplicateChannel(
+    channelId: string,
+    clientNonce: string,
+    name?: string,
+  ): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /** メッセージより先にbytesを預ける。受領したIDをsendMessageのattachmentsへ。 */
   uploadAttachment(
@@ -410,8 +458,13 @@ export interface MessagingBackend {
    * そのまま使う。scopeが変われば別のURLになる。
    */
   attachmentURL(attachmentId: string): string;
-  editMessage(place: Place, messageId: string, content: string): Promise<void>;
-  deleteMessage(place: Place, messageId: string): Promise<void>;
+  editMessage(
+    place: Place,
+    messageId: string,
+    content: string,
+    expectedRevision: number,
+  ): Promise<Message>;
+  deleteMessage(place: Place, messageId: string): Promise<Message>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
   /**
    * 自己申告のattentionの現在値。status_updatedはvolatileでreplayされず、
@@ -420,19 +473,23 @@ export interface MessagingBackend {
    */
   fetchPresence(): Promise<{
     statuses: ParticipantStatus[];
+    /** Empty status wires, split from statuses so UI state remains status-only. */
+    clearedStatuses?: StatusCleared[];
     replyLaterMarkers: ReplyLaterMarker[];
   }>;
   /**
    * mutationはserverが確定した値を返す。socketが再接続中でも成功ACKだけで
    * 収束できるよう、呼び出し側はこの戻り値を状態に反映する。
    */
-  setStatus(status: StatusKind, note: string): Promise<ParticipantStatus>;
   /**
-   * 自分の名乗りを置き換える。対象は認証されたsession本人で、bodyに参加者を
-   * 載せる余地はない（statusと同じ自己申告の規則）。返すのはサーバーが
-   * 正規化した確定値。
+   * 自分のステータスだけを置き換える。expiresAtを渡すと一時ステータスになり、
+   * 期限で「その前に言っていたこと」へ戻る（サーバーが解決する）。
    */
-  updateProfile(input: ProfileInput): Promise<MemberProfile>;
+  setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null,
+  ): Promise<ParticipantStatus>;
   createReplyLater(
     place: Place,
     messageId: string,

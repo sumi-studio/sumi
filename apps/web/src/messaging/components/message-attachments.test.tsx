@@ -173,6 +173,7 @@ describe("Composer attachments", () => {
         {
           channelId: "ch-general",
           workspaceId: "ws",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",
@@ -201,6 +202,54 @@ describe("Composer attachments", () => {
     expect(await screen.findByTestId("composer-attachments")).toHaveTextContent(
       "picked.txt",
     );
+  });
+
+  it("uses the shared @ autocomplete to insert a selected display name", () => {
+    bindMessagingSessionIdentity("human-self");
+    installMessagingBackend(new MockMessagingServer());
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "self" },
+      selfKey: "human:self",
+      activePlaceKey: "channel:ch-general",
+      channels: [
+        {
+          channelId: "ch-general",
+          workspaceId: "ws",
+          revision: 1,
+          name: "general",
+          topic: "",
+          visibility: "public",
+          voice: false,
+        },
+      ],
+      membersByKey: {
+        "human:self": {
+          participant: { kind: "human", humanId: "self" },
+          displayName: "自分",
+          tagline: "",
+        },
+        "personality_agent:sumi": {
+          participant: {
+            kind: "personality_agent",
+            personalityAgentId: "sumi",
+          },
+          displayName: "墨",
+          tagline: "秘書",
+        },
+      },
+      draftByPlace: { "channel:ch-general": "" },
+      messagesByPlace: { "channel:ch-general": [] },
+    });
+    render(<Composer />);
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "@" } });
+    const suggestions = screen.getByTestId("mention-suggestions");
+    fireEvent.mouseDown(screen.getByRole("button", { name: /墨 秘書/ }));
+
+    expect(textarea).toHaveValue("@墨 ");
+    expect(suggestions).not.toBeInTheDocument();
   });
 });
 
@@ -414,6 +463,7 @@ describe("Composer attachment cards", () => {
           {
             channelId: "ch-general",
             workspaceId: "ws",
+            revision: 1,
             name: "general",
             topic: "",
             visibility: "public",

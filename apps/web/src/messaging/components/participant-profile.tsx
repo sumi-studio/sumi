@@ -89,7 +89,6 @@ function ParticipantProfileCard({
           name={member.displayName}
           size={48}
           status={status?.status}
-          src={member.avatarUrl}
         />
         <div className="min-w-0 flex-1 pt-0.5">
           <p className="truncate font-semibold text-[15px]">

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 const testOrigin = "https://app.sumi.test"
@@ -237,6 +238,32 @@ func TestMessagingJSONTrailingGarbageReturnsInvalidJSONBeforeMutation(t *testing
 	}
 }
 
+func TestEditPatchRejectsStaleRevision(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "編集前")
+	path := "/messaging/places/" + ch.PlaceID + "/messages/" + msg.MessageID
+
+	response, _ := call(t, ts, http.MethodPatch, path, w.humanA.ID, map[string]any{
+		"content": "先に保存された本文", "revision": 1,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("first PATCH: status %d, want 200", response.StatusCode)
+	}
+	response, body := call(t, ts, http.MethodPatch, path, w.humanA.ID, map[string]any{
+		"content": "古い書きかけ", "revision": 1,
+	})
+	if response.StatusCode != http.StatusConflict || body["error"] != "edit_conflict" {
+		t.Fatalf("stale PATCH: status %d body %v, want 409 edit_conflict", response.StatusCode, body)
+	}
+	current, ok := body["message"].(map[string]any)
+	if !ok || current["content"] != "先に保存された本文" || current["revision"] != float64(2) || current["edited_at"] == nil {
+		t.Fatalf("stale PATCH must return the current message: %v", body)
+	}
+}
+
 func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -244,6 +271,12 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	_, ch := w.workspaceWithChannel(t, ctx)
 	if _, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent); err != nil {
 		t.Fatalf("ensure dm: %v", err)
+	}
+	tagline := "開発"
+	if _, err := koseki.New(w.store.pool).UpdateHumanProfile(
+		ctx, w.humanA.ID, nil, &tagline,
+	); err != nil {
+		t.Fatalf("set profile: %v", err)
 	}
 	w.send(t, ctx, ch.PlaceID, w.humanB, "@Yohaku 見て")
 
@@ -267,11 +300,18 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	}
 	// Everyone in the workspace appears once with a display name.
 	members := body["members"].([]any)
-	names := map[string]bool{}
+	names := map[string]string{}
 	for _, m := range members {
-		names[m.(map[string]any)["display_name"].(string)] = true
+		member := m.(map[string]any)
+		names[member["display_name"].(string)] = member["tagline"].(string)
 	}
-	if !names["Yohaku"] || !names["Haru"] || !names["Kuro"] {
+	if names["Yohaku"] != tagline {
+		t.Fatalf("Human tagline = %q, members %v", names["Yohaku"], members)
+	}
+	if _, ok := names["Haru"]; !ok {
+		t.Fatalf("Haru missing: %v", members)
+	}
+	if _, ok := names["Kuro"]; !ok {
 		t.Fatalf("members missing display names: %v", members)
 	}
 	// The channel has one unread mention for the viewer.
@@ -374,27 +414,39 @@ func TestEditAndDeleteMapAuthorizationOverHTTP(t *testing.T) {
 	msg := w.send(t, ctx, ch.PlaceID, w.humanB, "元の本文")
 
 	base := "/messaging/places/" + ch.PlaceID + "/messages/" + msg.MessageID
-	resp, body := call(t, ts, http.MethodPatch, base, w.humanA.ID, map[string]any{"content": "書き換え"})
+	resp, body := call(t, ts, http.MethodPatch, base, w.humanA.ID, map[string]any{"content": "書き換え", "revision": 1})
 	if resp.StatusCode != http.StatusForbidden || body["error"] != "not_author" {
 		t.Fatalf("non-author edit: status %d body %v", resp.StatusCode, body)
 	}
-	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "本人の編集"})
+	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "本人の編集", "revision": 1})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("author edit: status %d body %v", resp.StatusCode, body)
 	}
 	if body["message"].(map[string]any)["content"] != "本人の編集" {
 		t.Fatalf("edited message = %v", body["message"])
 	}
+	if body["message"].(map[string]any)["revision"] != float64(2) {
+		t.Fatalf("edited message revision = %v, want 2", body["message"])
+	}
 
 	// Owner (humanA) deletes another's message in a channel.
-	resp, _ = call(t, ts, http.MethodDelete, base, w.humanA.ID, nil)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("owner delete: status %d", resp.StatusCode)
+	resp, body = call(t, ts, http.MethodDelete, base, w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("owner delete: status %d body %v", resp.StatusCode, body)
 	}
-	// Editing the tombstone conflicts.
-	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "復活"})
+	deleted, ok := body["message"].(map[string]any)
+	if !ok || deleted["revision"] != float64(3) || deleted["deleted"] != true {
+		t.Fatalf("deleted message = %v, want revision 3 tombstone", body)
+	}
+	// Editing the tombstone conflicts, and returns the terminal revision so a
+	// disconnected client can project it without waiting for a WS replay.
+	resp, body = call(t, ts, http.MethodPatch, base, w.humanB.ID, map[string]any{"content": "復活", "revision": 2})
 	if resp.StatusCode != http.StatusConflict || body["error"] != "message_deleted" {
 		t.Fatalf("edit tombstone: status %d body %v", resp.StatusCode, body)
+	}
+	terminal, ok := body["message"].(map[string]any)
+	if !ok || terminal["revision"] != float64(3) || terminal["deleted"] != true {
+		t.Fatalf("edit tombstone response = %v, want revision 3 tombstone", body)
 	}
 }
 
@@ -439,7 +491,7 @@ func TestChannelTopicPatchOverHTTP(t *testing.T) {
 	ws, _ := w.workspaceWithChannel(t, ctx)
 
 	resp, body := call(t, ts, http.MethodPost, "/messaging/channels", w.humanA.ID,
-		map[string]any{"workspace_id": ws.WorkspaceID, "name": "design", "topic": "デザインの話"})
+		map[string]any{"workspace_id": ws.WorkspaceID, "name": "design", "topic": "デザインの話", "client_nonce": "http-create-design"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create channel: status %d body %v", resp.StatusCode, body)
 	}
