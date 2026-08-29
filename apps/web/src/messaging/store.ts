@@ -201,32 +201,45 @@ const presentedMessageNotifications = new Set<string>();
  * message is installed; otherwise the later rev0 snapshot would permanently
  * erase a vote state that the server will not replay.
  */
-const orphanPollProjectionsByPlace = new Map<
-  PlaceKey,
-  Map<string, MessagePoll>
->();
+const ORPHAN_POLL_PROJECTION_LIMIT = 256;
+interface OrphanPollProjection {
+  placeKey: PlaceKey;
+  messageId: string;
+  poll: MessagePoll;
+}
+const orphanPollProjections = new Map<string, OrphanPollProjection>();
+
+function orphanPollProjectionKey(key: PlaceKey, messageId: string): string {
+  return JSON.stringify([key, messageId]);
+}
 
 function rememberOrphanPollProjection(
   key: PlaceKey,
   messageId: string,
   poll: MessagePoll,
 ): void {
-  let projections = orphanPollProjectionsByPlace.get(key);
-  if (!projections) {
-    projections = new Map();
-    orphanPollProjectionsByPlace.set(key, projections);
-  }
-  const current = projections.get(messageId);
-  if (!current || poll.revision > current.revision) {
-    projections.set(messageId, poll);
+  const journalKey = orphanPollProjectionKey(key, messageId);
+  const current = orphanPollProjections.get(journalKey);
+  if (current && poll.revision <= current.poll.revision) return;
+  // Map order is the recency journal. A newer revision refreshes the key so a
+  // repeatedly active poll is not evicted ahead of older untouched entries.
+  orphanPollProjections.delete(journalKey);
+  orphanPollProjections.set(journalKey, { placeKey: key, messageId, poll });
+  while (orphanPollProjections.size > ORPHAN_POLL_PROJECTION_LIMIT) {
+    const oldest = orphanPollProjections.keys().next().value;
+    if (oldest === undefined) break;
+    orphanPollProjections.delete(oldest);
   }
 }
 
 function discardOrphanPollProjection(key: PlaceKey, messageId: string): void {
-  const projections = orphanPollProjectionsByPlace.get(key);
-  if (!projections) return;
-  projections.delete(messageId);
-  if (projections.size === 0) orphanPollProjectionsByPlace.delete(key);
+  orphanPollProjections.delete(orphanPollProjectionKey(key, messageId));
+}
+
+function discardOrphanPollProjectionsForPlace(key: PlaceKey): void {
+  for (const [journalKey, projection] of orphanPollProjections) {
+    if (projection.placeKey === key) orphanPollProjections.delete(journalKey);
+  }
 }
 
 function upsertMessageWithOrphanPoll(
@@ -235,7 +248,9 @@ function upsertMessageWithOrphanPoll(
   incoming: Message,
   payload: MessagePayloadKind,
 ): Message[] {
-  const orphan = orphanPollProjectionsByPlace.get(key)?.get(incoming.messageId);
+  const orphan = orphanPollProjections.get(
+    orphanPollProjectionKey(key, incoming.messageId),
+  )?.poll;
   const projected =
     orphan && !incoming.deleted
       ? { ...incoming, poll: applyPollRevision(incoming.poll, orphan) }
@@ -2315,7 +2330,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // A reopened place needs a fresh coordinator. An old pending mutation or
     // resync must not settle into the new timeline after release.
     reactionProjectionByPlace.delete(key);
-    orphanPollProjectionsByPlace.delete(key);
+    discardOrphanPollProjectionsForPlace(key);
     if (place) backend.releasePlace?.(place);
     set((state) => {
       if (
@@ -2762,7 +2777,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       threadSummaryRefreshes.clear();
       threadListLoads.clear();
       pollVoteQueues.clear();
-      orphanPollProjectionsByPlace.clear();
+      orphanPollProjections.clear();
       heldPlaces.clear();
       placeHoldGenerations.clear();
       knownLatestSeq.clear();
@@ -4271,7 +4286,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
   placeCreationAttempts.authorityReplaced();
   reactionProjectionByPlace.clear();
-  orphanPollProjectionsByPlace.clear();
+  orphanPollProjections.clear();
   presentedMessageNotifications.clear();
   releaseAllDraftFiles();
   backend.dispose();

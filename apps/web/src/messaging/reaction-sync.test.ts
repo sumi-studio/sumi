@@ -1136,6 +1136,97 @@ describe("poll convergence in the messaging store", () => {
     ).toEqual(newest);
   });
 
+  it("bounds orphan polls globally and evicts the oldest untouched key", async () => {
+    const harness = new StubBackend();
+    harness.holdFetches = true;
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const secondPlace = { kind: "channel", channelId: "channel-2" } as const;
+    const secondPlaceKey = "channel:channel-2" as const;
+    const firstChannel = useMessaging.getState().channels[0];
+    if (!firstChannel) throw new Error("channel fixture missing");
+    useMessaging.setState((state) => ({
+      channels: [
+        ...state.channels,
+        { ...firstChannel, channelId: secondPlace.channelId, name: "other" },
+      ],
+    }));
+    useMessaging.getState().selectPlace(placeKey);
+    useMessaging.getState().selectPlace(secondPlaceKey);
+    await harness.settle();
+    expect(harness.heldFetchCount).toBe(2);
+
+    const orphanMessage = (targetPlace: Place, index: number): Message => ({
+      ...pollMessage(0),
+      messageId: `orphan-poll-${index}`,
+      place: targetPlace,
+      seq: index,
+    });
+    const emitOrphan = (
+      targetPlace: Place,
+      index: number,
+      revision: number,
+      voters: Message["author"][] = [],
+    ) => {
+      const target = orphanMessage(targetPlace, index);
+      harness.emit({
+        type: "poll_updated",
+        place: targetPlace,
+        messageId: target.messageId,
+        poll: {
+          ...requiredPoll(target),
+          revision,
+          options: [
+            { optionId: "a", text: "A", voters },
+            { optionId: "b", text: "B", voters: [] },
+          ],
+        },
+      });
+    };
+
+    // Fill one 256-entry journal from two held places. Refreshing key 1 moves
+    // it to the newest end; a stale revision neither replaces nor refreshes it.
+    for (let index = 1; index <= 128; index += 1) {
+      emitOrphan(place, index, 1);
+    }
+    for (let index = 129; index <= 256; index += 1) {
+      emitOrphan(secondPlace, index, 1);
+    }
+    emitOrphan(place, 1, 2, [other]);
+    emitOrphan(place, 1, 1, [self]);
+    emitOrphan(secondPlace, 257, 1, [self]);
+
+    const refreshed = orphanMessage(place, 1);
+    const evicted = orphanMessage(place, 2);
+    const newest = orphanMessage(secondPlace, 257);
+    for (const message of [refreshed, evicted, newest]) {
+      harness.emit({ type: "message_created", message, notify: null });
+    }
+
+    const state = useMessaging.getState();
+    const projected = state.messagesByPlace[placeKey] ?? [];
+    expect(
+      projected.find((message) => message.messageId === refreshed.messageId)
+        ?.poll,
+    ).toMatchObject({
+      revision: 2,
+      options: [{ voters: [other] }, { voters: [] }],
+    });
+    expect(
+      projected.find((message) => message.messageId === evicted.messageId)?.poll
+        ?.revision,
+    ).toBe(0);
+    expect(
+      state.messagesByPlace[secondPlaceKey]?.find(
+        (message) => message.messageId === newest.messageId,
+      )?.poll?.revision,
+    ).toBe(1);
+
+    harness.releaseFetches();
+    await harness.settle();
+  });
+
   it("discards orphan poll projections when a watch-only place is released", async () => {
     const harness = new StubBackend();
     installMessagingBackend(harness);
