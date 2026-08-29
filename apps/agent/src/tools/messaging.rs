@@ -24,8 +24,8 @@ use crate::{
     apiclient::messaging::{
         CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
         CreateMessagingThreadRequest, DuplicateMessagingChannelRequest, ExactMessagingScope,
-        GetMessagingCallStateRequest, ListMessagingThreadsRequest,
-        MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
+        MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
         MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
         OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
         ReactMessagingReactionRequest, ReadMessagingThroughRequest,
@@ -5070,6 +5070,8 @@ mod tests {
             json!([
                 "overview",
                 "open",
+                "threads",
+                "create_thread",
                 "write",
                 "open_attachment",
                 "react",
@@ -6265,7 +6267,7 @@ mod tests {
         let create_thread = bind_action(
             &registry,
             "create-thread",
-            json!({"action": "create_thread", "name": "認証", "seq": 7}),
+            json!({"action": "create_thread", "name": "  認証  ", "seq": 7}),
         )
         .await
         .expect("bind thread creation from a visible message");
@@ -6279,6 +6281,11 @@ mod tests {
             create_thread.execution_arguments.as_object()["parent_message_id"],
             "message-7"
         );
+        assert_eq!(
+            create_thread.execution_arguments.as_object()["name"],
+            "認証"
+        );
+        assert_eq!(create_thread.review_projection.as_object()["name"], "認証");
 
         let write = bind_action(
             &registry,

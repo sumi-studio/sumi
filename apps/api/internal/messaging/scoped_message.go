@@ -423,6 +423,9 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		if err := s.joinThreadParticipants(ctx, tx, place.PlaceID, actorMembership, mentions); err != nil {
 			return Message{}, err
 		}
+		if err := bumpThreadProjectionRevision(ctx, tx, s.Scope.WorkspaceID, place.PlaceID); err != nil {
+			return Message{}, err
+		}
 	}
 	message.Content, message.Mentions, message.EditedAt = content, mentions, &editedAt
 	parts := []Message{message}
@@ -507,11 +510,32 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 			return Message{}, fmt.Errorf("clear tombstone projection: %w", err)
 		}
 	}
+	if place.Kind == PlaceThread {
+		if err := bumpThreadProjectionRevision(ctx, tx, s.Scope.WorkspaceID, place.PlaceID); err != nil {
+			return Message{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped delete: %w", err)
 	}
 	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Deleted = "", nil, nil, nil, true
 	return message, nil
+}
+
+// Message append already advances a place by updating last_seq, whose trigger
+// increments its projection revision. Edits and tombstones do not allocate a
+// sequence, but they still change a thread summary (preview, count, activity,
+// or participants). Touch the thread place exactly once in their transaction
+// so clients can reject old summaries without rejecting the new projection.
+func bumpThreadProjectionRevision(ctx context.Context, tx pgx.Tx, workspaceID, placeID string) error {
+	var revision int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE places SET revision = revision
+		WHERE workspace_id = $1 AND place_id = $2 AND kind = 'thread'
+		RETURNING revision`, workspaceID, placeID).Scan(&revision); err != nil {
+		return fmt.Errorf("advance thread projection revision: %w", err)
+	}
+	return nil
 }
 
 type messageDeletePreflight struct {

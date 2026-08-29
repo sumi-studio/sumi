@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "./api-backend";
 import type {
   ChannelSummary,
   ConnectionState,
@@ -7,6 +8,7 @@ import type {
   MessagingBackend,
   Place,
   PlaceKey,
+  ReactionMutationResult,
   SendMessageInput,
   SendReceipt,
   ServerEvent,
@@ -84,6 +86,16 @@ function threadMessage(threadId: string, seq: number): Message {
     editedAt: null,
     deleted: false,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function snapshot(options: {
@@ -215,7 +227,7 @@ class FakeBackend implements MessagingBackend {
   async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
     throw new Error("unused");
   }
-  async markRead() {}
+  markRead = vi.fn(async () => undefined);
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
   }
@@ -225,7 +237,7 @@ class FakeBackend implements MessagingBackend {
   async resolveReplyLater(): ReturnType<MessagingBackend["resolveReplyLater"]> {
     throw new Error("unused");
   }
-  async toggleReaction() {
+  async toggleReaction(): Promise<ReactionMutationResult> {
     return { messageId: "unused", reactions: [] };
   }
   async setNotificationSetting(): ReturnType<
@@ -395,6 +407,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     let resolveFetch!: (summary: ThreadSummary) => void;
     const fresh = {
       ...stale,
+      revision: 3,
       messageCount: 3,
       latestSeq: 3,
       lastMessageAt: 3,
@@ -431,12 +444,38 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(backend.fetchThread).toHaveBeenCalledTimes(2);
   });
 
+  it("未知threadのstale hydrate後のauthoritative refresh失敗をloadingのままにしない", async () => {
+    const stale = thread("thread-hydration-refresh-failure");
+    const initial = deferred<ThreadSummary>();
+    backend.fetchThread
+      .mockReturnValueOnce(initial.promise)
+      .mockRejectedValueOnce(new Error("authoritative refresh failed"))
+      .mockRejectedValue(new Error("retry refresh failed"));
+
+    const loading = useMessaging.getState().loadThread(stale.threadId);
+    backend.emit({
+      type: "message_created",
+      message: threadMessage(stale.threadId, 2),
+      notify: null,
+    });
+    await settle();
+    initial.resolve(stale);
+
+    await expect(loading).resolves.toBe(false);
+    await settle();
+    expect(useMessaging.getState().threadsById[stale.threadId]).toBeUndefined();
+    expect(useMessaging.getState().threadLoadErrorsById[stale.threadId]).toBe(
+      "failed",
+    );
+  });
+
   it("重複したthread message_createdを一度の権威あるsummary取得に合流する", async () => {
     const known = thread("thread-known");
     useMessaging.setState({ threadsById: { [known.threadId]: known } });
     const incoming = threadMessage(known.threadId, 2);
     const aggregate = {
       ...known,
+      revision: 2,
       messageCount: known.messageCount + 1,
       latestSeq: incoming.seq,
       lastMessageAt: incoming.createdAt,
@@ -482,6 +521,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const mentioned = { kind: "human", humanId: "human-c" } as const;
     const aggregate = {
       ...known,
+      revision: 3,
       messageCount: 3,
       latestSeq: 3,
       lastMessageAt: 3,
@@ -511,6 +551,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const stale = thread("thread-late-create");
     const fresh = {
       ...stale,
+      revision: 2,
       messageCount: 2,
       latestSeq: 2,
       lastMessageAt: 2,
@@ -544,6 +585,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const stale = thread("thread-create-response-race");
     const fresh = {
       ...stale,
+      revision: 2,
       messageCount: 2,
       latestSeq: 2,
       lastMessageAt: 2,
@@ -560,11 +602,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
 
     const creating = useMessaging
       .getState()
-      .createThread(
-        CHANNEL_1,
-        stale.name,
-        stale.parentMessageId,
-      );
+      .createThread(CHANNEL_1, stale.name, stale.parentMessageId);
     backend.emit({
       type: "message_created",
       message: threadMessage(stale.threadId, 2),
@@ -582,6 +620,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const stale = thread("thread-reconnect-bootstrap-race");
     const fresh = {
       ...stale,
+      revision: 2,
       messageCount: 2,
       latestSeq: 2,
       lastMessageAt: 2,
@@ -624,6 +663,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const stale = thread("thread-refresh-retry");
     const fresh = {
       ...stale,
+      revision: 2,
       messageCount: 2,
       latestSeq: 2,
       lastMessageAt: 2,
@@ -657,6 +697,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const other = thread("thread-other");
     const fresh = {
       ...raced,
+      revision: 2,
       messageCount: 2,
       latestSeq: 5,
       lastMessageAt: 5,
@@ -727,6 +768,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     const known = thread("thread-ack-only");
     const refreshed = {
       ...known,
+      revision: 2,
       messageCount: 2,
       latestSeq: 2,
       lastMessageAt: 2,
@@ -777,6 +819,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
       threads: [
         {
           ...known,
+          revision: 2,
           messageCount: known.messageCount + 1,
           latestSeq: incoming.seq,
           lastMessageAt: incoming.createdAt,
@@ -813,6 +856,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
       threads: [
         {
           ...known,
+          revision: 2,
           messageCount: 1,
           latestSeq: tombstone.seq,
           lastMessageAt: null,
@@ -1054,6 +1098,180 @@ describe("place lifecycleの再接続突き合わせ", () => {
     // A late completion must not call holdPlace again, which is the path that
     // registers this place in the next hello cursor collection.
     expect(backend.cursorCalls).toEqual(cursorsBeforeResponse);
+  });
+
+  it("watch-only thread release後の遅いedit success/409が履歴を復活させない", async () => {
+    for (const disposition of ["success", "conflict"] as const) {
+      const visiting: ThreadSummary = {
+        ...thread(`thread-late-edit-${disposition}`),
+        participants: [OTHER],
+      };
+      const key = `thread:${visiting.threadId}` as PlaceKey;
+      const target: Message = {
+        ...threadMessage(visiting.threadId, 1),
+        author: SELF,
+        content: "R",
+        mentions: [],
+        revision: 1,
+      };
+      const response = deferred<Message>();
+      backend.editMessage = vi.fn(async () => response.promise);
+      backend.fetchMessages.mockResolvedValueOnce([target]);
+      useMessaging.setState({ threadsById: { [visiting.threadId]: visiting } });
+
+      useMessaging.getState().selectPlace(key);
+      await settle();
+      useMessaging.getState().startEdit(target.messageId);
+      useMessaging.getState().setEditDraft("R+1");
+      useMessaging.getState().submitEdit();
+      useMessaging.getState().clearPlaceSelection();
+
+      const committed = { ...target, content: "R+1", revision: 2 };
+      if (disposition === "success") {
+        response.resolve(committed);
+      } else {
+        const conflict = new MessagingAPIError("edit_conflict", 409);
+        Object.defineProperty(conflict, "currentMessage", {
+          value: committed,
+        });
+        response.reject(conflict);
+      }
+      await settle();
+      expect(useMessaging.getState().messagesByPlace[key]).toBeUndefined();
+    }
+  });
+
+  it("reopened watch-only thread accepts a useful old edit ACK without rolling back a newer page", async () => {
+    for (const reopenedRevision of [1, 3]) {
+      const visiting: ThreadSummary = {
+        ...thread(`thread-reopened-edit-${reopenedRevision}`),
+        participants: [OTHER],
+      };
+      const key = `thread:${visiting.threadId}` as PlaceKey;
+      const target: Message = {
+        ...threadMessage(visiting.threadId, 1),
+        author: SELF,
+        content: "R",
+        mentions: [],
+        revision: 1,
+      };
+      const response = deferred<Message>();
+      backend.editMessage = vi.fn(async () => response.promise);
+      backend.fetchMessages
+        .mockResolvedValueOnce([target])
+        .mockResolvedValueOnce([
+          reopenedRevision === 1
+            ? target
+            : { ...target, content: "R+2", revision: reopenedRevision },
+        ]);
+      useMessaging.setState({ threadsById: { [visiting.threadId]: visiting } });
+
+      useMessaging.getState().selectPlace(key);
+      await settle();
+      useMessaging.getState().startEdit(target.messageId);
+      useMessaging.getState().setEditDraft("R+1");
+      useMessaging.getState().submitEdit();
+      useMessaging.getState().clearPlaceSelection();
+      useMessaging.getState().selectPlace(key);
+      await settle();
+
+      response.resolve({ ...target, content: "R+1", revision: 2 });
+      await settle();
+      expect(useMessaging.getState().messagesByPlace[key]?.[0]).toMatchObject(
+        reopenedRevision === 1
+          ? { content: "R+1", revision: 2 }
+          : { content: "R+2", revision: 3 },
+      );
+      useMessaging.getState().clearPlaceSelection();
+    }
+  });
+
+  it("release後の遅いread observerは未読もcursorも変更しない", async () => {
+    const visiting: ThreadSummary = {
+      ...thread("thread-late-read"),
+      participants: [OTHER],
+    };
+    const key = `thread:${visiting.threadId}` as PlaceKey;
+    backend.fetchMessages.mockResolvedValueOnce([
+      threadMessage(visiting.threadId, 2),
+    ]);
+    useMessaging.setState({
+      threadsById: { [visiting.threadId]: visiting },
+      lastReadByPlace: { [key]: 1 },
+      unreadCountByPlace: { [key]: 1 },
+      mentionCountByPlace: { [key]: 1 },
+    });
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    useMessaging.getState().clearPlaceSelection();
+    backend.markRead.mockClear();
+
+    useMessaging.getState().noteReadUpTo(key, 2);
+
+    expect(useMessaging.getState().lastReadByPlace[key]).toBe(1);
+    expect(useMessaging.getState().unreadCountByPlace[key]).toBe(1);
+    expect(useMessaging.getState().mentionCountByPlace[key]).toBe(1);
+    expect(backend.markRead).not.toHaveBeenCalled();
+  });
+
+  it("release/reopen後に古いreaction ACKやresyncを新しいsnapshotへ適用しない", async () => {
+    const visiting: ThreadSummary = {
+      ...thread("thread-old-reaction-projection"),
+      participants: [OTHER],
+    };
+    const key = `thread:${visiting.threadId}` as PlaceKey;
+    const target: Message = {
+      ...threadMessage(visiting.threadId, 1),
+      reactions: [],
+    };
+    const newer: Message = {
+      ...target,
+      reactions: [{ emoji: "🎉", participants: [OTHER] }],
+    };
+    const toggle = deferred<ReactionMutationResult>();
+    backend.toggleReaction = vi.fn(async () => toggle.promise);
+    backend.fetchMessages
+      .mockResolvedValueOnce([target])
+      .mockResolvedValueOnce([newer]);
+    useMessaging.setState({ threadsById: { [visiting.threadId]: visiting } });
+
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    useMessaging.getState().toggleReaction(target, "👍");
+    useMessaging.getState().clearPlaceSelection();
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    toggle.resolve({
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [SELF] }],
+    });
+    await settle();
+    expect(
+      useMessaging.getState().messagesByPlace[key]?.[0]?.reactions,
+    ).toEqual(newer.reactions);
+
+    const resync = deferred<Message[]>();
+    backend.fetchMessages
+      .mockReturnValueOnce(resync.promise)
+      .mockResolvedValueOnce([newer]);
+    backend.emit({
+      type: "caught_up",
+      place: { kind: "thread", threadId: visiting.threadId },
+    });
+    await settle();
+    useMessaging.getState().clearPlaceSelection();
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    resync.resolve([
+      {
+        ...target,
+        reactions: [{ emoji: "👀", participants: [SELF] }],
+      },
+    ]);
+    await settle();
+    expect(
+      useMessaging.getState().messagesByPlace[key]?.[0]?.reactions,
+    ).toEqual(newer.reactions);
   });
 
   it("activeなplaceの履歴取得失敗も保持とcursorをまとめて手放す", async () => {

@@ -199,7 +199,7 @@ describe("ThreadPanel", () => {
     expect(createToggle).toHaveFocus();
   });
 
-  it("retries with one nonce while blocking duplicate Enter submissions", async () => {
+  it("retries one store-owned gesture while blocking duplicate Enter submissions", async () => {
     state.threadsLoadedForPlace[PARENT_KEY] = true;
     let resolveCreate: ((key: string) => void) | undefined;
     mocks.createThread
@@ -227,13 +227,16 @@ describe("ThreadPanel", () => {
         "スレッドを作成できませんでした",
       ),
     );
-    const firstNonce = mocks.createThread.mock.calls[0]?.[3];
     expect(Array.from((input as HTMLInputElement).value)).toHaveLength(100);
 
     fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.createThread).toHaveBeenCalledTimes(2);
-    expect(mocks.createThread.mock.calls[1]?.[3]).toBe(firstNonce);
+    expect(mocks.createThread).toHaveBeenLastCalledWith(
+      PARENT_KEY,
+      "😀".repeat(100),
+      null,
+    );
 
     await act(async () => resolveCreate?.("thread:thread-1"));
     expect(mocks.navigate).toHaveBeenCalledWith("thread:thread-1");

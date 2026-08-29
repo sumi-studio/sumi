@@ -107,7 +107,7 @@ describe("MessageThreadAction", () => {
     );
   });
 
-  it("ignores IME Enter and retries with the same input and nonce", async () => {
+  it("ignores IME Enter and retries with the same input", async () => {
     mocks.createThread
       .mockRejectedValueOnce(new Error("temporary"))
       .mockResolvedValueOnce("thread:thread-1");
@@ -127,14 +127,16 @@ describe("MessageThreadAction", () => {
       ),
     );
     expect(input).toHaveValue("認証リダイレクト");
-    const firstNonce = mocks.createThread.mock.calls[0]?.[3];
-
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() =>
       expect(mocks.navigate).toHaveBeenCalledWith("thread:thread-1"),
     );
     expect(mocks.createThread).toHaveBeenCalledTimes(2);
-    expect(mocks.createThread.mock.calls[1]?.[3]).toBe(firstNonce);
+    expect(mocks.createThread).toHaveBeenLastCalledWith(
+      "channel:channel-1",
+      "認証リダイレクト",
+      message.messageId,
+    );
   });
 
   it("blocks duplicate submissions and clamps names by Unicode code point", async () => {

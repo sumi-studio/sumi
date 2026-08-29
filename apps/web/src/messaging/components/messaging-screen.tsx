@@ -61,6 +61,7 @@ interface PendingJumpTarget {
 
 interface PendingJump extends PendingJumpTarget {
   transportGeneration: number;
+  routeObserved: boolean;
 }
 
 interface ViewingImage {
@@ -446,6 +447,21 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   // 隠すのではなくcurrent placeを解除し、通知判定や編集状態にも同じ現在地を渡す。
   useLayoutEffect(() => {
     if (!ready) return;
+    if (
+      pendingJump &&
+      placeKey === pendingJump.placeKey &&
+      !pendingJump.routeObserved
+    ) {
+      setPendingJump({ ...pendingJump, routeObserved: true });
+    } else if (
+      pendingJump?.routeObserved &&
+      placeKey !== pendingJump.placeKey
+    ) {
+      // Once the target URL was actually observed, a later raw route is an
+      // explicit navigation away. Do not retain the old hit until a future
+      // ordinary visit to that thread.
+      setPendingJump(null);
+    }
     if (!selectedPlaceKey) {
       clearPlaceSelection();
       const pendingThreadKey = requestedThreadId
@@ -463,9 +479,6 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       }
       return;
     }
-    if (pendingJump && pendingJump.placeKey !== selectedPlaceKey) {
-      setPendingJump(null);
-    }
     if (selectedPlaceKey !== activePlaceKey) selectPlace(selectedPlaceKey);
   }, [
     ready,
@@ -476,10 +489,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     requestedThreadId,
     threadLoadError,
     pendingJump,
+    placeKey,
   ]);
 
   useEffect(() => {
-    setPendingJump(null);
+    setPendingJump((pending) =>
+      pending?.transportGeneration === transportGeneration ? pending : null,
+    );
   }, [transportGeneration]);
 
   useEffect(() => {
@@ -526,7 +542,12 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     const rawSeq = params.get("m");
     const seq = rawSeq === null ? null : Number(rawSeq);
     if (seq !== null && Number.isSafeInteger(seq) && seq > 0) {
-      setPendingJump({ placeKey, seq, transportGeneration });
+      setPendingJump({
+        placeKey,
+        seq,
+        transportGeneration,
+        routeObserved: true,
+      });
       window.history.replaceState(null, "", window.location.pathname);
     }
   }, [ready, placeKey, transportGeneration]);
@@ -534,9 +555,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const requestJump = useCallback(
     (jump: PendingJumpTarget) => {
       placeNavigate(jump.placeKey);
-      setPendingJump({ ...jump, transportGeneration });
+      setPendingJump({
+        ...jump,
+        transportGeneration,
+        routeObserved: placeKey === jump.placeKey,
+      });
     },
-    [placeNavigate, transportGeneration],
+    [placeNavigate, placeKey, transportGeneration],
   );
 
   // Route selection creates a history hold synchronously. A jump to an old

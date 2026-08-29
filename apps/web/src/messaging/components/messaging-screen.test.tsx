@@ -14,7 +14,13 @@ import type { PlaceKey } from "../model";
 import { bindMessagingSessionIdentity, useMessaging } from "../store";
 import { MessagingScreen } from "./messaging-screen";
 
-const mocks = vi.hoisted(() => ({ placeNavigate: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  placeNavigate: vi.fn(),
+  jump: { placeKey: "channel:channel-b", seq: 1 } as {
+    placeKey: PlaceKey;
+    seq: number;
+  },
+}));
 
 vi.mock("../../shell/app-rail", () => ({
   AppRail: () => <div data-testid="app-rail" />,
@@ -26,10 +32,7 @@ vi.mock("../place-route", () => ({
 
 vi.mock("./message-search", () => ({
   MessageSearch: ({ onJump }: { onJump: (jump: unknown) => void }) => (
-    <button
-      type="button"
-      onClick={() => onJump({ placeKey: CHANNEL_B, seq: 1 })}
-    >
+    <button type="button" onClick={() => onJump(mocks.jump)}>
       jump to old result
     </button>
   ),
@@ -124,6 +127,7 @@ describe("MessagingScreen route-owned current place", () => {
   beforeEach(() => {
     bindMessagingSessionIdentity(null);
     bindMessagingSessionIdentity("human-a");
+    mocks.jump = { placeKey: CHANNEL_B, seq: 1 };
     seedCurrentPlace();
   });
 
@@ -196,6 +200,113 @@ describe("MessagingScreen route-owned current place", () => {
     view.rerender(<MessagingScreen placeKey={CHANNEL_B} />);
     expect(useMessaging.getState().activePlaceKey).toBe(CHANNEL_B);
     expect(loadPlaceAround).toHaveBeenCalledWith(CHANNEL_B, 1);
+  });
+
+  it("hydrates an unknown thread hit before loading its old message", async () => {
+    const target = "thread:thread-search-hit" as PlaceKey;
+    mocks.jump = { placeKey: target, seq: 7 };
+    const loadPlaceAround = vi.fn();
+    let resolveLoad!: (loaded: boolean) => void;
+    const loadThread = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    useMessaging.setState({
+      capabilities: {
+        status: false,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+        threads: true,
+      },
+      loadPlaceAround,
+      loadThread,
+    });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    view.rerender(<MessagingScreen placeKey={target} />);
+    expect(loadPlaceAround).not.toHaveBeenCalled();
+
+    useMessaging.setState({
+      threadsById: {
+        "thread-search-hit": {
+          threadId: "thread-search-hit",
+          revision: 1,
+          parentPlace: { kind: "channel", channelId: "channel-a" },
+          parentMessageId: null,
+          workspaceId: "workspace-a",
+          name: "検索から開いた枝",
+          messageCount: 7,
+          lastMessageAt: null,
+          lastMessage: "",
+          participants: [],
+          latestSeq: 7,
+        },
+      },
+    });
+    await act(async () => resolveLoad(true));
+
+    await waitFor(() =>
+      expect(useMessaging.getState().activePlaceKey).toBe(target),
+    );
+    expect(loadPlaceAround).toHaveBeenCalledWith(target, 7);
+  });
+
+  it("cancels an observed unknown-thread jump after navigating away", async () => {
+    const target = "thread:thread-delayed-hit" as PlaceKey;
+    mocks.jump = { placeKey: target, seq: 9 };
+    const loadPlaceAround = vi.fn();
+    let resolveLoad!: (loaded: boolean) => void;
+    const loadThread = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    useMessaging.setState({
+      capabilities: {
+        status: false,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+        threads: true,
+      },
+      loadPlaceAround,
+      loadThread,
+    });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    view.rerender(<MessagingScreen placeKey={target} />);
+    expect(loadThread).toHaveBeenCalledWith("thread-delayed-hit");
+
+    view.rerender(<MessagingScreen placeKey={CHANNEL_A} />);
+    useMessaging.setState({
+      threadsById: {
+        "thread-delayed-hit": {
+          threadId: "thread-delayed-hit",
+          revision: 1,
+          parentPlace: { kind: "channel", channelId: "channel-a" },
+          parentMessageId: null,
+          workspaceId: "workspace-a",
+          name: "遅れて解決した枝",
+          messageCount: 9,
+          lastMessageAt: null,
+          lastMessage: "",
+          participants: [],
+          latestSeq: 9,
+        },
+      },
+    });
+    await act(async () => resolveLoad(true));
+    view.rerender(<MessagingScreen placeKey={target} />);
+
+    await waitFor(() =>
+      expect(useMessaging.getState().activePlaceKey).toBe(target),
+    );
+    expect(loadPlaceAround).not.toHaveBeenCalled();
   });
 
   it("opens a known thread route with its parent channel context", () => {

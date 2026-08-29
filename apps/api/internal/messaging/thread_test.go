@@ -62,6 +62,10 @@ func TestEditingThreadMessageAdmitsNewMention(t *testing.T) {
 		t.Fatalf("create thread: %v", err)
 	}
 	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "あとで追記します")
+	beforeEdit, err := a.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread before edit: %v", err)
+	}
 	if threads, err := b.ThreadsFor(ctx); err != nil || len(threads) != 0 {
 		t.Fatalf("mentioned member started as nonparticipant: threads=%+v err=%v", threads, err)
 	}
@@ -75,6 +79,50 @@ func TestEditingThreadMessageAdmitsNewMention(t *testing.T) {
 	}
 	if got := threads[0].Participants; len(got) != 2 || got[0] != w.humanA || got[1] != w.humanB {
 		t.Fatalf("thread participants = %+v, want author and edited mention", got)
+	}
+	if got := threads[0].Place.Revision; got != beforeEdit.Place.Revision+1 {
+		t.Fatalf("thread revision after edit = %d, want %d", got, beforeEdit.Place.Revision+1)
+	}
+}
+
+func TestDeletingThreadMessageAdvancesProjectionRevisionExactlyOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, channel.PlaceID, "削除revision", "", "thread-delete-revision-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "削除する発言")
+	beforeDelete, err := owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread before delete: %v", err)
+	}
+	if _, err := owner.DeleteMessage(ctx, thread.Place.PlaceID, message.MessageID); err != nil {
+		t.Fatalf("delete thread message: %v", err)
+	}
+	afterDelete, err := owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread after delete: %v", err)
+	}
+	if got := afterDelete.Place.Revision; got != beforeDelete.Place.Revision+1 {
+		t.Fatalf("thread revision after delete = %d, want %d", got, beforeDelete.Place.Revision+1)
+	}
+	if afterDelete.MessageCount != 0 || afterDelete.LastMessagePreview != "" {
+		t.Fatalf("thread summary after delete = %+v", afterDelete)
+	}
+	// Idempotent deletion does not change the projection a second time.
+	if _, err := owner.DeleteMessage(ctx, thread.Place.PlaceID, message.MessageID); err != nil {
+		t.Fatalf("replay thread delete: %v", err)
+	}
+	replayed, err := owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread after replay: %v", err)
+	}
+	if replayed.Place.Revision != afterDelete.Place.Revision {
+		t.Fatalf("replayed delete revision = %d, want %d", replayed.Place.Revision, afterDelete.Place.Revision)
 	}
 }
 

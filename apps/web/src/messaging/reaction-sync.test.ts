@@ -482,6 +482,7 @@ describe("reaction convergence in the messaging store", () => {
     harness.threadSummaries = [
       {
         ...thread,
+        revision: 2,
         messageCount: 1,
         lastMessageAt: 2,
         lastMessage: "survives",
@@ -521,10 +522,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = { ...message(1, "編集前"), revision: 1 };
-    useMessaging.setState({
-      activePlaceKey: placeKey,
-      messagesByPlace: { [placeKey]: [target] },
-    });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().startEdit(target.messageId);
     useMessaging.getState().setEditDraft("PATCHで確定した本文");
@@ -569,10 +567,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = { ...message(1, "編集前"), revision: 1 };
-    useMessaging.setState({
-      activePlaceKey: placeKey,
-      messagesByPlace: { [placeKey]: [target] },
-    });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().startEdit(target.messageId);
     useMessaging.getState().setEditDraft("PATCHで確定した本文");
@@ -618,10 +613,7 @@ describe("reaction convergence in the messaging store", () => {
     installMessagingBackend(harness);
     useMessaging.getState().init();
     await harness.bootstrapped;
-    useMessaging.setState({
-      activePlaceKey: placeKey,
-      messagesByPlace: { [placeKey]: [target] },
-    });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().startEdit(target.messageId);
     useMessaging.getState().setEditDraft("競合する編集");

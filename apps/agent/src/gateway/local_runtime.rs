@@ -48,12 +48,11 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-    CreateMessagingThreadRequest, DuplicateMessagingChannelRequest, ExactMessagingScope,
-    GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure,
-    MessagingApiFailureClass, MessagingAttachmentMetadata, MessagingNotificationSettingsRequest,
-    MessagingParticipant, MessagingWriteReceipt,
-    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
+    DuplicateMessagingChannelRequest, ExactMessagingScope, GetMessagingCallStateRequest,
+    ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure, MessagingApiFailureClass,
+    MessagingAttachmentMetadata, MessagingNotificationSettingsRequest, MessagingParticipant,
+    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
     SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
@@ -1734,7 +1733,9 @@ fn validate_messaging_thread_creation_response(
         .and_then(serde_json::Value::as_str)
         .context("Messaging thread creation omitted thread_id")?;
     if !is_canonical_uuid_v7(thread_id)
-        || response.get("workspace_id").and_then(serde_json::Value::as_str)
+        || response
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str)
             != Some(scope.workspace_id.as_str())
         || response.get("name").and_then(serde_json::Value::as_str) != Some(request.name)
         || response
@@ -4608,6 +4609,26 @@ mod tests {
     fn canonical_place_mutation_fixture_response(
         request: &serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        if let Some(parent_place_id) = request
+            .get("parent_place_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            return (
+                StatusCode::OK,
+                serde_json::json!({
+                    "thread_id": "0198f0f4-9b72-7000-8000-000000000703",
+                    "workspace_id": request["workspace_id"],
+                    "revision": 1,
+                    "name": request["name"],
+                    "parent_place": {
+                        "kind": "channel",
+                        "channel_id": parent_place_id
+                    },
+                    "parent_message_id": request.get("parent_message_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "created": false
+                }),
+            );
+        }
         if request.get("participants").is_some() {
             let actor = serde_json::json!({
                 "kind": "personality_agent",
@@ -5151,6 +5172,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let app = Router::new()
             .route(
+                "/local-control/v1/messaging:create-thread",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .route(
                 "/local-control/v1/messaging:create-channel",
                 post(place_response_loss_then_replay_fixture),
             )
@@ -5179,6 +5204,19 @@ mod tests {
         .unwrap();
         let scope = messaging_scope();
 
+        let thread = client
+            .create_thread(
+                &scope,
+                CreateMessagingThreadRequest {
+                    parent_place_id: "01900000-0000-7000-8000-000000000002",
+                    name: "  foo  ",
+                    parent_message_id: None,
+                    client_nonce: "lost-thread",
+                },
+            )
+            .await
+            .expect("canonical thread response loss reconciles");
+        assert_eq!(thread["name"], "foo");
         client
             .create_channel(
                 &scope,
@@ -5236,13 +5274,17 @@ mod tests {
             .expect("group DM response loss reconciles");
 
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 10);
         for pair in requests.chunks_exact(2) {
             assert_eq!(
                 pair[0], pair[1],
                 "retry must preserve exact scope, digest inputs, and nonce"
             );
         }
+        let thread_request: serde_json::Value =
+            serde_json::from_slice(&requests[0].2).expect("canonical thread request");
+        assert_eq!(thread_request["name"], "foo");
+        assert_eq!(thread_request["client_nonce"], "lost-thread");
         server.abort();
     }
 
