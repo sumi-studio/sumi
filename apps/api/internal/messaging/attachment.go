@@ -1083,24 +1083,53 @@ func enqueueAttachmentDeletionsInTx(ctx context.Context, tx pgx.Tx, workspaceID,
 	return nil
 }
 
-// messageRequestDigest is the canonical identity of one send request. Nonce
-// replay compares it so a changed request under the same nonce is a conflict.
-// Attachment identities are server-minted and one-to-one with immutable
-// manifests, so listing them in order fixes the manifests as well.
-func messageRequestDigest(content, urgency, replyTo string, attachmentIDs []string) []byte {
+// messageRequestDigest is the one canonical identity of every send request.
+// Poll-less sends explicitly encode poll:null; poll sends encode the complete
+// normalized creation request. Attachment identities are server-minted and
+// one-to-one with immutable manifests, so listing them in order fixes those
+// manifests as well.
+func messageRequestDigest(content, urgency, replyTo string, attachmentIDs []string, poll *PollInput) []byte {
 	ids := attachmentIDs
 	if ids == nil {
 		ids = []string{}
 	}
+	type canonicalPoll struct {
+		Question        string     `json:"question"`
+		AllowMulti      bool       `json:"allow_multi"`
+		ClosesAt        *time.Time `json:"closes_at"`
+		ClosesInMinutes uint32     `json:"closes_in_minutes"`
+		Options         []string   `json:"options"`
+	}
+	var pollDigest *canonicalPoll
+	if poll != nil {
+		closesAt := poll.ClosesAt
+		if poll.RelativeClosesInMinutes > 0 {
+			// A local retry derives a new wall-clock value on every attempt. Its
+			// durable request identity is the relative promise, not that attempt's
+			// conversion. Browser requests leave the relative field at zero and
+			// retain their canonical absolute instant here.
+			closesAt = nil
+		}
+		options := poll.Options
+		if options == nil {
+			options = []string{}
+		}
+		pollDigest = &canonicalPoll{
+			Question: poll.Question, AllowMulti: poll.AllowMulti,
+			ClosesAt: closesAt, ClosesInMinutes: poll.RelativeClosesInMinutes,
+			Options: options,
+		}
+	}
 	canonical, err := json.Marshal(struct {
-		Content     string   `json:"content"`
-		Urgency     string   `json:"urgency"`
-		ReplyTo     string   `json:"reply_to"`
-		Attachments []string `json:"attachments"`
-	}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids})
+		Content     string         `json:"content"`
+		Urgency     string         `json:"urgency"`
+		ReplyTo     string         `json:"reply_to"`
+		Attachments []string       `json:"attachments"`
+		Poll        *canonicalPoll `json:"poll"`
+	}{Content: content, Urgency: urgency, ReplyTo: replyTo, Attachments: ids, Poll: pollDigest})
 	if err != nil {
 		panic(fmt.Sprintf("marshal message request digest: %v", err))
 	}
-	sum := sha256.Sum256(append([]byte("sumi-messaging-request-v1\x00"), canonical...))
+	sum := sha256.Sum256(append([]byte("sumi-messaging-request-v2\x00"), canonical...))
 	return sum[:]
 }

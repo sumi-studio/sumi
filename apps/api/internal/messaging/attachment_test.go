@@ -371,7 +371,7 @@ func TestAttachmentBindFailureRollsBackTheWholeMessage(t *testing.T) {
 		INSERT INTO messages (message_id, workspace_id, place_id, seq, author_kind, author_id, content, client_nonce, request_digest)
 		VALUES ($1, $2, $3, 999, 'human', $4, '', 'direct-empty', $5)`,
 		newUUIDv7(), workspace.WorkspaceID, channel.PlaceID, f.humanA.ID,
-		messageRequestDigest("", UrgencyNormal, "", nil)); err == nil {
+		messageRequestDigest("", UrgencyNormal, "", nil, nil)); err == nil {
 		t.Fatal("database accepted an empty message without attachments")
 	}
 	// Cross-workspace binds are impossible at the database level.
