@@ -78,9 +78,7 @@ export function MessageThreadAction({ message }: { message: Message }) {
     setCreating(true);
     setError(null);
     try {
-      navigate(
-        await createThread(activePlaceKey, trimmed, message.messageId),
-      );
+      navigate(await createThread(activePlaceKey, trimmed, message.messageId));
       initializedDraftRef.current = false;
       setName("");
       overlay.close();

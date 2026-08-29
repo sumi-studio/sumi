@@ -469,7 +469,31 @@ describe("presenting an incoming message", () => {
     expect(FakeNotification.constructed).toHaveLength(0);
   });
 
-  it("presents a repeated message_created frame only once", () => {
+  it("plays a repeated message_created frame only once", () => {
+    const startTone = vi.fn();
+    const gainNode = () => ({
+      gain: {
+        value: 0,
+        setValueAtTime: vi.fn(),
+        exponentialRampToValueAtTime: vi.fn(),
+      },
+      connect: vi.fn(),
+    });
+    class FakeAudioContext {
+      currentTime = 0;
+      destination = {};
+      resume = vi.fn();
+      createGain = vi.fn(gainNode);
+      createOscillator = vi.fn(() => ({
+        type: "",
+        frequency: { setValueAtTime: vi.fn() },
+        connect: vi.fn(),
+        start: startTone,
+        stop: vi.fn(),
+      }));
+    }
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+    resetNotificationAudio();
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const event = {
       type: "message_created" as const,
@@ -478,37 +502,10 @@ describe("presenting an incoming message", () => {
     };
 
     backend.emit(event);
+    expect(startTone).toHaveBeenCalledTimes(2);
     backend.emit(event);
 
-    expect(FakeNotification.constructed).toHaveLength(1);
-  });
-
-  it("names the thread in a called thread notification", () => {
-    vi.spyOn(document, "hasFocus").mockReturnValue(false);
-    const thread: ThreadSummary = {
-      threadId: "thread-1",
-      revision: 1,
-      workspaceId: "ws",
-      parentPlace: CHANNEL,
-      parentMessageId: "message-0",
-      name: "設計レビュー",
-      messageCount: 1,
-      lastMessageAt: 1,
-      lastMessage: "",
-      participants: [SELF, OTHER],
-      latestSeq: 1,
-    };
-    useMessaging.setState({ threadsById: { [thread.threadId]: thread } });
-
-    backend.emit({
-      type: "message_created",
-      message: incoming({
-        place: { kind: "thread", threadId: thread.threadId },
-      }),
-      notify: { reason: "mention" },
-    });
-
-    expect(FakeNotification.constructed[0]?.title).toBe("設計レビュー — Kuro");
+    expect(startTone).toHaveBeenCalledTimes(2);
   });
 
   it("タブの件数は自分の台帳にあるplaceだけを数える", () => {

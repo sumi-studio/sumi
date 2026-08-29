@@ -162,6 +162,7 @@ export function MessageSearch({
   // session. Changing authority must synchronously make that state unusable,
   // including any debounce or response still in flight.
   useEffect(() => {
+    void transportGeneration;
     if (timer.current !== null) window.clearTimeout(timer.current);
     timer.current = null;
     requestID.current += 1;

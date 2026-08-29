@@ -800,9 +800,9 @@ export class MockMessagingServer implements MessagingBackend {
   }
 
   async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
-    return [...this.threads.values()].filter(
-      (thread) => placeKey(thread.parentPlace) === placeKey(parent),
-    ).map(copyThread);
+    return [...this.threads.values()]
+      .filter((thread) => placeKey(thread.parentPlace) === placeKey(parent))
+      .map(copyThread);
   }
 
   async fetchThread(threadId: string): Promise<ThreadSummary> {

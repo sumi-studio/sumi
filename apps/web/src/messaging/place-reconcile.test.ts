@@ -809,6 +809,60 @@ describe("place lifecycleの再接続突き合わせ", () => {
     );
   });
 
+  it.each([
+    "success",
+    "conflict",
+  ] as const)("live echoを取り逃したedit %sでもpreviewとparticipantsを取り直す", async (disposition) => {
+    const known = {
+      ...thread(`thread-edit-${disposition}`),
+      participants: [SELF],
+    };
+    const key = `thread:${known.threadId}` as PlaceKey;
+    const target: Message = {
+      ...threadMessage(known.threadId, 1),
+      author: SELF,
+      content: "編集前",
+      mentions: [],
+      revision: 1,
+    };
+    const committed: Message = {
+      ...target,
+      content: "編集後",
+      mentions: [OTHER],
+      revision: 2,
+    };
+    const refreshed: ThreadSummary = {
+      ...known,
+      revision: 2,
+      lastMessage: committed.content,
+      participants: [SELF, OTHER],
+    };
+    backend.fetchMessages.mockResolvedValueOnce([target]);
+    backend.fetchThread.mockResolvedValueOnce(refreshed);
+    backend.editMessage = vi.fn(async () => {
+      if (disposition === "success") return committed;
+      const conflict = new MessagingAPIError("edit_conflict", 409);
+      Object.defineProperty(conflict, "currentMessage", {
+        value: committed,
+      });
+      throw conflict;
+    });
+    useMessaging.setState({ threadsById: { [known.threadId]: known } });
+
+    useMessaging.getState().selectPlace(key);
+    await settle();
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft(committed.content);
+    useMessaging.getState().submitEdit();
+    await settle();
+    await settle();
+
+    expect(backend.fetchThread).toHaveBeenCalledWith(known.threadId);
+    expect(useMessaging.getState().threadsById[known.threadId]).toEqual(
+      refreshed,
+    );
+  });
+
   it("bootstrapが先に取り込んだthread messageをcatch-upで再加算しない", async () => {
     const known = thread("thread-known");
     const incoming = threadMessage(known.threadId, 2);

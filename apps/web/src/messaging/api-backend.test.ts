@@ -1572,6 +1572,7 @@ function threadPlaceWire(threadId: string) {
 function threadSummaryWire(threadId: string) {
   return {
     thread_id: threadId,
+    revision: 1,
     parent_place: channelWire(),
     parent_message_id: "message-1",
     workspace_id: "workspace-1",

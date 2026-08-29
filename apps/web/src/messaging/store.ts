@@ -1633,11 +1633,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       );
       const editingDeleted = state.editingMessageId === message.messageId;
       const messages = heldPlaces.has(key)
-        ? upsertMessage(
-            state.messagesByPlace[key] ?? [],
-            message,
-            "revision",
-          )
+        ? upsertMessage(state.messagesByPlace[key] ?? [], message, "revision")
         : null;
       return {
         messagesByPlace: messages
@@ -2200,10 +2196,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       );
     } catch (error) {
       // 取れなかったのにheldのままにすると、開き直しても取りに行かない。
-      if (
-        request.isCurrent() &&
-        holdsPlaceGeneration(key, holdGeneration)
-      ) {
+      if (request.isCurrent() && holdsPlaceGeneration(key, holdGeneration)) {
         releasePlace(key);
       }
       throw error;
@@ -3542,6 +3535,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 committed,
               ),
             );
+            noteThreadProjectionChange(place);
           },
           (error: unknown) => {
             if (!request.isCurrent()) return;
@@ -3579,12 +3573,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
               return;
             }
             const latest = error.currentMessage;
+            if (
+              latest.messageId !== submittedSession.messageId ||
+              placeKey(latest.place) !== key
+            )
+              return;
             set((current) => {
-              if (
-                latest.messageId !== submittedSession.messageId ||
-                placeKey(latest.place) !== key
-              )
-                return {};
               if (isLostEditAcknowledgement(latest, submittedSession)) {
                 return reduceSuccessfulEditAcknowledgement(
                   current,
@@ -3619,6 +3613,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 editSavedWithPendingChanges: false,
               };
             });
+            noteThreadProjectionChange(place);
           },
         );
     },
