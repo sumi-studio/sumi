@@ -1207,6 +1207,162 @@ CREATE INDEX CONCURRENTLY nontransactional_migration_retry_test_idx ON messages 
 	}
 }
 
+func TestPlaceStatusRevisionReceiptsMigrationDownAndReupgrade(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 31)
+	if version, err := LatestAppliedVersion(ctx, pool); err != nil || version != 31 {
+		t.Fatalf("migrate through 0031: version=%d err=%v", version, err)
+	}
+
+	assertShape := func(want bool) {
+		t.Helper()
+		var receipts, receiptTenure, receiptTenureFK bool
+		var placeRevision, placeFunction, statusFunction, statusIndex bool
+		var statusColumns int
+		if err := pool.QueryRow(ctx, `
+			SELECT
+				to_regclass('messaging_place_creation_receipts') IS NOT NULL,
+				EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name = 'messaging_place_creation_receipts'
+					  AND column_name = 'workspace_member_id'
+				),
+				EXISTS (
+					SELECT 1 FROM pg_constraint
+					WHERE conname = 'messaging_place_creation_receipts_workspace_member_identity'
+					  AND conrelid = to_regclass('messaging_place_creation_receipts')
+					  AND confrelid = to_regclass('workspace_members')
+					  AND contype = 'f'
+				),
+				EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name = 'places' AND column_name = 'revision'
+				),
+				to_regprocedure('messaging_increment_place_revision()') IS NOT NULL,
+				to_regprocedure('messaging_increment_participant_status_revision()') IS NOT NULL,
+				to_regclass('participant_statuses_expiring') IS NOT NULL,
+				(
+					SELECT count(*) FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name = 'participant_statuses'
+					  AND column_name IN ('base_status', 'base_note', 'revision')
+				)
+		`).Scan(
+			&receipts, &receiptTenure, &receiptTenureFK,
+			&placeRevision, &placeFunction, &statusFunction,
+			&statusIndex, &statusColumns,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if receipts != want || receiptTenure != want || receiptTenureFK != want ||
+			placeRevision != want || placeFunction != want ||
+			statusFunction != want || statusIndex != want || (statusColumns == 3) != want {
+			t.Fatalf("0031 shape = receipts:%t receipt-tenure:%t receipt-tenure-fk:%t place-column:%t place-function:%t status-function:%t status-index:%t status-columns:%d, want present=%t",
+				receipts, receiptTenure, receiptTenureFK, placeRevision, placeFunction,
+				statusFunction, statusIndex, statusColumns, want)
+		}
+	}
+	assertShape(true)
+
+	down, err := migrationFS.ReadFile(
+		"migrations/0031_place_status_revisions_and_creation_receipts.down.sql",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(down)); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("apply 0031 down transaction: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit 0031 down transaction: %v", err)
+	}
+	assertShape(false)
+
+	if _, err := pool.Exec(ctx, "DELETE FROM schema_migrations WHERE version = 31"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("reapply 0031: %v", err)
+	}
+	assertShape(true)
+}
+
+func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate through 0033: %v", err)
+	}
+
+	assertShape := func(want bool) {
+		t.Helper()
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			"SELECT to_regclass('participant_profiles') IS NOT NULL",
+		).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != want {
+			t.Fatalf("participant_profiles exists=%t, want %t", exists, want)
+		}
+	}
+	assertShape(true)
+
+	const humanID = "0198f0f4-9b72-7000-8000-000000000132"
+	if _, err := pool.Exec(ctx, `INSERT INTO participant_profiles
+		(member_kind, member_id, tagline) VALUES ('human', $1, '開発')`, humanID); err != nil {
+		t.Fatalf("insert valid Participant profile: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO participant_profiles
+		(member_kind, member_id, tagline) VALUES ('human', $1, repeat('名', 101))`,
+		"0198f0f4-9b72-7000-8000-000000000133"); err == nil {
+		t.Fatal("0033 accepted an overlong tagline")
+	}
+
+	down, err := migrationFS.ReadFile("migrations/0033_participant_profiles.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(down)); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("apply 0033 down transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM schema_migrations WHERE version = 33"); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("remove 0033 migration record: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit 0033 down transaction: %v", err)
+	}
+	assertShape(false)
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("reapply 0033: %v", err)
+	}
+	assertShape(true)
+	var rows int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM participant_profiles").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("recreated Participant profile table retained %d rows", rows)
+	}
+}
+
 func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maxVersion int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {

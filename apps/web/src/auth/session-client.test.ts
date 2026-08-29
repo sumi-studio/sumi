@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AuthAPIError,
   authRequestTimeoutMilliseconds,
+  getSumiProfile,
   getSumiSession,
   logoutSumiSession,
   postAuthJSON,
@@ -132,7 +133,34 @@ describe("Sumi browser session client", () => {
     await expect(getSumiSession()).rejects.toBeInstanceOf(AuthAPIError);
   });
 
-  it("updates the canonical Human display name through the authenticated profile endpoint", async () => {
+  it("reads the durable Human profile without a Workspace scope", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          user: { id: "user-1", display_name: "かずい" },
+          profile: {
+            participant: { kind: "human", human_id: "user-1" },
+            display_name: "かずい",
+            tagline: "開発",
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getSumiProfile()).resolves.toEqual({
+      participant: { kind: "human", humanId: "user-1" },
+      displayName: "かずい",
+      tagline: "開発",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/auth/profile",
+      expect.objectContaining({ credentials: "include", cache: "no-store" }),
+    );
+  });
+
+  it("updates the canonical Human profile through one authenticated request", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -144,22 +172,34 @@ describe("Sumi browser session client", () => {
         new Response(
           JSON.stringify({
             user: { id: "user-1", display_name: "かずい" },
+            profile: {
+              participant: { kind: "human", human_id: "user-1" },
+              display_name: "かずい",
+              tagline: "開発",
+            },
           }),
           { status: 200 },
         ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(updateSumiProfile("かずい")).resolves.toEqual({
+    await expect(
+      updateSumiProfile({ displayName: "かずい", tagline: " 開発 " }),
+    ).resolves.toEqual({
       id: "user-1",
       displayName: "かずい",
+      profile: {
+        participant: { kind: "human", humanId: "user-1" },
+        displayName: "かずい",
+        tagline: "開発",
+      },
     });
     expect(fetchMock.mock.calls[1]).toEqual([
       "/auth/profile",
       expect.objectContaining({
         method: "POST",
         credentials: "include",
-        body: JSON.stringify({ display_name: "かずい" }),
+        body: JSON.stringify({ display_name: "かずい", tagline: "開発" }),
       }),
     ]);
   });
@@ -168,9 +208,16 @@ describe("Sumi browser session client", () => {
     const fetchMock = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(updateSumiProfile("🌙".repeat(81))).rejects.toMatchObject({
-      status: 400,
-    });
+    await expect(
+      updateSumiProfile({ displayName: "🌙".repeat(81) }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      updateSumiProfile({ tagline: "🌙".repeat(101) }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      updateSumiProfile({ tagline: "one\ntwo" }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(updateSumiProfile({})).rejects.toMatchObject({ status: 400 });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

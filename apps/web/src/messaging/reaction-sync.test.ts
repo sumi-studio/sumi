@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "./api-backend";
 import type {
   ConnectionState,
   Message,
@@ -16,6 +17,21 @@ import {
 
 const place: Place = { kind: "channel", channelId: "channel-1" };
 const placeKey = "channel:channel-1" as const;
+
+/**
+ * 履歴を持っている状態を作る。storeが履歴を受け付けるのはheldなplaceだけなので、
+ * stateへ直接置くのではなく画面を開く経路（selectPlace → loadPlace）で作る。
+ * 読み込みのfetchは記録から外し、後続のresyncだけを見えるようにする。
+ */
+async function holdLoaded(
+  harness: StubBackend,
+  messages: Message[],
+): Promise<void> {
+  harness.history = messages;
+  useMessaging.getState().selectPlace(placeKey);
+  await harness.settle();
+  harness.fetches.splice(0);
+}
 
 /**
  * reaction eventはmessage全体を運ばない、という契約のstore側の裏。編集を
@@ -37,9 +53,7 @@ describe("reaction convergence in the messaging store", () => {
     installMessagingBackend(harness);
     useMessaging.getState().init();
     await harness.bootstrapped;
-    useMessaging.setState({
-      messagesByPlace: { [placeKey]: [message(1, "編集前"), message(2, "隣")] },
-    });
+    await holdLoaded(harness, [message(1, "編集前"), message(2, "隣")]);
 
     // 編集がcommit/publishしたあとに、編集前のcontentを見ていたreaction eventが
     // 遅れて届く。reactionだけが乗るので編集は生き残る。
@@ -437,7 +451,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = message(1, "message");
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().toggleReaction(target, "👍");
     await harness.settle();
@@ -468,6 +482,7 @@ describe("reaction convergence in the messaging store", () => {
     harness.threadSummaries = [
       {
         ...thread,
+        revision: 2,
         messageCount: 1,
         lastMessageAt: 2,
         lastMessage: "survives",
@@ -496,6 +511,127 @@ describe("reaction convergence in the messaging store", () => {
       messageCount: 1,
       lastMessageAt: 2,
       lastMessage: "survives",
+    });
+  });
+
+  it("keeps a tombstone when message_deleted precedes the PATCH response and replay", async () => {
+    const harness = new StubBackend();
+    const committed = deferred<Message>();
+    harness.editMessage = vi.fn(async () => await committed.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = { ...message(1, "編集前"), revision: 1 };
+    await holdLoaded(harness, [target]);
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("PATCHで確定した本文");
+    useMessaging.getState().submitEdit();
+    expect(harness.editMessage).toHaveBeenCalledOnce();
+
+    const tombstone = {
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: 3,
+    };
+    harness.emit({ type: "message_deleted", message: tombstone });
+    committed.resolve({
+      ...target,
+      content: "PATCHで確定した本文",
+      revision: 2,
+    });
+    await harness.settle();
+
+    // reconnectのcatch-upはmessage_createdで運ばれるが、旧編集eventも同じ
+    // 単調適用を通るためtombstoneを覆えない。
+    harness.emit({
+      type: "message_created",
+      message: { ...target, content: "replayされた古い編集", revision: 2 },
+      notify: null,
+    });
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ content: "", deleted: true, revision: 3 });
+  });
+
+  it("keeps a reaction published before a successful edit response", async () => {
+    const harness = new StubBackend();
+    const committed = deferred<Message>();
+    harness.editMessage = vi.fn(async () => await committed.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = { ...message(1, "編集前"), revision: 1 };
+    await holdLoaded(harness, [target]);
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("PATCHで確定した本文");
+    useMessaging.getState().submitEdit();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [other] }],
+    });
+    committed.resolve({
+      ...target,
+      content: "PATCHで確定した本文",
+      revision: 2,
+      reactions: [],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "PATCHで確定した本文",
+      revision: 2,
+      reactions: [{ emoji: "👍", participants: [other] }],
+    });
+  });
+
+  it("keeps a reaction published before a 409 edit-conflict response", async () => {
+    const harness = new StubBackend();
+    const target = { ...message(1, "編集前"), revision: 1 };
+    const conflict = new MessagingAPIError("edit_conflict", 409);
+    Object.defineProperty(conflict, "currentMessage", {
+      value: {
+        ...target,
+        content: "別クライアントの編集",
+        revision: 2,
+        reactions: [],
+      },
+    });
+    harness.editMessage = vi.fn(async () => {
+      throw conflict;
+    });
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    await holdLoaded(harness, [target]);
+
+    useMessaging.getState().startEdit(target.messageId);
+    useMessaging.getState().setEditDraft("競合する編集");
+    useMessaging.getState().submitEdit();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "🎉", participants: [other] }],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "別クライアントの編集",
+      revision: 2,
+      reactions: [{ emoji: "🎉", participants: [other] }],
     });
   });
 
@@ -594,6 +730,62 @@ describe("reaction convergence in the messaging store", () => {
       reactions: [{ emoji: "🎉", participants: [self] }],
     });
   });
+
+  it("does not apply a delayed deletion ACK to the replacement session", async () => {
+    const oldHarness = new StubBackend();
+    const deleted = deferred<Message>();
+    oldHarness.deleteMessage = vi.fn(async () => await deleted.promise);
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    const target = {
+      ...message(1, "old session"),
+      author: other,
+      mentions: [self],
+      revision: 1,
+    };
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [target] },
+      lastReadByPlace: { [placeKey]: 0 },
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+    useMessaging.getState().deleteMessage(target.messageId);
+    expect(oldHarness.deleteMessage).toHaveBeenCalledOnce();
+
+    bindMessagingSessionIdentity("reaction-test-delete-new-session");
+    const newHarness = new StubBackend();
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    useMessaging.setState({
+      activePlaceKey: placeKey,
+      messagesByPlace: { [placeKey]: [{ ...target, content: "new session" }] },
+      lastReadByPlace: { [placeKey]: 0 },
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+
+    deleted.resolve({
+      ...target,
+      content: "",
+      mentions: [],
+      reactions: [],
+      attachments: [],
+      deleted: true,
+      revision: 2,
+    });
+    await oldHarness.settle();
+
+    expect(useMessaging.getState()).toMatchObject({
+      unreadCountByPlace: { [placeKey]: 1 },
+      mentionCountByPlace: { [placeKey]: 1 },
+    });
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ content: "new session", deleted: false });
+  });
 });
 
 const self = { kind: "human", humanId: "human-1" } as const;
@@ -635,6 +827,7 @@ function message(
 function threadSummary(): ThreadSummary {
   return {
     threadId: "thread-1",
+    revision: 1,
     workspaceId: "workspace-1",
     parentPlace: { kind: "channel", channelId: "channel-1" },
     parentMessageId: "message-1",
@@ -652,7 +845,6 @@ class StubBackend implements MessagingBackend {
     status: false,
     replyLater: false,
     reactions: true,
-    polls: true,
     notifications: false,
   } as const;
   history: Message[] = [];
@@ -662,7 +854,6 @@ class StubBackend implements MessagingBackend {
     | ReactionMutationResult
     | Promise<ReactionMutationResult>
   )[] = [];
-  readonly pollVoteResults: (Message | Promise<Message>)[] = [];
   holdFetches = false;
   private heldFetches: {
     response: Message[];
@@ -694,7 +885,11 @@ class StubBackend implements MessagingBackend {
   }
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
-    queueMicrotask(() => this.resolveBootstrapped());
+    // Store request fencing validates the response in its own microtask before
+    // applying bootstrap.  Resolve the test readiness marker after that chain.
+    queueMicrotask(() =>
+      queueMicrotask(() => queueMicrotask(() => this.resolveBootstrapped())),
+    );
     return {
       self,
       workspaces: [],
@@ -702,6 +897,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "workspace-1",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",
@@ -756,7 +952,8 @@ class StubBackend implements MessagingBackend {
   createChannel = vi.fn();
   ensureDM = vi.fn();
   createGroupDM = vi.fn();
-  updateChannelTopic = vi.fn();
+  updateChannel = vi.fn();
+  duplicateChannel = vi.fn();
   fetchPresence = vi.fn(async () => ({
     statuses: [],
     replyLaterMarkers: [],
@@ -765,12 +962,20 @@ class StubBackend implements MessagingBackend {
   async uploadAttachment(): Promise<never> {
     throw new Error("uploadAttachment is not part of this test");
   }
+
+  async updateDraftAttachment(): Promise<never> {
+    throw new Error("updateDraftAttachment is not part of this test");
+  }
   attachmentURL(attachmentId: string): string {
     return `/test/attachments/${attachmentId}`;
   }
   sendMessage = vi.fn();
-  editMessage = vi.fn(async () => undefined);
-  deleteMessage = vi.fn(async () => undefined);
+  editMessage = async (): ReturnType<MessagingBackend["editMessage"]> => {
+    throw new Error("editMessage is not part of this test");
+  };
+  deleteMessage = vi.fn(async (): Promise<Message> => {
+    throw new Error("deleteMessage is not part of this test");
+  });
   markRead = vi.fn(async () => undefined);
   setStatus = vi.fn(async () => {
     throw new Error("unused");
@@ -788,10 +993,6 @@ class StubBackend implements MessagingBackend {
       _emoji: string,
     ): Promise<ReactionMutationResult> =>
       await (this.toggleResults.shift() ?? { messageId, reactions: [] }),
-  );
-  votePoll = vi.fn(
-    async (_place: Place, _messageId: string, _optionIds: string[]) =>
-      await (this.pollVoteResults.shift() ?? message(1, "message")),
   );
   async setNotificationSetting(): ReturnType<
     MessagingBackend["setNotificationSetting"]
@@ -815,324 +1016,3 @@ class StubBackend implements MessagingBackend {
     this.listener = null;
   }
 }
-
-describe("poll convergence in the messaging store", () => {
-  let session = 0;
-
-  beforeEach(() => {
-    bindMessagingSessionIdentity(`poll-test-${++session}`);
-  });
-
-  afterEach(() => {
-    bindMessagingSessionIdentity(null);
-  });
-
-  it("patches only the poll and does not let an older resync overwrite a live update", async () => {
-    const harness = new StubBackend();
-    installMessagingBackend(harness);
-    useMessaging.getState().init();
-    await harness.bootstrapped;
-    const initial = {
-      ...message(1, "edited content", 99),
-      poll: {
-        question: "いつ？",
-        allowMulti: false,
-        closesAt: null,
-        options: [
-          { optionId: "today", text: "今日", voters: [] },
-          { optionId: "tomorrow", text: "明日", voters: [] },
-        ],
-      },
-    };
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
-    harness.history = [initial];
-    harness.holdFetches = true;
-
-    harness.emit({ type: "caught_up", place });
-    await harness.settle();
-    harness.emit({
-      type: "poll_updated",
-      message: {
-        ...message(1, "stale content"),
-        poll: {
-          ...initial.poll,
-          options: [
-            { optionId: "today", text: "今日", voters: [self] },
-            { optionId: "tomorrow", text: "明日", voters: [] },
-          ],
-        },
-      },
-    });
-    harness.releaseFetches();
-    await harness.settle();
-
-    const projected = useMessaging.getState().messagesByPlace[placeKey]?.[0];
-    expect(projected?.content).toBe("edited content");
-    expect(projected?.editedAt).toBe(99);
-    expect(projected?.poll?.options[0]?.voters).toEqual([self]);
-  });
-
-  it("still applies a missed poll snapshot when a different poll changes live", async () => {
-    const harness = new StubBackend();
-    installMessagingBackend(harness);
-    useMessaging.getState().init();
-    await harness.bootstrapped;
-    const first = {
-      ...message(1, "first"),
-      poll: {
-        question: "first?",
-        allowMulti: false,
-        closesAt: null,
-        options: [{ optionId: "first-option", text: "A", voters: [] }],
-      },
-    };
-    const second = {
-      ...message(2, "second"),
-      poll: {
-        question: "second?",
-        allowMulti: false,
-        closesAt: null,
-        options: [{ optionId: "second-option", text: "B", voters: [] }],
-      },
-    };
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [first, second] } });
-    harness.history = [
-      {
-        ...first,
-        poll: {
-          ...first.poll,
-          options: [{ optionId: "first-option", text: "A", voters: [self] }],
-        },
-      },
-      second,
-    ];
-    harness.holdFetches = true;
-
-    harness.emit({ type: "caught_up", place });
-    await harness.settle();
-    harness.emit({
-      type: "poll_updated",
-      message: {
-        ...second,
-        poll: {
-          ...second.poll,
-          options: [{ optionId: "second-option", text: "B", voters: [other] }],
-        },
-      },
-    });
-    harness.releaseFetches();
-    await harness.settle();
-
-    const projected = useMessaging.getState().messagesByPlace[placeKey] ?? [];
-    expect(projected[0]?.poll?.options[0]?.voters).toEqual([self]);
-    expect(projected[1]?.poll?.options[0]?.voters).toEqual([other]);
-  });
-
-  it("does not let a delayed vote acknowledgement roll back a live poll update", async () => {
-    const harness = new StubBackend();
-    const acknowledgement = deferred<Message>();
-    harness.pollVoteResults.push(acknowledgement.promise);
-    installMessagingBackend(harness);
-    useMessaging.getState().init();
-    await harness.bootstrapped;
-    const initial = {
-      ...message(1, "poll"),
-      poll: {
-        question: "which?",
-        allowMulti: false,
-        closesAt: null,
-        options: [{ optionId: "option", text: "A", voters: [] }],
-      },
-    };
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
-
-    useMessaging.getState().votePoll(initial, ["option"]);
-    await harness.settle();
-    harness.emit({
-      type: "poll_updated",
-      message: {
-        ...initial,
-        poll: {
-          ...initial.poll,
-          options: [{ optionId: "option", text: "A", voters: [other] }],
-        },
-      },
-    });
-    acknowledgement.resolve({
-      ...initial,
-      poll: {
-        ...initial.poll,
-        options: [{ optionId: "option", text: "A", voters: [self] }],
-      },
-    });
-    await harness.settle();
-
-    expect(
-      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll?.options[0]
-        ?.voters,
-    ).toEqual([other]);
-  });
-
-  it("ignores a delayed earlier vote snapshot after a later revision", async () => {
-    const harness = new StubBackend();
-    installMessagingBackend(harness);
-    useMessaging.getState().init();
-    await harness.bootstrapped;
-    const initial = {
-      ...message(1, "poll"),
-      poll: {
-        question: "which?",
-        allowMulti: false,
-        closesAt: null,
-        revision: 0,
-        options: [{ optionId: "option", text: "A", voters: [] }],
-      },
-    };
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
-
-    harness.emit({
-      type: "poll_updated",
-      message: {
-        ...initial,
-        poll: {
-          ...initial.poll,
-          revision: 2,
-          options: [{ optionId: "option", text: "A", voters: [other] }],
-        },
-      },
-    });
-    harness.emit({
-      type: "poll_updated",
-      message: {
-        ...initial,
-        poll: {
-          ...initial.poll,
-          revision: 1,
-          options: [{ optionId: "option", text: "A", voters: [self] }],
-        },
-      },
-    });
-
-    const projected =
-      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll;
-    expect(projected?.revision).toBe(2);
-    expect(projected?.options[0]?.voters).toEqual([other]);
-  });
-
-  it("does not let an older poll in a message edit roll back a newer vote", async () => {
-    const harness = new StubBackend();
-    installMessagingBackend(harness);
-    useMessaging.getState().init();
-    await harness.bootstrapped;
-    const initial = {
-      ...message(1, "before edit"),
-      poll: {
-        question: "which?",
-        allowMulti: false,
-        closesAt: null,
-        revision: 0,
-        options: [{ optionId: "option", text: "A", voters: [] }],
-      },
-    };
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
-
-    harness.emit({
-      type: "poll_updated",
-      message: {
-        ...initial,
-        poll: {
-          ...initial.poll,
-          revision: 2,
-          options: [{ optionId: "option", text: "A", voters: [other] }],
-        },
-      },
-    });
-    harness.emit({
-      type: "message_edited",
-      message: {
-        ...initial,
-        content: "after edit",
-        editedAt: 99,
-        poll: {
-          ...initial.poll,
-          revision: 1,
-          options: [{ optionId: "option", text: "A", voters: [self] }],
-        },
-      },
-    });
-
-    const projected = useMessaging.getState().messagesByPlace[placeKey]?.[0];
-    expect(projected?.content).toBe("after edit");
-    expect(projected?.poll?.revision).toBe(2);
-    expect(projected?.poll?.options[0]?.voters).toEqual([other]);
-  });
-
-  it("serializes rapid whole-selection votes and retains both choices", async () => {
-    const harness = new StubBackend();
-    const first = deferred<Message>();
-    const second = deferred<Message>();
-    harness.pollVoteResults.push(first.promise, second.promise);
-    installMessagingBackend(harness);
-    useMessaging.getState().init();
-    await harness.bootstrapped;
-    const initial = {
-      ...message(1, "poll"),
-      poll: {
-        question: "which?",
-        allowMulti: true,
-        closesAt: null,
-        revision: 0,
-        options: [
-          { optionId: "a", text: "A", voters: [] },
-          { optionId: "b", text: "B", voters: [] },
-        ],
-      },
-    };
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
-
-    useMessaging.getState().votePoll(initial, ["a"]);
-    useMessaging.getState().votePoll(initial, ["a", "b"]);
-    await harness.settle();
-    expect(harness.votePoll).toHaveBeenCalledTimes(1);
-    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", [
-      "a",
-    ]);
-
-    first.resolve({
-      ...initial,
-      poll: {
-        ...initial.poll,
-        revision: 1,
-        options: [
-          { optionId: "a", text: "A", voters: [self] },
-          { optionId: "b", text: "B", voters: [] },
-        ],
-      },
-    });
-    await harness.settle();
-    expect(harness.votePoll).toHaveBeenCalledTimes(2);
-    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", [
-      "a",
-      "b",
-    ]);
-
-    second.resolve({
-      ...initial,
-      poll: {
-        ...initial.poll,
-        revision: 2,
-        options: [
-          { optionId: "a", text: "A", voters: [self] },
-          { optionId: "b", text: "B", voters: [self] },
-        ],
-      },
-    });
-    await harness.settle();
-    const projected =
-      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll;
-    expect(projected?.options.map((option) => option.voters)).toEqual([
-      [self],
-      [self],
-    ]);
-  });
-});

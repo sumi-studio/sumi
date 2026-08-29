@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -67,6 +68,11 @@ type attachmentWire struct {
 	SizeBytes    int64  `json:"size_bytes"`
 	SHA256       string `json:"sha256"`
 	Position     int    `json:"position"`
+	// Spoiler and Alt are the sender's declarations in attachment metadata
+	// deliveries — REST, WebSocket, and the agent's local open view. Byte
+	// responses deliberately carry only delivery headers.
+	Spoiler bool   `json:"spoiler"`
+	Alt     string `json:"alt"`
 }
 
 type attachmentUploadWire struct {
@@ -82,6 +88,8 @@ func attachmentToWire(a Attachment) attachmentWire {
 		SizeBytes:    a.SizeBytes,
 		SHA256:       a.SHA256Hex(),
 		Position:     a.Position,
+		Spoiler:      a.Spoiler,
+		Alt:          a.Alt,
 	}
 }
 
@@ -320,6 +328,87 @@ func (s *Server) serveUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, attachmentUploadWire{attachmentToWire(att), created})
 }
 
+// serveUpdateAttachment edits an upload before it is sent: display name,
+// description, and whether it arrives covered. Only the uploader's own
+// still-unbound attachment can be edited; after send, what the recipients saw
+// stands.
+//
+// An absent field is「触らない」, the same shape as the notification settings
+// lane, so naming one preference never silently resets the others.
+func (s *Server) serveUpdateAttachment(w http.ResponseWriter, r *http.Request) {
+	_, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	store := scopedStoreForRequest(r)
+	if store == nil || !store.Store.AttachmentsEnabled() {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	var req struct {
+		Filename *string `json:"filename"`
+		Alt      *string `json:"alt"`
+		Spoiler  *bool   `json:"spoiler"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Filename == nil && req.Alt == nil && req.Spoiler == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if req.Filename != nil {
+		name := sanitizeAttachmentFilename(*req.Filename)
+		req.Filename = &name
+	}
+	if req.Alt != nil {
+		alt := sanitizeAttachmentAlt(*req.Alt)
+		if utf8.RuneCountInString(alt) > MaxAttachmentAltRunes {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		req.Alt = &alt
+	}
+	var att Attachment
+	done, err := s.mutate(w, r, claims, func() error {
+		var updateErr error
+		att, updateErr = store.UpdateDraftAttachment(r.Context(), r.PathValue("attachment_id"),
+			AttachmentDraftPatch{Filename: req.Filename, Alt: req.Alt, Spoiler: req.Spoiler})
+		return updateErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, attachmentToWire(att))
+}
+
+// forbiddenAttachmentDisplayRune is the shared display-text policy: C0/C1
+// controls (including NEL), line/paragraph separators, bidi controls, and
+// zero-width format controls do not belong in sender-controlled one-line text.
+// The agent and web implementations carry the same explicit set.
+func forbiddenAttachmentDisplayRune(r rune) bool {
+	return unicode.IsControl(r) || r == 0x180e ||
+		(r >= 0x200b && r <= 0x200f) ||
+		r == 0x2028 || r == 0x2029 ||
+		(r >= 0x202a && r <= 0x202e) || r == 0x2060 ||
+		(r >= 0x2066 && r <= 0x2069) || r == 0xfeff
+}
+
+// sanitizeAttachmentAlt keeps a one-paragraph display description. Length is
+// bounded by the caller afterwards, on the sanitized value.
+func sanitizeAttachmentAlt(alt string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if forbiddenAttachmentDisplayRune(r) {
+			return ' '
+		}
+		return r
+	}, alt))
+}
+
 // authorizeSessionMutation is mutate without transport output: it runs op
 // under the session's durable admission lease and reports whether the lease
 // was granted at all.
@@ -388,13 +477,13 @@ func writeAttachmentHeaders(header http.Header, att Attachment) {
 	header.Set(AttachmentUploadFilenameHeader, url.PathEscape(att.Filename))
 }
 
-// sanitizeAttachmentFilename keeps a display name only: no directories, no
-// control characters, bounded length. It is never used as a storage path.
+// sanitizeAttachmentFilename keeps a display name only: no directories,
+// forbidden display characters, bounded length. It is never used as a storage path.
 func sanitizeAttachmentFilename(name string) string {
 	name = strings.ReplaceAll(name, "\\", "/")
 	name = path.Base(strings.TrimSpace(name))
 	name = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if forbiddenAttachmentDisplayRune(r) {
 			return -1
 		}
 		return r

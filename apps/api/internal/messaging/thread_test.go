@@ -3,9 +3,13 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T) {
@@ -22,8 +26,9 @@ func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T)
 	if !created {
 		t.Fatal("first thread creation was replayed")
 	}
-	if _, _, err := a.CreateThread(ctx, channel.PlaceID, "duplicate", origin.MessageID, "thread-origin-2"); !errors.Is(err, ErrThreadExists) {
-		t.Fatalf("duplicate origin error = %v", err)
+	duplicate, created, err := a.CreateThread(ctx, channel.PlaceID, "duplicate", origin.MessageID, "thread-origin-2")
+	if !errors.Is(err, ErrThreadExists) || created || duplicate.Place.PlaceID != thread.Place.PlaceID {
+		t.Fatalf("duplicate origin = %+v created=%v err=%v, want existing thread conflict", duplicate, created, err)
 	}
 	b := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	if _, err := b.ThreadFor(ctx, thread.Place.PlaceID); err != nil {
@@ -57,11 +62,15 @@ func TestEditingThreadMessageAdmitsNewMention(t *testing.T) {
 		t.Fatalf("create thread: %v", err)
 	}
 	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "あとで追記します")
+	beforeEdit, err := a.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread before edit: %v", err)
+	}
 	if threads, err := b.ThreadsFor(ctx); err != nil || len(threads) != 0 {
 		t.Fatalf("mentioned member started as nonparticipant: threads=%+v err=%v", threads, err)
 	}
 
-	if _, err := a.EditMessage(ctx, thread.Place.PlaceID, message.MessageID, "@Haru この件もお願いします"); err != nil {
+	if _, err := a.EditMessage(ctx, thread.Place.PlaceID, message.MessageID, "@Haru この件もお願いします", message.Revision); err != nil {
 		t.Fatalf("edit thread message: %v", err)
 	}
 	threads, err := b.ThreadsFor(ctx)
@@ -70,6 +79,50 @@ func TestEditingThreadMessageAdmitsNewMention(t *testing.T) {
 	}
 	if got := threads[0].Participants; len(got) != 2 || got[0] != w.humanA || got[1] != w.humanB {
 		t.Fatalf("thread participants = %+v, want author and edited mention", got)
+	}
+	if got := threads[0].Place.Revision; got != beforeEdit.Place.Revision+1 {
+		t.Fatalf("thread revision after edit = %d, want %d", got, beforeEdit.Place.Revision+1)
+	}
+}
+
+func TestDeletingThreadMessageAdvancesProjectionRevisionExactlyOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, channel.PlaceID, "削除revision", "", "thread-delete-revision-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "削除する発言")
+	beforeDelete, err := owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread before delete: %v", err)
+	}
+	if _, err := owner.DeleteMessage(ctx, thread.Place.PlaceID, message.MessageID); err != nil {
+		t.Fatalf("delete thread message: %v", err)
+	}
+	afterDelete, err := owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread after delete: %v", err)
+	}
+	if got := afterDelete.Place.Revision; got != beforeDelete.Place.Revision+1 {
+		t.Fatalf("thread revision after delete = %d, want %d", got, beforeDelete.Place.Revision+1)
+	}
+	if afterDelete.MessageCount != 0 || afterDelete.LastMessagePreview != "" {
+		t.Fatalf("thread summary after delete = %+v", afterDelete)
+	}
+	// Idempotent deletion does not change the projection a second time.
+	if _, err := owner.DeleteMessage(ctx, thread.Place.PlaceID, message.MessageID); err != nil {
+		t.Fatalf("replay thread delete: %v", err)
+	}
+	replayed, err := owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("load thread after replay: %v", err)
+	}
+	if replayed.Place.Revision != afterDelete.Place.Revision {
+		t.Fatalf("replayed delete revision = %d, want %d", replayed.Place.Revision, afterDelete.Place.Revision)
 	}
 }
 
@@ -88,7 +141,33 @@ func TestThreadRejectsDeletedOriginMessage(t *testing.T) {
 	}
 }
 
-func TestNonparticipantThreadReadMarkerSurvivesBootstrap(t *testing.T) {
+func TestCreateThreadRejectsNULClientNonceAtBothIngresses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+
+	resp, body := call(t, ts, http.MethodPost,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
+		map[string]any{"name": "NUL nonce", "client_nonce": "bad\x00nonce"})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_client_nonce" {
+		t.Fatalf("browser NUL nonce = %d %v, want 400 invalid_client_nonce", resp.StatusCode, body)
+	}
+
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	status, localBody := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, map[string]any{
+		"workspace_id": workspace.WorkspaceID, "parent_place_id": channel.PlaceID,
+		"name": "NUL nonce", "client_nonce": "bad\x00nonce",
+	}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
+	if status != http.StatusBadRequest || localBody["error"] != "invalid_request" {
+		t.Fatalf("local NUL nonce = %d %v, want 400 invalid_request", status, localBody)
+	}
+}
+
+// A viewer who only reads a thread keeps a durable read marker without
+// becoming a participant, and an unjoined thread stays out of their ledger:
+// bootstrap projects the places they hold, not every place they could open.
+func TestNonparticipantThreadReadMarkerPersistsOutsideBootstrap(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w, ts := newTestServer(t, ctx)
@@ -113,6 +192,10 @@ func TestNonparticipantThreadReadMarkerSurvivesBootstrap(t *testing.T) {
 	if threads, err := viewer.ThreadsFor(ctx); err != nil || len(threads) != 0 {
 		t.Fatalf("read marker made viewer a participant: threads=%+v err=%v", threads, err)
 	}
+	// The marker is durable and is what the thread's own screen shows.
+	if seq, err := viewer.ReadMarker(ctx, thread.Place.PlaceID); err != nil || seq != message.Seq {
+		t.Fatalf("nonparticipant read marker = %d (err %v), want %d", seq, err, message.Seq)
+	}
 
 	resp, body = call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanB.ID, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -121,13 +204,256 @@ func TestNonparticipantThreadReadMarkerSurvivesBootstrap(t *testing.T) {
 	for _, raw := range body["unread_summaries"].([]any) {
 		summary := raw.(map[string]any)
 		if summary["place"].(map[string]any)["thread_id"] == thread.Place.PlaceID {
-			if summary["unread_count"] != float64(0) || summary["latest_seq"] != float64(message.Seq) {
-				t.Fatalf("thread unread summary after bootstrap = %v", summary)
-			}
-			return
+			t.Fatalf("bootstrap projected an unjoined thread: %v", summary)
 		}
 	}
-	t.Fatalf("bootstrap unread summaries omitted visible thread: %v", body["unread_summaries"])
+	if threads, ok := body["threads"].([]any); ok && len(threads) != 0 {
+		t.Fatalf("bootstrap threads for a nonparticipant = %v", threads)
+	}
+}
+
+// A Workspace holds more threads than one reconnect handshake may carry, and
+// anyone who can post can make another one. If bootstrap projected all of them
+// the client would send one cursor per thread, the handshake would be refused
+// outright, and the same bootstrap would rebuild the same rejected ledger on
+// every reload — live delivery would stop permanently.
+func TestManyUnjoinedThreadsStayOutOfBootstrapAndTheHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	joined, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "参加している枝", "", "thread-handshake-joined")
+	if err != nil {
+		t.Fatalf("create joined thread: %v", err)
+	}
+	ids := make([]string, 0, maxHelloCursors+16)
+	for range cap(ids) {
+		ids = append(ids, newUUIDv7())
+	}
+	if _, err := w.store.pool.Exec(ctx, `
+		INSERT INTO places (place_id, kind, workspace_id, name, parent_place_id)
+		SELECT id, 'thread', $2, 'unjoined-' || ordinality, $3
+		FROM unnest($1::text[]) WITH ORDINALITY AS listed(id, ordinality)`,
+		ids, DefaultWorkspaceID, DefaultGeneralChannelID); err != nil {
+		t.Fatalf("seed unjoined threads: %v", err)
+	}
+
+	resp, body := call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanB.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bootstrap: status %d body %v", resp.StatusCode, body)
+	}
+	// Build the handshake exactly as the browser client does: one cursor per
+	// place bootstrap summarized.
+	cursors := map[string]int64{}
+	for _, raw := range body["unread_summaries"].([]any) {
+		place := raw.(map[string]any)["place"].(map[string]any)
+		for _, key := range []string{"channel_id", "dm_id", "thread_id"} {
+			if id, ok := place[key].(string); ok && id != "" {
+				cursors[id] = int64(raw.(map[string]any)["latest_seq"].(float64))
+			}
+		}
+	}
+	if _, projected := cursors[joined.Place.PlaceID]; projected {
+		t.Fatal("bootstrap projected a thread the viewer never joined")
+	}
+	if len(cursors) > maxHelloCursors {
+		t.Fatalf("bootstrap projected %d places, over the %d the handshake accepts",
+			len(cursors), maxHelloCursors)
+	}
+	// dialWS fails the test unless the handshake is accepted.
+	dialWS(t, ts, w.humanB.ID, cursors)
+
+	// Participation, not Workspace visibility, is what carries a thread.
+	resp, body = call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("owner bootstrap: status %d body %v", resp.StatusCode, body)
+	}
+	found := false
+	for _, raw := range body["unread_summaries"].([]any) {
+		place := raw.(map[string]any)["place"].(map[string]any)
+		if place["thread_id"] == joined.Place.PlaceID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("bootstrap omitted the thread its viewer participates in")
+	}
+}
+
+// Live thread traffic belongs to its participants. A Workspace member who
+// opens a thread they never joined still sees it arrive while it is on screen,
+// and stops receiving it when they leave — reading is not joining.
+func TestThreadLiveDeliveryIsParticipationScopedUntilTheThreadIsOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "参加者の枝", "", "thread-live-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	participant := dialWS(t, ts, w.humanA.ID, nil)
+	viewer := dialWS(t, ts, w.humanB.ID, nil)
+
+	post := func(content, nonce string) {
+		t.Helper()
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": nonce})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+	expectMessage := func(conn *websocket.Conn, content string) {
+		t.Helper()
+		frame := readFrame(t, conn)
+		event, _ := frame["event"].(map[string]any)
+		message, _ := event["message"].(map[string]any)
+		if frame["type"] != "event" || message["content"] != content {
+			t.Fatalf("expected %q, got %v", content, frame)
+		}
+	}
+	// Frames reach one subscriber in the order they were queued, and each post
+	// has already fanned out by the time it responds. So the first frame that
+	// answers the declaration is proof that nothing was delivered before it — a
+	// read timeout would prove the same thing but permanently break the socket.
+	// The declaration says the client already holds everything committed so far,
+	// which leaves the replay empty and caught_up first.
+	declareOpenHoldingAll := func(conn *websocket.Conn, placeID string) {
+		t.Helper()
+		place, err := owner.PlaceFor(ctx, placeID)
+		if err != nil {
+			t.Fatalf("read place %s: %v", placeID, err)
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := conn.WriteJSON(map[string]any{
+			"type": "open", "place_id": placeID, "since": place.LastSeq,
+		}); err != nil {
+			t.Fatalf("declare open place: %v", err)
+		}
+		if frame := readFrame(t, conn); frame["type"] != "caught_up" || frame["place_id"] != placeID {
+			t.Fatalf("first frame after open = %v, want caught_up for %s", frame, placeID)
+		}
+		if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != placeID {
+			t.Fatalf("frame after replay = %v, want open_ack for %s", frame, placeID)
+		}
+	}
+
+	post("参加者だけに届く", "thread-live-nonce-1")
+	expectMessage(participant, "参加者だけに届く")
+	declareOpenHoldingAll(viewer, thread.Place.PlaceID)
+
+	post("開いている間は届く", "thread-live-nonce-2")
+	expectMessage(participant, "開いている間は届く")
+	expectMessage(viewer, "開いている間は届く")
+
+	_ = viewer.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := viewer.WriteJSON(map[string]any{"type": "close", "place_id": thread.Place.PlaceID}); err != nil {
+		t.Fatalf("close place: %v", err)
+	}
+	post("閉じたら届かない", "thread-live-nonce-3")
+	expectMessage(participant, "閉じたら届かない")
+	declareOpenHoldingAll(viewer, DefaultGeneralChannelID)
+
+	// Reading never admitted the viewer as a participant.
+	viewerStore := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
+	if threads, err := viewerStore.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("watching admitted a participant: threads=%+v err=%v", threads, err)
+	}
+}
+
+// One thread summary must describe one moment. Its message count and its
+// participant list used to come from two statements, so a message that admitted
+// its author could be counted before that author appeared — a state that never
+// existed in the database.
+func TestThreadSummaryProjectsOneMoment(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	viewer := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	joined := func(thread Thread) bool {
+		for _, participant := range thread.Participants {
+			if participant == w.humanB {
+				return true
+			}
+		}
+		return false
+	}
+	for round := range 20 {
+		nonce := fmt.Sprintf("thread-snapshot-%d", round)
+		thread, _, err := owner.CreateThread(ctx, channel.PlaceID, nonce, "", nonce)
+		if err != nil {
+			t.Fatalf("create thread: %v", err)
+		}
+		w.send(t, ctx, thread.Place.PlaceID, w.humanA, "起点")
+		written := make(chan error, 1)
+		go func() {
+			_, _, err := w.store.AppendMessage(ctx, AppendInput{
+				PlaceID: thread.Place.PlaceID, Author: w.humanB,
+				Content: "参加と同時の一通", ClientNonce: nonce + "-reply",
+			})
+			written <- err
+		}()
+		for {
+			summary, err := viewer.ThreadFor(ctx, thread.Place.PlaceID)
+			if err != nil {
+				t.Fatalf("read thread summary: %v", err)
+			}
+			if (summary.MessageCount == 2) != joined(summary) {
+				t.Fatalf("summary showed a moment that never existed: count=%d participants=%+v",
+					summary.MessageCount, summary.Participants)
+			}
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatalf("concurrent reply: %v", err)
+				}
+				final, err := viewer.ThreadFor(ctx, thread.Place.PlaceID)
+				if err != nil {
+					t.Fatalf("read committed summary: %v", err)
+				}
+				if final.MessageCount != 2 || !joined(final) {
+					t.Fatalf("committed summary = count %d participants %+v",
+						final.MessageCount, final.Participants)
+				}
+			default:
+				continue
+			}
+			break
+		}
+	}
+}
+
+// A store failure is not an answer about existence. Reporting it as not-found
+// makes a client mark a thread it can see as permanently gone.
+func TestThreadReadReportsStoreFailureInsteadOfNotFound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, channel.PlaceID, "障害中", "", "thread-failure-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	if _, err := w.store.pool.Exec(ctx, "ALTER TABLE places RENAME TO places_unavailable"); err != nil {
+		t.Fatalf("inject store failure: %v", err)
+	}
+	_, err = owner.ThreadFor(ctx, thread.Place.PlaceID)
+	if err == nil || errors.Is(err, ErrPlaceNotFound) {
+		t.Fatalf("thread read during a store failure = %v, want the failure itself", err)
+	}
+	if _, err := w.store.pool.Exec(ctx, "ALTER TABLE places_unavailable RENAME TO places"); err != nil {
+		t.Fatalf("restore store: %v", err)
+	}
+	if _, err := owner.ThreadFor(ctx, thread.Place.PlaceID); err != nil {
+		t.Fatalf("thread read after recovery: %v", err)
+	}
+	if _, err := owner.ThreadFor(ctx, channel.PlaceID); !errors.Is(err, ErrPlaceNotFound) {
+		t.Fatalf("non-thread place = %v, want ErrPlaceNotFound", err)
+	}
 }
 
 func TestConcurrentThreadParticipantAdmissionIsIdempotent(t *testing.T) {
@@ -213,18 +539,25 @@ func TestThreadHTTPRoutesReturnParentRelation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w, server := newTestServer(t, ctx)
+	origin := w.send(t, ctx, DefaultGeneralChannelID, w.humanA, "HTTP origin")
 	resp, body := call(t, server, http.MethodPost,
 		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
-		map[string]any{"name": "HTTP thread", "parent_message_id": "", "client_nonce": "thread-http-1"})
+		map[string]any{"name": "HTTP thread", "parent_message_id": origin.MessageID, "client_nonce": "thread-http-1"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status %d body %v", resp.StatusCode, body)
 	}
 	threadID, _ := body["thread_id"].(string)
 	replayed, replayBody := call(t, server, http.MethodPost,
 		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
-		map[string]any{"name": "HTTP thread", "parent_message_id": "", "client_nonce": "thread-http-1"})
+		map[string]any{"name": "HTTP thread", "parent_message_id": origin.MessageID, "client_nonce": "thread-http-1"})
 	if replayed.StatusCode != http.StatusOK || replayBody["thread_id"] != threadID {
 		t.Fatalf("replayed create status %d body %v, want existing %q", replayed.StatusCode, replayBody, threadID)
+	}
+	conflict, conflictBody := call(t, server, http.MethodPost,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
+		map[string]any{"name": "different retry", "parent_message_id": origin.MessageID, "client_nonce": "thread-http-conflict-1"})
+	if conflict.StatusCode != http.StatusConflict || conflictBody["error"] != "thread_exists" || conflictBody["thread"].(map[string]any)["thread_id"] != threadID {
+		t.Fatalf("existing thread conflict status %d body %v, want thread %q", conflict.StatusCode, conflictBody, threadID)
 	}
 	resp, body = call(t, server, http.MethodGet, "/messaging/places/"+threadID, w.humanB.ID, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -247,4 +580,222 @@ func TestThreadHTTPRejectsNULName(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_name" {
 		t.Fatalf("NUL thread name = %d %v, want 400 invalid_name", resp.StatusCode, body)
 	}
+}
+
+// A cursor says where a client stopped reading, not what it is entitled to
+// read. A thread is visible Workspace-wide, so a viewer who once opened one
+// keeps a working cursor for it; replaying on that alone would push a
+// background conversation back into someone who never joined it. Replay
+// follows the same line as live delivery — participation, or an open
+// declaration on this connection — and the deferred half arrives after the
+// open frame, never before it.
+func TestThreadCatchUpFollowsParticipationNotTheClientsCursor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "背景の枝", "", "thread-catchup-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	for i, content := range []string{"先に置いておく", "二通目"} {
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": fmt.Sprintf("thread-catchup-post-%d", i)})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+
+	expectMessage := func(conn *websocket.Conn, content string) {
+		t.Helper()
+		frame := readFrame(t, conn)
+		event, _ := frame["event"].(map[string]any)
+		message, _ := event["message"].(map[string]any)
+		if frame["type"] != "event" || message["content"] != content {
+			t.Fatalf("expected replayed %q, got %v", content, frame)
+		}
+	}
+	expectCaughtUp := func(conn *websocket.Conn, placeID string) {
+		t.Helper()
+		if frame := readFrame(t, conn); frame["type"] != "caught_up" || frame["place_id"] != placeID {
+			t.Fatalf("expected caught_up for %s, got %v", placeID, frame)
+		}
+	}
+	declareOpen := func(conn *websocket.Conn, placeID string, since int64) {
+		t.Helper()
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := conn.WriteJSON(map[string]any{
+			"type": "open", "place_id": placeID, "since": since,
+		}); err != nil {
+			t.Fatalf("declare open place: %v", err)
+		}
+	}
+	expectOpenAck := func(conn *websocket.Conn, placeID string) {
+		t.Helper()
+		if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != placeID {
+			t.Fatalf("expected open_ack for %s, got %v", placeID, frame)
+		}
+	}
+
+	// The participant holds the thread, so the handshake alone replays it.
+	participant := dialWS(t, ts, w.humanA.ID, map[string]int64{thread.Place.PlaceID: 0})
+	expectMessage(participant, "先に置いておく")
+	expectMessage(participant, "二通目")
+	expectCaughtUp(participant, thread.Place.PlaceID)
+
+	// The viewer claims the same cursor without ever having joined. Opening a
+	// different place proves the handshake replayed nothing for the thread:
+	// its acknowledgement is the first frame after hello_ack.
+	viewer := dialWS(t, ts, w.humanB.ID, map[string]int64{thread.Place.PlaceID: 0})
+	channel, err := owner.PlaceFor(ctx, DefaultGeneralChannelID)
+	if err != nil {
+		t.Fatalf("read channel place: %v", err)
+	}
+	declareOpen(viewer, DefaultGeneralChannelID, channel.LastSeq)
+	expectCaughtUp(viewer, DefaultGeneralChannelID)
+	expectOpenAck(viewer, DefaultGeneralChannelID)
+
+	// Declaring the thread open is what finally admits the deferred replay, and
+	// it lands before the acknowledgement like any other cursor's.
+	declareOpen(viewer, thread.Place.PlaceID, 0)
+	expectMessage(viewer, "先に置いておく")
+	expectMessage(viewer, "二通目")
+	expectCaughtUp(viewer, thread.Place.PlaceID)
+	expectOpenAck(viewer, thread.Place.PlaceID)
+
+	// Replay is delivery, not admission: the viewer is still not a participant.
+	viewerStore := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
+	if threads, err := viewerStore.ThreadsFor(ctx); err != nil || len(threads) != 0 {
+		t.Fatalf("catch-up admitted a participant: threads=%+v err=%v", threads, err)
+	}
+}
+
+// A reconnecting browser sends hello with every held cursor and immediately
+// re-declares its selected place. Those are two transport declarations for one
+// connection, not two requests to replay the same durable range (and not two
+// chances to present the same notification).
+func TestHelloAndOpenShareOnePlaceReplayHighWater(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "再接続の枝", "", "thread-replay-high-water")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	for i, content := range []string{"切断中の一通目", "切断中の二通目"} {
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": fmt.Sprintf("thread-replay-high-water-%d", i)})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+
+	conn := dialWS(t, ts, w.humanA.ID, map[string]int64{thread.Place.PlaceID: 0})
+	messageCount := 0
+	caughtUpCount := 0
+	for range 3 {
+		frame := readFrame(t, conn)
+		switch frame["type"] {
+		case "event":
+			event, _ := frame["event"].(map[string]any)
+			if event["type"] != EventMessageCreated || event["place_id"] != thread.Place.PlaceID {
+				t.Fatalf("unexpected replay event: %v", frame)
+			}
+			messageCount++
+		case "caught_up":
+			if frame["place_id"] != thread.Place.PlaceID {
+				t.Fatalf("unexpected caught_up: %v", frame)
+			}
+			caughtUpCount++
+		default:
+			t.Fatalf("unexpected hello replay frame: %v", frame)
+		}
+	}
+	if messageCount != 2 || caughtUpCount != 1 {
+		t.Fatalf("hello replay messages=%d caught_up=%d, want 2 and 1", messageCount, caughtUpCount)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "open", "place_id": thread.Place.PlaceID, "since": 0,
+	}); err != nil {
+		t.Fatalf("open after hello: %v", err)
+	}
+	// replay and caught_up are ordered before open_ack. Seeing the acknowledgement
+	// next proves neither is queued a second time for the same place/head.
+	if frame := readFrame(t, conn); frame["type"] != "open_ack" || frame["place_id"] != thread.Place.PlaceID {
+		t.Fatalf("hello+open replayed a duplicate frame before acknowledgement: %v", frame)
+	}
+}
+
+// A screen is opened after its history has been fetched, so the declaration and
+// the fetch cannot be made simultaneous: whatever commits between them is in
+// neither. It is not in the page the client already holds, and it is not live,
+// because until the frame arrives the connection has not said it is looking at
+// the thread. The open frame therefore carries how far the client holds, and
+// the server replays from there before acknowledging.
+func TestThreadOpenReplaysWhatCommittedWhileTheDeclarationWasInFlight(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	owner := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanA)
+	thread, _, err := owner.CreateThread(ctx, DefaultGeneralChannelID, "行き違う枝", "", "thread-open-gap-1")
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	post := func(content, nonce string) {
+		t.Helper()
+		resp, body := call(t, ts, http.MethodPost,
+			"/messaging/places/"+thread.Place.PlaceID+"/messages", w.humanA.ID,
+			map[string]any{"content": content, "client_nonce": nonce})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("post %q: status %d body %v", content, resp.StatusCode, body)
+		}
+	}
+	expectMessage := func(conn *websocket.Conn, content string) {
+		t.Helper()
+		frame := readFrame(t, conn)
+		event, _ := frame["event"].(map[string]any)
+		message, _ := event["message"].(map[string]any)
+		if frame["type"] != "event" || message["content"] != content {
+			t.Fatalf("expected %q, got %v", content, frame)
+		}
+	}
+
+	post("画面が読み込んだ分", "thread-open-gap-post-1")
+	// The screen fetched its history here: this is everything the client holds.
+	held, err := owner.PlaceFor(ctx, thread.Place.PlaceID)
+	if err != nil {
+		t.Fatalf("read thread place: %v", err)
+	}
+
+	// The socket is already up and carries no cursor for a thread this viewer
+	// never joined, so the handshake deferred nothing to flush.
+	viewer := dialWS(t, ts, w.humanB.ID, nil)
+	post("取得と宣言の隙間", "thread-open-gap-post-2")
+
+	_ = viewer.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := viewer.WriteJSON(map[string]any{
+		"type": "open", "place_id": thread.Place.PlaceID, "since": held.LastSeq,
+	}); err != nil {
+		t.Fatalf("declare open place: %v", err)
+	}
+
+	// The gap arrives by replay, before the acknowledgement. Frames reach one
+	// subscriber in the order they were queued, so this is also proof that the
+	// page the client already holds was not replayed on top of it.
+	expectMessage(viewer, "取得と宣言の隙間")
+	if frame := readFrame(t, viewer); frame["type"] != "caught_up" || frame["place_id"] != thread.Place.PlaceID {
+		t.Fatalf("expected caught_up for the thread, got %v", frame)
+	}
+	if frame := readFrame(t, viewer); frame["type"] != "open_ack" || frame["place_id"] != thread.Place.PlaceID {
+		t.Fatalf("expected open_ack after the replay, got %v", frame)
+	}
+
+	// Live delivery starts at the declaration, so replay and live overlap
+	// rather than leaving a second gap behind the first.
+	post("開いてからのlive", "thread-open-gap-post-3")
+	expectMessage(viewer, "開いてからのlive")
 }

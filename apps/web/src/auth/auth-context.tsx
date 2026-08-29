@@ -22,6 +22,7 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import { startPushSubscriptionLogoutCleanup } from "../messaging/push";
 import {
   clearPendingConfirmation,
   loadPendingConfirmation,
@@ -57,9 +58,12 @@ import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
   AuthAPIError,
+  type ConfirmedSumiProfile,
   canonicalizeSumiDisplayName,
+  getSumiProfile,
   getSumiSession,
   logoutSumiSession,
+  type SumiProfilePatch,
   SumiProfileUpdateIndeterminateError,
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
@@ -146,6 +150,9 @@ export interface AuthContextValue {
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
+  updateProfile: (
+    patch: SumiProfilePatch,
+  ) => Promise<ConfirmedSumiProfile | null>;
   updateDisplayName: (displayName: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
@@ -730,33 +737,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setOutcomeNotice(null);
   }, []);
 
-  const updateDisplayName = useCallback(
-    async (displayName: string) => {
+  const updateProfile = useCallback(
+    async (patch: SumiProfilePatch): Promise<ConfirmedSumiProfile | null> => {
       const generation = nextGeneration();
-      await serializeSessionMutation(async () => {
-        if (!isCurrentGeneration(generation)) return;
+      return serializeSessionMutation(async () => {
+        if (!isCurrentGeneration(generation)) return null;
         const current = serverSession.current;
         if (!current.authenticated) {
           throw new AuthAPIError("Authentication is unavailable.", 401);
         }
-        const requestedDisplayName = canonicalizeSumiDisplayName(displayName);
-        let updatedUser: { id: string; displayName: string };
+        const requested: SumiProfilePatch = {};
+        if (patch.displayName !== undefined) {
+          requested.displayName = canonicalizeSumiDisplayName(
+            patch.displayName,
+          );
+        }
+        if (patch.tagline !== undefined) {
+          requested.tagline = patch.tagline.trim();
+        }
+        let updatedUser: Awaited<ReturnType<typeof updateSumiProfile>>;
         try {
-          updatedUser = await updateSumiProfile(requestedDisplayName);
+          updatedUser = await updateSumiProfile(requested);
         } catch (error) {
-          if (!isCurrentGeneration(generation)) return;
-          if (
-            error instanceof AuthAPIError &&
-            (error.status < 200 || error.status >= 300)
-          ) {
+          if (!isCurrentGeneration(generation)) return null;
+          if (isDefinitiveProfileUpdateRejection(error)) {
             throw error;
           }
-
           let reconciled: SumiSessionStatus;
           try {
             reconciled = await getSumiSession();
           } catch (reconciliationError) {
-            if (!isCurrentGeneration(generation)) return;
+            if (!isCurrentGeneration(generation)) return null;
             throw new SumiProfileUpdateIndeterminateError(
               new AggregateError(
                 [error, reconciliationError],
@@ -764,53 +775,87 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               ),
             );
           }
-          if (!isCurrentGeneration(generation)) return;
+          if (!isCurrentGeneration(generation)) return null;
           if (
             !reconciled.authenticated ||
             reconciled.user.id !== current.user.id
           ) {
-            const authorityCleared = clearDirectChatAuthority();
-            serverSession.current = { authenticated: false };
-            setSession({ authenticated: false });
-            setSessionState(
-              !reconciled.authenticated && authorityCleared
-                ? "unauthenticated"
-                : "unavailable",
-            );
+            flushSync(() => {
+              const authorityCleared = clearDirectChatAuthority();
+              serverSession.current = { authenticated: false };
+              setSession({ authenticated: false });
+              setSessionState(
+                !reconciled.authenticated && authorityCleared
+                  ? "unauthenticated"
+                  : "unavailable",
+              );
+            });
             throw new SumiProfileUpdateIndeterminateError(error);
           }
-          if (reconciled.authorityBindingId !== current.authorityBindingId) {
-            try {
-              bindDirectChatAuthority(reconciled.authorityBindingId);
-            } catch (bindingError) {
+          try {
+            flushSync(() => {
+              if (
+                reconciled.authorityBindingId !== current.authorityBindingId
+              ) {
+                bindDirectChatAuthority(reconciled.authorityBindingId);
+              }
+              serverSession.current = reconciled;
+              setSession(reconciled);
+              setSessionState("authenticated");
+            });
+          } catch (bindingError) {
+            flushSync(() => {
               clearDirectChatAuthority();
               serverSession.current = { authenticated: false };
               setSession({ authenticated: false });
               setSessionState("unavailable");
-              throw new SumiProfileUpdateIndeterminateError(
-                new AggregateError(
-                  [error, bindingError],
-                  "Profile reconciliation could not replace browser authority.",
-                ),
-              );
-            }
+            });
+            throw new SumiProfileUpdateIndeterminateError(
+              new AggregateError(
+                [error, bindingError],
+                "Profile reconciliation could not replace browser authority.",
+              ),
+            );
           }
-          serverSession.current = reconciled;
-          setSession(reconciled);
-          setSessionState("authenticated");
-          if (
-            reconciled.user.displayName === null ||
-            canonicalizeSumiDisplayName(reconciled.user.displayName) !==
-              requestedDisplayName
-          ) {
-            if (reconciled.user.displayName === current.user.displayName) {
-              throw error;
-            }
+          let reconciledProfile: ConfirmedSumiProfile;
+          try {
+            reconciledProfile = await getSumiProfile();
+          } catch (reconciliationError) {
+            if (!isCurrentGeneration(generation)) return null;
+            throw new SumiProfileUpdateIndeterminateError(
+              new AggregateError(
+                [error, reconciliationError],
+                "Profile update and reconciliation both failed.",
+              ),
+            );
+          }
+          if (!isCurrentGeneration(generation)) return null;
+          if (reconciledProfile.participant.humanId !== current.user.id) {
             throw new SumiProfileUpdateIndeterminateError(error);
           }
-          return;
+          const reconciledSession: SumiSessionStatus = {
+            ...reconciled,
+            user: {
+              ...reconciled.user,
+              displayName: reconciledProfile.displayName,
+            },
+          };
+          serverSession.current = reconciledSession;
+          setSession(reconciledSession);
+          setSessionState("authenticated");
+          const displayNameMatches =
+            requested.displayName === undefined ||
+            canonicalizeSumiDisplayName(reconciledProfile.displayName) ===
+              requested.displayName;
+          const taglineMatches =
+            requested.tagline === undefined ||
+            reconciledProfile.tagline === requested.tagline;
+          if (displayNameMatches && taglineMatches) {
+            return reconciledProfile;
+          }
+          throw new SumiProfileUpdateIndeterminateError(error);
         }
-        if (!isCurrentGeneration(generation)) return;
+        if (!isCurrentGeneration(generation)) return null;
         if (updatedUser.id !== current.user.id) {
           throw new AuthAPIError("Profile identity changed.", 409);
         }
@@ -820,9 +865,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         };
         serverSession.current = nextSession;
         setSession(nextSession);
+        return updatedUser.profile;
       });
     },
     [isCurrentGeneration, nextGeneration, serializeSessionMutation],
+  );
+
+  const updateDisplayName = useCallback(
+    async (displayName: string) => {
+      await updateProfile({ displayName });
+    },
+    [updateProfile],
   );
 
   const logout = useCallback(async () => {
@@ -848,6 +901,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       );
       throw error;
     }
+    startPushSubscriptionLogoutCleanup();
     let authorityCleared = true;
     if (isCurrentGeneration(generation)) {
       // Server logout is the authority transition. Commit it before touching
@@ -912,6 +966,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       confirmIntentTransition,
       cancelIntentTransition,
       dismissOutcomeNotice,
+      updateProfile,
       updateDisplayName,
       logout,
       refreshSession,
@@ -934,6 +989,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       outcomeNotice,
       user,
+      updateProfile,
       updateDisplayName,
     ],
   );
@@ -956,6 +1012,16 @@ export function classifySessionFailure(error: unknown): AuthSessionState {
     }
   }
   return "unavailable";
+}
+
+function isDefinitiveProfileUpdateRejection(error: unknown): boolean {
+  return (
+    error instanceof AuthAPIError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429
+  );
 }
 
 function createProvider(providerName: SignInProvider): FirebaseAuthProvider {

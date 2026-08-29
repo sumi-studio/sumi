@@ -16,14 +16,35 @@ import { resetNotificationAudio } from "./notifications";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
+  notifiableUnreadCount,
   notificationLevelFor,
   useMessaging,
 } from "./store";
 
 const SELF = { kind: "human", humanId: "human-1" } as const;
 const OTHER = { kind: "human", humanId: "human-2" } as const;
-const CHANNEL: Place = { kind: "channel", channelId: "channel-1" };
+const PARENT_CHANNEL = { kind: "channel", channelId: "channel-1" } as const;
+const CHANNEL: Place = PARENT_CHANNEL;
 const CHANNEL_KEY: PlaceKey = "channel:channel-1";
+
+function threadIn(
+  threadId: string,
+  participants: ThreadSummary["participants"],
+): ThreadSummary {
+  return {
+    threadId,
+    revision: 1,
+    workspaceId: "ws",
+    parentPlace: PARENT_CHANNEL,
+    parentMessageId: "message-0",
+    name: threadId,
+    messageCount: 1,
+    lastMessageAt: 1,
+    lastMessage: "",
+    participants,
+    latestSeq: 1,
+  };
+}
 
 /** MessagingBackendの最小実装。設定の送信と、event配送だけを見る。 */
 class StubBackend implements MessagingBackend {
@@ -69,6 +90,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "ws",
+          revision: 1,
           name: "dev",
           topic: "",
           visibility: "public",
@@ -114,13 +136,18 @@ class StubBackend implements MessagingBackend {
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): ReturnType<
-    MessagingBackend["updateChannelTopic"]
-  > {
+  async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): ReturnType<MessagingBackend["duplicateChannel"]> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {
     throw new Error("uploadAttachment is not part of this test");
+  }
+
+  async updateDraftAttachment(): Promise<never> {
+    throw new Error("updateDraftAttachment is not part of this test");
   }
   attachmentURL(attachmentId: string): string {
     return `/test/attachments/${attachmentId}`;
@@ -133,8 +160,12 @@ class StubBackend implements MessagingBackend {
       created: true,
     };
   }
-  async editMessage(): Promise<void> {}
-  async deleteMessage(): Promise<void> {}
+  async editMessage(): ReturnType<MessagingBackend["editMessage"]> {
+    throw new Error("unused");
+  }
+  async deleteMessage(): ReturnType<MessagingBackend["deleteMessage"]> {
+    throw new Error("unused");
+  }
   async markRead(): Promise<void> {}
   async setStatus(): ReturnType<MessagingBackend["setStatus"]> {
     throw new Error("unused");
@@ -426,7 +457,7 @@ describe("notification settings in the store", () => {
 });
 
 describe("presenting an incoming message", () => {
-  it("calls the person when the server said so and the tab is elsewhere", () => {
+  it("leaves OS notification presentation to the Service Worker", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
 
     backend.emit({
@@ -435,17 +466,28 @@ describe("presenting an incoming message", () => {
       notify: { reason: "keyword" },
     });
 
+    expect(FakeNotification.constructed).toHaveLength(0);
+  });
+
+  it("presents a repeated message_created frame only once", () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const event = {
+      type: "message_created" as const,
+      message: incoming(),
+      notify: { reason: "keyword" as const },
+    };
+
+    backend.emit(event);
+    backend.emit(event);
+
     expect(FakeNotification.constructed).toHaveLength(1);
-    expect(FakeNotification.constructed[0]?.title).toBe("#dev — Kuro");
-    expect(FakeNotification.constructed[0]?.options.body).toBe(
-      "デプロイの件です",
-    );
   });
 
   it("names the thread in a called thread notification", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const thread: ThreadSummary = {
       threadId: "thread-1",
+      revision: 1,
       workspaceId: "ws",
       parentPlace: CHANNEL,
       parentMessageId: "message-0",
@@ -467,6 +509,28 @@ describe("presenting an incoming message", () => {
     });
 
     expect(FakeNotification.constructed[0]?.title).toBe("設計レビュー — Kuro");
+  });
+
+  it("タブの件数は自分の台帳にあるplaceだけを数える", () => {
+    // URLで開いただけのthreadはsidebarにもbootstrapのthreadsにも出ない。
+    // その未読をタイトルへ足すと、どのバッジにも無い数字だけが増える。
+    useMessaging.setState({
+      threadsById: {
+        "thread-joined": threadIn("thread-joined", [SELF, OTHER]),
+        "thread-visiting": threadIn("thread-visiting", [OTHER]),
+      },
+      unreadCountByPlace: {
+        [CHANNEL_KEY]: 2,
+        "thread:thread-joined": 3,
+        "thread:thread-visiting": 40,
+        "thread:thread-not-hydrated": 7,
+      },
+      mentionCountByPlace: {},
+      notificationDefaultLevel: "all",
+      notificationLevelByPlace: {},
+    });
+
+    expect(notifiableUnreadCount(useMessaging.getState())).toBe(5);
   });
 
   it("stays quiet when the server did not call this person", () => {

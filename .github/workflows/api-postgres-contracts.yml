@@ -39,6 +39,33 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify migration history against exact base commit
+        env:
+          MIGRATION_FREEZE_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          MIGRATION_FREEZE_EVENT_NAME: ${{ github.event_name }}
+          MIGRATION_FREEZE_PUSH_DELETED: ${{ github.event_name == 'push' && github.event.deleted || false }}
+        run: |
+          if [[ "${MIGRATION_FREEZE_EVENT_NAME}" == "push" && "${MIGRATION_FREEZE_PUSH_DELETED}" == "true" ]]; then
+            echo "ref deletion has no candidate migration tree to verify" >&2
+            exit 1
+          fi
+
+          if [[ ! "${MIGRATION_FREEZE_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] || \
+             [[ "${MIGRATION_FREEZE_BASE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+            echo "migration freeze base must be a nonzero lowercase 40-hex commit SHA" >&2
+            exit 1
+          fi
+
+          if ! git cat-file -e "${MIGRATION_FREEZE_BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "${MIGRATION_FREEZE_BASE_SHA}"
+          fi
+          git cat-file -e "${MIGRATION_FREEZE_BASE_SHA}^{commit}"
+
+          node --test ../../scripts/dev/migration-freeze.test.mjs
+          node ../../scripts/dev/migration-freeze.mjs verify-base "${MIGRATION_FREEZE_BASE_SHA}"
 
       - name: Set up Go
         uses: actions/setup-go@v7

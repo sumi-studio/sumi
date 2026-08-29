@@ -560,7 +560,7 @@ func (s *testMessagingStore) EditMessage(ctx context.Context, placeID, messageID
 	if err != nil {
 		return Message{}, err
 	}
-	return scoped.EditMessage(ctx, placeID, messageID, content)
+	return scoped.EditMessage(ctx, placeID, messageID, content, 1)
 }
 
 func (s *testMessagingStore) DeleteMessage(ctx context.Context, placeID, messageID string, actor ParticipantRef) (Message, error) {

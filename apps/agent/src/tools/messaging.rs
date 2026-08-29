@@ -22,13 +22,16 @@ use uuid::{Uuid, Variant, Version};
 use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
-        CreateMessagingPollRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
-        ExactMessagingScope, GetMessagingCallStateRequest, ListMessagingThreadsRequest,
-        MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+        CreateMessagingThreadRequest, DuplicateMessagingChannelRequest, ExactMessagingScope,
+        GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
+        MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
         OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
         ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
-        UploadMessagingAttachmentRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
+        StartMessagingDMRequest, UpdateMessagingChannelRequest, UploadMessagingAttachmentRequest,
+        WriteMessagingMessageRequest,
     },
     approval::authority::MessagingSourceSigningContinuation,
     provider::types::{ToolDefinition, UserContent},
@@ -45,7 +48,7 @@ use crate::{
 
 const TOOL_NAME: &str = "messaging";
 const BINDING_ADAPTER_ID: &str = "sumi.messaging";
-const BINDING_ADAPTER_VERSION: u32 = 3;
+const BINDING_ADAPTER_VERSION: u32 = 5;
 const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const ATTACHMENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-attachment-upload-v1";
 const SOURCE_EXECUTION_ID_DOMAIN: &[u8] = b"sumi-messaging-source-execution-v1";
@@ -55,6 +58,18 @@ const MAX_REPLY_ID_BYTES: usize = 256;
 const MAX_MESSAGE_ID_BYTES: usize = 256;
 const MAX_CLIENT_NONCE_BYTES: usize = 128;
 const MAX_MARKER_ID_BYTES: usize = 256;
+const MAX_PARTICIPANT_ID_BYTES: usize = 256;
+// The server bounds a channel name at 200 characters and a topic at 1000
+// bytes; four bytes per character covers any UTF-8 within the name bound.
+const MAX_CHANNEL_NAME_CHARS: usize = 200;
+const MAX_CHANNEL_NAME_BYTES: usize = 800;
+// Thread names share the API's Unicode-code-point bound. Rust `chars()` is
+// the corresponding scalar-value count for valid UTF-8 input.
+const MAX_THREAD_NAME_CHARS: usize = 100;
+const MAX_TOPIC_BYTES: usize = 1000;
+// A group dm the agent opens in one gesture. Far beyond any real conversation,
+// tight enough that a malformed argument cannot fan out.
+const MAX_DM_PARTICIPANTS: usize = 32;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
 // The server counts characters, not bytes, so this check must too: a 201
@@ -64,6 +79,11 @@ const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
 const DEFAULT_OPEN_LIMIT: usize = 20;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
+const MAX_SEARCH_QUERY_BYTES: usize = 200;
+const MAX_SEARCH_LIMIT: u16 = 50;
+const MAX_NOTIFICATION_KEYWORDS: usize = 32;
+const MAX_NOTIFICATION_KEYWORD_CHARS: usize = 64;
+const MAX_NOTIFICATION_PLACES: usize = 200;
 const MESSAGING_APP_ID: &str = "messaging";
 // A single PersonalityAgent is single-threaded and normally inhabits only a
 // handful of Workspace installations at once. Sixteen retains ample locality
@@ -71,11 +91,8 @@ const MESSAGING_APP_ID: &str = "messaging";
 const MAX_CACHED_MESSAGING_VIEWS: usize = 16;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
-const MAX_THREAD_NAME_CHARS: usize = 100;
-const MAX_POLL_QUESTION_CHARS: usize = 500;
-const MAX_POLL_OPTION_CHARS: usize = 200;
-const MIN_POLL_OPTIONS: usize = 2;
-const MAX_POLL_OPTIONS: usize = 10;
+/// The API's MaxAttachmentAltRunes: the sender's description of a file.
+const MAX_ATTACHMENT_ALT_CHARS: usize = 1000;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MessagingProposal {
@@ -107,26 +124,6 @@ enum MessagingAction {
         #[serde(default)]
         seq: Option<u64>,
     },
-    /// Ask the open place a question. The poll and its carrier message commit together.
-    CreatePoll {
-        question: String,
-        options: Vec<String>,
-        #[serde(default)]
-        allow_multi: bool,
-        #[serde(default)]
-        content: Option<String>,
-        #[serde(default)]
-        closes_in_minutes: Option<u32>,
-    },
-    /// Replace this person's entire answer to a poll on a visible message.
-    VotePoll {
-        #[serde(default)]
-        message_id: Option<String>,
-        #[serde(default)]
-        seq: Option<u64>,
-        #[serde(default)]
-        option_ids: Vec<String>,
-    },
     /// Write in the place currently open in this view.
     Write {
         #[serde(default)]
@@ -150,6 +147,9 @@ enum MessagingAction {
     },
     /// Declare one's own attention state.  Unlike every other action this one
     /// is not about a place: it is about the person, so no view need be open.
+    /// With `expires_in_minutes` the state is temporary and lapses back to
+    /// whatever was declared before it, so「1時間だけ取り込み中」does not have
+    /// to be undone by hand.
     Status {
         status: MessagingStatus,
         #[serde(default)]
@@ -176,6 +176,75 @@ enum MessagingAction {
         #[serde(default)]
         place_id: Option<String>,
     },
+    /// Find messages the participant can already see, optionally within one
+    /// place. Results are references, not an opened Messaging view.
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    /// Read or partially update this participant's own notification setting.
+    /// No fields means read; present arrays replace their respective lists.
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+    },
+    /// Open a direct conversation with one person (a dm) or several (a group
+    /// dm), exactly like the human sidebar's「ダイレクトメッセージを開始」.
+    /// The new place becomes the one in view, as it does for a human who is
+    /// taken into the conversation they just opened.
+    ///
+    /// Participants are named, not selected from this view: overview, an open
+    /// place's members, and message authors are where their shape comes from,
+    /// and Workspace membership is what decides who may be reached.
+    StartDm {
+        participants: Vec<MessagingParticipant>,
+    },
+    /// Open a channel in this Workspace, as the sidebar's「チャンネルを作成」
+    /// does.  The new channel becomes the place in view.
+    CreateChannel {
+        name: String,
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default)]
+        voice: bool,
+    },
+    /// Rename a channel, retopic it, or both.  An omitted field is left alone.
+    UpdateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    /// Copy a channel's name and topic into a new, empty channel.  The copy
+    /// carries no messages: it is a fresh place shaped like the original.
+    DuplicateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MessagingNotifyLevel {
+    All,
+    Mentions,
+    Mute,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MessagingNotifyPlace {
+    place_id: String,
+    level: MessagingNotifyLevel,
 }
 
 /// Registry-sealed app arguments. Unlike the model-facing schema, every
@@ -199,21 +268,6 @@ enum BoundMessagingAction {
         name: String,
         #[serde(default)]
         parent_message_id: Option<String>,
-    },
-    CreatePoll {
-        place_id: String,
-        question: String,
-        options: Vec<String>,
-        allow_multi: bool,
-        #[serde(default)]
-        content: Option<String>,
-        #[serde(default)]
-        closes_in_minutes: Option<u32>,
-    },
-    VotePoll {
-        place_id: String,
-        message_id: String,
-        option_ids: Vec<String>,
     },
     Write {
         place_id: String,
@@ -256,6 +310,71 @@ enum BoundMessagingAction {
         #[serde(default)]
         place_id: Option<String>,
     },
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+    },
+    StartDm {
+        participants: Vec<MessagingParticipant>,
+    },
+    CreateChannel {
+        name: String,
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default)]
+        voice: bool,
+    },
+    UpdateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    DuplicateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+impl BoundMessagingAction {
+    /// Remote mutations need a committed-effect receipt: once their request is
+    /// dispatched, cancelling its future would turn a potentially committed
+    /// Workspace change into a false "cancelled" result. Reads only observe
+    /// server state, and this tool has no other local mutation, so they remain
+    /// local effects and may observe cancellation while waiting for a reply.
+    fn is_remote_persistent_mutation(&self) -> bool {
+        match self {
+            Self::Write { .. }
+            | Self::React { .. }
+            | Self::Status { .. }
+            | Self::ReplyLater { .. }
+            | Self::ResolveReplyLater { .. }
+            | Self::StartDm { .. }
+            | Self::CreateChannel { .. }
+            | Self::CreateThread { .. }
+            | Self::UpdateChannel { .. }
+            | Self::DuplicateChannel { .. } => true,
+            Self::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => defaults_level.is_some() || per_place.is_some() || keywords.is_some(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -288,6 +407,10 @@ struct ExactMessagingOutcome {
     live_post_commit: Option<LiveAppPostCommit>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "attachment metadata and response remain one allocation-free exact outcome"
+)]
 enum ExactMessagingResponse {
     Json(Value),
     Attachment {
@@ -352,24 +475,6 @@ struct OpenReactionWire {
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenPollOptionWire {
-    option_id: String,
-    text: String,
-    voters: Vec<OpenParticipantWire>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenPollWire {
-    question: String,
-    allow_multi: bool,
-    // Value keeps null distinct from an omitted required field without
-    // recreating the server's nullable-field machinery in this adapter.
-    closes_at: Value,
-    revision: i64,
-    options: Vec<OpenPollOptionWire>,
-}
-
-#[derive(Debug, Deserialize)]
 struct OpenMessageWire {
     message_id: String,
     place: OpenPlaceWire,
@@ -385,9 +490,9 @@ struct OpenMessageWire {
     client_nonce: String,
     created_at: String,
     edited_at: Value,
+    revision: u64,
     deleted: bool,
     attachments: Vec<MessagingAttachmentMetadata>,
-    poll: Option<OpenPollWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -643,9 +748,16 @@ fn messaging_parameters_schema() -> Value {
             "may include exactly one of message_id or seq to use a visible message as its origin; ",
             "status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id; get_call_state may include place_id. Write, react and reply_later act ",
-            "on the place most recently opened in this tool view; status and get_call_state ",
-            "need no open place; resolve_reply_later needs a marker ",
+            "marker_id; get_call_state may include place_id; search requires query and may ",
+            "include place_id or limit; notification_settings reads when given no setting ",
+            "fields and otherwise changes only the fields present; start_dm requires participants; ",
+            "create_channel requires name and may include topic and voice; update_channel requires ",
+            "place_id plus name, topic or both; duplicate_channel requires place_id and may ",
+            "include name. Write, react and reply_later act ",
+            "on the place most recently opened in this tool view; status, get_call_state and ",
+            "search, notification_settings and every place-opening or channel-editing action ",
+            "need no open place; ",
+            "resolve_reply_later needs a marker ",
             "already shown or returned in this tool view, but not its place open."
         ),
         "properties": {
@@ -656,9 +768,10 @@ fn messaging_parameters_schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": [
-                    "overview", "open", "write", "open_attachment", "react",
+                    "overview", "open", "threads", "create_thread", "write", "open_attachment", "react",
                     "status", "reply_later", "resolve_reply_later", "get_call_state",
-                    "threads", "create_thread", "create_poll", "vote_poll"
+                    "search", "notification_settings",
+                    "start_dm", "create_channel", "update_channel", "duplicate_channel"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -668,48 +781,76 @@ fn messaging_parameters_schema() -> Value {
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept; ",
-                    "get_call_state reports who is currently in calls you can see; threads lists ",
-                    "side conversations under the open place; create_thread creates one and opens it; ",
-                    "create_poll asks the open place a question; vote_poll replaces your answer ",
-                    "to a poll carried by a visible message."
+                    "get_call_state reports who is currently in calls you can see; search finds ",
+                    "messages in places you can already see; threads lists side conversations ",
+                    "under the open place and create_thread creates and opens one; ",
+                    "notification_settings reads or ",
+                    "partially updates what is allowed to interrupt you; ",
+                    "start_dm opens a direct conversation with one person, or a group ",
+                    "conversation with several, and puts it in view; create_channel opens a new ",
+                    "channel and puts it in view; update_channel renames or retopics a channel; ",
+                    "duplicate_channel copies a channel's name and topic into a new empty one."
                 )
             },
             "place_id": {
                 "type": "string",
-                "description": "Required for open, optional for get_call_state, and omitted for other actions. The place to open or whose current call to report."
+                "description": concat!(
+                    "Required for open, update_channel and duplicate_channel; optional for ",
+                    "get_call_state and search; omitted for other actions. The place to open, edit, ",
+                    "copy, whose current call to report, or the one place to search."
+                )
             },
             "name": {
                 "type": "string",
-                "maxLength": 100,
-                "description": "Required for create_thread and omitted for other actions."
+                "description": concat!(
+                    "Required for create_thread and create_channel; optional for update_channel ",
+                    "and duplicate_channel; omitted for other actions. Thread names are at most ",
+                    "100 Unicode code points; channel names are at most 200. For duplicate_channel, ",
+                    "omitting it takes the derived default name for a copy."
+                )
             },
-            "question": {
+            "topic": {
                 "type": "string",
-                "maxLength": 500,
-                "description": "Required for create_poll and omitted for other actions. What the poll asks."
+                "description": concat!(
+                    "Optional for create_channel and update_channel, omitted for other actions. ",
+                    "The one line describing what the channel is for."
+                )
             },
-            "options": {
-                "type": "array",
-                "items": {"type": "string", "maxLength": 200},
-                "minItems": 2,
-                "maxItems": 10,
-                "description": "Required for create_poll. Two to ten distinct answer labels."
-            },
-            "allow_multi": {
+            "voice": {
                 "type": "boolean",
-                "description": "Optional for create_poll. When true, each voter may select multiple options."
+                "description": "Optional for create_channel. Set true to create a voice channel; omitted creates a text channel."
             },
-            "closes_in_minutes": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 10080,
-                "description": "Optional for create_poll. Relative lifetime evaluated by the server clock."
-            },
-            "option_ids": {
+            "participants": {
                 "type": "array",
-                "items": {"type": "string"},
-                "maxItems": 10,
-                "description": "Required for vote_poll. The visible poll option ids forming your entire replacement vote; empty withdraws."
+                "maxItems": 32,
+                "description": concat!(
+                    "Required for start_dm and omitted for other actions. The people to open the ",
+                    "conversation with, in the participant shape used everywhere else: take one ",
+                    "from overview's member list, an open place's members, or a message author. ",
+                    "Do not list yourself. One entry opens the single direct conversation with ",
+                    "that person; several open a group conversation. Who may be reached is ",
+                    "decided by Workspace membership, not by what this view has shown."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["human", "personality_agent"],
+                            "description": "Which kind of participant this is."
+                        },
+                        "human_id": {
+                            "type": "string",
+                            "description": "Required when kind is human, omitted otherwise."
+                        },
+                        "personality_agent_id": {
+                            "type": "string",
+                            "description": "Required when kind is personality_agent, omitted otherwise."
+                        }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                }
             },
             "before_seq": {
                 "type": "integer",
@@ -720,7 +861,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Optional for open and omitted for other actions. Maximum number of messages to return."
+                "description": "Optional for open and search and omitted for other actions. Maximum number of messages or search results to return."
             },
             "content": {
                 "type": "string",
@@ -730,7 +871,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "array",
                 "items": {"type": "string"},
                 "maxItems": 10,
-                "description": "Optional only for write; prohibited for create_poll and all other actions. Ordered Foundation Workspace file paths to attach."
+                "description": "Optional for write and omitted for other actions. Ordered Foundation Workspace file paths to attach."
             },
             "attachment_id": {
                 "type": "string",
@@ -748,9 +889,9 @@ fn messaging_parameters_schema() -> Value {
             "message_id": {
                 "type": "string",
                 "description": concat!(
-                    "For react, reply_later, vote_poll, and create_thread, omitted for other actions. The ",
-                    "target or optional thread-origin message by message_id. React, reply_later, and ",
-                    "vote_poll require exactly one of message_id or seq; create_thread may omit both or use ",
+                    "For react, reply_later, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by message_id. React and reply_later ",
+                    "require exactly one of message_id or seq; create_thread may omit both or use ",
                     "exactly one. The message must be visible in the currently open place."
                 )
             },
@@ -758,9 +899,9 @@ fn messaging_parameters_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "description": concat!(
-                    "For react, reply_later, vote_poll, and create_thread, omitted for other actions. The ",
-                    "target or optional thread-origin message by its seq in the currently open place. ",
-                    "React, reply_later, and vote_poll require exactly one of message_id or seq; ",
+                    "For react, reply_later, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by its seq in the currently open ",
+                    "place. React and reply_later require exactly one of message_id or seq; ",
                     "create_thread may omit both or use exactly one."
                 )
             },
@@ -794,7 +935,9 @@ fn messaging_parameters_schema() -> Value {
                 "maximum": 10080,
                 "description": concat!(
                     "Optional for status and omitted for other actions. Minutes until the status ",
-                    "lapses on its own; when omitted it holds until you replace it."
+                    "lapses on its own, returning you to whatever you had declared before it — ",
+                    "use it for a state that is only true for a while (\"busy for the next ",
+                    "hour\"). When omitted the status holds until you replace it."
                 )
             },
             "remind_in_minutes": {
@@ -814,6 +957,38 @@ fn messaging_parameters_schema() -> Value {
                     "marker_id of your unresolved promise already shown or returned in this ",
                     "tool view."
                 )
+            },
+            "query": {
+                "type": "string",
+                "description": concat!(
+                    "Required for search and omitted for other actions. Case-insensitive ",
+                    "substring to find in messages from places you can currently access."
+                )
+            },
+            "defaults_level": {
+                "type": "string",
+                "enum": ["all", "mentions", "mute"],
+                "description": "Optional for notification_settings and omitted for other actions. The default notification level for places without an override."
+            },
+            "per_place": {
+                "type": "array",
+                "maxItems": 200,
+                "description": "Optional for notification_settings and omitted for other actions. When present, replaces the complete per-place override list; an empty array clears it.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "place_id": {"type": "string"},
+                        "level": {"type": "string", "enum": ["all", "mentions", "mute"]}
+                    },
+                    "required": ["place_id", "level"],
+                    "additionalProperties": false
+                }
+            },
+            "keywords": {
+                "type": "array",
+                "maxItems": 32,
+                "description": "Optional for notification_settings and omitted for other actions. When present, replaces the complete keyword list; an empty array clears it.",
+                "items": {"type": "string", "maxLength": 64}
             }
         },
         "required": ["workspace_id", "action"],
@@ -831,9 +1006,18 @@ impl Tool for MessagingTool {
                 "available places, or open an explicitly known place to see its timeline, ",
                 "members and unread state. Then write in that currently open place, or ",
                 "react or promise a later reply to a ",
-                "message visible in it. Declare your own availability with status. ",
+                "message visible in it. Declare your own availability with status, or ",
+                "open a new direct or group conversation with start_dm. ",
                 "Opening never publishes presence: what others see about your ",
-                "attention is only what you declare."
+                "attention is only what you declare. ",
+                "Search results are references: open their place before acting on a hit. ",
+                "Read or partially change your own notification preferences with ",
+                "notification_settings; explicit per_place and keywords arrays replace those lists. ",
+                "A message may carry attachments; each one reports filename, mime, ",
+                "size_bytes, an `alt` description written by the sender, and `spoiler`. ",
+                "A spoilered attachment is one the sender chose to keep covered until ",
+                "the reader opens it — treat it as hidden content: refer to it by its ",
+                "alt description and do not reveal what it shows unless the reader asks."
             )
             .to_owned(),
             parameters: messaging_parameters_schema(),
@@ -928,6 +1112,7 @@ impl BoundToolAdapter for MessagingTool {
                 message_id,
                 seq,
             } => {
+                let name = name.trim().to_owned();
                 let state = view.lock().await;
                 let parent_place_id = focused_place_for_binding(&state, "create_thread")?;
                 let parent_message_id = if message_id.is_some() || seq.is_some() {
@@ -962,69 +1147,6 @@ impl BoundToolAdapter for MessagingTool {
                     "create_thread",
                     CapabilityClass::Mutate,
                     scopes,
-                    arguments.clone(),
-                    arguments,
-                )
-            }
-            MessagingAction::CreatePoll {
-                question,
-                options,
-                allow_multi,
-                content,
-                closes_in_minutes,
-            } => {
-                let state = view.lock().await;
-                let place_id = focused_place_for_binding(&state, "create_poll")?;
-                let mut arguments = object([
-                    ("action", Value::String("create_poll".to_owned())),
-                    ("place_id", Value::String(place_id.clone())),
-                    ("question", Value::String(question)),
-                    (
-                        "options",
-                        serde_json::to_value(options).expect("strings serialize"),
-                    ),
-                    ("allow_multi", Value::Bool(allow_multi)),
-                ]);
-                insert_optional_string(&mut arguments, "content", content);
-                insert_optional_u64(
-                    &mut arguments,
-                    "closes_in_minutes",
-                    closes_in_minutes.map(u64::from),
-                );
-                messaging_binding(
-                    &scope,
-                    "create_poll",
-                    CapabilityClass::Mutate,
-                    vec![ResourceScope::resource("messaging", "place", &place_id)],
-                    arguments.clone(),
-                    arguments,
-                )
-            }
-            MessagingAction::VotePoll {
-                message_id,
-                seq,
-                option_ids,
-            } => {
-                let state = view.lock().await;
-                let place_id = focused_place_for_binding(&state, "vote_poll")?;
-                let target = visible_target_for_binding(&state, &message_id, seq, "vote_poll")?;
-                let arguments = object([
-                    ("action", Value::String("vote_poll".to_owned())),
-                    ("place_id", Value::String(place_id.clone())),
-                    ("message_id", Value::String(target.message_id.clone())),
-                    (
-                        "option_ids",
-                        serde_json::to_value(option_ids).expect("strings serialize"),
-                    ),
-                ]);
-                messaging_binding(
-                    &scope,
-                    "vote_poll",
-                    CapabilityClass::Mutate,
-                    vec![
-                        ResourceScope::resource("messaging", "place", &place_id),
-                        ResourceScope::resource("messaging", "message", &target.message_id),
-                    ],
                     arguments.clone(),
                     arguments,
                 )
@@ -1307,6 +1429,199 @@ impl BoundToolAdapter for MessagingTool {
                     arguments,
                 )
             }
+            MessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => {
+                let scopes = match &place_id {
+                    Some(place_id) => {
+                        vec![ResourceScope::resource("messaging", "place", place_id)]
+                    }
+                    None => vec![ResourceScope::collection("messaging", "place")],
+                };
+                let mut arguments = object([
+                    ("action", Value::String("search".to_owned())),
+                    ("query", Value::String(query)),
+                ]);
+                insert_optional_string(&mut arguments, "place_id", place_id);
+                insert_optional_u64(&mut arguments, "limit", limit.map(u64::from));
+                messaging_binding(
+                    &scope,
+                    "search",
+                    CapabilityClass::Read,
+                    scopes,
+                    arguments.clone(),
+                    arguments,
+                )
+            }
+            MessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let changes = defaults_level.is_some() || per_place.is_some() || keywords.is_some();
+                let mut arguments =
+                    object([("action", Value::String("notification_settings".to_owned()))]);
+                if let Some(level) = defaults_level {
+                    arguments.insert(
+                        "defaults_level".to_owned(),
+                        Value::String(notify_level_text(level).to_owned()),
+                    );
+                }
+                if let Some(entries) = &per_place {
+                    arguments.insert(
+                        "per_place".to_owned(),
+                        Value::Array(
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    Value::Object(object([
+                                        ("place_id", Value::String(entry.place_id.clone())),
+                                        (
+                                            "level",
+                                            Value::String(
+                                                notify_level_text(entry.level).to_owned(),
+                                            ),
+                                        ),
+                                    ]))
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(words) = &keywords {
+                    arguments.insert(
+                        "keywords".to_owned(),
+                        Value::Array(words.iter().cloned().map(Value::String).collect()),
+                    );
+                }
+                let mut review_projection = arguments.clone();
+                review_projection.insert("changes_setting".to_owned(), Value::Bool(changes));
+                let mut scopes = vec![ResourceScope::resource("messaging", "participant", "self")];
+                if let Some(entries) = &per_place {
+                    scopes.extend(entries.iter().map(|entry| {
+                        ResourceScope::resource("messaging", "place", &entry.place_id)
+                    }));
+                }
+                messaging_binding(
+                    &scope,
+                    "notification_settings",
+                    if changes {
+                        CapabilityClass::Mutate
+                    } else {
+                        CapabilityClass::Read
+                    },
+                    scopes,
+                    review_projection,
+                    arguments,
+                )
+            }
+            // Opening or editing a place binds without consulting the view.
+            // Its target is named outright — a person clicks a sidebar row
+            // without first having been inside it — so there is nothing here
+            // to resolve from what happens to be on screen.
+            MessagingAction::StartDm { mut participants } => {
+                let actor_id = ctx
+                    .executor_identity
+                    .ok_or(DescribeError::BindingInternal)?
+                    .personality_agent_id()
+                    .as_str();
+                canonicalize_dm_participants(&mut participants, Some(actor_id));
+                if participants.is_empty() {
+                    return Err(DescribeError::InvalidArguments);
+                }
+                let listed = Value::Array(
+                    participants
+                        .iter()
+                        .map(|participant| serde_json::to_value(participant).unwrap_or(Value::Null))
+                        .collect(),
+                );
+                let review_projection = object([
+                    ("action", Value::String("start_dm".to_owned())),
+                    ("participants", listed.clone()),
+                    (
+                        "conversation_kind",
+                        Value::String(
+                            if participants.len() == 1 {
+                                "dm"
+                            } else {
+                                "group_dm"
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                ]);
+                let arguments = object([
+                    ("action", Value::String("start_dm".to_owned())),
+                    ("participants", listed),
+                ]);
+                messaging_binding(
+                    &scope,
+                    "start_dm",
+                    CapabilityClass::Mutate,
+                    vec![ResourceScope::collection("messaging", "place")],
+                    review_projection,
+                    arguments,
+                )
+            }
+            MessagingAction::CreateChannel { name, topic, voice } => {
+                let mut arguments = object([
+                    ("action", Value::String("create_channel".to_owned())),
+                    ("name", Value::String(name.clone())),
+                ]);
+                insert_optional_string(&mut arguments, "topic", topic);
+                arguments.insert("voice".to_owned(), Value::Bool(voice));
+                let review_projection = arguments.clone();
+                messaging_binding(
+                    &scope,
+                    "create_channel",
+                    CapabilityClass::Mutate,
+                    vec![ResourceScope::collection("messaging", "place")],
+                    review_projection,
+                    arguments,
+                )
+            }
+            MessagingAction::UpdateChannel {
+                place_id,
+                name,
+                topic,
+            } => {
+                let mut arguments = object([
+                    ("action", Value::String("update_channel".to_owned())),
+                    ("place_id", Value::String(place_id.clone())),
+                ]);
+                insert_optional_string(&mut arguments, "name", name);
+                insert_optional_string(&mut arguments, "topic", topic);
+                let review_projection = arguments.clone();
+                messaging_binding(
+                    &scope,
+                    "update_channel",
+                    CapabilityClass::Mutate,
+                    vec![ResourceScope::resource("messaging", "place", &place_id)],
+                    review_projection,
+                    arguments,
+                )
+            }
+            MessagingAction::DuplicateChannel { place_id, name } => {
+                let mut arguments = object([
+                    ("action", Value::String("duplicate_channel".to_owned())),
+                    ("place_id", Value::String(place_id.clone())),
+                ]);
+                insert_optional_string(&mut arguments, "name", name);
+                let review_projection = arguments.clone();
+                messaging_binding(
+                    &scope,
+                    "duplicate_channel",
+                    CapabilityClass::Mutate,
+                    vec![
+                        ResourceScope::collection("messaging", "place"),
+                        ResourceScope::resource("messaging", "place", &place_id),
+                    ],
+                    review_projection,
+                    arguments,
+                )
+            }
         }
     }
 
@@ -1360,6 +1675,29 @@ impl BoundToolAdapter for MessagingTool {
                             call_id,
                             continuation,
                             &cancel,
+                        )
+                    })
+                    .await?
+            }
+            action if action.is_remote_persistent_mutation() => {
+                // This covers every non-attachment remote mutation. The
+                // executor effect deliberately survives cancellation after
+                // dispatch; a lost response is surfaced as Indeterminate,
+                // never as a locally abandoned effect.
+                committed_effect_permit
+                    .begin_executor_effect()
+                    .complete(|_| {
+                        self.execute_exact_action(
+                            &scope,
+                            view.clone(),
+                            &mut state,
+                            action,
+                            ExactMessagingExecutionContext {
+                                flow_id,
+                                call_id,
+                                cancel: &cancel,
+                                post_commit_mode: PostCommitMode::ReturnLiveHook,
+                            },
                         )
                     })
                     .await?
@@ -1449,6 +1787,12 @@ impl MessagingTool {
         action: BoundMessagingAction,
         execution: ExactMessagingExecutionContext<'_>,
     ) -> Result<ExactMessagingOutcome, ToolError> {
+        // A mutation may be cancelled before its request is dispatched. Once
+        // this gate has passed, each mutation below awaits its RPC directly:
+        // dropping it on cancellation could hide a server commit.
+        if action.is_remote_persistent_mutation() && execution.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         if let BoundMessagingAction::OpenAttachment {
             place_id,
             message_id,
@@ -1531,69 +1875,86 @@ impl MessagingTool {
             }.map_err(map_messaging_api_error)?,
             BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.create_thread(scope, CreateMessagingThreadRequest {
+                // This is a mutation boundary. Once its HTTP future exists we
+                // must retain it until it produces either the durable receipt
+                // or the transport's indeterminate failure. Dropping it on a
+                // cancellation would lose a committed thread_id and invite a
+                // second create with another call id.
+                let mut response = self.api.create_thread(scope, CreateMessagingThreadRequest {
                         parent_place_id: &parent_place_id,
                         name: &name,
                         parent_message_id: parent_message_id.as_deref(),
                         client_nonce: &nonce,
-                    }) => result,
-                }.map_err(map_messaging_api_error)?;
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 let thread_id = response.get("thread_id").and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                    .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?;
-                state.focused_place_id = Some(thread_id.to_owned());
-                state.visible_messages.clear();
-                response
-            }
-            BoundMessagingAction::CreatePoll {
-                place_id,
-                question,
-                options,
-                allow_multi,
-                content,
-                closes_in_minutes,
-            } => {
-                let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.create_poll(scope, CreateMessagingPollRequest {
-                        place_id: &place_id,
-                        question: &question,
-                        options: &options,
-                        allow_multi,
-                        content: content.as_deref(),
-                        client_nonce: &nonce,
-                        closes_in_minutes,
-                    }) => result,
-                }.map_err(map_messaging_api_error)?;
-                if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
-                    upsert_visible_message(state, visible_message_from_mutation(&response)?);
-                }
-                response
-            }
-            BoundMessagingAction::VotePoll {
-                place_id,
-                message_id,
-                option_ids,
-            } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.vote_poll(scope, VoteMessagingPollRequest {
-                        place_id: &place_id,
-                        message_id: &message_id,
-                        option_ids: &option_ids,
-                    }) => result,
-                }.map_err(map_messaging_api_error)?;
-                if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
-                    let visible = visible_message_from_mutation(&response)?;
-                    if visible.message_id != message_id {
-                        return Err(ToolError::Protocol(
-                            "Messaging vote_poll returned a different message".to_owned(),
-                        ));
+                    .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?
+                    .to_owned();
+                let response_object = response.as_object_mut().ok_or_else(|| ToolError::Protocol(
+                    "Messaging create_thread response is not an object".to_owned(),
+                ))?;
+                // Creating a thread opens it (契約: 作成後にそのthreadを現在の
+                // viewとして開く). This happens after the create commit, though:
+                // an open failure or cancellation must not turn the committed
+                // creation into an apparent failure that invites a duplicate.
+                // Retry once in this call, then return an explicit resumable
+                // partial success with the durable thread_id.
+                let open_created_thread = || async {
+                    self.api.open(scope, OpenMessagingPlaceRequest {
+                        place_id: &thread_id,
+                        before_seq: None,
+                        limit: None,
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)
+                    .and_then(|opened| {
+                        validate_open_response(&opened, &thread_id, None, None)
+                            .map(|admission| (opened, admission))
+                    })
+                };
+                let first_open = tokio::select! {
+                    _ = execution.cancel.cancelled() => Err(ToolError::Cancelled),
+                    result = open_created_thread() => result,
+                };
+                let opened = match first_open {
+                    Ok(opened) => Ok(opened),
+                    Err(first_error) => match tokio::select! {
+                        _ = execution.cancel.cancelled() => Err(ToolError::Cancelled),
+                        result = open_created_thread() => result,
+                    } {
+                        Ok(opened) => Ok(opened),
+                        Err(retry_error) => Err((first_error, retry_error)),
+                    },
+                };
+                match opened {
+                    Ok((opened, admission)) => {
+                        state.focused_place_id = Some(thread_id.clone());
+                        state.visible_messages = admission.visible_messages;
+                        if let Some(seq) = admission.read_through_seq {
+                            record_pending_read_through(state, &thread_id, seq);
+                            if matches!(execution.post_commit_mode, PostCommitMode::ReturnLiveHook) {
+                                live_post_commit = Some(read_through_post_commit(
+                                    self.api.clone(),
+                                    scope.clone(),
+                                    view.clone(),
+                                    thread_id.clone(),
+                                    seq,
+                                ));
+                            }
+                        }
+                        response_object.insert("open".to_owned(), opened);
                     }
-                    upsert_visible_message(state, visible);
+                    Err((first_error, retry_error)) => {
+                        response_object.insert("open_status".to_owned(), Value::String("pending".to_owned()));
+                        response_object.insert(
+                            "open_error".to_owned(),
+                            Value::String(format!(
+                                "thread was created but opening it failed twice: {first_error}; retry: {retry_error}"
+                            )),
+                        );
+                    }
                 }
                 response
             }
@@ -1610,18 +1971,21 @@ impl MessagingTool {
                     ));
                 }
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.write(scope, WriteMessagingMessageRequest {
-                        place_id: &place_id,
-                        content: &content,
-                        urgency: urgency_text(urgency),
-                        reply_to: reply_to.as_deref(),
-                        client_nonce: &nonce,
-                        attachments: &[],
-                    }) => result,
-                }
-                .map_err(map_messaging_api_error)?;
+                let response = self
+                    .api
+                    .write(
+                        scope,
+                        WriteMessagingMessageRequest {
+                            place_id: &place_id,
+                            content: &content,
+                            urgency: urgency_text(urgency),
+                            reply_to: reply_to.as_deref(),
+                            client_nonce: &nonce,
+                            attachments: &[],
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
                     upsert_visible_message(
                         state,
@@ -1641,46 +2005,54 @@ impl MessagingTool {
                 emoji,
             } => {
                 let nonce = client_nonce(execution.flow_id, execution.call_id);
-                tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.react(scope, ReactMessagingReactionRequest {
-                        place_id: &place_id,
-                        message_id: &message_id,
-                        emoji: &emoji,
-                        client_nonce: &nonce,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?
+                self.api
+                    .react(
+                        scope,
+                        ReactMessagingReactionRequest {
+                            place_id: &place_id,
+                            message_id: &message_id,
+                            emoji: &emoji,
+                            client_nonce: &nonce,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?
             }
             BoundMessagingAction::Status {
                 status,
                 note,
                 expires_in_minutes,
-            } => tokio::select! {
-                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                result = self.api.set_status(scope, SetMessagingStatusRequest {
-                    status: status_text(status),
-                    note: note.as_deref(),
-                    expires_in_minutes,
-                }) => result,
-            }
-            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            } => self
+                .api
+                .set_status(
+                    scope,
+                    SetMessagingStatusRequest {
+                        status: status_text(status),
+                        note: note.as_deref(),
+                        expires_in_minutes,
+                    },
+                )
+                .await
+                .map_err(map_messaging_api_error)?,
             BoundMessagingAction::ReplyLater {
                 place_id,
                 message_id,
                 note,
                 remind_in_minutes,
             } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.reply_later(scope, CreateMessagingReplyLaterRequest {
-                        place_id: &place_id,
-                        message_id: &message_id,
-                        note: note.as_deref(),
-                        remind_in_minutes,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let response = self
+                    .api
+                    .reply_later(
+                        scope,
+                        CreateMessagingReplyLaterRequest {
+                            place_id: &place_id,
+                            message_id: &message_id,
+                            note: note.as_deref(),
+                            remind_in_minutes,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 if let Some(marker) = reply_later_marker_from_response(&response) {
                     if state.self_participant.is_none() {
                         // The authenticated create endpoint can only return
@@ -1693,13 +2065,16 @@ impl MessagingTool {
                 response
             }
             BoundMessagingAction::ResolveReplyLater { marker_id } => {
-                let response = tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.resolve_reply_later(scope, ResolveMessagingReplyLaterRequest {
-                        marker_id: &marker_id,
-                    }) => result,
-                }
-                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                let response = self
+                    .api
+                    .resolve_reply_later(
+                        scope,
+                        ResolveMessagingReplyLaterRequest {
+                            marker_id: &marker_id,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
                 state
                     .visible_reply_later_markers
                     .retain(|marker| marker.marker_id != marker_id);
@@ -1715,6 +2090,127 @@ impl MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            // Search results are not an open page. In particular, they do not
+            // enter visible_messages and cannot authorize react/reply-later.
+            BoundMessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.search(scope, SearchMessagingRequest {
+                    query: &query,
+                    place_id: place_id.as_deref(),
+                    limit,
+                }) => result,
+            }
+            .map_err(map_messaging_api_error)?,
+            BoundMessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let places = per_place.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| MessagingNotificationPlace {
+                            place_id: entry.place_id.as_str(),
+                            level: notify_level_text(entry.level),
+                        })
+                        .collect()
+                });
+                let words = keywords
+                    .as_ref()
+                    .map(|words| words.iter().map(String::as_str).collect());
+                let request = MessagingNotificationSettingsRequest {
+                    defaults_level: defaults_level.map(notify_level_text),
+                    per_place: places,
+                    keywords: words,
+                };
+                let changes_setting = request.changes_setting();
+                if changes_setting {
+                    // Cancellation can still prevent an update before it is
+                    // emitted. Once emission begins, await the response so a
+                    // committed setting is never reported as cancelled.
+                    if execution.cancel.is_cancelled() {
+                        return Err(ToolError::Cancelled);
+                    }
+                    self.api.notification_settings(scope, request).await
+                } else {
+                    tokio::select! {
+                        _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                        result = self.api.notification_settings(scope, request) => result,
+                    }
+                }
+                .map_err(map_messaging_api_error)?
+            }
+            BoundMessagingAction::StartDm { participants } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = self
+                    .api
+                    .start_dm(
+                        scope,
+                        StartMessagingDMRequest {
+                            participants: &participants,
+                            client_nonce: (participants.len() > 1).then_some(nonce.as_str()),
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
+                focus_opened_place(&mut *state, &response, "dm", "dm_id")?;
+                response
+            }
+            BoundMessagingAction::CreateChannel { name, topic, voice } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = self
+                    .api
+                    .create_channel(
+                        scope,
+                        CreateMessagingChannelRequest {
+                            name: &name,
+                            topic: topic.as_deref(),
+                            voice,
+                            client_nonce: &nonce,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
+                focus_opened_place(&mut *state, &response, "channel", "channel_id")?;
+                response
+            }
+            BoundMessagingAction::UpdateChannel {
+                place_id,
+                name,
+                topic,
+            } => self
+                .api
+                .update_channel(
+                    scope,
+                    UpdateMessagingChannelRequest {
+                        place_id: &place_id,
+                        name: name.as_deref(),
+                        topic: topic.as_deref(),
+                    },
+                )
+                .await
+                .map_err(map_messaging_api_error)?,
+            BoundMessagingAction::DuplicateChannel { place_id, name } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                let response = self
+                    .api
+                    .duplicate_channel(
+                        scope,
+                        DuplicateMessagingChannelRequest {
+                            place_id: &place_id,
+                            name: name.as_deref(),
+                            client_nonce: &nonce,
+                        },
+                    )
+                    .await
+                    .map_err(map_messaging_api_error)?;
+                focus_opened_place(&mut *state, &response, "channel", "channel_id")?;
+                response
+            }
         };
         Ok(ExactMessagingOutcome {
             response: ExactMessagingResponse::Json(response),
@@ -1911,6 +2407,34 @@ fn render_attachment_output(
     })
 }
 
+/// A place that was just opened becomes the place in view, the way a human
+/// lands in the conversation or channel they just made. Nothing has been seen
+/// there, so the screen starts empty (ADR 0011 §3: 見えていないものは操作
+/// できない) and a write needs no second gesture.
+fn focus_opened_place(
+    state: &mut MessagingViewState,
+    response: &Value,
+    envelope: &str,
+    id_field: &str,
+) -> Result<(), ToolError> {
+    let place_id = response
+        .get(envelope)
+        .and_then(|place| place.get(id_field))
+        .and_then(Value::as_str)
+        .filter(|place_id| is_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES))
+        .ok_or_else(|| {
+            ToolError::Protocol(format!(
+                "Messaging {envelope} mutation returned no valid {id_field}"
+            ))
+        })?;
+    state.focused_place_id = Some(place_id.to_owned());
+    // Only this screen is emptied. Read cursors owed for other places are
+    // promises already made and are not this gesture's to cancel; a place
+    // opened a moment ago cannot have one of its own.
+    state.visible_messages.clear();
+    Ok(())
+}
+
 fn messaging_binding(
     scope: &ExactMessagingScope,
     operation: &str,
@@ -2030,39 +2554,13 @@ fn resolve_raw_action(
             parent_place_id: state.focused_place_id.clone().ok_or_else(|| ToolError::Protocol("open a messaging place before listing threads".to_owned()))?,
         }),
         MessagingAction::CreateThread { name, message_id, seq } => {
+            let name = name.trim().to_owned();
             let parent_place_id = state.focused_place_id.clone().ok_or_else(|| ToolError::Protocol("open a messaging place before creating a thread".to_owned()))?;
             let parent_message_id = if message_id.is_some() || seq.is_some() {
                 Some(visible_target(state, &message_id, seq, "create_thread")?.message_id)
             } else { None };
             Ok(BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id })
         }
-        MessagingAction::CreatePoll {
-            question,
-            options,
-            allow_multi,
-            content,
-            closes_in_minutes,
-        } => Ok(BoundMessagingAction::CreatePoll {
-            place_id: state.focused_place_id.clone().ok_or_else(|| {
-                ToolError::Protocol("open a messaging place before creating a poll".to_owned())
-            })?,
-            question,
-            options,
-            allow_multi,
-            content,
-            closes_in_minutes,
-        }),
-        MessagingAction::VotePoll {
-            message_id,
-            seq,
-            option_ids,
-        } => Ok(BoundMessagingAction::VotePoll {
-            place_id: state.focused_place_id.clone().ok_or_else(|| {
-                ToolError::Protocol("open a messaging place before voting in a poll".to_owned())
-            })?,
-            message_id: visible_target(state, &message_id, seq, "vote_poll")?.message_id,
-            option_ids,
-        }),
         MessagingAction::Write {
             content,
             attachments,
@@ -2165,6 +2663,46 @@ fn resolve_raw_action(
         MessagingAction::GetCallState { place_id } => {
             Ok(BoundMessagingAction::GetCallState { place_id })
         }
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => Ok(BoundMessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        }),
+        MessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        } => Ok(BoundMessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        }),
+        // Opening or editing a place needs no place already in view: the
+        // gesture names its own target, the way a human clicks a sidebar row
+        // without first having been inside it.
+        MessagingAction::StartDm { mut participants } => {
+            canonicalize_dm_participants(&mut participants, None);
+            Ok(BoundMessagingAction::StartDm { participants })
+        }
+        MessagingAction::CreateChannel { name, topic, voice } => {
+            Ok(BoundMessagingAction::CreateChannel { name, topic, voice })
+        }
+        MessagingAction::UpdateChannel {
+            place_id,
+            name,
+            topic,
+        } => Ok(BoundMessagingAction::UpdateChannel {
+            place_id,
+            name,
+            topic,
+        }),
+        MessagingAction::DuplicateChannel { place_id, name } => {
+            Ok(BoundMessagingAction::DuplicateChannel { place_id, name })
+        }
     }
 }
 
@@ -2266,9 +2804,10 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             message_id,
             seq,
         } => {
-            if name.trim().is_empty()
-                || name.chars().count() > MAX_THREAD_NAME_CHARS
-                || name.contains('\0')
+            let canonical_name = name.trim();
+            if canonical_name.is_empty()
+                || canonical_name.chars().count() > MAX_THREAD_NAME_CHARS
+                || canonical_name.contains('\0')
             {
                 return Err(ToolError::InvalidArguments);
             }
@@ -2280,59 +2819,6 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             if seq == &Some(0) {
                 return Err(ToolError::InvalidArguments);
-            }
-            Ok(())
-        }
-        MessagingAction::CreatePoll {
-            question,
-            options,
-            content,
-            closes_in_minutes,
-            ..
-        } => {
-            if question.trim().is_empty()
-                || question.contains('\0')
-                || question.chars().count() > MAX_POLL_QUESTION_CHARS
-            {
-                return Err(ToolError::InvalidArguments);
-            }
-            if !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&options.len()) {
-                return Err(ToolError::InvalidArguments);
-            }
-            let mut normalized_options = BTreeSet::new();
-            for option in options {
-                let normalized = option.trim();
-                if normalized.is_empty()
-                    || option.contains('\0')
-                    || option.chars().count() > MAX_POLL_OPTION_CHARS
-                    || !normalized_options.insert(normalized)
-                {
-                    return Err(ToolError::InvalidArguments);
-                }
-            }
-            if content
-                .as_deref()
-                .is_some_and(|content| content.len() > MAX_CONTENT_BYTES || content.contains('\0'))
-            {
-                return Err(ToolError::InvalidArguments);
-            }
-            validate_relative_minutes(closes_in_minutes)
-        }
-        MessagingAction::VotePoll {
-            message_id,
-            seq,
-            option_ids,
-        } => {
-            validate_visible_selector(message_id, seq)?;
-            if option_ids.len() > MAX_POLL_OPTIONS {
-                return Err(ToolError::InvalidArguments);
-            }
-            let mut seen = BTreeSet::new();
-            for option_id in option_ids {
-                validate_bounded_nonempty(option_id, MAX_MESSAGE_ID_BYTES)?;
-                if !seen.insert(option_id) {
-                    return Err(ToolError::InvalidArguments);
-                }
             }
             Ok(())
         }
@@ -2413,7 +2899,179 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => {
+            if query.trim().is_empty() || query.len() > MAX_SEARCH_QUERY_BYTES {
+                return Err(ToolError::InvalidArguments);
+            }
+            if place_id
+                .as_deref()
+                .is_some_and(|place| validate_bounded_nonempty(place, MAX_PLACE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_limit(*limit, MAX_SEARCH_LIMIT)
+        }
+        MessagingAction::NotificationSettings {
+            per_place,
+            keywords,
+            ..
+        } => {
+            if per_place
+                .as_ref()
+                .is_some_and(|entries| entries.len() > MAX_NOTIFICATION_PLACES)
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            if let Some(entries) = per_place {
+                let mut places = BTreeSet::new();
+                for entry in entries {
+                    validate_bounded_nonempty(&entry.place_id, MAX_PLACE_ID_BYTES)?;
+                    if !places.insert(entry.place_id.as_str()) {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                }
+            }
+            if let Some(words) = keywords {
+                if words.len() > MAX_NOTIFICATION_KEYWORDS {
+                    return Err(ToolError::InvalidArguments);
+                }
+                for word in words {
+                    if word.trim().is_empty()
+                        || word.chars().count() > MAX_NOTIFICATION_KEYWORD_CHARS
+                        || word.chars().any(char::is_control)
+                    {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                }
+            }
+            Ok(())
+        }
+        MessagingAction::StartDm { participants } => validate_dm_participants(participants),
+        MessagingAction::CreateChannel { name, topic, .. } => {
+            validate_channel_name(name)?;
+            validate_optional_bounded(topic, MAX_TOPIC_BYTES)
+        }
+        MessagingAction::UpdateChannel {
+            place_id,
+            name,
+            topic,
+        } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            // Naming nothing is not an edit; it would be a silent no-op that
+            // reads to the model as a successful rename.
+            if name.is_none() && topic.is_none() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if name
+                .as_deref()
+                .is_some_and(|name| validate_channel_name(name).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_bounded(topic, MAX_TOPIC_BYTES)
+        }
+        MessagingAction::DuplicateChannel { place_id, name } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            if name
+                .as_deref()
+                .is_some_and(|name| validate_channel_name(name).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
+}
+
+/// The people a conversation is opened with. Each is named in the shape the
+/// rest of this tool uses, and each names exactly one identity: a kind without
+/// its matching id (or with the other kind's id) is not a person.
+///
+/// This does not check the names against what the view has shown. Whether a
+/// conversation may be opened with someone is a question about Workspace
+/// membership, which the Store answers; refusing a fellow member here because
+/// this view had not listed them would be the tool inventing an authorization
+/// rule out of an affordance. A human picks from a list because that is how a
+/// list is useful, not because the list is the boundary.
+fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(), ToolError> {
+    if participants.is_empty() || participants.len() > MAX_DM_PARTICIPANTS {
+        return Err(ToolError::InvalidArguments);
+    }
+    for participant in participants {
+        let id = match (
+            participant.kind.as_str(),
+            participant.human_id.as_deref(),
+            participant.personality_agent_id.as_deref(),
+        ) {
+            ("human", Some(id), None) | ("personality_agent", None, Some(id)) => id,
+            _ => return Err(ToolError::InvalidArguments),
+        };
+        validate_bounded_nonempty(id, MAX_PARTICIPANT_ID_BYTES)?;
+    }
+    Ok(())
+}
+
+fn messaging_participant_key(participant: &MessagingParticipant) -> String {
+    let id = participant
+        .human_id
+        .as_deref()
+        .or(participant.personality_agent_id.as_deref())
+        .unwrap_or_default();
+    format!("{}:{id}", participant.kind)
+}
+
+fn canonicalize_dm_participants(
+    participants: &mut Vec<MessagingParticipant>,
+    actor_personality_agent_id: Option<&str>,
+) {
+    if let Some(actor_id) = actor_personality_agent_id {
+        participants.retain(|participant| {
+            participant.kind != "personality_agent"
+                || participant.personality_agent_id.as_deref() != Some(actor_id)
+        });
+    }
+    participants.sort_by_key(messaging_participant_key);
+    participants.dedup_by(|left, right| {
+        messaging_participant_key(left) == messaging_participant_key(right)
+    });
+}
+
+fn dm_participants_are_canonical(participants: &[MessagingParticipant]) -> bool {
+    let mut canonical = participants.to_vec();
+    canonicalize_dm_participants(&mut canonical, None);
+    canonical == participants
+}
+
+/// Keep the local admission boundary in the same units as the server's
+/// `length(name) <= 200`, while retaining the byte ceiling before binding or
+/// approval.
+fn validate_channel_name(value: &str) -> Result<(), ToolError> {
+    validate_bounded_nonempty(value, MAX_CHANNEL_NAME_BYTES)?;
+    if value.chars().count() > MAX_CHANNEL_NAME_CHARS {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// An optional free-text field bounded in bytes. Unlike a note this is not
+/// counted in characters: the server's topic bound is a byte bound.
+fn validate_optional_bounded(value: &Option<String>, max_bytes: usize) -> Result<(), ToolError> {
+    match value {
+        None => Ok(()),
+        Some(text) if text.len() <= max_bytes && !text.contains('\0') => Ok(()),
+        Some(_) => Err(ToolError::InvalidArguments),
+    }
+}
+
+fn validate_optional_limit(limit: Option<u16>, max: u16) -> Result<(), ToolError> {
+    if limit.is_some_and(|limit| limit == 0 || limit > max) {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
 }
 
 fn validate_canonical_uuid_v7(value: &str) -> Result<(), ToolError> {
@@ -2471,35 +3129,6 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
                 name: name.clone(),
                 message_id: parent_message_id.clone(),
                 seq: None,
-            })
-        }
-        BoundMessagingAction::CreatePoll {
-            place_id,
-            question,
-            options,
-            allow_multi,
-            content,
-            closes_in_minutes,
-        } => {
-            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
-            validate_action(&MessagingAction::CreatePoll {
-                question: question.clone(),
-                options: options.clone(),
-                allow_multi: *allow_multi,
-                content: content.clone(),
-                closes_in_minutes: *closes_in_minutes,
-            })
-        }
-        BoundMessagingAction::VotePoll {
-            place_id,
-            message_id,
-            option_ids,
-        } => {
-            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
-            validate_action(&MessagingAction::VotePoll {
-                message_id: Some(message_id.clone()),
-                seq: None,
-                option_ids: option_ids.clone(),
             })
         }
         BoundMessagingAction::Write {
@@ -2572,6 +3201,53 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
         BoundMessagingAction::GetCallState { place_id } => {
             validate_action(&MessagingAction::GetCallState {
                 place_id: place_id.clone(),
+            })
+        }
+        BoundMessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => validate_action(&MessagingAction::Search {
+            query: query.clone(),
+            place_id: place_id.clone(),
+            limit: *limit,
+        }),
+        BoundMessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        } => validate_action(&MessagingAction::NotificationSettings {
+            defaults_level: *defaults_level,
+            per_place: per_place.clone(),
+            keywords: keywords.clone(),
+        }),
+        BoundMessagingAction::StartDm { participants } => {
+            validate_dm_participants(participants)?;
+            if !dm_participants_are_canonical(participants) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
+        BoundMessagingAction::CreateChannel { name, topic, voice } => {
+            validate_action(&MessagingAction::CreateChannel {
+                name: name.clone(),
+                topic: topic.clone(),
+                voice: *voice,
+            })
+        }
+        BoundMessagingAction::UpdateChannel {
+            place_id,
+            name,
+            topic,
+        } => validate_action(&MessagingAction::UpdateChannel {
+            place_id: place_id.clone(),
+            name: name.clone(),
+            topic: topic.clone(),
+        }),
+        BoundMessagingAction::DuplicateChannel { place_id, name } => {
+            validate_action(&MessagingAction::DuplicateChannel {
+                place_id: place_id.clone(),
+                name: name.clone(),
             })
         }
     }
@@ -2756,40 +3432,6 @@ fn upsert_visible_message(state: &mut MessagingViewState, message: VisibleMessag
         .sort_by_key(|known| known.seq.unwrap_or(u64::MAX));
 }
 
-fn visible_message_from_mutation(response: &Value) -> Result<VisibleMessage, ToolError> {
-    let message = response
-        .get("message")
-        .ok_or_else(|| ToolError::Protocol("Messaging mutation omitted message".to_owned()))?;
-    let message_id = message
-        .get("message_id")
-        .and_then(Value::as_str)
-        .filter(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_ok())
-        .ok_or_else(|| {
-            ToolError::Protocol("Messaging mutation returned invalid message_id".to_owned())
-        })?
-        .to_owned();
-    let seq = message
-        .get("seq")
-        .and_then(Value::as_u64)
-        .filter(|seq| *seq > 0)
-        .ok_or_else(|| ToolError::Protocol("Messaging mutation returned invalid seq".to_owned()))?;
-    let attachments: Vec<MessagingAttachmentMetadata> = serde_json::from_value(
-        message
-            .get("attachments")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
-    )
-    .map_err(|error| ToolError::Protocol(format!("invalid Messaging attachments: {error}")))?;
-    for (position, attachment) in attachments.iter().enumerate() {
-        validate_attachment_metadata(attachment, Some(position))?;
-    }
-    Ok(VisibleMessage {
-        message_id,
-        seq: Some(seq),
-        attachments,
-    })
-}
-
 /// Authenticate one complete Messaging screen before any of it becomes local
 /// view state or read evidence. The API returns dense per-place history in
 /// ascending order even though it pages backwards; accepting a looser shape
@@ -2914,6 +3556,11 @@ fn validate_open_message(
             "Messaging open message has an invalid message_id".to_owned(),
         ));
     }
+    if message.revision == 0 {
+        return Err(ToolError::Protocol(
+            "Messaging open message has an invalid revision".to_owned(),
+        ));
+    }
     validate_open_participant(&message.author, "author")?;
     for mention in &message.mentions {
         validate_open_participant(mention, "mention")?;
@@ -2969,15 +3616,12 @@ fn validate_open_message(
             || !message.mentions.is_empty()
             || !message.reactions.is_empty()
             || !message.attachments.is_empty()
-            || message.poll.is_some()
         {
             return Err(ToolError::Protocol(
                 "Messaging open tombstone still carries removed experience data".to_owned(),
             ));
         }
-    } else if (message.content.is_empty()
-        && message.attachments.is_empty()
-        && message.poll.is_none())
+    } else if (message.content.is_empty() && message.attachments.is_empty())
         || message.content.len() > MAX_CONTENT_BYTES
         || message.content.contains('\0')
     {
@@ -2985,67 +3629,7 @@ fn validate_open_message(
             "Messaging open live message has invalid content".to_owned(),
         ));
     }
-    if let Some(poll) = &message.poll {
-        validate_open_poll(poll)?;
-    }
     Ok(())
-}
-
-fn validate_open_poll(poll: &OpenPollWire) -> Result<(), ToolError> {
-    if !valid_open_poll_text(&poll.question, MAX_POLL_QUESTION_CHARS)
-        || !valid_nullable_string(&poll.closes_at, usize::MAX)
-        || poll.revision < 0
-        || !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&poll.options.len())
-    {
-        return Err(ToolError::Protocol(
-            "Messaging open message has an invalid poll".to_owned(),
-        ));
-    }
-
-    let mut option_ids = BTreeSet::new();
-    let mut option_texts = BTreeSet::new();
-    let mut single_choice_voters = BTreeSet::new();
-    for option in &poll.options {
-        if validate_canonical_uuid_v7(&option.option_id).is_err()
-            || !option_ids.insert(option.option_id.as_str())
-            || !valid_open_poll_text(&option.text, MAX_POLL_OPTION_CHARS)
-            || !option_texts.insert(option.text.as_str())
-        {
-            return Err(ToolError::Protocol(
-                "Messaging open message has an invalid poll option".to_owned(),
-            ));
-        }
-
-        let mut option_voters = BTreeSet::new();
-        for voter in &option.voters {
-            validate_open_participant(voter, "poll voter")?;
-            let Some(voter_id) = (match voter.kind.as_str() {
-                "human" => voter.human_id.as_deref(),
-                "personality_agent" => voter.personality_agent_id.as_deref(),
-                _ => None,
-            }) else {
-                return Err(ToolError::Protocol(
-                    "Messaging open message has an invalid poll voter".to_owned(),
-                ));
-            };
-            let voter_key = (voter.kind.as_str(), voter_id);
-            if !option_voters.insert(voter_key)
-                || (!poll.allow_multi && !single_choice_voters.insert(voter_key))
-            {
-                return Err(ToolError::Protocol(
-                    "Messaging open message has inconsistent poll voters".to_owned(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn valid_open_poll_text(value: &str, max_chars: usize) -> bool {
-    !value.is_empty()
-        && value.trim() == value
-        && !value.contains('\0')
-        && value.chars().count() <= max_chars
 }
 
 fn validate_attachment_metadata(
@@ -3076,6 +3660,13 @@ fn validate_attachment_metadata(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || attachment.position as usize >= MAX_ATTACHMENTS_PER_MESSAGE
         || expected_position.is_some_and(|position| attachment.position as usize != position)
+        // The sender's description is one sentence about the file, bounded by
+        // the same rule the API enforces, and never a second message body.
+        || attachment.alt.chars().count() > MAX_ATTACHMENT_ALT_CHARS
+        || attachment
+            .alt
+            .chars()
+            .any(crate::apiclient::messaging::forbidden_attachment_display_character)
     {
         return Err(ToolError::Protocol(
             "invalid Messaging attachment metadata".to_owned(),
@@ -3145,6 +3736,14 @@ const fn status_text(status: MessagingStatus) -> &'static str {
         MessagingStatus::Available => "available",
         MessagingStatus::Busy => "busy",
         MessagingStatus::Away => "away",
+    }
+}
+
+const fn notify_level_text(level: MessagingNotifyLevel) -> &'static str {
+    match level {
+        MessagingNotifyLevel::All => "all",
+        MessagingNotifyLevel::Mentions => "mentions",
+        MessagingNotifyLevel::Mute => "mute",
     }
 }
 
@@ -3234,6 +3833,7 @@ mod tests {
             },
         },
         provider::types::{ToolCall, ToolInvocationRoute, ValidatedToolArguments},
+        runtime::contracts::RpcIdentity,
         store::Redactor,
         tools::{
             BoundExecutionError, BoundToolInvocation, ToolRegistry, ToolRegistryBuilder,
@@ -3245,6 +3845,7 @@ mod tests {
     const TEST_INSTALLATION_ID: &str = "0198f0f4-9b72-7000-8000-000000000301";
     const TEST_WORKSPACE_B_ID: &str = "0198f0f4-9b72-7000-8000-000000000202";
     const TEST_INSTALLATION_B_ID: &str = "0198f0f4-9b72-7000-8000-000000000302";
+    const TEST_PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000401";
     const TEST_WRONG_VARIANT_WORKSPACE_ID: &str = "0198f0f4-9b72-7000-0000-000000000201";
     const TEST_WRONG_VARIANT_INSTALLATION_ID: &str = "0198f0f4-9b72-7000-0000-000000000301";
 
@@ -3266,29 +3867,9 @@ mod tests {
             "client_nonce": format!("nonce-{seq}"),
             "created_at": "2026-08-12T00:00:00Z",
             "edited_at": null,
+            "revision": 1,
             "deleted": deleted,
             "attachments": []
-        })
-    }
-
-    fn test_open_poll() -> Value {
-        json!({
-            "question": "When should we ship?",
-            "allow_multi": false,
-            "closes_at": null,
-            "revision": 0,
-            "options": [
-                {
-                    "option_id": "0198f0f4-9b72-7000-8000-000000000401",
-                    "text": "Today",
-                    "voters": []
-                },
-                {
-                    "option_id": "0198f0f4-9b72-7000-8000-000000000402",
-                    "text": "Tomorrow",
-                    "voters": [test_participant()]
-                }
-            ]
         })
     }
 
@@ -3469,6 +4050,8 @@ mod tests {
             size_bytes: bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(bytes)),
             position,
+            spoiler: false,
+            alt: String::new(),
         }
     }
 
@@ -3494,20 +4077,19 @@ mod tests {
         statuses: AsyncMutex<Vec<RecordedStatus>>,
         promises: AsyncMutex<Vec<RecordedReplyLater>>,
         resolutions: AsyncMutex<Vec<String>>,
+        notification_requests: AsyncMutex<Vec<Value>>,
+        notification_gate: AsyncMutex<Option<Arc<Semaphore>>>,
+        notification_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
+        search_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         threads: AsyncMutex<Vec<(String, String, Option<String>, String)>>,
-        polls: AsyncMutex<
-            Vec<(
-                String,
-                String,
-                Vec<String>,
-                bool,
-                Option<String>,
-                Option<u32>,
-            )>,
-        >,
-        votes: AsyncMutex<Vec<(String, String, Vec<String>)>>,
+        create_thread_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
+        started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
+        started_dm_nonces: AsyncMutex<Vec<Option<String>>>,
+        created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
+        updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
+        duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -3580,6 +4162,12 @@ mod tests {
                 .lock()
                 .await
                 .push(format!("open:{}", request.place_id));
+            let mut failures = self.failures.lock().await;
+            if failures.front() == Some(&"open") {
+                failures.pop_front();
+                return Err(anyhow!("open failed"));
+            }
+            drop(failures);
             if let Some(response) = self.open_responses.lock().await.pop_front() {
                 return Ok(response);
             }
@@ -3643,49 +4231,6 @@ mod tests {
             })
         }
 
-        async fn create_poll(
-            &self,
-            scope: &ExactMessagingScope,
-            request: CreateMessagingPollRequest<'_>,
-        ) -> Result<Value> {
-            self.record_scope(scope).await;
-            self.calls
-                .lock()
-                .await
-                .push(format!("create_poll:{}", request.place_id));
-            self.polls.lock().await.push((
-                request.place_id.to_owned(),
-                request.question.to_owned(),
-                request.options.to_vec(),
-                request.allow_multi,
-                request.content.map(str::to_owned),
-                request.closes_in_minutes,
-            ));
-            Ok(json!({"message": {
-                "message_id": "poll-message", "seq": 9, "attachments": []
-            }, "created": true}))
-        }
-
-        async fn vote_poll(
-            &self,
-            scope: &ExactMessagingScope,
-            request: VoteMessagingPollRequest<'_>,
-        ) -> Result<Value> {
-            self.record_scope(scope).await;
-            self.calls
-                .lock()
-                .await
-                .push(format!("vote_poll:{}", request.message_id));
-            self.votes.lock().await.push((
-                request.place_id.to_owned(),
-                request.message_id.to_owned(),
-                request.option_ids.to_vec(),
-            ));
-            Ok(json!({"message": {
-                "message_id": request.message_id, "seq": 7, "attachments": []
-            }}))
-        }
-
         async fn upload_attachment(
             &self,
             scope: &ExactMessagingScope,
@@ -3739,6 +4284,10 @@ mod tests {
                 size_bytes,
                 sha256,
                 position: 0,
+                // The PA's own upload lane declares neither: it has no way to
+                // set them (see the write action's schema).
+                spoiler: false,
+                alt: String::new(),
             };
             by_nonce.insert(client_nonce, attachment.clone());
             Ok(UploadMessagingAttachmentResponse {
@@ -3808,6 +4357,94 @@ mod tests {
                 request.expires_in_minutes,
             ));
             Ok(json!({"status": {"status": request.status, "note": request.note.unwrap_or("")}}))
+        }
+
+        async fn start_dm(
+            &self,
+            scope: &ExactMessagingScope,
+            request: StartMessagingDMRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls.lock().await.push("start_dm".to_owned());
+            self.started_dms
+                .lock()
+                .await
+                .push(request.participants.to_vec());
+            self.started_dm_nonces
+                .lock()
+                .await
+                .push(request.client_nonce.map(str::to_owned));
+            let kind = if request.participants.len() == 1 {
+                "dm"
+            } else {
+                "group_dm"
+            };
+            Ok(json!({
+                "dm": {"dm_id": "dm-1", "kind": kind, "participants": request.participants},
+                "created": true
+            }))
+        }
+
+        async fn create_channel(
+            &self,
+            scope: &ExactMessagingScope,
+            request: CreateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls.lock().await.push("create_channel".to_owned());
+            self.created_channels.lock().await.push((
+                request.name.to_owned(),
+                request.topic.map(str::to_owned),
+                request.voice,
+            ));
+            Ok(json!({
+                "channel": {
+                    "channel_id": "channel-new",
+                    "name": request.name,
+                    "topic": request.topic.unwrap_or("")
+                }
+            }))
+        }
+
+        async fn update_channel(
+            &self,
+            scope: &ExactMessagingScope,
+            request: UpdateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls.lock().await.push("update_channel".to_owned());
+            self.updated_channels.lock().await.push((
+                request.place_id.to_owned(),
+                request.name.map(str::to_owned),
+                request.topic.map(str::to_owned),
+            ));
+            Ok(json!({
+                "channel": {
+                    "channel_id": request.place_id,
+                    "name": request.name.unwrap_or("general"),
+                    "topic": request.topic.unwrap_or("")
+                }
+            }))
+        }
+
+        async fn duplicate_channel(
+            &self,
+            scope: &ExactMessagingScope,
+            request: DuplicateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls.lock().await.push("duplicate_channel".to_owned());
+            self.duplicated_channels
+                .lock()
+                .await
+                .push((request.place_id.to_owned(), request.name.map(str::to_owned)));
+            Ok(json!({
+                "channel": {
+                    "channel_id": "channel-copy",
+                    "name": request.name.unwrap_or("general のコピー"),
+                    "topic": ""
+                }
+            }))
         }
 
         async fn reply_later(
@@ -3903,43 +4540,79 @@ mod tests {
             }]}))
         }
 
-        async fn threads(
+        async fn search(
             &self,
             scope: &ExactMessagingScope,
-            request: ListMessagingThreadsRequest<'_>,
+            request: SearchMessagingRequest<'_>,
         ) -> Result<Value> {
             self.record_scope(scope).await;
             self.calls
                 .lock()
                 .await
-                .push(format!("threads:{}", request.parent_place_id));
-            Ok(json!({"threads": []}))
+                .push(format!("search:{}", request.query));
+            if self.failures.lock().await.pop_front() == Some("search") {
+                return Err(anyhow!("search failed"));
+            }
+            if let Some(gate) = self.search_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("test search gate remains open")
+                    .forget();
+            }
+            Ok(json!({"results": [{
+                "message_id": "message-1",
+                "place": {"kind": "channel", "channel_id": request.place_id.unwrap_or("general")},
+                "seq": 7,
+                "author": {"kind": "human", "human_id": "human-1"},
+                "snippet": request.query,
+                "created_at": "2026-08-17T00:00:00Z"
+            }]}))
         }
 
-        async fn create_thread(
+        async fn notification_settings(
             &self,
             scope: &ExactMessagingScope,
-            request: CreateMessagingThreadRequest<'_>,
+            request: MessagingNotificationSettingsRequest<'_>,
         ) -> Result<Value> {
             self.record_scope(scope).await;
-            self.calls
-                .lock()
-                .await
-                .push(format!("create_thread:{}", request.parent_place_id));
-            self.threads.lock().await.push((
-                request.parent_place_id.to_owned(),
-                request.name.to_owned(),
-                request.parent_message_id.map(str::to_owned),
-                request.client_nonce.to_owned(),
+            let changed = request.changes_setting();
+            self.calls.lock().await.push(format!(
+                "notification_settings:{}",
+                if changed { "set" } else { "read" }
             ));
-            Ok(json!({
-                "thread_id": "th-1",
-                "name": request.name,
-                "parent_place": {"kind": "channel", "channel_id": request.parent_place_id},
-                "parent_message_id": request.parent_message_id,
-                "message_count": 0,
-                "participants": []
-            }))
+            self.notification_requests.lock().await.push(json!({
+                "defaults_level": request.defaults_level,
+                "per_place": request.per_place.as_ref().map(|entries| entries
+                    .iter()
+                    .map(|entry| json!({"place_id": entry.place_id, "level": entry.level}))
+                    .collect::<Vec<_>>()),
+                "keywords": request.keywords,
+            }));
+            if let Some(gate) = self.notification_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("test notification setting gate remains open")
+                    .forget();
+            }
+            if let Some(class) = *self.notification_failure_class.lock().await {
+                let failure = match class {
+                    MessagingApiFailureClass::Terminal => MessagingApiFailure::terminal(
+                        "test notification settings",
+                        "configured terminal failure",
+                    ),
+                    MessagingApiFailureClass::Indeterminate => MessagingApiFailure::indeterminate(
+                        "test notification settings",
+                        "configured indeterminate failure",
+                    ),
+                };
+                return Err(failure.into());
+            }
+            Ok(json!({"setting": {
+                "owner": {"kind": "personality_agent", "personality_agent_id": "agent-1"},
+                "defaults": {"level": request.defaults_level.unwrap_or("all")},
+                "per_place": [],
+                "keywords": []
+            }}))
         }
     }
 
@@ -3947,6 +4620,15 @@ mod tests {
         tool: &MessagingTool,
         action: Value,
         call_id: &str,
+    ) -> Result<ToolOutput, ToolError> {
+        execute_with_cancel(tool, action, call_id, CancellationToken::new()).await
+    }
+
+    async fn execute_with_cancel(
+        tool: &MessagingTool,
+        action: Value,
+        call_id: &str,
+        cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: ValidatedToolArguments =
             serde_json::from_value(with_default_workspace(action)).unwrap();
@@ -3957,7 +4639,7 @@ mod tests {
                 flow_id: "flow",
                 call_id,
                 args: &args,
-                cancel: CancellationToken::new(),
+                cancel,
                 on_update: Arc::new(|_| {}),
                 workspace: &workspace,
             },
@@ -4062,6 +4744,27 @@ mod tests {
             .await
     }
 
+    async fn bind_and_execute_action(
+        registry: &ToolRegistry,
+        id: &str,
+        action: Value,
+    ) -> Result<(BoundToolInvocation, BoundToolExecutionOutcome), BoundExecutionError> {
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(&tool_call(id, action), "flow", &workspace)
+            .await
+            .map_err(BoundExecutionError::InvalidInvocation)?;
+        let invocation = registry
+            .validate_bound(&sealed)
+            .map_err(BoundExecutionError::InvalidInvocation)?
+            .clone();
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let outcome = registry
+            .execute_bound(authorized, CancellationToken::new(), Arc::new(|_| {}))
+            .await?;
+        Ok((invocation, outcome))
+    }
+
     async fn binding_fixture() -> (Arc<FakeMessagingApi>, Arc<MessagingTool>, ToolRegistry) {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = Arc::new(MessagingTool::new(api.clone()));
@@ -4108,7 +4811,12 @@ mod tests {
         builder
             .register(tool.clone())
             .expect("register Messaging binder");
-        (api, tool, builder.build())
+        let identity = RpcIdentity::from_wire(TEST_PERSONALITY_AGENT_ID, 7, "messaging-test")
+            .expect("test executor identity");
+        let registry = builder
+            .build_bound_for_executor_identity(identity)
+            .expect("bind Messaging fixture to executor identity");
+        (api, tool, registry)
     }
 
     async fn attachment_binding_fixture(
@@ -4211,13 +4919,8 @@ mod tests {
                 exact_projection.contains(INVITE_CODE_SENTINEL),
                 "{id} must preserve exact local Human review content"
             );
-            let provider_projection = serde_json::to_string(&bound.provider_review_projection)
-                .expect("provider-safe projection");
-            assert_eq!(
-                provider_projection.matches(INVITE_CODE_SENTINEL).count(),
-                0,
-                "{id} leaked through the provider-safe projection"
-            );
+            let evidence = serde_json::to_value(&bound).expect("bound Messaging evidence");
+            assert!(evidence.get("provider_review_projection").is_none());
 
             let human_request = PendingApprovalRequest::from_bound(
                 format!("approval-{id}"),
@@ -4367,6 +5070,8 @@ mod tests {
             json!([
                 "overview",
                 "open",
+                "threads",
+                "create_thread",
                 "write",
                 "open_attachment",
                 "react",
@@ -4374,10 +5079,12 @@ mod tests {
                 "reply_later",
                 "resolve_reply_later",
                 "get_call_state",
-                "threads",
-                "create_thread",
-                "create_poll",
-                "vote_poll"
+                "search",
+                "notification_settings",
+                "start_dm",
+                "create_channel",
+                "update_channel",
+                "duplicate_channel"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -4405,11 +5112,9 @@ mod tests {
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
-        assert_eq!(schema["properties"]["options"]["minItems"], 2);
-        assert_eq!(schema["properties"]["options"]["maxItems"], 10);
-        assert_eq!(schema["properties"]["question"]["maxLength"], 500);
-        assert_eq!(schema["properties"]["options"]["items"]["maxLength"], 200);
-        assert_eq!(schema["properties"]["option_ids"]["maxItems"], 10);
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["properties"]["per_place"]["maxItems"], 200);
+        assert_eq!(schema["properties"]["keywords"]["maxItems"], 32);
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
             assert_eq!(schema["properties"][field]["maximum"], 10080);
@@ -4423,12 +5128,11 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "action",
-                "allow_multi",
                 "attachment_id",
                 "attachments",
                 "before_seq",
-                "closes_in_minutes",
                 "content",
+                "defaults_level",
                 "emoji",
                 "expires_in_minutes",
                 "limit",
@@ -4436,15 +5140,18 @@ mod tests {
                 "message_id",
                 "name",
                 "note",
-                "option_ids",
-                "options",
+                "keywords",
+                "per_place",
+                "participants",
                 "place_id",
-                "question",
+                "query",
                 "remind_in_minutes",
                 "reply_to",
                 "seq",
                 "status",
+                "topic",
                 "urgency",
+                "voice",
                 "workspace_id",
             ])
         );
@@ -5120,253 +5827,363 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_actions_require_a_parent_and_creation_moves_the_view() {
-        let api = Arc::new(FakeMessagingApi::default());
-        let tool = MessagingTool::new(api.clone());
+    async fn search_is_an_exact_read_and_does_not_make_hits_actionable() {
+        let (api, tool, registry) = binding_fixture().await;
 
-        for action in [
-            json!({"action": "threads"}),
-            json!({"action": "create_thread", "name": "認証リダイレクト"}),
+        let broad = bind_action(
+            &registry,
+            "search-all",
+            json!({"action": "search", "query": "デプロイ", "limit": 10}),
+        )
+        .await
+        .expect("bind workspace-visible search");
+        assert_eq!(broad.descriptor.operation, "search");
+        assert_eq!(broad.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(
+            broad.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::collection("messaging", "place")])
+        );
+        assert_eq!(
+            Value::Object(broad.execution_arguments.as_object().clone()),
+            scoped_execution(json!({
+                "action": "search",
+                "query": "デプロイ",
+                "limit": 10
+            }))
+        );
+
+        let one_place = bind_action(
+            &registry,
+            "search-place",
+            json!({"action": "search", "query": "デプロイ", "place_id": "place-a"}),
+        )
+        .await
+        .expect("bind place-scoped search");
+        assert_eq!(
+            one_place.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "place",
+                "place-a"
+            )])
+        );
+
+        let before = default_state(&tool).await.visible_messages.clone();
+        let output = execute_bound_action(
+            &registry,
+            "search-run",
+            json!({"action": "search", "query": "デプロイ"}),
+        )
+        .await
+        .expect("execute search");
+        assert_eq!(
+            output.output.details["results"][0]["message_id"],
+            "message-1"
+        );
+        assert_eq!(default_state(&tool).await.visible_messages, before);
+        assert_eq!(
+            api.calls.lock().await.last().map(String::as_str),
+            Some("search:デプロイ")
+        );
+
+        let hit_action = bind_action(
+            &registry,
+            "react-to-hit",
+            json!({"action": "react", "message_id": "message-1", "emoji": "👍"}),
+        )
+        .await
+        .expect_err("a search hit must be opened before it becomes actionable");
+        assert!(matches!(
+            hit_action,
+            DescribeError::AppPrecondition { precondition }
+                if precondition.code == "visible_target_required"
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_cancellation_and_errors_stay_typed() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let gate = Arc::new(Semaphore::new(0));
+        *api.search_gate.lock().await = Some(gate);
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "search-cancel",
+                    json!({"action": "search", "query": "blocked"}),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind cancellable search");
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let registry = Arc::new(registry);
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .execute_bound(authorized, cancel, Arc::new(|_| {}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|call| call == "search:blocked")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("search reaches the cancellation gate");
+        cancel.cancel();
+        let error = match execution.await.expect("search execution joins") {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled search must fail"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+
+        *api.search_gate.lock().await = None;
+        api.failures.lock().await.push_back("search");
+        let error = match execute_bound_action(
+            registry.as_ref(),
+            "search-error",
+            json!({"action": "search", "query": "failure"}),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("search RPC error must surface"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Rpc(message)) if message == "search failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn notification_settings_distinguishes_reads_from_partial_replacements() {
+        let (api, _tool, registry) = binding_fixture().await;
+
+        let read = bind_action(
+            &registry,
+            "notification-read",
+            json!({"action": "notification_settings"}),
+        )
+        .await
+        .expect("bind notification setting read");
+        assert_eq!(read.descriptor.operation, "notification_settings");
+        assert_eq!(read.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(read.review_projection.as_object()["changes_setting"], false);
+        assert_eq!(
+            read.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "participant",
+                "self"
+            )])
+        );
+
+        let update = bind_action(
+            &registry,
+            "notification-update",
+            json!({
+                "action": "notification_settings",
+                "defaults_level": "mentions",
+                "per_place": [{"place_id": "place-a", "level": "mute"}]
+            }),
+        )
+        .await
+        .expect("bind notification setting update");
+        assert_eq!(update.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            update.review_projection.as_object()["changes_setting"],
+            true
+        );
+        assert_eq!(
+            update.descriptor.resource_scopes,
+            scoped_resources(vec![
+                ResourceScope::resource("messaging", "participant", "self"),
+                ResourceScope::resource("messaging", "place", "place-a"),
+            ])
+        );
+
+        execute_bound_action(
+            &registry,
+            "notification-keywords",
+            json!({"action": "notification_settings", "keywords": ["リリース"]}),
+        )
+        .await
+        .expect("execute keyword-only update");
+        let requests = api.notification_requests.lock().await;
+        let keyword_only = requests.last().expect("record keyword-only request");
+        assert_eq!(keyword_only["keywords"], json!(["リリース"]));
+        assert_eq!(keyword_only["defaults_level"], Value::Null);
+        assert_eq!(keyword_only["per_place"], Value::Null);
+        drop(requests);
+
+        execute_bound_action(
+            &registry,
+            "notification-clear-lists",
+            json!({"action": "notification_settings", "per_place": [], "keywords": []}),
+        )
+        .await
+        .expect("execute explicit list replacement");
+        let requests = api.notification_requests.lock().await;
+        let cleared = requests.last().expect("record explicit empty arrays");
+        assert_eq!(cleared["per_place"], json!([]));
+        assert_eq!(cleared["keywords"], json!([]));
+        drop(requests);
+
+        for (id, action) in [
+            (
+                "duplicate-place",
+                json!({
+                    "action": "notification_settings",
+                    "per_place": [
+                        {"place_id": "place-a", "level": "all"},
+                        {"place_id": "place-a", "level": "mute"}
+                    ]
+                }),
+            ),
+            (
+                "blank-keyword",
+                json!({"action": "notification_settings", "keywords": ["   "]}),
+            ),
+            ("blank-search", json!({"action": "search", "query": "   "})),
         ] {
-            let error = execute(&tool, action, "without-parent")
+            let error = bind_action(&registry, id, action)
                 .await
-                .expect_err("thread action needs the current parent place");
-            assert!(matches!(error, ToolError::Protocol(_)));
+                .expect_err("invalid search or notification setting must not bind");
+            assert_eq!(error, DescribeError::InvalidArguments, "case {id}");
         }
+    }
 
-        execute(
-            &tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open-parent",
-        )
-        .await
-        .expect("open parent");
-        execute(&tool, json!({"action": "threads"}), "list")
+    #[tokio::test]
+    async fn notification_settings_update_settles_after_emission_while_read_remains_cancellable() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let registry = Arc::new(registry);
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+
+        let update = registry
+            .bind(
+                &tool_call(
+                    "notification-update-cancel",
+                    json!({"action": "notification_settings", "keywords": ["release"]}),
+                ),
+                "flow",
+                &workspace,
+            )
             .await
-            .expect("list threads");
-        execute(
-            &tool,
-            json!({"action": "create_thread", "name": "認証リダイレクト", "seq": 7}),
-            "create",
-        )
+            .expect("bind notification setting update");
+        let update = crate::approval::authority::AuthorizedBoundInvocation::for_test(update);
+        let gate = Arc::new(Semaphore::new(0));
+        *api.notification_gate.lock().await = Some(gate.clone());
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .execute_bound(update, cancel, Arc::new(|_| {}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api.notification_requests.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("create thread");
-        assert_eq!(
-            api.threads.lock().await.as_slice(),
-            &[(
-                "general".to_owned(),
-                "認証リダイレクト".to_owned(),
-                Some("m7".to_owned()),
-                client_nonce("flow", "create"),
-            )]
+        .expect("notification setting update reaches its response gate");
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !execution.is_finished(),
+            "post-emission cancellation must not hide a committed setting update"
         );
-
-        execute(
-            &tool,
-            json!({"action": "write", "content": "続きはこちらで"}),
-            "write-thread",
-        )
-        .await
-        .expect("write in newly focused thread");
-        assert_eq!(api.writes.lock().await[0].0, "th-1");
-    }
-
-    #[tokio::test]
-    async fn thread_creation_retries_with_a_stable_nonce_and_returns_the_same_thread() {
-        let api = Arc::new(FakeMessagingApi::default());
-        let create = json!({"action": "create_thread", "name": "認証リダイレクト"});
-
-        let first_tool = MessagingTool::new(api.clone());
-        execute(
-            &first_tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open-first",
-        )
-        .await
-        .expect("open parent for first create");
-        let first = execute(&first_tool, create.clone(), "create-retry")
+        gate.add_permits(1);
+        execution
             .await
-            .expect("create thread");
+            .expect("update execution task joins")
+            .expect("setting update settles after cancellation");
 
-        // A retry can be delivered after reconstructing the local view, so it
-        // must retain its operation identity independently of view state.
-        let retry_tool = MessagingTool::new(api.clone());
-        execute(
-            &retry_tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open-retry",
-        )
-        .await
-        .expect("open parent for retry");
-        let replay = execute(&retry_tool, create, "create-retry")
+        let read = registry
+            .bind(
+                &tool_call(
+                    "notification-read-cancel",
+                    json!({"action": "notification_settings"}),
+                ),
+                "flow",
+                &workspace,
+            )
             .await
-            .expect("replay thread creation");
-
-        assert_eq!(first.details["thread_id"], replay.details["thread_id"]);
-        let threads = api.threads.lock().await;
-        assert_eq!(threads.len(), 2);
-        assert_eq!(threads[0].3, client_nonce("flow", "create-retry"));
-        assert_eq!(threads[1].3, threads[0].3);
+            .expect("bind notification setting read");
+        let read = crate::approval::authority::AuthorizedBoundInvocation::for_test(read);
+        let read_gate = Arc::new(Semaphore::new(0));
+        *api.notification_gate.lock().await = Some(read_gate);
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move { registry.execute_bound(read, cancel, Arc::new(|_| {})).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api.notification_requests.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notification setting read reaches its cancellation gate");
+        cancel.cancel();
+        let error = match execution.await.expect("read execution task joins") {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled notification setting read must fail"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
     }
 
     #[tokio::test]
-    async fn poll_actions_create_and_replace_a_vote_on_a_visible_message() {
-        let api = Arc::new(FakeMessagingApi::default());
-        let tool = MessagingTool::new(api.clone());
+    async fn indeterminate_notification_settings_update_stays_typed() {
+        let (api, _tool, registry) = binding_fixture().await;
+        *api.notification_failure_class.lock().await =
+            Some(MessagingApiFailureClass::Indeterminate);
 
-        let error = execute(
-            &tool,
-            json!({"action": "create_poll", "question": "いつ？", "options": ["今日", "明日"]}),
-            "without-place",
-        )
-        .await
-        .expect_err("poll creation needs the current place");
-        assert!(matches!(error, ToolError::Protocol(_)));
-
-        execute(
-            &tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open",
-        )
-        .await
-        .expect("open place");
-        execute(
-            &tool,
-            json!({
-                "action": "create_poll",
-                "question": "いつ？",
-                "options": ["今日", "明日"],
-                "allow_multi": false,
-                "content": "リリース日",
-                "closes_in_minutes": 30
-            }),
-            "create-poll",
-        )
-        .await
-        .expect("create poll");
-        execute(
-            &tool,
-            json!({"action": "vote_poll", "seq": 7, "option_ids": ["option-1"]}),
-            "vote-poll",
-        )
-        .await
-        .expect("replace vote");
-
-        assert_eq!(
-            api.polls.lock().await.as_slice(),
-            &[(
-                "general".to_owned(),
-                "いつ？".to_owned(),
-                vec!["今日".to_owned(), "明日".to_owned()],
-                false,
-                Some("リリース日".to_owned()),
-                Some(30),
-            )]
-        );
-        assert_eq!(
-            api.votes.lock().await.as_slice(),
-            &[(
-                "general".to_owned(),
-                "m7".to_owned(),
-                vec!["option-1".to_owned()],
-            )]
-        );
-    }
-
-    #[tokio::test]
-    async fn create_poll_rejects_a_501_character_question_before_calling_the_server() {
-        let api = Arc::new(FakeMessagingApi::default());
-        let tool = MessagingTool::new(api.clone());
-        execute(
-            &tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open",
-        )
-        .await
-        .expect("open place");
-
-        let error = execute(
-            &tool,
-            json!({
-                "action": "create_poll",
-                "question": "a".repeat(501),
-                "options": ["today", "tomorrow"]
-            }),
-            "question-too-long",
-        )
-        .await
-        .expect_err("501 character question must be rejected by the tool");
-        assert!(matches!(error, ToolError::InvalidArguments));
-        assert!(api.polls.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_poll_rejects_attachments_before_calling_the_server() {
-        let api = Arc::new(FakeMessagingApi::default());
-        let tool = MessagingTool::new(api.clone());
-        execute(
-            &tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open",
-        )
-        .await
-        .expect("open place");
-
-        let error = execute(
-            &tool,
-            json!({
-                "action": "create_poll",
-                "question": "When?",
-                "options": ["today", "tomorrow"],
-                "attachments": ["/workspace/agenda.txt"]
-            }),
-            "poll-with-attachment",
-        )
-        .await
-        .expect_err("poll attachments are unsupported on every messaging surface");
-        assert!(matches!(error, ToolError::InvalidArguments));
-        assert!(api.polls.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn poll_binding_is_mutating_and_vote_requires_a_visible_message() {
-        let (_, _tool, registry) = binding_fixture().await;
-        let create = bind_action(
+        let error = match execute_bound_action(
             &registry,
-            "create-poll",
-            json!({"action": "create_poll", "question": "いつ？", "options": ["今日", "明日"]}),
+            "notification-update-indeterminate",
+            json!({"action": "notification_settings", "keywords": ["release"]}),
         )
         .await
-        .expect("bind poll creation");
-        assert_eq!(create.descriptor.operation, "create_poll");
-        assert_eq!(create.descriptor.capability, CapabilityClass::Mutate);
-        assert_eq!(
-            create.execution_arguments.as_object()["place_id"],
-            "place-a"
-        );
-
-        let vote = bind_action(
-            &registry,
-            "vote-poll",
-            json!({"action": "vote_poll", "seq": 7, "option_ids": ["option-1"]}),
-        )
-        .await
-        .expect("bind visible vote");
-        assert_eq!(vote.descriptor.operation, "vote_poll");
-        assert_eq!(vote.descriptor.capability, CapabilityClass::Mutate);
-        assert_eq!(
-            vote.execution_arguments.as_object()["message_id"],
-            "message-7"
-        );
-
-        let error = bind_action(
-            &registry,
-            "vote-hidden",
-            json!({"action": "vote_poll", "seq": 999, "option_ids": []}),
-        )
-        .await
-        .expect_err("hidden message cannot become a vote target");
-        assert!(matches!(error, DescribeError::AppPrecondition { .. }));
+        {
+            Err(error) => error,
+            Ok(_) => panic!("indeterminate setting update must not mint a bound receipt"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::RpcIndeterminate(_))
+        ));
     }
 
     #[tokio::test]
@@ -5450,7 +6267,7 @@ mod tests {
         let create_thread = bind_action(
             &registry,
             "create-thread",
-            json!({"action": "create_thread", "name": "認証", "seq": 7}),
+            json!({"action": "create_thread", "name": "  認証  ", "seq": 7}),
         )
         .await
         .expect("bind thread creation from a visible message");
@@ -5464,6 +6281,11 @@ mod tests {
             create_thread.execution_arguments.as_object()["parent_message_id"],
             "message-7"
         );
+        assert_eq!(
+            create_thread.execution_arguments.as_object()["name"],
+            "認証"
+        );
+        assert_eq!(create_thread.review_projection.as_object()["name"], "認証");
 
         let write = bind_action(
             &registry,
@@ -6209,30 +7031,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_admits_a_poll_only_message_and_returns_its_poll() {
-        let api = Arc::new(FakeMessagingApi::default());
-        let poll = test_open_poll();
-        let mut response = test_open_response("general", 1, 0, 1, 1, None);
-        response["messages"][0]["content"] = json!("");
-        response["messages"][0]["poll"] = poll.clone();
-        api.open_responses.lock().await.push_back(response);
-        let tool = MessagingTool::new(api);
-
-        let output = execute(
-            &tool,
-            json!({"action": "open", "place_id": "general"}),
-            "open-poll",
-        )
-        .await
-        .expect("poll-only message opens successfully");
-
-        assert_eq!(output.details["messages"][0]["poll"], poll);
-        let state = default_state(&tool).await;
-        assert_eq!(state.focused_place_id.as_deref(), Some("general"));
-        assert_eq!(state.visible_messages[0].message_id, "m1");
-    }
-
-    #[tokio::test]
     async fn bound_write_keeps_place_a_after_the_view_focuses_place_b() {
         let (api, tool, registry) = binding_fixture().await;
         let proposal = json!({"action": "write", "content": "hello"});
@@ -6311,7 +7109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_and_bound_paths_share_one_exact_executor_for_all_eight_actions() {
+    async fn raw_and_bound_paths_share_one_exact_executor_for_all_ten_actions() {
         let cases = [
             ("overview", json!({"action": "overview"})),
             (
@@ -6361,6 +7159,18 @@ mod tests {
             (
                 "call-state",
                 json!({"action": "get_call_state", "place_id": "place-a"}),
+            ),
+            (
+                "search",
+                json!({"action": "search", "query": "デプロイ", "limit": 10}),
+            ),
+            (
+                "notification-settings",
+                json!({
+                    "action": "notification_settings",
+                    "defaults_level": "mentions",
+                    "keywords": ["リリース"]
+                }),
             ),
         ];
 
@@ -6624,6 +7434,38 @@ mod tests {
     }
 
     #[test]
+    fn strict_open_wire_requires_positive_message_revision() {
+        let present = test_open_response("general", 1, 0, 1, 1, None);
+        assert!(
+            validate_open_response(&present, "general", None, None).is_ok(),
+            "a positive revision must be admitted"
+        );
+
+        let mut missing = present.clone();
+        missing["messages"][0]
+            .as_object_mut()
+            .expect("message object")
+            .remove("revision");
+        assert!(
+            matches!(
+                validate_open_response(&missing, "general", None, None),
+                Err(ToolError::Protocol(_))
+            ),
+            "an omitted revision must fail closed"
+        );
+
+        let mut zero = present;
+        zero["messages"][0]["revision"] = json!(0);
+        assert!(
+            matches!(
+                validate_open_response(&zero, "general", None, None),
+                Err(ToolError::Protocol(_))
+            ),
+            "revision zero must fail closed"
+        );
+    }
+
+    #[test]
     fn strict_open_wire_rejects_malformed_pages() {
         let valid = || test_open_response("general", 2, 0, 1, 2, None);
         let mut wrong_inner_place = valid();
@@ -6655,8 +7497,6 @@ mod tests {
         seq_zero["messages"][0]["seq"] = json!(0);
         let mut invalid_tombstone = valid();
         invalid_tombstone["messages"][0]["deleted"] = json!(true);
-        let mut genuinely_empty_live_message = valid();
-        genuinely_empty_live_message["messages"][0]["content"] = json!("");
         let mut gap = test_open_response("general", 3, 0, 1, 3, None);
         gap["messages"].as_array_mut().expect("messages").remove(1);
         let mut last_read_beyond_latest = valid();
@@ -6684,12 +7524,6 @@ mod tests {
             ("too-many-for-limit", valid(), None, Some(1)),
             ("gap", gap, None, None),
             ("invalid-tombstone", invalid_tombstone, None, None),
-            (
-                "genuinely-empty-live-message",
-                genuinely_empty_live_message,
-                None,
-                None,
-            ),
             (
                 "last-read-beyond-latest",
                 last_read_beyond_latest,
@@ -6749,6 +7583,63 @@ mod tests {
         ));
         assert_eq!(*default_state(&tool).await, expected_state);
         assert!(api.reads.lock().await.is_empty());
+    }
+
+    /// AX/UX 同型性: 送り手が添付に付けた「ネタバレ」と説明は、人間の画面と
+    /// 同じくこの view からも見えなければならない。見えなければ agent は、
+    /// 隠されているはずの中身を平然と読み上げてしまう。
+    #[tokio::test]
+    async fn open_carries_the_sender_spoiler_and_alt_on_attachments() {
+        let bytes = b"ending".to_vec();
+        let mut attachment = test_attachment_metadata(30, "ending.png", "image/png", &bytes, 0);
+        attachment.spoiler = true;
+        attachment.alt = "結末の一枚".to_owned();
+        let mut page = test_open_response("general", 1, 0, 1, 1, None);
+        page["messages"][0]["attachments"] =
+            json!([serde_json::to_value(&attachment).expect("attachment wire")]);
+        let api = Arc::new(FakeMessagingApi::default());
+        api.open_responses.lock().await.push_back(page);
+        let tool = Arc::new(MessagingTool::new(api.clone()));
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).expect("register Messaging");
+        let registry = builder.build();
+
+        let outcome = execute_bound_action(
+            &registry,
+            "spoilered-open",
+            json!({"action": "open", "place_id": "general"}),
+        )
+        .await
+        .expect("a spoilered attachment is still a valid page");
+        let projected = &outcome.output.details["messages"][0]["attachments"][0];
+        assert_eq!(projected["spoiler"], json!(true));
+        assert_eq!(projected["alt"], json!("結末の一枚"));
+
+        // モデルが読むテキストにも同じことが載る（details だけではない）。
+        let UserContent::Text { text } = &outcome.output.content[0] else {
+            panic!("Messaging open renders text");
+        };
+        assert!(text.contains("\"spoiler\": true"), "rendered: {text}");
+        assert!(text.contains("結末の一枚"), "rendered: {text}");
+
+        // 宣言も他のメタデータと同じ関門を通る: 説明はひと続きの一文で、
+        // 二通目の本文にはならない。
+        let mut oversized = attachment.clone();
+        oversized.alt = "あ".repeat(MAX_ATTACHMENT_ALT_CHARS + 1);
+        let mut multiline = attachment.clone();
+        multiline.alt = "一行目\n二行目".to_owned();
+        for (case, malformed) in [("oversized", oversized), ("multiline", multiline)] {
+            let mut page = test_open_response("general", 1, 0, 1, 1, None);
+            page["messages"][0]["attachments"] =
+                json!([serde_json::to_value(&malformed).expect("attachment wire")]);
+            assert!(
+                matches!(
+                    validate_open_response(&page, "general", None, None),
+                    Err(ToolError::Protocol(_))
+                ),
+                "{case} attachment description must fail closed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7313,6 +8204,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_names_are_bounded_by_characters_like_the_server() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        for name in ["a".repeat(200), "あ".repeat(200)] {
+            execute(
+                &tool,
+                json!({"action": "create_channel", "name": name}),
+                "channel-name",
+            )
+            .await
+            .unwrap();
+        }
+        execute(
+            &tool,
+            json!({"action": "create_channel", "name": "voice", "voice": true}),
+            "voice-channel",
+        )
+        .await
+        .unwrap();
+        for action in [
+            json!({"action": "create_channel", "name": "あ".repeat(201)}),
+            json!({"action": "update_channel", "place_id": "place-a", "name": "あ".repeat(201)}),
+            json!({"action": "duplicate_channel", "place_id": "place-a", "name": "あ".repeat(201)}),
+        ] {
+            let error = execute(&tool, action, "channel-name-too-long")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(
+            *api.created_channels.lock().await,
+            vec![
+                ("a".repeat(200), None, false),
+                ("あ".repeat(200), None, false),
+                ("voice".to_owned(), None, true),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn reply_later_targets_only_messages_visible_on_the_open_screen() {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = MessagingTool::new(api.clone());
@@ -7553,5 +8485,332 @@ mod tests {
                 format!("✅:{}", client_nonce("flow", "react"))
             )]
         );
+    }
+
+    fn test_dm_participant(id: &str) -> Value {
+        json!({"kind": "human", "human_id": id})
+    }
+
+    fn test_pa_participant(id: &str) -> Value {
+        json!({"kind": "personality_agent", "personality_agent_id": id})
+    }
+
+    #[tokio::test]
+    async fn place_opening_actions_bind_as_app_owned_mutations_without_an_open_view() {
+        let (api, tool, registry) = binding_fixture().await;
+        // Nothing is in view: opening a place names its own target, the way a
+        // person clicks a sidebar row without first having been inside it.
+        default_state(&tool).await.focused_place_id = None;
+
+        let start = bind_action(
+            &registry,
+            "start-dm",
+            json!({"action": "start_dm", "participants": [test_dm_participant("human-2")]}),
+        )
+        .await
+        .expect("bind start_dm");
+        assert_eq!(start.descriptor.operation, "start_dm");
+        assert_eq!(start.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            start.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::collection("messaging", "place")])
+        );
+        assert_eq!(
+            Value::Object(start.review_projection.as_object().clone()),
+            scoped_review(json!({
+                "action": "start_dm",
+                "participants": [test_dm_participant("human-2")],
+                "conversation_kind": "dm"
+            }))
+        );
+
+        let group = bind_action(
+            &registry,
+            "start-group-dm",
+            json!({
+                "action": "start_dm",
+                "participants": [test_dm_participant("human-2"), test_dm_participant("human-3")]
+            }),
+        )
+        .await
+        .expect("bind group start_dm");
+        assert_eq!(
+            group.review_projection.as_object()["conversation_kind"],
+            "group_dm"
+        );
+
+        let create = bind_action(
+            &registry,
+            "create-channel",
+            json!({"action": "create_channel", "name": "design", "topic": "意匠の話", "voice": true}),
+        )
+        .await
+        .expect("bind create_channel");
+        assert_eq!(create.descriptor.operation, "create_channel");
+        assert_eq!(create.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            Value::Object(create.execution_arguments.as_object().clone()),
+            scoped_execution(json!({
+                "action": "create_channel",
+                "name": "design",
+                "topic": "意匠の話",
+                "voice": true
+            }))
+        );
+
+        let update = bind_action(
+            &registry,
+            "update-channel",
+            json!({"action": "update_channel", "place_id": "place-b", "name": "design"}),
+        )
+        .await
+        .expect("bind update_channel");
+        assert_eq!(update.descriptor.operation, "update_channel");
+        assert_eq!(
+            update.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "place",
+                "place-b"
+            )])
+        );
+        // An omitted topic is absent, not an empty string: the sealed argument
+        // says "leave it alone", never "clear it".
+        assert_eq!(
+            Value::Object(update.execution_arguments.as_object().clone()),
+            scoped_execution(json!({
+                "action": "update_channel",
+                "place_id": "place-b",
+                "name": "design"
+            }))
+        );
+
+        let duplicate = bind_action(
+            &registry,
+            "duplicate-channel",
+            json!({"action": "duplicate_channel", "place_id": "place-b"}),
+        )
+        .await
+        .expect("bind duplicate_channel");
+        assert_eq!(duplicate.descriptor.operation, "duplicate_channel");
+        assert_eq!(duplicate.descriptor.capability, CapabilityClass::Mutate);
+
+        // Binding is a proposal. Nothing reached the app.
+        assert!(api.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_channel_edit_that_names_nothing_is_refused_rather_than_reported_as_done() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let error = bind_action(
+            &registry,
+            "empty-update",
+            json!({"action": "update_channel", "place_id": "place-b"}),
+        )
+        .await
+        .expect_err("a rename that renames nothing is not an edit");
+        assert!(matches!(error, DescribeError::InvalidArguments));
+        assert!(api.updated_channels.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_dm_refuses_a_participant_that_names_no_single_identity() {
+        let (_api, _tool, registry) = binding_fixture().await;
+        for malformed in [
+            json!([]),
+            json!([{"kind": "human"}]),
+            json!([{"kind": "human", "personality_agent_id": "agent-2"}]),
+            json!([{"kind": "octopus", "human_id": "human-2"}]),
+            json!([test_pa_participant(TEST_PERSONALITY_AGENT_ID)]),
+        ] {
+            let error = bind_action(
+                &registry,
+                "malformed-start-dm",
+                json!({"action": "start_dm", "participants": malformed}),
+            )
+            .await
+            .expect_err("a participant must name exactly one identity");
+            assert!(matches!(error, DescribeError::InvalidArguments));
+        }
+    }
+
+    #[tokio::test]
+    async fn start_dm_seals_and_executes_one_actor_relative_canonical_participant_set() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let cases = [
+            (
+                "duplicate-becomes-dm",
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-2")
+                ]),
+                json!([test_dm_participant("human-2")]),
+                "dm",
+                false,
+            ),
+            (
+                "self-is-not-an-other",
+                json!([
+                    test_pa_participant(TEST_PERSONALITY_AGENT_ID),
+                    test_dm_participant("human-2")
+                ]),
+                json!([test_dm_participant("human-2")]),
+                "dm",
+                false,
+            ),
+            (
+                "group-permutation-a",
+                json!([
+                    test_dm_participant("human-3"),
+                    test_dm_participant("human-2")
+                ]),
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-3")
+                ]),
+                "group_dm",
+                true,
+            ),
+            (
+                "group-permutation-b",
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-3")
+                ]),
+                json!([
+                    test_dm_participant("human-2"),
+                    test_dm_participant("human-3")
+                ]),
+                "group_dm",
+                true,
+            ),
+        ];
+
+        let mut canonical_group_effect = None;
+        for (index, (id, proposed, expected, kind, expects_nonce)) in cases.into_iter().enumerate()
+        {
+            let (bound, outcome) = bind_and_execute_action(
+                &registry,
+                id,
+                json!({"action": "start_dm", "participants": proposed}),
+            )
+            .await
+            .expect("bind and execute canonical start_dm");
+
+            assert_eq!(
+                bound.review_projection.as_object()["participants"],
+                expected
+            );
+            assert_eq!(
+                bound.review_projection.as_object()["conversation_kind"],
+                kind
+            );
+            assert_eq!(
+                bound.execution_arguments.as_object()["participants"],
+                expected
+            );
+            assert_eq!(outcome.output.details["dm"]["participants"], expected);
+            assert_eq!(outcome.output.details["dm"]["kind"], kind);
+            if expects_nonce {
+                let effect = Value::Object(bound.execution_arguments.as_object().clone());
+                if let Some(first) = &canonical_group_effect {
+                    assert_eq!(first, &effect, "permutations must seal the same effect");
+                } else {
+                    canonical_group_effect = Some(effect);
+                }
+            }
+
+            let started = api.started_dms.lock().await;
+            assert_eq!(
+                serde_json::to_value(&started[index]).expect("recorded participants serialize"),
+                expected
+            );
+            drop(started);
+            assert_eq!(
+                api.started_dm_nonces.lock().await[index].is_some(),
+                expects_nonce,
+                "only the exact sealed group effect needs a creation receipt nonce"
+            );
+        }
+
+        let started = api.started_dms.lock().await;
+        assert_eq!(
+            started[2], started[3],
+            "participant permutations must seal and execute the same group effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_place_puts_it_in_view_with_an_empty_screen() {
+        let (api, tool, registry) = binding_fixture().await;
+        {
+            let mut state = default_state(&tool).await;
+            state.focused_place_id = Some("place-a".to_owned());
+            state.pending_read_through.insert("place-a".to_owned(), 7);
+        }
+
+        execute_bound_action(
+            &registry,
+            "start-dm",
+            json!({"action": "start_dm", "participants": [test_dm_participant("human-2")]}),
+        )
+        .await
+        .expect("execute start_dm");
+        {
+            let state = default_state(&tool).await;
+            assert_eq!(state.focused_place_id.as_deref(), Some("dm-1"));
+            // Nothing has been seen in a place opened a moment ago.
+            assert!(state.visible_messages.is_empty());
+            // A read cursor owed for another place is a promise already made.
+            assert_eq!(state.pending_read_through.get("place-a"), Some(&7));
+        }
+
+        execute_bound_action(
+            &registry,
+            "duplicate-channel",
+            json!({"action": "duplicate_channel", "place_id": "place-b"}),
+        )
+        .await
+        .expect("execute duplicate_channel");
+        assert_eq!(
+            default_state(&tool).await.focused_place_id.as_deref(),
+            Some("channel-copy")
+        );
+        // The copy's name is the server's answer; the agent never assembled one.
+        assert_eq!(
+            api.duplicated_channels.lock().await.as_slice(),
+            &[("place-b".to_owned(), None)]
+        );
+        assert_eq!(
+            api.started_dms.lock().await[0][0],
+            MessagingParticipant {
+                kind: "human".to_owned(),
+                human_id: Some("human-2".to_owned()),
+                personality_agent_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_place_mutation_without_its_exact_identity_cannot_change_focus() {
+        let mut state = MessagingViewState {
+            focused_place_id: Some("place-before".to_owned()),
+            visible_messages: vec![VisibleMessage {
+                message_id: "message-before".to_owned(),
+                seq: Some(1),
+                attachments: Vec::new(),
+            }],
+            ..MessagingViewState::default()
+        };
+        let error = focus_opened_place(
+            &mut state,
+            &json!({"channel": {"name": "missing identity"}}),
+            "channel",
+            "channel_id",
+        )
+        .expect_err("missing committed place identity must fail closed");
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert_eq!(state.focused_place_id.as_deref(), Some("place-before"));
+        assert_eq!(state.visible_messages.len(), 1);
     }
 }

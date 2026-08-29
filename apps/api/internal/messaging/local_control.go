@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -19,8 +20,6 @@ const (
 	LocalOpenPath              = "/local-control/v1/messaging:open"
 	LocalThreadsPath           = "/local-control/v1/messaging:threads"
 	LocalCreateThreadPath      = "/local-control/v1/messaging:create-thread"
-	LocalCreatePollPath        = "/local-control/v1/messaging:create-poll"
-	LocalVotePollPath          = "/local-control/v1/messaging:vote-poll"
 	LocalWritePath             = "/local-control/v1/messaging:write"
 	LocalReactPath             = "/local-control/v1/messaging:react"
 	LocalStatusPath            = "/local-control/v1/messaging:status"
@@ -28,11 +27,22 @@ const (
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
 	LocalCallStatePath         = "/local-control/v1/messaging:call-state"
+	// The place-opening and place-editing operations the human sidebar has.
+	// Each is the same app-owned Store path the Human REST route uses, so a
+	// PersonalityAgent gains no reach a person in that Workspace lacks.
+	LocalStartDMPath          = "/local-control/v1/messaging:start-dm"
+	LocalCreateChannelPath    = "/local-control/v1/messaging:create-channel"
+	LocalUpdateChannelPath    = "/local-control/v1/messaging:update-channel"
+	LocalDuplicateChannelPath = "/local-control/v1/messaging:duplicate-channel"
 	// LocalNotificationSettingsPath reads and writes the same app-owned
 	// notification-setting resource for a PersonalityAgent that the Human UI
 	// uses for a Human. This adapter route does not itself define which agent
 	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
+	// LocalSearchPath exposes the same visibility-scoped message search used by
+	// the human UI. Search results are references and snippets, not an opened
+	// place or a source of message-action authority.
+	LocalSearchPath = "/local-control/v1/messaging:search"
 	// LocalUploadAttachmentPattern is the PAID-local raw-body upload route. The
 	// exact Messaging scope travels in headers because the body is the file.
 	LocalUploadAttachmentPattern = "/local-control/v1/messaging/places/{place_id}/attachments"
@@ -75,15 +85,18 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalOpenPath, s.localOpen},
 		{"POST " + LocalThreadsPath, s.localThreads},
 		{"POST " + LocalCreateThreadPath, s.localCreateThread},
-		{"POST " + LocalCreatePollPath, s.localCreatePoll},
-		{"POST " + LocalVotePollPath, s.localVotePoll},
 		{"POST " + LocalWritePath, s.localWrite},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
+		{"POST " + LocalStartDMPath, s.localStartDM},
+		{"POST " + LocalCreateChannelPath, s.localCreateChannel},
+		{"POST " + LocalUpdateChannelPath, s.localUpdateChannel},
+		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
+		{"POST " + LocalSearchPath, s.localSearch},
 		{"POST " + LocalAttachmentPath, s.localAttachment},
 	}
 	if s.Calls != nil {
@@ -137,7 +150,7 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.ParentPlaceID == "" || !threadNameValid(request.Name) || request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+	if request.ParentPlaceID == "" || !threadNameValid(request.Name) || !clientNonceValid(request.ClientNonce) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -147,6 +160,9 @@ func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, autho
 	}
 	thread, created, err := store.CreateThread(r.Context(), request.ParentPlaceID, request.Name, request.ParentMessageID, request.ClientNonce)
 	if err != nil {
+		if writeThreadCreateError(w, err) {
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
@@ -329,7 +345,11 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	}
 	members := make([]memberWire, len(snapshot.Members))
 	for i, profile := range snapshot.Members {
-		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
+		members[i] = memberWire{
+			Participant: participantToWire(profile.Participant),
+			DisplayName: profile.ProjectedDisplayName(),
+			Tagline:     profile.Tagline,
+		}
 	}
 	var thread *threadWire
 	if snapshot.Thread != nil {
@@ -365,7 +385,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
-	if code := validateSendRequest(request.Content, request.Urgency, request.ClientNonce, request.Attachments, false); code != "" {
+	if code := validateSendRequest(request.Content, request.Urgency, request.ClientNonce, request.Attachments); code != "" {
 		writeError(w, http.StatusBadRequest, code)
 		return
 	}
@@ -401,96 +421,6 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 	writeJSON(w, status, messageReceiptToWire(message, created))
 }
 
-func (s *Server) localCreatePoll(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
-	var request struct {
-		localScopeWire
-		PlaceID         string   `json:"place_id"`
-		Question        string   `json:"question"`
-		Options         []string `json:"options"`
-		AllowMulti      bool     `json:"allow_multi,omitempty"`
-		Content         string   `json:"content,omitempty"`
-		ClientNonce     string   `json:"client_nonce"`
-		ClosesInMinutes uint32   `json:"closes_in_minutes,omitempty"`
-	}
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	if request.PlaceID == "" || request.ClosesInMinutes > maxRelativeMinutes {
-		writeError(w, http.StatusBadRequest, "invalid_request")
-		return
-	}
-	poll := &PollInput{Question: request.Question, Options: request.Options, AllowMulti: request.AllowMulti}
-	if request.ClosesInMinutes > 0 {
-		moment := time.Now().Add(time.Duration(request.ClosesInMinutes) * time.Minute)
-		poll.ClosesAt = &moment
-		// The receipt's request identity is the relative promise the agent made,
-		// not this attempt's wall-clock conversion of it.
-		poll.RelativeClosesInMinutes = request.ClosesInMinutes
-	}
-	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
-	if !ok {
-		return
-	}
-	place, err := store.PlaceFor(r.Context(), request.PlaceID)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	message, created, err := store.AppendMessage(r.Context(), AppendInput{
-		PlaceID: request.PlaceID, Content: request.Content, ClientNonce: request.ClientNonce, Poll: poll,
-	})
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	if created {
-		publishMessageCreated(r.Context(), store, s.Hub, place, message)
-	}
-	status := http.StatusCreated
-	if !created {
-		status = http.StatusOK
-	}
-	writeJSON(w, status, struct {
-		Message messageWire `json:"message"`
-		Created bool        `json:"created"`
-	}{messageToWire(place, message), created})
-}
-
-func (s *Server) localVotePoll(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
-	var request struct {
-		localScopeWire
-		PlaceID   string   `json:"place_id"`
-		MessageID string   `json:"message_id"`
-		OptionIDs []string `json:"option_ids"`
-	}
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	if request.PlaceID == "" || request.MessageID == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request")
-		return
-	}
-	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
-	if !ok {
-		return
-	}
-	place, err := store.PlaceFor(r.Context(), request.PlaceID)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	message, err := store.VotePoll(r.Context(), request.PlaceID, request.MessageID, request.OptionIDs)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
-	wire := messageToWire(place, message)
-	_ = s.Hub.PublishScoped(r.Context(), store, Event{Type: EventPollUpdated, PlaceID: request.PlaceID, Message: &wire})
-	writeJSON(w, http.StatusOK, struct {
-		Message messageWire `json:"message"`
-	}{wire})
-}
-
 // localReact toggles the agent's emoji on a message through the identical
 // store path the human UI uses. The tool layer scopes it to messages visible
 // in the currently open view (ADR 0011 §3: 見えていないものは操作できない);
@@ -506,7 +436,7 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.PlaceID == "" || request.MessageID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || validateReactionEmoji(request.Emoji) != nil {
+	if request.PlaceID == "" || request.MessageID == "" || !clientNonceValid(request.ClientNonce) || validateReactionEmoji(request.Emoji) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -574,6 +504,235 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 	writeJSON(w, http.StatusOK, struct {
 		Status statusWire `json:"status"`
 	}{statusToWire(status)})
+}
+
+// localStartDM opens the agent's direct conversation with one participant, or
+// a group conversation with several — the same split the human sidebar's
+// 「ダイレクトメッセージを開始」makes by how many people were ticked. One
+// person takes EnsureDM (so a second attempt returns the conversation that
+// already exists rather than a second one), several take CreateGroupDM. Both
+// are the exact Store paths POST /messaging/dms and /messaging/group-dms use,
+// so reachability and authorization are identical.
+func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Participants []participantWire `json:"participants"`
+		ClientNonce  string            `json:"client_nonce,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	requested := make([]ParticipantRef, 0, len(request.Participants))
+	for _, wire := range request.Participants {
+		ref, err := wire.ref()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_participant")
+			return
+		}
+		requested = append(requested, ref)
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	others, normalizeErr := normalizeDMOthers(store.Scope.Actor, requested)
+	if normalizeErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	if len(others) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var (
+		place   Place
+		created bool
+		err     error
+	)
+	if len(others) == 1 {
+		place, created, err = store.EnsureDM(r.Context(), others[0])
+	} else {
+		if request.ClientNonce == "" || len(request.ClientNonce) > 128 {
+			writeError(w, http.StatusBadRequest, "invalid_client_nonce")
+			return
+		}
+		place, created, err = store.CreateGroupDMOnce(r.Context(), others, request.ClientNonce)
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := dmWire{
+		DMID: place.PlaceID, Kind: place.Kind,
+		Participants: append(
+			[]participantWire{participantToWire(store.Scope.Actor)},
+			participantsToWire(others)...,
+		),
+	}
+	// Only a place that did not exist a moment ago is news.
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire,
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		DM             dmWire `json:"dm"`
+		Created        bool   `json:"created"`
+		WorkspaceID    string `json:"workspace_id"`
+		InstallationID string `json:"installation_id"`
+		AuthorityEpoch string `json:"authority_epoch"`
+	}{
+		DM: wire, Created: created,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
+}
+
+// localCreateChannel opens a channel in the agent's exact Workspace, the same
+// Store path as POST /messaging/channels. There is no workspace_id field to
+// choose with: the sealed scope already names one Workspace, so the agent
+// cannot be talked into opening a channel somewhere else.
+func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Name        string `json:"name"`
+		Topic       string `json:"topic,omitempty"`
+		Voice       bool   `json:"voice"`
+		ClientNonce string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.Name == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || utf8.RuneCountInString(request.Name) > MaxChannelNameChars ||
+		len(request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, created, err := store.CreateChannelOnce(r.Context(), request.Name, request.Topic, request.Voice, request.ClientNonce)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		Channel        channelWire `json:"channel"`
+		Created        bool        `json:"created"`
+		Kind           string      `json:"kind"`
+		WorkspaceID    string      `json:"workspace_id"`
+		InstallationID string      `json:"installation_id"`
+		AuthorityEpoch string      `json:"authority_epoch"`
+	}{
+		Channel: wire, Created: created, Kind: PlaceChannel,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
+}
+
+// localUpdateChannel renames a channel, retopics it, or both. An omitted field
+// is left alone; naming neither is refused rather than answered as a
+// successful edit, so the model cannot read a no-op as a rename that happened.
+func (s *Server) localUpdateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		PlaceID string  `json:"place_id"`
+		Name    *string `json:"name,omitempty"`
+		Topic   *string `json:"topic,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || (request.Name == nil && request.Topic == nil) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if request.Name != nil &&
+		(*request.Name == "" || utf8.RuneCountInString(*request.Name) > MaxChannelNameChars) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if request.Topic != nil && len(*request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, err := store.UpdateChannel(r.Context(), request.PlaceID, request.Name, request.Topic)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	_ = s.Hub.PublishScoped(r.Context(), store, Event{
+		Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire,
+	})
+	writeJSON(w, http.StatusOK, struct {
+		Channel channelWire `json:"channel"`
+	}{wire})
+}
+
+// localDuplicateChannel copies a channel's shape into a new, empty one. An
+// omitted name takes the server's derived default, so neither the human menu
+// nor the agent has to decide what「コピー」is called.
+func (s *Server) localDuplicateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		PlaceID     string `json:"place_id"`
+		Name        string `json:"name,omitempty"`
+		ClientNonce string `json:"client_nonce"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.ClientNonce == "" || len(request.ClientNonce) > 128 || utf8.RuneCountInString(request.Name) > MaxChannelNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, created, err := store.DuplicateChannelOnce(r.Context(), request.PlaceID, request.Name, request.ClientNonce)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	if created {
+		_ = s.Hub.PublishScoped(r.Context(), store, Event{
+			Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire,
+		})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		Channel        channelWire `json:"channel"`
+		Created        bool        `json:"created"`
+		Kind           string      `json:"kind"`
+		WorkspaceID    string      `json:"workspace_id"`
+		InstallationID string      `json:"installation_id"`
+		AuthorityEpoch string      `json:"authority_epoch"`
+	}{
+		Channel: wire, Created: created, Kind: PlaceChannel,
+		WorkspaceID: store.Scope.WorkspaceID, InstallationID: store.Scope.InstallationID,
+		AuthorityEpoch: strconv.FormatInt(store.Scope.AuthorityEpoch, 10),
+	})
 }
 
 // localReplyLater places the agent's own「後で返信します」marker. The tool
@@ -719,6 +878,50 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
+}
+
+// localSearch mirrors the human search box through SearchMessages. Store
+// authorization decides which places and message tenures are visible; an
+// inaccessible explicit place remains indistinguishable from a missing one.
+func (s *Server) localSearch(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Query   string `json:"query"`
+		PlaceID string `json:"place_id,omitempty"`
+		Limit   int    `json:"limit,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	query := strings.TrimSpace(request.Query)
+	if query == "" || len(query) > MaxSearchQueryBytes || request.Limit < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	results, err := store.SearchMessages(r.Context(), query,
+		SearchOptions{PlaceID: request.PlaceID, Limit: request.Limit})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]searchResultWire, len(results))
+	for i, result := range results {
+		wires[i] = searchResultWire{
+			MessageID: result.Message.MessageID,
+			Place:     placeToWire(result.Place),
+			Seq:       result.Message.Seq,
+			Author:    participantToWire(result.Message.Author),
+			Snippet:   result.Snippet,
+			CreatedAt: result.Message.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []searchResultWire `json:"results"`
+	}{wires})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

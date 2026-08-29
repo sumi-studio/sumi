@@ -31,7 +31,7 @@ pub(super) fn sendmsg_with_fds(socket: RawFd, bytes: &[u8], fds: &[RawFd]) -> io
         iov_base: bytes.as_ptr() as *mut libc::c_void,
         iov_len: bytes.len(),
     };
-    let fd_bytes = mem::size_of::<RawFd>() * fds.len();
+    let fd_bytes = std::mem::size_of_val(fds);
     let control_len = if fds.is_empty() {
         0
     } else {

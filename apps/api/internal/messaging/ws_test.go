@@ -505,6 +505,19 @@ func TestWSCatchUpReplaysFromCursor(t *testing.T) {
 	}
 }
 
+func TestWSCatchUpEmptyPlaceStillAnnouncesCaughtUp(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+
+	conn := dialWS(t, ts, w.humanA.ID, map[string]int64{ch.PlaceID: 0})
+	frame := readFrame(t, conn)
+	if frame["type"] != "caught_up" || frame["place_id"] != ch.PlaceID || frame["latest_seq"] != float64(0) {
+		t.Fatalf("empty-place catch-up = %v, want caught_up at seq 0", frame)
+	}
+}
+
 func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -610,7 +623,7 @@ func (a *countingHubAuthorizer) withLiveAudience(
 	scope Scope,
 	boundary liveBoundary,
 	requireActor bool,
-	deliver func(map[ParticipantRef]struct{}) error,
+	deliver func(liveAudience) error,
 ) error {
 	if boundary.placeID != "" {
 		a.placeCalls++
@@ -620,7 +633,7 @@ func (a *countingHubAuthorizer) withLiveAudience(
 	if a.store != nil {
 		return a.store.core.withLiveAudience(ctx, scope, boundary, requireActor, deliver)
 	}
-	return deliver(a.audience)
+	return deliver(liveAudience{members: a.audience})
 }
 
 func TestHubBatchesAuthorizationAndVariantFanout(t *testing.T) {
@@ -695,7 +708,7 @@ func TestPlaceLifecycleEventsReachWSSubscribers(t *testing.T) {
 
 	// Channel creation reaches every workspace member's live socket.
 	resp, created := call(t, ts, http.MethodPost, "/messaging/channels", w.humanA.ID,
-		map[string]any{"workspace_id": ws.WorkspaceID, "name": "dev", "topic": "開発の相談"})
+		map[string]any{"workspace_id": ws.WorkspaceID, "name": "dev", "topic": "開発の相談", "client_nonce": "ws-create-dev"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create channel: status %d body %v", resp.StatusCode, created)
 	}
@@ -719,7 +732,7 @@ func TestPlaceLifecycleEventsReachWSSubscribers(t *testing.T) {
 		map[string]any{"participants": []any{
 			map[string]any{"kind": "human", "human_id": w.humanB.ID},
 			map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
-		}})
+		}, "client_nonce": "ws-create-group"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create group dm: status %d body %v", resp.StatusCode, groupDM)
 	}

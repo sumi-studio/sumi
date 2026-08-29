@@ -115,6 +115,11 @@ func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
 		t.Fatalf("create thread: %v", err)
 	}
 	message := w.send(t, ctx, thread.Place.PlaceID, w.humanA, "この枝をあとで見ます")
+	ownerMarker, _, err := owner.CreateReplyLater(
+		ctx, thread.Place.PlaceID, message.MessageID, "owner only", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("create owner's thread marker: %v", err)
+	}
 
 	viewer := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.humanB)
 	if _, err := viewer.ThreadFor(ctx, thread.Place.PlaceID); err != nil {
@@ -139,23 +144,22 @@ func TestThreadReplyLaterSurvivesBootstrapForNonparticipant(t *testing.T) {
 	}
 	markers := body["reply_later_markers"].([]any)
 	if len(markers) != 1 || markers[0].(map[string]any)["marker_id"] != markerID {
-		t.Fatalf("bootstrap markers = %v, want durable thread marker %v", markers, markerID)
+		t.Fatalf("bootstrap markers = %v, want only viewer marker %v (not owner marker %s)", markers, markerID, ownerMarker.MarkerID)
 	}
 	place := markers[0].(map[string]any)["place"].(map[string]any)
 	if place["thread_id"] != thread.Place.PlaceID {
 		t.Fatalf("bootstrap marker place = %v, want thread %s", place, thread.Place.PlaceID)
 	}
 
+	// The promise is the viewer's own, so it is theirs to see. The thread it
+	// points into is still not part of their ledger: they never joined it, and
+	// an unjoined thread carries no unread summary.
 	for _, raw := range body["unread_summaries"].([]any) {
 		summary := raw.(map[string]any)
 		if summary["place"].(map[string]any)["thread_id"] == thread.Place.PlaceID {
-			if summary["unread_count"] != float64(1) || summary["mention_count"] != float64(0) {
-				t.Fatalf("thread unread summary = %v", summary)
-			}
-			return
+			t.Fatalf("bootstrap summarized an unjoined thread: %v", summary)
 		}
 	}
-	t.Fatalf("bootstrap unread summaries omitted visible thread: %v", body["unread_summaries"])
 }
 
 func TestReplyLaterRemindAtNeverLeavesTheOwnersWire(t *testing.T) {

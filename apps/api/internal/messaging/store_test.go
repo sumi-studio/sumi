@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
@@ -66,6 +67,33 @@ func newWorldWithMaxConns(t *testing.T, ctx context.Context, maxConns int32) wor
 	return world{
 		store: store, workspaces: workspaces, apps: apps,
 		humanA: Human(humanA), humanB: Human(humanB), agent: PersonalityAgent(agent),
+	}
+}
+
+// waitForWaitingBackend blocks until another connection to this test's database
+// is waiting on a lock. Tests about what one statement sees of another's
+// uncommitted work have to know the second statement actually reached the
+// point where it waits; a sleep would be either flaky or slow, and the wait is
+// the thing under test.
+func waitForWaitingBackend(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatalf("read waiting backends: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no backend ever waited on a lock")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -163,6 +191,45 @@ func TestMemberProfilesQualifyCanonicalSumiByStableHuman(t *testing.T) {
 	}
 	if names[w.agent.ID] != "Sumi" || names[secondAgentID] != "Sumi" {
 		t.Fatalf("Secretary labels = %#v", names)
+	}
+}
+
+func TestMemberProfilesProjectOneParticipantGlobalTaglineAcrossWorkspaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	first, _ := w.workspaceWithChannel(t, ctx)
+	second, err := w.store.CreateWorkspace(ctx, "sumi-ops", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.AddWorkspaceMember(ctx, second.WorkspaceID, w.humanB, RoleMember); err != nil {
+		t.Fatal(err)
+	}
+
+	tagline := "開発"
+	if _, err := koseki.New(w.store.pool).UpdateHumanProfile(
+		ctx, w.humanA.ID, nil, &tagline,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, workspaceID := range []string{first.WorkspaceID, second.WorkspaceID} {
+		profiles, err := w.store.WorkspaceMemberProfiles(ctx, workspaceID, w.humanB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, profile := range profiles {
+			if profile.Participant == w.humanA {
+				found = true
+				if profile.Tagline != tagline {
+					t.Fatalf("Workspace %s tagline = %q", workspaceID, profile.Tagline)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("Workspace %s omitted profile owner", workspaceID)
+		}
 	}
 }
 
@@ -396,8 +463,12 @@ func TestEditAndDeleteAuthorization(t *testing.T) {
 	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.agent); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("member delete: got %v, want ErrForbidden", err)
 	}
-	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA); err != nil {
+	deleted, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA)
+	if err != nil {
 		t.Fatalf("owner delete: %v", err)
+	}
+	if deleted.Revision != edited.Revision+1 {
+		t.Fatalf("delete revision = %d, want %d", deleted.Revision, edited.Revision+1)
 	}
 	// Idempotent: deleting a tombstone is a no-op.
 	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanB); err != nil {

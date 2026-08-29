@@ -2327,22 +2327,10 @@ mod tests {
                 }
             }
 
-            let provider_identity = serde_json::to_string(&bound.provider_review_identity)
-                .expect("closed provider identity");
-            let provider_descriptor = serde_json::to_string(&bound.provider_review_descriptor)
-                .expect("provider-safe descriptor");
-            let provider_projection = serde_json::to_string(&bound.provider_review_projection)
-                .expect("provider-safe projection");
-            for provider_safe in [
-                provider_identity,
-                provider_descriptor.clone(),
-                provider_projection,
-            ] {
-                assert_eq!(provider_safe.matches(PATH_SENTINEL).count(), 0);
-                assert_eq!(provider_safe.matches(PATTERN_SENTINEL).count(), 0);
-                assert!(!provider_safe.contains("sumi.foundation.workspace"));
-            }
-            assert!(provider_descriptor.contains("foundation_workspace"));
+            let evidence = serde_json::to_value(bound).expect("bound remote evidence");
+            assert!(evidence.get("provider_review_identity").is_none());
+            assert!(evidence.get("provider_review_descriptor").is_none());
+            assert!(evidence.get("provider_review_projection").is_none());
 
             let human_request = PendingApprovalRequest::from_bound(
                 format!("approval-remote-elevated-{name}-secret"),

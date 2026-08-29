@@ -1,6 +1,7 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { AppRail } from "./app-rail";
+import { PushSubscriptionBridge } from "../messaging/components/push-bridge";
 import { MessagingTransport } from "../workspace/components/messaging-transport";
+import { AppRail } from "./app-rail";
 
 export function AppShell() {
   const pathname = useRouterState({
@@ -16,6 +17,7 @@ export function AppShell() {
   return (
     <div className="flex h-dvh bg-background text-foreground">
       <MessagingTransport />
+      <PushSubscriptionBridge />
       <AppRail activeAppId={activeAppId} workspaceId={workspaceId} />
       <div className="min-w-0 flex-1">
         <Outlet />

@@ -95,80 +95,77 @@ beforeEach(() => {
 });
 
 describe("optimistic media toggles", () => {
-  it.each(mediaToggles)(
-    "does not roll back $name after leaving the call",
-    async ({ localKey, transportMethod, toggle }) => {
-      const created = transport();
-      const pending = deferred();
-      created[transportMethod].mockReturnValueOnce(pending.promise);
-      installCallTransportFactory(() => created);
-      await useCall.getState().join(PLACE);
+  it.each(
+    mediaToggles,
+  )("does not roll back $name after leaving the call", async ({
+    localKey,
+    transportMethod,
+    toggle,
+  }) => {
+    const created = transport();
+    const pending = deferred();
+    created[transportMethod].mockReturnValueOnce(pending.promise);
+    installCallTransportFactory(() => created);
+    await useCall.getState().join(PLACE);
 
-      toggle();
-      await useCall.getState().leave();
-      const listener = vi.fn();
-      const unsubscribe = useCall.subscribe(listener);
+    toggle();
+    await useCall.getState().leave();
+    const listener = vi.fn();
+    const unsubscribe = useCall.subscribe(listener);
 
-      pending.reject(new Error("media unavailable"));
-      await pending.promise.catch(() => undefined);
-      await Promise.resolve();
+    pending.reject(new Error("media unavailable"));
+    await pending.promise.catch(() => undefined);
+    await Promise.resolve();
 
-      expect(useCall.getState().local[localKey]).toBe(
-        localKey === "micEnabled",
-      );
-      expect(listener).not.toHaveBeenCalled();
-      unsubscribe();
-    },
-  );
+    expect(useCall.getState().local[localKey]).toBe(localKey === "micEnabled");
+    expect(listener).not.toHaveBeenCalled();
+    unsubscribe();
+  });
 
-  it.each(mediaToggles)(
-    "does not roll back $name in a later call",
-    async ({ localKey, transportMethod, toggle }) => {
-      const first = transport();
-      const second = transport();
-      const pending = deferred();
-      first[transportMethod].mockReturnValueOnce(pending.promise);
-      installCallTransportFactory(
-        vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second),
-      );
-      await useCall.getState().join(PLACE);
+  it.each(mediaToggles)("does not roll back $name in a later call", async ({
+    localKey,
+    transportMethod,
+    toggle,
+  }) => {
+    const first = transport();
+    const second = transport();
+    const pending = deferred();
+    first[transportMethod].mockReturnValueOnce(pending.promise);
+    installCallTransportFactory(
+      vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second),
+    );
+    await useCall.getState().join(PLACE);
 
-      toggle();
-      await useCall.getState().join(OTHER_PLACE);
-      toggle();
-      expect(useCall.getState().local[localKey]).toBe(
-        localKey !== "micEnabled",
-      );
+    toggle();
+    await useCall.getState().join(OTHER_PLACE);
+    toggle();
+    expect(useCall.getState().local[localKey]).toBe(localKey !== "micEnabled");
 
-      pending.reject(new Error("media unavailable"));
-      await pending.promise.catch(() => undefined);
-      await Promise.resolve();
+    pending.reject(new Error("media unavailable"));
+    await pending.promise.catch(() => undefined);
+    await Promise.resolve();
 
-      expect(useCall.getState().local[localKey]).toBe(
-        localKey !== "micEnabled",
-      );
-    },
-  );
+    expect(useCall.getState().local[localKey]).toBe(localKey !== "micEnabled");
+  });
 
-  it.each(mediaToggles)(
-    "rolls back $name in the same call",
-    async ({ localKey, transportMethod, toggle }) => {
-      const created = transport();
-      const pending = deferred();
-      created[transportMethod].mockReturnValueOnce(pending.promise);
-      installCallTransportFactory(() => created);
-      await useCall.getState().join(PLACE);
+  it.each(mediaToggles)("rolls back $name in the same call", async ({
+    localKey,
+    transportMethod,
+    toggle,
+  }) => {
+    const created = transport();
+    const pending = deferred();
+    created[transportMethod].mockReturnValueOnce(pending.promise);
+    installCallTransportFactory(() => created);
+    await useCall.getState().join(PLACE);
 
-      toggle();
-      pending.reject(new Error("media unavailable"));
-      await pending.promise.catch(() => undefined);
-      await Promise.resolve();
+    toggle();
+    pending.reject(new Error("media unavailable"));
+    await pending.promise.catch(() => undefined);
+    await Promise.resolve();
 
-      expect(useCall.getState().local[localKey]).toBe(
-        localKey === "micEnabled",
-      );
-    },
-  );
+    expect(useCall.getState().local[localKey]).toBe(localKey === "micEnabled");
+  });
 });
 
 describe("call degradation", () => {

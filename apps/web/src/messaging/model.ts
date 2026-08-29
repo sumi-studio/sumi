@@ -76,42 +76,6 @@ export interface ReactionMutationResult {
   reactions: ReactionSummary[];
 }
 
-export interface PollOption {
-  optionId: string;
-  text: string;
-  voters: ParticipantRef[];
-}
-
-export interface MessagePoll {
-  question: string;
-  allowMulti: boolean;
-  closesAt: number | null;
-  /** Monotonically increasing committed vote snapshot version. */
-  revision?: number;
-  options: PollOption[];
-}
-
-export interface PollInput {
-  question: string;
-  allowMulti: boolean;
-  closesAt: number | null;
-  options: string[];
-}
-
-export const MIN_POLL_OPTIONS = 2;
-export const MAX_POLL_OPTIONS = 10;
-
-export function isPollClosed(poll: MessagePoll, now: number): boolean {
-  return poll.closesAt !== null && now >= poll.closesAt;
-}
-
-export function pollVoteCount(poll: MessagePoll): number {
-  return poll.options.reduce(
-    (total, option) => total + option.voters.length,
-    0,
-  );
-}
-
 /** 1ファイルの上限（20 MiB）と1メッセージあたりの添付数。サーバーと同じ値。 */
 export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
@@ -128,6 +92,23 @@ export interface Attachment {
   sizeBytes: number;
   sha256: string;
   position: number;
+  /**
+   * 送り手が「開くまで中身を見せない」と宣言した添付。受け手の画面では覆って
+   * おき、開示は受け手の操作に任せる。メッセージ本文ではなく添付の性質。
+   */
+  spoiler: boolean;
+  /** 中身を見なくても何のファイルか分かる説明。無ければ空。 */
+  alt: string;
+}
+
+/** 添付の説明の上限。サーバーのMaxAttachmentAltRunesと同値。 */
+export const MAX_ATTACHMENT_ALT_LENGTH = 1000;
+
+/** 送信前の添付への編集。省略した項目は「触らない」。 */
+export interface AttachmentDraftPatch {
+  filename?: string;
+  alt?: string;
+  spoiler?: boolean;
 }
 
 export function isInlineImageMime(mime: string): boolean {
@@ -152,10 +133,11 @@ export interface Message {
   reactions: ReactionSummary[];
   /** 送信者が選んだ順序。tombstoneでは空。 */
   attachments: Attachment[];
-  poll?: MessagePoll | null;
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
+  /** 編集の compare-and-swap 用の単調増加版。 */
+  revision?: number;
   /** 削除済みはtombstone: contentは空になり、消えた事実とseqだけが残る。 */
   deleted: boolean;
   /** 送信者自身の楽観的描画とACK/echoを照合するidempotency key。 */
@@ -180,6 +162,8 @@ export interface WorkspaceSummary {
 export interface ChannelSummary {
   channelId: string;
   workspaceId: string;
+  /** Monotonic database projection revision for volatile lifecycle frames. */
+  revision: number;
   name: string;
   topic: string;
   visibility: "public" | "private";
@@ -195,6 +179,8 @@ export interface DmSummary {
 
 export interface ThreadSummary {
   threadId: string;
+  /** Monotonic place projection revision for lifecycle and aggregate races. */
+  revision: number;
   parentPlace: Extract<Place, { kind: "channel" }>;
   parentMessageId: string | null;
   workspaceId: string;
@@ -218,13 +204,46 @@ export interface MemberProfile {
 
 export type StatusKind = "available" | "busy" | "away";
 
-/** 自己申告のステータス。監視による自動表示はしない。 */
+/**
+ * 自己申告のステータス。監視による自動表示はしない。
+ * 「オフライン」「非表示」が無いのは隠す手段が足りないからではなく、
+ * Sumiが在席を観測しないから——隠すべき自動の表示がそもそも無い。
+ */
 export interface ParticipantStatus {
   participant: ParticipantRef;
+  /** Monotonic database revision of this participant's status projection. */
+  revision: number;
   status: StatusKind;
   note: string;
   expiresAt: number | null;
+  /**
+   * expiresAtが来たときに戻る先。nullなら戻る先が無く、期限で宣言そのものが
+   * 終わる。期限なしのステータスでは常にnull。
+   */
+  baseStatus: StatusKind | null;
+  baseNote: string;
 }
+
+/** A durable empty status projection. It still advances the participant's revision. */
+export interface StatusCleared {
+  participant: ParticipantRef;
+  revision: number;
+}
+
+/** 一時ステータスの期間プリセット。nullは「解除するまで」。 */
+export interface StatusDuration {
+  label: string;
+  minutes: number | null;
+}
+
+export const STATUS_DURATIONS: StatusDuration[] = [
+  { label: "15分", minutes: 15 },
+  { label: "1時間", minutes: 60 },
+  { label: "8時間", minutes: 8 * 60 },
+  { label: "24時間", minutes: 24 * 60 },
+  { label: "3日間", minutes: 3 * 24 * 60 },
+  { label: "解除するまで", minutes: null },
+];
 
 /**
  * 「後で返信します」の応答予約。相手には返信予定が見え、
@@ -301,6 +320,12 @@ export type ServerEvent =
   | { type: "message_deleted"; message: Message }
   | { type: "typing"; place: Place; participant: ParticipantRef }
   | { type: "status_updated"; status: ParticipantStatus }
+  /**
+   * 一時ステータスが戻る先を持たずに期限切れになった。「対応可能になった」
+   * ではなく「何も言っていない状態に戻った」——サーバーが代わりに何かを
+   * 名乗ることはしない。
+   */
+  | ({ type: "status_cleared" } & StatusCleared)
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   /**
@@ -313,7 +338,6 @@ export type ServerEvent =
       messageId: string;
       reactions: ReactionSummary[];
     }
-  | { type: "poll_updated"; message: Message }
   /**
    * placeのcatch-up完了。cursorより手前のmessageに付いたreactionはreplayされ
    * ないので、受け手はロード済み範囲を読み直して収束させる。
@@ -340,7 +364,6 @@ export interface SendMessageInput {
   clientNonce: string;
   /** upload済みattachmentのIDを送信者の順序で。contentが空でも1件あれば送れる。 */
   attachments: string[];
-  poll?: PollInput | null;
 }
 
 export interface UploadAttachmentInput {
@@ -375,7 +398,6 @@ export interface MessagingCapabilities {
   reactions: boolean;
   notifications: boolean;
   threads?: boolean;
-  polls?: boolean;
 }
 
 /**
@@ -394,6 +416,8 @@ export interface MessagingBackend {
     threads?: ThreadSummary[];
     members: MemberProfile[];
     statuses: ParticipantStatus[];
+    /** Empty status wires, split from statuses so UI state remains status-only. */
+    clearedStatuses?: StatusCleared[];
     readMarkers: ReadMarker[];
     unreadSummaries: UnreadSummary[];
     replyLaterMarkers: ReplyLaterMarker[];
@@ -415,11 +439,32 @@ export interface MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary>;
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
-  createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
-  updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
+  createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary>;
+  /**
+   * channelのmutableな身元（名前・トピック）を書き換える。省いた項目は
+   * そのまま残る——名前を変えただけでトピックが消えては困る。
+   */
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<ChannelSummary>;
+  /**
+   * 同じ形（名前・トピック）の空のchannelを新しく作る。中身は複製しない:
+   * メッセージ・既読・通知設定は元のchannelのもの。nameを省くとサーバーが
+   * 既定の名前（「〜 のコピー」）を決める。
+   */
+  duplicateChannel(
+    channelId: string,
+    clientNonce: string,
+    name?: string,
+  ): Promise<ChannelSummary>;
   fetchThread?(threadId: string): Promise<ThreadSummary>;
   fetchThreads?(parent: Place): Promise<ThreadSummary[]>;
   createThread?(
@@ -434,12 +479,25 @@ export interface MessagingBackend {
     input: UploadAttachmentInput,
   ): Promise<UploadAttachmentReceipt>;
   /**
+   * 送信前の添付を編集する（名前・説明・ネタバレ）。送ってしまった添付は
+   * 受け手が見たものが正なので、サーバーが編集を拒む。
+   */
+  updateDraftAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment>;
+  /**
    * 現在のexact scopeで再認可されるbytes取得URL。<img src>と<a download>が
    * そのまま使う。scopeが変われば別のURLになる。
    */
   attachmentURL(attachmentId: string): string;
-  editMessage(place: Place, messageId: string, content: string): Promise<void>;
-  deleteMessage(place: Place, messageId: string): Promise<void>;
+  editMessage(
+    place: Place,
+    messageId: string,
+    content: string,
+    expectedRevision: number,
+  ): Promise<Message>;
+  deleteMessage(place: Place, messageId: string): Promise<Message>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
   /**
    * 自己申告のattentionの現在値。status_updatedはvolatileでreplayされず、
@@ -448,13 +506,23 @@ export interface MessagingBackend {
    */
   fetchPresence(): Promise<{
     statuses: ParticipantStatus[];
+    /** Empty status wires, split from statuses so UI state remains status-only. */
+    clearedStatuses?: StatusCleared[];
     replyLaterMarkers: ReplyLaterMarker[];
   }>;
   /**
    * mutationはserverが確定した値を返す。socketが再接続中でも成功ACKだけで
    * 収束できるよう、呼び出し側はこの戻り値を状態に反映する。
    */
-  setStatus(status: StatusKind, note: string): Promise<ParticipantStatus>;
+  /**
+   * 自分のステータスだけを置き換える。expiresAtを渡すと一時ステータスになり、
+   * 期限で「その前に言っていたこと」へ戻る（サーバーが解決する）。
+   */
+  setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null,
+  ): Promise<ParticipantStatus>;
   createReplyLater(
     place: Place,
     messageId: string,
@@ -467,11 +535,6 @@ export interface MessagingBackend {
     emoji: string,
     clientNonce: string,
   ): Promise<ReactionMutationResult>;
-  votePoll?(
-    place: Place,
-    messageId: string,
-    optionIds: string[],
-  ): Promise<Message>;
   /**
    * 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。
    * 返すのはサーバーが正規化した確定値。手元がそれと食い違ったまま残らないよう、
@@ -482,6 +545,20 @@ export interface MessagingBackend {
   ): Promise<NotificationSetting>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
+  /**
+   * いま画面に開いているplaceをserverへ宣言する。参加していないthreadをURLで
+   * 開いた閲覧者は、開いている間だけそのplaceのlive eventを受け取る。参加して
+   * いるplaceの配送はこの宣言に依存しない（開いていなくても届く）。
+   * sinceSeqはその画面をどこまで見ているか——切断を跨いで開いたままのときに、
+   * その先だけをreplayさせるためのcursorである。閉じれば一緒に捨てられる。
+   */
+  openPlace?(place: Place | null, sinceSeq?: number): void;
+  /**
+   * そのplaceの履歴をもう持っていないと伝える。cursorを手放すので、次の再接続
+   * ではreplayされず、開き直したときにRESTで取り直すことになる。履歴を捨てる
+   * 側（store）と対で呼ぶ。
+   */
+  releasePlace?(place: Place): void;
   /**
    * durable eventの購読。再接続時はplaceごとの消費済みseqをcursorとして渡し、
    * その次からcatch-upする（volatile eventはreplayしない）。

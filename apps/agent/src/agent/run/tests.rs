@@ -1093,6 +1093,283 @@ async fn route_run_loop_sends_human_and_current_assistant_pending_call_to_review
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BoundRouteSettlement {
+    Success,
+    Indeterminate,
+}
+
+struct BoundRouteControlProbeDriver {
+    settlement: BoundRouteSettlement,
+    mutation_committed: Notify,
+    cancel_observed: Notify,
+    response_release: Notify,
+}
+
+impl BoundRouteControlProbeDriver {
+    fn new(settlement: BoundRouteSettlement) -> Self {
+        Self {
+            settlement,
+            mutation_committed: Notify::new(),
+            cancel_observed: Notify::new(),
+            response_release: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for BoundRouteControlProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("bound route control probe has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        unreachable!("bound route control probe never executes a raw tool")
+    }
+
+    async fn execute_bound_tool_observed(
+        &self,
+        authorized: AuthorizedBoundInvocation,
+        cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<BoundToolResult, BoundExecutionError> {
+        let tool_call_id = authorized.tool_call_id().to_owned();
+        let tool_name = authorized.tool_name().to_owned();
+        // This is the server-side commit boundary. Cancellation may interrupt
+        // the wait for its response, but cannot undo the mutation.
+        self.mutation_committed.notify_one();
+        cancel.cancelled().await;
+        self.cancel_observed.notify_one();
+        self.response_release.notified().await;
+        match self.settlement {
+            BoundRouteSettlement::Success => Ok(BoundToolResult {
+                result: ToolResultMessage {
+                    tool_call_id,
+                    tool_name,
+                    content: vec![UserContent::Text {
+                        text: "committed".to_owned(),
+                    }],
+                    details: json!({"committed": true}),
+                    is_error: false,
+                    timestamp: timestamp(),
+                },
+                live_post_commit: None,
+            }),
+            BoundRouteSettlement::Indeterminate => Err(BoundExecutionError::Tool(
+                ToolError::RpcIndeterminate("committed response was lost".to_owned()),
+            )),
+        }
+    }
+
+    fn synthetic_error(&self, _message: &str) -> PublicMessage {
+        unreachable!("bound route control probe has no synthetic errors")
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("bound route control probe has no overflow recovery")
+    }
+}
+
+async fn authorized_run_loop_route(call_id: &str) -> AuthorizedBoundInvocation {
+    let call = ToolCall {
+        id: call_id.to_owned(),
+        name: "fixture_tool".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
+        arguments: serde_json::from_value(json!({"target":"one"}))
+            .expect("validated fixture arguments"),
+    };
+    let mut registry = ToolRegistryBuilder::default();
+    registry
+        .register(Arc::new(RunLoopRouteTool))
+        .expect("register bound route control probe");
+    let sealed = registry
+        .build()
+        .bind(
+            &call,
+            "bound-route-control-flow",
+            &WorkspacePaths::new("/workspace").expect("workspace"),
+        )
+        .await
+        .expect("bind route control probe");
+    AuthorizedBoundInvocation::for_test(sealed)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BoundRouteControlBoundary {
+    RuntimeCancel,
+    Abort,
+    HardSteer,
+    Command,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BoundRouteControlBookkeeping {
+    abort_requested: bool,
+    in_flight_sequences: Vec<u64>,
+    pending_sequences: Vec<u64>,
+}
+
+#[tokio::test]
+async fn committed_bound_route_result_survives_every_cancelling_control_boundary() {
+    for boundary in [
+        BoundRouteControlBoundary::RuntimeCancel,
+        BoundRouteControlBoundary::Abort,
+        BoundRouteControlBoundary::HardSteer,
+        BoundRouteControlBoundary::Command,
+    ] {
+        for settlement in [
+            BoundRouteSettlement::Success,
+            BoundRouteSettlement::Indeterminate,
+        ] {
+            let driver = Arc::new(BoundRouteControlProbeDriver::new(settlement));
+            let shutdown = CancellationToken::new();
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let (events_tx, _events_rx) = mpsc::channel(1);
+            let mut runner = Runner::new(
+                bound_core_with_runtime_shutdown(1, &shutdown),
+                driver.clone(),
+                control_rx,
+                events_tx,
+            );
+            let authorized =
+                authorized_run_loop_route(&format!("bound-{boundary:?}-{settlement:?}")).await;
+            let task = tokio::spawn(async move {
+                let result = runner.execute_bound_tool_with_updates(authorized).await;
+                let bookkeeping = BoundRouteControlBookkeeping {
+                    abort_requested: runner.abort_requested,
+                    in_flight_sequences: runner
+                        .in_flight_controls
+                        .iter()
+                        .map(|command| command.envelope().seq)
+                        .collect(),
+                    pending_sequences: pending_sequences(&mut runner.core),
+                };
+                (result, bookkeeping)
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), driver.mutation_committed.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{boundary:?}/{settlement:?} reaches its committed mutation")
+                });
+            match boundary {
+                BoundRouteControlBoundary::RuntimeCancel => shutdown.cancel(),
+                BoundRouteControlBoundary::Abort => {
+                    let (accepted_tx, accepted_rx) = oneshot::channel();
+                    let (committed_tx, committed_rx) = oneshot::channel();
+                    control_tx
+                        .send(RunControl::Abort {
+                            command: admitted_abort(2),
+                            accepted: accepted_tx,
+                            committed: committed_rx,
+                        })
+                        .await
+                        .expect("send Abort during committed bound route");
+                    assert!(accepted_rx.await.expect("bound route accepts Abort"));
+                    committed_tx
+                        .send(())
+                        .expect("durably authorize bound route Abort");
+                }
+                BoundRouteControlBoundary::HardSteer => {
+                    let (accepted_tx, accepted_rx) = oneshot::channel();
+                    control_tx
+                        .send(RunControl::HardSteer {
+                            command: admitted_user(2),
+                            accepted: accepted_tx,
+                        })
+                        .await
+                        .expect("send HardSteer during committed bound route");
+                    assert!(accepted_rx.await.expect("bound route accepts HardSteer"));
+                }
+                BoundRouteControlBoundary::Command => {
+                    control_tx
+                        .send(RunControl::Command(admitted_user(2)))
+                        .await
+                        .expect("send follow-up during committed bound route");
+                }
+            }
+
+            tokio::time::timeout(Duration::from_secs(1), driver.cancel_observed.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{boundary:?}/{settlement:?} propagates child cancellation")
+                });
+            assert!(
+                !task.is_finished(),
+                "{boundary:?}/{settlement:?} must wait for the committed response"
+            );
+            driver.response_release.notify_one();
+            let (result, bookkeeping) = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap_or_else(|_| panic!("{boundary:?}/{settlement:?} settles after response"))
+                .expect("bound route task joins");
+
+            match settlement {
+                BoundRouteSettlement::Success => match result {
+                    Ok(outcome) => assert_eq!(outcome.result.details, json!({"committed": true})),
+                    Err(error) => {
+                        panic!("{boundary:?} replaced a committed success with {error:?}")
+                    }
+                },
+                BoundRouteSettlement::Indeterminate => match result {
+                    Err(ExecuteBoundToolError::Bound(BoundExecutionError::Tool(
+                        ToolError::RpcIndeterminate(message),
+                    ))) => assert_eq!(message, "committed response was lost"),
+                    Err(error) => {
+                        panic!("{boundary:?} replaced an indeterminate result with {error:?}")
+                    }
+                    Ok(_) => panic!("{boundary:?} converted an indeterminate result to success"),
+                },
+            }
+
+            let expected_bookkeeping = match boundary {
+                BoundRouteControlBoundary::RuntimeCancel => BoundRouteControlBookkeeping {
+                    abort_requested: false,
+                    in_flight_sequences: Vec::new(),
+                    pending_sequences: Vec::new(),
+                },
+                BoundRouteControlBoundary::Abort => BoundRouteControlBookkeeping {
+                    abort_requested: true,
+                    in_flight_sequences: Vec::new(),
+                    pending_sequences: Vec::new(),
+                },
+                BoundRouteControlBoundary::HardSteer => BoundRouteControlBookkeeping {
+                    abort_requested: false,
+                    in_flight_sequences: vec![2],
+                    pending_sequences: Vec::new(),
+                },
+                BoundRouteControlBoundary::Command => BoundRouteControlBookkeeping {
+                    abort_requested: false,
+                    in_flight_sequences: Vec::new(),
+                    pending_sequences: vec![2],
+                },
+            };
+            assert_eq!(bookkeeping, expected_bookkeeping, "{boundary:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn tool_evaluation_without_broker_fails_closed() {
     let command = admitted_user(1);

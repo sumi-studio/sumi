@@ -95,6 +95,12 @@ describe("MemberList DM action", () => {
     vi.restoreAllMocks();
   });
 
+  it("ステータス未申告のメンバーを対応可能ドットで補わない", () => {
+    const { container } = render(<MemberList />);
+
+    expect(container.querySelector(".bg-emerald-500")).not.toBeInTheDocument();
+  });
+
   it("starts a DM from a non-self member and navigates to its place", async () => {
     const startDM = vi.fn(async (): Promise<PlaceKey> => "dm:dm-bob");
     useMessaging.setState({ startDM });
@@ -108,10 +114,13 @@ describe("MemberList DM action", () => {
     );
   });
 
+  // 保留はstoreが持つので、この契約は本物のstartDMでしか測れない。
   it("exposes one pending action and blocks concurrent member actions", async () => {
-    const pending = deferred<PlaceKey>();
-    const startDM = vi.fn(() => pending.promise);
-    useMessaging.setState({ startDM });
+    const pending = deferred<DmSummary>();
+    const server = new MockMessagingServer();
+    vi.spyOn(server, "ensureDM").mockReturnValue(pending.promise);
+    installMessagingBackend(server);
+    setMembers();
     render(<MemberList />);
 
     const bob = screen.getByRole("button", { name: "BobにDMを送る" });
@@ -123,9 +132,16 @@ describe("MemberList DM action", () => {
     expect(carol).toBeDisabled();
     expect(screen.getByText("DMを開始しています…")).toBeVisible();
     fireEvent.click(carol);
-    expect(startDM).toHaveBeenCalledTimes(1);
+    expect(server.ensureDM).toHaveBeenCalledTimes(1);
 
-    await act(async () => pending.resolve("dm:dm-bob"));
+    await act(async () => {
+      pending.resolve({
+        dmId: "dm-bob",
+        kind: "dm",
+        participants: [SELF, BOB],
+      });
+      await pending.promise;
+    });
     await waitFor(() =>
       expect(navigation.navigate).toHaveBeenCalledWith("dm:dm-bob"),
     );

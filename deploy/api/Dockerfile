@@ -6,10 +6,12 @@ COPY apps/api/go.mod apps/api/go.sum ./
 RUN go mod download
 COPY apps/api/ ./
 RUN CGO_ENABLED=0 go build -o /usr/local/bin/sumi-api ./cmd/server && \
-    CGO_ENABLED=0 go build -o /usr/local/bin/sumi-migrate ./cmd/migrate
+    CGO_ENABLED=0 go build -o /usr/local/bin/sumi-migrate ./cmd/migrate && \
+    CGO_ENABLED=0 go build -o /usr/local/bin/sumi-schema30-rollback ./cmd/schema30-rollback
 
 FROM gcr.io/distroless/static-debian12:debug
 COPY --from=build /usr/local/bin/sumi-api /usr/local/bin/sumi-api
 COPY --from=build /usr/local/bin/sumi-migrate /usr/local/bin/sumi-migrate
+COPY --from=build /usr/local/bin/sumi-schema30-rollback /usr/local/bin/sumi-schema30-rollback
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/sumi-api"]

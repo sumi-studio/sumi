@@ -19,8 +19,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -185,6 +188,27 @@ type connectionLeaseState struct {
 }
 
 var errBrowserRuntimeUnavailable = errors.New("browser runtime is unavailable")
+
+// directChatReadiness is the browser-facing projection of the durable runtime
+// state. It deliberately distinguishes an automatic rehydration from a
+// terminal shutdown; a bare NotReady state is not enough evidence to claim
+// either condition to the browser.
+type directChatReadiness struct {
+	ready  bool
+	reason string
+}
+
+func (r directChatReadiness) directChatStatusFrame() directChatStatusFrame {
+	status := "unavailable"
+	if r.ready {
+		status = "ready"
+	}
+	return directChatStatusFrame{
+		Type:   "direct_chat_status",
+		Status: status,
+		Reason: r.reason,
+	}
+}
 
 const (
 	connectionLeaseStateVersion  = uint64(1)
@@ -807,11 +831,32 @@ func verifyRuntimeGeneration(state runtimeState, generation uint64) error {
 // IsPersonalityAgentReady reports the authoritative Ready latch for the one
 // global runtime identity. Tenant is intentionally absent from this key.
 func (g *DurableGateway) IsPersonalityAgentReady(ctx context.Context, personalityAgentID string) (bool, error) {
-	state, err := g.stateWithIntegrityMigration(ctx, personalityAgentID)
+	readiness, err := g.directChatReadiness(ctx, personalityAgentID)
 	if err != nil {
 		return false, err
 	}
-	return state.present && state.HydrationReceiptIdentity != nil, nil
+	return readiness.ready, nil
+}
+
+func (g *DurableGateway) directChatReadiness(ctx context.Context, personalityAgentID string) (directChatReadiness, error) {
+	state, err := g.stateWithIntegrityMigration(ctx, personalityAgentID)
+	if err != nil {
+		return directChatReadiness{}, err
+	}
+	if state.present && state.HydrationReceiptIdentity != nil {
+		return directChatReadiness{ready: true}, nil
+	}
+	if state.LocalControl == nil {
+		return directChatReadiness{reason: directChatUnavailableUnknown}, nil
+	}
+	switch state.LocalControl.Reason {
+	case LocalRuntimeStartup:
+		return directChatReadiness{reason: directChatUnavailableRehydrating}, nil
+	case LocalRuntimeShutdown:
+		return directChatReadiness{reason: directChatUnavailableStopped}, nil
+	default:
+		return directChatReadiness{reason: directChatUnavailableUnknown}, nil
+	}
 }
 
 // Observe observes readiness for exactly one authenticated generation. It
@@ -2332,6 +2377,182 @@ func stringPointerEqual(left, right *string) bool {
 
 func (g *DurableGateway) statePath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "runtime-"+safeFileID(personalityAgentID)+".json")
+}
+
+// ValidateLocalControlDurableStateKeyring settles what this process does about
+// durable local-control state it cannot verify, before the API starts serving
+// spawn requests.
+//
+// Refusing to start is scoped to the personality agents this process is
+// authorized to control: for those an unknown integrity key is a stale
+// checkout/runtime pairing the operator configured and can fix. State for any
+// other personality agent is debris from an earlier run. Under dynamic runtime
+// provisioning there are no configured authorizations at all, so treating
+// debris as fatal meant one leftover file kept the whole API down, where
+// spawning that one PAID is all that was ever at stake. Debris is unusable by
+// this process either way, so it is moved aside and logged — never deleted,
+// and never a reason to stay down.
+//
+// It intentionally reports only key identifiers, never signing material or
+// durable contents.
+func (g *DurableGateway) ValidateLocalControlDurableStateKeyring() error {
+	keyring, ok := g.localControlIntegrityKeyringSnapshot()
+	if !ok {
+		return errors.New("local control integrity keyring is not installed")
+	}
+	entries, err := os.ReadDir(g.dir)
+	if err != nil {
+		return fmt.Errorf("list durable runtime state directory: %w", err)
+	}
+	owned := make(map[string]struct{})
+	// Dynamic provisioning installs the keyring with no authorizations, so
+	// `owned` is intentionally empty there: a leftover file cannot identify a
+	// PAID this process is responsible for. The fail-closed branch below is for
+	// explicitly configured local/CI authorizations only.
+	for _, personalityAgentID := range g.localControlOwnerSnapshot() {
+		owned[filepath.Base(g.statePath(personalityAgentID))] = struct{}{}
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "runtime-") || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(g.dir, entry.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read durable runtime state %q: %w", path, err)
+		}
+		var state runtimeState
+		if err := unmarshalStrict(raw, &state); err != nil || state.LocalControl == nil || state.LocalControl.Integrity == nil {
+			continue
+		}
+		savedID := state.LocalControl.Integrity.KeyID
+		if savedID == keyring.Current.ID {
+			continue
+		}
+		if _, previous := keyring.Previous[savedID]; previous {
+			continue
+		}
+		if _, authorized := owned[entry.Name()]; authorized {
+			return fmt.Errorf(
+				"durable local-control state uses an unknown integrity key: file=%q saved_key_id=%s current_key_id=%s; configure SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS to re-sign it, or discard this runtime state",
+				path,
+				savedID,
+				keyring.Current.ID,
+			)
+		}
+		personalityAgentID, err := personalityAgentIDFromStateFileName(entry.Name())
+		if err != nil {
+			return fmt.Errorf("derive personality agent for durable runtime state %q: %w", path, err)
+		}
+		quarantined, moved, err := g.quarantineUnverifiableDurableState(personalityAgentID, path, savedID)
+		if err != nil {
+			return fmt.Errorf("quarantine unverifiable durable runtime state %q: %w", path, err)
+		}
+		if !moved {
+			// A replica repaired or replaced this state while we waited for the
+			// authoritative PAID lock. Leave its new contents alone.
+			continue
+		}
+		log.Printf(
+			"local control: durable runtime state %q belongs to no authorized personality agent and uses unknown integrity key %s (current %s); moved to %q. Move it back and configure SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS to re-sign it, or delete it.",
+			path,
+			savedID,
+			keyring.Current.ID,
+			quarantined,
+		)
+	}
+	return nil
+}
+
+// quarantineDurableStateSuffix marks state this process cannot verify. It must
+// not match the "runtime-*.json" scan so a quarantined file is never rescanned
+// and never re-quarantined.
+const quarantineDurableStateSuffix = ".unverifiable"
+
+// quarantineUnverifiableDurableState moves one unusable durable runtime state
+// out of the scanned name space and returns where it went. It renames rather
+// than deletes: the contents are the only record of that epoch, and an
+// operator who later supplies the signing secret that produced them can move
+// the file back. The authoritative PAID flock covers the re-check and the
+// link/unlink sequence, so another API replica cannot publish a replacement
+// under the same state path while this process quarantines it. A collision
+// keeps both files rather than overwriting either.
+func (g *DurableGateway) quarantineUnverifiableDurableState(personalityAgentID, path, savedKeyID string) (string, bool, error) {
+	if path != g.statePath(personalityAgentID) {
+		return "", false, errors.New("runtime state path does not match its personality agent")
+	}
+	lock, err := g.openRuntimeLock(personalityAgentID)
+	if err != nil {
+		return "", false, fmt.Errorf("open runtime state lock: %w", err)
+	}
+	defer lock.Close()
+	if err := flockContext(context.Background(), lock.Fd(), syscall.LOCK_EX); err != nil {
+		return "", false, fmt.Errorf("lock runtime state quarantine: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+
+	// The state was first classified before acquiring the lock. Re-read it
+	// while holding the lock so a concurrent repair is never quarantined.
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var state runtimeState
+	if err := unmarshalStrict(raw, &state); err != nil || state.LocalControl == nil || state.LocalControl.Integrity == nil || state.LocalControl.Integrity.KeyID != savedKeyID {
+		return "", false, nil
+	}
+	quarantined, err := quarantineDurableStateFile(path, savedKeyID)
+	if err != nil {
+		return "", false, err
+	}
+	return quarantined, true, nil
+}
+
+func quarantineDurableStateFile(path string, savedKeyID string) (string, error) {
+	base := fmt.Sprintf("%s%s-%s", path, quarantineDurableStateSuffix, savedKeyID)
+	target := base
+	for attempt := 1; ; attempt++ {
+		err := os.Link(path, target)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+		if attempt > 64 {
+			return "", fmt.Errorf("no free quarantine name beside %q", base)
+		}
+		target = fmt.Sprintf("%s.%d", base, attempt)
+	}
+	if err := os.Remove(path); err != nil {
+		_ = os.Remove(target)
+		return "", err
+	}
+	return target, nil
+}
+
+func personalityAgentIDFromStateFileName(name string) (string, error) {
+	const prefix = "runtime-"
+	const suffix = ".json"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return "", errors.New("not a runtime state filename")
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode filename: %w", err)
+	}
+	personalityAgentID := string(decoded)
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return "", err
+	}
+	if safeFileID(personalityAgentID) != encoded {
+		return "", errors.New("runtime state filename is not canonical")
+	}
+	return personalityAgentID, nil
 }
 
 func (g *DurableGateway) connectionLeasePath(personalityAgentID string) string {

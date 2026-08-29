@@ -174,11 +174,16 @@ first message. From that commit onward, every migration file named in the
 manifest is immutable and all schema changes use a new forward migration. The
 ordinary database test suite validates the seal; `node
 scripts/dev/migration-freeze.mjs check` provides the same explicit operator
-check. A later forward migration must be added to the manifest with
+check. Pull requests and pushes to `main` additionally compare the candidate
+against the exact event base commit with `migration-freeze.mjs verify-base`, so
+changing historical SQL and its candidate manifest digest together is rejected.
+A later forward migration must use the next numeric version and be added to the
+manifest with
 `node scripts/dev/migration-freeze.mjs extend`; that command refuses to extend
 over any changed or deleted sealed entry, a numeric gap at or below the sealed
-maximum, or anything other than one matching `up`/`down` pair at a new higher
-version. Resetting or replacing an applied migration is no longer an available
+maximum, or anything other than one matching `up`/`down` pair at the immediately
+following version. Manifest lines are in canonical filename order and append-only.
+Resetting or replacing an applied migration is no longer an available
 operation after this point.
 
 First validate configuration, then start:
@@ -194,6 +199,17 @@ uses one origin for session cookies and chat. The API allowlist is set to the
 exact origin `http://127.0.0.1:5173`. `SUMI_AUTH_ALLOW_INSECURE_COOKIES=true`
 is set only by this native HTTP launcher; production keeps secure cookies and
 its exact-origin rules.
+
+Closed-tab Messaging notifications are enabled in the supported local stack.
+`SUMI_MESSAGING_PUSH_SUBJECT` is the VAPID operator contact (`mailto:` or an
+`https://` URL); the launcher defaults it to `mailto:dev@sumi.local`. The API
+generates one deployment key pair in Postgres, while each push payload contains
+only a Workspace/place routing pointer. Notification text is fixed by the
+service worker and no message body, attachment name, or participant name is
+sent to the push service. Unset the variable when starting the API directly to
+disable subscription registration and delivery. Service Workers require a
+secure context, so browser delivery works on loopback and HTTPS; direct
+Tailnet HTTP continues to support text messaging but does not register Push.
 
 ### Direct Tailnet access
 
@@ -300,10 +316,30 @@ bind host, which the other device reaches over the Tailnet.
 
 `make dev` creates state directories and non-production secrets in one
 mode-0700 temporary directory. It acquires one host lock, starts exactly one
-generation (`0`), never restarts or replaces that generation, and deletes all
-state on shutdown. Because there is no surviving ledger or replacement
+generation (`0`), never restarts or replaces that generation, and deletes that
+directory on shutdown. Because there is no surviving ledger or replacement
 generation to allocate, the persistent supervisor allocator is not part of
 this deliberately disposable single-agent direct path.
+
+Two stores are deliberately outside that boundary, because the identity
+registry rows and the attachment bytes they name have to be discarded together
+or not at all:
+
+- the control-plane Postgres, in the Compose volume `sumi-postgres`;
+- messaging attachment bytes under
+  `${XDG_STATE_HOME:-~/.local/state}/sumi/real-stack/messaging-attachments`
+  (override with `SUMI_REAL_STACK_STATE_ROOT`; the path must be absolute, and
+  an existing directory must already be mode 0700 and owned by you — the
+  launcher will not relax or tighten a directory it did not create). The
+  configured path is normalized once and its real path is used. Its
+  ancestors must be owned by you or root, and may only be group/other-writable
+  when sticky; the default path beneath your home directory needs no extra
+  setup.
+
+Keeping the bytes inside the temporary directory left the database naming
+objects that shutdown had already deleted, so attachments referred to missing
+objects after a restart. Delete both stores together to start clean; the API's
+attachment reconciler sweeps bytes the database no longer names.
 
 Do not use this exception for persistent, concurrent, or restartable
 deployment. `deploy/agent/supervisor` and its allocator own monotonic

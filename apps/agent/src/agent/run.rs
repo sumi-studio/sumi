@@ -474,6 +474,10 @@ enum ApprovalWaitOutcome {
     Cancelled,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeps the non-cloneable authority grant owned by the exact route outcome"
+)]
 enum RouteCallDisposition {
     Allowed {
         grant: crate::approval::authority::ExecutableGrant,
@@ -488,6 +492,10 @@ enum RouteCallDisposition {
     },
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeps approval authority and its command in one explicit ownership outcome"
+)]
 enum RouteApprovalWaitOutcome {
     Approved {
         grant: crate::approval::authority::ExecutableGrant,
@@ -506,6 +514,10 @@ enum RouteApprovalWaitOutcome {
     Cancelled,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeps sealed reauthorization authority allocation-free and single-owner"
+)]
 enum RouteExecutionDisposition {
     Completed {
         result: ToolResultMessage,
@@ -3050,8 +3062,7 @@ impl Runner {
                 biased;
                 _ = self.cancel.cancelled() => {
                     cancel.cancel();
-                    let _ = future.await;
-                    return Err(ExecuteBoundToolError::Cancelled);
+                    break future.await;
                 }
                 result = &mut future => break result,
                 update = updates_rx.recv() => update,
@@ -3081,9 +3092,9 @@ impl Runner {
                         } => {
                             if self.accept_abort_control(accepted, committed).await? {
                                 cancel.cancel();
-                                let _ = future.await;
+                                let result = future.await;
                                 self.abort_requested = true;
-                                return Err(ExecuteBoundToolError::Cancelled);
+                                break result;
                             }
                             continue;
                         }
@@ -3091,19 +3102,18 @@ impl Runner {
                             self.claim_control(command)?;
                             if accepted.send(true).is_ok() {
                                 cancel.cancel();
-                                let _ = future.await;
-                                return Err(ExecuteBoundToolError::Cancelled);
+                                break future.await;
                             }
                             self.in_flight_controls.pop();
                             continue;
                         }
                         RunControl::Command(command) => {
                             cancel.cancel();
-                            let _ = future.await;
+                            let result = future.await;
                             self.core
                                 .queue_followup(command)
                                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                            return Err(ExecuteBoundToolError::Cancelled);
+                            break result;
                         }
                     }
                 }

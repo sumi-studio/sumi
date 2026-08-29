@@ -15,6 +15,7 @@
 2. HumanとPersonalityAgentはメッセージング上で同じ「参加者」。
 3. direct chatはチャットではなく人生ログの正面窓（Employer専用私信、ADR 0009 §5）。
    本契約のスコープ外で、既存の `contracts/agent-events.yaml` の世界に残る。
+   `/direct-chat/ws` の `4001` / `runtime_not_ready` close pair はサーバー発のみとする。
 4. SecretaryとのDMはメッセージング側の通常のDMとして別途作る（ログ全部見えのDMはノイズ）。
 5. channel配送は人間と同型: 全発言が参加agentの未読として積もり、
    本人の通知設定が覚醒トリガ（呼びかけ）を決める。コスト上限はEmployer予算の別軸。
@@ -43,7 +44,31 @@
 ```
 
 - author、membership、mention、read marker、通知設定ownerのすべてでこの型を使う。
-- 表示名はscope-local（Workspace membershipのnickname等）で解決し、IDを表示名にしない（ADR 0008 §1）。
+- 表示名とtaglineはParticipant-globalなプロフィールとして解決し、IDを表示名にしない。
+  Workspace membershipのnickname等をこのプロフィールへ混ぜない。Workspace固有の肩書きが
+  必要になればmembership側の別resourceにする（ADR 0008 §1）。
+
+### Participant profile — 名乗り
+
+```json
+{
+  "participant": { "kind": "human", "human_id": "<UUIDv7>" },
+  "display_name": "Yohaku",
+  "tagline": "開発"
+}
+```
+
+- プロフィールはParticipantに属するglobal resourceであり、Workspace-localではない。
+  `display_name` の正本は戸籍（human / personality agent）で、`tagline` は
+  `participant_profiles` の `(member_kind, member_id)` 一行に置く。member listや
+  bootstrapはこのglobal値を各Workspaceへ投影する。
+- 現行のHuman縦切りはglobal設定の `GET /auth/profile` で本人の確定値を読み、
+  `POST /auth/profile` で `display_name?: string` / `tagline?: string` を部分更新する。
+  subjectはsigned browser sessionのHumanだけで、requestから別Participantを指定できない。
+  省略fieldは保持し、同じtransactionで両fieldを確定して完全なprofileを返す。
+- PersonalityAgentの自己編集transportとWorkspace nicknameはこの縦切りに含めない。
+  storage/projectionのParticipant identityをHuman専用やWorkspace専用に狭めず、必要なlaneで
+  それぞれ明示的なauthority boundaryを追加する。
 
 ### Place — メッセージが流れる場所
 
@@ -83,7 +108,8 @@
   "urgency": "urgent | normal | fyi",
   "reply_to": "<message_id> | null",
   "created_at": "...",
-  "edited_at": null
+  "edited_at": null,
+  "revision": 1
 }
 ```
 
@@ -98,6 +124,10 @@
 - `mentions` は入力テキストの `@表示名` をadmission時にmembership lookupで**解決済みParticipantRef**として束縛する。
   raw文字列の一致を認可やmention判定に使わない（ADR 0008: scope-local addressは交換可能な参照）。
 - authorはサーバー側が認証済みactorから構成する。client-assertedのauthor名を信用しない（ADR 0008 §6）。
+- `revision` は作成時に `1`。編集PATCHは現在の `revision` を必須で送り、サーバーは
+  compare-and-swap で一致したときだけ本文・mentions・`edited_at` とともに増分する。
+  古い版は `409 edit_conflict` と現在の完全な `message` を受け取る。clientはローカルの
+  推測やWS到達を使わず、この本文とrevisionを衝突表示・再読込の正本にする。
 
 ### ReadMarker と NotificationSetting — HumanもAgentも同じ形
 
@@ -140,13 +170,18 @@
   "mime": "サーバーがバイト先頭を sniff して決めた型",
   "size_bytes": 12345,
   "sha256": "<hex>",
-  "position": 0
+  "position": 0,
+  "spoiler": false,
+  "alt": "中身を見なくても何のファイルか分かる説明"
 }
 ```
 
 - `Message.attachments` は送信者が選んだ順序で最大 10 件。1 ファイルは最大 20 MiB。
   `content` が空でも attachments が 1 件以上あれば有効なメッセージである
   （DB の deferred trigger が同じ規則を commit 時に強制する）。
+- `spoiler` は受信側が開くまで inline 画像を覆う送信者の宣言であり、必ず boolean として
+  wire に載せる。`alt` は中身を見ずに分かる説明で、空文字を「説明なし」とし、最大
+  1,000 code point（DB 上は最大 4,000 UTF-8 bytes）を必ず string として wire に載せる。
 - upload は message より先に行い、`POST /messaging/places/{place_id}/attachments`
   に生バイトを送る。メタデータは header で運ぶ: `Idempotency-Key`（ファイルごとに
   安定な nonce）、`Content-Length`（宣言サイズ・必須）、`Content-Type`（ヒント）、
@@ -165,6 +200,12 @@
   削除確認後だけに行う。
   tombstone 済みの nonce は historical logical-upload identity として retired になり、
   ready receipt に化けず `410 attachment_upload_retired` を返す。
+- 送信前の宣言は `PATCH /messaging/attachments/{attachment_id}`（exact scope query 付き）で
+  編集する。body は `filename` / `alt` / `spoiler` の任意の非空サブセットで、空 patch は
+  `400 invalid_request`。省略した field は不変である。編集できるのは
+  upload した本人の未 bind attachment だけで、送信済みの本人の attachment は
+  `409 attachment_already_sent`、それ以外（見えない・削除中・他人のものを含む）は
+  `404 not_found` になる。
 - 送信 `POST /messaging/places/{place_id}/messages` の body に
   `attachments: [attachment_id, ...]` を順序付きで載せる。bind は message insert・
   mention・seq 割当・notification intent と同じ transaction で行われ、1 件でも
@@ -194,25 +235,12 @@
 - REST の `/messaging/*` は OpenAPI 契約（`contracts/openapi.yaml`）にはまだ 1 本も
   載っておらず、この文書が唯一の契約記述である。添付の 2 route も同じ扱いにしてある。
 
-### Poll — messageと同時に確定する質問（追補）
-
-- `Message.poll` は任意の1件で、pollはcarrier messageと1対1である。question、
-  `allow_multi`、任意の`closes_at`、2〜10件のoptionを持つ。option idはserverが割り当て、
-  voterは匿名化せず`ParticipantRef`で全員に見える。
-- pollは送信bodyの`poll`として渡し、message insert・seq・mention・attachment・通知と
-  同じtransactionで作る。pollだけ（空content、添付なし）のmessageも有効である。
-  nonce replayはpollを含むcanonical requestとして比較し、異なる再送は
-  `409 idempotency_conflict`になる。
-- `POST /messaging/places/{place_id}/messages/{message_id}/poll/vote` の
-  `option_ids`は本人の選択全体の置換で、空配列は取り下げである。single choiceへの複数票、
-  他pollのoption、締切後の投票をserverが拒否する。締切判定はserver clockを正本にする。
-- tombstoneはpoll・option・vote投影を削除する。editとreactionはpollを保持する。
-  `poll_updated`はcanonicalなmessage全体を運ぶが、reaction同様にplace replay cursorを
-  進めない。clientはpoll部分だけをpatchし、`caught_up`時にロード済み範囲を再取得して
-  切断中の更新へ収束する。
-
 ## API / event（人間UI側）
 
+- JSON request body は messaging REST 全体で strict に decode する。malformed JSON、複数の
+  JSON value、未知 field は endpoint を問わず `400 invalid_json` とする。decode 後の
+  endpoint 固有の内容検証だけが、それぞれの `invalid_*`（この PATCH の空 body などは
+  `invalid_request`）を返す。
 - REST: place一覧、履歴取得（seqベースのpagination）、read marker更新、
   connection申請/承認、通知設定CRUD、channel作成。
 - 送信とlive配信は既存方針どおりWS経由（TTFT < 500ms、[screen-composition.md](screen-composition.md) の設計制約）。
@@ -220,6 +248,9 @@
   `/direct-chat/ws` とは混ぜない（privacy・認可・replay・backpressureの境界が違う）。
 - bootstrap/place一覧は各placeの `latest_seq`、未読数、mention未読数を返す。履歴を
   lazy loadしていても、未訪問placeのバッジを欠落させないための投影である。
+- channel は `revision`（JSON safe integer、作成時は1・`places` の更新ごとに+1）も
+  運ぶ。`place_updated` はreplayされないため、clientは既に持つchannelより**新しい**
+  revisionだけを適用し、遅れて届いた過去の全量projectionで名前やtopicを戻さない。
 - `GET /messaging/search?q=&place_id=&limit=` は、現在の正確なWorkspace app
   scopeの中で、閲覧者が今見られるlive messageだけを部分一致検索する。結果は
   `message_id`、`place`、`seq`、`author`、`created_at` と、全文ではなくサーバー側で
@@ -231,7 +262,29 @@
   `parent_message_id`, `client_nonce`）は作成である。同じ作成nonceの再送は最初の
   threadを返す。1 message から作れるthreadは1つだけ。
   bootstrapは閲覧者が参加しているthreadだけを返し、個別open responseは
-  `thread` summaryに親channelを含める。Threadのmessageは既存の送信・添付・検索・
+  `thread` summaryに親channelを含める。未読summaryとlive配信も同じ線で切る:
+  ambientに載るのは参加しているthreadだけで、開けるだけのthreadは読んでも
+  参加者にならない。参加していないthreadをURLで開いた閲覧者には、WSの
+  `open{place_id, since}` / `close{place_id}`（ackは `open_ack{place_id}`）で
+  宣言した「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可では
+  ない。cursorを持つ台帳も同じ線で切る。serverのcatch-upはcursorを購読の根拠に
+  しない: helloでreplayするのは参加しているplaceだけで、開いているだけのthread
+  はその `open` frame のあとにreplayされる。
+  画面はRESTで履歴を取ってから開くので、その取得と宣言の隙間にcommitされた分は
+  手元のpageにもliveにも無い。`open` は「ここまで持っている」（`since`）を運び、
+  serverはそこからreplayして最後に `open_ack` を返す——replayが先、ackが後。
+  helloが預かったcursorも同じ経路に合流し（両者のうち手前から replay する）、
+  replayの経路は1本だけである。live配信は宣言の時点から始まるので、replayと
+  liveは重なる（重複はclientが畳めるが、隙間は畳めない）。まだ履歴を持って
+  いない場所でも、clientは0ではなく**知っている最新seq**（unread summaryや
+  thread summary、liveで見たseq）を名乗る。0は「先頭からreplayせよ」であり、
+  開くたびに古い履歴が流れてしまう。
+- 再接続の握手はWorkspaceの場所数に比例しない。clientがcursorを持つのは**いま
+  履歴を持っている場所**（開いて読み込んだ場所）と、いま開いている場所だけで、
+  手放すときはcursorと履歴を一緒に捨てる（片方だけ残すと穴の空いた履歴になる）。
+  それ以外の場所は、未読はbootstrapのunread summaryが正本、履歴は開いたときの
+  RESTが運ぶ。参加threadを何千持っていてもhelloは大きくならない。未読summary
+  自体は参加の数だけ並ぶので、そちらが重くなったら別途ページングを足す。Threadのmessageは既存の送信・添付・検索・
   tombstone・read markerをそのまま使う。通知候補は参加者と新しいmention先だけで、
   mentionされた人は同じtransactionで参加者になる。
 - 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして
@@ -241,7 +294,6 @@
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,
   `message_pinned`。
 - WS event（volatile）: `typing`, `status_updated`（下記）。
-- WS event（projection update、cursorを進めない）: `reaction_updated`, `poll_updated`。
 
 ### Status と ReplyLater — 自己申告のattention
 
@@ -250,7 +302,16 @@
 
 ```json
 // Status: 本人が設定する。期限付き
-{ "participant": ParticipantRef, "status": "available | busy | away", "note": "取り込み中", "expires_at": "..." }
+{
+  "participant": ParticipantRef,
+  "revision": 12,
+  "status": "available | busy | away",
+  "note": "取り込み中",
+  "expires_at": "...",
+  // 期限が切れたとき戻る先。空なら戻る先が無い（宣言そのものが終わる）
+  "base_status": "available | busy | away | \"\"",
+  "base_note": ""
+}
 
 // ReplyLater: mention/メッセージへのワンタップ応答予約
 {
@@ -266,6 +327,20 @@
   リマインドして返信忘れを防ぐ**（通知タブ + 覚醒トリガ「予定された出来事」に合流）。
 - 既読の自動晒し（read receipt）は作らない。見えるのは本人が宣言したものだけ。
 - Statusの現在値はREST、変化はvolatile event `status_updated`。ReplyLaterはdurable。
+- Status wire（HTTP ACK、`status_updated`、bootstrap/presence再同期、期限切れの
+  復元・clearを含む）はparticipantごとの単調増加 `revision` を運ぶ。clientは既知の
+  revisionより新しいprojectionだけを適用するので、HTTP ACKより遅く届いた古いexpiry
+  frameや過去のpresence snapshotは新しい自己申告を巻き戻さない。
+- 期限付きStatusは**置き換える前の宣言を覚える**。`base_status` / `base_note` が
+  それで、`expires_at` に達したら宣言はそこへ戻る。期限付きを期限付きで置き換えても
+  `base_*` は引き継ぐので、短い宣言を重ねても本人が選んだ「期限の無い宣言」は
+  埋もれない。期限の無いStatusを立てると `base_*` は空になる——新しい宣言が全部だから。
+  `base_*` は `expires_at` があるときだけ意味を持つ。
+- 戻る先が無いまま期限が切れた場合は、`status_updated` が**空の `status`** を運ぶ。
+  これは欠損ではなく「その人はもう何も言っていない」という答えで、「対応可能」とは
+  別の状態——プラットフォームは本人の宣言を勝手に既定値へ書き換えない。
+- 期限切れは読み出し時に解決される（RESTもWSも、上の規則で受け手が同じ答えを出せる）。
+  サーバー側のsweepは**通知のため**にあり、正しさのためではない。
 
 ### 権限（最小構成）
 
@@ -327,9 +402,6 @@ agentにとってより適した方法があるときだけそちらで代替す
    Threadにはread-onlyの `threads` とmutatingな `create_thread` があり、後者は
    作成後にそのthreadを現在のviewとして開く。起点messageを指定する場合は現在の
    open画面に見えているmessageだけを対象にする。
-   Pollにはmutatingな `create_poll` と `vote_poll` がある。`create_poll`の締切は
-   agentからserver clock基準の相対分数で渡す。`vote_poll`はADR 0011 §3どおり、現在の
-   open画面に見えているpoll messageだけを対象にし、全選択の置換（空は取り下げ）を行う。
 3. **人生ログへの記録**: agent基盤がprovenanceとともに記録する。正本はWorkspace
    API側で、agent DBはlocal copy/projection（ADR 0008 §8）。
 

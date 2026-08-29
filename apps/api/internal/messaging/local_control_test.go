@@ -308,6 +308,130 @@ func TestLocalCreateThreadAcceptsAgentNonceAndReplaysIt(t *testing.T) {
 	}
 }
 
+func TestAgentAndBrowserShareCanonicalThreadAndMessagePath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, browser := newTestServer(t, ctx)
+	local := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	agent := w.store.mustScope(t, ctx, DefaultWorkspaceID, w.agent)
+
+	localRequest := func(fields map[string]any) map[string]any {
+		request := map[string]any{
+			"workspace_id": agent.Scope.WorkspaceID, "installation_id": agent.Scope.InstallationID,
+			"authority_epoch": strconv.FormatInt(agent.Scope.AuthorityEpoch, 10),
+		}
+		for key, value := range fields {
+			request[key] = value
+		}
+		return request
+	}
+
+	create := localRequest(map[string]any{
+		"parent_place_id": DefaultGeneralChannelID,
+		"name":            "agent と browser の縦契約",
+		"client_nonce":    "vertical-create-thread-1",
+	})
+	status, created := callLocalWithoutFixtureInference(
+		t, ctx, local.localCreateThread, LocalCreateThreadPath, create, authorization)
+	if status != http.StatusCreated {
+		t.Fatalf("agent create thread = %d %v", status, created)
+	}
+	threadID, ok := created["thread_id"].(string)
+	if !ok || threadID == "" {
+		t.Fatalf("agent create omitted thread id: %v", created)
+	}
+
+	status, agentWrite := callLocalWithoutFixtureInference(
+		t, ctx, local.localWrite, LocalWritePath,
+		localRequest(map[string]any{
+			"place_id": threadID, "content": "agent からの一通目",
+			"urgency": "normal", "client_nonce": "vertical-agent-write-1",
+		}), authorization)
+	if status != http.StatusCreated || agentWrite["created"] != true {
+		t.Fatalf("agent write = %d %v", status, agentWrite)
+	}
+	agentMessageID, ok := agentWrite["message_id"].(string)
+	if !ok || agentMessageID == "" {
+		t.Fatalf("agent write omitted message id: %v", agentWrite)
+	}
+
+	resp, listed := call(t, browser, http.MethodGet,
+		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("browser thread list = %d %v", resp.StatusCode, listed)
+	}
+	threads, ok := listed["threads"].([]any)
+	if !ok || len(threads) != 1 || threads[0].(map[string]any)["thread_id"] != threadID {
+		t.Fatalf("browser thread list = %v, want %q", listed, threadID)
+	}
+
+	resp, opened := call(t, browser, http.MethodGet,
+		"/messaging/places/"+threadID, w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("browser open thread = %d %v", resp.StatusCode, opened)
+	}
+	threadWire, ok := opened["thread"].(map[string]any)
+	if !ok || threadWire["thread_id"] != threadID {
+		t.Fatalf("browser open relation = %v, want %q", opened, threadID)
+	}
+	resp, history := call(t, browser, http.MethodGet,
+		"/messaging/places/"+threadID+"/messages", w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("browser thread history = %d %v", resp.StatusCode, history)
+	}
+	messages, ok := history["messages"].([]any)
+	if !ok || len(messages) != 1 || messages[0].(map[string]any)["message_id"] != agentMessageID ||
+		messages[0].(map[string]any)["content"] != "agent からの一通目" {
+		t.Fatalf("browser history = %v, want agent message %q", history, agentMessageID)
+	}
+
+	resp, humanWrite := call(t, browser, http.MethodPost,
+		"/messaging/places/"+threadID+"/messages", w.humanA.ID,
+		map[string]any{"content": "human からの二通目", "urgency": "normal", "client_nonce": "vertical-human-write-1"})
+	if resp.StatusCode != http.StatusCreated || humanWrite["created"] != true {
+		t.Fatalf("browser write = %d %v", resp.StatusCode, humanWrite)
+	}
+	humanMessageID, ok := humanWrite["message_id"].(string)
+	if !ok || humanMessageID == "" {
+		t.Fatalf("browser write omitted message id: %v", humanWrite)
+	}
+
+	status, agentOpened := callLocalWithoutFixtureInference(
+		t, ctx, local.localOpen, LocalOpenPath,
+		localRequest(map[string]any{"place_id": threadID, "limit": 20}), authorization)
+	if status != http.StatusOK {
+		t.Fatalf("agent open thread = %d %v", status, agentOpened)
+	}
+	openedMessages, ok := agentOpened["messages"].([]any)
+	if !ok || len(openedMessages) != 2 {
+		t.Fatalf("agent open messages = %v", agentOpened)
+	}
+	first := openedMessages[0].(map[string]any)
+	second := openedMessages[1].(map[string]any)
+	if first["message_id"] != agentMessageID || first["content"] != "agent からの一通目" ||
+		second["message_id"] != humanMessageID || second["content"] != "human からの二通目" ||
+		first["seq"].(float64) >= second["seq"].(float64) {
+		t.Fatalf("agent ordered open = %v", openedMessages)
+	}
+
+	status, replayed := callLocalWithoutFixtureInference(
+		t, ctx, local.localCreateThread, LocalCreateThreadPath, create, authorization)
+	if status != http.StatusOK || replayed["thread_id"] != threadID {
+		t.Fatalf("agent create replay = %d %v, want %q", status, replayed, threadID)
+	}
+	var count int
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT count(*) FROM places
+		WHERE workspace_id = $1 AND parent_place_id = $2 AND kind = 'thread'`,
+		DefaultWorkspaceID, DefaultGeneralChannelID).Scan(&count); err != nil {
+		t.Fatalf("count canonical threads: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("same-nonce create left %d threads, want 1", count)
+	}
+}
+
 func TestLocalCreateThreadRejectsNULName(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -327,33 +451,75 @@ func TestLocalCreateThreadRejectsNULName(t *testing.T) {
 	}
 }
 
-func TestLocalCreatePollReplayWithRelativeDeadlineReturnsOriginalReceipt(t *testing.T) {
+func TestLocalSearchUsesExactAgentScopeAndDoesNotLeakInvisiblePlaces(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
-	_, channel := w.workspaceWithChannel(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	visible := w.send(t, ctx, channel.PlaceID, w.humanA, "引き継ぎ検索メモ")
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB)
+	if err != nil {
+		t.Fatalf("create invisible DM fixture: %v", err)
+	}
+	w.send(t, ctx, dm.PlaceID, w.humanA, "秘密の引き継ぎ検索メモ")
+
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
 	server := NewServer(w.store.core, nil)
 	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	body := map[string]any{
-		"place_id": channel.PlaceID, "question": "いつ？", "options": []string{"今日", "明日"},
-		"client_nonce": "relative-deadline-replay", "closes_in_minutes": 30,
-	}
-	firstStatus, first := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, body, authorization)
-	if firstStatus != http.StatusCreated || first["created"] != true {
-		t.Fatalf("first relative poll = %d %v, want 201 created", firstStatus, first)
-	}
-	firstMessage, ok := first["message"].(map[string]any)
-	if !ok || firstMessage["message_id"] == "" {
-		t.Fatalf("first relative poll receipt = %v", first)
+	base := map[string]any{
+		"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
+		"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10),
 	}
 
-	secondStatus, second := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, body, authorization)
-	if secondStatus != http.StatusOK || second["created"] != false {
-		t.Fatalf("relative poll replay = %d %v, want 200 replay", secondStatus, second)
+	search := make(map[string]any, len(base)+2)
+	for key, value := range base {
+		search[key] = value
 	}
-	secondMessage, ok := second["message"].(map[string]any)
-	if !ok || secondMessage["message_id"] != firstMessage["message_id"] {
-		t.Fatalf("relative poll replay receipt = %v, first %v", second, first)
+	search["query"] = "  引き継ぎ検索  "
+	search["limit"] = 1
+	status, body := callLocalWithoutFixtureInference(
+		t, ctx, server.localSearch, LocalSearchPath, search, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("local search status=%d body=%v", status, body)
+	}
+	results, ok := body["results"].([]any)
+	if !ok || len(results) != 1 {
+		t.Fatalf("local search results=%v, want one visible hit", body)
+	}
+	hit, ok := results[0].(map[string]any)
+	if !ok || hit["message_id"] != visible.MessageID || hit["snippet"] == nil {
+		t.Fatalf("local search hit=%v, want snippet-only visible message %s", results[0], visible.MessageID)
+	}
+	if _, exists := hit["content"]; exists {
+		t.Fatalf("local search leaked full content: %v", hit)
+	}
+
+	invisible := make(map[string]any, len(base)+2)
+	for key, value := range base {
+		invisible[key] = value
+	}
+	invisible["query"] = "秘密"
+	invisible["place_id"] = dm.PlaceID
+	status, body = callLocalWithoutFixtureInference(
+		t, ctx, server.localSearch, LocalSearchPath, invisible, authorization)
+	if status != http.StatusNotFound || body["error"] != "not_found" {
+		t.Fatalf("invisible local search=%d %v, want 404 not_found", status, body)
+	}
+
+	for name, invalid := range map[string]any{
+		"blank query": "   ",
+		"long query":  strings.Repeat("x", MaxSearchQueryBytes+1),
+	} {
+		request := make(map[string]any, len(base)+1)
+		for key, value := range base {
+			request[key] = value
+		}
+		request["query"] = invalid
+		status, body = callLocalWithoutFixtureInference(
+			t, ctx, server.localSearch, LocalSearchPath, request, authorization)
+		if status != http.StatusBadRequest || body["error"] != "invalid_request" {
+			t.Fatalf("%s local search=%d %v, want 400 invalid_request", name, status, body)
+		}
 	}
 }
 

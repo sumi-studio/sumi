@@ -15,6 +15,7 @@ import { MessageSearch } from "./message-search";
 const mocks = vi.hoisted(() => ({ searchMessages: vi.fn() }));
 const state = {
   searchMessages: mocks.searchMessages,
+  transportGeneration: 1,
   channels: [
     {
       channelId: "channel-1",
@@ -63,6 +64,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.resetAllMocks();
   state.threadsById = {};
+  state.transportGeneration = 1;
 });
 
 describe("MessageSearch", () => {
@@ -110,6 +112,7 @@ describe("MessageSearch", () => {
     state.threadsById = {
       "thread-1": {
         threadId: "thread-1",
+        revision: 1,
         parentPlace: { kind: "channel", channelId: "channel-1" },
         parentMessageId: null,
         workspaceId: "workspace-1",
@@ -128,7 +131,9 @@ describe("MessageSearch", () => {
     });
     await advance(300);
 
-    expect(screen.getByRole("button", { name: /認証リダイレクト/ })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /認証リダイレクト/ }),
+    ).toBeInTheDocument();
     expect(screen.queryByText("DM")).not.toBeInTheDocument();
   });
 
@@ -150,5 +155,29 @@ describe("MessageSearch", () => {
     fireEvent.change(input, { target: { value: "予定" } });
     fireEvent.pointerDown(screen.getByRole("button", { name: "outside" }));
     expect(screen.queryByText(/「予定」の検索結果/)).not.toBeInTheDocument();
+  });
+
+  it("forgets snippets, controls, and in-flight results when authority changes", async () => {
+    let resolveSearch!: (results: MessageSearchResult[]) => void;
+    mocks.searchMessages.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSearch = resolve;
+      }),
+    );
+    const onJump = vi.fn();
+    const view = render(<MessageSearch onJump={onJump} />);
+    const input = screen.getByPlaceholderText("検索");
+    fireEvent.change(input, { target: { value: "秘密" } });
+    await advance(300);
+    expect(mocks.searchMessages).toHaveBeenCalledWith("秘密");
+
+    state.transportGeneration = 2;
+    view.rerender(<MessageSearch onJump={onJump} />);
+    expect(input).toHaveValue("");
+    expect(screen.queryByText(/「秘密」の検索結果/)).not.toBeInTheDocument();
+
+    await act(async () => resolveSearch([result()]));
+    expect(screen.queryByRole("button", { name: /# general/ })).toBeNull();
+    expect(onJump).not.toHaveBeenCalled();
   });
 });

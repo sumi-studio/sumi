@@ -7,10 +7,11 @@ import { ApiMessagingBackend } from "../../messaging/api-backend";
 import {
   bindMessagingSessionIdentity,
   getMessagingScope,
+  useMessaging,
 } from "../../messaging/store";
 import type { WorkspaceControlState } from "../store";
-import { MessagingTransport } from "./messaging-transport";
 import { MessagingScopeGate } from "./messaging-scope-gate";
+import { MessagingTransport } from "./messaging-transport";
 
 const mocks = vi.hoisted(() => ({
   installApp: vi.fn(),
@@ -249,6 +250,81 @@ describe("MessagingScopeGate", () => {
 
     expect(getMessagingScope()?.authorityEpoch).toBe("2");
     expect(mounts).toBe(2);
+  });
+
+  it("rebinds the shell-owned transport to the exact newly selected Workspace", () => {
+    const first = {
+      installationId: "installation-1",
+      owner: { kind: "workspace" as const, workspaceId: "workspace-1" },
+      appId: "messaging",
+      state: "enabled" as const,
+      authorityEpoch: "1",
+      installedAt: 1,
+      updatedAt: 1,
+    };
+    mocks.state = workspaceState([first]);
+    const view = render(<MessagingTransport />);
+    expect(getMessagingScope()).toEqual({
+      workspaceId: "workspace-1",
+      installationId: "installation-1",
+      authorityEpoch: "1",
+    });
+
+    const secondState = workspaceState([
+      {
+        ...first,
+        installationId: "installation-2",
+        owner: { kind: "workspace", workspaceId: "workspace-2" },
+        authorityEpoch: "2",
+      },
+    ]);
+    mocks.state = {
+      ...secondState,
+      selectedWorkspaceId: "workspace-2",
+      members: secondState.members.map((membership) => ({
+        ...membership,
+        workspaceId: "workspace-2",
+      })),
+    };
+    view.rerender(<MessagingTransport />);
+
+    expect(getMessagingScope()).toEqual({
+      workspaceId: "workspace-2",
+      installationId: "installation-2",
+      authorityEpoch: "2",
+    });
+  });
+
+  it("does not reinitialize when unrelated Workspace arrays are replaced", () => {
+    const installation = {
+      installationId: "installation-1",
+      owner: { kind: "workspace" as const, workspaceId: "workspace-1" },
+      appId: "messaging",
+      state: "enabled" as const,
+      authorityEpoch: "1",
+      installedAt: 1,
+      updatedAt: 1,
+    };
+    mocks.state = workspaceState([installation]);
+    const init = vi.spyOn(useMessaging.getState(), "init");
+    const view = render(<MessagingTransport />);
+    expect(init).toHaveBeenCalledTimes(1);
+    init.mockClear();
+
+    mocks.state = {
+      ...mocks.state,
+      catalog: [...mocks.state.catalog],
+      installations: [...mocks.state.installations],
+      members: [...mocks.state.members],
+    };
+    view.rerender(<MessagingTransport />);
+
+    expect(init).not.toHaveBeenCalled();
+    expect(getMessagingScope()).toEqual({
+      workspaceId: "workspace-1",
+      installationId: "installation-1",
+      authorityEpoch: "1",
+    });
   });
 
   it("closes the shell-owned transport when the Messaging session logs out", () => {

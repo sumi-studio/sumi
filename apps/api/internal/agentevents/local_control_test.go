@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -1257,6 +1259,47 @@ func TestLocalControlIntegrityRotationConstructorMigratesPreviousKeyState(t *tes
 	}
 }
 
+func TestLocalControlStartupNamesStaleDurableStateKeyAndRecovery(t *testing.T) {
+	runtimeDir := privateRuntimeDir(t)
+	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
+	oldSecret := []byte("old-local-control-startup-reporting-secret-1")
+	currentSecret := []byte("new-local-control-startup-reporting-secret-2")
+	oldControl, err := NewLocalControlServer(oldGateway, oldSecret, []LocalRuntimeAuthorization{authorization})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldControl.publishRuntimeState(context.Background(), startupPublication("stale-key", localControlTestPAID, 7, "boot-a")); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewLocalControlServer(restarted, currentSecret, []LocalRuntimeAuthorization{authorization})
+	if err == nil {
+		t.Fatal("startup accepted durable state signed by an unavailable key")
+	}
+	oldID := deriveLocalControlIntegrityKeyID(deriveLocalControlIntegrityKey(oldSecret))
+	currentID := deriveLocalControlIntegrityKeyID(deriveLocalControlIntegrityKey(currentSecret))
+	for _, want := range []string{runtimeDir, oldID, currentID, "SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS", "discard"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("startup diagnostic missing %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), string(oldSecret)) || strings.Contains(err.Error(), string(currentSecret)) {
+		t.Fatalf("startup diagnostic exposed signing secret: %v", err)
+	}
+	withPrevious, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(withPrevious, currentSecret, [][]byte{oldSecret}, []LocalRuntimeAuthorization{authorization}); err != nil {
+		t.Fatalf("previous signing secret did not restore startup: %v", err)
+	}
+}
+
 func TestLocalControlIntegrityRotationRepairsPartialStateBeforePreviousKeyRetirement(t *testing.T) {
 	runtimeDir := privateRuntimeDir(t)
 	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
@@ -1636,4 +1679,147 @@ func TestLocalControlCredentialCapacityExpiresRatherThanWedges(t *testing.T) {
 	if len(state.LocalControl.CredentialRequests) != 1 {
 		t.Fatalf("credential records after expiry sweep = %d, want 1", len(state.LocalControl.CredentialRequests))
 	}
+}
+
+// TestDurableStateFromAnEarlierRunDoesNotKeepTheAPIDown pins where an
+// unverifiable durable runtime state is fatal and where it is only debris.
+// Under dynamic runtime provisioning there are no configured authorizations,
+// so every leftover file is unowned; treating those as fatal meant one file
+// from a past PAID kept the entire API from starting, when only that PAID's
+// spawn was ever at stake.
+func TestDurableStateFromAnEarlierRunDoesNotKeepTheAPIDown(t *testing.T) {
+	runtimeDir := privateRuntimeDir(t)
+	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
+	oldSecret := []byte("old-local-control-debris-secret-000000000001")
+	currentSecret := []byte("new-local-control-debris-secret-000000000002")
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		3,
+		"boot-debris",
+	)
+	currentAuthorization := localControlAuthorization(
+		localControlOtherBearer,
+		localControlOtherPAID,
+		4,
+		"boot-current",
+	)
+
+	// This is a legitimate current-key state that dynamic provisioning does
+	// not list as an authorization. It must survive the same startup sweep that
+	// quarantines the older debris below.
+	_, currentGateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
+	currentControl, err := NewLocalControlServer(
+		currentGateway,
+		currentSecret,
+		[]LocalRuntimeAuthorization{currentAuthorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := currentControl.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-current", localControlOtherPAID, 4, "boot-current"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	signedByCurrentKey, err := os.ReadFile(currentGateway.statePath(localControlOtherPAID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldControl, err := NewLocalControlServer(oldGateway, oldSecret, []LocalRuntimeAuthorization{authorization})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldControl.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-debris", localControlTestPAID, 3, "boot-debris"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	statePath := oldGateway.statePath(localControlTestPAID)
+	signedByOldKey, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentStatePath := oldGateway.statePath(localControlOtherPAID)
+	if err := os.WriteFile(currentStatePath, signedByCurrentKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authorized for that PAID: the operator's configuration is what is stale, so the
+	// process must say so instead of moving state it is responsible for.
+	ownedGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewLocalControlServer(ownedGateway, currentSecret, []LocalRuntimeAuthorization{authorization})
+	if err == nil || !strings.Contains(err.Error(), "unknown integrity key") {
+		t.Fatalf("an authorized PAID's unverifiable state must fail closed: %v", err)
+	}
+	if survived, readErr := os.ReadFile(statePath); readErr != nil || !bytes.Equal(survived, signedByOldKey) {
+		t.Fatalf("a failed startup must not disturb owned durable state: err=%v", readErr)
+	}
+
+	// Same file, no authorization for it: dynamic provisioning starts with an
+	// empty authorization list, so this is the shape a leftover file has.
+	dynamicGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServer(dynamicGateway, currentSecret, nil); err != nil {
+		t.Fatalf("debris from an earlier run kept the API down: %v", err)
+	}
+	if _, err := os.Stat(statePath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("unverifiable debris was left in the scanned name space: %v", err)
+	}
+	if survived, readErr := os.ReadFile(currentStatePath); readErr != nil || !bytes.Equal(survived, signedByCurrentKey) {
+		t.Fatalf("dynamic startup changed a legitimate current-key state: err=%v", readErr)
+	}
+	quarantined := quarantinedDurableStateFiles(t, runtimeDir)
+	if len(quarantined) != 1 {
+		t.Fatalf("want exactly one quarantined file, got %v", quarantined)
+	}
+	oldKeyID := deriveLocalControlIntegrityKeyID(deriveLocalControlIntegrityKey(oldSecret))
+	if !strings.HasSuffix(quarantined[0], oldKeyID) {
+		t.Fatalf("quarantine name does not name the key that signed it: %q", quarantined[0])
+	}
+	preserved, err := os.ReadFile(filepath.Join(runtimeDir, quarantined[0]))
+	if err != nil || !bytes.Equal(preserved, signedByOldKey) {
+		t.Fatalf("quarantine did not preserve the durable contents: err=%v", err)
+	}
+
+	// A restart after the sweep is quiet, and the PAID can be provisioned
+	// again because nothing unverifiable is left under its state path.
+	restarted, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServer(restarted, currentSecret, nil); err != nil {
+		t.Fatalf("a second start after quarantine failed: %v", err)
+	}
+	if again := quarantinedDurableStateFiles(t, runtimeDir); len(again) != 1 {
+		t.Fatalf("quarantined state was rescanned or re-quarantined: %v", again)
+	}
+	if _, err := NewLocalControlServer(restarted, currentSecret, []LocalRuntimeAuthorization{
+		localControlAuthorization(localControlTestBearer, localControlTestPAID, 4, "boot-after-quarantine"),
+	}); err != nil {
+		t.Fatalf("the PAID could not be authorized again after quarantine: %v", err)
+	}
+}
+
+func quarantinedDurableStateFiles(t *testing.T, runtimeDir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), quarantineDurableStateSuffix) {
+			names = append(names, entry.Name())
+		}
+	}
+	return names
 }

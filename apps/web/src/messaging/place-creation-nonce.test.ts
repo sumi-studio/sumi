@@ -1,0 +1,531 @@
+// @vitest-environment jsdom
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MessagingAPIError } from "./api-backend";
+import { MockMessagingServer } from "./mock-server";
+import { type ParticipantRef, participantKey } from "./model";
+import {
+  PlaceCreationAttemptCapacityError,
+  PlaceCreationAttemptLedger,
+} from "./place-creation-attempt-ledger";
+import {
+  bindMessagingSessionIdentity,
+  installMessagingBackend,
+  useMessaging,
+} from "./store";
+
+const SELF: ParticipantRef = { kind: "human", humanId: "human-a" };
+const BOB: ParticipantRef = { kind: "human", humanId: "human-b" };
+const CAROL: ParticipantRef = { kind: "human", humanId: "human-c" };
+
+class ThrowingStorage implements Storage {
+  readonly values = new Map<string, string>();
+  throwOnRemove = false;
+  throwOnSet = false;
+
+  get length(): number {
+    return this.values.size;
+  }
+
+  clear(): void {
+    this.values.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return [...this.values.keys()][index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    if (this.throwOnRemove) throw new Error("Storage remove denied");
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    if (this.throwOnSet) throw new Error("Storage quota denied");
+    this.values.set(key, value);
+  }
+}
+
+function signIn(): MockMessagingServer {
+  bindMessagingSessionIdentity(null);
+  bindMessagingSessionIdentity("human-a");
+  const server = new MockMessagingServer();
+  installMessagingBackend(server);
+  useMessaging.setState({
+    ready: true,
+    self: SELF,
+    selfKey: "human:human-a",
+    channels: [],
+    dms: [],
+  });
+  return server;
+}
+
+describe("place creation logical-attempt nonces", () => {
+  afterEach(() => {
+    bindMessagingSessionIdentity(null);
+    sessionStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("retains a channel nonce for manual retry and renews it after success", async () => {
+    const server = signIn();
+    const create = server.createChannel.bind(server);
+    const nonces: string[] = [];
+    vi.spyOn(server, "createChannel").mockImplementation(async (...args) => {
+      nonces.push(args[4]);
+      if (nonces.length === 1) throw new TypeError("ambiguous response loss");
+      return create(...args);
+    });
+
+    const gesture = () =>
+      useMessaging
+        .getState()
+        .createChannel("workspace-1", "incident", "coordination", false);
+    await expect(gesture()).rejects.toThrow("ambiguous response loss");
+    const reconciled = await gesture();
+    const [laterGesture, concurrent] = await Promise.all([
+      gesture(),
+      gesture(),
+    ]);
+
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+    expect(nonces[2]).not.toBe(nonces[1]);
+    expect(nonces[3]).toBe(nonces[2]);
+    expect(laterGesture).not.toBe(reconciled);
+    expect(concurrent).toBe(laterGesture);
+  });
+
+  it("retains a group-DM nonce for manual retry and renews it after success", async () => {
+    const server = signIn();
+    const create = server.createGroupDM.bind(server);
+    const nonces: string[] = [];
+    const participantSets: string[][] = [];
+    vi.spyOn(server, "createGroupDM").mockImplementation(async (...args) => {
+      nonces.push(args[1]);
+      participantSets.push(args[0].map(participantKey));
+      if (nonces.length === 1) throw new TypeError("ambiguous response loss");
+      return create(...args);
+    });
+
+    await expect(
+      useMessaging.getState().startDM([CAROL, BOB, CAROL]),
+    ).rejects.toThrow("ambiguous response loss");
+    const gesture = () => useMessaging.getState().startDM([BOB, CAROL]);
+    const reconciled = await gesture();
+    const laterGesture = await gesture();
+
+    expect(participantSets).toEqual([
+      ["human:human-b", "human:human-c"],
+      ["human:human-b", "human:human-c"],
+      ["human:human-b", "human:human-c"],
+    ]);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+    expect(nonces[2]).not.toBe(nonces[1]);
+    expect(laterGesture).not.toBe(reconciled);
+  });
+
+  it("reconciles a committed thread after response loss across a remounted UI gesture", async () => {
+    const server = signIn();
+    const create = server.createThread.bind(server);
+    const nonces: string[] = [];
+    let committedThreadId = "";
+    vi.spyOn(server, "createThread").mockImplementation(async (...args) => {
+      nonces.push(args[3]);
+      const thread = await create(...args);
+      if (nonces.length === 1) {
+        committedThreadId = thread.threadId;
+        throw new TypeError("response lost after thread commit");
+      }
+      return thread;
+    });
+
+    const gesture = (name: string) =>
+      useMessaging.getState().createThread("channel:ch-general", name, null);
+    await expect(gesture("response-loss thread")).rejects.toThrow(
+      "response lost after thread commit",
+    );
+    const reconciled = await gesture("response-loss thread");
+    const changedInput = await gesture("different thread");
+    const listed = await server.fetchThreads({
+      kind: "channel",
+      channelId: "ch-general",
+    });
+
+    expect(reconciled).toBe(`thread:${committedThreadId}`);
+    expect(changedInput).not.toBe(reconciled);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+    expect(nonces[2]).not.toBe(nonces[1]);
+    expect(
+      listed.filter((thread) => thread.threadId === committedThreadId),
+    ).toHaveLength(1);
+  });
+
+  it("retires a stale group-DM tenure rejection instead of pinning its nonce", async () => {
+    const server = signIn();
+    const nonces: string[] = [];
+    vi.spyOn(server, "createGroupDM").mockImplementation(
+      async (_participants, clientNonce) => {
+        nonces.push(clientNonce);
+        throw new MessagingAPIError("participant_tenure_stale", 409);
+      },
+    );
+
+    const gesture = () => useMessaging.getState().startDM([CAROL, BOB]);
+    await expect(gesture()).rejects.toMatchObject({
+      code: "participant_tenure_stale",
+      status: 409,
+    });
+    await expect(gesture()).rejects.toMatchObject({ status: 409 });
+
+    expect(nonces).toHaveLength(2);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).not.toBe(nonces[0]);
+  });
+
+  it("converges concurrent duplicate invocations and renews after success", async () => {
+    const server = signIn();
+    const duplicate = server.duplicateChannel.bind(server);
+    const nonces: string[] = [];
+    vi.spyOn(server, "duplicateChannel").mockImplementation(async (...args) => {
+      nonces.push(args[1]);
+      return duplicate(...args);
+    });
+
+    const gesture = () =>
+      useMessaging.getState().duplicateChannel("ch-general");
+    const [first, concurrent] = await Promise.all([gesture(), gesture()]);
+    const laterGesture = await gesture();
+
+    expect(first).toBe(concurrent);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+    expect(nonces[2]).not.toBe(nonces[1]);
+    expect(laterGesture).not.toBe(first);
+  });
+
+  it("reuses the unresolved duplicate nonce after exhausted reconciliation", async () => {
+    const server = signIn();
+    const duplicate = server.duplicateChannel.bind(server);
+    const nonces: string[] = [];
+    vi.spyOn(server, "duplicateChannel").mockImplementation(async (...args) => {
+      nonces.push(args[1]);
+      if (nonces.length === 1) {
+        throw new TypeError("ambiguous reconciliation exhausted");
+      }
+      return duplicate(...args);
+    });
+
+    const gesture = () =>
+      useMessaging.getState().duplicateChannel("ch-general");
+    await expect(gesture()).rejects.toThrow(
+      "ambiguous reconciliation exhausted",
+    );
+    await expect(gesture()).resolves.toMatch(/^channel:/);
+
+    expect(nonces).toHaveLength(2);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+  });
+
+  it("does not carry an unresolved nonce into a replacement session", async () => {
+    const firstServer = signIn();
+    let staleNonce = "";
+    vi.spyOn(firstServer, "createChannel").mockImplementation(
+      async (_workspaceId, _name, _topic, _voice, clientNonce) => {
+        staleNonce = clientNonce;
+        throw new TypeError("ambiguous response loss");
+      },
+    );
+    const gesture = () =>
+      useMessaging
+        .getState()
+        .createChannel("workspace-1", "session-fenced", "", false);
+    await expect(gesture()).rejects.toThrow("ambiguous response loss");
+
+    const replacement = signIn();
+    const create = replacement.createChannel.bind(replacement);
+    let replacementNonce = "";
+    vi.spyOn(replacement, "createChannel").mockImplementation(
+      async (...args) => {
+        replacementNonce = args[4];
+        return create(...args);
+      },
+    );
+    await expect(gesture()).resolves.toMatch(/^channel:/);
+
+    expect(staleNonce).toBeTruthy();
+    expect(replacementNonce).toBeTruthy();
+    expect(replacementNonce).not.toBe(staleNonce);
+  });
+
+  it("fails closed at capacity without evicting the oldest attempt", async () => {
+    const server = signIn();
+    const calls: Array<{ name: string; nonce: string }> = [];
+    vi.spyOn(server, "createChannel").mockImplementation(
+      async (_workspaceId, name, _topic, _voice, clientNonce) => {
+        calls.push({ name, nonce: clientNonce });
+        throw new TypeError("ambiguous response loss");
+      },
+    );
+    const create = (name: string) =>
+      useMessaging.getState().createChannel("workspace-1", name, "", false);
+
+    for (let index = 0; index < 32; index += 1) {
+      await expect(create(`unresolved-${index}`)).rejects.toThrow(
+        "ambiguous response loss",
+      );
+    }
+    const oldestNonce = calls[0]?.nonce;
+    await expect(create("unresolved-32")).rejects.toBeInstanceOf(
+      PlaceCreationAttemptCapacityError,
+    );
+    expect(calls).toHaveLength(32);
+
+    await expect(create("unresolved-0")).rejects.toThrow(
+      "ambiguous response loss",
+    );
+    expect(calls).toHaveLength(33);
+    expect(calls.at(-1)).toEqual({
+      name: "unresolved-0",
+      nonce: oldestNonce,
+    });
+  });
+
+  it("retires deterministic failures so repeated rejections never exhaust the tab", async () => {
+    const server = signIn();
+    const calls: Array<{ name: string; nonce: string }> = [];
+    vi.spyOn(server, "createChannel").mockImplementation(
+      async (_workspaceId, name, _topic, _voice, clientNonce) => {
+        calls.push({ name, nonce: clientNonce });
+        throw new MessagingAPIError("definitive_rejection", 409);
+      },
+    );
+    const create = (name: string) =>
+      useMessaging.getState().createChannel("workspace-1", name, "", false);
+
+    for (let index = 0; index < 40; index += 1) {
+      await expect(create(`rejected-${index}`)).rejects.toMatchObject({
+        code: "definitive_rejection",
+        status: 409,
+      });
+    }
+    await expect(create("rejected-again")).rejects.toMatchObject({
+      status: 409,
+    });
+    await expect(create("rejected-again")).rejects.toMatchObject({
+      status: 409,
+    });
+
+    expect(calls).toHaveLength(42);
+    expect(calls[40]?.nonce).toBeTruthy();
+    expect(calls[41]?.nonce).not.toBe(calls[40]?.nonce);
+  });
+
+  it("survives a hard reload until authoritative acknowledgement", () => {
+    const owner = JSON.stringify([
+      "human-a",
+      "workspace-1",
+      "installation-1",
+      "7",
+    ]);
+    const declaration = JSON.stringify([
+      "create_channel",
+      "workspace-1",
+      "reload-safe",
+      "",
+      false,
+    ]);
+    let generated = 0;
+    const nonceFactory = () => `reload-nonce-${++generated}`;
+
+    const beforeReload = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    beforeReload.activate(owner, true);
+    const committedButAmbiguous = beforeReload.nonceFor(declaration);
+
+    // A new ledger instance is the relevant hard-page-reload boundary. No
+    // in-memory state is shared, but the exact authority loads the same nonce.
+    const afterReload = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    afterReload.activate(owner, true);
+    expect(afterReload.nonceFor(declaration)).toBe(committedButAmbiguous);
+
+    afterReload.complete(declaration, committedButAmbiguous);
+    const afterAcknowledgement = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    afterAcknowledgement.activate(owner, true);
+    expect(afterAcknowledgement.nonceFor(declaration)).not.toBe(
+      committedButAmbiguous,
+    );
+  });
+
+  it("retains an ambiguous attempt in memory when Storage setItem fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `set-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    storage.throwOnSet = true;
+
+    const retained = ledger.nonceFor("create-a");
+    expect(ledger.nonceFor("create-a")).toBe(retained);
+    expect(storage.values.size).toBe(0);
+
+    // Degradation is sticky: later Storage recovery cannot silently replace
+    // the in-memory ambiguous attempt or give it a second nonce.
+    storage.throwOnSet = false;
+    expect(ledger.nonceFor("create-a")).toBe(retained);
+    expect(storage.values.size).toBe(0);
+  });
+
+  it("completes in memory when removing the final persisted attempt fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `remove-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    const acknowledged = ledger.nonceFor("create-a");
+    storage.throwOnRemove = true;
+
+    expect(() => ledger.complete("create-a", acknowledged)).not.toThrow();
+    expect(ledger.nonceFor("create-a")).not.toBe(acknowledged);
+  });
+
+  it("completes one attempt in memory when persisting the remainder fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `remaining-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    const completed = ledger.nonceFor("create-a");
+    const unresolved = ledger.nonceFor("create-b");
+    storage.throwOnSet = true;
+
+    expect(() => ledger.complete("create-a", completed)).not.toThrow();
+    expect(ledger.nonceFor("create-a")).not.toBe(completed);
+    expect(ledger.nonceFor("create-b")).toBe(unresolved);
+  });
+
+  it("resets authority in memory when persisted-state removal fails", () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `authority-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+    const obsolete = ledger.nonceFor("duplicate-a");
+    storage.throwOnRemove = true;
+
+    expect(() => ledger.authorityReplaced()).not.toThrow();
+    ledger.activate("owner-b", true);
+    expect(ledger.nonceFor("duplicate-a")).not.toBe(obsolete);
+  });
+
+  it("does not report canonical success as failure and renews manual gestures after Storage failure", async () => {
+    const storage = new ThrowingStorage();
+    let generated = 0;
+    const ledger = new PlaceCreationAttemptLedger(
+      storage,
+      32,
+      () => `success-failure-${++generated}`,
+    );
+    ledger.activate("owner-a", true);
+
+    const gesture = async () => {
+      const nonce = ledger.nonceFor("create-a");
+      const canonicalResult = await Promise.resolve("channel:created");
+      ledger.complete("create-a", nonce);
+      return { canonicalResult, nonce };
+    };
+    storage.throwOnRemove = true;
+    const first = await gesture();
+    expect(first).toMatchObject({
+      canonicalResult: "channel:created",
+    });
+    const retry = await gesture();
+    expect(retry).toMatchObject({
+      canonicalResult: "channel:created",
+    });
+
+    expect(retry.nonce).not.toBe(first.nonce);
+  });
+
+  it("still rejects malformed persisted ledger state instead of swallowing logic errors", () => {
+    const storage = new ThrowingStorage();
+    storage.values.set(
+      "sumi.messaging.place-creation-attempts/v1/owner-a",
+      "not-json",
+    );
+    const ledger = new PlaceCreationAttemptLedger(storage);
+
+    expect(() => ledger.activate("owner-a", true)).toThrow(SyntaxError);
+  });
+
+  it("does not carry persisted reconciliation state across authority replacement", () => {
+    let generated = 0;
+    const nonceFactory = () => `authority-nonce-${++generated}`;
+    const declaration = JSON.stringify(["duplicate_channel", "channel-1"]);
+    const firstOwner = JSON.stringify([
+      "human-a",
+      "workspace-1",
+      "installation-1",
+      "7",
+    ]);
+    const replacementOwner = JSON.stringify([
+      "human-a",
+      "workspace-1",
+      "installation-1",
+      "8",
+    ]);
+    const first = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    first.activate(firstOwner, true);
+    const obsolete = first.nonceFor(declaration);
+
+    const replacement = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    replacement.activate(replacementOwner, true);
+    const afterReplacement = new PlaceCreationAttemptLedger(
+      sessionStorage,
+      32,
+      nonceFactory,
+    );
+    afterReplacement.activate(firstOwner, true);
+
+    expect(afterReplacement.nonceFor(declaration)).not.toBe(obsolete);
+  });
+});

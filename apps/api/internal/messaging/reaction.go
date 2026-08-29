@@ -38,7 +38,7 @@ func (s *Server) toggleScopedReaction(ctx context.Context, store *ScopedStore, p
 }
 
 func (s *ScopedStore) ToggleReactionIdempotent(ctx context.Context, placeID, messageID, emoji, clientNonce string) (Message, bool, error) {
-	if clientNonce == "" || len(clientNonce) > 128 {
+	if !clientNonceValid(clientNonce) {
 		return Message{}, false, fmt.Errorf("client nonce must be 1..128 bytes")
 	}
 	if err := validateReactionEmoji(emoji); err != nil {
@@ -86,7 +86,7 @@ func (s *ScopedStore) ToggleReactionIdempotent(ctx context.Context, placeID, mes
 			return Message{}, false, ErrIdempotencyConflict
 		}
 		parts := []Message{message}
-		if err := attachMessagePartsWith(ctx, tx, s.Scope.WorkspaceID, parts); err != nil {
+		if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
 			return Message{}, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -121,7 +121,7 @@ func (s *ScopedStore) ToggleReactionIdempotent(ctx context.Context, placeID, mes
 		return Message{}, false, err
 	}
 	parts := []Message{message}
-	if err := attachMessagePartsWith(ctx, tx, s.Scope.WorkspaceID, parts); err != nil {
+	if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
 		return Message{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -45,11 +45,11 @@ type Message struct {
 	Mentions    []ParticipantRef
 	Reactions   []ReactionSummary
 	Attachments []Attachment // sender-ordered; empty for tombstones
-	Poll        *Poll
-	ReplyTo     string // empty when not a reply
+	ReplyTo     string       // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
 	EditedAt    *time.Time
+	Revision    int64
 	Deleted     bool
 }
 
@@ -66,8 +66,6 @@ type AppendInput struct {
 	// AttachmentIDs are the author's own finalized uploads in the sender's
 	// order. They bind inside the send transaction; any miss rolls it back.
 	AttachmentIDs []string
-	// Poll commits in the same transaction as the message it belongs to.
-	Poll *PollInput
 }
 
 type HistoryOptions struct {
@@ -102,7 +100,7 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		)
 		if err := rows.Scan(&m.MessageID, &m.PlaceID, &m.Seq, &authorKind, &m.Author.ID,
 			&content, &m.Urgency, &replyTo, &m.ClientNonce,
-			&m.CreatedAt, &m.EditedAt, &deletedAt); err != nil {
+			&m.CreatedAt, &m.EditedAt, &m.Revision, &deletedAt); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		m.Author.Kind = ParticipantKind(authorKind)

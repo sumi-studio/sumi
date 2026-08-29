@@ -1,28 +1,26 @@
 import {
-  BarChart3,
+  AtSign,
   CornerUpLeft,
-  FileText,
-  Loader2,
   Paperclip,
-  Pencil,
-  RotateCw,
+  SendHorizontal,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { DraftAttachment } from "../draft-attachments";
-import {
-  attachmentFailureLabel,
-  formatAttachmentSize,
-} from "../draft-attachments";
-import type { MemberProfile, Message, Urgency } from "../model";
+import type { Message, Urgency } from "../model";
 import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
-import { useWheelPassthrough } from "./overlay";
-import { ParticipantAvatar } from "./participant-avatar";
-import { PollCreateDialog } from "./poll-create-dialog";
+import { ComposerAttachments } from "./composer-attachments";
+import type { ComposerPlusMenuItem } from "./composer-plus-menu";
+import { ComposerPlusMenu } from "./composer-plus-menu";
+import {
+  MentionSuggestions,
+  useMentionAutocomplete,
+} from "./mention-autocomplete";
+import { useImeCommittedTextarea } from "./use-ime-committed-textarea";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
@@ -37,22 +35,7 @@ const URGENCIES: { value: Urgency; label: string; hint: string }[] = [
   { value: "fyi", label: "FYI", hint: "返信不要。手すきで見て" },
 ];
 
-interface MentionQuery {
-  query: string;
-  start: number;
-  end: number;
-}
-
-function findMentionQuery(value: string, caret: number): MentionQuery | null {
-  const before = value.slice(0, caret);
-  const match = /(^|\s)@([^\s@]*)$/.exec(before);
-  if (!match) return null;
-  const start = match.index + match[1].length;
-  return { query: match[2], start, end: caret };
-}
-
 export function Composer() {
-  const pollsEnabled = useMessaging((state) => state.capabilities.polls);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const draft = useMessaging((state) =>
     state.activePlaceKey
@@ -69,9 +52,9 @@ export function Composer() {
       ? (state.messagesByPlace[state.activePlaceKey] ?? NO_MESSAGES)
       : NO_MESSAGES,
   );
+  // 編集はメッセージ本体の位置で行う（message-item のインライン編集）。
+  // composerは編集を預からず、↑キーの入り口だけを持つ。
   const editingMessageId = useMessaging((state) => state.editingMessageId);
-  const cancelEdit = useMessaging((state) => state.cancelEdit);
-  const submitEdit = useMessaging((state) => state.submitEdit);
   const startEdit = useMessaging((state) => state.startEdit);
   const replyTargetId = useMessaging((state) => state.replyTargetId);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
@@ -95,22 +78,18 @@ export function Composer() {
   const retryDraftAttachment = useMessaging(
     (state) => state.retryDraftAttachment,
   );
+  const editDraftAttachment = useMessaging(
+    (state) => state.editDraftAttachment,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
-  const [pollOpen, setPollOpen] = useState(false);
 
   const display = usePlaceDisplay(activePlaceKey);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [urgency, setUrgency] = useState<Urgency>("normal");
-  const [editValue, setEditValue] = useState("");
-  const [mention, setMention] = useState<MentionQuery | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(0);
   const lastTypingAt = useRef(0);
-  const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
+  const ime = useImeCommittedTextarea(textareaRef);
 
-  const editingMessage = editingMessageId
-    ? messages.find((entry) => entry.messageId === editingMessageId)
-    : undefined;
   const replyTarget = replyTargetId
     ? messages.find((entry) => entry.messageId === replyTargetId)
     : undefined;
@@ -118,15 +97,12 @@ export function Composer() {
     ? membersByKey[participantKey(replyTarget.author)]
     : undefined;
 
-  const editing = editingMessage !== undefined;
-  const value = editing ? editValue : draft;
+  const value = draft;
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: place切替・返信開始・編集終了をフォーカスのトリガーにする
   useEffect(() => {
-    if (editingMessage) setEditValue(editingMessage.content);
-  }, [editingMessage]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 編集開始・place切替・返信開始をフォーカスのトリガーにする
-  useEffect(() => {
+    // インライン編集中はキャレットが編集欄にある。奪い返さない。
+    if (editingMessageId) return;
     textareaRef.current?.focus();
   }, [activePlaceKey, editingMessageId, replyTargetId]);
 
@@ -142,20 +118,9 @@ export function Composer() {
       textarea.scrollHeight > MAX_HEIGHT_PX ? "auto" : "hidden";
   }, [value]);
 
-  const candidates = useMemo(() => {
-    if (!mention) return [];
-    const query = mention.query.toLowerCase();
-    return Object.values(membersByKey)
-      .filter((member) => participantKey(member.participant) !== selfKey)
-      .filter((member) => member.displayName.toLowerCase().includes(query))
-      .slice(0, 6);
-  }, [mention, membersByKey, selfKey]);
-
   const updateValue = useCallback(
     (next: string) => {
-      if (editing) {
-        setEditValue(next);
-      } else if (activePlaceKey) {
+      if (activePlaceKey) {
         setDraft(activePlaceKey, next);
         const now = Date.now();
         if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
@@ -163,31 +128,16 @@ export function Composer() {
           sendTyping();
         }
       }
-      const caret = textareaRef.current?.selectionStart ?? next.length;
-      setMention(findMentionQuery(next, caret));
-      setMentionIndex(0);
     },
-    [editing, activePlaceKey, setDraft, sendTyping],
+    [activePlaceKey, setDraft, sendTyping],
   );
-
-  const applyMention = useCallback(
-    (member: MemberProfile) => {
-      if (!mention) return;
-      const inserted = `@${member.displayName} `;
-      const next =
-        value.slice(0, mention.start) + inserted + value.slice(mention.end);
-      updateValue(next);
-      setMention(null);
-      window.requestAnimationFrame(() => {
-        const textarea = textareaRef.current;
-        if (!textarea) return;
-        const caret = mention.start + inserted.length;
-        textarea.setSelectionRange(caret, caret);
-        textarea.focus();
-      });
-    },
-    [mention, value, updateValue],
-  );
+  const mentionAutocomplete = useMentionAutocomplete({
+    value,
+    onValueChange: updateValue,
+    inputRef: textareaRef,
+    membersByKey,
+    selfKey,
+  });
 
   const attachmentsSettled = draftAttachments.every(
     (entry) => entry.status === "ready",
@@ -195,29 +145,32 @@ export function Composer() {
   const readyAttachmentCount = draftAttachments.filter(
     (entry) => entry.status === "ready",
   ).length;
-  const canSend =
-    !editing &&
-    attachmentsSettled &&
-    (value.trim().length > 0 || readyAttachmentCount > 0);
+  const attachmentsFull =
+    draftAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
+  const canSubmitText = useCallback(
+    (text: string) =>
+      attachmentsSettled &&
+      (text.trim().length > 0 || readyAttachmentCount > 0),
+    [attachmentsSettled, readyAttachmentCount],
+  );
+  const canSend = canSubmitText(value);
 
   const submit = useCallback(() => {
-    if (editing) {
-      submitEdit(editValue);
-      return;
-    }
-    if (!canSend) return;
-    send(value, urgency);
+    const text = ime.committedValue(value);
+    if (!canSubmitText(text)) return;
+    send(text, urgency);
     setUrgency("normal");
-    setMention(null);
-  }, [editing, editValue, submitEdit, value, send, urgency, canSend]);
+    mentionAutocomplete.dismiss();
+    textareaRef.current?.focus();
+  }, [value, send, urgency, canSubmitText, mentionAutocomplete, ime]);
 
   const acceptFiles = useCallback(
     (list: FileList | File[] | null | undefined) => {
-      if (editing || !list) return;
+      if (!list) return;
       const files = Array.from(list).filter((file) => file.size >= 0);
       if (files.length > 0) addDraftAttachments(files);
     },
-    [editing, addDraftAttachments],
+    [addDraftAttachments],
   );
 
   const onPaste = useCallback(
@@ -240,38 +193,35 @@ export function Composer() {
     [acceptFiles],
   );
 
+  const plusItems = useMemo<ComposerPlusMenuItem[]>(
+    () => [
+      {
+        id: "attach",
+        label: "ファイルを添付",
+        hint: attachmentsFull
+          ? `1通につき${MAX_ATTACHMENTS_PER_MESSAGE}件まで`
+          : "貼り付け・ドロップも可",
+        icon: Paperclip,
+        disabled: attachmentsFull,
+        onSelect: () => fileInputRef.current?.click(),
+      },
+      {
+        id: "mention",
+        label: "メンション",
+        hint: "@ で相手を呼ぶ",
+        icon: AtSign,
+        onSelect: mentionAutocomplete.insertTrigger,
+      },
+    ],
+    [attachmentsFull, mentionAutocomplete.insertTrigger],
+  );
+
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (isImeComposing(event)) return;
-      if (mention && candidates.length > 0) {
-        if (event.key === "ArrowDown") {
-          event.preventDefault();
-          setMentionIndex((index) => (index + 1) % candidates.length);
-          return;
-        }
-        if (event.key === "ArrowUp") {
-          event.preventDefault();
-          setMentionIndex(
-            (index) => (index - 1 + candidates.length) % candidates.length,
-          );
-          return;
-        }
-        if (event.key === "Enter" || event.key === "Tab") {
-          event.preventDefault();
-          applyMention(candidates[mentionIndex]);
-          return;
-        }
-        if (event.key === "Escape") {
-          event.preventDefault();
-          setMention(null);
-          return;
-        }
-      }
+      if (mentionAutocomplete.onKeyDown(event)) return;
       if (event.key === "Escape") {
-        if (editing) {
-          event.preventDefault();
-          cancelEdit();
-        } else if (replyTargetId) {
+        if (replyTargetId) {
           event.preventDefault();
           setReplyTarget(null);
         }
@@ -285,11 +235,16 @@ export function Composer() {
         submit();
         return;
       }
-      // 空欄で↑ = 自分の直前のメッセージを編集（Discordと同じ手癖）。
-      if (event.key === "ArrowUp" && !editing && value === "") {
+      // 空欄で↑ = 自分の直前のメッセージをその場で編集し始める。
+      if (event.key === "ArrowUp" && !editingMessageId && value === "") {
+        // messages は tombstone を含む。削除済みは編集できないので、
+        // 「まだ本文のある自分の直前の発言」を拾う。
         const own = [...messages]
           .reverse()
-          .find((entry) => participantKey(entry.author) === selfKey);
+          .find(
+            (entry) =>
+              !entry.deleted && participantKey(entry.author) === selfKey,
+          );
         if (own) {
           event.preventDefault();
           startEdit(own.messageId);
@@ -297,12 +252,8 @@ export function Composer() {
       }
     },
     [
-      mention,
-      candidates,
-      mentionIndex,
-      applyMention,
-      editing,
-      cancelEdit,
+      mentionAutocomplete,
+      editingMessageId,
       replyTargetId,
       setReplyTarget,
       submit,
@@ -319,72 +270,31 @@ export function Composer() {
       ? `#${display.name} へメッセージ`
       : `${display.name} へメッセージ`;
 
-  const attachmentsFull =
-    draftAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
+  const blockedNotice =
+    attachmentOverflow > 0
+      ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
+      : draftAttachments.some((entry) => entry.status === "edit_failed")
+        ? "添付の保存に失敗しました。鉛筆から内容を直すか、再送してください"
+        : draftAttachments.length > 0 && !attachmentsSettled
+          ? "添付の準備ができると送信できます"
+          : null;
 
   return (
     <section
       aria-label="メッセージ入力"
       className="relative shrink-0 px-4 pb-4 sm:px-6"
       onDragOver={(event) => {
-        if (editing) return;
         event.preventDefault();
         setDragging(true);
       }}
       onDragLeave={() => setDragging(false)}
       onDrop={onDrop}
     >
-      {mention && candidates.length > 0 ? (
-        <div
-          ref={mentionPassthroughRef}
-          className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6"
-        >
-          {candidates.map((member, index) => {
-            const key = participantKey(member.participant);
-            return (
-              <button
-                key={key}
-                type="button"
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  applyMention(member);
-                }}
-                className={`flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px] ${
-                  index === mentionIndex ? "bg-accent" : ""
-                }`}
-              >
-                <ParticipantAvatar
-                  participantKey={key}
-                  name={member.displayName}
-                  size={20}
-                />
-                <span className="font-medium">{member.displayName}</span>
-                <span className="truncate text-muted-foreground text-xs">
-                  {member.tagline}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-      {editing ? (
-        <div className="mb-1 flex items-center gap-2 text-muted-foreground text-xs">
-          <Pencil className="size-3" />
-          メッセージを編集中
-          <span className="text-muted-foreground/70">
-            Enterで保存・Escでキャンセル
-          </span>
-          <button
-            type="button"
-            onClick={cancelEdit}
-            className="ml-auto rounded p-0.5 hover:bg-accent"
-            aria-label="編集をキャンセル"
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
-      ) : null}
-      {!editing && replyTarget && replyAuthor ? (
+      <MentionSuggestions
+        autocomplete={mentionAutocomplete}
+        className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6"
+      />
+      {replyTarget && replyAuthor ? (
         <div className="mb-1 flex items-center gap-2 text-muted-foreground text-xs">
           <CornerUpLeft className="size-3" />
           <span className="font-medium text-foreground">
@@ -406,44 +316,33 @@ export function Composer() {
           dragging ? "border-ring/80 bg-accent/30" : "border-border"
         }`}
       >
-        {!editing && draftAttachments.length > 0 ? (
-          <div
-            className="flex flex-wrap gap-1.5 px-3 pt-2.5"
-            data-testid="composer-attachments"
-          >
-            {draftAttachments.map((entry) => (
-              <DraftAttachmentChip
-                key={entry.clientNonce}
-                draft={entry}
-                onRemove={() => removeDraftAttachment(entry.clientNonce)}
-                onRetry={() => retryDraftAttachment(entry.clientNonce)}
-              />
-            ))}
-          </div>
-        ) : null}
+        <ComposerAttachments
+          drafts={draftAttachments}
+          onRemove={removeDraftAttachment}
+          onRetry={retryDraftAttachment}
+          onEdit={editDraftAttachment}
+        />
         <textarea
           ref={textareaRef}
           value={value}
-          onChange={(event) => updateValue(event.target.value)}
+          onChange={mentionAutocomplete.onInputChange}
           onKeyDown={onKeyDown}
-          onPaste={onPaste}
-          onClick={(event) => {
-            const caret = event.currentTarget.selectionStart ?? 0;
-            setMention(findMentionQuery(value, caret));
+          onKeyUp={mentionAutocomplete.onKeyUp}
+          onCompositionStart={ime.onCompositionStart}
+          onCompositionEnd={(event) => {
+            ime.onCompositionEnd();
+            mentionAutocomplete.onCompositionEnd(event);
           }}
+          onPaste={onPaste}
+          onClick={mentionAutocomplete.onInputClick}
+          onSelect={mentionAutocomplete.onSelectionChange}
           rows={1}
           placeholder={placeholder}
           aria-label={placeholder}
           className="block w-full resize-none bg-transparent px-3.5 pt-3 pb-1.5 text-[13.5px] leading-6 outline-none placeholder:text-muted-foreground/70"
         />
         <div className="flex items-center gap-1 px-2.5 pb-2">
-          {/* 編集中は緊急度セレクタを不可視にするだけで場所は保つ
-              （編集開始でツールバー行の高さが変わり入力欄が跳ねないように）。 */}
-          <div
-            className={`flex items-center rounded-md bg-muted/60 p-0.5 ${
-              editing ? "invisible" : ""
-            }`}
-          >
+          <div className="flex items-center rounded-md bg-muted/60 p-0.5">
             {URGENCIES.map((entry) => (
               <button
                 key={entry.value}
@@ -462,117 +361,41 @@ export function Composer() {
               </button>
             ))}
           </div>
-          {!editing ? (
-            <>
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                data-testid="composer-file-input"
-                onChange={(event) => {
-                  acceptFiles(event.currentTarget.files);
-                  event.currentTarget.value = "";
-                }}
-              />
-              <button
-                type="button"
-                title={
-                  attachmentsFull
-                    ? `添付は1件のメッセージにつき${MAX_ATTACHMENTS_PER_MESSAGE}件まで`
-                    : "ファイルを添付（貼り付け・ドロップも可）"
-                }
-                aria-label="ファイルを添付"
-                disabled={attachmentsFull}
-                onClick={() => fileInputRef.current?.click()}
-                className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
-              >
-                <Paperclip className="size-4" />
-              </button>
-              {pollsEnabled ? (
-                <button
-                  type="button"
-                  title="投票を作成"
-                  aria-label="投票を作成"
-                  onClick={() => setPollOpen(true)}
-                  className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                >
-                  <BarChart3 className="size-4" />
-                </button>
-              ) : null}
-            </>
-          ) : null}
-          <span className="ml-auto text-[11px] text-muted-foreground/60">
-            {!editing && attachmentOverflow > 0
-              ? `上限のため${attachmentOverflow}件のファイルを追加できませんでした`
-              : !editing && draftAttachments.length > 0 && !attachmentsSettled
-                ? "添付の準備ができると送信できます"
-                : "Enterで送信・Shift+Enterで改行"}
-          </span>
-        </div>
-      </div>
-      {pollOpen ? (
-        <PollCreateDialog onClose={() => setPollOpen(false)} />
-      ) : null}
-    </section>
-  );
-}
-
-function DraftAttachmentChip({
-  draft,
-  onRemove,
-  onRetry,
-}: {
-  draft: DraftAttachment;
-  onRemove: () => void;
-  onRetry: () => void;
-}) {
-  const failed = draft.status === "failed";
-  return (
-    <div
-      className={`flex max-w-full items-center gap-1.5 rounded-md border px-2 py-1 text-[12px] ${
-        failed
-          ? "border-rose-500/40 bg-rose-500/5 text-rose-600"
-          : "border-border bg-muted/50"
-      }`}
-      data-status={draft.status}
-      title={failed ? attachmentFailureLabel(draft.errorCode) : draft.filename}
-    >
-      {draft.status === "uploading" ? (
-        <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-      ) : (
-        <FileText className="size-3.5 shrink-0 text-muted-foreground" />
-      )}
-      <span className="max-w-40 truncate font-medium">{draft.filename}</span>
-      <span className="shrink-0 text-muted-foreground">
-        {formatAttachmentSize(draft.sizeBytes)}
-      </span>
-      {failed ? (
-        <>
-          <span className="shrink-0">
-            {attachmentFailureLabel(draft.errorCode)}
-          </span>
-          {draft.errorCode !== "attachment_too_large" &&
-          draft.errorCode !== "attachment_empty" ? (
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            data-testid="composer-file-input"
+            onChange={(event) => {
+              acceptFiles(event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <ComposerPlusMenu items={plusItems} finalFocusRef={textareaRef} />
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+            {blockedNotice ? (
+              <span className="truncate text-[11px] text-muted-foreground/60">
+                {blockedNotice}
+              </span>
+            ) : (
+              <span className="hidden truncate text-[11px] text-muted-foreground/60 sm:inline">
+                Enterで送信・Shift+Enterで改行
+              </span>
+            )}
             <button
               type="button"
-              onClick={onRetry}
-              className="rounded p-0.5 hover:bg-rose-500/10"
-              aria-label={`${draft.filename}を再送`}
+              onClick={submit}
+              disabled={!canSend}
+              title="送信（Enter）"
+              aria-label="送信"
+              className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-opacity enabled:hover:opacity-90 disabled:bg-muted disabled:text-muted-foreground/60"
             >
-              <RotateCw className="size-3" />
+              <SendHorizontal className="size-3.5" />
             </button>
-          ) : null}
-        </>
-      ) : null}
-      <button
-        type="button"
-        onClick={onRemove}
-        className="rounded p-0.5 hover:bg-accent"
-        aria-label={`${draft.filename}を外す`}
-      >
-        <X className="size-3" />
-      </button>
-    </div>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }

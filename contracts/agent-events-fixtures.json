@@ -659,6 +659,30 @@
       "status": "ready"
     }
   },
+  "browser_direct_chat_status_rehydrating": {
+    "kind": "browser_direct_chat_status",
+    "wire": {
+      "type": "direct_chat_status",
+      "status": "unavailable",
+      "reason": "rehydrating"
+    }
+  },
+  "browser_direct_chat_status_stopped": {
+    "kind": "browser_direct_chat_status",
+    "wire": {
+      "type": "direct_chat_status",
+      "status": "unavailable",
+      "reason": "stopped"
+    }
+  },
+  "browser_direct_chat_status_unknown": {
+    "kind": "browser_direct_chat_status",
+    "wire": {
+      "type": "direct_chat_status",
+      "status": "unavailable",
+      "reason": "unavailable"
+    }
+  },
   "browser_command_rejected_idempotency_conflict": {
     "kind": "browser_command_rejected",
     "wire": {

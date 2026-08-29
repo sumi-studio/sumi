@@ -281,7 +281,7 @@ impl RowAad {
         canonical_fields(
             b"sumi-row-aad/v2",
             [
-                self.personality_agent_id.as_str().as_bytes(),
+                self.personality_agent_id.as_bytes(),
                 self.table.as_bytes(),
                 self.row_id.as_bytes(),
                 self.purpose.as_bytes(),
@@ -309,7 +309,7 @@ impl KeyWrapAad {
                 self.key_ref.as_bytes(),
                 self.scope.as_str().as_bytes(),
                 self.purpose.as_str().as_bytes(),
-                self.personality_agent_id.as_str().as_bytes(),
+                self.personality_agent_id.as_bytes(),
                 self.retention_unit.as_bytes(),
                 self.wrap_key_id.as_bytes(),
             ],
