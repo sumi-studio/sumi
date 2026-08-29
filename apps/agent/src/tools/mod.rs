@@ -239,6 +239,10 @@ pub struct ToolCtx<'a> {
 pub(crate) struct ToolBindCtx<'a> {
     pub args: &'a ValidatedToolArguments,
     pub workspace: &'a WorkspacePaths,
+    /// Immutable identity of the executor that will perform this sealed
+    /// invocation. Production registries always carry it; local fixtures may
+    /// omit it for adapters without identity-relative targets.
+    pub executor_identity: Option<&'a RpcIdentity>,
 }
 
 pub(crate) struct BoundToolCtx<'a> {
@@ -571,6 +575,7 @@ impl ToolRegistry {
             .bind(ToolBindCtx {
                 args: &call.arguments,
                 workspace,
+                executor_identity: self.executor_identity.as_ref(),
             })
             .await?;
         let invocation = BoundToolInvocation::seal(

@@ -837,6 +837,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "workspace-1",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",
@@ -881,7 +882,8 @@ class StubBackend implements MessagingBackend {
   createChannel = vi.fn();
   ensureDM = vi.fn();
   createGroupDM = vi.fn();
-  updateChannelTopic = vi.fn();
+  updateChannel = vi.fn();
+  duplicateChannel = vi.fn();
   fetchPresence = vi.fn(async () => ({
     statuses: [],
     replyLaterMarkers: [],

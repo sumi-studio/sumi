@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
 import type { ChannelSummary, DmSummary } from "./model";
 import {
+  bindMessagingScope,
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
   installMessagingBackend,
@@ -9,8 +10,18 @@ import {
   useMessaging,
 } from "./store";
 
+const MESSAGING_SCOPE = {
+  workspaceId: "workspace-1",
+  installationId: "installation-1",
+  authorityEpoch: "1",
+} as const;
+
 describe("messaging session boundary", () => {
-  afterEach(() => bindMessagingSessionIdentity(null));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    bindMessagingScope(null);
+    bindMessagingSessionIdentity(null);
+  });
 
   it("disposes private state before a different signed-in human can render", () => {
     bindMessagingSessionIdentity("human-a");
@@ -22,6 +33,7 @@ describe("messaging session boundary", () => {
         {
           channelId: "private-a",
           workspaceId: "workspace",
+          revision: 1,
           name: "A",
           topic: "",
           visibility: "private",
@@ -62,6 +74,61 @@ describe("messaging session boundary", () => {
       activePlaceKey: null,
       connection: "disconnected",
     });
+  });
+
+  // Every store action that awaits the backend is fenced the same way: the
+  // answer is applied only if it comes back into the session that asked. A
+  // place action that outlives a Workspace switch would otherwise put the old
+  // Workspace's channel into the new one's sidebar — and, for a duplicate,
+  // navigate there.
+  it.each([
+    {
+      name: "duplicateChannel",
+      method: "duplicateChannel" as const,
+      run: () => useMessaging.getState().duplicateChannel("ch-general"),
+    },
+    {
+      name: "updateChannel",
+      method: "updateChannel" as const,
+      run: () =>
+        useMessaging.getState().updateChannel("ch-general", { name: "設計" }),
+    },
+  ])("discards the answer to $name after a Workspace switch", async ({
+    method,
+    run,
+  }) => {
+    bindMessagingSessionIdentity("human-self");
+    bindMessagingScope(MESSAGING_SCOPE);
+    const server = new MockMessagingServer();
+    let release!: (channel: ChannelSummary) => void;
+    const answer = new Promise<ChannelSummary>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(server, method).mockImplementation(() => answer);
+    installMessagingBackend(server);
+    const original: ChannelSummary = {
+      channelId: "ch-general",
+      workspaceId: "workspace-1",
+      revision: 1,
+      name: "general",
+      topic: "",
+      visibility: "public",
+      voice: false,
+    };
+    useMessaging.setState({
+      ready: true,
+      self: { kind: "human", humanId: "self" },
+      selfKey: "human:self",
+      channels: [original],
+    });
+
+    const pending = run();
+    // 別のWorkspaceへ移る。ここで前のsessionのstateは捨てられる。
+    bindMessagingScope({ ...MESSAGING_SCOPE, authorityEpoch: "2" });
+    release({ ...original, channelId: "ch-copy", name: "general のコピー" });
+
+    await expect(pending).rejects.toThrow(/session changed/i);
+    expect(useMessaging.getState().channels).toEqual([]);
   });
 
   it("atomically refreshes Human and contextual agent presentation profiles", async () => {
@@ -189,6 +256,7 @@ describe("messaging session boundary", () => {
       "dev",
       "開発",
       true,
+      expect.any(String),
     );
   });
 
@@ -217,6 +285,7 @@ describe("messaging session boundary", () => {
     resolveChannel({
       channelId: "stale-channel",
       workspaceId: "workspace-a",
+      revision: 1,
       name: "private-a",
       topic: "A only",
       visibility: "private",

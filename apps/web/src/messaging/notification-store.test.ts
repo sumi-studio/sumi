@@ -68,6 +68,7 @@ class StubBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "ws",
+          revision: 1,
           name: "dev",
           topic: "",
           visibility: "public",
@@ -113,9 +114,10 @@ class StubBackend implements MessagingBackend {
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): ReturnType<
-    MessagingBackend["updateChannelTopic"]
-  > {
+  async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): ReturnType<MessagingBackend["duplicateChannel"]> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {

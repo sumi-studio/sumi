@@ -16,11 +16,6 @@ vi.mock("../place-route", () => ({
 }));
 
 vi.mock("./sidebar", () => ({
-  NOTIFICATION_LEVEL_LABEL: {
-    all: "すべて通知",
-    mentions: "メンションのみ",
-    mute: "ミュート",
-  },
   Sidebar: ({ selectedPlaceKey }: { selectedPlaceKey: PlaceKey | null }) => (
     <aside data-testid="sidebar-selection">
       {selectedPlaceKey ?? "unselected"}
@@ -65,6 +60,7 @@ function seedCurrentPlace() {
       {
         channelId: "channel-a",
         workspaceId: "workspace-a",
+        revision: 1,
         name: "alpha",
         topic: "",
         visibility: "public",
@@ -73,6 +69,7 @@ function seedCurrentPlace() {
       {
         channelId: "channel-b",
         workspaceId: "workspace-b",
+        revision: 1,
         name: "beta",
         topic: "",
         visibility: "public",

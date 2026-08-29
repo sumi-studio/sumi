@@ -27,6 +27,7 @@ import type {
   ReactionSummary,
   ReplyLaterMarker,
   ServerEvent,
+  StatusCleared,
   StatusKind,
   Urgency,
   WorkspaceSummary,
@@ -50,6 +51,7 @@ import {
   presentationFor,
   presentDesktopNotification,
 } from "./notifications";
+import { PlaceCreationAttemptLedger } from "./place-creation-attempt-ledger";
 import {
   getActiveMessagingScope,
   type MessagingScope,
@@ -82,6 +84,20 @@ const UNBOUND_CAPABILITIES: MessagingCapabilities = {
   notifications: false,
 };
 
+/**
+ * Lifecycle frames do not replay. A late frame or bootstrap answer can
+ * describe an already superseded state, so only a strictly newer database
+ * revision can replace what this client has projected.
+ */
+function applyNewer<T extends { revision: number }>(
+  current: T | undefined,
+  candidate: T,
+): T {
+  return !current || candidate.revision > current.revision
+    ? candidate
+    : current;
+}
+
 function unboundMessagingBackend(): MessagingBackend {
   const target = {
     capabilities: UNBOUND_CAPABILITIES,
@@ -100,6 +116,66 @@ function unboundMessagingBackend(): MessagingBackend {
 let backend: MessagingBackend = unboundMessagingBackend();
 let nextDMStartToken = 0;
 let nextEditSessionToken = 0;
+
+/**
+ * One entry is one unresolved human place-creation gesture. A transport
+ * failure keeps its nonce for a manual retry with the exact same declaration;
+ * a canonical response removes it so a later explicit gesture is new. The map
+ * is cleared with the exact Messaging session/installation scope.
+ */
+const placeCreationAttempts = new PlaceCreationAttemptLedger(
+  typeof sessionStorage === "undefined" ? null : sessionStorage,
+);
+
+function activatePlaceCreationAttemptOwner(): void {
+  const identity = getMessagingSessionIdentity();
+  const scope = getActiveMessagingScope();
+  if (identity && scope) {
+    placeCreationAttempts.activate(
+      JSON.stringify([
+        identity,
+        scope.workspaceId,
+        scope.installationId,
+        scope.authorityEpoch,
+      ]),
+      true,
+    );
+    return;
+  }
+  // Unit/development mock backends can be identity-bound without a real app
+  // installation. Their attempts remain memory-only and generation-fenced.
+  placeCreationAttempts.activate(
+    JSON.stringify(["ephemeral", messagingSessionGeneration, identity]),
+    false,
+  );
+}
+
+function placeCreationAttemptNonce(key: string): string {
+  activatePlaceCreationAttemptOwner();
+  return placeCreationAttempts.nonceFor(key);
+}
+
+function completePlaceCreationAttempt(key: string, nonce: string): void {
+  placeCreationAttempts.complete(key, nonce);
+}
+
+function retireDefinitivePlaceCreationAttempt(
+  key: string,
+  nonce: string,
+  error: unknown,
+): void {
+  if (
+    error instanceof MessagingAPIError &&
+    error.status !== 408 &&
+    error.status !== 429 &&
+    error.status < 500
+  ) {
+    // This response authoritatively rejected the exact nonce/digest under the
+    // current scope. Replaying it cannot reconcile a committed place, so the
+    // failed logical gesture must not consume unresolved-attempt capacity.
+    completePlaceCreationAttempt(key, nonce);
+  }
+}
 
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
@@ -212,6 +288,8 @@ interface MessagingState {
   startingDM: PendingDMStart | null;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
+  /** Includes cleared declarations, so an absent UI status still fences late frames. */
+  statusRevisionByKey: Record<ParticipantKey, { revision: number }>;
   messagesByPlace: Record<PlaceKey, Message[]>;
   pendingByPlace: Record<PlaceKey, PendingMessage[]>;
   lastReadByPlace: Record<PlaceKey, number>;
@@ -283,7 +361,12 @@ interface MessagingState {
   ): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
-  updateChannelTopic(channelId: string, topic: string): Promise<void>;
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<void>;
+  /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
+  duplicateChannel(channelId: string): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
@@ -309,7 +392,11 @@ interface MessagingState {
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
-  setStatus(status: StatusKind, note: string): void;
+  setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt?: number | null,
+  ): Promise<void>;
   setPlaceNotificationLevel(
     key: PlaceKey,
     level: NotificationLevel,
@@ -683,6 +770,7 @@ const reactionProjectionByPlace = new Map<
 let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 type PresenceProjection =
   | { type: "status"; status: ParticipantStatus }
+  | ({ type: "status_cleared" } & StatusCleared)
   | { type: "reply_later"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string };
 let presenceResyncGeneration = 0;
@@ -814,20 +902,36 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 正しい。serverは読み出し時に落とすだけで失効eventを送らないので、
    * 期限に達した分はこちらで落とす。
    */
+  /**
+   * 期限切れの一時ステータスを、サーバーが読み出し時にするのと同じ形へ畳む。
+   * 戻る先があればその宣言へ戻し、無ければ宣言そのものを消す——「対応可能」に
+   * 書き換えることはしない。ここが黙って違う答えを出すと、開いている画面だけが
+   * サーバーと食い違う。
+   */
   const withoutExpired = (
     statuses: Record<ParticipantKey, ParticipantStatus>,
     now: number,
   ): Record<ParticipantKey, ParticipantStatus> => {
     const live: Record<ParticipantKey, ParticipantStatus> = {};
-    let dropped = false;
+    let changed = false;
     for (const [key, status] of Object.entries(statuses)) {
-      if (status.expiresAt !== null && status.expiresAt <= now) {
-        dropped = true;
+      if (status.expiresAt === null || status.expiresAt > now) {
+        live[key] = status;
         continue;
       }
-      live[key] = status;
+      changed = true;
+      if (status.baseStatus === null) continue;
+      live[key] = {
+        participant: status.participant,
+        revision: status.revision,
+        status: status.baseStatus,
+        note: status.baseNote,
+        expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
+      };
     }
-    return dropped ? live : statuses;
+    return changed ? live : statuses;
   };
 
   const scheduleStatusExpiry = () => {
@@ -854,23 +958,110 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }, delay);
   };
 
-  const applyStatuses = (statuses: ParticipantStatus[]) => {
-    const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
-    for (const status of statuses) {
-      statusByKey[participantKey(status.participant)] = status;
-    }
-    return withoutExpired(statusByKey, Date.now());
-  };
-
   /** 一人分の申告を置き換える。WS echoとRESTのACKはどちらが先でも同じ形。 */
   const applyStatus = (status: ParticipantStatus) => {
-    set((state) => ({
-      statusByKey: withoutExpired(
-        { ...state.statusByKey, [participantKey(status.participant)]: status },
-        Date.now(),
-      ),
-    }));
+    set((state) => {
+      const key = participantKey(status.participant);
+      if (applyNewer(state.statusRevisionByKey[key], status) !== status)
+        return {};
+      return {
+        statusByKey: withoutExpired(
+          { ...state.statusByKey, [key]: status },
+          Date.now(),
+        ),
+        statusRevisionByKey: { ...state.statusRevisionByKey, [key]: status },
+      };
+    });
     scheduleStatusExpiry();
+  };
+
+  /** その人が何も言っていない状態へ戻す。既定値で埋めることはしない。 */
+  const clearStatus = (cleared: StatusCleared) => {
+    set((state) => {
+      const key = participantKey(cleared.participant);
+      if (applyNewer(state.statusRevisionByKey[key], cleared) !== cleared)
+        return {};
+      const statusByKey = { ...state.statusByKey };
+      delete statusByKey[key];
+      return {
+        statusByKey,
+        statusRevisionByKey: { ...state.statusRevisionByKey, [key]: cleared },
+      };
+    });
+    scheduleStatusExpiry();
+  };
+
+  /**
+   * Presence snapshots are the complete set at the fetch boundary. Rebuild
+   * both status maps before replaying projections buffered while that fetch
+   * was in flight: otherwise a participant who left the snapshot keeps an
+   * old status forever, while applying a late snapshot after a live event
+   * would erase that event.
+   */
+  const applyPresenceSnapshot = (
+    presence: Awaited<ReturnType<MessagingBackend["fetchPresence"]>>,
+    projections: PresenceProjection[],
+  ) => {
+    set((_state) => {
+      const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
+      const statusRevisionByKey: Record<ParticipantKey, { revision: number }> =
+        {};
+      for (const status of presence.statuses) {
+        const key = participantKey(status.participant);
+        if (applyNewer(statusRevisionByKey[key], status) !== status) continue;
+        statusByKey[key] = status;
+        statusRevisionByKey[key] = status;
+      }
+      for (const cleared of presence.clearedStatuses ?? []) {
+        const key = participantKey(cleared.participant);
+        if (applyNewer(statusRevisionByKey[key], cleared) !== cleared) continue;
+        delete statusByKey[key];
+        statusRevisionByKey[key] = cleared;
+      }
+      const replyLaterById: Record<string, ReplyLaterMarker> = {};
+      for (const marker of presence.replyLaterMarkers) {
+        replyLaterById[marker.markerId] = marker;
+      }
+      for (const projection of projections) {
+        if (projection.type === "status") {
+          const key = participantKey(projection.status.participant);
+          if (
+            applyNewer(statusRevisionByKey[key], projection.status) !==
+            projection.status
+          )
+            continue;
+          statusByKey[key] = projection.status;
+          statusRevisionByKey[key] = projection.status;
+          continue;
+        }
+        if (projection.type === "status_cleared") {
+          const key = participantKey(projection.participant);
+          if (applyNewer(statusRevisionByKey[key], projection) !== projection)
+            continue;
+          delete statusByKey[key];
+          statusRevisionByKey[key] = projection;
+          continue;
+        }
+        if (projection.type === "reply_later") {
+          const known = replyLaterById[projection.marker.markerId];
+          replyLaterById[projection.marker.markerId] = {
+            ...projection.marker,
+            remindAt: projection.marker.remindAt ?? known?.remindAt ?? null,
+            resolved: projection.marker.resolved || (known?.resolved ?? false),
+          };
+          continue;
+        }
+        const marker = replyLaterById[projection.markerId];
+        if (marker) {
+          replyLaterById[projection.markerId] = { ...marker, resolved: true };
+        }
+      }
+      return {
+        statusByKey: withoutExpired(statusByKey, Date.now()),
+        statusRevisionByKey,
+        replyLaterById,
+      };
+    });
   };
 
   /**
@@ -903,6 +1094,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (projection.type === "status") {
       applyStatus(projection.status);
+      return;
+    }
+    if (projection.type === "status_cleared") {
+      clearStatus(projection);
       return;
     }
     if (projection.type === "reply_later") {
@@ -1121,19 +1316,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return;
       }
-      const replyLaterById: Record<string, ReplyLaterMarker> = {};
-      for (const marker of presence.replyLaterMarkers) {
-        replyLaterById[marker.markerId] = marker;
-      }
       // Stop buffering before replaying, otherwise the replay would append to
-      // its own queue forever. Events were already applied live; replaying them
-      // now restores anything the older wholesale snapshot replaced.
+      // its own queue forever. applyPresenceSnapshot replaces the complete
+      // snapshot and then restores every projection it displaced.
       pendingPresenceResync = null;
-      set({ statusByKey: applyStatuses(presence.statuses), replyLaterById });
+      applyPresenceSnapshot(presence, resync.projections);
       scheduleStatusExpiry();
-      for (const projection of resync.projections) {
-        applyPresenceProjection(projection, false);
-      }
     } finally {
       if (pendingPresenceResync === resync) pendingPresenceResync = null;
     }
@@ -1405,6 +1593,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       applyPresenceProjection({ type: "status", status: event.status });
       return;
     }
+    if (event.type === "status_cleared") {
+      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
+      applyPresenceProjection({
+        type: "status_cleared",
+        participant: event.participant,
+        revision: event.revision,
+      });
+      return;
+    }
     if (event.type === "reply_later_created") {
       applyPresenceProjection({ type: "reply_later", marker: event.marker });
       return;
@@ -1420,11 +1617,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const { channel, dm } = event;
       set((state) => {
         if (channel) {
-          return state.channels.some(
+          const index = state.channels.findIndex(
             (entry) => entry.channelId === channel.channelId,
-          )
-            ? {}
-            : { channels: [...state.channels, channel] };
+          );
+          const next = applyNewer(state.channels[index], channel);
+          if (next === state.channels[index]) return {};
+          if (index < 0) return { channels: [...state.channels, next] };
+          const channels = [...state.channels];
+          channels[index] = next;
+          return { channels };
         }
         if (dm) {
           return state.dms.some((entry) => entry.dmId === dm.dmId)
@@ -1437,11 +1638,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
     if (event.type === "place_updated") {
       const { channel } = event;
-      set((state) => ({
-        channels: state.channels.map((entry) =>
-          entry.channelId === channel.channelId ? channel : entry,
-        ),
-      }));
+      set((state) => {
+        const index = state.channels.findIndex(
+          (entry) => entry.channelId === channel.channelId,
+        );
+        const next = applyNewer(state.channels[index], channel);
+        if (index < 0) return { channels: [...state.channels, next] };
+        if (next === state.channels[index]) return {};
+        const channels = [...state.channels];
+        channels[index] = next;
+        return { channels };
+      });
     }
   };
 
@@ -1461,6 +1668,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const request = beginMessagingBackendRequest();
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = get().selfKey;
+    // A live lifecycle event can arrive while bootstrap is in flight. Retain
+    // only entries that appeared or advanced after this boundary; entries
+    // already known here and omitted by the complete snapshot are gone.
+    const channelsBeforeFetch = new Map(
+      get().channels.map((channel) => [channel.channelId, channel]),
+    );
+    const dmIDsBeforeFetch = new Set(get().dms.map((dm) => dm.dmId));
     const snapshot = await request.wait((backend) => backend.bootstrap());
     if (!snapshot) return;
     if (
@@ -1500,10 +1714,33 @@ export const useMessaging = create<MessagingState>((set, get) => {
       mentionCountByPlace[key] = summary.mentionCount;
       sinceByPlace[key] = summary.latestSeq;
     }
+    const currentChannels = new Map(
+      state.channels.map((channel) => [channel.channelId, channel]),
+    );
+    const snapshotChannelIDs = new Set(
+      snapshot.channels.map((channel) => channel.channelId),
+    );
+    const channels = snapshot.channels.map((channel) =>
+      applyNewer(currentChannels.get(channel.channelId), channel),
+    );
+    for (const [channelID, current] of currentChannels) {
+      if (snapshotChannelIDs.has(channelID)) continue;
+      // This channel reached the client after the fetch began, so a snapshot
+      // that predates its creation must not erase it.
+      if (channelsBeforeFetch.get(channelID) !== current)
+        channels.push(current);
+    }
+    const snapshotDMIDs = new Set(snapshot.dms.map((dm) => dm.dmId));
+    const dms = [
+      ...snapshot.dms,
+      ...state.dms.filter(
+        (dm) => !snapshotDMIDs.has(dm.dmId) && !dmIDsBeforeFetch.has(dm.dmId),
+      ),
+    ];
     set({
       workspaces: snapshot.workspaces,
-      channels: snapshot.channels,
-      dms: snapshot.dms,
+      channels,
+      dms,
       membersByKey,
       lastReadByPlace,
       unreadCountByPlace,
@@ -1812,6 +2049,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     startingDM: null,
     membersByKey: {},
     statusByKey: {},
+    statusRevisionByKey: {},
     messagesByPlace: {},
     pendingByPlace: {},
     lastReadByPlace: {},
@@ -1856,7 +2094,24 @@ export const useMessaging = create<MessagingState>((set, get) => {
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
           }
-          const statusByKey = applyStatuses(snapshot.statuses);
+          const initialStatuses: Record<ParticipantKey, ParticipantStatus> = {};
+          const statusRevisionByKey: Record<
+            ParticipantKey,
+            { revision: number }
+          > = {};
+          for (const status of snapshot.statuses) {
+            const key = participantKey(status.participant);
+            initialStatuses[key] = status;
+            statusRevisionByKey[key] = status;
+          }
+          for (const cleared of snapshot.clearedStatuses ?? []) {
+            const key = participantKey(cleared.participant);
+            if (applyNewer(statusRevisionByKey[key], cleared) !== cleared)
+              continue;
+            delete initialStatuses[key];
+            statusRevisionByKey[key] = cleared;
+          }
+          const statusByKey = withoutExpired(initialStatuses, Date.now());
           const lastReadByPlace: Record<PlaceKey, number> = {};
           for (const marker of snapshot.readMarkers) {
             lastReadByPlace[placeKey(marker.place)] = marker.lastReadSeq;
@@ -1889,6 +2144,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             dms: snapshot.dms,
             membersByKey,
             statusByKey,
+            statusRevisionByKey,
             lastReadByPlace,
             unreadCountByPlace,
             mentionCountByPlace,
@@ -1969,9 +2225,24 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const request = beginMessagingBackendRequest();
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
-      const channel = await request.wait((backend) =>
-        backend.createChannel(workspaceId, name, topic, voice),
-      );
+      const attemptKey = JSON.stringify([
+        "create_channel",
+        workspaceId,
+        name,
+        topic,
+        voice,
+      ]);
+      const clientNonce = placeCreationAttemptNonce(attemptKey);
+      let channel: ChannelSummary | undefined;
+      try {
+        channel = await request.wait((backend) =>
+          backend.createChannel(workspaceId, name, topic, voice, clientNonce),
+        );
+      } catch (error) {
+        retireDefinitivePlaceCreationAttempt(attemptKey, clientNonce, error);
+        throw error;
+      }
+      if (channel) completePlaceCreationAttempt(attemptKey, clientNonce);
       if (
         !channel ||
         !request.isCurrent() ||
@@ -1989,7 +2260,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     async startDM(participants) {
-      const [first] = participants;
+      const canonicalParticipants = [
+        ...new Map(
+          participants.map((participant) => [
+            participantKey(participant),
+            participant,
+          ]),
+        ).entries(),
+      ]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([, participant]) => participant);
+      const [first] = canonicalParticipants;
       if (!first) throw new Error("participants are required");
       if (get().startingDM !== null) {
         throw new Error("A DM start is already pending");
@@ -1998,14 +2279,45 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const currentIdentity = getMessagingSessionIdentity();
       const expectedSelfKey = get().selfKey;
       const token = ++nextDMStartToken;
+      const canonicalGroupParticipants =
+        canonicalParticipants.length > 1 ? canonicalParticipants : null;
+      const groupAttemptKey =
+        canonicalGroupParticipants !== null
+          ? JSON.stringify([
+              "create_group_dm",
+              ...canonicalGroupParticipants.map(participantKey),
+            ])
+          : null;
+      const clientNonce =
+        groupAttemptKey === null
+          ? null
+          : placeCreationAttemptNonce(groupAttemptKey);
       set({ startingDM: { participants, token } });
       try {
-        const dm =
-          participants.length === 1
-            ? await request.wait((backend) => backend.ensureDM(first))
-            : await request.wait((backend) =>
-                backend.createGroupDM(participants),
-              );
+        let dm: DmSummary | undefined;
+        try {
+          dm =
+            canonicalParticipants.length === 1
+              ? await request.wait((backend) => backend.ensureDM(first))
+              : await request.wait((backend) =>
+                  backend.createGroupDM(
+                    canonicalGroupParticipants ?? [],
+                    clientNonce ?? "",
+                  ),
+                );
+        } catch (error) {
+          if (groupAttemptKey && clientNonce) {
+            retireDefinitivePlaceCreationAttempt(
+              groupAttemptKey,
+              clientNonce,
+              error,
+            );
+          }
+          throw error;
+        }
+        if (dm && groupAttemptKey && clientNonce) {
+          completePlaceCreationAttempt(groupAttemptKey, clientNonce);
+        }
         if (
           !dm ||
           !request.isCurrent() ||
@@ -2029,17 +2341,64 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
     },
 
-    async updateChannelTopic(channelId, topic) {
+    async updateChannel(channelId, input) {
       const request = beginMessagingBackendRequest();
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
       const channel = await request.wait((backend) =>
-        backend.updateChannelTopic(channelId, topic),
+        backend.updateChannel(channelId, input),
       );
-      if (!channel || !request.isCurrent()) return;
-      set((state) => ({
-        channels: state.channels.map((entry) =>
-          entry.channelId === channel.channelId ? channel : entry,
-        ),
-      }));
+      if (
+        !channel ||
+        !request.isCurrent() ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during channel edit");
+      }
+      set((state) => {
+        const index = state.channels.findIndex(
+          (entry) => entry.channelId === channel.channelId,
+        );
+        const next = applyNewer(state.channels[index], channel);
+        if (index < 0) return { channels: [...state.channels, next] };
+        if (next === state.channels[index]) return {};
+        const channels = [...state.channels];
+        channels[index] = next;
+        return { channels };
+      });
+    },
+
+    async duplicateChannel(channelId) {
+      const request = beginMessagingBackendRequest();
+      const currentIdentity = getMessagingSessionIdentity();
+      const expectedSelfKey = get().selfKey;
+      const attemptKey = JSON.stringify(["duplicate_channel", channelId]);
+      const clientNonce = placeCreationAttemptNonce(attemptKey);
+      let channel: ChannelSummary | undefined;
+      try {
+        channel = await request.wait((backend) =>
+          backend.duplicateChannel(channelId, clientNonce),
+        );
+      } catch (error) {
+        retireDefinitivePlaceCreationAttempt(attemptKey, clientNonce, error);
+        throw error;
+      }
+      if (channel) completePlaceCreationAttempt(attemptKey, clientNonce);
+      if (
+        !channel ||
+        !request.isCurrent() ||
+        getMessagingSessionIdentity() !== currentIdentity ||
+        get().selfKey !== expectedSelfKey
+      ) {
+        throw new Error("Messaging session changed during channel duplication");
+      }
+      set((state) =>
+        state.channels.some((entry) => entry.channelId === channel.channelId)
+          ? {}
+          : { channels: [...state.channels, channel] },
+      );
+      return placeKey({ kind: "channel", channelId: channel.channelId });
     },
 
     async searchMessages(query) {
@@ -2569,17 +2928,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
-    setStatus(status, note) {
+    async setStatus(status, note, expiresAt = null) {
       const request = beginMessagingBackendRequest();
-      void request
-        .wait((backend) => backend.setStatus(status, note))
-        .then(
-          (canonical) => {
-            if (!canonical || !request.isCurrent()) return;
-            applyPresenceProjection({ type: "status", status: canonical });
-          },
-          () => undefined,
-        );
+      const canonical = await request.wait((backend) =>
+        backend.setStatus(status, note, expiresAt),
+      );
+      if (!canonical || !request.isCurrent()) {
+        throw new Error("Messaging session changed during status declaration");
+      }
+      applyPresenceProjection({ type: "status", status: canonical });
     },
 
     setPlaceNotificationLevel(key, level) {
@@ -2819,6 +3176,7 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
 
 function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
+  placeCreationAttempts.authorityReplaced();
   reactionProjectionByPlace.clear();
   releaseAllDraftFiles();
   backend.dispose();
@@ -2844,6 +3202,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     startingDM: null,
     membersByKey: {},
     statusByKey: {},
+    statusRevisionByKey: {},
     messagesByPlace: {},
     pendingByPlace: {},
     lastReadByPlace: {},

@@ -695,7 +695,7 @@ func TestPlaceLifecycleEventsReachWSSubscribers(t *testing.T) {
 
 	// Channel creation reaches every workspace member's live socket.
 	resp, created := call(t, ts, http.MethodPost, "/messaging/channels", w.humanA.ID,
-		map[string]any{"workspace_id": ws.WorkspaceID, "name": "dev", "topic": "開発の相談"})
+		map[string]any{"workspace_id": ws.WorkspaceID, "name": "dev", "topic": "開発の相談", "client_nonce": "ws-create-dev"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create channel: status %d body %v", resp.StatusCode, created)
 	}
@@ -719,7 +719,7 @@ func TestPlaceLifecycleEventsReachWSSubscribers(t *testing.T) {
 		map[string]any{"participants": []any{
 			map[string]any{"kind": "human", "human_id": w.humanB.ID},
 			map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
-		}})
+		}, "client_nonce": "ws-create-group"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create group dm: status %d body %v", resp.StatusCode, groupDM)
 	}

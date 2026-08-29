@@ -13,7 +13,8 @@ import { applyUserScrollDelta } from "../../lib/user-scroll-intent";
 const openOverlays = new Set<() => void>();
 
 /** 行やリストが自分の中に描くだけで、中身は自分のものではないもの。 */
-const HOSTED_OVERLAY = '[role="dialog"],[role="menu"],[role="listbox"]';
+const HOSTED_OVERLAY =
+  '[data-sumi-overlay-panel],[role="dialog"],[role="menu"],[role="listbox"]';
 
 /**
  * その合成イベントを、ハンドラを置いた要素が「自分の操作」として扱ってよいか。
@@ -132,7 +133,10 @@ export interface OverlayPanelBindings<T extends HTMLElement> {
     "aria-expanded": boolean;
     onClick: () => void;
   };
-  panelProps: { ref: RefCallback<HTMLDivElement> };
+  panelProps: {
+    ref: RefCallback<HTMLDivElement>;
+    "data-sumi-overlay-panel": "";
+  };
   toggle: () => void;
   close: () => void;
 }
@@ -251,7 +255,7 @@ export function useOverlayPanel<T extends HTMLElement = HTMLButtonElement>({
     triggerRef,
     panelRef,
     triggerProps: { ref: setTrigger, "aria-expanded": open, onClick: toggle },
-    panelProps: { ref: setPanel },
+    panelProps: { ref: setPanel, "data-sumi-overlay-panel": "" },
     toggle,
     close,
   };
