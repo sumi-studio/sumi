@@ -200,6 +200,17 @@ exact origin `http://127.0.0.1:5173`. `SUMI_AUTH_ALLOW_INSECURE_COOKIES=true`
 is set only by this native HTTP launcher; production keeps secure cookies and
 its exact-origin rules.
 
+Closed-tab Messaging notifications are enabled in the supported local stack.
+`SUMI_MESSAGING_PUSH_SUBJECT` is the VAPID operator contact (`mailto:` or an
+`https://` URL); the launcher defaults it to `mailto:dev@sumi.local`. The API
+generates one deployment key pair in Postgres, while each push payload contains
+only a Workspace/place routing pointer. Notification text is fixed by the
+service worker and no message body, attachment name, or participant name is
+sent to the push service. Unset the variable when starting the API directly to
+disable subscription registration and delivery. Service Workers require a
+secure context, so browser delivery works on loopback and HTTPS; direct
+Tailnet HTTP continues to support text messaging but does not register Push.
+
 ### Direct Tailnet access
 
 To make the same native processes reachable from another Tailnet device,

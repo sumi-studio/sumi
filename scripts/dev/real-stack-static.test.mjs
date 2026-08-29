@@ -290,6 +290,10 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   assert.match(launcher, /SUMI_BROWSER_WS_ALLOWED_ORIGINS=\$\{WEB_ORIGIN\}/);
   assert.match(launcher, /SUMI_AUTH_ALLOW_INSECURE_COOKIES=true/);
   const apiBlock = launcher.slice(apiStart, executorStart);
+  assert.match(
+    apiBlock,
+    /"SUMI_MESSAGING_PUSH_SUBJECT=\$\{MESSAGING_PUSH_SUBJECT\}"/,
+  );
   for (const [apiVariable, launcherVariable] of [
     [
       "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES",

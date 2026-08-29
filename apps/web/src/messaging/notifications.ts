@@ -9,12 +9,14 @@
  * （正本はサーバー）に一本化する。
  */
 
-import type {
-  Attachment,
-  NotificationLevel,
-  NotifyReason,
-  PlaceKey,
+import {
+  type Attachment,
+  type NotificationLevel,
+  type NotifyReason,
+  type PlaceKey,
+  parsePlaceKey,
 } from "./model";
+import { getActiveMessagingScope } from "./scope";
 
 const SOUND_STORAGE_KEY = "sumi.messaging.notification-sound";
 const PROMPT_STORAGE_KEY = "sumi.messaging.notification-prompt";
@@ -167,9 +169,18 @@ export function presentDesktopNotification(input: DesktopNotification): void {
     return;
   }
   try {
+    const place = parsePlaceKey(input.placeKey);
+    const workspaceId = getActiveMessagingScope()?.workspaceId;
+    const placeId = place?.kind === "channel" ? place.channelId : place?.dmId;
+    const tag =
+      workspaceId && place && placeId
+        ? `sumi:${workspaceId}:${place.kind}:${placeId}`
+        : `sumi:${input.placeKey}`;
     const notification = new Notification(input.title, {
       body: input.body,
-      tag: `sumi:${input.placeKey}`,
+      // Web Push uses the same tag, so a background WS frame and its push
+      // delivery replace one another instead of creating two visible cards.
+      tag,
       // 通知そのものは声かけであり、既読の代わりではない。
       silent: true,
     });

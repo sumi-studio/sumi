@@ -23,6 +23,7 @@ import {
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
+import { enablePushSubscription } from "../push";
 import {
   getMessagingScope,
   setNotificationNavigator,
@@ -207,7 +208,10 @@ function NotificationPermissionBanner() {
       <button
         type="button"
         onClick={() => {
-          void requestNotificationPermission().then(setPermission);
+          void requestNotificationPermission().then((next) => {
+            setPermission(next);
+            if (next === "granted") void enablePushSubscription();
+          });
         }}
         className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
       >

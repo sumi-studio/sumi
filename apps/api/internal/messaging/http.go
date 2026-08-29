@@ -42,6 +42,8 @@ type Server struct {
 	Hub *Hub
 	// Calls is nil when this deployment has no configured media transport.
 	Calls *CallService
+	// Push is nil when this deployment has no configured VAPID subject.
+	Push *PushDispatcher
 	// reactionMu keeps a reaction commit, its authoritative snapshot and the
 	// corresponding live publish in one process-local order. Hub itself is
 	// process-local, so this is the ordering boundary clients can observe.
@@ -71,6 +73,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
+	mux.HandleFunc("GET /messaging/push-key", s.servePushKey)
+	mux.HandleFunc("POST /messaging/push-subscriptions", s.serveSavePushSubscription)
+	mux.HandleFunc("DELETE /messaging/push-subscriptions", s.serveDeletePushSubscription)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
 	mux.HandleFunc("POST /messaging/places/{place_id}/attachments", s.serveUploadAttachment)
@@ -428,9 +433,6 @@ func notificationSettingToWire(setting NotificationSetting) notificationSettingW
 // durable truth, so a delivery read failure still fans out the message without
 // claiming that anyone was called.
 func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, place Place, msg Message) {
-	if hub == nil {
-		return
-	}
 	wire := messageToWire(place, msg)
 	decisions, err := store.NotificationIntentsForMessage(ctx, msg.MessageID)
 	if err != nil {
@@ -451,7 +453,10 @@ func publishMessageCreated(ctx context.Context, store *ScopedStore, hub *Hub, pl
 		Type: EventMessageCreated, PlaceID: place.PlaceID,
 		Message: &wire, ExceptFor: notified,
 	})
-	_ = hub.PublishVariantsScoped(ctx, store, events)
+	if hub != nil {
+		_ = hub.PublishVariantsScoped(ctx, store, events)
+	}
+	store.deliverPush(ctx, place, decisions)
 }
 
 // publishStatus fans a self-declared status out to everyone who may see the
@@ -1511,6 +1516,12 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+	case errors.Is(err, ErrInvalidPushSubscription):
+		writeError(w, http.StatusBadRequest, "invalid_push_subscription")
+	case errors.Is(err, ErrPushSubscriptionOwned):
+		writeError(w, http.StatusConflict, "push_subscription_owned")
+	case errors.Is(err, ErrPushSubscriptionLimit):
+		writeError(w, http.StatusConflict, "push_subscription_limit")
 	case errors.Is(err, ErrInvalidScope):
 		writeError(w, http.StatusBadRequest, "invalid_scope")
 	case errors.Is(err, applicationapps.ErrInstallationNotFound):

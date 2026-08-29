@@ -1,5 +1,6 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback } from "react";
+import { messagingPlacePath } from "../../public/place-path.js";
 import { type PlaceKey, parsePlaceKey } from "./model";
 import { getMessagingScope } from "./store";
 
@@ -10,10 +11,8 @@ import { getMessagingScope } from "./store";
 export function placePath(workspaceId: string, key: PlaceKey): string {
   const place = parsePlaceKey(key);
   if (!place) return "/";
-  const base = `/w/${encodeURIComponent(workspaceId)}/messaging`;
-  if (place.kind === "channel") return `${base}/c/${place.channelId}`;
-  if (place.kind === "dm") return `${base}/dm/${place.dmId}`;
-  return `${base}/group/${place.dmId}`;
+  const placeId = place.kind === "channel" ? place.channelId : place.dmId;
+  return messagingPlacePath(workspaceId, place.kind, placeId);
 }
 
 export function usePlaceNavigate() {

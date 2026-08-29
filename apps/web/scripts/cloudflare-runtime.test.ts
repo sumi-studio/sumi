@@ -134,8 +134,15 @@ test("pinned Wrangler dry-run and local workerd enforce the production artifact"
       assert.equal(ready.headers.get("X-Content-Type-Options"), "nosniff");
 
       const serviceWorker = await manualFetch(origin, "/sw.js");
-      assert.equal(serviceWorker.status, 404);
-      assert.equal(serviceWorker.headers.get("Cache-Control"), "no-store");
+      assert.equal(serviceWorker.status, 200);
+      assert.equal(
+        serviceWorker.headers.get("Cache-Control"),
+        "no-cache, must-revalidate",
+      );
+      assert.match(
+        serviceWorker.headers.get("Content-Type") ?? "",
+        /^(?:application|text)\/javascript/,
+      );
 
       const release = await manualFetch(origin, "/release.json");
       assert.equal(release.status, 200);
