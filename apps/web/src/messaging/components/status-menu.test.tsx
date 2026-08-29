@@ -76,6 +76,10 @@ describe("StatusMenu", () => {
     fireEvent.click(screen.getByRole("button", { name: /取り込み中/ }));
 
     expect(
+      screen.getByRole("menu", { name: "取り込み中の期間" }),
+    ).not.toHaveClass("ml-1");
+
+    expect(
       screen.getByText("期限が来たら「離席中 — 在宅です」に戻ります"),
     ).toBeVisible();
 

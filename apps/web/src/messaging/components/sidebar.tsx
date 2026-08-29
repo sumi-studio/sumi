@@ -1,6 +1,7 @@
 import { BellOff, Check, Hash, Plus, Search, Volume2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
+import { useCurrentWorkspacePermission } from "../../workspace/store";
 import { VoiceChannelMembers } from "../call/voice-channel-members";
 import { VoiceChannelPanel } from "../call/voice-channel-panel";
 import type { PlaceKey } from "../model";
@@ -25,6 +26,7 @@ const sidebarPlaces = () => document.querySelector<HTMLElement>(SIDEBAR_PLACES);
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
+const CHANNEL_NAME_MAX_LENGTH = 200;
 
 export function Badge({
   count,
@@ -67,6 +69,7 @@ function PlaceRow({
   onDuplicateChannel,
   onCreateChannel,
   duplicateState,
+  canManageChannel,
 }: {
   placeKey: PlaceKey;
   /** channelでなければnull。メニューからchannel専用の項目が消える。 */
@@ -85,6 +88,7 @@ function PlaceRow({
   onDuplicateChannel: (channelId: string) => void;
   onCreateChannel: () => void;
   duplicateState: "idle" | "pending" | "failed";
+  canManageChannel: boolean;
 }) {
   const canConfigureNotifications = useMessaging(
     (state) => state.capabilities.notifications,
@@ -94,8 +98,8 @@ function PlaceRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const active = selectedPlaceKey === key;
   const muted = level === "mute";
-  // channelなら操作が必ず一つはあるので、通知を設定できない相手でもメニューは出る。
-  const hasMenu = channelId !== null || canConfigureNotifications;
+  const hasMenu =
+    (channelId !== null && canManageChannel) || canConfigureNotifications;
   return (
     // 右クリックは行そのものが受ける。leadingへ切り出したアバターの上でも
     // 同じ導線が出る（行の右クリック契約はアバター領域を含む）。行内の
@@ -142,6 +146,7 @@ function PlaceRow({
         <PlaceContextMenu
           placeKey={key}
           channelId={channelId}
+          canManageChannel={canManageChannel}
           open={menuOpen}
           onOpenChange={setMenuOpen}
           onEditChannel={onEditChannel}
@@ -264,7 +269,7 @@ function CreateChannelDialog({
             value={name}
             onChange={(event) => setName(event.target.value)}
             disabled={busy}
-            maxLength={80}
+            maxLength={CHANNEL_NAME_MAX_LENGTH}
             placeholder="例: dev"
             className={INPUT_CLASS}
           />
@@ -414,7 +419,7 @@ function EditChannelDialog({
             value={name}
             onChange={(event) => setName(event.target.value)}
             disabled={busy}
-            maxLength={200}
+            maxLength={CHANNEL_NAME_MAX_LENGTH}
             className={INPUT_CLASS}
           />
         </label>
@@ -695,6 +700,9 @@ export function Sidebar({
   const transportGeneration = useMessaging(
     (state) => state.transportGeneration,
   );
+  const canManageChannels = useCurrentWorkspacePermission(
+    "app.messaging.manage_channels",
+  );
   const placeNavigate = usePlaceNavigate();
   const [openDialog, setOpenDialog] = useState<
     | { kind: "channel"; workspaceId: string }
@@ -824,7 +832,11 @@ export function Sidebar({
           <SectionHeader
             label="チャンネル"
             actionTitle="チャンネルを作成"
-            onAction={activeWorkspace ? openCreateChannel : undefined}
+            onAction={
+              activeWorkspace && canManageChannels
+                ? openCreateChannel
+                : undefined
+            }
           />
         </div>
         {channels.map((channel) => {
@@ -848,6 +860,7 @@ export function Sidebar({
                 unread={unread}
                 mentions={mentions}
                 {...menuActions}
+                canManageChannel={canManageChannels}
                 duplicateState={
                   duplicateMutation?.channelId === channel.channelId
                     ? duplicateMutation.state
@@ -940,6 +953,7 @@ export function Sidebar({
               unread={unread}
               mentions={unread}
               {...menuActions}
+              canManageChannel={false}
               duplicateState="idle"
             />
           );

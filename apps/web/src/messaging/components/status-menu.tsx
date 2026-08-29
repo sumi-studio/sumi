@@ -236,7 +236,7 @@ export function StatusMenu() {
                   <div
                     role="menu"
                     aria-label={`${STATUS_LABEL[kind]}の期間`}
-                    className="absolute bottom-0 left-full z-20 ml-1 w-44 rounded-lg border border-border bg-background p-1 shadow-md"
+                    className="absolute bottom-0 left-full z-20 w-44 rounded-lg border border-border bg-background p-1 shadow-md"
                   >
                     {STATUS_DURATIONS.map((duration) => (
                       <button

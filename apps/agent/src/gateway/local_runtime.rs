@@ -572,7 +572,10 @@ impl LocalControlHttpClient {
                 )
             })?;
         if !status.is_success() {
-            let failure = if status.is_server_error() {
+            let failure = if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+            {
                 MessagingApiFailure::indeterminate(
                     "Messaging mutation",
                     format!("server returned {status} after a possibly committed request"),
@@ -5245,6 +5248,78 @@ mod tests {
             if expected_attempts == 2 {
                 assert_eq!(requests[0], requests[1], "status {status}");
             }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn messaging_nonce_less_mutation_classifies_408_429_and_other_4xx_without_replay() {
+        for (status, expected_class) in [
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                MessagingApiFailureClass::Indeterminate,
+            ),
+            (StatusCode::FORBIDDEN, MessagingApiFailureClass::Terminal),
+        ] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:status",
+                    post(counted_place_status_fixture),
+                )
+                .with_state(CountedPlaceStatusFixture {
+                    status,
+                    requests: requests.clone(),
+                });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error = client
+                .set_status(
+                    &messaging_scope(),
+                    SetMessagingStatusRequest {
+                        status: "busy",
+                        note: Some("meeting"),
+                        expires_in_minutes: Some(30),
+                    },
+                )
+                .await
+                .expect_err("fixture rejection must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                expected_class,
+                "status {status}"
+            );
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "nonce-less mutation must not replay status {status}"
+            );
             server.abort();
         }
     }

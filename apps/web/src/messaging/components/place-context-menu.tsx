@@ -37,6 +37,7 @@ const ITEM_CLASS =
 export function PlaceContextMenu({
   placeKey: key,
   channelId,
+  canManageChannel,
   open,
   onOpenChange,
   onEditChannel,
@@ -47,6 +48,7 @@ export function PlaceContextMenu({
   placeKey: PlaceKey;
   /** channel以外（DM・グループDM）ではnull。channel専用の項目が消える。 */
   channelId: string | null;
+  canManageChannel: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onEditChannel: (channelId: string) => void;
@@ -122,7 +124,7 @@ export function PlaceContextMenu({
           aria-label="この場所のメニュー"
           className="absolute top-full right-0 z-30 mt-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
         >
-          {channelId ? (
+          {channelId && canManageChannel ? (
             <>
               <button
                 type="button"
@@ -162,7 +164,9 @@ export function PlaceContextMenu({
           ) : null}
           {canConfigureNotifications ? (
             <>
-              {channelId ? <div className="my-1 h-px bg-border/70" /> : null}
+              {channelId && canManageChannel ? (
+                <div className="my-1 h-px bg-border/70" />
+              ) : null}
               {/* 横に開くサブメニュー。ホバーでもクリックでも開く——
                   指す手と押す手のどちらにも同じ入口がある。 */}
               <div
@@ -191,7 +195,7 @@ export function PlaceContextMenu({
                   <fieldset
                     id={submenuId}
                     aria-label="通知設定"
-                    className="absolute top-0 right-full z-40 mr-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
+                    className="absolute top-0 right-full z-40 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
                   >
                     {(
                       Object.keys(

@@ -62,6 +62,15 @@ func run(ctx context.Context) (runErr error) {
 	defer func() {
 		runErr = errors.Join(runErr, app.Close())
 	}()
+	if app.messagingServer != nil {
+		// Readers resolve temporary status expiry themselves; this worker makes
+		// it visible on already-open screens. Start it only after run owns the
+		// application so Close can cancel it.
+		go app.messagingServer.RunStatusExpiry(
+			app.backgroundCtx,
+			messaging.DefaultStatusExpiryInterval,
+		)
+	}
 
 	publicServer := &http.Server{
 		Addr:              publicAddress,
@@ -211,16 +220,18 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux     *http.ServeMux
-	localMux      *http.ServeMux
-	localListener *localControlListenerConfig
-	store         *agentevents.CommandStore
-	browser       *agentevents.BrowserServer
-	database      *db.Pool
-	spawnManager  *spawn.Manager
-	localRuntimes *agentevents.LocalControlListenerRegistry
+	publicMux       *http.ServeMux
+	localMux        *http.ServeMux
+	localListener   *localControlListenerConfig
+	store           *agentevents.CommandStore
+	browser         *agentevents.BrowserServer
+	database        *db.Pool
+	spawnManager    *spawn.Manager
+	localRuntimes   *agentevents.LocalControlListenerRegistry
+	messagingServer *messaging.Server
+	backgroundCtx   context.Context
 	// stopBackground cancels process-lifetime workers such as the attachment
-	// reconciler.
+	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
 	closeOnce      sync.Once
 	closeErr       error
@@ -480,22 +491,18 @@ func newApplicationFromEnv() (*application, error) {
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
-	if messagingServer != nil {
-		// Temporary statuses lapse back to what the participant had said
-		// before. Readers resolve that themselves, so this loop only makes the
-		// change visible on screens that are already open.
-		go messagingServer.RunStatusExpiry(backgroundCtx, messaging.DefaultStatusExpiryInterval)
-	}
 	return &application{
-		publicMux:      mux,
-		localMux:       localMux,
-		localListener:  localListener,
-		store:          store,
-		browser:        browser,
-		database:       database,
-		spawnManager:   spawnManager,
-		localRuntimes:  localRuntimes,
-		stopBackground: stopBackground,
+		publicMux:       mux,
+		localMux:        localMux,
+		localListener:   localListener,
+		store:           store,
+		browser:         browser,
+		database:        database,
+		spawnManager:    spawnManager,
+		localRuntimes:   localRuntimes,
+		messagingServer: messagingServer,
+		backgroundCtx:   backgroundCtx,
+		stopBackground:  stopBackground,
 	}, nil
 }
 

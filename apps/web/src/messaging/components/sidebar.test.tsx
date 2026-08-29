@@ -11,6 +11,7 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useWorkspaceControl } from "../../workspace/store";
 import type { PlaceKey } from "../model";
 import {
   bindMessagingSessionIdentity,
@@ -87,6 +88,38 @@ function setTwoWorkspaceState(
     statusByKey: {},
     activePlaceKey: "channel:channel-a",
     createChannel,
+  });
+  setChannelManagementPermission(true);
+}
+
+function setChannelManagementPermission(allowed: boolean) {
+  useWorkspaceControl.setState({
+    sessionIdentity: "human-a",
+    members: [
+      {
+        workspaceMemberId: "member-a",
+        workspaceId: "workspace-a",
+        participant: SELF,
+        displayName: "Alice",
+        owner: false,
+        roleIds: allowed ? ["channel-manager"] : [],
+        joinedAt: 0,
+        leftAt: null,
+      },
+    ],
+    roles: allowed
+      ? [
+          {
+            roleId: "channel-manager",
+            workspaceId: "workspace-a",
+            name: "Channel manager",
+            color: "#000000",
+            position: 0,
+            permissions: ["app.messaging.manage_channels"],
+            createdAt: 0,
+          },
+        ]
+      : [],
   });
 }
 
@@ -218,6 +251,36 @@ describe("Sidebar route authority", () => {
       ),
     );
     expect(navigation.navigate).toHaveBeenCalledWith("channel:first-b");
+  });
+
+  it("accepts the API and database channel-name limit when creating", async () => {
+    const createChannel = vi.fn(
+      async (): Promise<PlaceKey> => "channel:long-name",
+    );
+    setTwoWorkspaceState(createChannel);
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("チャンネルを作成"));
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
+    const name = within(dialog).getByRole("textbox", { name: "名前" });
+    const exactLimit = "あ".repeat(200);
+    expect(name).toHaveAttribute("maxlength", "200");
+    fireEvent.change(name, { target: { value: exactLimit } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
+
+    await waitFor(() =>
+      expect(createChannel).toHaveBeenCalledWith(
+        "workspace-a",
+        exactLimit,
+        "",
+        false,
+      ),
+    );
   });
 
   it("rechecks identity after store completion before channel navigation", async () => {
@@ -388,6 +451,7 @@ describe("Sidebar overlay and IME behavior", () => {
     const notificationGroup = screen.getByRole("group", {
       name: "通知設定",
     });
+    expect(notificationGroup).not.toHaveClass("mr-1");
     const allNotifications = within(notificationGroup).getByRole("button", {
       name: /すべて通知/,
     });
@@ -544,6 +608,31 @@ describe("place menu channel actions", () => {
     );
   }
 
+  it("hides channel management actions without authority but keeps notification settings", () => {
+    setChannelManagementPermission(false);
+    render(
+      <Sidebar
+        selectedPlaceKey="channel:channel-a"
+        workspaceId="workspace-a"
+      />,
+    );
+
+    expect(screen.queryByTitle("チャンネルを作成")).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "この場所のメニュー" })[0],
+    );
+    expect(
+      screen.queryByRole("button", { name: "チャンネルを編集" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "複製" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "チャンネルを作成" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /通知設定/ })).toBeVisible();
+  });
+
   it("refuses to save an edit that names no change, then sends only what changed", async () => {
     openAlphaMenu();
     fireEvent.click(screen.getByRole("button", { name: "チャンネルを編集" }));
@@ -646,8 +735,10 @@ describe("place menu channel actions", () => {
       "チャンネルを複製できませんでした",
     );
     fireEvent.click(screen.getByRole("button", { name: "再試行" }));
-    expect(await screen.findByRole("alert")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+    const retry = await screen.findByRole("button", { name: "再試行" });
+    await waitFor(() => expect(retry).toBeEnabled());
+    expect(screen.getByRole("alert")).toBeVisible();
+    fireEvent.click(retry);
 
     await waitFor(() =>
       expect(navigation.navigate).toHaveBeenCalledWith("channel:alpha-copy"),
