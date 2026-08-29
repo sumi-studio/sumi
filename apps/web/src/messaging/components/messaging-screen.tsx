@@ -23,11 +23,7 @@ import {
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
 import { enablePushSubscription } from "../push";
-import {
-  getMessagingScope,
-  setNotificationNavigator,
-  useMessaging,
-} from "../store";
+import { getMessagingScope, useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
@@ -464,12 +460,6 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     notificationLevelByPlace,
     notificationDefaultLevel,
   ]);
-
-  // デスクトップ通知のクリック先。URLが現在地の正本なのでrouterに任せる。
-  useEffect(() => {
-    setNotificationNavigator(placeNavigate);
-    return () => setNotificationNavigator(null);
-  }, [placeNavigate]);
 
   // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {

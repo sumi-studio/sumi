@@ -199,6 +199,61 @@ func TestPushSubscriptionOwnershipAndSessionCleanup(t *testing.T) {
 	}
 }
 
+func TestPushSessionCleanupTimeoutNeverWedgesLogout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	configureTestPushEgress(w.store.Store)
+	endpoint := "https://push.example.test/blocked-cleanup"
+	session := testPushSession(strings.Repeat("E", 43))
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	if _, err := owner.SavePushSubscription(
+		ctx, session, endpoint, testPushP256dh, testPushAuth,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	if _, err := blocker.Exec(
+		ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	w.store.CloseBrowserSession(session.ID)
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("blocked session cleanup held logout for %v", elapsed)
+	}
+	var remaining int
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM push_subscriptions WHERE endpoint = $1", endpoint,
+	).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("timed-out cleanup partially mutated subscriptions: %d", remaining)
+	}
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w.store.CloseBrowserSession(session.ID)
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM push_subscriptions WHERE endpoint = $1", endpoint,
+	).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("retry left %d subscriptions after the lock cleared", remaining)
+	}
+}
+
 func TestPushReauthorizesAudienceAndBrowserSessionBeforeSend(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -245,5 +300,48 @@ func TestPushReauthorizesAudienceAndBrowserSessionBeforeSend(t *testing.T) {
 	audience.deliver(ctx, scope.Scope, place, decision)
 	if audienceClient.count() != 0 {
 		t.Fatal("removed audience member received a push")
+	}
+}
+
+func TestPublishMessageCreatedDeliversPushWithoutWebSocketHub(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, place := w.workspaceWithChannel(t, ctx)
+	configureTestPushEgress(w.store.Store)
+	recipient := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	if _, err := recipient.SavePushSubscription(
+		ctx,
+		testPushSession(strings.Repeat("D", 43)),
+		"https://push.example.test/closed-tab",
+		testPushP256dh,
+		testPushAuth,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &recordingPushClient{}
+	dispatcher, err := NewPushDispatcher(
+		ctx,
+		w.store.Store,
+		testPushSessionAuthorizer{allow: true},
+		"mailto:test@example.com",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher.client = client
+	w.store.UsePush(dispatcher)
+
+	message := w.send(t, ctx, place.PlaceID, w.humanA, "closed tab delivery")
+	sender := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	publishMessageCreated(ctx, sender, nil, place, message)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for client.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if client.count() != 1 {
+		t.Fatalf("hubless publish sent %d pushes, want one", client.count())
 	}
 }

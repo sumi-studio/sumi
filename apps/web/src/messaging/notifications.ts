@@ -1,22 +1,15 @@
 /**
  * 通知の提示層。「呼ぶかどうか」はサーバーが送信時に評価済みで、ここに届く
  * `notify` は既にその答えである。この層が決めるのは「どう提示するか」だけ
- * ——今この画面を見ている人にデスクトップ通知を重ねない、音を鳴らすか、
- * どの言葉で呼ぶか。
+ * ——今この画面を見ている人に音を重ねるか。OS の通知カードは Service
+ * Worker だけが generic 文面で提示し、page と二重発火させない。
  *
  * 通知許可は端末の同意であってサーバーの設定ではない。localStorageに置くのは
  * 音のon/offとバナーを閉じた事実だけで、通知条件そのものは本人のNotificationSetting
  * （正本はサーバー）に一本化する。
  */
 
-import {
-  type Attachment,
-  type NotificationLevel,
-  type NotifyReason,
-  type PlaceKey,
-  parsePlaceKey,
-} from "./model";
-import { getActiveMessagingScope } from "./scope";
+import type { NotificationLevel, NotifyReason, PlaceKey } from "./model";
 
 const SOUND_STORAGE_KEY = "sumi.messaging.notification-sound";
 const PROMPT_STORAGE_KEY = "sumi.messaging.notification-prompt";
@@ -90,12 +83,10 @@ export interface PresentationInput {
   tabActive: boolean;
   /** そのplaceを今まさに開いているか。開いていれば音も要らない。 */
   placeIsActive: boolean;
-  permission: NotificationPermissionState;
   soundEnabled: boolean;
 }
 
 export interface Presentation {
-  desktop: boolean;
   sound: boolean;
 }
 
@@ -116,82 +107,10 @@ export function notificationCountForPlace(
  * 受信側の設定としてサーバーが持っている。ここにあるのは端末の事情だけ。
  */
 export function presentationFor(input: PresentationInput): Presentation {
-  if (!input.notify || input.authorIsSelf)
-    return { desktop: false, sound: false };
+  if (!input.notify || input.authorIsSelf) return { sound: false };
   // 見ている画面に通知を重ねない。見えているものを知らせ直す意味はない。
   const unseen = !input.tabActive || !input.placeIsActive;
-  return {
-    desktop: !input.tabActive && input.permission === "granted",
-    sound: unseen && input.soundEnabled,
-  };
-}
-
-/** 通知の文面。場所と発言者で呼び、本文は抜粋にとどめる。 */
-export const MAX_SNIPPET_CHARS = 140;
-
-export function notificationTitle(
-  placeName: string,
-  authorName: string,
-): string {
-  return placeName ? `${placeName} — ${authorName}` : authorName;
-}
-
-export function notificationBody(
-  content: string,
-  attachments: readonly Attachment[] = [],
-): string {
-  const collapsed = content.replace(/\s+/g, " ").trim();
-  if (!collapsed && attachments.length > 0) {
-    const first = attachments[0];
-    if (first.spoiler) return "📎 添付（ネタバレ）";
-    return attachments.length === 1
-      ? `📎 ${first.filename}`
-      : `📎 ${attachments.length}件のファイル`;
-  }
-  return collapsed.length > MAX_SNIPPET_CHARS
-    ? `${collapsed.slice(0, MAX_SNIPPET_CHARS - 1)}…`
-    : collapsed;
-}
-
-export interface DesktopNotification {
-  title: string;
-  body: string;
-  /** 同じplaceの通知は積み上げず置き換える。 */
-  placeKey: PlaceKey;
-  onActivate: () => void;
-}
-
-export function presentDesktopNotification(input: DesktopNotification): void {
-  if (
-    typeof Notification === "undefined" ||
-    Notification.permission !== "granted"
-  ) {
-    return;
-  }
-  try {
-    const place = parsePlaceKey(input.placeKey);
-    const workspaceId = getActiveMessagingScope()?.workspaceId;
-    const placeId = place?.kind === "channel" ? place.channelId : place?.dmId;
-    const tag =
-      workspaceId && place && placeId
-        ? `sumi:${workspaceId}:${place.kind}:${placeId}`
-        : `sumi:${input.placeKey}`;
-    const notification = new Notification(input.title, {
-      body: input.body,
-      // Web Push uses the same tag, so a background WS frame and its push
-      // delivery replace one another instead of creating two visible cards.
-      tag,
-      // 通知そのものは声かけであり、既読の代わりではない。
-      silent: true,
-    });
-    notification.onclick = () => {
-      globalThis.focus?.();
-      notification.close();
-      input.onActivate();
-    };
-  } catch {
-    // 通知が作れない環境では黙って諦める。会話は壊れない。
-  }
+  return { sound: unseen && input.soundEnabled };
 }
 
 type AudioContextConstructor = new () => AudioContext;
