@@ -462,6 +462,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const display = usePlaceDisplay(selectedPlaceKey);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
   const listRef = useRef<MessageListHandle>(null);
+  const threadsToggleRef = useRef<HTMLButtonElement>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [threadsOpen, setThreadsOpen] = useState(false);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
@@ -648,6 +649,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             <MessageSearch onJump={requestJump} />
             {canUseThreads && selectedPlaceKey?.startsWith("channel:") ? (
               <button
+                ref={threadsToggleRef}
                 type="button"
                 title="スレッド"
                 aria-expanded={threadsOpen}
@@ -753,6 +755,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
               key={selectedPlaceKey}
               parentKey={selectedPlaceKey}
               onClose={() => setThreadsOpen(false)}
+              returnFocusRef={threadsToggleRef}
             />
           ) : null}
           {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}

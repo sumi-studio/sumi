@@ -1,5 +1,12 @@
 import { MessagesSquare, Plus, Search, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { isImeComposing } from "../../lib/ime";
 import { secureRandomUUID } from "../../lib/random-uuid";
 import { clampCodePoints, codePointLength } from "../../lib/text-length";
@@ -198,9 +205,11 @@ type ThreadListState = "loading" | "loaded" | "error";
 export function ThreadPanel({
   parentKey,
   onClose,
+  returnFocusRef,
 }: {
   parentKey: PlaceKey;
   onClose: () => void;
+  returnFocusRef?: RefObject<HTMLButtonElement | null>;
 }) {
   const threadsById = useMessaging((state) => state.threadsById);
   const parentLoaded = useMessaging(
@@ -213,6 +222,7 @@ export function ThreadPanel({
   const [listState, setListState] = useState<ThreadListState>(() =>
     parentLoaded ? "loaded" : "loading",
   );
+  const createTriggerRef = useRef<HTMLButtonElement>(null);
   const loadGenerationRef = useRef(0);
 
   const load = useCallback(() => {
@@ -259,6 +269,10 @@ export function ThreadPanel({
     navigate(key);
     onClose();
   };
+  const closeCreateForm = useCallback(() => {
+    createTriggerRef.current?.focus();
+    setCreating(false);
+  }, []);
 
   return (
     <aside className="flex w-72 shrink-0 flex-col border-border/70 border-l bg-muted/20">
@@ -267,6 +281,7 @@ export function ThreadPanel({
           スレッド
         </strong>
         <button
+          ref={createTriggerRef}
           type="button"
           title="スレッドを作成"
           aria-label="スレッドを作成"
@@ -280,7 +295,10 @@ export function ThreadPanel({
           type="button"
           title="閉じる"
           aria-label="スレッド一覧を閉じる"
-          onClick={onClose}
+          onClick={() => {
+            returnFocusRef?.current?.focus();
+            onClose();
+          }}
           className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           <X className="size-3.5" />
@@ -305,7 +323,7 @@ export function ThreadPanel({
             setCreating(false);
             openThread(key);
           }}
-          onCancel={() => setCreating(false)}
+          onCancel={closeCreateForm}
         />
       ) : null}
       <div className="scrollbar-ui min-h-0 flex-1 overflow-y-auto px-1 pb-2">

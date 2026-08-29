@@ -188,12 +188,14 @@ describe("ThreadPanel", () => {
       screen.queryByRole("textbox", { name: "スレッドの名前" }),
     ).not.toBeInTheDocument();
     expect(createToggle).toHaveAttribute("aria-expanded", "false");
+    expect(createToggle).toHaveFocus();
 
     fireEvent.click(createToggle);
     fireEvent.click(screen.getByRole("button", { name: "キャンセル" }));
     expect(
       screen.queryByRole("textbox", { name: "スレッドの名前" }),
     ).not.toBeInTheDocument();
+    expect(createToggle).toHaveFocus();
   });
 
   it("retries with one nonce while blocking duplicate Enter submissions", async () => {

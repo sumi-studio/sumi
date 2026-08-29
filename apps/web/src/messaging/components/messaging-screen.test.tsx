@@ -52,9 +52,6 @@ vi.mock("./connection-banner", () => ({ ConnectionBanner: () => null }));
 vi.mock("./member-list", () => ({
   MemberList: () => <aside data-testid="member-list" />,
 }));
-vi.mock("./thread-panel", () => ({
-  ThreadPanel: () => <aside data-testid="thread-panel" />,
-}));
 vi.mock("./message-list", () => ({ MessageList: () => null }));
 vi.mock("./composer", () => ({ Composer: () => null }));
 
@@ -348,11 +345,19 @@ describe("MessagingScreen route-owned current place", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(toggle).toHaveClass("bg-accent", "text-foreground");
-    const panel = screen.getByTestId("thread-panel");
+    const close = screen.getByRole("button", {
+      name: "スレッド一覧を閉じる",
+    });
+    const panel = close.closest("aside");
+    if (!panel) throw new Error("thread panel missing");
     const members = screen.getByTestId("member-list");
     expect(
       panel.compareDocumentPosition(members) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     await waitFor(() => expect(loadThreads).toHaveBeenCalledWith(CHANNEL_A));
+
+    fireEvent.click(close);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveFocus();
   });
 });
