@@ -253,7 +253,7 @@ describe("Sidebar route authority", () => {
     expect(navigation.navigate).toHaveBeenCalledWith("channel:first-b");
   });
 
-  it("accepts the API and database channel-name limit when creating", async () => {
+  it("accepts 200 astral code points when creating a channel", async () => {
     const createChannel = vi.fn(
       async (): Promise<PlaceKey> => "channel:long-name",
     );
@@ -268,8 +268,8 @@ describe("Sidebar route authority", () => {
     fireEvent.click(screen.getByTitle("チャンネルを作成"));
     const dialog = screen.getByRole("dialog", { name: "チャンネルを作成" });
     const name = within(dialog).getByRole("textbox", { name: "名前" });
-    const exactLimit = "あ".repeat(200);
-    expect(name).toHaveAttribute("maxlength", "200");
+    const exactLimit = "😀".repeat(200);
+    expect(name).not.toHaveAttribute("maxlength");
     fireEvent.change(name, { target: { value: exactLimit } });
     fireEvent.click(within(dialog).getByRole("button", { name: "作成" }));
 
@@ -653,6 +653,25 @@ describe("place menu channel actions", () => {
     await waitFor(() =>
       expect(updateChannel).toHaveBeenCalledWith("channel-a", {
         topic: "設計の話",
+      }),
+    );
+  });
+
+  it("rejects the 201st astral code point when editing a channel name", async () => {
+    openAlphaMenu();
+    fireEvent.click(screen.getByRole("button", { name: "チャンネルを編集" }));
+    const dialog = screen.getByRole("dialog", { name: "チャンネルを編集" });
+    const name = within(dialog).getByRole("textbox", { name: "名前" });
+    const exactLimit = "😀".repeat(200);
+
+    expect(name).not.toHaveAttribute("maxlength");
+    fireEvent.change(name, { target: { value: `${exactLimit}😀` } });
+    expect(name).toHaveValue(exactLimit);
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(updateChannel).toHaveBeenCalledWith("channel-a", {
+        name: exactLimit,
       }),
     );
   });

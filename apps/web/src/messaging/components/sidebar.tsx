@@ -1,6 +1,7 @@
 import { BellOff, Check, Hash, Plus, Search, Volume2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
+import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import { useCurrentWorkspacePermission } from "../../workspace/store";
 import { VoiceChannelMembers } from "../call/voice-channel-members";
 import { VoiceChannelPanel } from "../call/voice-channel-panel";
@@ -26,7 +27,7 @@ const sidebarPlaces = () => document.querySelector<HTMLElement>(SIDEBAR_PLACES);
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
-const CHANNEL_NAME_MAX_LENGTH = 200;
+const CHANNEL_NAME_MAX_CODE_POINTS = 200;
 
 export function Badge({
   count,
@@ -217,7 +218,13 @@ function CreateChannelDialog({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     const trimmed = name.trim();
-    if (!trimmed || busy) return;
+    if (
+      !trimmed ||
+      codePointLength(trimmed) > CHANNEL_NAME_MAX_CODE_POINTS ||
+      busy
+    ) {
+      return;
+    }
     const currentIdentity = getMessagingSessionIdentity();
     const expectedSelfKey = useMessaging.getState().selfKey;
     setBusy(true);
@@ -267,9 +274,15 @@ function CreateChannelDialog({
           <input
             ref={nameRef}
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) =>
+              setName(
+                clampCodePoints(
+                  event.target.value,
+                  CHANNEL_NAME_MAX_CODE_POINTS,
+                ),
+              )
+            }
             disabled={busy}
-            maxLength={CHANNEL_NAME_MAX_LENGTH}
             placeholder="例: dev"
             className={INPUT_CLASS}
           />
@@ -321,7 +334,11 @@ function CreateChannelDialog({
           </button>
           <button
             type="submit"
-            disabled={busy || !name.trim()}
+            disabled={
+              busy ||
+              !name.trim() ||
+              codePointLength(name.trim()) > CHANNEL_NAME_MAX_CODE_POINTS
+            }
             className="rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             作成
@@ -375,13 +392,14 @@ function EditChannelDialog({
 
   const nextName = name.trim();
   const nextTopic = topic.trim();
+  const nameTooLong = codePointLength(nextName) > CHANNEL_NAME_MAX_CODE_POINTS;
   const changed =
-    (nextName !== "" && nextName !== initial.name) ||
+    (nextName !== "" && !nameTooLong && nextName !== initial.name) ||
     nextTopic !== initial.topic;
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (busy || !changed) return;
+    if (busy || !changed || nameTooLong) return;
     const currentIdentity = getMessagingSessionIdentity();
     setBusy(true);
     setFailed(false);
@@ -417,9 +435,15 @@ function EditChannelDialog({
           <input
             ref={nameRef}
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) =>
+              setName(
+                clampCodePoints(
+                  event.target.value,
+                  CHANNEL_NAME_MAX_CODE_POINTS,
+                ),
+              )
+            }
             disabled={busy}
-            maxLength={CHANNEL_NAME_MAX_LENGTH}
             className={INPUT_CLASS}
           />
         </label>
@@ -455,7 +479,7 @@ function EditChannelDialog({
           </button>
           <button
             type="submit"
-            disabled={busy || !changed}
+            disabled={busy || !changed || nameTooLong}
             className="rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             保存
