@@ -81,6 +81,7 @@ function threadMessage(threadId: string, seq: number): Message {
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: seq,
     editedAt: null,

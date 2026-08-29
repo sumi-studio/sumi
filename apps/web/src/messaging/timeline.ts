@@ -1,4 +1,4 @@
-import type { Message, ParticipantKey, Urgency } from "./model";
+import type { Message, ParticipantKey, PollInput, Urgency } from "./model";
 import { participantKey } from "./model";
 
 /**
@@ -17,6 +17,8 @@ export interface PendingMessage {
   replyTo: string | null;
   /** upload済みの受領。送信者の順序で、楽観的描画にそのまま出す。 */
   attachments: Message["attachments"];
+  /** Poll declaration retained with the nonce so a failed send can be retried exactly. */
+  poll?: PollInput | null;
   createdAt: number;
   /** 送信失敗。UIは再送を促し、再送は同じclientNonceで冪等に行う。 */
   failed?: boolean;
@@ -73,6 +75,23 @@ export function applyMessageRevision<T extends MessageContentRevision>(
 }
 
 /**
+ * Poll votes and message edits have independent revisions. A message snapshot
+ * may therefore be newer for content while older for the poll (or vice versa).
+ * Poll presence is immutable for a live message in v0; only a tombstone clears
+ * it, so a null field can never erase a poll already observed on a live row.
+ */
+export function applyPollRevision(
+  current: Message["poll"] | undefined,
+  incoming: Message["poll"],
+  terminal = false,
+): Message["poll"] {
+  if (terminal) return null;
+  if (incoming === null) return current ?? null;
+  if (current === null || current === undefined) return incoming;
+  return incoming.revision >= current.revision ? incoming : current;
+}
+
+/**
  * revisionが受理されたmessageを投影する。部分更新はmessage revisionが支配する
  * 項目だけを置き換え、reaction_updatedが最後に確定したreactionsを保つ。履歴の
  * snapshotはreactionsも置き換える。snapshotの本文側が古いrevisionなら本文側は
@@ -85,14 +104,23 @@ function applyMessagePayload(
   payload: MessagePayloadKind,
 ): Message {
   const revisionApplied = applyMessageRevision(current, incoming, payload);
+  const poll = applyPollRevision(
+    current?.poll,
+    incoming.poll,
+    current?.deleted === true ||
+      (revisionApplied === incoming && incoming.deleted === true),
+  );
   if (revisionApplied !== incoming) {
-    if (current && payload === "snapshot" && !current.deleted) {
-      return { ...current, reactions: incoming.reactions };
+    if (current && !current.deleted) {
+      if (payload === "snapshot") {
+        return { ...current, reactions: incoming.reactions, poll };
+      }
+      if (poll !== current.poll) return { ...current, poll };
     }
     return revisionApplied;
   }
-  if (!current || payload === "snapshot") return incoming;
-  return { ...incoming, reactions: current.reactions };
+  if (!current || payload === "snapshot") return { ...incoming, poll };
+  return { ...incoming, reactions: current.reactions, poll };
 }
 
 /**
@@ -280,6 +308,20 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         urgency: entry.urgency,
         reactions: [],
         attachments: entry.attachments,
+        poll:
+          entry.poll == null
+            ? null
+            : {
+                question: entry.poll.question,
+                allowMulti: entry.poll.allowMulti,
+                closesAt: entry.poll.closesAt,
+                revision: 0,
+                options: entry.poll.options.map((text, index) => ({
+                  optionId: `pending:${index}`,
+                  text,
+                  voters: [],
+                })),
+              },
         replyTo: entry.replyTo,
         createdAt: entry.createdAt,
         editedAt: null,

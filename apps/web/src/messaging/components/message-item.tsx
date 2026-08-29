@@ -53,6 +53,7 @@ import {
 } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { MessageEditor } from "./message-editor";
+import { MessagePoll } from "./message-poll";
 import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { conversationViewport, useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -371,7 +372,9 @@ export const MessageItem = memo(function MessageItem({
             {replyAuthor.displayName}
           </span>
           <span className="truncate">
-            {replyTarget.content || "添付ファイル"}
+            {replyTarget.content ||
+              replyTarget.poll?.question ||
+              "添付ファイル"}
           </span>
         </button>
       ) : null}
@@ -448,6 +451,7 @@ export const MessageItem = memo(function MessageItem({
               </>
             )}
           </div>
+          {message.deleted ? null : <MessagePoll message={message} />}
           {message.deleted ? null : (
             <MessageAttachments
               attachments={message.attachments}

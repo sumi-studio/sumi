@@ -154,6 +154,63 @@ describe("MockMessagingServer admission", () => {
     });
   });
 
+  it("projects a revisioned poll, emits a field-only vote event, and summarizes its question", async () => {
+    vi.useFakeTimers();
+    const server = new MockMessagingServer();
+    const thread = await server.createThread(
+      GENERAL,
+      "投票スレッド",
+      null,
+      "thread-poll-nonce",
+    );
+    const place = { kind: "thread", threadId: thread.threadId } as const;
+    const events: unknown[] = [];
+    server.subscribe((event) => events.push(event));
+    const receiptPromise = server.sendMessage({
+      place,
+      content: "",
+      urgency: "normal",
+      replyTo: null,
+      clientNonce: "poll-message-nonce",
+      attachments: [],
+      poll: {
+        question: "次の開催日は？",
+        options: ["今日", "明日"],
+        allowMulti: false,
+        closesAt: null,
+      },
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    const receipt = await receiptPromise;
+    const created = (await server.fetchMessages(place)).find(
+      (message) => message.messageId === receipt.messageId,
+    );
+    expect(created?.poll).toMatchObject({
+      question: "次の開催日は？",
+      revision: 0,
+    });
+    expect(await server.fetchThread(thread.threadId)).toMatchObject({
+      lastMessage: "次の開催日は？",
+    });
+    const optionId = created?.poll?.options[0]?.optionId;
+    if (!optionId) throw new Error("poll option missing");
+
+    const voted = await server.votePoll(place, receipt.messageId, [optionId]);
+
+    expect(voted.poll?.revision).toBe(1);
+    expect(voted.poll?.options[0]).toMatchObject({
+      optionId,
+      voters: [{ kind: "human", humanId: "h-yohaku" }],
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: "poll_updated",
+      place,
+      messageId: receipt.messageId,
+      poll: { revision: 1 },
+    });
+    expect(events.at(-1)).not.toHaveProperty("message");
+  });
+
   it("未訪問placeを含む未読集計をbootstrapで返す", async () => {
     const server = new MockMessagingServer();
     const snapshot = await server.bootstrap();

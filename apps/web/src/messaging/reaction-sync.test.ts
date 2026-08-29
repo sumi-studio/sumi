@@ -794,12 +794,15 @@ const other = { kind: "human", humanId: "human-2" } as const;
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => {
     resolve = settle;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function message(
@@ -817,6 +820,7 @@ function message(
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: 1,
     editedAt,
@@ -845,6 +849,7 @@ class StubBackend implements MessagingBackend {
     status: false,
     replyLater: false,
     reactions: true,
+    polls: true,
     notifications: false,
   } as const;
   history: Message[] = [];
@@ -854,6 +859,7 @@ class StubBackend implements MessagingBackend {
     | ReactionMutationResult
     | Promise<ReactionMutationResult>
   )[] = [];
+  readonly pollVoteResults: (Message | Promise<Message>)[] = [];
   holdFetches = false;
   private heldFetches: {
     response: Message[];
@@ -994,6 +1000,10 @@ class StubBackend implements MessagingBackend {
     ): Promise<ReactionMutationResult> =>
       await (this.toggleResults.shift() ?? { messageId, reactions: [] }),
   );
+  votePoll = vi.fn(
+    async (_place: Place, _messageId: string, _optionIds: string[]) =>
+      await (this.pollVoteResults.shift() ?? message(1, "message")),
+  );
   async setNotificationSetting(): ReturnType<
     MessagingBackend["setNotificationSetting"]
   > {
@@ -1016,3 +1026,408 @@ class StubBackend implements MessagingBackend {
     this.listener = null;
   }
 }
+
+function pollMessage(revision = 0, allowMulti = true): Message {
+  return {
+    ...message(1, "poll message"),
+    revision: 1,
+    poll: {
+      question: "which?",
+      allowMulti,
+      closesAt: null,
+      revision,
+      options: [
+        { optionId: "a", text: "A", voters: [] },
+        { optionId: "b", text: "B", voters: [] },
+      ],
+    },
+  };
+}
+
+function requiredPoll(message: Message): NonNullable<Message["poll"]> {
+  if (!message.poll) throw new Error("poll fixture missing");
+  return message.poll;
+}
+
+describe("poll convergence in the messaging store", () => {
+  let session = 0;
+
+  beforeEach(() => {
+    bindMessagingSessionIdentity(`poll-test-${++session}`);
+  });
+
+  afterEach(() => {
+    bindMessagingSessionIdentity(null);
+  });
+
+  it("applies poll-only live state and never rolls it back through resync or edit", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = {
+      ...pollMessage(0),
+      content: "edited content",
+      editedAt: 9,
+    };
+    await holdLoaded(harness, [initial]);
+    harness.history = [
+      {
+        ...initial,
+        poll: {
+          ...requiredPoll(initial),
+          revision: 1,
+          options: [
+            { optionId: "a", text: "A", voters: [self] },
+            { optionId: "b", text: "B", voters: [] },
+          ],
+        },
+      },
+    ];
+    harness.holdFetches = true;
+
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 3,
+        options: [
+          { optionId: "a", text: "A", voters: [] },
+          { optionId: "b", text: "B", voters: [other] },
+        ],
+      },
+    });
+    harness.releaseFetches();
+    await harness.settle();
+
+    harness.emit({
+      type: "message_edited",
+      message: {
+        ...initial,
+        content: "newer edit",
+        revision: 2,
+        poll: {
+          ...requiredPoll(initial),
+          revision: 2,
+          options: [
+            { optionId: "a", text: "A", voters: [self] },
+            { optionId: "b", text: "B", voters: [] },
+          ],
+        },
+      },
+    });
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: { ...requiredPoll(initial), revision: 1 },
+    });
+
+    const projected = useMessaging.getState().messagesByPlace[placeKey]?.[0];
+    expect(projected).toMatchObject({ content: "newer edit", revision: 2 });
+    expect(projected?.poll?.revision).toBe(3);
+    expect(projected?.poll?.options[1]?.voters).toEqual([other]);
+  });
+
+  it("serializes whole-selection intents and lets a later vote run after failure", async () => {
+    const harness = new StubBackend();
+    const first = deferred<Message>();
+    const second = deferred<Message>();
+    harness.pollVoteResults.push(first.promise, second.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = pollMessage();
+    await holdLoaded(harness, [initial]);
+
+    const firstTask = useMessaging.getState().votePoll(initial, ["a"]);
+    const firstFailure = expect(firstTask).rejects.toThrow("first failed");
+    const secondTask = useMessaging.getState().votePoll(initial, ["a", "b"]);
+    await harness.settle();
+    expect(harness.votePoll).toHaveBeenCalledTimes(1);
+    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", [
+      "a",
+    ]);
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toEqual(
+      expect.objectContaining({ optionIds: ["a", "b"], pending: true }),
+    );
+
+    first.reject(new Error("first failed"));
+    await firstFailure;
+    await harness.settle();
+    expect(harness.votePoll).toHaveBeenCalledTimes(2);
+    expect(harness.votePoll).toHaveBeenLastCalledWith(place, "message-1", [
+      "a",
+      "b",
+    ]);
+
+    second.resolve({
+      ...initial,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 2,
+        options: [
+          { optionId: "a", text: "A", voters: [self] },
+          { optionId: "b", text: "B", voters: [self] },
+        ],
+      },
+    });
+    await secondTask;
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll,
+    ).toMatchObject({
+      revision: 2,
+      options: [{ voters: [self] }, { voters: [self] }],
+    });
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toBeUndefined();
+  });
+
+  it("does not let a lower-revision HTTP acknowledgement roll back live state", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<Message>();
+    harness.pollVoteResults.push(acknowledgement.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = pollMessage();
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
+
+    const task = useMessaging.getState().votePoll(initial, ["a"]);
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 2,
+        options: [
+          { optionId: "a", text: "A", voters: [] },
+          { optionId: "b", text: "B", voters: [other] },
+        ],
+      },
+    });
+    acknowledgement.resolve({
+      ...initial,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 1,
+        options: [
+          { optionId: "a", text: "A", voters: [self] },
+          { optionId: "b", text: "B", voters: [] },
+        ],
+      },
+    });
+    await task;
+
+    const poll = useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll;
+    expect(poll?.revision).toBe(2);
+    expect(poll?.options[1]?.voters).toEqual([other]);
+  });
+
+  it("surfaces only the latest failed intent and retries its whole selection", async () => {
+    const harness = new StubBackend();
+    const failure = deferred<Message>();
+    const retry = deferred<Message>();
+    harness.pollVoteResults.push(failure.promise, retry.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = pollMessage();
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [initial] } });
+
+    const failedTask = useMessaging.getState().votePoll(initial, ["b"]);
+    const assertion = expect(failedTask).rejects.toThrow("offline");
+    failure.reject(new Error("offline"));
+    await assertion;
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toEqual(
+      expect.objectContaining({
+        optionIds: ["b"],
+        pending: false,
+        failed: true,
+      }),
+    );
+
+    const retryTask = useMessaging.getState().votePoll(initial, ["b"]);
+    retry.resolve({
+      ...initial,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 1,
+        options: [
+          { optionId: "a", text: "A", voters: [] },
+          { optionId: "b", text: "B", voters: [self] },
+        ],
+      },
+    });
+    await retryTask;
+    expect(harness.votePoll).toHaveBeenNthCalledWith(2, place, "message-1", [
+      "b",
+    ]);
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toBeUndefined();
+  });
+
+  it("fences old-session acknowledgements and queued intents", async () => {
+    const oldHarness = new StubBackend();
+    const acknowledgement = deferred<Message>();
+    oldHarness.pollVoteResults.push(acknowledgement.promise, pollMessage(7));
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    const oldMessage = pollMessage();
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [oldMessage] } });
+    void useMessaging
+      .getState()
+      .votePoll(oldMessage, ["a"])
+      .catch(() => undefined);
+    void useMessaging
+      .getState()
+      .votePoll(oldMessage, ["a", "b"])
+      .catch(() => undefined);
+    await oldHarness.settle();
+
+    bindMessagingSessionIdentity("poll-test-replacement-session");
+    const newHarness = new StubBackend();
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    const replacement = {
+      ...pollMessage(5),
+      content: "replacement session",
+      poll: {
+        ...requiredPoll(pollMessage(5)),
+        options: [
+          { optionId: "a", text: "A", voters: [] },
+          { optionId: "b", text: "B", voters: [other] },
+        ],
+      },
+    };
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [replacement] } });
+
+    acknowledgement.resolve({
+      ...oldMessage,
+      poll: {
+        ...requiredPoll(oldMessage),
+        revision: 6,
+        options: [
+          { optionId: "a", text: "A", voters: [self] },
+          { optionId: "b", text: "B", voters: [] },
+        ],
+      },
+    });
+    await oldHarness.settle();
+
+    expect(oldHarness.votePoll).toHaveBeenCalledTimes(1);
+    expect(useMessaging.getState().messagesByPlace[placeKey]?.[0]).toEqual(
+      replacement,
+    );
+  });
+
+  it("keeps a tombstone terminal against poll events and delayed vote ACKs", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<Message>();
+    harness.pollVoteResults.push(acknowledgement.promise, pollMessage(10));
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const initial = pollMessage();
+    await holdLoaded(harness, [initial]);
+    void useMessaging
+      .getState()
+      .votePoll(initial, ["a"])
+      .catch(() => undefined);
+    void useMessaging
+      .getState()
+      .votePoll(initial, ["a", "b"])
+      .catch(() => undefined);
+    await harness.settle();
+
+    harness.emit({
+      type: "message_deleted",
+      message: {
+        ...initial,
+        content: "",
+        deleted: true,
+        revision: 2,
+        poll: null,
+      },
+    });
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: { ...requiredPoll(initial), revision: 8 },
+    });
+    acknowledgement.resolve({
+      ...initial,
+      poll: { ...requiredPoll(initial), revision: 9 },
+    });
+    await harness.settle();
+
+    expect(harness.votePoll).toHaveBeenCalledTimes(1);
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ deleted: true, poll: null });
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toBeUndefined();
+  });
+
+  it("retries a failed poll send with the same nonce and preserved declaration", async () => {
+    const harness = new StubBackend();
+    harness.sendMessage
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({
+        clientNonce: "ignored by assertion",
+        messageId: "message-1",
+        seq: 1,
+        created: true,
+      });
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.getState().selectPlace(placeKey);
+    await harness.settle();
+    const declaration = {
+      question: "which?",
+      allowMulti: true,
+      closesAt: null,
+      options: ["A", "B"],
+    };
+
+    expect(useMessaging.getState().send("context", "urgent", declaration)).toBe(
+      true,
+    );
+    await harness.settle();
+    const pending = useMessaging.getState().pendingByPlace[placeKey]?.[0];
+    expect(pending).toMatchObject({
+      content: "context",
+      urgency: "urgent",
+      poll: declaration,
+      failed: true,
+    });
+    if (!pending) throw new Error("pending poll missing");
+
+    useMessaging.getState().retrySend(pending.clientNonce);
+    await harness.settle();
+    const first = harness.sendMessage.mock.calls[0]?.[0];
+    const second = harness.sendMessage.mock.calls[1]?.[0];
+    expect(second).toMatchObject({
+      clientNonce: first?.clientNonce,
+      content: "context",
+      urgency: "urgent",
+      poll: declaration,
+    });
+  });
+});

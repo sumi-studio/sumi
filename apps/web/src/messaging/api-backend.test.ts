@@ -102,6 +102,98 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("rejects a poll snapshot that omits its independent revision", async () => {
+    const invalidPoll = { ...pollWire() } as Record<string, unknown>;
+    delete invalidPoll.revision;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        json({ messages: [{ ...messageWire(1, ""), poll: invalidPoll }] }),
+      ),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(backend.fetchMessages(channel)).rejects.toThrow(
+      "invalid messaging sequence",
+    );
+  });
+
+  it("rejects a message snapshot that omits the explicit poll projection", async () => {
+    const invalid = { ...messageWire(1, "missing poll") } as Record<
+      string,
+      unknown
+    >;
+    delete invalid.poll;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json({ messages: [invalid] })),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+
+    await expect(backend.fetchMessages(channel)).rejects.toThrow(
+      "invalid messaging response",
+    );
+  });
+
+  it("sends canonical poll fields and replaces a whole selection", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path.endsWith("/messages") && init?.method === "POST") {
+          return json({
+            client_nonce: "poll-nonce",
+            message_id: "message-1",
+            seq: 1,
+            created: true,
+          });
+        }
+        if (path.endsWith("/messages/message-1/poll/vote")) {
+          return json({
+            message: { ...messageWire(1, ""), poll: pollWire(1) },
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    const closesAt = Date.parse("2026-08-30T12:00:00Z");
+
+    await backend.sendMessage({
+      place: channel,
+      content: "",
+      urgency: "urgent",
+      replyTo: "message-parent",
+      clientNonce: "poll-nonce",
+      attachments: [],
+      poll: {
+        question: "いつにしますか？",
+        options: ["今日", "明日"],
+        allowMulti: true,
+        closesAt,
+      },
+    });
+    expect(
+      JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)),
+    ).toMatchObject({
+      urgency: "urgent",
+      reply_to: "message-parent",
+      poll: {
+        question: "いつにしますか？",
+        options: ["今日", "明日"],
+        allow_multi: true,
+        closes_at: "2026-08-30T12:00:00.000Z",
+      },
+    });
+
+    await expect(
+      backend.votePoll(channel, "message-1", ["option-1", "option-2"]),
+    ).resolves.toMatchObject({ poll: { revision: 1 } });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      option_ids: ["option-1", "option-2"],
+    });
+  });
+
   it("rejects attachment wires that omit required spoiler or alt declarations", async () => {
     for (const missing of ["spoiler", "alt"] as const) {
       const attachment: Record<string, unknown> = {
@@ -484,6 +576,48 @@ describe("ApiMessagingBackend", () => {
         reactions: [],
       },
     ]);
+  });
+
+  it("parses poll_updated as a field-only projection without moving the cursor", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    socket?.message({
+      type: "event",
+      event: {
+        type: "poll_updated",
+        place_id: "channel-1",
+        poll: { message_id: "message-1", poll: pollWire(2) },
+      },
+    });
+    expect(events).toEqual([
+      {
+        type: "poll_updated",
+        place: channel,
+        messageId: "message-1",
+        poll: expect.objectContaining({ revision: 2 }),
+      },
+    ]);
+
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(250);
+    FakeWebSocket.instances[0]?.open();
+    expect(JSON.parse(FakeWebSocket.instances[0]?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4 },
+    });
   });
 
   it("returns the canonical REST reaction result and projects WS updates", async () => {
@@ -1624,12 +1758,30 @@ function messageWire(
     mentions: [],
     urgency: "normal",
     reactions,
+    poll: null,
     reply_to: null,
     client_nonce: `nonce-${seq}`,
     created_at: "2026-08-01T10:00:00Z",
     edited_at: null,
     revision: 1,
     deleted: false,
+  };
+}
+
+function pollWire(revision = 0) {
+  return {
+    question: "いつにしますか？",
+    allow_multi: true,
+    closes_at: null,
+    revision,
+    options: [
+      {
+        option_id: "option-1",
+        text: "今日",
+        voters: [{ kind: "human", human_id: "human-1" }],
+      },
+      { option_id: "option-2", text: "明日", voters: [] },
+    ],
   };
 }
 

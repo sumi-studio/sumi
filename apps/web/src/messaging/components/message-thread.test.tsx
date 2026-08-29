@@ -33,6 +33,7 @@ const message: Message = {
   urgency: "normal",
   reactions: [],
   attachments: [],
+  poll: null,
   replyTo: null,
   createdAt: 1,
   editedAt: null,

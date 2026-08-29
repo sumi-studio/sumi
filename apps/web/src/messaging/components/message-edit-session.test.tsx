@@ -89,6 +89,7 @@ function makeMessages(count: number): Message[] {
     urgency: "normal" as const,
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     // グルーピングでまとまらないよう十分に離す。
     createdAt: Date.UTC(2026, 0, 1) + index * 3_600_000,

@@ -8,6 +8,7 @@ import type {
   MemberProfile,
   Message,
   ParticipantRef,
+  PollInput,
   Urgency,
 } from "../model";
 import { participantKey } from "../model";
@@ -62,6 +63,18 @@ function openPlusMenu() {
   fireEvent.click(screen.getByRole("button", { name: "作成メニューを開く" }));
 }
 
+function fillPoll(question = "いつにしますか？") {
+  fireEvent.change(screen.getByLabelText("質問"), {
+    target: { value: question },
+  });
+  fireEvent.change(screen.getByLabelText("選択肢 1"), {
+    target: { value: "今日" },
+  });
+  fireEvent.change(screen.getByLabelText("選択肢 2"), {
+    target: { value: "明日" },
+  });
+}
+
 function ownMessage(content: string): Message {
   return {
     messageId: "m1",
@@ -73,6 +86,7 @@ function ownMessage(content: string): Message {
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: 0,
     editedAt: null,
@@ -91,6 +105,11 @@ beforeEach(() => {
     messagesByPlace: {},
     draftAttachmentsByPlace: {},
     draftAttachmentOverflowByPlace: {},
+    capabilities: {
+      ...useMessaging.getState().capabilities,
+      polls: true,
+    },
+    pollVoteByMessage: {},
     editingMessageId: null,
     replyTargetId: null,
     membersByKey: Object.fromEntries(
@@ -98,11 +117,14 @@ beforeEach(() => {
     ),
     // 本物のsendはdraftを空にする（store.ts）。送信直後にボタンがdisabledへ
     // 変わる経路まで再現しないと、フォーカスの行き先を検査できない。
-    send: (content: string, urgency: Urgency) => {
-      mocks.send(content, urgency);
+    send: (content: string, urgency: Urgency, poll?: PollInput | null) => {
+      if (poll) mocks.send(content, urgency, poll);
+      else mocks.send(content, urgency);
       useMessaging.setState((state) => ({
         draftByPlace: { ...state.draftByPlace, [placeKey]: "" },
+        replyTargetId: null,
       }));
+      return true;
     },
     sendTyping: mocks.sendTyping,
     submitEdit: mocks.submitEdit,
@@ -491,5 +513,109 @@ describe("Composer ＋メニュー", () => {
     expect(
       screen.getByRole("button", { name: "作成メニューを開く" }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("Composer 投票", () => {
+  it("＋メニューから投票を開き、本文・緊急度・返信先と一緒に送る", async () => {
+    const replied = {
+      ...ownMessage(""),
+      messageId: "reply-parent",
+      poll: {
+        question: "親投票の質問",
+        allowMulti: false,
+        closesAt: null,
+        revision: 4,
+        options: [
+          { optionId: "yes", text: "はい", voters: [] },
+          { optionId: "no", text: "いいえ", voters: [] },
+        ],
+      },
+    };
+    useMessaging.setState({
+      messagesByPlace: { [placeKey]: [replied] },
+      replyTargetId: replied.messageId,
+      draftByPlace: { [placeKey]: "日程を決めます" },
+    });
+    render(<Composer />);
+
+    expect(screen.getByText("親投票の質問")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "急ぎ" }));
+    openPlusMenu();
+    fireEvent.click(screen.getByRole("button", { name: /投票を作成/ }));
+    await vi.waitFor(() => expect(screen.getByLabelText("質問")).toHaveFocus());
+    fillPoll();
+    fireEvent.click(
+      screen.getByRole("button", { name: "複数選べるようにする" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "投票を送信" }));
+
+    expect(mocks.send).toHaveBeenCalledWith("日程を決めます", "urgent", {
+      question: "いつにしますか？",
+      options: ["今日", "明日"],
+      allowMulti: true,
+      closesAt: null,
+    });
+    expect(screen.getByRole("button", { name: "普通" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(useMessaging.getState().replyTargetId).toBeNull();
+  });
+
+  it("capability または添付がある間は理由を示して投票下書きを開かない", () => {
+    useMessaging.setState({
+      draftByPlace: { [placeKey]: "残す本文" },
+      draftAttachmentsByPlace: {
+        [placeKey]: [
+          {
+            clientNonce: "attachment-1",
+            filename: "agenda.pdf",
+            contentType: "application/pdf",
+            sizeBytes: 1,
+            status: "ready",
+          },
+        ],
+      },
+    });
+    const { unmount } = render(<Composer />);
+    openPlusMenu();
+    const attached = screen.getByRole("button", { name: /投票を作成/ });
+    expect(attached).toBeDisabled();
+    expect(attached).toHaveTextContent("添付を外すと作成できます");
+    fireEvent.click(attached);
+    expect(screen.queryByRole("dialog", { name: "投票を作成" })).toBeNull();
+    expect(useMessaging.getState().draftByPlace[placeKey]).toBe("残す本文");
+
+    unmount();
+    useMessaging.setState((state) => ({
+      capabilities: { ...state.capabilities, polls: false },
+      draftAttachmentsByPlace: {},
+    }));
+    render(<Composer />);
+    openPlusMenu();
+    const unavailable = screen.getByRole("button", { name: /投票を作成/ });
+    expect(unavailable).toBeDisabled();
+    expect(unavailable).toHaveTextContent("この接続では利用できません");
+  });
+
+  it("enqueue が拒否したときは緊急度と投票ダイアログを保つ", () => {
+    useMessaging.setState({
+      send: () => false,
+      draftByPlace: { [placeKey]: "本文" },
+    });
+    render(<Composer />);
+    fireEvent.click(screen.getByRole("button", { name: "急ぎ" }));
+    openPlusMenu();
+    fireEvent.click(screen.getByRole("button", { name: /投票を作成/ }));
+    fillPoll();
+    fireEvent.click(screen.getByRole("button", { name: "投票を送信" }));
+
+    expect(screen.getByRole("dialog", { name: "投票を作成" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "急ぎ" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(useMessaging.getState().draftByPlace[placeKey]).toBe("本文");
   });
 });

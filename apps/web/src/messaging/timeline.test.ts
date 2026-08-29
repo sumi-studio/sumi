@@ -27,6 +27,7 @@ function message(overrides: Partial<Message> & { seq: number }): Message {
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: BASE_AT + overrides.seq * 1_000,
     editedAt: null,
@@ -118,6 +119,71 @@ describe("upsertMessage", () => {
       revision: 2,
       reactions: [{ emoji: "👍", participants: [SELF] }],
     });
+  });
+
+  it("messageとpollのrevisionを独立に単調適用する", () => {
+    const current = message({
+      seq: 1,
+      content: "本文1",
+      revision: 1,
+      poll: {
+        question: "いつ？",
+        allowMulti: false,
+        closesAt: null,
+        revision: 3,
+        options: [{ optionId: "today", text: "今日", voters: [SELF] }],
+      },
+    });
+    const poll = current.poll;
+    if (!poll) throw new Error("poll fixture missing");
+
+    const edited = upsertMessage(
+      [current],
+      message({
+        seq: 1,
+        content: "本文2",
+        revision: 2,
+        poll: {
+          ...poll,
+          revision: 2,
+          options: [{ optionId: "today", text: "今日", voters: [] }],
+        },
+      }),
+      "revision",
+    );
+    expect(edited[0]?.content).toBe("本文2");
+    expect(edited[0]?.poll?.revision).toBe(3);
+
+    const newerPoll = upsertMessage(
+      edited,
+      message({
+        seq: 1,
+        content: "古い本文",
+        revision: 1,
+        poll: {
+          ...poll,
+          revision: 4,
+          options: [{ optionId: "today", text: "今日", voters: [] }],
+        },
+      }),
+      "revision",
+    );
+    expect(newerPoll[0]?.content).toBe("本文2");
+    expect(newerPoll[0]?.poll?.revision).toBe(4);
+
+    const staleTombstone = upsertMessage(
+      newerPoll,
+      message({
+        seq: 1,
+        content: "",
+        deleted: true,
+        revision: 1,
+        poll: null,
+      }),
+      "snapshot",
+    );
+    expect(staleTombstone[0]?.deleted).toBe(false);
+    expect(staleTombstone[0]?.poll?.revision).toBe(4);
   });
 
   it("削除tombstoneの部分更新でもreactionsは独立同期の値を保つ", () => {
@@ -316,6 +382,43 @@ describe("buildRows", () => {
     if (last.kind === "message") {
       expect(last.pending).toBe(true);
       expect(participantKey(last.message.author)).toBe(selfKey);
+    }
+  });
+
+  it("pending pollをrevision 0の回答不能な投影として保持する", () => {
+    const result = buildRows({
+      messages: [message({ seq: 1 })],
+      pending: [
+        {
+          clientNonce: "poll-nonce",
+          content: "",
+          mentions: [],
+          urgency: "urgent",
+          replyTo: "m1",
+          attachments: [],
+          poll: {
+            question: "いつ？",
+            allowMulti: true,
+            closesAt: null,
+            options: ["今日", "明日"],
+          },
+          createdAt: BASE_AT + 5_000,
+        },
+      ],
+      selfKey,
+      unreadLineSeq: null,
+      self: SELF,
+      now: BASE_AT,
+    });
+    const last = result.at(-1);
+    expect(last?.kind).toBe("message");
+    if (last?.kind === "message") {
+      expect(last.message.poll).toMatchObject({
+        question: "いつ？",
+        revision: 0,
+      });
+      expect(last.message.urgency).toBe("urgent");
+      expect(last.message.replyTo).toBe("m1");
     }
   });
 });
