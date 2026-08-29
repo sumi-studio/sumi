@@ -1300,9 +1300,7 @@ func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate through 0034: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 34)
 
 	assertShape := func(want bool) {
 		t.Helper()
@@ -1316,7 +1314,32 @@ func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
 			t.Fatalf("participant_profiles exists=%t, want %t", exists, want)
 		}
 	}
+	assertPollShape := func(wantPoll bool) {
+		t.Helper()
+		var pollTable, pollAdmission, emptyMessageTrigger bool
+		if err := pool.QueryRow(ctx, `
+			SELECT
+				to_regclass('message_polls') IS NOT NULL,
+				EXISTS (
+					SELECT 1 FROM pg_proc
+					WHERE oid = to_regprocedure('require_attachment_for_empty_message()')
+					  AND position('message_polls' in prosrc) > 0
+				),
+				EXISTS (
+					SELECT 1 FROM pg_trigger
+					WHERE tgname = 'message_empty_content_requires_attachment'
+					  AND NOT tgisinternal
+				)
+		`).Scan(&pollTable, &pollAdmission, &emptyMessageTrigger); err != nil {
+			t.Fatal(err)
+		}
+		if pollTable != wantPoll || pollAdmission != wantPoll || !emptyMessageTrigger {
+			t.Fatalf("0035 shape = table:%t poll-admission:%t empty-message-trigger:%t, want poll=%t trigger=true",
+				pollTable, pollAdmission, emptyMessageTrigger, wantPoll)
+		}
+	}
 	assertShape(true)
+	assertPollShape(false)
 
 	const humanID = "0198f0f4-9b72-7000-8000-000000000132"
 	if _, err := pool.Exec(ctx, `INSERT INTO participant_profiles
@@ -1354,14 +1377,16 @@ func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
 		t.Fatalf("remove 0033-0034 migration records: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit 0033 down transaction: %v", err)
+		t.Fatalf("commit 0033-0034 down transaction: %v", err)
 	}
 	assertShape(false)
+	assertPollShape(false)
 
 	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("reapply 0033-0034: %v", err)
+		t.Fatalf("reapply 0033-0035: %v", err)
 	}
 	assertShape(true)
+	assertPollShape(true)
 	var rows int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM participant_profiles").Scan(&rows); err != nil {
 		t.Fatal(err)
