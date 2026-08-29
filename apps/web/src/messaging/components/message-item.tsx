@@ -52,8 +52,8 @@ import {
   MessageAttachments,
 } from "./message-attachments";
 import { MessageContent } from "./message-content";
-import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { MessageEditor } from "./message-editor";
+import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { conversationViewport, useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";

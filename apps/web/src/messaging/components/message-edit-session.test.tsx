@@ -34,6 +34,7 @@ import { MessageList } from "./message-list";
 
 vi.mock("../place-route", () => ({
   placePath: (workspaceId: string, key: string) => `/w/${workspaceId}/${key}`,
+  usePlaceNavigate: () => () => undefined,
 }));
 
 /**
@@ -130,7 +131,7 @@ function conflictWire(message: Message) {
         ? { kind: "channel", channel_id: message.place.channelId }
         : message.place.kind === "thread"
           ? { kind: "thread", thread_id: message.place.threadId }
-        : { kind: message.place.kind, dm_id: message.place.dmId },
+          : { kind: message.place.kind, dm_id: message.place.dmId },
     seq: message.seq,
     author:
       message.author.kind === "human"
