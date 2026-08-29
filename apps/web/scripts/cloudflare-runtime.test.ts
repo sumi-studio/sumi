@@ -8,7 +8,7 @@ import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { chromium, type Worker } from "@playwright/test";
+import { type CDPSession, chromium } from "@playwright/test";
 
 const run = promisify(execFile);
 const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
@@ -530,7 +530,7 @@ async function verifyThemeBootstrapInBrowser(origin: string): Promise<void> {
   try {
     browser = await chromium.launch({
       ...(configuredExecutable === undefined
-        ? {}
+        ? { channel: "chromium" }
         : { executablePath: configuredExecutable }),
       headless: true,
     });
@@ -611,15 +611,18 @@ async function verifyClosedTabGenericPush(
   try {
     await context.grantPermissions(["notifications"], { origin });
     await cdp.send("ServiceWorker.enable");
+    await cdp.send("BackgroundService.setRecording", {
+      service: "notifications",
+      shouldRecord: true,
+    });
+    await cdp.send("BackgroundService.clearEvents", {
+      service: "notifications",
+    });
+    await cdp.send("BackgroundService.startObserving", {
+      service: "notifications",
+    });
     const page = await context.newPage();
     await page.goto(`${origin}/direct`, { waitUntil: "domcontentloaded" });
-    const serviceWorkerPromise =
-      context
-        .serviceWorkers()
-        .find((candidate) => candidate.url() === `${origin}/sw.js`) ??
-      context.waitForEvent("serviceworker", {
-        predicate: (candidate) => candidate.url() === `${origin}/sw.js`,
-      });
     await page.evaluate(async () => {
       await navigator.serviceWorker.register("/sw.js", {
         scope: "/",
@@ -627,10 +630,6 @@ async function verifyClosedTabGenericPush(
       });
       await navigator.serviceWorker.ready;
     });
-    const serviceWorker = await serviceWorkerPromise;
-    await installNotificationCapture(serviceWorker);
-    const captureOperation = waitForNotificationCapture(serviceWorker);
-    void captureOperation.catch(() => undefined);
     const registration = await waitForServiceWorkerRegistration(
       registrations,
       `${origin}/`,
@@ -661,23 +660,41 @@ async function verifyClosedTabGenericPush(
       registrationId: registration.registrationId,
       data: JSON.stringify(pointer),
     };
-    const boundedCapture = within(
-      captureOperation,
-      5_000,
-      "notification delegate calls did not complete",
+    const displays = await captureNotificationDisplays(
+      cdp,
+      {
+        origin: `${origin}/`,
+        registrationId: registration.registrationId,
+        count: 2,
+      },
+      async () => {
+        await cdp.send("ServiceWorker.deliverPushMessage", delivery);
+        await cdp.send("ServiceWorker.deliverPushMessage", delivery);
+      },
     );
-    void boundedCapture.catch(() => undefined);
-    await cdp.send("ServiceWorker.deliverPushMessage", delivery);
-    await cdp.send("ServiceWorker.deliverPushMessage", delivery);
-    const capture = await boundedCapture;
-    assert.deepEqual(capture.calls, [
-      expectedNotification,
-      expectedNotification,
-    ]);
-    assert.deepEqual(capture.active, [expectedNotification]);
-    const visible = capture.calls
-      .map((notification) => `${notification.title}\n${notification.body}`)
-      .join("\n");
+    const expectedDisplay = {
+      title: expectedNotification.title,
+      body: expectedNotification.body,
+      tag: expectedNotification.tag,
+    };
+    assert.deepEqual(displays, [expectedDisplay, expectedDisplay]);
+
+    const inspectionPage = await context.newPage();
+    await inspectionPage.goto(`${origin}/direct`, {
+      waitUntil: "domcontentloaded",
+    });
+    const notifications = await inspectionPage.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      if (!registration) return [];
+      return (await registration.getNotifications()).map((notification) => ({
+        title: notification.title,
+        body: notification.body,
+        tag: notification.tag,
+        data: notification.data as unknown,
+      }));
+    });
+    assert.deepEqual(notifications, [expectedNotification]);
+    const visible = `${notifications[0]?.title}\n${notifications[0]?.body}`;
     assert.doesNotMatch(
       visible,
       /workspace-private-pointer|place-private-pointer|participant|attachment/i,
@@ -688,6 +705,15 @@ async function verifyClosedTabGenericPush(
       "routing pointers must not reach browser console output",
     );
   } finally {
+    await cdp
+      .send("BackgroundService.stopObserving", { service: "notifications" })
+      .catch(() => undefined);
+    await cdp
+      .send("BackgroundService.setRecording", {
+        service: "notifications",
+        shouldRecord: false,
+      })
+      .catch(() => undefined);
     await cdp.send("ServiceWorker.disable").catch(() => undefined);
     await cdp.detach().catch(() => undefined);
     await context.close();
@@ -713,65 +739,71 @@ async function waitForServiceWorkerRegistration(
   throw new Error(`Service Worker registration did not appear for ${scopeURL}`);
 }
 
-interface NotificationSnapshot {
+interface NotificationDisplay {
   title: string;
   body: string;
   tag: string;
-  data: unknown;
 }
 
-interface NotificationCapture {
-  calls: NotificationSnapshot[];
-  active: NotificationSnapshot[];
-}
-
-async function installNotificationCapture(worker: Worker): Promise<void> {
-  // Keep this expression dependency-free: tsx's nested-function naming helper
-  // is not present inside the Service Worker realm.
-  await worker.evaluate(`(() => {
-    const registration = globalThis.registration;
-    const calls = [];
-    let complete = null;
-    const completion = new Promise((resolveCapture) => {
-      complete = resolveCapture;
+async function captureNotificationDisplays(
+  cdp: CDPSession,
+  expected: { origin: string; registrationId: string; count: number },
+  deliver: () => Promise<void>,
+): Promise<NotificationDisplay[]> {
+  const displays: NotificationDisplay[] = [];
+  let complete: ((value: NotificationDisplay[]) => void) | undefined;
+  const completed = new Promise<NotificationDisplay[]>((resolveCompleted) => {
+    complete = resolveCompleted;
+  });
+  const onEvent = ({
+    backgroundServiceEvent,
+  }: {
+    backgroundServiceEvent: {
+      origin: string;
+      serviceWorkerRegistrationId: string;
+      service: string;
+      eventName: string;
+      instanceId: string;
+      eventMetadata: Array<{ key: string; value: string }>;
+    };
+  }) => {
+    if (
+      backgroundServiceEvent.service !== "notifications" ||
+      backgroundServiceEvent.eventName !== "Notification displayed" ||
+      backgroundServiceEvent.origin !== expected.origin ||
+      backgroundServiceEvent.serviceWorkerRegistrationId !==
+        expected.registrationId
+    ) {
+      return;
+    }
+    const metadata = new Map(
+      backgroundServiceEvent.eventMetadata.map(({ key, value }) => [
+        key,
+        value,
+      ]),
+    );
+    displays.push({
+      title: metadata.get("Title") ?? "",
+      body: metadata.get("Body") ?? "",
+      tag: backgroundServiceEvent.instanceId,
     });
-    globalThis.__sumiNotificationCapture = { completion };
-    const nativeShowNotification = registration.showNotification.bind(registration);
-    Object.defineProperty(registration, "showNotification", {
-      configurable: true,
-      value: async (title, options) => {
-        await nativeShowNotification(title, options);
-        calls.push({
-          title,
-          body: options?.body ?? "",
-          tag: options?.tag ?? "",
-          data: options?.data,
-        });
-        if (calls.length !== 2) return;
-        const active = await registration.getNotifications();
-        complete?.({
-          calls: [...calls],
-          active: active.map((notification) => ({
-            title: notification.title,
-            body: notification.body,
-            tag: notification.tag,
-            data: notification.data,
-          })),
-        });
-        complete = null;
-      },
-    });
-  })()`);
-}
-
-async function waitForNotificationCapture(
-  worker: Worker,
-): Promise<NotificationCapture> {
-  return worker.evaluate<NotificationCapture>(`(async () => {
-    const capture = globalThis.__sumiNotificationCapture;
-    if (!capture) throw new Error("notification capture is not installed");
-    return capture.completion;
-  })()`);
+    if (displays.length === expected.count) complete?.([...displays]);
+  };
+  cdp.on("BackgroundService.backgroundServiceEventReceived", onEvent);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(
+      () => reject(new Error("notification display events did not complete")),
+      5_000,
+    );
+  });
+  try {
+    await deliver();
+    return await Promise.race([completed, timedOut]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    cdp.off("BackgroundService.backgroundServiceEventReceived", onEvent);
+  }
 }
 
 async function availablePort(): Promise<number> {
