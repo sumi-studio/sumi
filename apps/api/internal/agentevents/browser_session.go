@@ -61,6 +61,20 @@ type UserSessionClaims struct {
 // through AuthorizeSession.
 func (c UserSessionClaims) BrowserSessionID() string { return c.sessionID }
 
+// BrowserSessionIdentity is the opaque lifecycle coordinate that server-side
+// resources may retain so their effects remain fenced by logout and rotation.
+// It is not a browser credential: only the session authorizer can admit it.
+type BrowserSessionIdentity struct {
+	ID        string
+	ExpiresAt time.Time
+}
+
+// BrowserSessionIdentity returns the current signed session's lifecycle
+// coordinate without exposing it to the browser wire contract.
+func (c UserSessionClaims) BrowserSessionIdentity() BrowserSessionIdentity {
+	return BrowserSessionIdentity{ID: c.sessionID, ExpiresAt: c.expiresAt}
+}
+
 // UserSessionVerifier validates the signed HttpOnly browser session cookie.
 // The Firebase exchange control-plane issues this format server-side.
 type UserSessionVerifier interface {
@@ -133,6 +147,16 @@ func (i hmacBrowserSessionIssuer) IssueSession(
 type UserSessionAuthorizer interface {
 	UserSessionVerifier
 	AuthorizeSession(ctx context.Context, claims UserSessionClaims, operation func() error) error
+}
+
+// BrowserSessionIdentityAuthorizer admits a server-retained resource only
+// while the exact browser session that registered it is still current.
+type BrowserSessionIdentityAuthorizer interface {
+	AuthorizeBrowserSessionIdentity(
+		ctx context.Context,
+		identity BrowserSessionIdentity,
+		operation func() error,
+	) error
 }
 
 // BrowserSessionLifecycle owns issuance and shared durable revocation in
@@ -504,6 +528,32 @@ func (v *HMACUserSessionVerifier) AuthorizeSession(
 		operation,
 	); err != nil {
 		return fmt.Errorf("authorize browser session: %w", err)
+	}
+	return nil
+}
+
+// AuthorizeBrowserSessionIdentity is the persisted-resource counterpart of
+// AuthorizeSession. Rotation and logout take the same exclusive durable lease,
+// so a completed authority transition prevents any later retained effect.
+func (v *HMACUserSessionVerifier) AuthorizeBrowserSessionIdentity(
+	ctx context.Context,
+	identity BrowserSessionIdentity,
+	operation func() error,
+) error {
+	if operation == nil {
+		return errors.New("browser session authorization operation is required")
+	}
+	if !validBrowserSessionID(identity.ID) || !v.now().Before(identity.ExpiresAt) {
+		return errors.New("browser session has invalid lifecycle identity")
+	}
+	if err := v.revocations.AuthorizeBrowserSession(
+		ctx,
+		identity.ID,
+		identity.ExpiresAt,
+		v.now(),
+		operation,
+	); err != nil {
+		return fmt.Errorf("authorize browser session identity: %w", err)
 	}
 	return nil
 }

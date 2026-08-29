@@ -62,6 +62,15 @@ func run(ctx context.Context) (runErr error) {
 	defer func() {
 		runErr = errors.Join(runErr, app.Close())
 	}()
+	if app.messagingServer != nil {
+		// Readers resolve temporary status expiry themselves; this worker makes
+		// it visible on already-open screens. Start it only after run owns the
+		// application so Close can cancel it.
+		go app.messagingServer.RunStatusExpiry(
+			app.backgroundCtx,
+			messaging.DefaultStatusExpiryInterval,
+		)
+	}
 
 	publicServer := &http.Server{
 		Addr:              publicAddress,
@@ -211,16 +220,18 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux     *http.ServeMux
-	localMux      *http.ServeMux
-	localListener *localControlListenerConfig
-	store         *agentevents.CommandStore
-	browser       *agentevents.BrowserServer
-	database      *db.Pool
-	spawnManager  *spawn.Manager
-	localRuntimes *agentevents.LocalControlListenerRegistry
+	publicMux       *http.ServeMux
+	localMux        *http.ServeMux
+	localListener   *localControlListenerConfig
+	store           *agentevents.CommandStore
+	browser         *agentevents.BrowserServer
+	database        *db.Pool
+	spawnManager    *spawn.Manager
+	localRuntimes   *agentevents.LocalControlListenerRegistry
+	messagingServer *messaging.Server
+	backgroundCtx   context.Context
 	// stopBackground cancels process-lifetime workers such as the attachment
-	// reconciler.
+	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
 	closeOnce      sync.Once
 	closeErr       error
@@ -310,6 +321,7 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	var databasePool *pgxpool.Pool
 	var messagingServer *messaging.Server
+	var messagingPushCloser *messaging.Store
 	var workspaceServer *workspacecontrol.Server
 	var workspaceStore *workspacecontrol.Store
 	var appStore *applicationapps.Store
@@ -394,6 +406,26 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
+		pushSubject := strings.TrimSpace(os.Getenv("SUMI_MESSAGING_PUSH_SUBJECT"))
+		if pushSubject != "" {
+			if sv == nil {
+				closeOnError()
+				return nil, errors.New("SUMI_MESSAGING_PUSH_SUBJECT requires browser session authorization")
+			}
+			pushDispatcher, pushErr := messaging.NewPushDispatcher(
+				context.Background(), messagingStore, sv, pushSubject,
+			)
+			if pushErr != nil {
+				closeOnError()
+				return nil, fmt.Errorf("messaging Web Push: %w", pushErr)
+			}
+			messagingStore.UsePush(pushDispatcher)
+			messagingServer.Push = pushDispatcher
+			messagingPushCloser = messagingStore
+			log.Print("messaging Web Push ready (generic payload)")
+		} else {
+			log.Print("messaging Web Push disabled: SUMI_MESSAGING_PUSH_SUBJECT is unset")
+		}
 		messagingServer.RegisterRoutes(mux)
 		livekit, callsEnabled, configErr := liveKitConfigFromEnv()
 		if configErr != nil {
@@ -420,6 +452,9 @@ func newApplicationFromEnv() (*application, error) {
 		closers := browserSessionConnectionClosers{browser}
 		if messagingWS != nil {
 			closers = append(closers, messagingWS)
+		}
+		if messagingPushCloser != nil {
+			closers = append(closers, messagingPushCloser)
 		}
 		authServer.Connections = closers
 	}
@@ -481,15 +516,17 @@ func newApplicationFromEnv() (*application, error) {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
 	return &application{
-		publicMux:      mux,
-		localMux:       localMux,
-		localListener:  localListener,
-		store:          store,
-		browser:        browser,
-		database:       database,
-		spawnManager:   spawnManager,
-		localRuntimes:  localRuntimes,
-		stopBackground: stopBackground,
+		publicMux:       mux,
+		localMux:        localMux,
+		localListener:   localListener,
+		store:           store,
+		browser:         browser,
+		database:        database,
+		spawnManager:    spawnManager,
+		localRuntimes:   localRuntimes,
+		messagingServer: messagingServer,
+		backgroundCtx:   backgroundCtx,
+		stopBackground:  stopBackground,
 	}, nil
 }
 

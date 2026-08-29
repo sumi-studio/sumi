@@ -386,6 +386,69 @@ func TestHMACUserSessionVerifierRevocationIsAnAdmissionBarrier(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionIdentityAuthorizationRejectsRotationAndLogout(t *testing.T) {
+	verifier, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	current, err := verifier.IssueSession(context.Background(), claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentClaims, err := verifier.VerifySession(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := verifier.AuthorizeBrowserSessionIdentity(
+		context.Background(),
+		currentClaims.BrowserSessionIdentity(),
+		func() error { called = true; return nil },
+	); err != nil || !called {
+		t.Fatalf("current identity authorization: called=%v err=%v", called, err)
+	}
+
+	_, successor, valid, err := verifier.RotateSession(
+		context.Background(), current, claims, time.Minute,
+	)
+	if err != nil || !valid {
+		t.Fatalf("rotate: valid=%v err=%v", valid, err)
+	}
+	called = false
+	if err := verifier.AuthorizeBrowserSessionIdentity(
+		context.Background(),
+		currentClaims.BrowserSessionIdentity(),
+		func() error { called = true; return nil },
+	); err == nil || called {
+		t.Fatalf("retired identity admitted: called=%v err=%v", called, err)
+	}
+
+	successorClaims, err := verifier.VerifySession(context.Background(), successor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.RevokeSession(context.Background(), successor); err != nil {
+		t.Fatal(err)
+	}
+	called = false
+	if err := verifier.AuthorizeBrowserSessionIdentity(
+		context.Background(),
+		successorClaims.BrowserSessionIdentity(),
+		func() error { called = true; return nil },
+	); err == nil || called {
+		t.Fatalf("logged-out identity admitted: called=%v err=%v", called, err)
+	}
+}
+
 func TestHMACUserSessionVerifierBoundsAndReclaimsRevocations(t *testing.T) {
 	revocations := newTestBrowserSessionRevocationStore()
 	v, err := NewHMACUserSessionVerifier(

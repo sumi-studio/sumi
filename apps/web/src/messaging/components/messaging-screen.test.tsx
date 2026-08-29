@@ -16,11 +16,6 @@ vi.mock("../place-route", () => ({
 }));
 
 vi.mock("./sidebar", () => ({
-  NOTIFICATION_LEVEL_LABEL: {
-    all: "すべて通知",
-    mentions: "メンションのみ",
-    mute: "ミュート",
-  },
   Sidebar: ({ selectedPlaceKey }: { selectedPlaceKey: PlaceKey | null }) => (
     <aside data-testid="sidebar-selection">
       {selectedPlaceKey ?? "unselected"}
@@ -65,6 +60,7 @@ function seedCurrentPlace() {
       {
         channelId: "channel-a",
         workspaceId: "workspace-a",
+        revision: 1,
         name: "alpha",
         topic: "",
         visibility: "public",
@@ -73,6 +69,7 @@ function seedCurrentPlace() {
       {
         channelId: "channel-b",
         workspaceId: "workspace-b",
+        revision: 1,
         name: "beta",
         topic: "",
         visibility: "public",
@@ -103,6 +100,8 @@ describe("MessagingScreen route-owned current place", () => {
 
   afterEach(() => {
     cleanup();
+    vi.unstubAllGlobals();
+    Reflect.deleteProperty(navigator, "serviceWorker");
     useMessaging.setState({ init: realInit, selectPlace: realSelectPlace });
     bindMessagingSessionIdentity(null);
   });
@@ -147,5 +146,42 @@ describe("MessagingScreen route-owned current place", () => {
     expect(screen.getByTestId("sidebar-selection")).toHaveTextContent(
       "unselected",
     );
+  });
+
+  it("hides the notification permission prompt when Web Push is unsupported", () => {
+    vi.stubGlobal("Notification", { permission: "default" });
+    useMessaging.setState({
+      capabilities: {
+        ...useMessaging.getState().capabilities,
+        notifications: true,
+      },
+    });
+
+    render(<MessagingScreen />);
+
+    expect(
+      screen.queryByRole("button", { name: "許可する" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the notification permission prompt when Web Push is supported", () => {
+    vi.stubGlobal("Notification", { permission: "default" });
+    vi.stubGlobal("PushManager", class FakePushManager {});
+    Object.defineProperty(navigator, "serviceWorker", {
+      configurable: true,
+      value: {},
+    });
+    useMessaging.setState({
+      capabilities: {
+        ...useMessaging.getState().capabilities,
+        notifications: true,
+      },
+    });
+
+    render(<MessagingScreen />);
+
+    expect(
+      screen.getByRole("button", { name: "許可する" }),
+    ).toBeInTheDocument();
   });
 });

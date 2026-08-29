@@ -25,6 +25,7 @@ import type {
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusCleared,
   StatusKind,
   UnreadSummary,
   UploadAttachmentInput,
@@ -66,6 +67,7 @@ const CHANNELS: ChannelSummary[] = [
   {
     channelId: "ch-general",
     workspaceId: "ws-sumi",
+    revision: 1,
     name: "general",
     topic: "雑談と全体連絡",
     visibility: "public",
@@ -74,6 +76,7 @@ const CHANNELS: ChannelSummary[] = [
   {
     channelId: "ch-dev",
     workspaceId: "ws-sumi",
+    revision: 1,
     name: "dev",
     topic: "開発の相談と進捗",
     visibility: "public",
@@ -82,6 +85,7 @@ const CHANNELS: ChannelSummary[] = [
   {
     channelId: "ch-design",
     workspaceId: "ws-sumi",
+    revision: 1,
     name: "design",
     topic: "デザインレビュー",
     visibility: "public",
@@ -100,6 +104,65 @@ const MEMBERS: MemberProfile[] = [
   { participant: SUMI, displayName: "Sumi", tagline: "yohakuの秘書" },
   { participant: KURO, displayName: "Kuro", tagline: "開発" },
 ];
+
+// The mock's in-memory tables are its server state, not wire objects. Keep
+// that distinction at the boundary just as JSON does for the real API.
+function copyChannel(channel: ChannelSummary): ChannelSummary {
+  return { ...channel };
+}
+
+function copyDM(dm: DmSummary): DmSummary {
+  return {
+    ...dm,
+    participants: dm.participants.map((participant) => ({ ...participant })),
+  };
+}
+
+function copyMember(member: MemberProfile): MemberProfile {
+  return { ...member, participant: { ...member.participant } };
+}
+
+function copyStatus(status: ParticipantStatus): ParticipantStatus {
+  return { ...status, participant: { ...status.participant } };
+}
+
+function copyReplyLater(marker: ReplyLaterMarker): ReplyLaterMarker {
+  return {
+    ...marker,
+    participant: { ...marker.participant },
+    place: { ...marker.place },
+  };
+}
+
+function copyMessage(message: Message): Message {
+  return {
+    ...message,
+    place: { ...message.place },
+    author: { ...message.author },
+    mentions: message.mentions.map((participant) => ({ ...participant })),
+    reactions: message.reactions.map((reaction) => ({
+      ...reaction,
+      participants: reaction.participants.map((participant) => ({
+        ...participant,
+      })),
+    })),
+    attachments: message.attachments.map((attachment) => ({ ...attachment })),
+  };
+}
+
+function copyReactionMutation(
+  mutation: ReactionMutationResult,
+): ReactionMutationResult {
+  return {
+    ...mutation,
+    reactions: mutation.reactions.map((reaction) => ({
+      ...reaction,
+      participants: reaction.participants.map((participant) => ({
+        ...participant,
+      })),
+    })),
+  };
+}
 
 interface AgentPersona {
   ref: ParticipantRef;
@@ -340,6 +403,30 @@ const TYPING_DELAY_MS = 650;
 const TYPING_INTERVAL_MS = 3_000;
 const REPLY_LATER_REMIND_MS = 9_000;
 
+/**
+ * places.name のスキーマCHECKと同じ上限（apps/api/internal/messaging/scoped_core.go
+ * の MaxChannelNameChars）。
+ */
+const MAX_CHANNEL_NAME_CHARS = 200;
+
+/**
+ * 複製の既定名。本番の `copyChannelName`（apps/api/internal/messaging/scoped_core.go）
+ * と同じ規則で、末尾の「 のコピー」を剥がしてから付け直す——コピーのコピーで
+ * サフィックスが積み上がると、元の名前を探すのに単語を数えることになる。
+ * mock がここで違う名前を出すと、手で確かめた挙動が本物と食い違う。
+ */
+function copyChannelName(source: string): string {
+  const suffix = " のコピー";
+  const trimmed = source.endsWith(suffix)
+    ? source.slice(0, -suffix.length)
+    : source;
+  const base = trimmed === "" ? source : trimmed;
+  // 上限は本番と同じ200文字ぶんの「文字」——サロゲートペアを半分に切ると
+  // 名前が壊れるので、コードユニットではなくコードポイントで数えて切る。
+  const room = MAX_CHANNEL_NAME_CHARS - [...suffix].length;
+  return `${[...base].slice(0, room).join("")}${suffix}`;
+}
+
 export class MockMessagingServer implements MessagingBackend {
   readonly capabilities = {
     status: true,
@@ -351,7 +438,14 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
+  /** Mirrors the database trigger: every participant projection advances alone. */
+  private readonly statusRevisions = new Map<string, number>();
+  private readonly clearedStatuses = new Map<string, StatusCleared>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
+  private readonly placeCreationReceipts = new Map<
+    string,
+    { digest: string; result: ChannelSummary | DmSummary }
+  >();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
     owner: SELF,
@@ -364,12 +458,17 @@ export class MockMessagingServer implements MessagingBackend {
 
   constructor() {
     this.readMarkers = initialReadMarkers(this.history);
-    this.statuses.set(participantKey(KURO), {
+    const key = participantKey(KURO);
+    this.statuses.set(key, {
       participant: KURO,
+      revision: 1,
       status: "busy",
       note: "デプロイ対応中",
       expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
     });
+    this.statusRevisions.set(key, 1);
   }
 
   dispose(): void {
@@ -403,17 +502,32 @@ export class MockMessagingServer implements MessagingBackend {
       });
     }
     return {
-      self: SELF,
-      workspaces: WORKSPACES,
-      channels: CHANNELS,
-      dms: DMS,
-      members: MEMBERS,
-      statuses: [...this.statuses.values()],
+      self: { ...SELF },
+      workspaces: WORKSPACES.map((workspace) => ({ ...workspace })),
+      channels: CHANNELS.map(copyChannel),
+      dms: DMS.map(copyDM),
+      members: MEMBERS.map(copyMember),
+      statuses: [...this.statuses.values()].map(copyStatus),
+      clearedStatuses: [...this.clearedStatuses.values()].map((cleared) => ({
+        ...cleared,
+        participant: { ...cleared.participant },
+      })),
       readMarkers,
       unreadSummaries,
-      replyLaterMarkers: [...this.replyLaterMarkers.values()],
-      notificationSetting: this.notificationSetting,
-      employedAgents: [SUMI],
+      replyLaterMarkers: [...this.replyLaterMarkers.values()].map(
+        copyReplyLater,
+      ),
+      notificationSetting: {
+        ...this.notificationSetting,
+        owner: { ...this.notificationSetting.owner },
+        defaults: { ...this.notificationSetting.defaults },
+        perPlace: this.notificationSetting.perPlace.map((setting) => ({
+          ...setting,
+          place: { ...setting.place },
+        })),
+        keywords: [...this.notificationSetting.keywords],
+      },
+      employedAgents: [{ ...SUMI }],
     };
   }
 
@@ -421,7 +535,16 @@ export class MockMessagingServer implements MessagingBackend {
     input: NotificationSettingInput,
   ): Promise<NotificationSetting> {
     this.notificationSetting = { owner: SELF, ...input };
-    return this.notificationSetting;
+    return {
+      ...this.notificationSetting,
+      owner: { ...this.notificationSetting.owner },
+      defaults: { ...this.notificationSetting.defaults },
+      perPlace: this.notificationSetting.perPlace.map((setting) => ({
+        ...setting,
+        place: { ...setting.place },
+      })),
+      keywords: [...this.notificationSetting.keywords],
+    };
   }
 
   /**
@@ -459,7 +582,7 @@ export class MockMessagingServer implements MessagingBackend {
     const beforeSeq = options?.beforeSeq ?? Number.POSITIVE_INFINITY;
     const limit = options?.limit ?? 50;
     const slice = messages.filter((message) => message.seq < beforeSeq);
-    return slice.slice(Math.max(0, slice.length - limit));
+    return slice.slice(Math.max(0, slice.length - limit)).map(copyMessage);
   }
 
   async searchMessages(
@@ -508,18 +631,37 @@ export class MockMessagingServer implements MessagingBackend {
     name: string,
     topic: string,
     voice: boolean,
+    clientNonce: string,
   ): Promise<ChannelSummary> {
+    if (!clientNonce || clientNonce.length > 128) {
+      throw new Error("invalid client nonce");
+    }
+    const receiptKey = `create_channel:${clientNonce}`;
+    const digest = JSON.stringify([workspaceId, name, topic, voice]);
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("channelId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyChannel(receipt.result);
+    }
     const channel: ChannelSummary = {
       channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
       workspaceId,
+      revision: 1,
       name,
       topic,
       visibility: "public",
       voice,
     };
     CHANNELS.push(channel);
-    this.emit({ type: "place_created", channel });
-    return channel;
+    const response = copyChannel(channel);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyChannel(response),
+    });
+    this.emit({ type: "place_created", channel: copyChannel(response) });
+    return response;
   }
 
   async ensureDM(participant: ParticipantRef): Promise<DmSummary> {
@@ -528,37 +670,118 @@ export class MockMessagingServer implements MessagingBackend {
         dm.kind === "dm" &&
         dm.participants.some((ref) => sameParticipant(ref, participant)),
     );
-    if (existing) return existing;
+    if (existing) return copyDM(existing);
     const dm: DmSummary = {
       dmId: `dm-${secureRandomUUID().slice(0, 8)}`,
       kind: "dm",
       participants: [SELF, participant],
     };
     DMS.push(dm);
-    this.emit({ type: "place_created", dm });
-    return dm;
+    const response = copyDM(dm);
+    this.emit({ type: "place_created", dm: copyDM(response) });
+    return response;
   }
 
-  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+  async createGroupDM(
+    participants: ParticipantRef[],
+    clientNonce: string,
+  ): Promise<DmSummary> {
+    if (!clientNonce || clientNonce.length > 128) {
+      throw new Error("invalid client nonce");
+    }
+    const canonicalParticipants = [
+      ...new Map(
+        participants.map((participant) => [
+          participantKey(participant),
+          participant,
+        ]),
+      ).entries(),
+    ]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, participant]) => participant);
+    const receiptKey = `create_group_dm:${clientNonce}`;
+    const digest = JSON.stringify(canonicalParticipants.map(participantKey));
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("dmId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyDM(receipt.result);
+    }
     const dm: DmSummary = {
       dmId: `gdm-${secureRandomUUID().slice(0, 8)}`,
       kind: "group_dm",
-      participants: [SELF, ...participants],
+      participants: [SELF, ...canonicalParticipants],
     };
     DMS.push(dm);
-    this.emit({ type: "place_created", dm });
-    return dm;
+    const response = copyDM(dm);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyDM(response),
+    });
+    this.emit({ type: "place_created", dm: copyDM(response) });
+    return response;
   }
 
-  async updateChannelTopic(
+  async updateChannel(
     channelId: string,
-    topic: string,
+    input: { name?: string; topic?: string },
   ): Promise<ChannelSummary> {
-    const channel = CHANNELS.find((entry) => entry.channelId === channelId);
+    const index = CHANNELS.findIndex((entry) => entry.channelId === channelId);
+    const channel = CHANNELS[index];
     if (!channel) throw new Error("unknown channel");
-    channel.topic = topic;
-    this.emit({ type: "place_updated", channel });
-    return channel;
+    if (input.name === undefined && input.topic === undefined) {
+      throw new Error("a channel edit must name something to change");
+    }
+    const updated: ChannelSummary = {
+      ...channel,
+      name: input.name ?? channel.name,
+      topic: input.topic ?? channel.topic,
+      revision: channel.revision + 1,
+    };
+    CHANNELS[index] = updated;
+    const response = copyChannel(updated);
+    this.emit({ type: "place_updated", channel: copyChannel(response) });
+    return response;
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    clientNonce: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    if (!clientNonce || clientNonce.length > 128) {
+      throw new Error("invalid client nonce");
+    }
+    const receiptKey = `duplicate_channel:${clientNonce}`;
+    const digest = JSON.stringify([channelId, name ?? ""]);
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("channelId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyChannel(receipt.result);
+    }
+    const source = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!source) throw new Error("unknown channel");
+    // 名前の既定はサーバーが決める。UIもagentも自分では組み立てない。
+    const copy: ChannelSummary = {
+      channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
+      workspaceId: source.workspaceId,
+      revision: 1,
+      name: name && name !== "" ? name : copyChannelName(source.name),
+      topic: source.topic,
+      visibility: "public",
+      voice: source.voice,
+    };
+    CHANNELS.push(copy);
+    const response = copyChannel(copy);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyChannel(response),
+    });
+    this.emit({ type: "place_created", channel: copyChannel(response) });
+    return response;
   }
 
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -595,7 +818,7 @@ export class MockMessagingServer implements MessagingBackend {
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
         this.emit({
           type: "message_created",
-          message: { ...message },
+          message: copyMessage(message),
           notify: this.notifyFor(message),
         });
         this.scheduleAgentResponses(message);
@@ -681,7 +904,7 @@ export class MockMessagingServer implements MessagingBackend {
     message.mentions = resolveMentionsAtAdmission(content);
     message.editedAt = Date.now();
     message.revision = (message.revision ?? 1) + 1;
-    const committed = { ...message };
+    const committed = copyMessage(message);
     this.emit({ type: "message_edited", message: committed });
     return committed;
   }
@@ -700,7 +923,7 @@ export class MockMessagingServer implements MessagingBackend {
     message.reactions = [];
     message.attachments = [];
     message.revision = (message.revision ?? 1) + 1;
-    const deleted = { ...message };
+    const deleted = copyMessage(message);
     this.emit({
       type: "message_deleted",
       message: deleted,
@@ -716,29 +939,87 @@ export class MockMessagingServer implements MessagingBackend {
 
   async fetchPresence(): Promise<{
     statuses: ParticipantStatus[];
+    clearedStatuses: StatusCleared[];
     replyLaterMarkers: ReplyLaterMarker[];
   }> {
     return {
-      statuses: [...this.statuses.values()],
-      replyLaterMarkers: [...this.replyLaterMarkers.values()].filter(
-        (marker) => !marker.resolved,
-      ),
+      statuses: [...this.statuses.values()].map(copyStatus),
+      clearedStatuses: [...this.clearedStatuses.values()].map((cleared) => ({
+        ...cleared,
+        participant: { ...cleared.participant },
+      })),
+      replyLaterMarkers: [...this.replyLaterMarkers.values()]
+        .filter((marker) => !marker.resolved)
+        .map(copyReplyLater),
     };
   }
 
   async setStatus(
     status: StatusKind,
     note: string,
+    expiresAt: number | null = null,
   ): Promise<ParticipantStatus> {
+    const key = participantKey(SELF);
+    const current = this.statuses.get(key);
+    // 一時ステータスは「その前に言っていたこと」を覚えて、期限で戻る。
+    // 一時の上に一時を重ねても、下にある恒久の宣言は埋もれない。
+    const base =
+      expiresAt === null
+        ? null
+        : current === undefined
+          ? null
+          : current.expiresAt !== null
+            ? current.baseStatus === null
+              ? null
+              : { status: current.baseStatus, note: current.baseNote }
+            : { status: current.status, note: current.note };
     const next: ParticipantStatus = {
       participant: SELF,
+      revision: this.nextStatusRevision(key),
       status,
       note,
-      expiresAt: null,
+      expiresAt,
+      baseStatus: base?.status ?? null,
+      baseNote: base?.note ?? "",
     };
-    this.statuses.set(participantKey(SELF), next);
-    this.emit({ type: "status_updated", status: next });
-    return next;
+    this.statuses.set(key, next);
+    this.clearedStatuses.delete(key);
+    this.emit({ type: "status_updated", status: copyStatus(next) });
+    if (expiresAt === null) return copyStatus(next);
+    window.setTimeout(
+      () => {
+        // 期限が来ても、途中で置き換えられていたら何もしない。
+        if (this.statuses.get(key) !== next) return;
+        if (next.baseStatus === null) {
+          this.statuses.delete(key);
+          const cleared = {
+            participant: SELF,
+            revision: this.nextStatusRevision(key),
+          };
+          this.clearedStatuses.set(key, cleared);
+          this.emit({
+            type: "status_cleared",
+            ...cleared,
+            participant: { ...cleared.participant },
+          });
+          return;
+        }
+        const restored: ParticipantStatus = {
+          participant: SELF,
+          revision: this.nextStatusRevision(key),
+          status: next.baseStatus,
+          note: next.baseNote,
+          expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
+        };
+        this.statuses.set(key, restored);
+        this.clearedStatuses.delete(key);
+        this.emit({ type: "status_updated", status: copyStatus(restored) });
+      },
+      Math.max(0, expiresAt - Date.now()),
+    );
+    return copyStatus(next);
   }
 
   async createReplyLater(
@@ -752,7 +1033,7 @@ export class MockMessagingServer implements MessagingBackend {
         marker.messageId === messageId &&
         sameParticipant(marker.participant, SELF),
     );
-    if (existing) return existing;
+    if (existing) return copyReplyLater(existing);
     const marker: ReplyLaterMarker = {
       markerId: secureRandomUUID(),
       participant: SELF,
@@ -763,17 +1044,18 @@ export class MockMessagingServer implements MessagingBackend {
       resolved: false,
     };
     this.replyLaterMarkers.set(marker.markerId, marker);
-    this.emit({ type: "reply_later_created", marker });
-    return marker;
+    this.emit({ type: "reply_later_created", marker: copyReplyLater(marker) });
+    return copyReplyLater(marker);
   }
 
   async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
     const marker = this.replyLaterMarkers.get(markerId);
     if (!marker) throw new Error("unknown reply-later marker");
-    if (marker.resolved) return marker;
-    marker.resolved = true;
+    if (marker.resolved) return copyReplyLater(marker);
+    const resolved = { ...marker, resolved: true };
+    this.replyLaterMarkers.set(markerId, resolved);
     this.emit({ type: "reply_later_resolved", markerId });
-    return marker;
+    return copyReplyLater(resolved);
   }
 
   async toggleReaction(
@@ -823,10 +1105,10 @@ export class MockMessagingServer implements MessagingBackend {
     };
     this.emit({
       type: "reaction_updated",
-      place: message.place,
-      ...reaction,
+      place: { ...message.place },
+      ...copyReactionMutation(reaction),
     });
-    return reaction;
+    return copyReactionMutation(reaction);
   }
 
   sendTyping(_place: Place): void {
@@ -945,7 +1227,10 @@ export class MockMessagingServer implements MessagingBackend {
     };
     window.setTimeout(() => {
       this.replyLaterMarkers.set(marker.markerId, marker);
-      this.emit({ type: "reply_later_created", marker });
+      this.emit({
+        type: "reply_later_created",
+        marker: copyReplyLater(marker),
+      });
     }, 1_100);
     window.setTimeout(() => {
       const typingAt = Date.now();
@@ -957,15 +1242,23 @@ export class MockMessagingServer implements MessagingBackend {
       );
       window.setTimeout(() => {
         this.appendAndEmitReply(persona, trigger);
-        marker.resolved = true;
+        this.replyLaterMarkers.set(marker.markerId, {
+          ...marker,
+          resolved: true,
+        });
         this.emit({ type: "reply_later_resolved", markerId: marker.markerId });
         const status: ParticipantStatus = {
           participant: persona.ref,
+          revision: this.nextStatusRevision(participantKey(persona.ref)),
           status: "available",
           note: "",
           expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
         };
-        this.statuses.set(participantKey(persona.ref), status);
+        const key = participantKey(persona.ref);
+        this.statuses.set(key, status);
+        this.clearedStatuses.delete(key);
         this.emit({ type: "status_updated", status });
       }, 1_700);
     }, REPLY_LATER_REMIND_MS);
@@ -984,9 +1277,15 @@ export class MockMessagingServer implements MessagingBackend {
     });
     this.emit({
       type: "message_created",
-      message: { ...message },
+      message: copyMessage(message),
       notify: this.notifyFor(message),
     });
+  }
+
+  private nextStatusRevision(key: string): number {
+    const revision = (this.statusRevisions.get(key) ?? 0) + 1;
+    this.statusRevisions.set(key, revision);
+    return revision;
   }
 
   private scheduleTypingUntil(

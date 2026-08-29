@@ -67,7 +67,7 @@ export function MemberList() {
                 participantKey={key}
                 name={member.displayName}
                 size={28}
-                status={status?.status ?? "available"}
+                status={status?.status}
               />
             </ParticipantProfilePopover>
           );

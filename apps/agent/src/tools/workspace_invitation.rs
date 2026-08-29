@@ -557,6 +557,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -615,6 +616,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -744,6 +746,7 @@ mod tests {
             ToolBindCtx {
                 args: &args,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -809,6 +812,7 @@ mod tests {
             ToolBindCtx {
                 args: &list_arguments,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -836,6 +840,7 @@ mod tests {
             ToolBindCtx {
                 args: &accept_arguments,
                 workspace: &workspace,
+                executor_identity: None,
             },
         )
         .await
@@ -994,6 +999,7 @@ mod tests {
                 ToolBindCtx {
                     args: &args,
                     workspace: &workspace,
+                    executor_identity: None,
                 },
             )
             .await
