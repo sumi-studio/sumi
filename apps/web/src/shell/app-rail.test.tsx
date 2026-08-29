@@ -10,7 +10,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
+import {
+  AuthAPIError,
+  SumiProfileUpdateIndeterminateError,
+} from "../auth/session-client";
 import { useParticipantApps } from "../participant/app-store";
 import { AppRail } from "./app-rail";
 
@@ -204,6 +207,10 @@ describe("AppRail settings", () => {
       expect(mocks.refreshMessagingMemberProfiles).toHaveBeenCalledTimes(1);
     });
     expect(screen.getByText("保存しました。")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "表示名" })).toHaveValue(
+      "たっけ",
+    );
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
   });
 
   it("edits the Participant-global tagline without resending the display name", async () => {
@@ -371,5 +378,36 @@ describe("AppRail settings", () => {
         "更新結果を確認できませんでした。再読み込みしてください。",
       ),
     ).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "表示名" })).toHaveValue(
+      "たっけ",
+    );
+    expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
+    expect(screen.queryByText("保存しました。")).not.toBeInTheDocument();
+  });
+
+  it("keeps the draft after an authoritative profile rejection", async () => {
+    mocks.updateProfile.mockRejectedValue(
+      new AuthAPIError("invalid profile", 422),
+    );
+    render(
+      <TooltipProvider>
+        <AppRail activeAppId="home" />
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "設定" }));
+    await screen.findByDisplayValue("Yohaku");
+    fireEvent.change(screen.getByRole("textbox", { name: "表示名" }), {
+      target: { value: "たっけ" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(
+      await screen.findByText("プロフィールを更新できませんでした。"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "表示名" })).toHaveValue(
+      "たっけ",
+    );
+    expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
+    expect(screen.queryByText("保存しました。")).not.toBeInTheDocument();
   });
 });

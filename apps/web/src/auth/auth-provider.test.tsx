@@ -11,7 +11,11 @@ import {
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
-import { AuthAPIError, SumiSessionCompensatedError } from "./session-client";
+import {
+  AuthAPIError,
+  SumiProfileUpdateIndeterminateError,
+  SumiSessionCompensatedError,
+} from "./session-client";
 
 const authorityBindingA = "A".repeat(43);
 const authorityBindingB = `${"B".repeat(42)}E`;
@@ -162,11 +166,16 @@ beforeEach(() => {
 function AuthStateProbe() {
   const auth = useAuth();
   const [confirmedTagline, setConfirmedTagline] = useState("none");
+  const [profileUpdateResult, setProfileUpdateResult] = useState("idle");
   return (
     <>
       <div data-testid="session-state">{auth.sessionState}</div>
       <div data-testid="user-id">{auth.user?.id ?? "none"}</div>
       <div data-testid="display-name">{auth.user?.displayName ?? "none"}</div>
+      <div data-testid="authority-binding">
+        {auth.authorityBindingId ?? "none"}
+      </div>
+      <div data-testid="profile-update-result">{profileUpdateResult}</div>
       <div data-testid="confirmed-tagline">{confirmedTagline}</div>
       <div data-testid="confirmation">
         {auth.confirmation?.action ?? "none"}
@@ -206,9 +215,19 @@ function AuthStateProbe() {
       </button>
       <button
         type="button"
-        onClick={() =>
-          void auth.updateDisplayName("After").catch(() => undefined)
-        }
+        onClick={() => {
+          setProfileUpdateResult("pending");
+          void auth
+            .updateDisplayName("After")
+            .then(() => setProfileUpdateResult("succeeded"))
+            .catch((error) =>
+              setProfileUpdateResult(
+                error instanceof SumiProfileUpdateIndeterminateError
+                  ? "indeterminate"
+                  : "rejected",
+              ),
+            );
+        }}
       >
         update display name
       </button>
@@ -302,6 +321,120 @@ describe("canonical Human profile", () => {
     expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    {
+      status: 408,
+      result: "succeeded",
+      displayName: "After",
+      sessionReads: 2,
+      profileReads: 1,
+    },
+    {
+      status: 429,
+      result: "succeeded",
+      displayName: "After",
+      sessionReads: 2,
+      profileReads: 1,
+    },
+    {
+      status: 503,
+      result: "succeeded",
+      displayName: "After",
+      sessionReads: 2,
+      profileReads: 1,
+    },
+    {
+      status: 422,
+      result: "rejected",
+      displayName: "Before",
+      sessionReads: 1,
+      profileReads: 0,
+    },
+  ])("classifies HTTP $status profile responses as $result", async ({
+    status,
+    result,
+    displayName,
+    sessionReads,
+    profileReads,
+  }) => {
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new AuthAPIError("profile response", status),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("profile-update-result")).toHaveTextContent(
+        result,
+      );
+    });
+    expect(screen.getByTestId("display-name")).toHaveTextContent(displayName);
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(sessionReads);
+    expect(authMocks.getSumiProfile).toHaveBeenCalledTimes(profileReads);
+    expect(screen.getByTestId("authority-binding")).toHaveTextContent(
+      authorityBindingA,
+    );
+  });
+
+  it("reports an ambiguous response with an unchanged canonical profile as indeterminate", async () => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new AuthAPIError("upstream unavailable", 503),
+    );
+    authMocks.getSumiProfile.mockResolvedValue({
+      participant: { kind: "human", humanId: "user-a" },
+      displayName: "Before",
+      tagline: "",
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("profile-update-result")).toHaveTextContent(
+        "indeterminate",
+      );
+    });
+    expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "authenticated",
+    );
+  });
+
   it("reconciles a committed tagline-only update from the durable profile", async () => {
     authMocks.getSumiSession
       .mockResolvedValueOnce({
@@ -378,6 +511,87 @@ describe("canonical Human profile", () => {
     expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
       authorityBindingB,
     );
+  });
+
+  it.each([
+    "profile read fails",
+    "profile identity mismatches",
+  ])("keeps a replacement authority coherent when %s", async (outcome) => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValue({
+        authenticated: true,
+        authorityBindingId: authorityBindingB,
+        user: { id: "user-a", displayName: "Session B" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new TypeError("disconnected"),
+    );
+    if (outcome === "profile read fails") {
+      authMocks.getSumiProfile.mockRejectedValue(
+        new Error("profile unavailable"),
+      );
+    } else {
+      authMocks.getSumiProfile.mockResolvedValue({
+        participant: { kind: "human", humanId: "user-b" },
+        displayName: "Wrong Human",
+        tagline: "",
+      });
+    }
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    authMocks.bindDirectChatAuthority.mockClear();
+    authMocks.clearDirectChatAuthority.mockClear();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("profile-update-result")).toHaveTextContent(
+        "indeterminate",
+      );
+    });
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "authenticated",
+    );
+    expect(screen.getByTestId("user-id")).toHaveTextContent("user-a");
+    expect(screen.getByTestId("display-name")).toHaveTextContent("Session B");
+    expect(screen.getByTestId("authority-binding")).toHaveTextContent(
+      authorityBindingB,
+    );
+    expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
+      authorityBindingB,
+    );
+    expect(authMocks.clearDirectChatAuthority).not.toHaveBeenCalled();
+
+    authMocks.bindDirectChatAuthority.mockClear();
+    authMocks.getSumiProfile.mockResolvedValue({
+      participant: { kind: "human", humanId: "user-a" },
+      displayName: "After",
+      tagline: "",
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("profile-update-result")).toHaveTextContent(
+        "succeeded",
+      );
+    });
+    expect(authMocks.bindDirectChatAuthority).not.toHaveBeenCalled();
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(3);
   });
 
   it("publishes a replacement authority even when the rename did not commit", async () => {

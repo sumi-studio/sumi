@@ -759,10 +759,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           updatedUser = await updateSumiProfile(requested);
         } catch (error) {
           if (!isCurrentGeneration(generation)) return null;
-          if (
-            error instanceof AuthAPIError &&
-            (error.status < 200 || error.status >= 300)
-          ) {
+          if (isDefinitiveProfileUpdateRejection(error)) {
             throw error;
           }
           let reconciled: SumiSessionStatus;
@@ -782,31 +779,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             !reconciled.authenticated ||
             reconciled.user.id !== current.user.id
           ) {
-            const authorityCleared = clearDirectChatAuthority();
-            serverSession.current = { authenticated: false };
-            setSession({ authenticated: false });
-            setSessionState(
-              !reconciled.authenticated && authorityCleared
-                ? "unauthenticated"
-                : "unavailable",
-            );
+            flushSync(() => {
+              const authorityCleared = clearDirectChatAuthority();
+              serverSession.current = { authenticated: false };
+              setSession({ authenticated: false });
+              setSessionState(
+                !reconciled.authenticated && authorityCleared
+                  ? "unauthenticated"
+                  : "unavailable",
+              );
+            });
             throw new SumiProfileUpdateIndeterminateError(error);
           }
-          if (reconciled.authorityBindingId !== current.authorityBindingId) {
-            try {
-              bindDirectChatAuthority(reconciled.authorityBindingId);
-            } catch (bindingError) {
+          try {
+            flushSync(() => {
+              if (
+                reconciled.authorityBindingId !== current.authorityBindingId
+              ) {
+                bindDirectChatAuthority(reconciled.authorityBindingId);
+              }
+              serverSession.current = reconciled;
+              setSession(reconciled);
+              setSessionState("authenticated");
+            });
+          } catch (bindingError) {
+            flushSync(() => {
               clearDirectChatAuthority();
               serverSession.current = { authenticated: false };
               setSession({ authenticated: false });
               setSessionState("unavailable");
-              throw new SumiProfileUpdateIndeterminateError(
-                new AggregateError(
-                  [error, bindingError],
-                  "Profile reconciliation could not replace browser authority.",
-                ),
-              );
-            }
+            });
+            throw new SumiProfileUpdateIndeterminateError(
+              new AggregateError(
+                [error, bindingError],
+                "Profile reconciliation could not replace browser authority.",
+              ),
+            );
           }
           let reconciledProfile: ConfirmedSumiProfile;
           try {
@@ -843,12 +851,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             reconciledProfile.tagline === requested.tagline;
           if (displayNameMatches && taglineMatches) {
             return reconciledProfile;
-          }
-          if (
-            requested.tagline === undefined &&
-            reconciledProfile.displayName === current.user.displayName
-          ) {
-            throw error;
           }
           throw new SumiProfileUpdateIndeterminateError(error);
         }
@@ -1008,6 +1010,16 @@ export function classifySessionFailure(error: unknown): AuthSessionState {
     }
   }
   return "unavailable";
+}
+
+function isDefinitiveProfileUpdateRejection(error: unknown): boolean {
+  return (
+    error instanceof AuthAPIError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429
+  );
 }
 
 function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
