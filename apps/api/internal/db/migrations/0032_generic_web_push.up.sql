@@ -1,6 +1,14 @@
--- Generic closed-tab Web Push. Notification decisions remain in
--- message_notification_intents; these tables only own the deployment key and
--- browser delivery endpoints.
+-- Generic closed-tab Web Push. Bind every Human notification intent to the
+-- exact membership tenure that admitted it. A later rejoin by the same Human
+-- gets new tenure IDs and cannot revive an old delivery decision.
+
+ALTER TABLE message_notification_intents
+    ADD COLUMN recipient_workspace_member_id uuidv7 NOT NULL
+        REFERENCES workspace_members(workspace_member_id),
+    ADD COLUMN recipient_place_member_id uuidv7
+        REFERENCES place_members(place_member_id);
+
+-- These tables own only the deployment key and browser delivery endpoints.
 
 CREATE TABLE push_vapid_keys (
     singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),

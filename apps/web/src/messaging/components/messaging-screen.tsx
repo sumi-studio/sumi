@@ -22,7 +22,7 @@ import {
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
-import { enablePushSubscription } from "../push";
+import { enablePushSubscription, isPushSupported } from "../push";
 import { getMessagingScope, useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
@@ -103,7 +103,9 @@ function NotificationPermissionBanner() {
     isPermissionPromptDismissed(),
   );
 
-  if (!enabled || dismissed || permission !== "default") return null;
+  if (!enabled || !isPushSupported() || dismissed || permission !== "default") {
+    return null;
+  }
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-border/70 border-b bg-accent/40 px-4 py-1.5 sm:px-5">

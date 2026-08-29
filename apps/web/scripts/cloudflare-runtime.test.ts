@@ -143,6 +143,12 @@ test("pinned Wrangler dry-run and local workerd enforce the production artifact"
         serviceWorker.headers.get("Content-Type") ?? "",
         /^(?:application|text)\/javascript/,
       );
+      const serviceWorkerSource = await serviceWorker.text();
+      assert.doesNotMatch(
+        serviceWorkerSource,
+        /\bconsole\s*\./,
+        "the Service Worker must not log routing pointers",
+      );
 
       const release = await manualFetch(origin, "/release.json");
       assert.equal(release.status, 200);
@@ -571,9 +577,136 @@ async function verifyThemeBootstrapInBrowser(origin: string): Promise<void> {
     );
     assert.deepEqual(themeResponses, [200]);
     assert.deepEqual(cspErrors, []);
+    await page.close();
+    await verifyClosedTabGenericPush(browser, origin);
   } finally {
     await browser.close();
   }
+}
+
+async function verifyClosedTabGenericPush(
+  browser: Awaited<ReturnType<typeof chromium.launch>>,
+  origin: string,
+): Promise<void> {
+  const context = await browser.newContext();
+  // Chrome exposes the ServiceWorker domain on a page target rather than the
+  // browser target. Keep one about:blank control target in the same context;
+  // the Sumi-origin page itself is still closed before delivery.
+  const controlPage = await context.newPage();
+  const cdp = await context.newCDPSession(controlPage);
+  const registrations = new Map<
+    string,
+    { registrationId: string; scopeURL: string; isDeleted: boolean }
+  >();
+  const consoleMessages: string[] = [];
+  context.on("console", (message) => consoleMessages.push(message.text()));
+  cdp.on(
+    "ServiceWorker.workerRegistrationUpdated",
+    ({ registrations: next }) => {
+      for (const registration of next) {
+        registrations.set(registration.registrationId, registration);
+      }
+    },
+  );
+  try {
+    await context.grantPermissions(["notifications"], { origin });
+    await cdp.send("ServiceWorker.enable");
+    const page = await context.newPage();
+    await page.goto(`${origin}/direct`, { waitUntil: "domcontentloaded" });
+    await page.evaluate(async () => {
+      await navigator.serviceWorker.register("/sw.js", {
+        scope: "/",
+        type: "module",
+      });
+      await navigator.serviceWorker.ready;
+    });
+    const registration = await waitForServiceWorkerRegistration(
+      registrations,
+      `${origin}/`,
+    );
+    await page.close();
+    assert.equal(
+      context.pages().filter((candidate) => candidate.url().startsWith(origin))
+        .length,
+      0,
+      "the push must be delivered with no Sumi page open",
+    );
+
+    const pointer = {
+      workspace_id: "workspace-private-pointer",
+      place_id: "place-private-pointer",
+      place_kind: "channel",
+    };
+    const delivery = {
+      origin,
+      registrationId: registration.registrationId,
+      data: JSON.stringify(pointer),
+    };
+    await cdp.send("ServiceWorker.deliverPushMessage", delivery);
+    await cdp.send("ServiceWorker.deliverPushMessage", delivery);
+
+    const inspectionPage = await context.newPage();
+    await inspectionPage.goto(`${origin}/direct`, {
+      waitUntil: "domcontentloaded",
+    });
+    await inspectionPage.waitForFunction(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      return (await registration?.getNotifications())?.length === 1;
+    });
+    const notifications = await inspectionPage.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      if (!registration) return [];
+      return (await registration.getNotifications()).map((notification) => ({
+        title: notification.title,
+        body: notification.body,
+        tag: notification.tag,
+        data: notification.data as unknown,
+      }));
+    });
+    assert.deepEqual(notifications, [
+      {
+        title: "Sumi",
+        body: "新しいメッセージがあります",
+        tag: "sumi:workspace-private-pointer:channel:place-private-pointer",
+        data: {
+          url: "/w/workspace-private-pointer/messaging/c/place-private-pointer",
+        },
+      },
+    ]);
+    const visible = `${notifications[0]?.title}\n${notifications[0]?.body}`;
+    assert.doesNotMatch(
+      visible,
+      /workspace-private-pointer|place-private-pointer|participant|attachment/i,
+    );
+    assert.doesNotMatch(
+      consoleMessages.join("\n"),
+      /workspace-private-pointer|place-private-pointer/,
+      "routing pointers must not reach browser console output",
+    );
+  } finally {
+    await cdp.send("ServiceWorker.disable").catch(() => undefined);
+    await cdp.detach().catch(() => undefined);
+    await context.close();
+  }
+}
+
+async function waitForServiceWorkerRegistration(
+  registrations: ReadonlyMap<
+    string,
+    { registrationId: string; scopeURL: string; isDeleted: boolean }
+  >,
+  scopeURL: string,
+): Promise<{ registrationId: string; scopeURL: string; isDeleted: boolean }> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    for (const registration of registrations.values()) {
+      if (registration.scopeURL === scopeURL && !registration.isDeleted) {
+        return registration;
+      }
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  throw new Error(`Service Worker registration did not appear for ${scopeURL}`);
 }
 
 async function availablePort(): Promise<number> {

@@ -77,6 +77,10 @@ func (n NotificationSetting) LevelFor(placeID string) string {
 type NotificationDecision struct {
 	Participant ParticipantRef
 	Reason      string
+	// Delivery is bound to the membership tenure that existed when the message
+	// and its notification intent committed. These fields are never serialized.
+	workspaceMemberID string
+	placeMemberID     string
 }
 
 // ErrInvalidNotificationSetting marks a setting the caller shaped wrongly (an

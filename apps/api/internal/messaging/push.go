@@ -2,17 +2,26 @@ package messaging
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
+	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
 
 const (
@@ -22,6 +31,8 @@ const (
 	maxPushSubscriptionsPerHuman = 8
 	pushTTL                      = 3600
 	pushDeliveryTimeout          = 20 * time.Second
+	pushEndpointDeliveryTimeout  = 10 * time.Second
+	pushFanoutConcurrency        = 4
 	pushSessionCleanupTimeout    = 500 * time.Millisecond
 )
 
@@ -105,8 +116,8 @@ func (s *ScopedStore) SavePushSubscription(
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", owner.ID); err != nil {
 		return PushSubscription{}, fmt.Errorf("lock push owner: %w", err)
 	}
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint); err != nil {
-		return PushSubscription{}, fmt.Errorf("lock push endpoint: %w", err)
+	if err := lockAndPurgeExpiredPushSubscriptions(ctx, tx, owner.ID, endpoint); err != nil {
+		return PushSubscription{}, err
 	}
 	var otherEndpoints int
 	if err := tx.QueryRow(ctx, `
@@ -171,6 +182,57 @@ func (s *ScopedStore) SavePushSubscription(
 		return PushSubscription{}, fmt.Errorf("commit push subscription save: %w", err)
 	}
 	return subscription, nil
+}
+
+// lockAndPurgeExpiredPushSubscriptions lazily bounds durable endpoint state at
+// the next save by this Human. Endpoint locks preserve the same transfer/send
+// fence as normal ownership changes; a global janitor is unnecessary.
+func lockAndPurgeExpiredPushSubscriptions(
+	ctx context.Context,
+	tx pgx.Tx,
+	humanID, currentEndpoint string,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT endpoint FROM push_subscriptions
+		WHERE human_id = $1 AND session_expires_at <= now()
+		ORDER BY endpoint`, humanID)
+	if err != nil {
+		return fmt.Errorf("list expired push subscriptions: %w", err)
+	}
+	endpoints := []string{currentEndpoint}
+	for rows.Next() {
+		var endpoint string
+		if err := rows.Scan(&endpoint); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan expired push subscription: %w", err)
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate expired push subscriptions: %w", err)
+	}
+	rows.Close()
+	sort.Strings(endpoints)
+	last := ""
+	for _, endpoint := range endpoints {
+		if endpoint == last {
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			"SELECT pg_advisory_xact_lock(hashtext($1))", endpoint,
+		); err != nil {
+			return fmt.Errorf("lock push endpoint: %w", err)
+		}
+		last = endpoint
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM push_subscriptions
+		WHERE session_expires_at <= now()
+		  AND (human_id = $1 OR endpoint = $2)`, humanID, currentEndpoint); err != nil {
+		return fmt.Errorf("purge expired push subscriptions: %w", err)
+	}
+	return nil
 }
 
 func (s *ScopedStore) DeletePushSubscription(
@@ -337,11 +399,12 @@ type pushHTTPClient interface {
 }
 
 type PushDispatcher struct {
-	store    *Store
-	sessions agentevents.BrowserSessionIdentityAuthorizer
-	keys     VAPIDKeys
-	subject  string
-	client   pushHTTPClient
+	store           *Store
+	sessions        agentevents.BrowserSessionIdentityAuthorizer
+	keys            VAPIDKeys
+	subject         string
+	client          pushHTTPClient
+	endpointTimeout time.Duration
 }
 
 func NewPushDispatcher(
@@ -367,6 +430,7 @@ func NewPushDispatcher(
 	return &PushDispatcher{
 		store: store, sessions: sessions, keys: keys,
 		subject: normalized, client: newPushHTTPClient(),
+		endpointTimeout: pushEndpointDeliveryTimeout,
 	}, nil
 }
 
@@ -376,6 +440,12 @@ func normalizeVAPIDSubject(subject string) (string, error) {
 		return "", nil
 	}
 	if strings.HasPrefix(subject, "https://") {
+		parsed, err := url.ParseRequestURI(subject)
+		if err != nil || strings.Contains(subject, "#") || !parsed.IsAbs() || parsed.Scheme != "https" ||
+			parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil ||
+			parsed.Fragment != "" || parsed.Opaque != "" {
+			return "", errors.New("VAPID subject must be a mailto: address or absolute HTTPS URL")
+		}
 		return subject, nil
 	}
 	if strings.HasPrefix(subject, "mailto:") {
@@ -415,8 +485,15 @@ func (s *ScopedStore) deliverPush(
 }
 
 type pushDelivery struct {
-	subscription PushSubscription
-	payload      []byte
+	subscription      PushSubscription
+	payload           []byte
+	workspaceID       string
+	installationID    string
+	authorityEpoch    int64
+	placeID           string
+	placeKind         string
+	workspaceMemberID string
+	placeMemberID     string
 }
 
 func (d *PushDispatcher) deliver(
@@ -432,15 +509,17 @@ func (d *PushDispatcher) deliver(
 		liveBoundary{placeID: place.PlaceID},
 		false,
 		func(tx pgx.Tx, audience map[ParticipantRef]struct{}) error {
-			humans := make([]ParticipantRef, 0, len(decisions))
+			humans := make([]NotificationDecision, 0, len(decisions))
+			recipients := make([]ParticipantRef, 0, len(decisions))
 			for _, decision := range decisions {
 				if decision.Participant.Kind == KindHuman {
 					if _, allowed := audience[decision.Participant]; allowed {
-						humans = append(humans, decision.Participant)
+						humans = append(humans, decision)
+						recipients = append(recipients, decision.Participant)
 					}
 				}
 			}
-			subscriptions, err := d.store.pushSubscriptionsForWith(ctx, tx, humans)
+			subscriptions, err := d.store.pushSubscriptionsForWith(ctx, tx, recipients)
 			if err != nil {
 				return err
 			}
@@ -452,14 +531,9 @@ func (d *PushDispatcher) deliver(
 			if err != nil {
 				return fmt.Errorf("encode generic push payload: %w", err)
 			}
-			for _, human := range humans {
-				for _, subscription := range subscriptions[human.Key()] {
-					deliveries = append(deliveries, pushDelivery{
-						subscription: subscription,
-						payload:      payload,
-					})
-				}
-			}
+			deliveries = append(deliveries, pushDeliveriesRoundRobin(
+				scope, place, humans, subscriptions, payload,
+			)...)
 			return nil
 		},
 	)
@@ -467,9 +541,84 @@ func (d *PushDispatcher) deliver(
 		log.Printf("messaging push: reauthorize audience: %v", err)
 		return
 	}
-	for _, delivery := range deliveries {
-		d.send(ctx, delivery)
+	d.sendDeliveries(ctx, deliveries)
+}
+
+// pushDeliveriesRoundRobin prevents one Human's maximum device set from
+// occupying every worker for consecutive timeout waves. Each active Human's
+// first endpoint is attempted before any Human's second endpoint.
+func pushDeliveriesRoundRobin(
+	scope Scope,
+	place Place,
+	humans []NotificationDecision,
+	subscriptions map[string][]PushSubscription,
+	payload []byte,
+) []pushDelivery {
+	deliveries := make([]pushDelivery, 0)
+	for endpointIndex := 0; ; endpointIndex++ {
+		appended := false
+		for _, human := range humans {
+			owned := subscriptions[human.Participant.Key()]
+			if endpointIndex >= len(owned) {
+				continue
+			}
+			deliveries = append(deliveries, pushDelivery{
+				subscription:      owned[endpointIndex],
+				payload:           payload,
+				workspaceID:       scope.WorkspaceID,
+				installationID:    scope.InstallationID,
+				authorityEpoch:    scope.AuthorityEpoch,
+				placeID:           place.PlaceID,
+				placeKind:         place.Kind,
+				workspaceMemberID: human.workspaceMemberID,
+				placeMemberID:     human.placeMemberID,
+			})
+			appended = true
+		}
+		if !appended {
+			return deliveries
+		}
 	}
+}
+
+func (d *PushDispatcher) sendDeliveries(ctx context.Context, deliveries []pushDelivery) {
+	runBoundedPushFanout(ctx, deliveries, d.endpointTimeout, d.send)
+}
+
+func runBoundedPushFanout(
+	ctx context.Context,
+	deliveries []pushDelivery,
+	endpointTimeout time.Duration,
+	send func(context.Context, pushDelivery),
+) {
+	if len(deliveries) == 0 {
+		return
+	}
+	workers := min(pushFanoutConcurrency, len(deliveries))
+	jobs := make(chan pushDelivery)
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for delivery := range jobs {
+				endpointCtx, cancel := context.WithTimeout(ctx, endpointTimeout)
+				send(endpointCtx, delivery)
+				cancel()
+			}
+		}()
+	}
+	for _, delivery := range deliveries {
+		select {
+		case jobs <- delivery:
+		case <-ctx.Done():
+			close(jobs)
+			wait.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wait.Wait()
 }
 
 type pushEndpointSendLease struct {
@@ -493,6 +642,48 @@ func (d *PushDispatcher) acquirePushSendLease(
 		return nil, false, fmt.Errorf("begin push endpoint lease: %w", err)
 	}
 	lease := &pushEndpointSendLease{tx: tx}
+	address := Scope{
+		WorkspaceID:    delivery.workspaceID,
+		InstallationID: delivery.installationID,
+		AuthorityEpoch: delivery.authorityEpoch,
+	}
+	if err := address.validateAddress(); err != nil {
+		lease.release()
+		return nil, false, nil
+	}
+	if d.store.workspaces == nil || d.store.apps == nil {
+		lease.release()
+		return nil, false, errors.New("push authority dependencies are unavailable")
+	}
+	if err := d.store.workspaces.LockSharedInTx(ctx, tx, delivery.workspaceID); err != nil {
+		lease.release()
+		if errors.Is(err, workspacecontrol.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("lock push workspace: %w", err)
+	}
+	if _, err := d.store.apps.RequireEnabledInstallationEpochInTx(
+		ctx,
+		tx,
+		delivery.installationID,
+		delivery.authorityEpoch,
+		applicationapps.WorkspaceOwner(delivery.workspaceID),
+		MessagingAppID,
+	); err != nil {
+		lease.release()
+		if errors.Is(err, applicationapps.ErrInstallationNotFound) ||
+			errors.Is(err, applicationapps.ErrAppDisabled) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("lock push installation: %w", err)
+	}
+	if ok, err := lockExactPushAudience(ctx, tx, delivery); err != nil {
+		lease.release()
+		return nil, false, err
+	} else if !ok {
+		lease.release()
+		return nil, false, nil
+	}
 	if _, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock(hashtext($1))",
 		delivery.subscription.Endpoint,
@@ -520,6 +711,84 @@ func (d *PushDispatcher) acquirePushSendLease(
 		return nil, false, fmt.Errorf("recheck push subscription: %w", err)
 	}
 	return lease, true, nil
+}
+
+// lockExactPushAudience fences the network send against removal of the exact
+// tenure that created the intent. Remove/leave takes FOR UPDATE on these rows;
+// whichever side acquires its lock first defines whether this send may start.
+func lockExactPushAudience(ctx context.Context, tx pgx.Tx, delivery pushDelivery) (bool, error) {
+	if delivery.workspaceID == "" || delivery.workspaceMemberID == "" ||
+		delivery.placeID == "" {
+		return false, nil
+	}
+	var locked string
+	err := tx.QueryRow(ctx, `
+		SELECT workspace_member_id FROM workspace_members
+		WHERE workspace_member_id = $1 AND workspace_id = $2
+		  AND member_kind = 'human' AND member_id = $3 AND left_at IS NULL
+		FOR SHARE`,
+		delivery.workspaceMemberID,
+		delivery.workspaceID,
+		delivery.subscription.Human.ID,
+	).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock push workspace tenure: %w", err)
+	}
+	switch delivery.placeKind {
+	case PlaceChannel:
+		return delivery.placeMemberID == "", nil
+	case PlaceDM, PlaceGroupDM:
+		if delivery.placeMemberID == "" {
+			return false, nil
+		}
+		err = tx.QueryRow(ctx, `
+			SELECT place_member_id FROM place_members
+			WHERE place_member_id = $1 AND workspace_id = $2 AND place_id = $3
+			  AND workspace_member_id = $4
+			  AND member_kind = 'human' AND member_id = $5 AND left_at IS NULL
+			FOR SHARE`,
+			delivery.placeMemberID,
+			delivery.workspaceID,
+			delivery.placeID,
+			delivery.workspaceMemberID,
+			delivery.subscription.Human.ID,
+		).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("lock push place tenure: %w", err)
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func pushSendFailureReason(err error) string {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostnameError x509.HostnameError
+	var certificateInvalid x509.CertificateInvalidError
+	var recordHeader tls.RecordHeaderError
+	if errors.As(err, &unknownAuthority) || errors.As(err, &hostnameError) ||
+		errors.As(err, &certificateInvalid) || errors.As(err, &recordHeader) {
+		return "tls"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return "timeout"
+	}
+	return "transport"
 }
 
 func (d *PushDispatcher) send(ctx context.Context, delivery pushDelivery) {
@@ -574,7 +843,7 @@ func (d *PushDispatcher) send(ctx context.Context, delivery pushDelivery) {
 			log.Print("messaging push: destination refused by egress policy")
 			return
 		}
-		log.Printf("messaging push: send: %v", sendErr)
+		log.Printf("messaging push: send failed (%s)", pushSendFailureReason(sendErr))
 		return
 	}
 	if response == nil {
@@ -635,9 +904,26 @@ type pushSubscriptionWire struct {
 	} `json:"keys"`
 }
 
+func requirePushJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	values := r.Header.Values("Content-Type")
+	if len(values) != 1 {
+		writeError(w, http.StatusUnsupportedMediaType, "application_json_required")
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(values[0])
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "application_json_required")
+		return false
+	}
+	return true
+}
+
 func (s *Server) serveSavePushSubscription(w http.ResponseWriter, r *http.Request) {
 	_, claims, ok := s.viewer(w, r)
 	if !ok {
+		return
+	}
+	if !requirePushJSONContentType(w, r) {
 		return
 	}
 	if s.Push == nil {
@@ -673,6 +959,9 @@ func (s *Server) serveSavePushSubscription(w http.ResponseWriter, r *http.Reques
 func (s *Server) serveDeletePushSubscription(w http.ResponseWriter, r *http.Request) {
 	_, claims, ok := s.viewer(w, r)
 	if !ok {
+		return
+	}
+	if !requirePushJSONContentType(w, r) {
 		return
 	}
 	var request struct {
