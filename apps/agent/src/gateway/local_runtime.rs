@@ -2164,8 +2164,14 @@ fn validate_messaging_poll_message(
             || poll.allow_multi != creation.allow_multi
             || poll.closes_at.is_null() == creation.has_deadline
             || message.content != creation.content.unwrap_or_default()
+            || message.urgency != "normal"
+            || message.revision != 1
+            || !message.edited_at.is_null()
+            || !message.reactions.is_empty()
             || !message.attachments.is_empty()
             || !message.reply_to.is_null()
+            || poll.revision != 0
+            || poll.options.iter().any(|option| !option.voters.is_empty())
         {
             bail!("Messaging poll creation receipt differs from its exact request");
         }
@@ -5987,6 +5993,85 @@ mod tests {
             }
             assert_eq!(*attempts.lock().unwrap(), 1);
             server.abort();
+        }
+    }
+
+    #[test]
+    fn messaging_poll_fresh_receipt_rejects_preexisting_mutation_state() {
+        let options = vec!["Today".to_owned(), "Tomorrow".to_owned()];
+        let request = CreateMessagingPollRequest {
+            place_id: POLL_PLACE_ID,
+            question: "When?",
+            options: &options,
+            allow_multi: false,
+            content: None,
+            client_nonce: "fresh-create-state",
+            closes_in_minutes: None,
+        };
+        let message = canonical_poll_message(CanonicalPollMessageInput {
+            place_id: POLL_PLACE_ID,
+            message_id: POLL_MESSAGE_ID,
+            nonce: request.client_nonce,
+            question: request.question,
+            options: &options,
+            allow_multi: false,
+            content: "",
+            poll_revision: 0,
+            selected: &[],
+            has_deadline: false,
+        });
+        let receipt = |message| MessagingCreatePollResponse {
+            client_nonce: request.client_nonce.to_owned(),
+            message_id: POLL_MESSAGE_ID.to_owned(),
+            seq: 9,
+            message,
+            created: true,
+        };
+        validate_messaging_poll_creation_response(
+            StatusCode::CREATED,
+            &receipt(message.clone()),
+            &request,
+            PAID,
+        )
+        .expect("canonical fresh create state");
+
+        for (case, pointer, value) in [
+            ("urgency", "/urgency", serde_json::json!("urgent")),
+            ("message revision", "/revision", serde_json::json!(2)),
+            (
+                "edited timestamp",
+                "/edited_at",
+                serde_json::json!("2026-08-30T00:01:00Z"),
+            ),
+            (
+                "reaction",
+                "/reactions",
+                serde_json::json!([{"emoji": "👍", "participants": []}]),
+            ),
+            ("poll revision", "/poll/revision", serde_json::json!(1)),
+            (
+                "preexisting voter",
+                "/poll/options/0/voters",
+                serde_json::json!([{
+                    "kind": "personality_agent",
+                    "personality_agent_id": PAID
+                }]),
+            ),
+        ] {
+            let mut malformed = message.clone();
+            *malformed
+                .pointer_mut(pointer)
+                .expect("canonical poll fixture path") = value;
+            assert!(
+                validate_messaging_poll_creation_response(
+                    StatusCode::CREATED,
+                    &receipt(malformed),
+                    &request,
+                    PAID,
+                )
+                .is_err(),
+                "fresh create accepted {case}"
+            );
         }
     }
 
