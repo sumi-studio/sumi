@@ -461,6 +461,97 @@ impl LocalControlHttpClient {
         Ok((status, body))
     }
 
+    async fn post_messaging_notification_settings_update<Request, Response>(
+        &self,
+        path: &str,
+        body: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        const OPERATION: &str = "Messaging notification settings update";
+
+        // Keep failures before execute() terminal: the request cannot have
+        // reached the server before its credential, URL, body, and transport
+        // identity have all been validated.
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let url = self
+            .base_url
+            .join(path)
+            .context("join local control endpoint URL")?;
+        let mut request = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .json(body);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request.build().context("build local control request")?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint.revalidate()?;
+        }
+
+        // Once execute() begins, a transport failure or lost/malformed
+        // response cannot prove that the server did not commit the mutation.
+        let response = http.execute(request).await.map_err(|error| {
+            MessagingApiFailure::indeterminate(
+                OPERATION,
+                format!("transport failed after request admission: {error}"),
+            )
+        })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_LOCAL_CONTROL_RESPONSE_BYTES as u64)
+        {
+            return Err(MessagingApiFailure::indeterminate(
+                OPERATION,
+                "response exceeded its bounded size after request admission",
+            )
+            .into());
+        }
+        let mut response_body = Zeroizing::new(Vec::new());
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                MessagingApiFailure::indeterminate(
+                    OPERATION,
+                    format!("response body was incomplete after request admission: {error}"),
+                )
+            })?;
+            if response_body.len().saturating_add(chunk.len()) > MAX_LOCAL_CONTROL_RESPONSE_BYTES {
+                return Err(MessagingApiFailure::indeterminate(
+                    OPERATION,
+                    "response exceeded its bounded size after request admission",
+                )
+                .into());
+            }
+            response_body.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(messaging_mutation_rejection(
+                status,
+                response_body.as_slice(),
+                OPERATION,
+            ));
+        }
+        serde_json::from_slice(response_body.as_slice()).map_err(|error| {
+            MessagingApiFailure::indeterminate(
+                OPERATION,
+                format!("committed success response was malformed: {error}"),
+            )
+            .into()
+        })
+    }
+
     async fn post_runtime_state(
         &self,
         publication: &LocalRuntimeStatePublication,
@@ -1037,11 +1128,15 @@ impl MessagingApi for LocalControlHttpClient {
         scope: &ExactMessagingScope,
         request: MessagingNotificationSettingsRequest<'_>,
     ) -> Result<serde_json::Value> {
-        self.post_json(
-            "/local-control/v1/messaging:notification-settings",
-            &ScopedMessagingRequest::new(scope, request),
-        )
-        .await
+        const PATH: &str = "/local-control/v1/messaging:notification-settings";
+        let changes_setting = request.changes_setting();
+        let request = ScopedMessagingRequest::new(scope, request);
+        if changes_setting {
+            self.post_messaging_notification_settings_update(PATH, &request)
+                .await
+        } else {
+            self.post_json(PATH, &request).await
+        }
     }
 }
 
@@ -3851,6 +3946,18 @@ mod tests {
         body: Vec<u8>,
     }
 
+    #[derive(Clone, Copy)]
+    enum NotificationSettingsMutationFailureFixture {
+        ResponseLoss,
+        MalformedSuccess,
+    }
+
+    #[derive(Clone)]
+    struct NotificationSettingsMutationFixtureState {
+        behavior: NotificationSettingsMutationFailureFixture,
+        committed_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
     type MessagingReplayRequest = (String, String, Vec<u8>);
 
     #[test]
@@ -4151,6 +4258,20 @@ mod tests {
             .header("content-type", response.content_type)
             .body(axum::body::Body::from(response.body))
             .expect("fixture response")
+    }
+
+    async fn notification_settings_mutation_failure_fixture(
+        State(state): State<NotificationSettingsMutationFixtureState>,
+        body: Bytes,
+    ) -> Response {
+        let request = serde_json::from_slice(&body).expect("valid notification setting request");
+        state.committed_requests.lock().unwrap().push(request);
+        match state.behavior {
+            NotificationSettingsMutationFailureFixture::ResponseLoss => committed_response_loss(),
+            NotificationSettingsMutationFailureFixture::MalformedSuccess => {
+                (StatusCode::OK, "not-json").into_response()
+            }
+        }
     }
 
     async fn write_with_fixture_response(
@@ -5168,6 +5289,67 @@ mod tests {
         assert_eq!(requests[3].1["per_place"], serde_json::json!([]));
         assert_eq!(requests[3].1["keywords"], serde_json::json!([]));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn notification_settings_update_response_loss_and_corruption_are_indeterminate() {
+        for behavior in [
+            NotificationSettingsMutationFailureFixture::ResponseLoss,
+            NotificationSettingsMutationFailureFixture::MalformedSuccess,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = NotificationSettingsMutationFixtureState {
+                behavior,
+                committed_requests: Arc::new(StdMutex::new(Vec::new())),
+            };
+            let app = Router::new()
+                .route(
+                    "/local-control/v1/messaging:notification-settings",
+                    post(notification_settings_mutation_failure_fixture),
+                )
+                .with_state(state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let expected = authority();
+            let credential = LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let client = LocalControlHttpClient::new_loopback(
+                format!("http://{address}/"),
+                expected,
+                credential,
+            )
+            .unwrap();
+
+            let error = client
+                .notification_settings(
+                    &messaging_scope(),
+                    MessagingNotificationSettingsRequest {
+                        defaults_level: None,
+                        per_place: None,
+                        keywords: Some(vec!["release"]),
+                    },
+                )
+                .await
+                .expect_err("a committed update without a valid response is indeterminate");
+            assert_eq!(
+                error
+                    .downcast_ref::<MessagingApiFailure>()
+                    .expect("typed Messaging failure")
+                    .class(),
+                MessagingApiFailureClass::Indeterminate
+            );
+            let committed = state.committed_requests.lock().unwrap();
+            assert_eq!(committed.len(), 1);
+            assert_eq!(committed[0]["keywords"], serde_json::json!(["release"]));
+            drop(committed);
+            server.abort();
+        }
     }
 
     #[tokio::test]

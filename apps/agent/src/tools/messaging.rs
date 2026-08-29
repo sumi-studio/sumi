@@ -1621,13 +1621,25 @@ impl MessagingTool {
                 let words = keywords
                     .as_ref()
                     .map(|words| words.iter().map(String::as_str).collect());
-                tokio::select! {
-                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
-                    result = self.api.notification_settings(scope, MessagingNotificationSettingsRequest {
-                        defaults_level: defaults_level.map(notify_level_text),
-                        per_place: places,
-                        keywords: words,
-                    }) => result,
+                let request = MessagingNotificationSettingsRequest {
+                    defaults_level: defaults_level.map(notify_level_text),
+                    per_place: places,
+                    keywords: words,
+                };
+                let changes_setting = request.changes_setting();
+                if changes_setting {
+                    // Cancellation can still prevent an update before it is
+                    // emitted. Once emission begins, await the response so a
+                    // committed setting is never reported as cancelled.
+                    if execution.cancel.is_cancelled() {
+                        return Err(ToolError::Cancelled);
+                    }
+                    self.api.notification_settings(scope, request).await
+                } else {
+                    tokio::select! {
+                        _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                        result = self.api.notification_settings(scope, request) => result,
+                    }
                 }
                 .map_err(map_messaging_api_error)?
             }
@@ -3245,6 +3257,8 @@ mod tests {
         promises: AsyncMutex<Vec<RecordedReplyLater>>,
         resolutions: AsyncMutex<Vec<String>>,
         notification_requests: AsyncMutex<Vec<Value>>,
+        notification_gate: AsyncMutex<Option<Arc<Semaphore>>>,
+        notification_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
         search_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
@@ -3639,9 +3653,7 @@ mod tests {
             request: MessagingNotificationSettingsRequest<'_>,
         ) -> Result<Value> {
             self.record_scope(scope).await;
-            let changed = request.defaults_level.is_some()
-                || request.per_place.is_some()
-                || request.keywords.is_some();
+            let changed = request.changes_setting();
             self.calls.lock().await.push(format!(
                 "notification_settings:{}",
                 if changed { "set" } else { "read" }
@@ -3654,6 +3666,25 @@ mod tests {
                     .collect::<Vec<_>>()),
                 "keywords": request.keywords,
             }));
+            if let Some(gate) = self.notification_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("test notification setting gate remains open")
+                    .forget();
+            }
+            if let Some(class) = *self.notification_failure_class.lock().await {
+                let failure = match class {
+                    MessagingApiFailureClass::Terminal => MessagingApiFailure::terminal(
+                        "test notification settings",
+                        "configured terminal failure",
+                    ),
+                    MessagingApiFailureClass::Indeterminate => MessagingApiFailure::indeterminate(
+                        "test notification settings",
+                        "configured indeterminate failure",
+                    ),
+                };
+                return Err(failure.into());
+            }
             Ok(json!({"setting": {
                 "owner": {"kind": "personality_agent", "personality_agent_id": "agent-1"},
                 "defaults": {"level": request.defaults_level.unwrap_or("all")},
@@ -5062,6 +5093,121 @@ mod tests {
                 .expect_err("invalid search or notification setting must not bind");
             assert_eq!(error, DescribeError::InvalidArguments, "case {id}");
         }
+    }
+
+    #[tokio::test]
+    async fn notification_settings_update_settles_after_emission_while_read_remains_cancellable() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let registry = Arc::new(registry);
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+
+        let update = registry
+            .bind(
+                &tool_call(
+                    "notification-update-cancel",
+                    json!({"action": "notification_settings", "keywords": ["release"]}),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind notification setting update");
+        let update = crate::approval::authority::AuthorizedBoundInvocation::for_test(update);
+        let gate = Arc::new(Semaphore::new(0));
+        *api.notification_gate.lock().await = Some(gate.clone());
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .execute_bound(update, cancel, Arc::new(|_| {}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api.notification_requests.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notification setting update reaches its response gate");
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !execution.is_finished(),
+            "post-emission cancellation must not hide a committed setting update"
+        );
+        gate.add_permits(1);
+        execution
+            .await
+            .expect("update execution task joins")
+            .expect("setting update settles after cancellation");
+
+        let read = registry
+            .bind(
+                &tool_call(
+                    "notification-read-cancel",
+                    json!({"action": "notification_settings"}),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind notification setting read");
+        let read = crate::approval::authority::AuthorizedBoundInvocation::for_test(read);
+        let read_gate = Arc::new(Semaphore::new(0));
+        *api.notification_gate.lock().await = Some(read_gate);
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move { registry.execute_bound(read, cancel, Arc::new(|_| {})).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api.notification_requests.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notification setting read reaches its cancellation gate");
+        cancel.cancel();
+        let error = match execution.await.expect("read execution task joins") {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled notification setting read must fail"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn indeterminate_notification_settings_update_stays_typed() {
+        let (api, _tool, registry) = binding_fixture().await;
+        *api.notification_failure_class.lock().await =
+            Some(MessagingApiFailureClass::Indeterminate);
+
+        let error = match execute_bound_action(
+            &registry,
+            "notification-update-indeterminate",
+            json!({"action": "notification_settings", "keywords": ["release"]}),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("indeterminate setting update must not mint a bound receipt"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::RpcIndeterminate(_))
+        ));
     }
 
     #[tokio::test]

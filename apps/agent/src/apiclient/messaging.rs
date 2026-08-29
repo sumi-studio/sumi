@@ -343,6 +343,12 @@ pub(crate) struct MessagingNotificationSettingsRequest<'a> {
     pub keywords: Option<Vec<&'a str>>,
 }
 
+impl MessagingNotificationSettingsRequest<'_> {
+    pub(crate) const fn changes_setting(&self) -> bool {
+        self.defaults_level.is_some() || self.per_place.is_some() || self.keywords.is_some()
+    }
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
     async fn overview(&self, scope: &ExactMessagingScope) -> Result<Value>;
