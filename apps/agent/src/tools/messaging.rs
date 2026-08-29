@@ -3912,6 +3912,8 @@ mod tests {
     type RecordedStatus = (String, Option<String>, Option<u32>);
     type RecordedReplyLater = (String, String, Option<String>, Option<u32>);
     type RecordedWrite = (String, String, String, Vec<String>);
+    type RecordedThreadCreate = (String, String, Option<String>, String);
+    type RecordedChannelUpdate = (String, Option<String>, Option<String>);
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedUpload {
@@ -4082,13 +4084,13 @@ mod tests {
         notification_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
         search_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
-        threads: AsyncMutex<Vec<(String, String, Option<String>, String)>>,
+        threads: AsyncMutex<Vec<RecordedThreadCreate>>,
         create_thread_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
         started_dm_nonces: AsyncMutex<Vec<Option<String>>>,
         created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
-        updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
+        updated_channels: AsyncMutex<Vec<RecordedChannelUpdate>>,
         duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
