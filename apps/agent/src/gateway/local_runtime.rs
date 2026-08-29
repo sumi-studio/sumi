@@ -198,6 +198,9 @@ struct MessagingAttachmentUploadWire {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessagingCreatePollResponse {
+    client_nonce: String,
+    message_id: String,
+    seq: u64,
     message: serde_json::Value,
     created: bool,
 }
@@ -1321,6 +1324,9 @@ impl MessagingApi for LocalControlHttpClient {
             )
             .await?;
         Ok(serde_json::json!({
+            "client_nonce": response.client_nonce,
+            "message_id": response.message_id,
+            "seq": response.seq,
             "message": response.message,
             "created": response.created,
         }))
@@ -1906,21 +1912,40 @@ fn validate_messaging_poll_creation_response(
     {
         bail!("Messaging poll creation response status/created mismatch");
     }
+    if response.client_nonce != request.client_nonce
+        || !is_canonical_uuid_v7(&response.message_id)
+        || response.seq == 0
+        || response.seq > i64::MAX as u64
+    {
+        bail!("Messaging poll creation response has an invalid stable receipt");
+    }
+    if !response.created {
+        if !response.message.is_null() {
+            bail!("Messaging poll replay receipt must contain an explicit null message");
+        }
+        return Ok(());
+    }
+    if response.message.is_null() {
+        bail!("fresh Messaging poll creation receipt omitted its full message");
+    }
     validate_messaging_poll_message(
         &response.message,
-        request.place_id,
-        None,
-        Some(request.client_nonce),
-        Some((
-            request.question,
-            request.options,
-            request.allow_multi,
-            request.closes_in_minutes.is_some(),
-            request.content,
-        )),
-        Some(expected_author_id),
-        None,
-        &[],
+        MessagingPollMessageExpectation {
+            place_id: request.place_id,
+            message_id: Some(response.message_id.as_str()),
+            seq: Some(response.seq),
+            nonce: Some(request.client_nonce),
+            creation: Some(MessagingPollCreationExpectation {
+                question: request.question,
+                options: request.options,
+                allow_multi: request.allow_multi,
+                has_deadline: request.closes_in_minutes.is_some(),
+                content: request.content,
+                author_id: expected_author_id,
+            }),
+            voter_id: None,
+            selected_option_ids: &[],
+        },
     )
 }
 
@@ -1935,33 +1960,50 @@ fn validate_messaging_poll_vote_response(
     }
     validate_messaging_poll_message(
         &response.message,
-        request.place_id,
-        Some(request.message_id),
-        None,
-        None,
-        None,
-        Some(expected_voter_id),
-        request.option_ids,
+        MessagingPollMessageExpectation {
+            place_id: request.place_id,
+            message_id: Some(request.message_id),
+            seq: None,
+            nonce: None,
+            creation: None,
+            voter_id: Some(expected_voter_id),
+            selected_option_ids: request.option_ids,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+struct MessagingPollCreationExpectation<'a> {
+    question: &'a str,
+    options: &'a [String],
+    allow_multi: bool,
+    has_deadline: bool,
+    content: Option<&'a str>,
+    author_id: &'a str,
+}
+
+struct MessagingPollMessageExpectation<'a> {
+    place_id: &'a str,
+    message_id: Option<&'a str>,
+    seq: Option<u64>,
+    nonce: Option<&'a str>,
+    creation: Option<MessagingPollCreationExpectation<'a>>,
+    voter_id: Option<&'a str>,
+    selected_option_ids: &'a [String],
+}
+
 fn validate_messaging_poll_message(
     message: &serde_json::Value,
-    expected_place_id: &str,
-    expected_message_id: Option<&str>,
-    expected_nonce: Option<&str>,
-    expected_poll: Option<(&str, &[String], bool, bool, Option<&str>)>,
-    expected_author_id: Option<&str>,
-    expected_voter_id: Option<&str>,
-    selected_option_ids: &[String],
+    expected: MessagingPollMessageExpectation<'_>,
 ) -> Result<()> {
     let message: MessagingPollMessageWire = serde_json::from_value(message.clone())
         .context("decode strict Messaging poll response message")?;
     if !is_canonical_uuid_v7(&message.message_id)
-        || expected_message_id.is_some_and(|expected| message.message_id != expected)
+        || expected
+            .message_id
+            .is_some_and(|expected| message.message_id != expected)
         || message.seq == 0
         || message.seq > i64::MAX as u64
+        || expected.seq.is_some_and(|expected| message.seq != expected)
         || message.revision == 0
         || message.revision > i64::MAX as u64
         || message.deleted
@@ -1970,12 +2012,14 @@ fn validate_messaging_poll_message(
     }
     let place_id = messaging_poll_place_id(&message.place)
         .context("Messaging poll response has an invalid place")?;
-    if place_id != expected_place_id || !is_canonical_uuid_v7(place_id) {
+    if place_id != expected.place_id || !is_canonical_uuid_v7(place_id) {
         bail!("Messaging poll response place mismatch");
     }
     let author = validate_messaging_poll_participant(&message.author)?;
-    if expected_author_id
-        .is_some_and(|expected| author.0 != "personality_agent" || author.1 != expected)
+    if expected
+        .creation
+        .as_ref()
+        .is_some_and(|creation| author.0 != "personality_agent" || author.1 != creation.author_id)
     {
         bail!("Messaging poll creation receipt author mismatch");
     }
@@ -2039,7 +2083,9 @@ fn validate_messaging_poll_message(
     if message.client_nonce.is_empty()
         || message.client_nonce.len() > 128
         || message.client_nonce.chars().any(char::is_control)
-        || expected_nonce.is_some_and(|expected| message.client_nonce != expected)
+        || expected
+            .nonce
+            .is_some_and(|expected| message.client_nonce != expected)
     {
         bail!("Messaging poll response nonce mismatch");
     }
@@ -2077,21 +2123,24 @@ fn validate_messaging_poll_message(
             if !voters.insert(voter) || (!poll.allow_multi && !single_choice_voters.insert(voter)) {
                 bail!("Messaging poll response contains inconsistent poll voters");
             }
-            if expected_voter_id
+            if expected
+                .voter_id
                 .is_some_and(|expected| voter.0 == "personality_agent" && voter.1 == expected)
             {
                 voter_option_ids.insert(option.option_id.as_str());
             }
         }
     }
-    if selected_option_ids
+    if expected
+        .selected_option_ids
         .iter()
         .any(|option_id| !option_ids.contains(option_id.as_str()))
     {
         bail!("Messaging poll vote response omitted a selected option");
     }
-    if expected_voter_id.is_some() {
-        let expected_option_ids = selected_option_ids
+    if expected.voter_id.is_some() {
+        let expected_option_ids = expected
+            .selected_option_ids
             .iter()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>();
@@ -2099,28 +2148,22 @@ fn validate_messaging_poll_message(
             bail!("Messaging poll vote receipt does not contain the exact replacement vote");
         }
     }
-    if let Some((
-        expected_question,
-        expected_options,
-        expected_allow_multi,
-        has_deadline,
-        expected_content,
-    )) = expected_poll
-    {
+    if let Some(creation) = expected.creation.as_ref() {
         let actual_options = poll
             .options
             .iter()
             .map(|option| option.text.as_str())
             .collect::<Vec<_>>();
-        if poll.question != expected_question
+        if poll.question != creation.question
             || actual_options
-                != expected_options
+                != creation
+                    .options
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>()
-            || poll.allow_multi != expected_allow_multi
-            || poll.closes_at.is_null() == has_deadline
-            || message.content != expected_content.unwrap_or_default()
+            || poll.allow_multi != creation.allow_multi
+            || poll.closes_at.is_null() == creation.has_deadline
+            || message.content != creation.content.unwrap_or_default()
             || !message.attachments.is_empty()
             || !message.reply_to.is_null()
         {
@@ -3797,18 +3840,32 @@ mod tests {
         format!("0198f0f4-9b72-7000-8000-{:012x}", 0x601 + index)
     }
 
-    fn canonical_poll_message(
-        place_id: &str,
-        message_id: &str,
-        nonce: &str,
-        question: &str,
-        options: &[String],
+    struct CanonicalPollMessageInput<'a> {
+        place_id: &'a str,
+        message_id: &'a str,
+        nonce: &'a str,
+        question: &'a str,
+        options: &'a [String],
         allow_multi: bool,
-        content: &str,
+        content: &'a str,
         poll_revision: u64,
-        selected: &[String],
+        selected: &'a [String],
         has_deadline: bool,
-    ) -> serde_json::Value {
+    }
+
+    fn canonical_poll_message(input: CanonicalPollMessageInput<'_>) -> serde_json::Value {
+        let CanonicalPollMessageInput {
+            place_id,
+            message_id,
+            nonce,
+            question,
+            options,
+            allow_multi,
+            content,
+            poll_revision,
+            selected,
+            has_deadline,
+        } = input;
         serde_json::json!({
             "message_id": message_id,
             "place": {"kind": "channel", "channel_id": place_id},
@@ -5160,30 +5217,13 @@ mod tests {
             return committed_response_loss();
         }
         drop(requests);
-        let options = request["options"]
-            .as_array()
-            .expect("poll options")
-            .iter()
-            .map(|option| option.as_str().expect("poll option text").to_owned())
-            .collect::<Vec<_>>();
         (
             StatusCode::OK,
             Json(serde_json::json!({
-                "message": canonical_poll_message(
-                    request["place_id"].as_str().expect("poll place"),
-                    POLL_MESSAGE_ID,
-                    &nonce,
-                    request["question"].as_str().expect("poll question"),
-                    &options,
-                    request["allow_multi"].as_bool().expect("poll allow_multi"),
-                    request
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default(),
-                    0,
-                    &[],
-                    request.get("closes_in_minutes").is_some(),
-                ),
+                "client_nonce": nonce,
+                "message_id": POLL_MESSAGE_ID,
+                "seq": 9,
+                "message": null,
                 "created": false
             })),
         )
@@ -5821,7 +5861,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messaging_poll_create_replays_the_same_canonical_relative_request_and_full_receipt() {
+    async fn messaging_poll_create_replays_the_same_canonical_relative_request_to_a_stable_null_receipt()
+     {
         let state = MessagingReplayFixtureState::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -5861,10 +5902,12 @@ mod tests {
                 },
             )
             .await
-            .expect("full poll receipt reconciles response loss");
+            .expect("stable poll replay receipt reconciles response loss");
+        assert_eq!(response["client_nonce"], "stable-relative-poll");
+        assert_eq!(response["message_id"], POLL_MESSAGE_ID);
+        assert_eq!(response["seq"], 9);
         assert_eq!(response["created"], false);
-        assert_eq!(response["message"]["message_id"], POLL_MESSAGE_ID);
-        assert_eq!(response["message"]["poll"]["revision"], 0);
+        assert!(response["message"].is_null());
 
         let requests = state.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -5899,18 +5942,18 @@ mod tests {
                 .with_state(CountedMutationFixture {
                     status,
                     body: serde_json::json!({
-                        "message": canonical_poll_message(
-                            POLL_PLACE_ID,
-                            POLL_MESSAGE_ID,
-                            "existing-poll",
-                            "When?",
-                            &options,
-                            false,
-                            "",
-                            1,
-                            &selected,
-                            true,
-                        )
+                        "message": canonical_poll_message(CanonicalPollMessageInput {
+                            place_id: POLL_PLACE_ID,
+                            message_id: POLL_MESSAGE_ID,
+                            nonce: "existing-poll",
+                            question: "When?",
+                            options: &options,
+                            allow_multi: false,
+                            content: "",
+                            poll_revision: 1,
+                            selected: &selected,
+                            has_deadline: true,
+                        })
                     }),
                     attempts: attempts.clone(),
                 });
@@ -5959,19 +6002,22 @@ mod tests {
             client_nonce: "strict-create-poll",
             closes_in_minutes: Some(30),
         };
-        let message = canonical_poll_message(
-            POLL_PLACE_ID,
-            POLL_MESSAGE_ID,
-            create_request.client_nonce,
-            create_request.question,
-            &options,
-            false,
-            "release context",
-            0,
-            &[],
-            true,
-        );
+        let message = canonical_poll_message(CanonicalPollMessageInput {
+            place_id: POLL_PLACE_ID,
+            message_id: POLL_MESSAGE_ID,
+            nonce: create_request.client_nonce,
+            question: create_request.question,
+            options: &options,
+            allow_multi: false,
+            content: "release context",
+            poll_revision: 0,
+            selected: &[],
+            has_deadline: true,
+        });
         let response = MessagingCreatePollResponse {
+            client_nonce: create_request.client_nonce.to_owned(),
+            message_id: POLL_MESSAGE_ID.to_owned(),
+            seq: 9,
             message: message.clone(),
             created: true,
         };
@@ -5982,6 +6028,96 @@ mod tests {
             PAID,
         )
         .expect("canonical full create receipt");
+
+        let replay = MessagingCreatePollResponse {
+            client_nonce: create_request.client_nonce.to_owned(),
+            message_id: POLL_MESSAGE_ID.to_owned(),
+            seq: 9,
+            message: serde_json::Value::Null,
+            created: false,
+        };
+        validate_messaging_poll_creation_response(StatusCode::OK, &replay, &create_request, PAID)
+            .expect("stable replay receipt needs no mutable message projection");
+
+        for (case, response, status) in [
+            (
+                "nonce",
+                MessagingCreatePollResponse {
+                    client_nonce: "wrong-nonce".to_owned(),
+                    message_id: POLL_MESSAGE_ID.to_owned(),
+                    seq: 9,
+                    message: serde_json::Value::Null,
+                    created: false,
+                },
+                StatusCode::OK,
+            ),
+            (
+                "message-id",
+                MessagingCreatePollResponse {
+                    client_nonce: create_request.client_nonce.to_owned(),
+                    message_id: "not-a-canonical-message-id".to_owned(),
+                    seq: 9,
+                    message: serde_json::Value::Null,
+                    created: false,
+                },
+                StatusCode::OK,
+            ),
+            (
+                "seq",
+                MessagingCreatePollResponse {
+                    client_nonce: create_request.client_nonce.to_owned(),
+                    message_id: POLL_MESSAGE_ID.to_owned(),
+                    seq: 0,
+                    message: serde_json::Value::Null,
+                    created: false,
+                },
+                StatusCode::OK,
+            ),
+            (
+                "replay-message",
+                MessagingCreatePollResponse {
+                    client_nonce: create_request.client_nonce.to_owned(),
+                    message_id: POLL_MESSAGE_ID.to_owned(),
+                    seq: 9,
+                    message: message.clone(),
+                    created: false,
+                },
+                StatusCode::OK,
+            ),
+            (
+                "fresh-null",
+                MessagingCreatePollResponse {
+                    client_nonce: create_request.client_nonce.to_owned(),
+                    message_id: POLL_MESSAGE_ID.to_owned(),
+                    seq: 9,
+                    message: serde_json::Value::Null,
+                    created: true,
+                },
+                StatusCode::CREATED,
+            ),
+            (
+                "fresh-seq-drift",
+                MessagingCreatePollResponse {
+                    client_nonce: create_request.client_nonce.to_owned(),
+                    message_id: POLL_MESSAGE_ID.to_owned(),
+                    seq: 10,
+                    message: message.clone(),
+                    created: true,
+                },
+                StatusCode::CREATED,
+            ),
+        ] {
+            assert!(
+                validate_messaging_poll_creation_response(
+                    status,
+                    &response,
+                    &create_request,
+                    PAID,
+                )
+                .is_err(),
+                "{case} drift"
+            );
+        }
 
         for (case, malformed) in [
             {
@@ -6020,6 +6156,9 @@ mod tests {
             },
         ] {
             let response = MessagingCreatePollResponse {
+                client_nonce: create_request.client_nonce.to_owned(),
+                message_id: POLL_MESSAGE_ID.to_owned(),
+                seq: 9,
                 message: malformed,
                 created: true,
             };
@@ -6042,18 +6181,18 @@ mod tests {
             option_ids: &selected,
         };
         let canonical_vote = MessagingVotePollResponse {
-            message: canonical_poll_message(
-                POLL_PLACE_ID,
-                POLL_MESSAGE_ID,
-                "existing-poll",
-                "When?",
-                &options,
-                false,
-                "",
-                1,
-                &selected,
-                true,
-            ),
+            message: canonical_poll_message(CanonicalPollMessageInput {
+                place_id: POLL_PLACE_ID,
+                message_id: POLL_MESSAGE_ID,
+                nonce: "existing-poll",
+                question: "When?",
+                options: &options,
+                allow_multi: false,
+                content: "",
+                poll_revision: 1,
+                selected: &selected,
+                has_deadline: true,
+            }),
         };
         validate_messaging_poll_vote_response(StatusCode::OK, &canonical_vote, &vote_request, PAID)
             .expect("exact replacement vote receipt");
@@ -6068,18 +6207,18 @@ mod tests {
         );
 
         let stale_vote = MessagingVotePollResponse {
-            message: canonical_poll_message(
-                POLL_PLACE_ID,
-                POLL_MESSAGE_ID,
-                "existing-poll",
-                "When?",
-                &options,
-                false,
-                "",
-                1,
-                &[],
-                true,
-            ),
+            message: canonical_poll_message(CanonicalPollMessageInput {
+                place_id: POLL_PLACE_ID,
+                message_id: POLL_MESSAGE_ID,
+                nonce: "existing-poll",
+                question: "When?",
+                options: &options,
+                allow_multi: false,
+                content: "",
+                poll_revision: 1,
+                selected: &[],
+                has_deadline: true,
+            }),
         };
         assert!(
             validate_messaging_poll_vote_response(
@@ -6091,18 +6230,18 @@ mod tests {
             .is_err()
         );
         let revision_zero = MessagingVotePollResponse {
-            message: canonical_poll_message(
-                POLL_PLACE_ID,
-                POLL_MESSAGE_ID,
-                "existing-poll",
-                "When?",
-                &options,
-                false,
-                "",
-                0,
-                &selected,
-                true,
-            ),
+            message: canonical_poll_message(CanonicalPollMessageInput {
+                place_id: POLL_PLACE_ID,
+                message_id: POLL_MESSAGE_ID,
+                nonce: "existing-poll",
+                question: "When?",
+                options: &options,
+                allow_multi: false,
+                content: "",
+                poll_revision: 0,
+                selected: &selected,
+                has_deadline: true,
+            }),
         };
         assert!(
             validate_messaging_poll_vote_response(

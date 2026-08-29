@@ -571,6 +571,18 @@ struct OpenMessageWire {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatePollReceiptWire {
+    client_nonce: String,
+    message_id: String,
+    seq: u64,
+    created: bool,
+    // Required and nullable: fresh creation carries the strict full message;
+    // nonce replay deliberately does not project mutable current message state.
+    message: Value,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenResponseWire {
     place: OpenPlaceWire,
     latest_seq: u64,
@@ -2217,8 +2229,14 @@ impl MessagingTool {
                     )
                     .await
                     .map_err(map_messaging_api_error)?;
-                let visible = visible_message_from_poll_mutation(&response, &place_id, None)?;
-                if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
+                let visible = visible_message_from_poll_creation_receipt(
+                    &response,
+                    &place_id,
+                    &nonce,
+                )?;
+                if state.focused_place_id.as_deref() == Some(place_id.as_str())
+                    && let Some(visible) = visible
+                {
                     upsert_visible_message(state, visible);
                 }
                 response
@@ -2243,8 +2261,12 @@ impl MessagingTool {
                     )
                     .await
                     .map_err(map_messaging_api_error)?;
-                let visible =
-                    visible_message_from_poll_mutation(&response, &place_id, Some(&message_id))?;
+                let visible = visible_message_from_poll_mutation(
+                    &response,
+                    &place_id,
+                    Some(&message_id),
+                    None,
+                )?;
                 if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
                     upsert_visible_message(state, visible);
                 }
@@ -3920,10 +3942,51 @@ fn upsert_visible_message(state: &mut MessagingViewState, message: VisibleMessag
         .sort_by_key(|known| known.seq.unwrap_or(u64::MAX));
 }
 
+fn visible_message_from_poll_creation_receipt(
+    response: &Value,
+    expected_place_id: &str,
+    expected_nonce: &str,
+) -> Result<Option<VisibleMessage>, ToolError> {
+    let receipt: CreatePollReceiptWire =
+        serde_json::from_value(response.clone()).map_err(|error| {
+            ToolError::Protocol(format!("invalid Messaging poll creation receipt: {error}"))
+        })?;
+    if receipt.client_nonce != expected_nonce
+        || validate_canonical_uuid_v7(&receipt.message_id).is_err()
+        || receipt.seq == 0
+        || receipt.seq > i64::MAX as u64
+    {
+        return Err(ToolError::Protocol(
+            "Messaging poll creation returned invalid stable receipt identity".to_owned(),
+        ));
+    }
+    if !receipt.created {
+        if !receipt.message.is_null() {
+            return Err(ToolError::Protocol(
+                "Messaging poll replay receipt carried mutable message state".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    if receipt.message.is_null() {
+        return Err(ToolError::Protocol(
+            "fresh Messaging poll creation omitted its message".to_owned(),
+        ));
+    }
+    visible_message_from_poll_mutation(
+        response,
+        expected_place_id,
+        Some(&receipt.message_id),
+        Some(receipt.seq),
+    )
+    .map(Some)
+}
+
 fn visible_message_from_poll_mutation(
     response: &Value,
     expected_place_id: &str,
     expected_message_id: Option<&str>,
+    expected_seq: Option<u64>,
 ) -> Result<VisibleMessage, ToolError> {
     let message: OpenMessageWire =
         serde_json::from_value(response.get("message").cloned().ok_or_else(|| {
@@ -3937,6 +4000,7 @@ fn visible_message_from_poll_mutation(
     if message.deleted
         || message.poll.is_none()
         || expected_message_id.is_some_and(|expected| message.message_id != expected)
+        || expected_seq.is_some_and(|expected| message.seq != expected)
     {
         return Err(ToolError::Protocol(
             "Messaging poll mutation returned a different or poll-less message".to_owned(),
@@ -5021,21 +5085,32 @@ mod tests {
                 .lock()
                 .await
                 .insert(recorded.client_nonce.clone());
-            let message = test_poll_message(
-                &recorded.place_id,
-                TEST_POLL_MESSAGE_ID,
-                9,
-                &recorded.client_nonce,
-                &recorded.question,
-                &recorded.options,
-                recorded.allow_multi,
-                0,
-                &[],
-                recorded.closes_in_minutes.is_some(),
-                recorded.content.as_deref(),
-            );
-            *self.poll_message.lock().await = Some(message.clone());
-            Ok(json!({"message": message, "created": created}))
+            let message = if created {
+                let message = test_poll_message(
+                    &recorded.place_id,
+                    TEST_POLL_MESSAGE_ID,
+                    9,
+                    &recorded.client_nonce,
+                    &recorded.question,
+                    &recorded.options,
+                    recorded.allow_multi,
+                    0,
+                    &[],
+                    recorded.closes_in_minutes.is_some(),
+                    recorded.content.as_deref(),
+                );
+                *self.poll_message.lock().await = Some(message.clone());
+                message
+            } else {
+                Value::Null
+            };
+            Ok(json!({
+                "client_nonce": recorded.client_nonce,
+                "message_id": TEST_POLL_MESSAGE_ID,
+                "seq": 9,
+                "message": message,
+                "created": created
+            }))
         }
 
         async fn vote_poll(
@@ -7353,7 +7428,11 @@ mod tests {
             .expect("same create receipt replays");
         assert_eq!(first.details["created"], true);
         assert_eq!(replay.details["created"], false);
-        assert_eq!(first.details["message"], replay.details["message"]);
+        assert!(first.details["message"].is_object());
+        assert!(replay.details["message"].is_null());
+        for field in ["client_nonce", "message_id", "seq"] {
+            assert_eq!(first.details[field], replay.details[field]);
+        }
 
         let requests = api.polls.lock().await.clone();
         assert_eq!(requests.len(), 2);
@@ -7442,6 +7521,74 @@ mod tests {
                 format!("vote_poll:{TEST_POLL_MESSAGE_ID}"),
                 format!("vote_poll:{TEST_POLL_MESSAGE_ID}"),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciled_create_response_loss_returns_stable_null_receipt_without_visibility_open() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open-before-reconciled-poll",
+        )
+        .await
+        .expect("open place");
+        let options = vec!["Today".to_owned(), "Tomorrow".to_owned()];
+        let nonce = poll_client_nonce(
+            "flow",
+            "reconciled-null-poll",
+            "general",
+            "When?",
+            &options,
+            false,
+            None,
+            Some(30),
+        );
+        *api.create_poll_response.lock().await = Some(json!({
+            "client_nonce": nonce,
+            "message_id": TEST_POLL_MESSAGE_ID,
+            "seq": 9,
+            "created": false,
+            "message": null
+        }));
+
+        let response = execute(
+            &tool,
+            json!({
+                "action": "create_poll",
+                "question": "When?",
+                "options": options,
+                "closes_in_minutes": 30
+            }),
+            "reconciled-null-poll",
+        )
+        .await
+        .expect("transport-reconciled replay is a stable success");
+        assert_eq!(response.details["client_nonce"], nonce);
+        assert_eq!(response.details["message_id"], TEST_POLL_MESSAGE_ID);
+        assert_eq!(response.details["seq"], 9);
+        assert_eq!(response.details["created"], false);
+        assert!(response.details["message"].is_null());
+        let state = default_state(&tool).await;
+        assert!(
+            state
+                .visible_messages
+                .iter()
+                .all(|message| message.message_id != TEST_POLL_MESSAGE_ID),
+            "a null replay receipt cannot manufacture mutable visibility"
+        );
+        drop(state);
+        assert_eq!(
+            api.calls
+                .lock()
+                .await
+                .iter()
+                .filter(|call| call.starts_with("open:"))
+                .count(),
+            1,
+            "stable replay success never triggers an extra open"
         );
     }
 
