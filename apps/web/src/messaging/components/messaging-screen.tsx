@@ -487,7 +487,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
 
   useEffect(() => {
     if (selectedPlaceKey?.startsWith("channel:"))
-      void loadThreads(selectedPlaceKey);
+      void loadThreads(selectedPlaceKey).catch(() => undefined);
   }, [selectedPlaceKey, loadThreads]);
 
   useEffect(() => {
@@ -650,8 +650,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
               <button
                 type="button"
                 title="スレッド"
+                aria-expanded={threadsOpen}
                 onClick={() => setThreadsOpen((value) => !value)}
-                className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-accent"
+                className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
+                  threadsOpen
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground"
+                }`}
               >
                 <MessagesSquare className="size-4" />
               </button>
@@ -714,6 +719,12 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
                   </button>
                 </div>
               </section>
+            ) : requestedThreadId ? (
+              <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+                <p role="status" className="text-sm text-muted-foreground">
+                  スレッドを読み込み中…
+                </p>
+              </section>
             ) : (
               <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
                 <div className="max-w-sm">
@@ -735,15 +746,16 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
               </section>
             )}
           </main>
-          {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
           {canUseThreads &&
           threadsOpen &&
           selectedPlaceKey?.startsWith("channel:") ? (
             <ThreadPanel
+              key={selectedPlaceKey}
               parentKey={selectedPlaceKey}
               onClose={() => setThreadsOpen(false)}
             />
           ) : null}
+          {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
         </div>
       </div>
       <IncomingCall />

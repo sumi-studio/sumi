@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -48,7 +49,12 @@ vi.mock("./sidebar", () => ({
 }));
 
 vi.mock("./connection-banner", () => ({ ConnectionBanner: () => null }));
-vi.mock("./member-list", () => ({ MemberList: () => null }));
+vi.mock("./member-list", () => ({
+  MemberList: () => <aside data-testid="member-list" />,
+}));
+vi.mock("./thread-panel", () => ({
+  ThreadPanel: () => <aside data-testid="thread-panel" />,
+}));
 vi.mock("./message-list", () => ({ MessageList: () => null }));
 vi.mock("./composer", () => ({ Composer: () => null }));
 
@@ -59,6 +65,7 @@ const realInit = useMessaging.getState().init;
 const realSelectPlace = useMessaging.getState().selectPlace;
 const realLoadPlaceAround = useMessaging.getState().loadPlaceAround;
 const realLoadThread = useMessaging.getState().loadThread;
+const realLoadThreads = useMessaging.getState().loadThreads;
 
 function seedCurrentPlace() {
   useMessaging.setState({
@@ -101,6 +108,9 @@ function seedCurrentPlace() {
       },
     ],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
+    threadLoadErrorsById: {},
     membersByKey: {
       "human:human-a": {
         participant: SELF,
@@ -130,6 +140,7 @@ describe("MessagingScreen route-owned current place", () => {
       selectPlace: realSelectPlace,
       loadPlaceAround: realLoadPlaceAround,
       loadThread: realLoadThread,
+      loadThreads: realLoadThreads,
     });
     bindMessagingSessionIdentity(null);
   });
@@ -216,6 +227,43 @@ describe("MessagingScreen route-owned current place", () => {
     expect(screen.getByText("認証リダイレクト")).toBeInTheDocument();
     expect(screen.getByText("親: #alpha")).toBeInTheDocument();
     expect(useMessaging.getState().activePlaceKey).toBe("thread:thread-a");
+
+    fireEvent.click(screen.getByTitle("親チャンネルへ戻る"));
+    expect(mocks.placeNavigate).toHaveBeenCalledWith(CHANNEL_A);
+  });
+
+  it("shows direct thread loading explicitly before a not-found result", async () => {
+    let resolveLoad: ((loaded: boolean) => void) | undefined;
+    const loadThread = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    useMessaging.setState({
+      capabilities: {
+        status: false,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+        threads: true,
+      },
+      loadThread,
+    });
+
+    render(<MessagingScreen placeKey="thread:thread-missing" />);
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "スレッドを読み込み中",
+    );
+    useMessaging.setState({
+      threadLoadErrorsById: { "thread-missing": "not_found" },
+    });
+    await act(async () => resolveLoad?.(false));
+    expect(screen.getByText("スレッドが見つかりません")).toBeInTheDocument();
+    expect(
+      screen.getByText(/存在しないか、アクセスできません/),
+    ).toBeInTheDocument();
   });
 
   it("shows a direct thread load failure and retries it into the existing thread", async () => {
@@ -279,5 +327,32 @@ describe("MessagingScreen route-owned current place", () => {
     render(<MessagingScreen placeKey={CHANNEL_A} />);
 
     expect(screen.queryByTitle("スレッド")).not.toBeInTheDocument();
+  });
+
+  it("marks the thread toggle active and places its panel beside the conversation", async () => {
+    const loadThreads = vi.fn().mockRejectedValue(new Error("offline"));
+    useMessaging.setState({
+      capabilities: {
+        status: false,
+        replyLater: false,
+        reactions: false,
+        notifications: false,
+        threads: true,
+      },
+      loadThreads,
+    });
+    render(<MessagingScreen placeKey={CHANNEL_A} />);
+    const toggle = screen.getByRole("button", { name: "スレッド" });
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveClass("bg-accent", "text-foreground");
+    const panel = screen.getByTestId("thread-panel");
+    const members = screen.getByTestId("member-list");
+    expect(
+      panel.compareDocumentPosition(members) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    await waitFor(() => expect(loadThreads).toHaveBeenCalledWith(CHANNEL_A));
   });
 });
