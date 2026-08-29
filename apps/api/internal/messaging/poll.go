@@ -295,84 +295,67 @@ func attachPollsWith(ctx context.Context, q querier, messages []Message) error {
 		messageIndex[message.MessageID] = i
 	}
 
-	rows, err := q.Query(ctx, `
-		SELECT message_id, question, allow_multi, closes_at, revision
-		FROM message_polls WHERE message_id = ANY($1)`, ids)
-	if err != nil {
-		return fmt.Errorf("query polls: %w", err)
-	}
-	for rows.Next() {
-		var messageID string
-		poll := &Poll{Options: []PollOption{}}
-		if err := rows.Scan(&messageID, &poll.Question, &poll.AllowMulti, &poll.ClosesAt, &poll.Revision); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan poll: %w", err)
-		}
-		messages[messageIndex[messageID]].Poll = poll
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate polls: %w", err)
-	}
-	rows.Close()
-
+	// Poll revision, ordered options, and voters are one absolute projection.
+	// Keep them in one statement snapshot: under READ COMMITTED, separate
+	// SELECTs could otherwise combine revision N with voters committed at N+1
+	// and defeat the live event's revision fence.
 	type optionLocation struct{ message, option int }
 	optionIndex := make(map[string]optionLocation)
-	rows, err = q.Query(ctx, `
-		SELECT message_id, option_id, text
-		FROM message_poll_options
-		WHERE message_id = ANY($1)
-		ORDER BY message_id, ord`, ids)
+	rows, err := q.Query(ctx, `
+		SELECT p.message_id, p.question, p.allow_multi, p.closes_at, p.revision,
+		       o.option_id, o.text, v.voter_kind, v.voter_id
+		FROM message_polls p
+		LEFT JOIN message_poll_options o ON o.message_id = p.message_id
+		LEFT JOIN message_poll_votes v ON v.option_id = o.option_id
+		WHERE p.message_id = ANY($1)
+		ORDER BY p.message_id, o.ord, v.created_at, v.voter_kind, v.voter_id`, ids)
 	if err != nil {
-		return fmt.Errorf("query poll options: %w", err)
-	}
-	for rows.Next() {
-		var messageID, optionID, text string
-		if err := rows.Scan(&messageID, &optionID, &text); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan poll option: %w", err)
-		}
-		message := &messages[messageIndex[messageID]]
-		if message.Poll == nil {
-			continue
-		}
-		message.Poll.Options = append(message.Poll.Options, PollOption{
-			OptionID: optionID, Text: text, Voters: []ParticipantRef{},
-		})
-		optionIndex[optionID] = optionLocation{
-			message: messageIndex[messageID], option: len(message.Poll.Options) - 1,
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate poll options: %w", err)
-	}
-	rows.Close()
-
-	rows, err = q.Query(ctx, `
-		SELECT v.option_id, v.voter_kind, v.voter_id
-		FROM message_poll_options o
-		JOIN message_poll_votes v ON v.option_id = o.option_id
-		WHERE o.message_id = ANY($1)
-		ORDER BY o.message_id, o.ord, v.created_at, v.voter_kind, v.voter_id`, ids)
-	if err != nil {
-		return fmt.Errorf("query poll votes: %w", err)
+		return fmt.Errorf("query poll projection: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var optionID string
-		var voter ParticipantRef
-		if err := rows.Scan(&optionID, &voter.Kind, &voter.ID); err != nil {
-			return fmt.Errorf("scan poll vote: %w", err)
+		var (
+			messageID                          string
+			question                           string
+			allowMulti                         bool
+			closesAt                           *time.Time
+			revision                           int64
+			optionID, text, voterKind, voterID *string
+		)
+		if err := rows.Scan(
+			&messageID, &question, &allowMulti, &closesAt, &revision,
+			&optionID, &text, &voterKind, &voterID,
+		); err != nil {
+			return fmt.Errorf("scan poll projection: %w", err)
 		}
-		location, ok := optionIndex[optionID]
-		if ok {
+		messageAt := messageIndex[messageID]
+		message := &messages[messageAt]
+		if message.Poll == nil {
+			message.Poll = &Poll{
+				Question: question, AllowMulti: allowMulti, ClosesAt: closesAt,
+				Revision: revision, Options: []PollOption{},
+			}
+		}
+		if optionID == nil {
+			continue
+		}
+		location, found := optionIndex[*optionID]
+		if !found {
+			message.Poll.Options = append(message.Poll.Options, PollOption{
+				OptionID: *optionID, Text: *text, Voters: []ParticipantRef{},
+			})
+			location = optionLocation{message: messageAt, option: len(message.Poll.Options) - 1}
+			optionIndex[*optionID] = location
+		}
+		if voterKind != nil {
 			option := &messages[location.message].Poll.Options[location.option]
-			option.Voters = append(option.Voters, voter)
+			option.Voters = append(option.Voters, ParticipantRef{
+				Kind: ParticipantKind(*voterKind), ID: *voterID,
+			})
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate poll votes: %w", err)
+		return fmt.Errorf("iterate poll projection: %w", err)
 	}
 	return nil
 }

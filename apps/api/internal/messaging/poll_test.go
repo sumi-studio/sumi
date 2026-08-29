@@ -7,11 +7,46 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
+
+type interleavingPollQuerier struct {
+	querier
+	once       sync.Once
+	interleave func()
+}
+
+func (q *interleavingPollQuerier) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	rows, err := q.querier.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &interleavingPollRows{
+		Rows: rows,
+		afterFirstScan: func() {
+			q.once.Do(q.interleave)
+		},
+	}, nil
+}
+
+type interleavingPollRows struct {
+	pgx.Rows
+	once           sync.Once
+	afterFirstScan func()
+}
+
+func (rows *interleavingPollRows) Scan(dest ...any) error {
+	err := rows.Rows.Scan(dest...)
+	if err == nil {
+		rows.once.Do(rows.afterFirstScan)
+	}
+	return err
+}
 
 func appendTestPoll(
 	t *testing.T,
@@ -248,7 +283,7 @@ func TestPollReplayAfterCloseUsesCanonicalRequestAndChangedPollConflicts(t *test
 	w := newWorld(t, ctx)
 	workspace, channel := w.workspaceWithChannel(t, ctx)
 	a := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
-	closesAt := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	closesAt := time.Now().Add(2 * time.Second).UTC().Truncate(time.Microsecond)
 	request := AppendInput{
 		PlaceID: channel.PlaceID, ClientNonce: "poll-replay-after-close",
 		Poll: &PollInput{Question: "締切後？", Options: []string{"はい", "いいえ"}, ClosesAt: &closesAt},
@@ -257,10 +292,18 @@ func TestPollReplayAfterCloseUsesCanonicalRequestAndChangedPollConflicts(t *test
 	if err != nil || !fresh {
 		t.Fatalf("create: fresh=%t err=%v", fresh, err)
 	}
-	if _, err := w.store.pool.Exec(ctx, `
-		UPDATE message_polls SET closes_at = clock_timestamp() - interval '1 second'
-		WHERE message_id = $1`, created.MessageID); err != nil {
-		t.Fatal(err)
+	for time.Now().Before(closesAt) {
+		if wait := time.Until(closesAt); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+	if time.Now().Before(closesAt) {
+		t.Fatalf("test clock has not reached original closes_at %s", closesAt)
+	}
+	expiredNewNonce := request
+	expiredNewNonce.ClientNonce = "poll-expired-new-nonce"
+	if _, _, err := a.AppendMessage(ctx, expiredNewNonce); !errors.Is(err, ErrInvalidPoll) {
+		t.Fatalf("expired request under a new nonce = %v, want ErrInvalidPoll", err)
 	}
 	replayed, fresh, err := a.AppendMessage(ctx, request)
 	if err != nil || fresh || replayed.MessageID != created.MessageID || replayed.Poll == nil ||
@@ -335,6 +378,55 @@ func TestPollCloseEqualityAndConcurrentSameActorReplacement(t *testing.T) {
 	}
 	if got, want := selectedOption(final.Poll, w.humanB), selectedOption(byRevision[2].Poll, w.humanB); got == "" || got != want {
 		t.Fatalf("final selected option = %q, revision-2 snapshot = %q", got, want)
+	}
+}
+
+func TestPollProjectionUsesOneStatementSnapshotAcrossConcurrentVote(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	a := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	b := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	message := appendTestPoll(t, ctx, a, channel.PlaceID, "poll-projection-snapshot", PollInput{
+		Question: "snapshot?", Options: []string{"A", "B"},
+	})
+
+	var (
+		voted   Message
+		voteErr error
+	)
+	q := &interleavingPollQuerier{
+		querier: w.store.pool,
+		interleave: func() {
+			voted, voteErr = b.VotePoll(ctx, channel.PlaceID, message.MessageID,
+				[]string{message.Poll.Options[0].OptionID})
+		},
+	}
+	projection := []Message{{MessageID: message.MessageID, PlaceID: channel.PlaceID}}
+	if err := attachPollsWith(ctx, q, projection); err != nil {
+		t.Fatal(err)
+	}
+	if voteErr != nil {
+		t.Fatalf("interleaved vote: %v", voteErr)
+	}
+	if voted.Poll == nil || voted.Poll.Revision != 1 ||
+		len(voted.Poll.Options[0].Voters) != 1 {
+		t.Fatalf("committed interleaved vote = %+v", voted.Poll)
+	}
+	poll := projection[0].Poll
+	if poll == nil {
+		t.Fatal("projection omitted poll")
+	}
+	voters := 0
+	for _, option := range poll.Options {
+		voters += len(option.Voters)
+	}
+	// The vote commits immediately after the first result row is scanned. A
+	// single statement must keep reading its revision-0 snapshot; the former
+	// three-SELECT loader instead returned revision 0 plus the revision-1 voter.
+	if poll.Revision != 0 || voters != 0 {
+		t.Fatalf("mixed poll projection: revision=%d voters=%d poll=%+v", poll.Revision, voters, poll)
 	}
 }
 
@@ -450,6 +542,21 @@ func TestEditReactionPreservePollAndTombstoneCascadesIt(t *testing.T) {
 	if err != nil || reacted.Poll == nil || reacted.Content != "after" || len(reacted.Reactions) != 1 {
 		t.Fatalf("reaction lost poll/message state: %+v err=%v", reacted, err)
 	}
+	votedOptionID := reacted.Poll.Options[0].OptionID
+	voted, err := b.VotePoll(ctx, channel.PlaceID, message.MessageID, []string{votedOptionID})
+	if err != nil || voted.Poll == nil || voted.Poll.Revision != 1 ||
+		len(voted.Poll.Options[0].Voters) != 1 {
+		t.Fatalf("vote before tombstone = %+v err=%v", voted.Poll, err)
+	}
+	var voteCountBefore int
+	if err := w.store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM message_poll_votes WHERE option_id = $1", votedOptionID,
+	).Scan(&voteCountBefore); err != nil {
+		t.Fatal(err)
+	}
+	if voteCountBefore != 1 {
+		t.Fatalf("vote rows before tombstone = %d, want one", voteCountBefore)
+	}
 	tombstone, err := a.DeleteMessage(ctx, channel.PlaceID, message.MessageID)
 	if err != nil || !tombstone.Deleted || tombstone.Poll != nil {
 		t.Fatalf("tombstone = %+v err=%v", tombstone, err)
@@ -459,9 +566,8 @@ func TestEditReactionPreservePollAndTombstoneCascadesIt(t *testing.T) {
 		SELECT
 		  (SELECT count(*) FROM message_polls WHERE message_id = $1),
 		  (SELECT count(*) FROM message_poll_options WHERE message_id = $1),
-		  (SELECT count(*) FROM message_poll_votes v
-		   JOIN message_poll_options o ON o.option_id = v.option_id WHERE o.message_id = $1)`,
-		message.MessageID).Scan(&pollCount, &optionCount, &voteCount); err != nil {
+		  (SELECT count(*) FROM message_poll_votes WHERE option_id = $2)`,
+		message.MessageID, votedOptionID).Scan(&pollCount, &optionCount, &voteCount); err != nil {
 		t.Fatal(err)
 	}
 	if pollCount != 0 || optionCount != 0 || voteCount != 0 {
