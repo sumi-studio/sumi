@@ -1,4 +1,4 @@
--- 0032_participant_profiles: the canonical Participant profile.
+-- 0033_participant_profiles: the canonical Participant profile.
 --
 -- 表示名は戸籍（humans / agents）が正本であり続ける。この表が持つのは、参加者が
 -- 自分について名乗った一行 — tagline だけ。Workspace membership ではなく

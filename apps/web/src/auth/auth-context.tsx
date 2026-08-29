@@ -22,6 +22,7 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import { startPushSubscriptionLogoutCleanup } from "../messaging/push";
 import {
   clearPendingConfirmation,
   loadPendingConfirmation,
@@ -900,6 +901,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       );
       throw error;
     }
+    startPushSubscriptionLogoutCleanup();
     let authorityCleared = true;
     if (isCurrentGeneration(generation)) {
       // Server logout is the authority transition. Commit it before touching

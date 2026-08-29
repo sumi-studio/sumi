@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -36,6 +37,10 @@ const (
 	// uses for a Human. This adapter route does not itself define which agent
 	// tool action invokes the operation.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
+	// LocalSearchPath exposes the same visibility-scoped message search used by
+	// the human UI. Search results are references and snippets, not an opened
+	// place or a source of message-action authority.
+	LocalSearchPath = "/local-control/v1/messaging:search"
 	// LocalUploadAttachmentPattern is the PAID-local raw-body upload route. The
 	// exact Messaging scope travels in headers because the body is the file.
 	LocalUploadAttachmentPattern = "/local-control/v1/messaging/places/{place_id}/attachments"
@@ -87,6 +92,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalUpdateChannelPath, s.localUpdateChannel},
 		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
+		{"POST " + LocalSearchPath, s.localSearch},
 		{"POST " + LocalAttachmentPath, s.localAttachment},
 	}
 	if s.Calls != nil {
@@ -798,6 +804,50 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
+}
+
+// localSearch mirrors the human search box through SearchMessages. Store
+// authorization decides which places and message tenures are visible; an
+// inaccessible explicit place remains indistinguishable from a missing one.
+func (s *Server) localSearch(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		localScopeWire
+		Query   string `json:"query"`
+		PlaceID string `json:"place_id,omitempty"`
+		Limit   int    `json:"limit,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	query := strings.TrimSpace(request.Query)
+	if query == "" || len(query) > MaxSearchQueryBytes || request.Limit < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	results, err := store.SearchMessages(r.Context(), query,
+		SearchOptions{PlaceID: request.PlaceID, Limit: request.Limit})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]searchResultWire, len(results))
+	for i, result := range results {
+		wires[i] = searchResultWire{
+			MessageID: result.Message.MessageID,
+			Place:     placeToWire(result.Place),
+			Seq:       result.Message.Seq,
+			Author:    participantToWire(result.Message.Author),
+			Snippet:   result.Snippet,
+			CreatedAt: result.Message.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []searchResultWire `json:"results"`
+	}{wires})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

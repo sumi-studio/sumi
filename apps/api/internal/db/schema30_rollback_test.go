@@ -44,9 +44,7 @@ func TestPreflightSchema30RollbackDoesNotMutateCanonicalHead(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 
 	if err := PreflightSchema30Rollback(ctx, pool); err != nil {
 		t.Fatalf("preflight schema 30 rollback: %v", err)
@@ -83,13 +81,23 @@ func TestPreflightSchema30RollbackRejectsWrongHead(t *testing.T) {
 	}
 }
 
+func TestPreflightSchema30RollbackRejectsFutureHead(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 31)
+
+	err := PreflightSchema30Rollback(ctx, pool)
+	if !errors.Is(err, ErrSchema30RollbackWrongHead) {
+		t.Fatalf("preflight error = %v, want wrong-head refusal", err)
+	}
+}
+
 func TestPreflightSchema30RollbackRejectsWrongChecksum(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 	if _, err := pool.Exec(ctx, "UPDATE schema_migrations SET checksum = repeat('0', 64) WHERE version = 29"); err != nil {
 		t.Fatal(err)
 	}
@@ -104,9 +112,7 @@ func TestPreflightSchema30RollbackRejectsRevisionAboveOne(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 	insertSchema30RollbackMessage(t, ctx, pool)
 	if _, err := pool.Exec(ctx, "UPDATE messages SET revision = 2"); err != nil {
 		t.Fatal(err)
@@ -122,9 +128,7 @@ func TestPreflightSchema30RollbackRejectsNullRevisionAfterConstraintDrift(t *tes
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 	insertSchema30RollbackMessage(t, ctx, pool)
 	if _, err := pool.Exec(ctx, "ALTER TABLE messages ALTER COLUMN revision DROP NOT NULL"); err != nil {
 		t.Fatal(err)
@@ -143,9 +147,7 @@ func TestRollbackSchema30To29AtomicallyAppliesSealedDownMigration(t *testing.T) 
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 	insertSchema30RollbackMessage(t, ctx, pool)
 
 	if err := RollbackSchema30To29(ctx, pool); err != nil {
@@ -182,9 +184,7 @@ func TestPreflightSchema30RollbackWaitsForExistingMigrationLock(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 	lockConn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -209,9 +209,7 @@ func TestRollbackSchema30To29RefusalLeavesSchema30Intact(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate to schema 30: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 30)
 	insertSchema30RollbackMessage(t, ctx, pool)
 	if _, err := pool.Exec(ctx, "UPDATE messages SET revision = 2"); err != nil {
 		t.Fatal(err)

@@ -43,13 +43,9 @@ import {
 import {
   isNotificationSoundEnabled,
   isTabActive,
-  notificationBody,
-  notificationPermission,
-  notificationTitle,
   setNotificationSoundEnabled as persistNotificationSound,
   playNotificationSound,
   presentationFor,
-  presentDesktopNotification,
 } from "./notifications";
 import { PlaceCreationAttemptLedger } from "./place-creation-attempt-ledger";
 import {
@@ -815,18 +811,6 @@ let notificationWriteGeneration = 0;
 /** サーバーが最後に確定を返した設定。失敗時に戻る先はここで、送信前の手元ではない。 */
 let confirmedNotificationSetting: NotificationSettingState | null = null;
 
-let notificationNavigate: ((key: PlaceKey) => void) | null = null;
-
-/**
- * 通知をクリックした先の遷移。URLが現在地の正本なので、storeが自前で
- * activePlaceKeyを書き換えるのではなくrouterの遷移を借りる。
- */
-export function setNotificationNavigator(
-  navigate: ((key: PlaceKey) => void) | null,
-): void {
-  notificationNavigate = navigate;
-}
-
 /** placeに効いている通知レベル。place個別の指定が無ければ既定に落ちる。 */
 export function notificationLevelFor(
   state: Pick<
@@ -836,32 +820,6 @@ export function notificationLevelFor(
   key: PlaceKey,
 ): NotificationLevel {
   return state.notificationLevelByPlace[key] ?? state.notificationDefaultLevel;
-}
-
-/**
- * 通知の見出しに使う場所の名前。DMは相手の名前が発言者の名前と同じなので
- * 場所を名乗らせない（「Haru — Haru」は情報が無い）。
- */
-function notificationPlaceLabel(state: MessagingState, key: PlaceKey): string {
-  const place = parsePlaceKey(key);
-  if (!place) return "";
-  if (place.kind === "channel") {
-    const channel = state.channels.find(
-      (entry) => entry.channelId === place.channelId,
-    );
-    return channel ? `#${channel.name}` : "";
-  }
-  if (place.kind === "dm") return "";
-  const dm = state.dms.find(
-    (entry) => entry.kind === place.kind && entry.dmId === place.dmId,
-  );
-  if (!dm) return "";
-  return dm.participants
-    .filter((ref) => participantKey(ref) !== state.selfKey)
-    .map(
-      (ref) => state.membersByKey[participantKey(ref)]?.displayName ?? "不明",
-    )
-    .join("、");
 }
 
 export const useMessaging = create<MessagingState>((set, get) => {
@@ -1343,20 +1301,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       authorIsSelf: participantKey(event.message.author) === state.selfKey,
       tabActive: isTabActive(),
       placeIsActive: state.activePlaceKey === key,
-      permission: notificationPermission(),
       soundEnabled: state.notificationSoundEnabled,
     });
     if (presentation.sound) playNotificationSound();
-    if (!presentation.desktop) return;
-    const authorName =
-      state.membersByKey[participantKey(event.message.author)]?.displayName ??
-      "誰か";
-    presentDesktopNotification({
-      title: notificationTitle(notificationPlaceLabel(state, key), authorName),
-      body: notificationBody(event.message.content, event.message.attachments),
-      placeKey: key,
-      onActivate: () => notificationNavigate?.(key),
-    });
   };
 
   // REST DELETE応答とlive/replayのmessage_deletedは、同じtombstone投影を通す。

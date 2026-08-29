@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
@@ -25,7 +26,31 @@ func (s *Store) withLiveAudience(
 	requireActor bool,
 	deliver func(map[ParticipantRef]struct{}) error,
 ) error {
-	if s == nil || s.workspaces == nil || s.apps == nil || deliver == nil {
+	if deliver == nil {
+		return ErrInvalidScope
+	}
+	return s.withLiveAudienceInTx(
+		ctx,
+		scope,
+		boundary,
+		requireActor,
+		func(_ pgx.Tx, audience map[ParticipantRef]struct{}) error {
+			return deliver(audience)
+		},
+	)
+}
+
+// withLiveAudienceInTx prepares a coherent delivery plan under the current
+// Workspace, installation, and place audience lease. Callbacks may only read
+// and build memory state; external delivery happens after this method returns.
+func (s *Store) withLiveAudienceInTx(
+	ctx context.Context,
+	scope Scope,
+	boundary liveBoundary,
+	requireActor bool,
+	prepare func(pgx.Tx, map[ParticipantRef]struct{}) error,
+) error {
+	if s == nil || s.workspaces == nil || s.apps == nil || prepare == nil {
 		return ErrInvalidScope
 	}
 	if requireActor {
@@ -107,7 +132,7 @@ func (s *Store) withLiveAudience(
 			audience[membership.Participant] = struct{}{}
 		}
 	}
-	if err := deliver(audience); err != nil {
+	if err := prepare(tx, audience); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

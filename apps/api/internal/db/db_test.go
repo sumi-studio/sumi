@@ -1301,7 +1301,7 @@ func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate through 0032: %v", err)
+		t.Fatalf("migrate through 0033: %v", err)
 	}
 
 	assertShape := func(want bool) {
@@ -1326,10 +1326,10 @@ func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO participant_profiles
 		(member_kind, member_id, tagline) VALUES ('human', $1, repeat('名', 101))`,
 		"0198f0f4-9b72-7000-8000-000000000133"); err == nil {
-		t.Fatal("0032 accepted an overlong tagline")
+		t.Fatal("0033 accepted an overlong tagline")
 	}
 
-	down, err := migrationFS.ReadFile("migrations/0032_participant_profiles.down.sql")
+	down, err := migrationFS.ReadFile("migrations/0033_participant_profiles.down.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1339,19 +1339,19 @@ func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
 	}
 	if _, err := tx.Exec(ctx, string(down)); err != nil {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("apply 0032 down transaction: %v", err)
+		t.Fatalf("apply 0033 down transaction: %v", err)
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM schema_migrations WHERE version = 32"); err != nil {
+	if _, err := tx.Exec(ctx, "DELETE FROM schema_migrations WHERE version = 33"); err != nil {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("remove 0032 migration record: %v", err)
+		t.Fatalf("remove 0033 migration record: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit 0032 down transaction: %v", err)
+		t.Fatalf("commit 0033 down transaction: %v", err)
 	}
 	assertShape(false)
 
 	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("reapply 0032: %v", err)
+		t.Fatalf("reapply 0033: %v", err)
 	}
 	assertShape(true)
 	var rows int
