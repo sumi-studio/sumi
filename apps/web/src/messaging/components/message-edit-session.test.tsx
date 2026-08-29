@@ -146,6 +146,7 @@ function conflictWire(message: Message) {
     urgency: message.urgency,
     reactions: [],
     attachments: [],
+    poll: message.poll,
     reply_to: null,
     client_nonce: "conflict-nonce",
     created_at: new Date(message.createdAt).toISOString(),
